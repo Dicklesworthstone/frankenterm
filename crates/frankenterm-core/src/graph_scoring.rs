@@ -367,8 +367,8 @@ mod tests {
     #[test]
     fn test_adj_graph_no_edges() {
         let g = AdjGraph::new(3);
-        assert!(g.successors(0).is_empty());
-        assert!(g.predecessors(0).is_empty());
+        assert_eq!(g.successors(0), [] as [usize; 0]);
+        assert_eq!(g.predecessors(0), [] as [usize; 0]);
     }
 
     // -------------------------------------------------------------------------
@@ -694,7 +694,7 @@ mod tests {
     fn test_graph_view_default_adj_graph() {
         let g = AdjGraph::default();
         assert_eq!(g.node_count(), 0);
-        assert!(g.nodes().is_empty());
+        assert_eq!(g.nodes(), [] as [usize; 0]);
     }
 
     #[test]

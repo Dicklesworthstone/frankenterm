@@ -478,7 +478,7 @@ fn template_clone_preserves_id() {
 fn template_debug_nonempty() {
     let tmpl = get_explanation("deny.alt_screen").unwrap();
     let d = format!("{:?}", tmpl);
-    assert!(!d.is_empty());
+    assert_ne!(d, "");
     assert!(d.contains("deny.alt_screen"));
 }
 
@@ -486,7 +486,7 @@ fn template_debug_nonempty() {
 fn template_serialize_to_json() {
     let tmpl = get_explanation("deny.alt_screen").unwrap();
     let json = serde_json::to_string(tmpl).unwrap();
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
     // Verify JSON contains the template id
     assert!(json.contains("deny.alt_screen"));
 }

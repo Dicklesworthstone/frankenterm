@@ -565,8 +565,8 @@ mod tests {
     #[test]
     fn manifest_entry_default() {
         let entry = ConfigProfileManifestEntry::default();
-        assert!(entry.name.is_empty());
-        assert!(entry.path.is_empty());
+        assert_eq!(entry.name, "");
+        assert_eq!(entry.path, "");
         assert!(entry.description.is_none());
         assert!(entry.created_at.is_none());
         assert!(entry.updated_at.is_none());
@@ -593,8 +593,8 @@ mod tests {
     #[test]
     fn manifest_entry_serde_defaults_from_empty_json() {
         let entry: ConfigProfileManifestEntry = serde_json::from_str("{}").unwrap();
-        assert!(entry.name.is_empty());
-        assert!(entry.path.is_empty());
+        assert_eq!(entry.name, "");
+        assert_eq!(entry.path, "");
     }
 
     // ── ConfigProfileSummary tests ──

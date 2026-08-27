@@ -969,7 +969,7 @@ mod tests {
             (2, PaneHealth::PossiblyStuck, Duration::from_secs(8 * 3600)),
         ];
         let candidates = pressure_renice_candidates(&healths, 0.5, &config);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [(u64, i32); 0]);
     }
 
     #[test]
@@ -1210,7 +1210,7 @@ mod tests {
         assert!((cfg.stuck_cpu_threshold - 2.0).abs() < f64::EPSILON);
         assert!((cfg.pressure_renice_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(cfg.renice_value, 19);
-        assert!(cfg.protected_panes.is_empty());
+        assert_eq!(cfg.protected_panes, [] as [u64; 0]);
     }
 
     #[test]
@@ -1266,7 +1266,7 @@ mod tests {
         assert!((cfg.stuck_cpu_threshold - 2.0).abs() < f64::EPSILON);
         assert!((cfg.pressure_renice_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(cfg.renice_value, 19);
-        assert!(cfg.protected_panes.is_empty());
+        assert_eq!(cfg.protected_panes, [] as [u64; 0]);
     }
 
     // ========================================================================
@@ -1492,7 +1492,7 @@ mod tests {
         let healths = vec![(1, PaneHealth::Working, Duration::from_secs(8 * 3600))];
         // Above threshold, Working is NOT in the renice filter.
         let candidates = pressure_renice_candidates(&healths, 0.9, &config);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [(u64, i32); 0]);
     }
 
     #[test]
@@ -1500,7 +1500,7 @@ mod tests {
         let config = LifecycleConfig::default();
         let healths: Vec<(u64, PaneHealth, Duration)> = vec![];
         let candidates = pressure_renice_candidates(&healths, 0.9, &config);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [(u64, i32); 0]);
     }
 
     #[test]

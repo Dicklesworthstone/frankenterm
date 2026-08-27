@@ -453,8 +453,8 @@ mod tests {
         };
 
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(plan.batches.is_empty());
-        assert!(plan.log_lines().is_empty());
+        assert_eq!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
+        assert_eq!(plan.log_lines(), [] as [std::string::String; 0]);
         assert_eq!(plan.frame_work_units, 0);
     }
 
@@ -471,7 +471,7 @@ mod tests {
         };
 
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(!plan.batches.is_empty());
+        assert_ne!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         assert!(
             plan.batches
                 .iter()
@@ -484,7 +484,7 @@ mod tests {
         );
 
         let logs = plan.log_lines();
-        assert!(!logs.is_empty());
+        assert_ne!(logs, [] as [std::string::String; 0]);
         assert!(logs[0].contains("range="));
         assert!(logs[0].contains("reason="));
     }
@@ -503,7 +503,7 @@ mod tests {
             frame_budget_units: 8,
         };
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(plan.batches.is_empty());
+        assert_eq!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         assert_eq!(plan.frame_work_units, 0);
     }
 
@@ -519,7 +519,7 @@ mod tests {
             frame_budget_units: 100,
         };
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(!plan.batches.is_empty());
+        assert_ne!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         // With max_batch_lines clamped to 1, each batch covers exactly 1 line.
         assert!(
             plan.batches.iter().all(|b| b.range.len() == 1),
@@ -540,7 +540,7 @@ mod tests {
         };
         let plan = ViewportReflowPlanner::plan(&input);
         // Should not panic or divide by zero.
-        assert!(!plan.batches.is_empty());
+        assert_ne!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         // Each batch's work_units should equal its line count (1 line per work unit).
         for batch in &plan.batches {
             assert_eq!(batch.work_units, batch.range.len().max(1));
@@ -559,7 +559,7 @@ mod tests {
             frame_budget_units: 0,
         };
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(!plan.batches.is_empty());
+        assert_ne!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         // At least the first batch is always selected for progress guarantee.
         assert!(
             plan.batches[0].selected_for_frame,
@@ -721,7 +721,7 @@ mod tests {
             frame_budget_units: 10,
         };
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(!plan.batches.is_empty());
+        assert_ne!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         // All lines should be viewport core.
         assert!(
             plan.batches
@@ -909,7 +909,7 @@ mod tests {
         };
         let plan = ViewportReflowPlanner::plan(&input);
         let hooks = plan.scheduling_hooks();
-        assert!(!hooks.is_empty());
+        assert_ne!(hooks, [] as [viewport_reflow_planner::ReflowSchedulingHook; 0]);
         let hook = &hooks[0];
         let intent = hook.to_resize_intent(42, 7, 1000);
         assert_eq!(intent.pane_id, 42);
@@ -965,7 +965,7 @@ mod tests {
         };
         // Should not panic due to overflow.
         let plan = ViewportReflowPlanner::plan(&input);
-        assert!(!plan.batches.is_empty());
+        assert_ne!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
         // Verify no batch exceeds max_batch_lines.
         for batch in &plan.batches {
             assert!(batch.range.len() <= 64);
@@ -1101,7 +1101,7 @@ mod tests {
             ReflowBatchPriority::ColdScrollback,
         ];
         for v in variants {
-            assert!(!v.rationale().is_empty());
+            assert_ne!(v.rationale(), "");
         }
     }
 
@@ -1184,19 +1184,19 @@ mod tests {
         let plan = ReflowPlan::default();
         assert_eq!(plan.frame_budget_units, 0);
         assert_eq!(plan.frame_work_units, 0);
-        assert!(plan.batches.is_empty());
+        assert_eq!(plan.batches, [] as [viewport_reflow_planner::ReflowBatch; 0]);
     }
 
     #[test]
     fn reflow_plan_scheduling_hooks_empty() {
         let plan = ReflowPlan::default();
-        assert!(plan.scheduling_hooks().is_empty());
+        assert_eq!(plan.scheduling_hooks(), [] as [viewport_reflow_planner::ReflowSchedulingHook; 0]);
     }
 
     #[test]
     fn reflow_plan_log_lines_empty() {
         let plan = ReflowPlan::default();
-        assert!(plan.log_lines().is_empty());
+        assert_eq!(plan.log_lines(), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1264,13 +1264,13 @@ mod tests {
     #[test]
     fn chunk_range_empty_when_start_equals_end() {
         let result = chunk_range(5, 5, 8, ChunkDirection::Forward);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [viewport_reflow_planner::ReflowLineRange; 0]);
     }
 
     #[test]
     fn chunk_range_empty_when_start_exceeds_end() {
         let result = chunk_range(10, 5, 8, ChunkDirection::Forward);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [viewport_reflow_planner::ReflowLineRange; 0]);
     }
 
     #[test]
@@ -1292,7 +1292,7 @@ mod tests {
     #[test]
     fn interleave_empty_vecs() {
         let result = interleave(vec![], vec![]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [viewport_reflow_planner::ReflowLineRange; 0]);
     }
 
     #[test]

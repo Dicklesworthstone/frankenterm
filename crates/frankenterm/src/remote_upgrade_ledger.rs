@@ -22,11 +22,11 @@ use super::{
     validate_remote_generation_directory, validate_remote_generation_file_metadata,
 };
 
-pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024;
-pub(crate) const MAX_COMMITTED_RECORDS: u32 = 32;
-pub(crate) const MAX_ATTEMPTS: u8 = 16;
-pub(crate) const MAX_TRANSACTION_BYTES: u64 = 2 * 1024 * 1024;
-pub(crate) const MAX_TRANSACTION_DIRECTORIES: usize = 4_096;
+pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
+pub const MAX_COMMITTED_RECORDS: u32 = 32;
+pub const MAX_ATTEMPTS: u8 = 16;
+pub const MAX_TRANSACTION_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_TRANSACTION_DIRECTORIES: usize = 4_096;
 
 const MAX_RECORD_ARTIFACTS: usize = 32 * 16;
 const MAX_TRANSACTION_ENTRIES: usize = 1 + MAX_RECORD_ARTIFACTS + 32;
@@ -43,7 +43,7 @@ const QUARANTINED_ARTIFACT_PREFIX: &str = ".quarantine-v2-";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RemoteUpgradeClaim {
+pub struct RemoteUpgradeClaim {
     schema: String,
     transaction_id: String,
     operation: String,
@@ -133,7 +133,7 @@ impl RemoteUpgradeClaim {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum SelectorAuthority {
+pub enum SelectorAuthority {
     Missing,
     Unresolved {
         reason: String,
@@ -211,7 +211,7 @@ impl SelectorAuthority {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub(crate) enum RemoteUpgradeState {
+pub enum RemoteUpgradeState {
     Prepared,
     PendingLiveOwner,
     Activating,
@@ -258,12 +258,8 @@ fn record_transition_is_valid(
         (previous_state, next_state),
         (RemoteUpgradeState::Prepared, RemoteUpgradeState::Prepared)
             | (
-                RemoteUpgradeState::PendingLiveOwner,
-                RemoteUpgradeState::Activating
-            )
-            | (
+                RemoteUpgradeState::PendingLiveOwner | RemoteUpgradeState::Activating,
                 RemoteUpgradeState::Activating,
-                RemoteUpgradeState::Activating
             )
     ) {
         next_attempt > previous_attempt
@@ -283,10 +279,10 @@ fn record_authority_transition_is_valid(
         return true;
     }
     let expected_before = match (previous.state, next.state) {
-        (RemoteUpgradeState::PendingLiveOwner, RemoteUpgradeState::Activating)
-        | (RemoteUpgradeState::PendingLiveOwner, RemoteUpgradeState::Indeterminate) => {
-            &previous.selector_after
-        }
+        (
+            RemoteUpgradeState::PendingLiveOwner,
+            RemoteUpgradeState::Activating | RemoteUpgradeState::Indeterminate,
+        ) => &previous.selector_after,
         _ => &previous.selector_before,
     };
     &next.selector_before == expected_before
@@ -294,7 +290,7 @@ fn record_authority_transition_is_valid(
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RemoteUpgradeRecord {
+pub struct RemoteUpgradeRecord {
     schema: String,
     transaction_id: String,
     claim_sha256: String,
@@ -429,7 +425,7 @@ enum DurableEffectKind {
 ///
 /// Deliberately not `Clone`: entering the external effect consumes the permit,
 /// preventing a caller from using one committed authorization more than once.
-pub(crate) struct DurableEffectPermit {
+pub struct DurableEffectPermit {
     transaction_id: String,
     claim_sha256: String,
     authorization_sequence: u32,
@@ -530,7 +526,7 @@ struct RecordArtifact {
     attempt: u8,
 }
 
-pub(crate) struct RemoteUpgradeLedger<'root> {
+pub struct RemoteUpgradeLedger<'root> {
     root: &'root cap_std::fs::Dir,
     transactions: cap_std::fs::Dir,
     transaction: cap_std::fs::Dir,
@@ -1283,7 +1279,11 @@ fn create_or_validate_claim(
             .file_name()
             .into_string()
             .map_err(|_| anyhow::anyhow!("upgrade transaction contains a non-UTF-8 entry"))?;
-        if name.starts_with("claim-") && name.ends_with(".v1") {
+        if name.starts_with("claim-")
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "v1")
+        {
             claims.push(name);
         } else if is_retained_publication_residue_name(&name) {
             validate_retained_publication_residue(
@@ -3069,12 +3069,11 @@ mod tests {
             .expect("read transaction artifacts")
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| {
+            .find(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("commit-0002-"))
             })
-            .next()
             .expect("newest commit marker");
         std::fs::set_permissions(&newest_commit, std::fs::Permissions::from_mode(0o600))
             .expect("plant corrupt newest commit mode");

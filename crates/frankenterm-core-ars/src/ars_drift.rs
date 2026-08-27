@@ -996,7 +996,7 @@ mod tests {
         }
 
         let at_risk = detector.at_risk_reflexes(0.5);
-        assert!(at_risk.is_empty());
+        assert_eq!(at_risk, [] as [(u64, f64); 0]);
     }
 
     #[test]

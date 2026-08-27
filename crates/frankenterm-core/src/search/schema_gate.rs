@@ -515,9 +515,9 @@ mod tests {
         let snap = snapshot_fused_result_schema();
         let result = check_schema_preservation(&snap, &snap);
         assert!(result.safe);
-        assert!(result.missing_fields.is_empty());
+        assert_eq!(result.missing_fields, [] as [std::string::String; 0]);
         assert!(result.type_mismatches.is_empty());
-        assert!(result.added_fields.is_empty());
+        assert_eq!(result.added_fields, [] as [std::string::String; 0]);
     }
 
     #[test]

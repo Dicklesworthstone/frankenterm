@@ -153,7 +153,7 @@ fn ftvi_empty_index() {
     assert_eq!(index.len(), 0);
 
     let results = index.search(&[1.0, 0.0, 0.0, 0.0], 5);
-    assert!(results.is_empty());
+    assert_eq!(results, [] as [(u64, f32); 0]);
 }
 
 #[test]

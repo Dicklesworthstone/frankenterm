@@ -861,7 +861,7 @@ gate: smoke
 check: test
 -->";
         let waivers = parse_waivers(body);
-        assert!(waivers.is_empty());
+        assert_eq!(waivers, [] as [crate::replay_ci_gate::Waiver; 0]);
     }
 
     #[test]
@@ -871,13 +871,13 @@ gate: invalid_gate
 reason: something
 -->";
         let waivers = parse_waivers(body);
-        assert!(waivers.is_empty());
+        assert_eq!(waivers, [] as [crate::replay_ci_gate::Waiver; 0]);
     }
 
     #[test]
     fn parse_waiver_no_markers_returns_empty() {
         let waivers = parse_waivers("Just a normal PR description");
-        assert!(waivers.is_empty());
+        assert_eq!(waivers, [] as [crate::replay_ci_gate::Waiver; 0]);
     }
 
     #[test]

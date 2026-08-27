@@ -890,7 +890,7 @@ fn headless_rollback_nonexistent_checkpoint_returns_error() {
     }) {
         RemoteResponse::Error { code, message } => {
             assert_eq!(code, "rollback_failed");
-            assert!(!message.is_empty());
+            assert_ne!(message, "");
         }
         other => panic!("expected Error, got {other:?}"),
     }

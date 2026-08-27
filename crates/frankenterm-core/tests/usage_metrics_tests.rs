@@ -1127,7 +1127,7 @@ fn integration_record_aggregate_render_daily() {
         let ctx = RenderContext::new(OutputFormat::Json);
         let output = AnalyticsDailyRenderer::render(&daily, &ctx);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert!(!parsed.is_empty());
+        assert_ne!(parsed, [] as [serde_json::Value; 0]);
         assert!(parsed[0].get("total_tokens").is_some());
 
         storage.shutdown().await.expect("shutdown");

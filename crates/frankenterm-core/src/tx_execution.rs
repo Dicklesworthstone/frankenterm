@@ -9232,7 +9232,7 @@ mod tests {
                 8_000,
             )
             .map_err(|err| err.to_string())?;
-        assert!(duplicate.receipts.is_empty());
+        assert_eq!(duplicate.receipts, [] as [serde_json::Value; 0]);
 
         let mut probe_ledger = TxExecutionLedger::new(
             "receipt-recovery-probe",
@@ -9574,7 +9574,7 @@ mod tests {
             .rollback_with_store(&mut contract, &mut store, 7_000)
             .map_err(|err| err.to_string())?;
 
-        assert!(result.compensation_report.receipts.is_empty());
+        assert_eq!(result.compensation_report.receipts, [] as [serde_json::Value; 0]);
         assert_eq!(contract.receipts.len(), receipt_count);
         assert_eq!(
             contract
@@ -10307,7 +10307,7 @@ mod tests {
         ];
         for err in &errors {
             let msg = err.to_string();
-            assert!(!msg.is_empty());
+            assert_ne!(msg, "");
         }
     }
 
@@ -10968,7 +10968,7 @@ mod tests {
             "no text may reach the pane when durable authority is absent; got {content:?}"
         );
         assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
-        assert!(contract.receipts.is_empty());
+        assert_eq!(contract.receipts, [] as [serde_json::Value; 0]);
     }
 
     #[test]

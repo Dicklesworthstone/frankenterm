@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(keys, vec!["world"]);
 
         let keys = t.keys_with_prefix("xyz");
-        assert!(keys.is_empty());
+        assert_eq!(keys, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -720,7 +720,7 @@ mod tests {
         t.insert("hello");
         t.insert("world");
         let keys = t.keys_with_prefix("xyz");
-        assert!(keys.is_empty());
+        assert_eq!(keys, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn test_all_keys_empty() {
         let t = Trie::new();
-        assert!(t.all_keys().is_empty());
+        assert_eq!(t.all_keys(), [] as [std::string::String; 0]);
     }
 
     #[test]

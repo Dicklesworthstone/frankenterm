@@ -482,6 +482,6 @@ mod tests {
     fn batch_embed_empty_list() {
         let emb = HashEmbedder::new(64);
         let batch = emb.embed_batch(&[] as &[&str]).unwrap();
-        assert!(batch.is_empty());
+        assert_eq!(batch, [] as [std::vec::Vec<f32>; 0]);
     }
 }

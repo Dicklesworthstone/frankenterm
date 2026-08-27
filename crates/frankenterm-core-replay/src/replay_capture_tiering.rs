@@ -622,7 +622,7 @@ mod tests {
             );
             assert!(decision.has_explicit_gap_receipt());
         }
-        assert!(report.deferred_without_receipts().is_empty());
+        assert_eq!(report.deferred_without_receipts(), [] as [u64; 0]);
     }
 
     #[test]
@@ -676,7 +676,7 @@ mod tests {
                 .reasons
                 .contains(&"capture_backlog_pressure".to_string())
         );
-        assert!(report.deferred_without_receipts().is_empty());
+        assert_eq!(report.deferred_without_receipts(), [] as [u64; 0]);
     }
 
     #[test]
@@ -726,7 +726,7 @@ mod tests {
             "receipt should disclose global indexing backlog: {}",
             receipt.message
         );
-        assert!(report.deferred_without_receipts().is_empty());
+        assert_eq!(report.deferred_without_receipts(), [] as [u64; 0]);
     }
 
     #[test]
@@ -765,7 +765,7 @@ mod tests {
             "receipt should disclose memory pressure: {}",
             receipt.message
         );
-        assert!(report.deferred_without_receipts().is_empty());
+        assert_eq!(report.deferred_without_receipts(), [] as [u64; 0]);
     }
 
     #[test]
@@ -840,7 +840,7 @@ mod tests {
         assert!(summary.cold > 0);
         assert!(summary.deferred > 0);
         assert_eq!(summary.deferred, summary.degraded_receipts);
-        assert!(report.deferred_without_receipts().is_empty());
+        assert_eq!(report.deferred_without_receipts(), [] as [u64; 0]);
     }
 
     #[test]

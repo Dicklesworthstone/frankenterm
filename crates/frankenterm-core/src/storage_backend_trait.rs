@@ -3920,7 +3920,7 @@ mod tests {
         let rows = backend
             .query_map_strings("SELECT id FROM p WHERE id > ?1", &["100"])
             .unwrap();
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [std::vec::Vec<std::string::String>; 0]);
     }
 
     #[test]
@@ -3970,7 +3970,7 @@ mod tests {
         assert_eq!(r1[0], vec!["1".to_string(), "alpha".to_string()]);
         // Empty queue: defaults to vec![].
         let r2 = mock.query_map_strings("SELECT * FROM p", &[]).unwrap();
-        assert!(r2.is_empty());
+        assert_eq!(r2, [] as [std::vec::Vec<std::string::String>; 0]);
     }
 
     #[test]
@@ -4220,7 +4220,7 @@ mod tests {
             .expect("row");
         assert!(row[0].is_null());
         match &row[1] {
-            SqlCell::Text(s) => assert!(s.is_empty()),
+            SqlCell::Text(s) => assert_eq!(s, ""),
             other => panic!("expected empty Text, got {other:?}"),
         }
     }
@@ -4302,7 +4302,7 @@ mod tests {
         let backend = open_memory();
         backend.execute("CREATE TABLE t (x INT)").unwrap();
         let rows = backend.query_map_cells("SELECT x FROM t", &[]).unwrap();
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [std::vec::Vec<storage_backend_trait::SqlCell>; 0]);
     }
 
     #[test]

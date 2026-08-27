@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn eviction_order_empty() {
         let order = eviction_order(&[]);
-        assert!(order.is_empty());
+        assert_eq!(order, [] as [u64; 0]);
     }
 
     // -- InformationBudget ---------------------------------------------------

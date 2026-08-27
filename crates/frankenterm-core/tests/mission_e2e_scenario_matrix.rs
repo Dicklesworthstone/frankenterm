@@ -466,7 +466,10 @@ fn degraded_conflict_detection_under_contention() {
     ];
 
     let report = ml.detect_conflicts(&d.assignment_set, &reservations, &[], 1000, &issues);
-    assert!(!report.conflicts.is_empty());
+    assert_ne!(
+        report.conflicts,
+        [] as [frankenterm_core::mission_loop::AssignmentConflict; 0]
+    );
 
     let (total, _auto) = ml.conflict_stats();
     // Stats reflect detected conflicts

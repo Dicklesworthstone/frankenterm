@@ -657,11 +657,11 @@ fn default_corpus_is_nonempty_and_valid() {
     let queries = default_semantic_eval_queries();
     assert!(!queries.is_empty());
     for q in &queries {
-        assert!(!q.name.is_empty());
+        assert_ne!(q.name, "");
         assert!(q.top_k > 0);
-        assert!(!q.relevant_ids.is_empty());
-        assert!(!q.lexical_ranked.is_empty());
-        assert!(!q.semantic_ranked.is_empty());
+        assert_ne!(q.relevant_ids, [] as [u64; 0]);
+        assert_ne!(q.lexical_ranked, [] as [(u64, f32); 0]);
+        assert_ne!(q.semantic_ranked, [] as [(u64, f32); 0]);
     }
 }
 
@@ -679,7 +679,7 @@ fn default_corpus_passes_default_thresholds() {
 fn regression_thresholds_debug_nonempty() {
     let t = RegressionThresholds::default();
     let debug = format!("{:?}", t);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 #[test]
@@ -691,7 +691,7 @@ fn threshold_violation_debug_nonempty() {
         required: 0.5,
     };
     let debug = format!("{:?}", v);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 // ── Batch 13: additional property tests (DarkMill) ────────────────────

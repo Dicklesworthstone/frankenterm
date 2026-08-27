@@ -199,7 +199,7 @@ impl CiVersionGate {
 
 #[test]
 fn test_api_version_constant_exists() {
-    assert!(!RECORDER_API_VERSION.is_empty());
+    assert_ne!(RECORDER_API_VERSION, "");
     assert!(RECORDER_API_VERSION.starts_with("ft.recorder-api."));
 }
 
@@ -458,7 +458,7 @@ fn test_ci_gate_in_range() {
         ],
     };
     assert!(gate.is_in_range(&SemanticVersion::new(1, 0, 0)));
-    assert!(gate.out_of_range_versions().is_empty());
+    assert_eq!(gate.out_of_range_versions(), [] as [&SemanticVersion; 0]);
 }
 
 #[test]

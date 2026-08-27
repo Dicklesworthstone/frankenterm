@@ -387,7 +387,7 @@ mod tests {
             updated_at: 100,
         };
         let view = PaneBookmarkView::from(record);
-        assert!(view.tags.is_empty());
+        assert_eq!(view.tags, [] as [std::string::String; 0]);
         assert!(view.description.is_none());
     }
 
@@ -587,7 +587,7 @@ mod tests {
             updated_at: 0,
         };
         let view = PaneBookmarkView::from(record);
-        assert!(view.tags.is_empty());
+        assert_eq!(view.tags, [] as [std::string::String; 0]);
     }
 
     // ====================================================================
@@ -762,7 +762,7 @@ mod tests {
             updated_at: 200,
         };
         let view = PaneBookmarkView::from(record);
-        assert!(view.tags.is_empty()); // None becomes empty vec
+        assert_eq!(view.tags, [] as [std::string::String; 0]); // None becomes empty vec
         assert_eq!(view.description.as_deref(), Some("desc"));
         assert_eq!(view.created_at, 100);
         assert_eq!(view.updated_at, 200);

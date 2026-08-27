@@ -520,7 +520,7 @@ mod tests {
         let none_holders = s
             .fetch_with_class(&CapabilityClass::ToolAvailability("nethack".into()))
             .unwrap();
-        assert!(none_holders.is_empty());
+        assert_eq!(none_holders, [] as [capability_passport::CapabilityPassport; 0]);
     }
 
     // ── Eviction ─────────────────────────────────────────────────────────

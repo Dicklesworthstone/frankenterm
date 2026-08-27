@@ -371,7 +371,7 @@ mod tests {
             score: 0.0,
         };
         let rd = scored_doc_to_rerank_document(&doc);
-        assert!(rd.text.is_empty());
+        assert_eq!(rd.text, "");
     }
 
     #[test]

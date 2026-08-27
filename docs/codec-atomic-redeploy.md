@@ -178,16 +178,45 @@ When both the maximum and minimum advance, use the maintenance window:
    The bridge accepts only v0.13.0 build `3ebd60566`, pins the client and socket
    file identities, runs the old Robot API in a sterile private environment,
    batches bounded pane reads between two censuses, reapplies redaction, and
-   publishes through the ordinary no-clobber dump verifier. Its topology is
-   explicitly the limited v0.13 projection: pane, optional pane UUID, tab,
-   window, and redacted domain values. It does not invent workspace, geometry,
+   publishes a schema-v2 artifact through the ordinary no-clobber dump
+   verifier. Because the old Robot state may project one numeric pane into
+   multiple window/tab rows, schema v2 separates unique `content_targets` from
+   lossless `projections`: each unique numeric pane ID receives exactly one
+   `get-text` request and one untruncated outcome, every distinct
+   `(window_id, tab_id, pane_id)` row is retained, and duplicate or
+   metadata-conflicting aliases fail closed. Without incarnation authority,
+   that exact request/outcome accounting is not an ABA-exclusion claim.
+   `pane_count` and verifier-derived domain counts therefore count unique
+   content targets; `projection_count` reports the retained topology rows. The
+   client subprocess batches run sequentially, but v0.13 may read panes within
+   one batch concurrently, so the content remains bounded batch-concurrent,
+   best-effort, and non-atomic. The topology remains explicitly limited to the
+   v0.13 projection and does not invent workspace, geometry,
    active/zoom, stable incarnation, or authoritative domain identity.
 
    Retry with the exact same output path and request bounds after an ambiguous
    reply. The bridge first performs an offline Query/Ack: an existing complete
-   artifact must match the expected client hash/length/version, mux-socket path
-   digest, and all resource bounds before it is acknowledged without contacting
-   the mux. A mismatch or incomplete artifact is retained and fails closed.
+   schema-v2 artifact must match the expected client hash/length/version,
+   mux-socket path digest, and all resource bounds before it is acknowledged
+   without contacting the mux. A mismatch, incomplete artifact, or legacy v1
+   artifact is retained and fails closed. Legacy v1 remains offline-verifiable
+   for forensic use but cannot satisfy the current alias-aware capture contract.
+   The exact output path and bound request tuple are the offline idempotency
+   key. Query/Ack does not require the historical socket to remain present, so
+   it still works if the mux crashed after publication; use a new output path
+   to request a genuinely new capture. A reconciled receipt is therefore not
+   current socket-incarnation or liveness evidence and cannot authorize
+   activation.
+   Offline verification also requires a whole-second batch timeout, recomputes
+   the producer's batches-plus-two-censuses total deadline, and requires the
+   tested 16-KiB minimum needed to fit the frozen v0.13 maximum-size empty
+   batch control envelope. These checks reject known source-impossible bounds
+   even when all JSON checksums were recomputed. The artifact does not retain
+   per-batch raw stdout receipts, so this check does not claim the configured
+   allowance equals the bytes each subprocess actually emitted. Fresh
+   publication then re-locates the private recovery environment before saying
+   it is retained; Query/Ack repeats that bounded check and may truthfully
+   report it absent without invalidating the durable forensic artifact.
    The receipt includes verifier-derived `domain_pane_counts`; record and check
    the expected domain counts before admitting the artifact to any later
    activation transaction.

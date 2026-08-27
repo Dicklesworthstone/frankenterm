@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn report_no_atlases_in_process_carries_zero_aggregate() {
         let report = AtlasDoctorReport::no_atlases_in_process();
-        assert!(report.atlases.is_empty());
+        assert_eq!(report.atlases, [] as [atlas_doctor::AtlasDoctorRow; 0]);
         assert_eq!(report.aggregate.atlas_count, 0);
         assert_eq!(report.aggregate.total_atlas_bytes, 0);
     }

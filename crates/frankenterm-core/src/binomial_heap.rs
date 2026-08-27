@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn into_sorted_empty() {
         let heap: BinomialHeap<i32, i32> = BinomialHeap::new();
-        assert!(heap.into_sorted().is_empty());
+        assert_eq!(heap.into_sorted(), [] as [(i32, i32); 0]);
     }
 
     #[test]
@@ -997,7 +997,7 @@ mod tests {
         receiver.merge(&mut donor);
         assert!(donor.is_empty());
         assert!(donor.nodes.is_empty());
-        assert!(donor.free.is_empty());
+        assert_eq!(donor.free, [] as [usize; 0]);
         assert!(donor.head.is_none());
         assert!(donor.min_root.is_none());
 

@@ -542,7 +542,7 @@ fn integration_all_empty_detections_safe() {
 
     // Serialization still works
     let json = serde_json::to_string(&auto).unwrap();
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
     let env_json = serde_json::to_string(&env).unwrap();
-    assert!(!env_json.is_empty());
+    assert_ne!(env_json, "");
 }

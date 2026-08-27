@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn empty_input_produces_no_chunks() {
         let chunks = build_semantic_chunks(&[], &default_config());
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, [] as [search::chunking::SemanticChunk; 0]);
     }
 
     // ── build_semantic_chunks: single egress event ────────────────────────
@@ -1172,7 +1172,7 @@ mod tests {
 
         let chunks = build_semantic_chunks(&events, &default_config());
         // May be 1 (glued) or 2 depending on glue rules (tiny fragments)
-        assert!(!chunks.is_empty());
+        assert_ne!(chunks, [] as [search::chunking::SemanticChunk; 0]);
         // At least verify the text contents exist
         let all_text: String = chunks.iter().map(|c| c.text.clone()).collect();
         assert!(all_text.contains("[OUT] output"));
@@ -1481,7 +1481,7 @@ mod tests {
             let second = &chunks[1];
             if let Some(overlap) = &second.overlap {
                 assert!(overlap.chars > 0);
-                assert!(!overlap.text.is_empty());
+                assert_ne!(overlap.text, "");
                 assert_eq!(overlap.from_chunk_id, chunks[0].chunk_id);
             }
         }
@@ -1597,7 +1597,7 @@ mod tests {
         ];
 
         let chunks = build_semantic_chunks(&events, &default_config());
-        assert!(!chunks.is_empty());
+        assert_ne!(chunks, [] as [search::chunking::SemanticChunk; 0]);
 
         for chunk in &chunks {
             let json = serde_json::to_string(chunk).unwrap();
@@ -1789,7 +1789,7 @@ mod tests {
         ];
 
         let chunks = build_semantic_chunks(&events, &default_config());
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, [] as [search::chunking::SemanticChunk; 0]);
     }
 
     // ── CRLF normalization in chunks ──────────────────────────────────────

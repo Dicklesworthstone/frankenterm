@@ -2187,7 +2187,7 @@ mod tests {
         let sandbox = SandboxBuilder::new("zone.test").build();
         assert_eq!(sandbox.zone_id, "zone.test");
         assert!(sandbox.fail_closed);
-        assert!(sandbox.capability_envelope.allowed_capabilities.is_empty());
+        assert_eq!(sandbox.capability_envelope.allowed_capabilities, [] as [connector_host_runtime::ConnectorCapability; 0]);
     }
 
     #[test]

@@ -439,7 +439,7 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
 
 fn mint_mux_domain_config_reconciliation_generation() -> Option<u64> {
     MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .ok()
@@ -574,7 +574,7 @@ fn retry_mux_domain_config_admission() {
             }
             MuxDomainConfigAdmission::Retryable(rejection) => {
                 attempts = attempts.saturating_add(1);
-                if attempts == 1 || attempts % 100 == 0 {
+                if attempts == 1 || attempts.is_multiple_of(100) {
                     log::warn!(
                         "mux-server domain-config reconciliation is waiting for main-thread admission (attempt {attempts}): {rejection}"
                     );
@@ -626,7 +626,7 @@ async fn reconcile_mux_domain_config_until_converged(generation: u64) {
             }
             Ok(MuxDomainUpdateOutcome::PendingRetirements { domain_names }) => {
                 retirement_round = retirement_round.saturating_add(1);
-                if retirement_round == 1 || retirement_round % 100 == 0 {
+                if retirement_round == 1 || retirement_round.is_multiple_of(100) {
                     log::info!(
                         "mux-server domain-config reload is waiting for exact domain retirements before replacement: {domain_names:?}"
                     );

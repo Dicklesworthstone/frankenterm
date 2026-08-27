@@ -2386,7 +2386,7 @@ mod tests {
             panic!("expected HandoffApplied, got {resp:?}");
         };
         assert_eq!(summary.accepted_indices, vec![0]);
-        assert!(summary.skipped.is_empty());
+        assert_eq!(summary.skipped, [] as [headless_mux_server::HandoffSkipReport; 0]);
         assert_eq!(summary.passport_excerpt_applies.len(), 1);
         assert_eq!(
             summary.passport_excerpt_applies[0].disposition,
@@ -2460,10 +2460,10 @@ mod tests {
         let RemoteResponse::HandoffApplied { summary } = resp else {
             panic!("expected HandoffApplied, got {resp:?}");
         };
-        assert!(summary.accepted_indices.is_empty());
+        assert_eq!(summary.accepted_indices, [] as [usize; 0]);
         assert_eq!(summary.skipped.len(), 1);
         assert_eq!(summary.skipped[0].section_label, "passport_excerpt");
-        assert!(summary.passport_excerpt_applies.is_empty());
+        assert_eq!(summary.passport_excerpt_applies, [] as [headless_mux_server::PassportExcerptApplyReport; 0]);
 
         // Store does NOT contain the inherited passport.
         assert!(

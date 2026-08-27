@@ -91,7 +91,10 @@ fn test_api_compat_public_search_surface_smoke() {
     assert_eq!(ingest.accepted_docs, 1);
 
     let lexical_docs = index.search("cargo", 5, now + 2);
-    assert!(!lexical_docs.is_empty());
+    assert_ne!(
+        lexical_docs,
+        [] as [frankenterm_core::search::IndexedDocument; 0]
+    );
 
     let lexical_ranked: Vec<(u64, f32)> = lexical_docs
         .iter()
@@ -160,7 +163,10 @@ fn test_bridge_round_trip() {
     assert!(ingest.flushed_docs >= 1);
 
     let lexical_docs = index.search("panic", 10, now + 4);
-    assert!(!lexical_docs.is_empty());
+    assert_ne!(
+        lexical_docs,
+        [] as [frankenterm_core::search::IndexedDocument; 0]
+    );
 
     let lexical_ranked: Vec<(u64, f32)> = lexical_docs
         .iter()
@@ -251,7 +257,10 @@ fn test_index_size_limit() {
     let stats = index.stats(now + 31);
     assert!(stats.total_bytes <= max_bytes);
     assert!(stats.doc_count < 24);
-    assert!(index.search("doc-0", 5, now + 32).is_empty());
+    assert_eq!(
+        index.search("doc-0", 5, now + 32),
+        [] as [frankenterm_core::search::IndexedDocument; 0]
+    );
 }
 
 #[test]
@@ -316,5 +325,5 @@ fn test_scrollback_indexing() {
     assert!(report.accepted_docs >= 4);
 
     let hits = index.search("cargo", 10, now + 1);
-    assert!(!hits.is_empty());
+    assert_ne!(hits, [] as [frankenterm_core::search::IndexedDocument; 0]);
 }

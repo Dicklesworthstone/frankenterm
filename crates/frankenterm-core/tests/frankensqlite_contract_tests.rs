@@ -274,7 +274,10 @@ fn test_lag_metrics_append_log() {
 
         let lag = storage.lag_metrics().await.unwrap();
         assert!(lag.latest_offset.is_some());
-        assert!(!lag.consumers.is_empty());
+        assert_ne!(
+            lag.consumers,
+            [] as [frankenterm_core::recorder_storage::RecorderConsumerLag; 0]
+        );
         let consumer_lag = &lag.consumers[0];
         assert!(consumer_lag.offsets_behind > 0);
     });

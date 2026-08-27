@@ -471,6 +471,11 @@ impl CommandDef {
     /// collection to figure out which items were not reused/updated
     /// and remove them at the end.
     #[cfg(target_os = "macos")]
+    // The macOS menubar plumbing is written against the deprecated
+    // `cocoa`/`objc` crates (re-exported through `window::os::macos::menu`).
+    // Migrating to `objc2` is a large inherited-upstream port; see the matching
+    // allow in `window/src/os/macos/mod.rs`.
+    #[allow(deprecated)]
     pub fn recreate_menubar(config: &ConfigHandle) {
         use window::os::macos::menu::*;
 

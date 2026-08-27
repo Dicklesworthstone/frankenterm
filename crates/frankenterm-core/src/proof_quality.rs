@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(receipt.release_impact, ProofReleaseImpact::Supplemental);
         assert!(receipt.remote_worker_reached);
         assert!(receipt.valid_remote_proof);
-        assert!(receipt.blockers.is_empty());
+        assert_eq!(receipt.blockers, [] as [std::string::String; 0]);
         assert!(receipt.receipt_id.starts_with("proof-quality:"));
     }
 

@@ -3092,7 +3092,7 @@ export PATH=$HOME/bin:$PATH
             port: None,
             identity_files: vec![],
         };
-        assert!(host.redacted_identity_files().is_empty());
+        assert_eq!(host.redacted_identity_files(), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3128,19 +3128,19 @@ export PATH=$HOME/bin:$PATH
 
     #[test]
     fn parse_ssh_config_empty_input() {
-        assert!(parse_ssh_config("").is_empty());
+        assert_eq!(parse_ssh_config(""), [] as [setup::SshHost; 0]);
     }
 
     #[test]
     fn parse_ssh_config_comments_only() {
         let input = "# This is a comment\n# Another comment\n";
-        assert!(parse_ssh_config(input).is_empty());
+        assert_eq!(parse_ssh_config(input), [] as [setup::SshHost; 0]);
     }
 
     #[test]
     fn parse_ssh_config_wildcard_hosts_skipped() {
         let input = "Host *\n  ServerAliveInterval 60\n\nHost *.example.com\n  User admin\n";
-        assert!(parse_ssh_config(input).is_empty());
+        assert_eq!(parse_ssh_config(input), [] as [setup::SshHost; 0]);
     }
 
     #[test]

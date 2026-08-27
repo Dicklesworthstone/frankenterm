@@ -324,7 +324,7 @@ mod tests {
         }
         // Confirm no row was inserted.
         let listed = list_agent_profiles(&conn, None).unwrap();
-        assert!(listed.is_empty());
+        assert_eq!(listed, [] as [agent_profiles::AgentProfile; 0]);
     }
 
     /// br-ft-43lpu: duplicate name → SQLite UNIQUE constraint
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(dev[0].name, "bob");
 
         let missing = list_agent_profiles(&conn, Some("manager")).unwrap();
-        assert!(missing.is_empty());
+        assert_eq!(missing, [] as [agent_profiles::AgentProfile; 0]);
     }
 
     /// br-ft-43lpu: delete returns true on hit, false on miss.

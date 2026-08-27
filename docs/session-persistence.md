@@ -934,16 +934,25 @@ and recompute every digest.
 
 `ft session verify-dump <path>` performs bounded offline verification of the
 private single-link regular-file shape, complete-publication marker, schema,
-whole-payload checksum, per-pane text checksums and byte/line counts, aggregate limits,
-the one canonical v1 JSON encoding, exact field sets at every nested object,
-pane metadata, exact outcome equality with the sorted unique initial-pane-ID
-manifest, unique capture-error ownership, sorted domain summaries,
-summary counters, topology-fence kind/scope/fingerprints, completeness/error
-consistency, and the explicit non-restorable capability claims. A `complete:
-true` artifact is accepted only when its initial/final pane counts match every
-captured pane, its initial fingerprint recomputes from the canonical redacted
-pane metadata, and its initial/final topology fingerprints agree. A valid artifact
-can still have `complete: false` when it was deliberately retained with
+whole-payload checksum, per-target text checksums and byte/line counts,
+aggregate limits, the one canonical JSON encoding for the declared schema,
+exact field sets at every nested object, target metadata, exact outcome
+equality with the sorted unique initial-pane-ID manifest, unique capture-error
+ownership, sorted domain summaries, summary counters, topology-fence
+kind/scope/fingerprints, completeness/error consistency, and the explicit
+non-restorable capability claims. Schema v1 stores one pane record per direct
+mux pane. Schema v2 stores each numeric pane identity once in
+`content_targets` and separately stores every sorted unique
+`(window_id, tab_id, pane_id)` entry in `projections`; its verifier rejects
+duplicate, dangling, unreferenced, or reordered identities and binds both
+collections into the topology fingerprint. Before publication, the producer
+also requires every alias row for one numeric pane to agree on the metadata
+that cannot be represented per projection. A
+`complete: true` artifact is accepted only when its initial/final counts match
+every captured target and projection, its initial fingerprint recomputes from
+the canonical redacted metadata, and its initial/final topology fingerprints
+agree. A valid artifact can still have `complete: false` when it was
+deliberately retained with
 `--allow-partial`; verification reports that state rather than promoting it to
 a complete safety gate. Pass `--require-complete` for any upgrade or recovery
 admission check; it rejects an otherwise intact partial artifact or any nonzero
@@ -960,6 +969,11 @@ the allocating JSON parse, a zero-retention streaming preflight applies global
 node, map-entry, sequence-entry, decoded-string-byte, and nesting-depth limits,
 preventing a byte-small structural payload from amplifying into an unbounded
 value tree.
+
+The `dump`, `compatible-client-dump`, and `verify-dump` receipts all expose the
+verified schema and separate pane/projection counts. Every surface also emits
+`executable_restore_image: false` and `production_mux_activation: false`; an
+intact forensic artifact is never an implicit activation or restore permit.
 
 #### Exact v0.13 compatible-client bridge
 
@@ -986,21 +1000,68 @@ candidate-ft session compatible-client-dump \
 The bridge requires version `0.13.0` and git identity `3ebd60566`, pins the
 client and socket identities without following symlinks, creates a sterile
 private environment, obtains two state censuses around bounded batches of
-`robot get-text`, and publishes through the ordinary dump verifier. The
-topology contract contains only facts available in the v0.13 Robot projection:
-numeric pane/tab/window IDs, optional pane UUID, and redacted domain. It does
-not claim workspace, geometry, active/zoom, stable mux incarnation, or
-authoritative domain identity.
+`robot get-text`, and publishes a schema-v2 artifact through the ordinary dump
+verifier. The old Robot state may project the same numeric pane through more
+than one window/tab row. The bridge therefore treats `--max-panes` as a bound
+on projection rows, requires all rows for one numeric pane to agree on pane
+UUID/domain/title/cwd/observation metadata, issues exactly one `get-text`
+request for each unique numeric pane ID, requires one untruncated outcome, and
+preserves every distinct window/tab projection. Exact duplicate projections or
+conflicting aliases fail before content capture. Because v0.13 exposes no
+incarnation authority, this request/outcome accounting does not prove that the
+pane incarnation remained unchanged between census and read. The topology
+contract contains only facts available in the v0.13 Robot projection: unique
+numeric pane identities, optional pane UUIDs, redacted domains, and all numeric
+window/tab projections. It does not claim workspace, geometry, active/zoom,
+stable mux incarnation, or authoritative domain identity.
+
+The between-census stability fence deliberately covers the sampled
+identity/topology fields only: pane ID, optional pane UUID, raw domain, and
+every window/tab projection. Title, cwd, observation status, and ignore reason
+are captured from the first census but are not represented as stable topology
+facts. The artifact's payload checksum still binds their captured values.
+The bridge runs pane batches as sequential client subprocesses, but the frozen
+v0.13 client may read multiple panes concurrently within one bounded batch.
+Accordingly, schema v2 declares bounded batch-concurrent, best-effort,
+non-atomic content consistency; neither array order nor batch boundaries imply
+a pane-by-pane point-in-time ordering.
 
 Before contacting either the old client or mux, an exact-path retry performs an
-offline Query/Ack. The existing complete artifact must match the expected
-client hash/length/version, socket-path digest, and every request bound. Exact
-recovery re-synchronizes and acknowledges the retained artifact; mismatch,
-corruption, or an incomplete capture fails without overwrite or recapture.
+offline Query/Ack. The existing complete artifact must use alias-aware schema
+v2 and match the expected client hash/length/version, socket-path digest, and
+every request bound. Exact recovery re-synchronizes and acknowledges the
+retained artifact; mismatch, corruption, an incomplete capture, or a legacy v1
+artifact fails without overwrite or recapture. Legacy v1 remains accepted by
+`verify-dump` for forensic inspection, but cannot be promoted into a current
+compatible-client success receipt because it cannot prove that aliases were
+retained.
+
+The exact output path plus the bound client/socket-path/request tuple is the
+idempotency key for this offline recovery operation. Query/Ack intentionally
+does not require the source socket to still exist or to retain the same inode:
+the mux may have crashed after durable publication but before the caller saw
+the reply. A caller requesting a new live capture must choose a new output
+path. Consequently, a receipt with `reconciled_without_mux_contact: true`
+proves only that the retained artifact satisfies the original bound operation;
+it is not evidence that a current mux exists at that path or has the artifact's
+historical socket identity.
+
+The v0.13 CLI accepts timeout seconds, so a source-valid artifact must encode a
+positive whole-second `batch_timeout_ms`. The verifier independently recomputes
+`(ceil(unique_content_targets / batch_size) + 2) * batch_timeout_ms` and rejects
+an artifact above the 7,200-second total deadline. It also requires at least a
+16-KiB batch-output allowance, a tested ceiling for the frozen v0.13 pretty-JSON
+control envelope with 64 maximum-width pane IDs and empty successful results.
+Those checks reject known source-impossible timeout and control-envelope
+bounds. The forensic artifact does not retain verifier-bound per-batch raw
+stdout byte receipts, so the offline verifier does not claim the configured
+allowance was the exact byte count observed by each subprocess.
 Both fresh and recovered receipts expose a verifier-derived, sorted
-`domain_pane_counts` map. An upgrade coordinator can therefore require named
-domain coverage without trusting producer counters or reparsing unverified
-JSON.
+`domain_pane_counts` map plus separate `pane_count` and `projection_count`
+values. Domain counts and `pane_count` count unique content targets, while
+`projection_count` records the retained window/tab aliases. An upgrade
+coordinator can therefore require named domain coverage without trusting
+producer counters or reparsing unverified JSON.
 
 ```bash
 candidate-ft session verify-dump /absolute/private/path/pre-upgrade.json \
@@ -1018,8 +1079,15 @@ expectations, zero counts, malformed values, and partial captures fail closed.
 font, or live-mux initialization, so damaged local state cannot block or mutate
 this offline incident-recovery check.
 
-The private sterile environment is retained as reconciliation evidence. A
-successful receipt still declares `forensic_text_export: true`,
+The producer retains its private sterile environment as reconciliation
+evidence. Immediately after artifact verification, it rescans the private
+output parent without following symlinks and emits
+`retained_recovery_environment: true` only when the expected private directory
+is still present at that receipt-time check. Query/Ack repeats the same bounded
+check and may acknowledge the durable artifact with the retention field false
+if that auxiliary directory has since moved or disappeared. This is
+point-in-time filesystem evidence, not a lease preventing a later rename. A
+successful artifact receipt still declares `forensic_text_export: true`,
 `executable_restore_image: false`, and `production_mux_activation: false`.
 
 The dump is deliberately not accepted as an executable restore image. It does

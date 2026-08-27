@@ -1424,7 +1424,7 @@ mod tests {
         let input = make_input(ActionKind::Spawn, ActorKind::Robot);
         let result = evaluate_dsl_rules(&[], &input);
         assert!(result.matched_rule.is_none());
-        assert!(result.evaluations.is_empty());
+        assert_eq!(result.evaluations, [] as [policy_dsl::DslRuleEvaluation; 0]);
     }
 
     #[test]

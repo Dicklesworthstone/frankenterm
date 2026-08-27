@@ -1279,9 +1279,9 @@ mod tests {
     #[test]
     fn sharded_map_empty_keys_values_entries() {
         let map: ShardedMap<String, i32> = ShardedMap::with_shards(4);
-        assert!(map.keys().is_empty());
-        assert!(map.values().is_empty());
-        assert!(map.entries().is_empty());
+        assert_eq!(map.keys(), [] as [std::string::String; 0]);
+        assert_eq!(map.values(), [] as [i32; 0]);
+        assert_eq!(map.entries(), [] as [(std::string::String, i32); 0]);
     }
 
     #[test]
@@ -1393,7 +1393,7 @@ mod tests {
     fn pane_map_map_all_mut_empty() {
         let map = PaneMap::<i32>::with_shards(4);
         let results = map.map_all_mut(|_, v| *v);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(u64, i32); 0]);
     }
 
     #[test]

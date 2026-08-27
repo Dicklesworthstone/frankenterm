@@ -2491,9 +2491,9 @@ mod tests {
         assert_eq!(result.manifest.stats.segments, 3);
         assert_eq!(result.manifest.stats.events, 1);
         assert_eq!(result.manifest.stats.audit_actions, 0);
-        assert!(!result.manifest.db_checksum.is_empty());
+        assert_ne!(result.manifest.db_checksum, "");
         assert!(result.manifest.redaction_applied);
-        assert!(!result.manifest.redaction_catalog_version.is_empty());
+        assert_ne!(result.manifest.redaction_catalog_version, "");
         assert!(result.manifest.redaction_patterns_checked > 0);
     }
 
@@ -2719,7 +2719,7 @@ mod tests {
         let hash1 = sha256_bytes(b"hello world");
         let hash2 = sha256_bytes(b"hello world");
         assert_eq!(hash1, hash2);
-        assert!(!hash1.is_empty());
+        assert_ne!(hash1, "");
     }
 
     #[test]
@@ -3140,7 +3140,7 @@ mod tests {
         let manifest = load_backup_manifest(&backup_dir).unwrap();
         assert_eq!(manifest.schema_version, SCHEMA_VERSION);
         assert_eq!(manifest.stats.panes, 2);
-        assert!(!manifest.db_checksum.is_empty());
+        assert_ne!(manifest.db_checksum, "");
     }
 
     // ========================================================================
@@ -3807,7 +3807,7 @@ mod tests {
         assert!(compressed.manifest.compressed);
         // Compressed file should be smaller or equal (zstd overhead for tiny files)
         let zst_content = fs::read(backup_dir.join("database.db.zst")).unwrap();
-        assert!(!zst_content.is_empty());
+        assert_ne!(zst_content, [] as [u8; 0]);
         // Verify the compressed content can be decompressed back
         let decompressed = zstd::decode_all(zst_content.as_slice()).unwrap();
         assert_eq!(decompressed, db_content);

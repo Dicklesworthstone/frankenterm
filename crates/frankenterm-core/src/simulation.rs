@@ -2541,7 +2541,7 @@ events: []
         assert_eq!(pane.tab_id, 0);
         assert_eq!(pane.cols, 80);
         assert_eq!(pane.rows, 24);
-        assert!(pane.initial_content.is_empty());
+        assert_eq!(pane.initial_content, "");
         assert!(scenario.metadata.is_empty());
     }
 
@@ -3962,7 +3962,7 @@ events: []
             executed_resize_events: 0,
             events: vec![],
         };
-        assert!(timeline.flame_samples().is_empty());
+        assert_eq!(timeline.flame_samples(), [] as [simulation::ResizeTimelineFlameSample; 0]);
     }
 
     #[test]
@@ -4580,7 +4580,7 @@ events:
                 .unwrap();
             assert_eq!(count, 2);
             assert_eq!(timeline.executed_resize_events, 0);
-            assert!(timeline.events.is_empty());
+            assert_eq!(timeline.events, [] as [simulation::ResizeTimelineEvent; 0]);
         });
     }
 
@@ -4961,7 +4961,7 @@ panes: []
 events: []
 "#;
         let scenario = Scenario::from_yaml(yaml).unwrap();
-        assert!(scenario.description.is_empty());
+        assert_eq!(scenario.description, "");
     }
 
     #[test]

@@ -654,7 +654,7 @@ mod tests {
         let result = runner.run(&events, &events, &DiffConfig::default());
         let formatted =
             runner.format_result(&result, ReplayOutputMode::Human, &ReportMeta::default());
-        assert!(!formatted.is_empty());
+        assert_ne!(formatted, "");
     }
 
     #[test]

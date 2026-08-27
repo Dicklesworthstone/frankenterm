@@ -558,8 +558,8 @@ fn validation_result_empty_errors() {
     };
     let json = serde_json::to_string(&result).unwrap();
     let back: ValidationResult = serde_json::from_str(&json).unwrap();
-    assert!(back.errors.is_empty());
-    assert!(back.warnings.is_empty());
+    assert_eq!(back.errors, [] as [std::string::String; 0]);
+    assert_eq!(back.warnings, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -614,7 +614,7 @@ fn capability_level_hierarchy() {
 fn sandbox_capabilities_debug_nonempty() {
     let caps = CapabilityLevel::Full.to_capabilities();
     let debug = format!("{:?}", caps);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
     assert!(debug.contains("SandboxCapabilities"));
 }
 

@@ -5662,7 +5662,7 @@ mod tests {
     #[test]
     fn view_names_are_non_empty() {
         for &view in View::all() {
-            assert!(!view.name().is_empty());
+            assert_ne!(view.name(), "");
         }
     }
 
@@ -6539,7 +6539,7 @@ mod tests {
         model.search_input.set_text("  ".into());
         press_key(&mut model, ftui::KeyCode::Enter);
         assert!(model.search_results.is_empty());
-        assert!(model.search_last_query.is_empty());
+        assert_eq!(model.search_last_query, "");
     }
 
     #[test]
@@ -6551,8 +6551,8 @@ mod tests {
         press_key(&mut model, ftui::KeyCode::Enter);
         assert!(!model.search_results.is_empty());
         press_key(&mut model, ftui::KeyCode::Escape);
-        assert!(model.search_input.text().is_empty());
-        assert!(model.search_last_query.is_empty());
+        assert_eq!(model.search_input.text(), "");
+        assert_eq!(model.search_last_query, "");
         assert!(model.search_results.is_empty());
         assert_eq!(model.search_selected, 0);
     }
@@ -7913,7 +7913,7 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         };
         model.handle_view_key(&esc);
-        assert!(model.view_state.history.filter_input.text().is_empty());
+        assert_eq!(model.view_state.history.filter_input.text(), "");
         assert!(!model.view_state.history.undoable_only);
         assert_eq!(model.view_state.history.selected_index, 0);
     }
@@ -9855,7 +9855,7 @@ mod tests {
         // Clear with Escape
         s.press(ftui::KeyCode::Escape);
         s.capture();
-        assert!(s.model.view_state.history.filter_input.text().is_empty());
+        assert_eq!(s.model.view_state.history.filter_input.text(), "");
         assert!(!s.model.view_state.history.undoable_only);
     }
 
@@ -10133,7 +10133,7 @@ mod tests {
         s.capture();
         assert_eq!(s.model.view_state.history.filter_input.text(), "test");
         s.press(ftui::KeyCode::Escape);
-        assert!(s.model.view_state.history.filter_input.text().is_empty());
+        assert_eq!(s.model.view_state.history.filter_input.text(), "");
 
         // 4. Panes (Tab forward from History back around to Home, then '2')
         s.tab_to(View::Home);
@@ -10213,7 +10213,7 @@ mod tests {
 
         // Clear it all with Escape
         s.press(ftui::KeyCode::Escape);
-        assert!(s.model.view_state.history.filter_input.text().is_empty());
+        assert_eq!(s.model.view_state.history.filter_input.text(), "");
     }
 
     // -- Artifact diagnostic test (demonstrates dump format) --
@@ -10446,7 +10446,7 @@ mod tests {
         }
         assert!(s.model.view_state.history.filter_input.is_empty());
         s.capture();
-        assert!(!s.last_frame().is_empty());
+        assert_ne!(s.last_frame(), "");
     }
 
     #[test]

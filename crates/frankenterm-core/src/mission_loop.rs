@@ -3049,7 +3049,7 @@ mod tests {
         let ml = MissionLoop::new(MissionLoopConfig::default());
         assert_eq!(ml.state().cycle_count, 0);
         assert!(ml.state().last_evaluation_ms.is_none());
-        assert!(ml.state().pending_triggers.is_empty());
+        assert_eq!(ml.state().pending_triggers, [] as [mission_loop::MissionTrigger; 0]);
         assert!(ml.state().last_decision.is_none());
         assert_eq!(ml.state().total_assignments_made, 0);
     }
@@ -3889,8 +3889,8 @@ mod tests {
         let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
         let reservations = vec![make_reservation("agent2", &["src/a.rs"], Some("b"))];
         let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &[]);
-        assert!(report.conflicts.is_empty());
-        assert!(report.messages.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
+        assert_eq!(report.messages, [] as [mission_loop::DeconflictionMessage; 0]);
         assert_eq!(report.auto_resolved_count, 0);
     }
 
@@ -3904,7 +3904,7 @@ mod tests {
         ];
         let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
     }
 
     #[test]
@@ -4149,7 +4149,7 @@ mod tests {
             5000,
             &issues,
         );
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
     }
 
     #[test]
@@ -4168,7 +4168,7 @@ mod tests {
         ];
         let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
     }
 
     #[test]
@@ -4187,7 +4187,7 @@ mod tests {
         ];
         let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
     }
 
     #[test]
@@ -4201,7 +4201,7 @@ mod tests {
         ];
         let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
     }
 
     #[test]
@@ -4272,7 +4272,7 @@ mod tests {
         let active = vec![make_active_claim("bead-x", "agent1")];
         let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflicts, [] as [mission_loop::AssignmentConflict; 0]);
     }
 
     #[test]
@@ -4284,7 +4284,7 @@ mod tests {
         ]);
         let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
-        assert!(!report.messages.is_empty());
+        assert_ne!(report.messages, [] as [mission_loop::DeconflictionMessage; 0]);
         // Each conflict sends to all involved agents.
         assert_eq!(report.messages.len(), 2); // 1 conflict × 2 agents
         let recipients: Vec<&str> = report
@@ -4312,7 +4312,7 @@ mod tests {
         let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
         assert_eq!(report.conflicts.len(), 1);
-        assert!(report.messages.is_empty());
+        assert_eq!(report.messages, [] as [mission_loop::DeconflictionMessage; 0]);
     }
 
     #[test]
@@ -4572,7 +4572,7 @@ mod tests {
             sample_detail("b", BeadStatus::Open, 1, &[]),
         ];
         let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
-        assert!(!report.messages.is_empty());
+        assert_ne!(report.messages, [] as [mission_loop::DeconflictionMessage; 0]);
         let msg = &report.messages[0];
         assert!(msg.subject.contains("reservation_overlap"));
         assert!(msg.body.contains("Conflict detected"));
@@ -4627,7 +4627,7 @@ mod tests {
         let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
 
-        assert!(!report.messages.is_empty());
+        assert_ne!(report.messages, [] as [mission_loop::DeconflictionMessage; 0]);
         assert!(
             report
                 .messages
@@ -4842,7 +4842,7 @@ mod tests {
         let active = vec![make_active_claim("a", "agent2")];
         let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
         let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
-        assert!(!report.messages.is_empty());
+        assert_ne!(report.messages, [] as [mission_loop::DeconflictionMessage; 0]);
         assert_eq!(report.messages[0].thread_id, "a");
     }
 
@@ -5355,10 +5355,10 @@ mod tests {
         );
         state.activate(ovr);
         assert_eq!(state.active.len(), 1);
-        assert!(state.history.is_empty());
+        assert_eq!(state.history, [] as [mission_loop::OperatorOverride; 0]);
 
         assert!(state.clear("ovr-1", 1000));
-        assert!(state.active.is_empty());
+        assert_eq!(state.active, [] as [mission_loop::OperatorOverride; 0]);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].override_id, "ovr-1");
         assert_eq!(state.history[0].expires_at_ms, Some(1000));
@@ -5528,7 +5528,7 @@ mod tests {
         assert_eq!(ml.active_overrides().len(), 1);
 
         assert!(ml.clear_override("clr", 5000));
-        assert!(ml.active_overrides().is_empty());
+        assert_eq!(ml.active_overrides(), []);
         assert_eq!(ml.state.override_state.history.len(), 1);
     }
 

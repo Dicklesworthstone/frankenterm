@@ -5506,8 +5506,8 @@ mod tests {
 
     #[test]
     fn phase_terminal_no_transitions() {
-        assert!(TxPhase::Completed.valid_transitions().is_empty());
-        assert!(TxPhase::Aborted.valid_transitions().is_empty());
+        assert_eq!(TxPhase::Completed.valid_transitions(), []);
+        assert_eq!(TxPhase::Aborted.valid_transitions(), []);
         assert!(TxPhase::Completed.is_terminal());
         assert!(TxPhase::Aborted.is_terminal());
     }
@@ -5560,7 +5560,7 @@ mod tests {
             .append(key.clone(), outcome.clone(), StepRisk::Low, "agent-0", 1000)
             .unwrap();
 
-        assert!(!hash.is_empty());
+        assert_ne!(hash, "");
         assert!(ledger.is_executed(&key));
         assert_eq!(ledger.get_outcome(&key), Some(&outcome));
         assert_eq!(ledger.record_count(), 1);
@@ -5707,7 +5707,7 @@ mod tests {
         let verification = ledger.verify_chain();
         assert!(verification.chain_intact);
         assert_eq!(verification.total_records, 5);
-        assert!(verification.missing_ordinals.is_empty());
+        assert_eq!(verification.missing_ordinals, [] as [u64; 0]);
     }
 
     #[test]
@@ -6358,7 +6358,7 @@ mod tests {
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
-        assert!(ctx.completed_steps.is_empty());
+        assert_eq!(ctx.completed_steps, [] as [std::string::String; 0]);
         assert_eq!(ctx.remaining_steps.len(), 2);
     }
 
@@ -6382,7 +6382,7 @@ mod tests {
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
-        assert!(ctx.remaining_steps.is_empty());
+        assert_eq!(ctx.remaining_steps, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -6409,7 +6409,7 @@ mod tests {
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
-        assert!(ctx.remaining_steps.is_empty());
+        assert_eq!(ctx.remaining_steps, [] as [std::string::String; 0]);
         assert_eq!(ctx.failed_steps, vec![plan.steps[0].id.clone()]);
     }
 
@@ -9173,7 +9173,7 @@ mod tests {
         let h1 = record.hash();
         let h2 = record.hash();
         assert_eq!(h1, h2);
-        assert!(!h1.is_empty());
+        assert_ne!(h1, "");
     }
 
     #[test]
@@ -9534,7 +9534,7 @@ mod tests {
         assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
         assert_eq!(ctx.completed_steps.len(), 1);
         assert_eq!(ctx.failed_steps.len(), 1);
-        assert!(ctx.remaining_steps.is_empty());
+        assert_eq!(ctx.remaining_steps, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9785,8 +9785,8 @@ mod tests {
             .expect("certificate synthesized on Completed");
         assert_eq!(cert.disposition, TerminalDispositionKind::Committed);
         assert_eq!(cert.completed_step_ids, vec!["step-b0", "step-b1"]);
-        assert!(cert.failed_step_ids.is_empty());
-        assert!(cert.compensated_step_ids.is_empty());
+        assert_eq!(cert.failed_step_ids, [] as [std::string::String; 0]);
+        assert_eq!(cert.compensated_step_ids, [] as [std::string::String; 0]);
 
         let json = serde_json::to_string(&ledger).unwrap();
         let deserialized: TxExecutionLedger = serde_json::from_str(&json).unwrap();

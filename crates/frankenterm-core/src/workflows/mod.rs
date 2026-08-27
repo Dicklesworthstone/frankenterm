@@ -3408,7 +3408,7 @@ steps:
             ..Default::default()
         };
         let failures = check_preconditions(&preconditions, &caps);
-        assert!(failures.is_empty());
+        assert_eq!(failures, [] as [&str; 0]);
     }
 
     #[test]
@@ -5014,10 +5014,10 @@ steps:
     #[test]
     fn handle_compaction_prompts_exist() {
         // Verify all agent-specific prompts are non-empty
-        assert!(!compaction_prompts::CLAUDE_CODE.is_empty());
-        assert!(!compaction_prompts::CODEX.is_empty());
-        assert!(!compaction_prompts::GEMINI.is_empty());
-        assert!(!compaction_prompts::UNKNOWN.is_empty());
+        assert_ne!(compaction_prompts::CLAUDE_CODE, "");
+        assert_ne!(compaction_prompts::CODEX, "");
+        assert_ne!(compaction_prompts::GEMINI, "");
+        assert_ne!(compaction_prompts::UNKNOWN, "");
 
         // Verify they contain AGENTS.md reference (key context file)
         assert!(compaction_prompts::CLAUDE_CODE.contains("AGENTS.md"));
@@ -7856,7 +7856,7 @@ Try again at 3:00 PM UTC.
     fn handle_session_end_metadata() {
         let wf = HandleSessionEnd::new();
         assert_eq!(wf.name(), "handle_session_end");
-        assert!(!wf.description().is_empty());
+        assert_ne!(wf.description(), "");
         assert_eq!(wf.steps().len(), 2);
         assert_eq!(wf.steps()[0].name, "extract_summary");
         assert_eq!(wf.steps()[1].name, "persist_record");
@@ -8373,7 +8373,7 @@ Try again at 3:00 PM UTC.
     fn handle_auth_required_metadata() {
         let wf = HandleAuthRequired::new();
         assert_eq!(wf.name(), "handle_auth_required");
-        assert!(!wf.description().is_empty());
+        assert_ne!(wf.description(), "");
         assert_eq!(wf.steps().len(), 3);
         assert_eq!(wf.steps()[0].name, "check_cooldown");
         assert_eq!(wf.steps()[1].name, "classify_auth");
@@ -8697,7 +8697,7 @@ Try again at 3:00 PM UTC.
     fn handle_claude_code_limits_metadata() {
         let wf = HandleClaudeCodeLimits::new();
         assert_eq!(wf.name(), "handle_claude_code_limits");
-        assert!(!wf.description().is_empty());
+        assert_ne!(wf.description(), "");
         assert_eq!(wf.steps().len(), 3);
         assert_eq!(wf.steps()[0].name, "check_guards");
         assert_eq!(wf.steps()[1].name, "check_cooldown");
@@ -8847,7 +8847,7 @@ Try again at 3:00 PM UTC.
         assert_eq!(plan["limit_type"], "usage_warning");
         assert_eq!(plan["pane_id"], 42);
         assert_eq!(plan["safe_to_send"], true);
-        assert!(!plan["next_steps"].as_array().unwrap().is_empty());
+        assert_ne!(plan["next_steps"].as_array().unwrap().as_slice(), []);
     }
 
     #[test]
@@ -8874,7 +8874,7 @@ Try again at 3:00 PM UTC.
     fn handle_gemini_quota_metadata() {
         let wf = HandleGeminiQuota::default();
         assert_eq!(wf.name(), "handle_gemini_quota");
-        assert!(!wf.description().is_empty());
+        assert_ne!(wf.description(), "");
         assert_eq!(wf.steps().len(), 3);
         assert_eq!(wf.steps()[0].name, "check_guards");
         assert_eq!(wf.steps()[1].name, "check_cooldown");
@@ -10324,8 +10324,8 @@ Try again at 3:00 PM UTC.
             assert_eq!(plan.resume_session_id.as_deref(), Some("sess-abc123"));
             assert_eq!(plan.account_id.as_deref(), Some("openai-team"));
             assert_eq!(plan.retry_after_ms, Some(1_700_000_000_000));
-            assert!(!plan.operator_steps.is_empty());
-            assert!(!plan.suggested_commands.is_empty());
+            assert_ne!(plan.operator_steps, [] as [std::string::String; 0]);
+            assert_ne!(plan.suggested_commands, [] as [std::string::String; 0]);
             assert_eq!(plan.created_at_ms, 1_699_999_000_000);
 
             // Operator steps should mention bootstrap and resume
@@ -11681,9 +11681,9 @@ You've hit your usage limit. Try again at 5:00 PM.";
     fn descriptor_trigger_empty_defaults() {
         let json = "{}";
         let trigger: DescriptorTrigger = serde_json::from_str(json).unwrap();
-        assert!(trigger.event_types.is_empty());
-        assert!(trigger.agent_types.is_empty());
-        assert!(trigger.rule_ids.is_empty());
+        assert_eq!(trigger.event_types, [] as [std::string::String; 0]);
+        assert_eq!(trigger.agent_types, [] as [std::string::String; 0]);
+        assert_eq!(trigger.rule_ids, [] as [std::string::String; 0]);
     }
 
     #[test]

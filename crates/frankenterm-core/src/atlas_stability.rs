@@ -444,7 +444,7 @@ mod tests {
             atlas_size_bytes_after: 4 * 1024 * 1024,
             sync_duration_ms: 0,
         };
-        assert!(check_pure_resize(&r).is_empty());
+        assert_eq!(check_pure_resize(&r), [] as [atlas_stability::AtlasStabilityViolation; 0]);
     }
 
     #[test]
@@ -532,7 +532,7 @@ mod tests {
                 bytes: 0,
             },
         ];
-        assert!(check_invariants(&events).is_empty());
+        assert_eq!(check_invariants(&events), [] as [atlas_stability::AtlasStabilityViolation; 0]);
     }
 
     #[test]
@@ -647,7 +647,7 @@ mod tests {
         let cycle = recover_cycle("hash-a", "hash-a", 1_000_000);
         assert!(cycle.pixel_identical());
         assert!(cycle.passes_visual_floor());
-        assert!(check_recover_cycle(&cycle).is_empty());
+        assert_eq!(check_recover_cycle(&cycle), [] as [atlas_stability::AtlasStabilityViolation; 0]);
     }
 
     #[test]
@@ -655,7 +655,7 @@ mod tests {
         let cycle = recover_cycle("hash-a", "hash-b", ATLAS_RECOVER_SSIM_FLOOR_PPM);
         assert!(!cycle.pixel_identical());
         assert!(cycle.passes_visual_floor());
-        assert!(check_recover_cycle(&cycle).is_empty());
+        assert_eq!(check_recover_cycle(&cycle), [] as [atlas_stability::AtlasStabilityViolation; 0]);
     }
 
     #[test]

@@ -571,7 +571,7 @@ fn standard_plan_is_ready() {
 fn standard_plan_summary_renders() {
     let plan = DecommissionPlan::standard();
     let summary = plan.render_summary();
-    assert!(!summary.is_empty());
+    assert_ne!(summary, "");
     assert!(summary.contains("NTM-DECOM-001"));
 }
 
@@ -589,6 +589,6 @@ fn standard_plan_serde_roundtrip() {
 fn standard_reversibility_allows_reversal() {
     let policy = ReversibilityPolicy::standard();
     assert!(policy.reversal_allowed);
-    assert!(!policy.conditions.is_empty());
+    assert_ne!(policy.conditions, [] as [std::string::String; 0]);
     assert!(policy.reversal_window_ms > 0);
 }

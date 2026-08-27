@@ -4482,8 +4482,8 @@ main();
 
             // Verify all methods have correct names
             for method in &sdk.methods {
-                assert!(!method.method_name.is_empty());
-                assert!(!method.command.is_empty());
+                assert_ne!(method.method_name, "");
+                assert_ne!(method.command, "");
                 assert!(method.is_async);
             }
         }

@@ -3567,7 +3567,7 @@ mod tests {
         assert_eq!(export.session.session_id, "sess-1");
         assert_eq!(export.pane_ids, vec![1, 2]);
         assert_eq!(export.events_processed, 1);
-        assert!(export.warnings.is_empty());
+        assert_eq!(export.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3685,7 +3685,7 @@ mod tests {
     #[test]
     fn error_is_std_error() {
         let e: Box<dyn std::error::Error> = Box::new(SessionResumeError::Cancelled);
-        assert!(!e.to_string().is_empty());
+        assert_ne!(e.to_string(), "");
     }
 
     // -- Helper functions --
@@ -3919,7 +3919,7 @@ mod tests {
         ];
         for v in &variants {
             let json_str = serde_json::to_string(v).unwrap();
-            assert!(!json_str.is_empty());
+            assert_ne!(json_str, "");
         }
     }
 

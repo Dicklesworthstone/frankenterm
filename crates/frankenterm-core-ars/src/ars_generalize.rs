@@ -1093,7 +1093,7 @@ mod tests {
             ParamKind::Custom,
         ];
         for kind in &kinds {
-            assert!(!kind.safety_regex().is_empty());
+            assert_ne!(kind.safety_regex(), "");
         }
     }
 
@@ -1146,13 +1146,13 @@ mod tests {
     #[test]
     fn extract_file_paths_empty_input() {
         let paths = extract_file_paths("");
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [std::string::String; 0]);
     }
 
     #[test]
     fn extract_file_paths_no_paths() {
         let paths = extract_file_paths("just a simple error message");
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [std::string::String; 0]);
     }
 
     // =========================================================================
@@ -1176,14 +1176,14 @@ mod tests {
     #[test]
     fn extract_line_numbers_no_numbers() {
         let nums = extract_line_numbers("no numbers here");
-        assert!(nums.is_empty());
+        assert_eq!(nums, [] as [(std::string::String, usize); 0]);
     }
 
     #[test]
     fn extract_line_numbers_rejects_huge_numbers() {
         let nums = extract_line_numbers(":99999999999:");
         // Should reject because > 1_000_000
-        assert!(nums.is_empty());
+        assert_eq!(nums, [] as [(std::string::String, usize); 0]);
     }
 
     // =========================================================================
@@ -1362,7 +1362,10 @@ mod tests {
         let cmd = make_block(0, "cargo test src/main.rs");
         let error = "error in src/main.rs:42";
         let detections = gzr.detect_params(&[cmd], error);
-        assert!(!detections.is_empty());
+        assert_ne!(
+            detections,
+            [] as [(u32, std::vec::Vec<crate::ars_generalize::DetectedParam>); 0]
+        );
         let (_, params) = &detections[0];
         let has_file = params.iter().any(|p| p.kind == ParamKind::FilePath);
         assert!(has_file, "should detect file path, got {:?}", params);
@@ -1374,7 +1377,10 @@ mod tests {
         let cmd = make_block(0, "sed -n 42p src/main.rs");
         let error = "error at line 42";
         let detections = gzr.detect_params(&[cmd], error);
-        assert!(!detections.is_empty());
+        assert_ne!(
+            detections,
+            [] as [(u32, std::vec::Vec<crate::ars_generalize::DetectedParam>); 0]
+        );
         let all_params: Vec<&DetectedParam> = detections.iter().flat_map(|(_, p)| p).collect();
         let has_line = all_params.iter().any(|p| p.kind == ParamKind::LineNumber);
         assert!(has_line, "should detect line number, got {:?}", all_params);
@@ -2029,6 +2035,9 @@ mod tests {
         let cmd = make_block(0, "cargo test src/main.rs");
         let error = "error in src/main.rs:42 MyStruct";
         let detections = gzr.detect_params(&[cmd], error);
-        assert!(detections.is_empty());
+        assert_eq!(
+            detections,
+            [] as [(u32, std::vec::Vec<crate::ars_generalize::DetectedParam>); 0]
+        );
     }
 }

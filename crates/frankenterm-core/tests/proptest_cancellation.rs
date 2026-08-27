@@ -775,7 +775,7 @@ fn all_escalation_actions_display_non_empty() {
         EscalationAction::LogAndWait,
     ];
     for a in actions {
-        assert!(!a.to_string().is_empty());
+        assert_ne!(a.to_string(), "");
     }
 }
 
@@ -794,7 +794,7 @@ fn all_finalizer_statuses_display_non_empty() {
         },
     ];
     for s in statuses {
-        assert!(!s.to_string().is_empty());
+        assert_ne!(s.to_string(), "");
     }
 }
 

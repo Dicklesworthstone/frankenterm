@@ -1641,8 +1641,8 @@ mod tests {
             artifact_paths: Vec::new(),
         });
 
-        assert!(report.recommendations.is_empty());
-        assert!(advise_context_horizon(&report).is_empty());
+        assert_eq!(report.recommendations, [] as [context_horizon::ContextHorizonRecommendation; 0]);
+        assert_eq!(advise_context_horizon(&report), [] as [context_horizon::ContextHorizonAdvisorRecord; 0]);
         assert_eq!(report.fleet_summary.top_operator_move, "none");
     }
 
@@ -1778,7 +1778,7 @@ mod tests {
             ContextHorizonPolicyState::AllowedDryRun
         );
         assert!(handoff.confidence > 0.0);
-        assert!(!handoff.expected_operator_effect.is_empty());
+        assert_ne!(handoff.expected_operator_effect, "");
     }
 
     #[test]

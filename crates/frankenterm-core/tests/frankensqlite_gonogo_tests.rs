@@ -350,7 +350,7 @@ fn test_review_has_all_gate_summaries() {
 fn test_review_gate_evidence_artifacts() {
     let review = build_all_gates_pass_review();
     for gate in &review.gate_summaries {
-        assert!(!gate.evidence_artifacts.is_empty());
+        assert_ne!(gate.evidence_artifacts, [] as [std::string::String; 0]);
     }
 }
 

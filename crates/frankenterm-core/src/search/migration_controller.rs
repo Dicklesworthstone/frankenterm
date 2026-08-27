@@ -716,7 +716,7 @@ mod tests {
         let result = run_default_retirement_gate();
         // At PreCheck, phase_ready fails, so not approved.
         assert!(!result.approved);
-        assert!(!result.summary.is_empty());
+        assert_ne!(result.summary, "");
     }
 
     #[test]

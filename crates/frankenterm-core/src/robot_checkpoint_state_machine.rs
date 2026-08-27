@@ -538,14 +538,13 @@ mod tests {
         let view = w.session_state.get(&1).unwrap();
         assert!(view.last_checkpoint.is_some());
         // No orphans.
-        assert!(
+        assert_eq!(
             check_invariants(
                 &prior,
                 &w,
                 CheckpointAction::Save { session_id: 1 },
                 outcome
-            )
-            .is_empty()
+            ), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]
         );
     }
 
@@ -567,14 +566,13 @@ mod tests {
         );
         // snapshots count unchanged.
         assert_eq!(w.snapshots.len(), 1);
-        assert!(
+        assert_eq!(
             check_invariants(
                 &prior,
                 &w,
                 CheckpointAction::Save { session_id: 1 },
                 outcome
-            )
-            .is_empty()
+            ), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]
         );
     }
 
@@ -600,14 +598,13 @@ mod tests {
         ));
         // 2 distinct snapshots.
         assert_eq!(w.snapshots.len(), 2);
-        assert!(
+        assert_eq!(
             check_invariants(
                 &prior,
                 &w,
                 CheckpointAction::Save { session_id: 1 },
                 outcome
-            )
-            .is_empty()
+            ), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]
         );
     }
 
@@ -627,7 +624,7 @@ mod tests {
         // No mutation.
         assert_eq!(w.session_state, prior.session_state);
         assert_eq!(w.events.len(), prior.events.len());
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]);
     }
 
     #[test]
@@ -643,7 +640,7 @@ mod tests {
         };
         let outcome = apply_action(&mut w, action);
         assert_eq!(outcome, ActionOutcome::RollbackDenied);
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]);
     }
 
     #[test]
@@ -672,7 +669,7 @@ mod tests {
         assert!(matches!(outcome, ActionOutcome::RollbackSucceeded { .. }));
         let view = w.session_state.get(&1).unwrap();
         assert_eq!(view.content, ContentHash(7));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]);
     }
 
     #[test]
@@ -710,7 +707,7 @@ mod tests {
         let outcome = apply_action(&mut w, action);
         assert_eq!(outcome, ActionOutcome::SaveFailed);
         assert_eq!(w, prior);
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]);
     }
 
     #[test]
@@ -725,7 +722,7 @@ mod tests {
         let outcome = apply_action(&mut w, action);
         assert_eq!(outcome, ActionOutcome::RollbackFailed);
         assert_eq!(w, prior);
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]);
     }
 
     #[test]
@@ -737,7 +734,7 @@ mod tests {
         let outcome = apply_action(&mut w, action);
         assert_eq!(outcome, ActionOutcome::Listed);
         assert_eq!(w, prior);
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_checkpoint_state_machine::CheckpointSafetyViolation; 0]);
     }
 
     #[test]

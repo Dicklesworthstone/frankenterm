@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn all_components_empty_is_empty_vec() {
         let mut uf = UnionFind::new(0);
-        assert!(uf.all_components().is_empty());
+        assert_eq!(uf.all_components(), [] as [std::vec::Vec<usize>; 0]);
     }
 
     #[test]

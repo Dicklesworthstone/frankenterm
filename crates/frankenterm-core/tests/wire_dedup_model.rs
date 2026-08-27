@@ -203,7 +203,10 @@ fn replay_attempt_never_accepts() {
     let history: Vec<(SenderId, Seq)> = std::iter::once((1, 5))
         .chain(std::iter::repeat_n((1, 5), 10))
         .collect();
-    assert!(check_invariants(&state, &history).is_empty());
+    assert_eq!(
+        check_invariants(&state, &history),
+        [] as [frankenterm_core::wire_dedup_model::DedupSafetyViolation; 0]
+    );
 }
 
 #[test]

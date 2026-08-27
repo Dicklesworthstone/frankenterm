@@ -693,7 +693,7 @@ mod tests {
         // Build a detection to verify the instance works
         let contract = sample_contract("test", "agent");
         let detection = dispatcher.build_detection(&contract);
-        assert!(!detection.rule_id.is_empty());
+        assert_ne!(detection.rule_id, "");
     }
 
     #[test]

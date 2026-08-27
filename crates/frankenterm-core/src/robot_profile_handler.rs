@@ -1465,7 +1465,7 @@ mod tests {
         let conn = fresh_conn();
         let v = handle_profile_command("list", &json!({}), &conn).expect("ok");
         let arr = v.get("profiles").and_then(Value::as_array).expect("arr");
-        assert!(arr.is_empty());
+        assert_eq!(arr.as_slice(), []);
     }
 
     #[test]
@@ -1543,7 +1543,7 @@ mod tests {
         let v = handle_profile_command("validate", &json!({ "name": "good" }), &conn).expect("ok");
         assert_eq!(v.get("valid").and_then(Value::as_bool), Some(true));
         let issues = v.get("issues").and_then(Value::as_array).unwrap();
-        assert!(issues.is_empty());
+        assert_eq!(issues.as_slice(), []);
     }
 
     #[test]
@@ -1658,7 +1658,7 @@ mod tests {
 
         assert_eq!(err.error_code(), "robot.profile.bad_params");
         assert!(err.to_string().contains("`dry_run` must be a boolean"));
-        assert!(executor.spawned.is_empty());
+        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
     }
 
     #[test]
@@ -1684,7 +1684,7 @@ mod tests {
             err.to_string()
                 .contains(&format!("`count` must be <= {PROFILE_APPLY_COUNT_MAX}"))
         );
-        assert!(executor.spawned.is_empty());
+        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
     }
 
     #[test]
@@ -1708,7 +1708,7 @@ mod tests {
             err.to_string()
                 .contains(&format!("maximum is {ENV_MAX_COUNT}"))
         );
-        assert!(executor.spawned.is_empty());
+        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
     }
 
     #[test]
@@ -1737,7 +1737,7 @@ mod tests {
             err.to_string()
                 .contains(&format!("maximum is {ENV_VALUE_MAX_LEN}"))
         );
-        assert!(executor.spawned.is_empty());
+        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
     }
 
     #[test]
@@ -1761,7 +1761,7 @@ mod tests {
             &vec![json!(100), json!(101)]
         );
         assert_eq!(executor.spawned.len(), 2);
-        assert!(executor.stopped.is_empty());
+        assert_eq!(executor.stopped, [] as [(u64, std::string::String); 0]);
         assert_eq!(v.get("spawned_agents").and_then(Value::as_u64), Some(2));
     }
 
@@ -1797,7 +1797,7 @@ mod tests {
             replay.get("idempotent_replay").and_then(Value::as_bool),
             Some(true)
         );
-        assert!(replay_executor.spawned.is_empty());
+        assert_eq!(replay_executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
     }
 
     #[test]
@@ -1819,7 +1819,7 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ProfileHandlerError::PolicyDenied { .. }));
-        assert!(executor.spawned.is_empty());
+        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
     }
 
     #[test]
@@ -1909,7 +1909,7 @@ mod tests {
 
         assert_eq!(specs.len(), 1);
         for spec in &specs {
-            assert!(spec.setup_preamble_commands.is_empty());
+            assert_eq!(spec.setup_preamble_commands, [] as [std::string::String; 0]);
             assert_eq!(spec.command.as_deref(), Some("echo"));
         }
     }
@@ -2088,7 +2088,7 @@ mod bootstrap_serde_drop_tests {
         reset_robot_profile_bootstrap_serde_drop_count_for_test();
         let metadata: HashMap<String, String> = HashMap::new();
         let result = parse_bootstrap_commands(&metadata);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
     }
 
@@ -2117,7 +2117,7 @@ mod bootstrap_serde_drop_tests {
             r#"["echo hi""#.to_string(),
         );
         let result = parse_bootstrap_commands(&metadata);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
     }
 
@@ -2132,7 +2132,7 @@ mod bootstrap_serde_drop_tests {
             r#"{"a": "b"}"#.to_string(),
         );
         let result = parse_bootstrap_commands(&metadata);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
     }
 
@@ -2144,7 +2144,7 @@ mod bootstrap_serde_drop_tests {
         // Vec<i32>, not Vec<String>
         metadata.insert("bootstrap_commands".to_string(), r"[1, 2, 3]".to_string());
         let result = parse_bootstrap_commands(&metadata);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
     }
 

@@ -185,7 +185,10 @@ fn schedule_frame_with_no_pending_returns_empty_result() {
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
 
     let frame = scheduler.schedule_frame();
-    assert!(frame.scheduled.is_empty());
+    assert_eq!(
+        frame.scheduled,
+        [] as [frankenterm_core::resize_scheduler::ScheduledResizeWork; 0]
+    );
     assert_eq!(frame.budget_spent_units, 0);
     assert_eq!(frame.pending_after, 0);
 }
@@ -335,7 +338,10 @@ fn debug_snapshot_lifecycle_limit_zero_means_all_events() {
         !debug.lifecycle_events.is_empty(),
         "limit=0 should return all events, not zero"
     );
-    assert!(!debug.scheduler.panes.is_empty());
+    assert_ne!(
+        debug.scheduler.panes,
+        [] as [frankenterm_core::resize_scheduler::ResizeSchedulerPaneSnapshot; 0]
+    );
 
     // Contrast with limit=1 which returns at most 1.
     let debug1 = scheduler.debug_snapshot(1);
@@ -375,7 +381,10 @@ fn disabled_scheduler_suppresses_all_operations() {
     );
 
     let frame = scheduler.schedule_frame();
-    assert!(frame.scheduled.is_empty());
+    assert_eq!(
+        frame.scheduled,
+        [] as [frankenterm_core::resize_scheduler::ScheduledResizeWork; 0]
+    );
     assert_eq!(
         scheduler.metrics().suppressed_frames,
         1,
@@ -436,7 +445,10 @@ fn many_panes_schedule_without_panic() {
     assert_eq!(scheduler.pending_total(), 100);
 
     let frame = scheduler.schedule_frame();
-    assert!(!frame.scheduled.is_empty());
+    assert_ne!(
+        frame.scheduled,
+        [] as [frankenterm_core::resize_scheduler::ScheduledResizeWork; 0]
+    );
     assert!(
         frame.budget_spent_units <= 50,
         "should not exceed frame budget of 50"

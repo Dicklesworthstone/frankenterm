@@ -581,7 +581,7 @@ mod tests {
         }
         let emb = FastEmbedEmbedder::try_new_default().unwrap();
         let results = emb.embed_batch(&[]).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [std::vec::Vec<f32>; 0]);
     }
 
     #[test]
@@ -679,7 +679,7 @@ mod tests {
         match result {
             FastEmbedInitResult::Ok(_) => { /* model was available — fine */ }
             FastEmbedInitResult::Degraded { error } => {
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
             }
         }
     }

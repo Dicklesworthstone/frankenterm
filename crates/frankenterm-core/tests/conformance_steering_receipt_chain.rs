@@ -170,6 +170,6 @@ fn steer_plan_is_side_effect_free() {
         let result = steer_plan(scenario, "obj", "ws-steer", NOW as u64, NOW, None);
         // A receipt is produced and self-consistent; no execution occurred.
         assert!(result.receipt.validate().is_ok());
-        assert!(!result.policy_verdict.is_empty());
+        assert_ne!(result.policy_verdict, "");
     }
 }

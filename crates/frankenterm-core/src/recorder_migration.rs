@@ -2782,7 +2782,7 @@ mod tests {
             assert_eq!(result.consumers_found, 2);
             assert_eq!(result.checkpoints_migrated, 2);
             assert_eq!(result.checkpoints_reset, 0);
-            assert!(result.reset_consumers.is_empty());
+            assert_eq!(result.reset_consumers, [] as [std::string::String; 0]);
             assert_eq!(target.committed.lock().unwrap().len(), 2);
         });
     }

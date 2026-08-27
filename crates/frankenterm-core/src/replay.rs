@@ -1427,7 +1427,7 @@ mod tests {
     #[test]
     fn parse_empty_recording() {
         let recording = Recording::from_bytes(&[]).unwrap();
-        assert!(recording.frames.is_empty());
+        assert_eq!(recording.frames, [] as [recording::RecordingFrame; 0]);
         assert_eq!(recording.duration_ms, 0);
     }
 
@@ -1631,7 +1631,7 @@ mod tests {
         player.seek_to(450, &mut sink).unwrap();
         assert_eq!(player.position().frame_index, 5);
         // Frames 0-4 (timestamps 0, 100, 200, 300, 400) should have been replayed.
-        assert!(!sink.output.is_empty());
+        assert_ne!(sink.output, [] as [u8; 0]);
     }
 
     #[test]
@@ -1722,7 +1722,7 @@ mod tests {
             player.play(&mut sink, rx).await.unwrap();
             assert_eq!(player.state(), PlayerState::Stopped);
             // Stop arrived before any frames were output.
-            assert!(sink.output.is_empty());
+            assert_eq!(sink.output, [] as [u8; 0]);
         });
     }
 
@@ -2370,7 +2370,7 @@ mod tests {
         // seek_to only replays Output frames silently — events/markers are skipped
         assert_eq!(sink.output, b"start");
         assert_eq!(sink.events.len(), 0);
-        assert!(sink.markers.is_empty());
+        assert_eq!(sink.markers, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2614,7 +2614,7 @@ mod tests {
         for v in &variants {
             let cloned = v.clone();
             let dbg = format!("{:?}", cloned);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 
@@ -2641,7 +2641,7 @@ mod tests {
         assert_eq!(cloned.cols, 80);
         assert_eq!(cloned.rows, 24);
         assert!(cloned.redact);
-        assert!(cloned.extra_redact_patterns.is_empty());
+        assert_eq!(cloned.extra_redact_patterns, [] as [std::string::String; 0]);
         assert!(cloned.title.is_none());
         let dbg = format!("{:?}", opts);
         assert!(dbg.contains("ExportOptions"));
@@ -2698,9 +2698,9 @@ mod tests {
     #[test]
     fn collector_sink_default() {
         let sink = CollectorSink::default();
-        assert!(sink.output.is_empty());
-        assert!(sink.events.is_empty());
-        assert!(sink.markers.is_empty());
+        assert_eq!(sink.output, [] as [u8; 0]);
+        assert_eq!(sink.events, [] as [serde_json::Value; 0]);
+        assert_eq!(sink.markers, [] as [std::string::String; 0]);
     }
 
     #[test]

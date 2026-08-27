@@ -623,9 +623,9 @@ mod tests {
         assert_eq!(cfg.service, BrowserAuthService::OpenAi);
         assert_eq!(cfg.timeout_ms, 300_000);
         assert_eq!(cfg.poll_interval_ms, 2_000);
-        assert!(!cfg.login_url.is_empty());
-        assert!(!cfg.success_url_prefixes.is_empty());
-        assert!(!cfg.success_text_markers.is_empty());
+        assert_ne!(cfg.login_url, "");
+        assert_ne!(cfg.success_url_prefixes, [] as [std::string::String; 0]);
+        assert_ne!(cfg.success_text_markers, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -977,7 +977,7 @@ mod tests {
         ];
         for v in &variants {
             let dbg = format!("{:?}", v);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 

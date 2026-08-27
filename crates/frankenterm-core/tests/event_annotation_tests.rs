@@ -416,7 +416,7 @@ fn fresh_event_has_empty_annotations() {
             .unwrap();
         assert!(ann.triage_state.is_none());
         assert!(ann.note.is_none());
-        assert!(ann.labels.is_empty());
+        assert_eq!(ann.labels, [] as [std::string::String; 0]);
     });
 }
 
@@ -608,7 +608,7 @@ fn event_annotations_default_is_empty() {
     assert!(ann.note.is_none());
     assert!(ann.note_updated_at.is_none());
     assert!(ann.note_updated_by.is_none());
-    assert!(ann.labels.is_empty());
+    assert_eq!(ann.labels, [] as [std::string::String; 0]);
 }
 
 // ---- Multiple events with labels ----
@@ -983,7 +983,7 @@ fn remove_all_labels_leaves_empty_vec() {
             .await
             .unwrap()
             .unwrap();
-        assert!(ann.labels.is_empty());
+        assert_eq!(ann.labels, [] as [std::string::String; 0]);
     });
 }
 

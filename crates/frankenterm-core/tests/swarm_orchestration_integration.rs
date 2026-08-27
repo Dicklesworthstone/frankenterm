@@ -156,7 +156,10 @@ fn fleet_launch_registers_lifecycle_entities() {
     assert_eq!(outcome.failed_slots, 0);
 
     // Verify lifecycle entities were registered
-    assert!(!outcome.registry_snapshot.is_empty());
+    assert_ne!(
+        outcome.registry_snapshot,
+        [] as [frankenterm_core::session_topology::LifecycleEntityRecord; 0]
+    );
 }
 
 #[test]
@@ -359,7 +362,10 @@ fn scheduler_recommends_action_on_ready_work() {
             assert!(!reason.is_empty(), "should have a reason");
         }
         SchedulerDecision::AssignWork { assignments } => {
-            assert!(!assignments.is_empty());
+            assert_ne!(
+                assignments,
+                [] as [frankenterm_core::swarm_scheduler::WorkAssignment; 0]
+            );
         }
         SchedulerDecision::Noop { .. } => {
             // Acceptable if cooldown or other conditions prevent action
@@ -377,7 +383,7 @@ fn scheduler_does_not_crash_on_empty_queue() {
     let decision = scheduler.evaluate(&mut queue, 1000);
     match decision {
         SchedulerDecision::Noop { reason } => {
-            assert!(!reason.is_empty());
+            assert_ne!(reason, "");
         }
         _ => {
             // Other decisions are also acceptable as long as no panic
@@ -504,10 +510,10 @@ fn e2e_scheduler_evaluates_queue_state() {
     // Should produce some decision (not panic)
     match &decision {
         SchedulerDecision::Noop { reason } => {
-            assert!(!reason.is_empty());
+            assert_ne!(reason, "");
         }
         SchedulerDecision::AssignWork { assignments } => {
-            assert!(!assignments.is_empty());
+            assert_ne!(assignments.as_slice(), []);
         }
         SchedulerDecision::ScaleUp {
             additional_agents, ..
@@ -515,7 +521,7 @@ fn e2e_scheduler_evaluates_queue_state() {
             assert!(*additional_agents >= 1);
         }
         SchedulerDecision::Rebalance { moves } => {
-            assert!(!moves.is_empty());
+            assert_ne!(moves.as_slice(), []);
         }
         _ => {} // Other decisions are also valid
     }

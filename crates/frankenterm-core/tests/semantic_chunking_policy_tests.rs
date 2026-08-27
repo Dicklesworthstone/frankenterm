@@ -148,7 +148,7 @@ fn chunking_is_deterministic_for_same_input() {
     let run_one = build_semantic_chunks(&events, &config);
     let run_two = build_semantic_chunks(&events, &config);
     assert_eq!(run_one, run_two);
-    assert!(!run_one.is_empty());
+    assert_ne!(run_one, [] as [frankenterm_core::search::SemanticChunk; 0]);
 }
 
 #[test]

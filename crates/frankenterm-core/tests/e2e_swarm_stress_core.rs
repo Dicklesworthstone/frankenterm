@@ -272,7 +272,7 @@ mod multi_pane_scrollback {
             }
         }
 
-        assert!(!ratios.is_empty());
+        assert_ne!(ratios, [] as [f64; 0]);
         let min = ratios.iter().copied().fold(f64::INFINITY, f64::min);
         let max = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         assert!(

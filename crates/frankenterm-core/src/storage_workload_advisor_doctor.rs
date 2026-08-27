@@ -256,7 +256,7 @@ mod tests {
                 // structured fields. The substrate's classifier
                 // determines the actual values.
                 let _ = (backend, index, migration_priority, confidence);
-                assert!(!rationale.is_empty());
+                assert_ne!(rationale, "");
                 let _ = proof_commands;
             }
             AdvisorReportRendering::DataNeeded { .. } => {
@@ -271,7 +271,7 @@ mod tests {
         let rendering = WorkloadAdvisorDoctor::new().render(&report);
         match rendering {
             AdvisorReportRendering::DataNeeded { reasons } => {
-                assert!(!reasons.is_empty());
+                assert_ne!(reasons, [] as [std::string::String; 0]);
             }
             AdvisorReportRendering::Recommendation { .. } => {
                 panic!("expected DataNeeded variant")
@@ -308,7 +308,7 @@ mod tests {
             BackendChoice::FrankenSqlite,
             BackendChoice::NoChange,
         ] {
-            assert!(!backend_label(backend).is_empty());
+            assert_ne!(backend_label(backend), "");
         }
         for index in [
             IndexChoice::Fts5,
@@ -316,7 +316,7 @@ mod tests {
             IndexChoice::Hybrid,
             IndexChoice::NoChange,
         ] {
-            assert!(!index_label(index).is_empty());
+            assert_ne!(index_label(index), "");
         }
         for priority in [
             MigrationPriority::None,
@@ -324,10 +324,10 @@ mod tests {
             MigrationPriority::Medium,
             MigrationPriority::High,
         ] {
-            assert!(!priority_label(priority).is_empty());
+            assert_ne!(priority_label(priority), "");
         }
         for confidence in [Confidence::High, Confidence::Medium, Confidence::Low] {
-            assert!(!confidence_label(confidence).is_empty());
+            assert_ne!(confidence_label(confidence), "");
         }
     }
 

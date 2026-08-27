@@ -490,7 +490,7 @@ pub fn key_to_minhash(key: &[u8]) -> Result<Vec<u64>, FstError> {
     }
 
     let (chunks, remainder) = key.as_chunks::<8>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder, [] as [u8; 0]);
     Ok(chunks.iter().copied().map(u64::from_be_bytes).collect())
 }
 
@@ -840,7 +840,7 @@ mod tests {
         let index = compiler.compile(&entries).unwrap();
 
         let matches = index.prefix_search(b"error: foo");
-        assert!(matches.is_empty());
+        assert_eq!(matches, [] as [crate::ars_fst::FstMatch; 0]);
     }
 
     #[test]
@@ -880,7 +880,7 @@ mod tests {
         let index = compiler.compile(&entries).unwrap();
 
         let matches = index.entries_with_prefix(b"warn");
-        assert!(matches.is_empty());
+        assert_eq!(matches, [] as [crate::ars_fst::FstMatch; 0]);
     }
 
     // ---- Shared prefix compression ----
@@ -1102,7 +1102,7 @@ mod tests {
         let err = builder.add_literal("overflow", "c", 0).unwrap_err();
 
         assert_eq!(err, FstError::ReflexIdExhausted);
-        assert!(builder.entries().is_empty());
+        assert_eq!(builder.entries(), []);
     }
 
     #[test]

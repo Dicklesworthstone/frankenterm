@@ -787,8 +787,8 @@ mod tests {
 
     #[test]
     fn tokenizer_names_are_non_empty() {
-        assert!(!TOKENIZER_TERMINAL_TEXT.is_empty());
-        assert!(!TOKENIZER_TERMINAL_SYMBOLS.is_empty());
+        assert_ne!(TOKENIZER_TERMINAL_TEXT, "");
+        assert_ne!(TOKENIZER_TERMINAL_SYMBOLS, "");
     }
 
     #[test]
@@ -953,7 +953,7 @@ mod tests {
     fn fingerprint_is_not_empty() {
         let (schema, _) = build_lexical_schema_v1();
         let fp = schema_fingerprint(&schema);
-        assert!(!fp.is_empty());
+        assert_ne!(fp, "");
     }
 
     #[test]
@@ -1180,14 +1180,14 @@ mod tests {
     fn document_source_is_set() {
         let event = sample_ingress_event();
         let doc_fields = map_event_to_document(&event, 0);
-        assert!(!doc_fields.source.is_empty());
+        assert_ne!(doc_fields.source, "");
     }
 
     #[test]
     fn document_event_type_is_set() {
         let event = sample_control_event();
         let doc_fields = map_event_to_document(&event, 0);
-        assert!(!doc_fields.event_type.is_empty());
+        assert_ne!(doc_fields.event_type, "");
     }
 
     #[test]
@@ -1209,7 +1209,7 @@ mod tests {
     fn document_schema_version_is_set() {
         let event = sample_ingress_event();
         let doc_fields = map_event_to_document(&event, 0);
-        assert!(!doc_fields.schema_version.is_empty());
-        assert!(!doc_fields.lexical_schema_version.is_empty());
+        assert_ne!(doc_fields.schema_version, "");
+        assert_ne!(doc_fields.lexical_schema_version, "");
     }
 }

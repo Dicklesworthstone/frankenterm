@@ -808,7 +808,7 @@ mod tests {
             let json = serde_json::to_string(&s).unwrap();
             let parsed: LiveResizeState = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, s);
-            assert!(!s.slug().is_empty());
+            assert_ne!(s.slug(), "");
         }
     }
 

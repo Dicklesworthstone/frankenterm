@@ -705,7 +705,7 @@ mod tests {
         let rendered = render_explanation(template, &context);
         // The template doesn't have {pane_id} placeholder currently,
         // but the function should handle it gracefully
-        assert!(!rendered.is_empty());
+        assert_ne!(rendered, "");
     }
 
     #[test]

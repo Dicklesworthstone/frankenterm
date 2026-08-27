@@ -432,7 +432,7 @@ fn crash_bundle_with_empty_message() {
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
     let parsed: CrashReport = serde_json::from_str(&content).unwrap();
 
-    assert!(parsed.message.is_empty());
+    assert_eq!(parsed.message, "");
     assert!(parsed.location.is_none());
     assert!(parsed.backtrace.is_none());
 }
@@ -478,8 +478,8 @@ fn incident_bundle_manifest_is_valid_json() {
     let parsed: IncidentBundleResult = serde_json::from_str(&manifest_json).unwrap();
 
     assert_eq!(parsed.kind, IncidentKind::Crash);
-    assert!(!parsed.wa_version.is_empty());
-    assert!(!parsed.exported_at.is_empty());
+    assert_ne!(parsed.wa_version, "");
+    assert_ne!(parsed.exported_at, "");
 }
 
 #[test]
@@ -1330,7 +1330,7 @@ fn collect_incident_bundle_process_sampler_writes_bounded_snapshot() {
         serde_json::from_str(&fs::read_to_string(sample_path).unwrap()).unwrap();
     assert_eq!(sample["collector"], "ps");
     let processes = sample["processes"].as_array().unwrap();
-    assert!(!processes.is_empty());
+    assert_ne!(processes.as_slice(), []);
     assert!(
         processes
             .iter()

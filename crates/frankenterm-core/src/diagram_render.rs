@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn render_flow_empty() {
         let output = render_flow(&[], &[]);
-        assert!(output.is_empty());
+        assert_eq!(output, "");
     }
 
     // -- Topological ordering --
@@ -851,7 +851,7 @@ mod tests {
     fn box_style_all_variants_produce_output() {
         for style in [BoxStyle::Single, BoxStyle::Double, BoxStyle::Ascii] {
             let output = draw_box("test", style);
-            assert!(!output.is_empty());
+            assert_ne!(output, "");
             assert!(output.contains("test"));
         }
     }

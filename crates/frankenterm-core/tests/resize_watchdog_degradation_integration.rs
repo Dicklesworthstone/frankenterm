@@ -208,9 +208,18 @@ fn degradation_full_quality_when_no_stalls() {
     let assessment = evaluate_resize_degradation_ladder(signals);
     assert_eq!(assessment.tier, ResizeDegradationTier::FullQuality);
     assert_eq!(assessment.tier_rank, 0);
-    assert!(assessment.quality_reductions.is_empty());
-    assert!(assessment.correctness_guards.is_empty());
-    assert!(assessment.availability_changes.is_empty());
+    assert_eq!(
+        assessment.quality_reductions,
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(
+        assessment.correctness_guards,
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(
+        assessment.availability_changes,
+        [] as [std::string::String; 0]
+    );
     assert!(assessment.warning_line().is_none());
 }
 

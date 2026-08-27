@@ -884,7 +884,7 @@ mod tests {
         let checks = check_policy_engine_health(&mut engine, 1_700_000_000_000);
         for check in &checks {
             let json = serde_json::to_string(check).unwrap();
-            assert!(!json.is_empty());
+            assert_ne!(json, "");
             // Verify it deserializes back
             let _: RuntimeHealthCheck = serde_json::from_str(&json).unwrap();
         }

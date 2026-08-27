@@ -303,8 +303,14 @@ fn contract_operator_override_is_expired_boundary() {
 #[test]
 fn contract_override_state_default_empty() {
     let state = OperatorOverrideState::default();
-    assert!(state.active.is_empty());
-    assert!(state.history.is_empty());
+    assert_eq!(
+        state.active,
+        [] as [frankenterm_core::mission_loop::OperatorOverride; 0]
+    );
+    assert_eq!(
+        state.history,
+        [] as [frankenterm_core::mission_loop::OperatorOverride; 0]
+    );
 }
 
 #[test]
@@ -430,8 +436,14 @@ fn contract_mission_loop_state_has_override_state() {
     let ml = MissionLoop::new(MissionLoopConfig::default());
     let state = ml.state();
     // override_state field must exist and be default-empty.
-    assert!(state.override_state.active.is_empty());
-    assert!(state.override_state.history.is_empty());
+    assert_eq!(
+        state.override_state.active,
+        [] as [frankenterm_core::mission_loop::OperatorOverride; 0]
+    );
+    assert_eq!(
+        state.override_state.history,
+        [] as [frankenterm_core::mission_loop::OperatorOverride; 0]
+    );
     assert!(state.last_override_summary.is_none());
 }
 
@@ -732,7 +744,7 @@ fn contract_clear_override_returns_true_for_existing() {
     ))
     .unwrap();
     assert!(ml.clear_override("to-clear", 2000));
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
 }
 
 #[test]
@@ -760,6 +772,9 @@ fn contract_backward_compat_state_without_override_fields() {
     }"#;
     let state: MissionLoopState = serde_json::from_str(old_json).expect("deserialize old format");
     assert_eq!(state.cycle_count, 3);
-    assert!(state.override_state.active.is_empty());
+    assert_eq!(
+        state.override_state.active,
+        [] as [frankenterm_core::mission_loop::OperatorOverride; 0]
+    );
     assert!(state.last_override_summary.is_none());
 }

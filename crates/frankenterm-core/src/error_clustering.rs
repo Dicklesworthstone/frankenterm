@@ -678,7 +678,7 @@ mod tests {
         let sig2: Vec<u64> = (1000..1128).collect();
         idx.insert(0, &sig1);
         let candidates = idx.insert(1, &sig2);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [usize; 0]);
     }
 
     // -- ErrorClusterer --

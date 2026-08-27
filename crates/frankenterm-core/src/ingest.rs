@@ -4170,7 +4170,7 @@ mod tests {
     #[test]
     fn registry_tracks_panes() {
         let registry = PaneRegistry::new();
-        assert!(registry.pane_ids().is_empty());
+        assert_eq!(registry.pane_ids(), [] as [u64; 0]);
     }
 
     #[test]
@@ -5585,9 +5585,9 @@ mod tests {
         assert_eq!(diff.new_panes.len(), 2);
         assert!(diff.new_panes.contains(&1));
         assert!(diff.new_panes.contains(&2));
-        assert!(diff.closed_panes.is_empty());
-        assert!(diff.metadata_changes.is_empty());
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.closed_panes, [] as [u64; 0]);
+        assert_eq!(diff.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
 
         // Registry now tracks both panes
         assert_eq!(registry.len(), 2);
@@ -5609,7 +5609,7 @@ mod tests {
         let panes = vec![make_pane(1, "bash", Some("/home"))];
         let diff = registry.discovery_tick(panes);
 
-        assert!(diff.new_panes.is_empty());
+        assert_eq!(diff.new_panes, [] as [u64; 0]);
         assert_eq!(diff.closed_panes.len(), 1);
         assert!(diff.closed_panes.contains(&2));
 
@@ -5634,11 +5634,11 @@ mod tests {
         let panes = vec![make_pane(1, "vim", Some("/home"))];
         let diff = registry.discovery_tick(panes);
 
-        assert!(diff.new_panes.is_empty());
-        assert!(diff.closed_panes.is_empty());
+        assert_eq!(diff.new_panes, [] as [u64; 0]);
+        assert_eq!(diff.closed_panes, [] as [u64; 0]);
         assert_eq!(diff.metadata_changes.len(), 1);
         assert_eq!(diff.metadata_changes[0].pane_id, 1);
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
 
         // Mutable metadata advances without rotating lifecycle authority.
         let entry = registry.entries.get(&1).unwrap();
@@ -5663,11 +5663,11 @@ mod tests {
         pane.tab_id = 2;
         let diff = registry.discovery_tick(vec![pane]);
 
-        assert!(diff.new_panes.is_empty());
-        assert!(diff.closed_panes.is_empty());
+        assert_eq!(diff.new_panes, [] as [u64; 0]);
+        assert_eq!(diff.closed_panes, [] as [u64; 0]);
         assert_eq!(diff.metadata_changes.len(), 1);
         assert_eq!(diff.metadata_changes[0].pane_id, 1);
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
 
         // Verify metadata was updated but lifecycle stayed the same.
         let entry = registry.entries.get(&1).unwrap();
@@ -5688,7 +5688,7 @@ mod tests {
         let mut display_only = initial.clone();
         display_only.domain_name = Some("renamed-display".to_string());
         let display_diff = registry.discovery_tick(vec![display_only.clone()]);
-        assert!(display_diff.lifecycle_replacements.is_empty());
+        assert_eq!(display_diff.lifecycle_replacements, [] as [u64; 0]);
         assert_eq!(display_diff.metadata_changes.len(), 1);
         assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 0);
 
@@ -5700,8 +5700,8 @@ mod tests {
         assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
 
         let stable_diff = registry.discovery_tick(vec![replacement]);
-        assert!(stable_diff.lifecycle_replacements.is_empty());
-        assert!(stable_diff.metadata_changes.is_empty());
+        assert_eq!(stable_diff.lifecycle_replacements, [] as [u64; 0]);
+        assert_eq!(stable_diff.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
         assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
     }
 
@@ -5716,7 +5716,7 @@ mod tests {
         enriched.tty_name = Some("/dev/pts/8".to_string());
         let diff = registry.discovery_tick(vec![enriched]);
 
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
         assert_eq!(diff.metadata_changes.len(), 1);
         assert_ne!(
             diff.metadata_changes[0].diff.bits() & PaneMetadataDiff::IDENTITY_EVIDENCE,
@@ -5746,7 +5746,7 @@ mod tests {
         let diff = registry.discovery_tick(vec![ambiguous]);
 
         assert_eq!(diff.ambiguous_lifecycle_panes, vec![9]);
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
         let entry = registry.get_entry(9).unwrap();
         assert_eq!(entry.lifecycle_revision.get(), 0);
         assert!(!entry.should_observe());
@@ -5772,7 +5772,7 @@ mod tests {
         let diff = registry.discovery_tick(vec![proven.clone(), contradictory]);
 
         assert_eq!(diff.ambiguous_lifecycle_panes, vec![pane_id]);
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
         assert_eq!(diff.metadata_changes.len(), 1);
         let entry = registry.get_entry(pane_id).unwrap();
         assert_eq!(entry.lifecycle_identity.domain_id, Some(8));
@@ -5790,8 +5790,8 @@ mod tests {
 
         let repeated = registry.discovery_tick(vec![proven.clone(), proven]);
         assert_eq!(repeated.ambiguous_lifecycle_panes, vec![pane_id]);
-        assert!(repeated.lifecycle_replacements.is_empty());
-        assert!(repeated.metadata_changes.is_empty());
+        assert_eq!(repeated.lifecycle_replacements, [] as [u64; 0]);
+        assert_eq!(repeated.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
         assert_eq!(
             registry
                 .get_entry(pane_id)
@@ -5817,7 +5817,7 @@ mod tests {
         replacement.tty_name = Some("tty-b".to_string());
         let lifecycle_diff = lifecycle_registry.discovery_tick(vec![replacement]);
         assert_eq!(lifecycle_diff.revision_exhausted_panes, vec![10]);
-        assert!(lifecycle_diff.lifecycle_replacements.is_empty());
+        assert_eq!(lifecycle_diff.lifecycle_replacements, [] as [u64; 0]);
         assert!(!lifecycle_registry.get_entry(10).unwrap().should_observe());
         let lifecycle_repeat = lifecycle_registry.discovery_tick(vec![make_pane(
             10,
@@ -5836,7 +5836,7 @@ mod tests {
         let metadata_diff =
             metadata_registry.discovery_tick(vec![make_pane(11, "editor", Some("/tmp"))]);
         assert_eq!(metadata_diff.revision_exhausted_panes, vec![11]);
-        assert!(metadata_diff.metadata_changes.is_empty());
+        assert_eq!(metadata_diff.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
         assert!(!metadata_registry.get_entry(11).unwrap().should_observe());
         let metadata_repeat = metadata_registry.discovery_tick(vec![make_pane(
             11,
@@ -5873,7 +5873,7 @@ mod tests {
             exhausted.revision_exhausted_panes,
             (0..600_u64).collect::<Vec<_>>()
         );
-        assert!(exhausted.metadata_changes.is_empty());
+        assert_eq!(exhausted.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
 
         let repeated = registry.discovery_tick(changed);
         assert!(
@@ -5939,8 +5939,8 @@ mod tests {
                 diff.metadata_changes.len(),
                 usize::try_from(pane_count).expect("fixture pane count fits usize")
             );
-            assert!(diff.lifecycle_replacements.is_empty());
-            assert!(diff.revision_exhausted_panes.is_empty());
+            assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
+            assert_eq!(diff.revision_exhausted_panes, [] as [u64; 0]);
             assert_eq!(
                 registry
                     .entries
@@ -6388,12 +6388,12 @@ mod tests {
         // Tick 1: first sighting is a new pane, not a resumption.
         let diff = registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
         assert_eq!(diff.new_panes, vec![1]);
-        assert!(diff.re_observed_panes.is_empty());
+        assert_eq!(diff.re_observed_panes, [] as [u64; 0]);
         registry.get_cursor_mut(1).unwrap().next_seq = 7;
 
         // Tick 2: the title matches an exclude rule, so the pane retires.
         let diff = registry.discovery_tick(vec![make_pane(1, "vim", Some("/home"))]);
-        assert!(diff.re_observed_panes.is_empty());
+        assert_eq!(diff.re_observed_panes, [] as [u64; 0]);
         assert!(registry.get_cursor(1).is_none());
         assert_eq!(registry.entries.get(&1).unwrap().resume_next_seq, 7);
 
@@ -6717,19 +6717,19 @@ mod tests {
     fn osc133_parse_ignores_malformed() {
         // Unknown marker type
         let markers = parse_osc133_markers("\x1b]133;X\x07");
-        assert!(markers.is_empty());
+        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
 
         // Missing terminator (text ends before terminator)
         let markers = parse_osc133_markers("\x1b]133;A");
-        assert!(markers.is_empty());
+        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
 
         // Wrong OSC number
         let markers = parse_osc133_markers("\x1b]7;A\x07");
-        assert!(markers.is_empty());
+        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
 
         // Not an OSC sequence
         let markers = parse_osc133_markers("[133;A");
-        assert!(markers.is_empty());
+        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
     }
 
     #[test]
@@ -7614,7 +7614,7 @@ mod tests {
         changed.title = Some("vim".to_string());
         let diff = reg.discovery_tick(vec![changed]);
 
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
         assert_eq!(diff.metadata_changes.len(), 1);
         assert!(diff.new_panes.is_empty(), "should not be new pane");
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
@@ -7637,7 +7637,7 @@ mod tests {
         changed.cwd = Some("/tmp".to_string());
         let diff = reg.discovery_tick(vec![changed]);
 
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
         assert_eq!(diff.metadata_changes.len(), 1);
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
         assert_eq!(
@@ -7662,7 +7662,7 @@ mod tests {
 
         assert_eq!(diff.metadata_changes.len(), 1);
         assert_eq!(diff.metadata_changes[0].pane_id, 1);
-        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
         assert_eq!(
             uuid_before, uuid_after,
@@ -8072,7 +8072,7 @@ mod tests {
             overflow: false,
         });
 
-        assert!(segments.is_empty());
+        assert_eq!(segments, [] as [ingest::CapturedSegment; 0]);
         assert_eq!(ingester.active_panes(), 0);
         assert_eq!(ingester.total_segments(), 0);
         assert_eq!(ingester.total_gaps(), 0);
@@ -8299,7 +8299,7 @@ mod tests {
     fn ingester_pane_closed_unknown_pane_is_noop() {
         let mut ingester = StreamIngester::new();
         let segs = ingester.process(StreamEvent::PaneClosed { pane_id: 999 });
-        assert!(segs.is_empty());
+        assert_eq!(segs, [] as [ingest::CapturedSegment; 0]);
     }
 
     // --- Disconnected ---

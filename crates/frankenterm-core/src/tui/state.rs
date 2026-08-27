@@ -781,7 +781,7 @@ mod tests {
             ..Default::default()
         };
         reduce(&mut state, UiAction::ClearPanesFilters);
-        assert!(state.panes_filter.is_empty());
+        assert_eq!(state.panes_filter, "");
         assert!(!state.panes_unhandled_only);
         assert!(!state.panes_bookmarked_only);
         assert!(state.panes_agent_filter.is_none());
@@ -879,8 +879,8 @@ mod tests {
 
         // Clear
         reduce(&mut state, UiAction::ClearSearch);
-        assert!(state.search_query.is_empty());
-        assert!(state.search_last_query.is_empty());
+        assert_eq!(state.search_query, "");
+        assert_eq!(state.search_last_query, "");
         assert_eq!(state.search_results_count, 0);
     }
 
@@ -888,7 +888,7 @@ mod tests {
     fn reduce_submit_empty_search_is_noop() {
         let mut state = UiState::default();
         let effects = reduce(&mut state, UiAction::SubmitSearch);
-        assert!(effects.is_empty());
+        assert_eq!(effects, [] as [tui::state::Effect; 0]);
     }
 
     #[test]
@@ -1065,9 +1065,9 @@ mod tests {
         reduce(&mut state, UiAction::PopEventsFilterChar);
         assert_eq!(state.events_pane_filter, "4");
         reduce(&mut state, UiAction::PopEventsFilterChar);
-        assert!(state.events_pane_filter.is_empty());
+        assert_eq!(state.events_pane_filter, "");
         reduce(&mut state, UiAction::PopEventsFilterChar);
-        assert!(state.events_pane_filter.is_empty()); // No panic on empty
+        assert_eq!(state.events_pane_filter, ""); // No panic on empty
     }
 
     #[test]
@@ -1078,7 +1078,7 @@ mod tests {
             ..Default::default()
         };
         reduce(&mut state, UiAction::ClearEventsFilter);
-        assert!(state.events_pane_filter.is_empty());
+        assert_eq!(state.events_pane_filter, "");
         assert_eq!(state.events.selected, 0);
     }
 
@@ -1135,7 +1135,7 @@ mod tests {
             ..Default::default()
         };
         reduce(&mut state, UiAction::ClearHistoryFilter);
-        assert!(state.history_filter.is_empty());
+        assert_eq!(state.history_filter, "");
         assert_eq!(state.history.selected, 0);
     }
 

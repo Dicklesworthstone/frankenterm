@@ -2011,7 +2011,7 @@ mod tests {
         assert_eq!(enrichment.health_tier, HealthTier::Red);
         assert_eq!(enrichment.phase, RuntimePhase::Running);
         assert!(enrichment.recent_events.is_empty());
-        assert!(enrichment.recent_records.is_empty());
+        assert_eq!(enrichment.recent_records, [] as [runtime_telemetry::UnifiedTelemetryRecord; 0]);
     }
 
     #[test]
@@ -2311,7 +2311,7 @@ mod tests {
         assert_eq!(cockpit.schema_version, SLO_COCKPIT_SCHEMA_VERSION);
         assert!(cockpit.is_green());
         assert_eq!(cockpit.primary_bottleneck, None);
-        assert!(cockpit.next_steps.is_empty());
+        assert_eq!(cockpit.next_steps, [] as [std::string::String; 0]);
         assert_eq!(json["overall_tier"], "green");
         assert_eq!(json["summary"], "all monitored swarm SLO domains are green");
     }

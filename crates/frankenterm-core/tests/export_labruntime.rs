@@ -553,7 +553,7 @@ fn export_empty_produces_header_only() {
         assert_eq!(header["_export"], true);
         assert_eq!(header["kind"], "events");
         assert_eq!(header["record_count"], 0);
-        assert!(records.is_empty());
+        assert_eq!(records, [] as [serde_json::Value; 0]);
 
         teardown(storage, &db_path).await;
     });
@@ -989,7 +989,7 @@ fn export_segment_schema_validation() {
         assert_fields_present(&header, &expected_header_fields(), "Segment export header");
         assert_eq!(header["_export"], true);
         assert_eq!(header["kind"], "segments");
-        assert!(!header["version"].as_str().unwrap().is_empty());
+        assert_ne!(header["version"].as_str().unwrap(), "");
 
         assert_eq!(records.len(), 1);
         assert_fields_present(&records[0], &expected_segment_fields(), "Segment record");

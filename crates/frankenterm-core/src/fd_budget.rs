@@ -727,7 +727,7 @@ mod tests {
         let validation = validate_system_limits(&config, 2);
         // With only 2 target panes and min_nofile of 64, this should pass
         assert!(validation.all_ok);
-        assert!(validation.fix_commands.is_empty());
+        assert_eq!(validation.fix_commands, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -743,7 +743,7 @@ mod tests {
         assert!(validation.checks.len() >= 2);
         // All checks should have valid fields
         for check in &validation.checks {
-            assert!(!check.name.is_empty());
+            assert_ne!(check.name, "");
         }
     }
 

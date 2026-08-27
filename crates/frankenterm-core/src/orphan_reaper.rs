@@ -494,7 +494,7 @@ mod tests {
                 let report = reap_orphans_with_cx(&cx, 0).await;
                 assert_eq!(report.scanned, 0);
                 assert_eq!(report.killed, 0);
-                assert!(report.killed_pids.is_empty());
+                assert_eq!(report.killed_pids, [] as [u32; 0]);
                 assert_eq!(
                     report.errors,
                     vec!["reap disabled: no handle-owned child identity".to_string()]

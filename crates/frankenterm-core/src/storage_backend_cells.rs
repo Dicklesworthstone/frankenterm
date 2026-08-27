@@ -328,7 +328,7 @@ mod tests {
             .execute_batch("CREATE TABLE t (x INTEGER);")
             .unwrap();
         let rows = query_map_cells(&backend, "SELECT x FROM t", &[]).unwrap();
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [storage_backend_cells::RowCells; 0]);
     }
 
     #[test]

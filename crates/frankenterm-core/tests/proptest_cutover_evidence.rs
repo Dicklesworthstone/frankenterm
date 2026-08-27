@@ -561,7 +561,7 @@ fn empty_evidence_package_evaluates() {
     let pkg = EvidencePackage::new("test", 1);
     let verdict = pkg.evaluate();
     // Empty package should produce some verdict
-    assert!(!verdict.rationale.is_empty());
+    assert_ne!(verdict.rationale, "");
 }
 
 #[test]

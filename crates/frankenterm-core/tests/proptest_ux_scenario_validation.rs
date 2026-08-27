@@ -715,6 +715,6 @@ fn go_no_go_renders() {
     let thresholds = UxThresholds::development();
     let eval = GoNoGoEvaluation::evaluate(&telemetry, &thresholds);
     let rendered = eval.render();
-    assert!(!rendered.is_empty());
+    assert_ne!(rendered, "");
     assert!(rendered.contains("Go/No-Go"));
 }

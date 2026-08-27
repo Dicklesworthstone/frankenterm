@@ -1999,8 +1999,8 @@ mod tests {
         assert_eq!(deserialized.max_delay_ms, 5000);
         assert!(!deserialized.skip_empty);
         assert!(deserialized.include_markers);
-        assert!(deserialized.pane_filter.is_empty());
-        assert!(deserialized.kind_filter.is_empty());
+        assert_eq!(deserialized.pane_filter, [] as [u64; 0]);
+        assert_eq!(deserialized.kind_filter, [] as [recorder_query::QueryEventKind; 0]);
         assert_eq!(
             deserialized.equivalence_level,
             ReplayEquivalenceLevel::Decision
@@ -2863,7 +2863,7 @@ mod tests {
         let first_run = scheduler.run_to_completion();
         let second_run = scheduler.run_to_completion();
         assert_eq!(first_run.len(), 2);
-        assert!(second_run.is_empty());
+        assert_eq!(second_run, [] as [recorder_replay::ReplayScheduleStep; 0]);
         assert_eq!(scheduler.cursor(), scheduler.total_events());
     }
 
@@ -2881,7 +2881,7 @@ mod tests {
         let step = scheduler.next_step();
         assert!(step.is_none());
         assert_eq!(scheduler.cursor(), scheduler.total_events());
-        assert!(scheduler.decisions().is_empty());
+        assert_eq!(scheduler.decisions(), []);
     }
 
     #[test]
@@ -2987,7 +2987,7 @@ mod tests {
             .resume(checkpoint)
             .expect("zero decisions <= cursor must accept");
         assert_eq!(scheduler.cursor(), real_cursor);
-        assert!(scheduler.decisions().is_empty());
+        assert_eq!(scheduler.decisions(), []);
     }
 
     proptest! {
@@ -3081,13 +3081,13 @@ mod tests {
         let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
         let _ = scheduler.run_to_completion();
         let trace = scheduler.decision_trace_bytes().unwrap();
-        assert!(!trace.is_empty());
+        assert_ne!(trace, [] as [u8; 0]);
         assert_eq!(trace.last().copied(), Some(b'\n'));
 
         let lines = String::from_utf8(trace).unwrap();
         for line in lines.lines() {
             let parsed: ReplayDecisionRecord = serde_json::from_str(line).unwrap();
-            assert!(!parsed.decision_id.is_empty());
+            assert_ne!(parsed.decision_id, "");
         }
     }
 

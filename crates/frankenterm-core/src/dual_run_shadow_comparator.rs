@@ -1180,7 +1180,7 @@ mod tests {
         );
         let verdict = wf.compare(&dual);
         let ids = wf.classify_and_add("s1", &verdict, 1000);
-        assert!(!ids.is_empty());
+        assert_ne!(ids, [] as [u64; 0]);
         assert_eq!(wf.len(), ids.len());
     }
 

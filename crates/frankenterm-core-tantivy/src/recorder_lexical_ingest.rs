@@ -411,7 +411,7 @@ mod tests {
         let config = test_config(dir.path());
         let indexer = LexicalIndexer::open(config.clone()).unwrap();
 
-        assert!(!indexer.fingerprint().is_empty());
+        assert_ne!(indexer.fingerprint(), "");
         assert_eq!(indexer.doc_count().unwrap(), 0);
 
         // Fingerprint file should exist
@@ -1141,7 +1141,7 @@ mod tests {
 
         // Reopen should succeed (fingerprint check is skipped if file absent)
         let indexer2 = LexicalIndexer::open(config).unwrap();
-        assert!(!indexer2.fingerprint().is_empty());
+        assert_ne!(indexer2.fingerprint(), "");
     }
 
     // =========================================================================

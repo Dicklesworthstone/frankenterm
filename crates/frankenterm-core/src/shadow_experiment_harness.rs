@@ -1071,7 +1071,7 @@ mod tests {
     fn new_harness_starts_empty() {
         let h = ShadowExperimentHarness::new(manifest(ExperimentBudget::conservative()));
         assert_eq!(h.ledger().schema_version, SHADOW_EXPERIMENT_LEDGER_SCHEMA);
-        assert!(h.ledger().decisions.is_empty());
+        assert_eq!(h.ledger().decisions, [] as [shadow_experiment_harness::ShadowDecisionPair; 0]);
         assert_eq!(h.ledger().sampling_gaps, 0);
         assert!(h.ledger().abort_reason.is_none());
         assert!(!h.is_aborted());

@@ -716,7 +716,7 @@ mod tests {
         let mut ev = press(9);
         ev.event_kind = KeyEventKind::Release;
         let bytes = encode_key_event(&ev, KittyKbdFlagSet::empty());
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, [] as [u8; 0]);
     }
 
     #[test]

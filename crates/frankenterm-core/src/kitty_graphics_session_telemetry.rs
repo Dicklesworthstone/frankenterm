@@ -457,7 +457,7 @@ mod tests {
         ] {
             // Slug must be non-empty and not contain whitespace.
             let slug = action_slug(action);
-            assert!(!slug.is_empty());
+            assert_ne!(slug, "");
             assert!(!slug.contains(' '));
         }
     }
@@ -504,7 +504,7 @@ mod tests {
                 assert_eq!(bytes_in, 4_096);
                 assert_eq!(bytes_out, 1_024);
                 assert_eq!(decode_ns, 5_000_000);
-                assert!(!layer_slug.is_empty());
+                assert_ne!(layer_slug, "");
             }
             other => panic!("expected ImageAdmitted, got {other:?}"),
         }
@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(agg.summary().total_rejected, 1);
         // A second flush returns empty.
         let drained2 = agg.flush_log_rows();
-        assert!(drained2.is_empty());
+        assert_eq!(drained2, [] as [kitty_graphics_compositor::StructuredLogRow; 0]);
     }
 
     #[test]

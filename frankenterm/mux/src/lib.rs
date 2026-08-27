@@ -71,7 +71,7 @@ use crate::guardian_output_journal::{
     GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
     GuardianOutputPredecessor, GuardianOutputRecoveryBatch, GuardianOutputRecoveryLimits,
 };
-use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
+use crate::pane::{CachePolicy, CloseReason, GuardianLiveOutputReader, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
@@ -1680,8 +1680,13 @@ type MuxSubscriber = dyn Fn(MuxNotificationEnvelope) -> bool + Send + Sync;
 
 struct PreparedPaneRegistration {
     pane_id: PaneId,
-    reader: Option<Box<dyn std::io::Read + Send>>,
+    reader: Option<PreparedPaneReader>,
     registration_reservation: pane_registration_handle::PaneRegistrationReservation,
+}
+
+enum PreparedPaneReader {
+    Raw(Box<dyn std::io::Read + Send>),
+    Guardian(Box<dyn GuardianLiveOutputReader>),
 }
 
 /// Process-local, non-forgeable identity for one live registration of a pane.
@@ -2796,6 +2801,33 @@ impl LiveParserCheckpointControl {
         drop(state);
         self.delivery_gate.notify_all();
         Ok(parser_global_endpoint)
+    }
+
+    /// Wait until a checkpoint or prior exact delivery releases the single
+    /// guardian publication slot. Permanent reader failures remain fail-fast;
+    /// callers must retry the full authorization after this returns because a
+    /// competing checkpoint can claim the slot between wakeup and retry.
+    fn wait_for_guardian_delivery_slot(&self) -> Result<(), LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        loop {
+            if !state.attached {
+                return Err(LiveParserCheckpointError::ReaderUnavailable);
+            }
+            if state.dead {
+                return Err(LiveParserCheckpointError::ReaderDead);
+            }
+            if let Some(reason) = state.poison {
+                return Err(LiveParserCheckpointError::Poisoned(reason));
+            }
+            if !state.delivery_call_in_flight
+                && !state.socket_write_in_flight
+                && state.authorized_delivery.is_none()
+                && state.pending.is_none()
+            {
+                return Ok(());
+            }
+            self.delivery_gate.wait(&mut state);
+        }
     }
 
     fn register_checkpoint(
@@ -10113,6 +10145,82 @@ fn schedule_pane_reader_eof(
 /// blocking reads from the pty (non-blocking reads are not portable to
 /// all platforms and pty/tty types), parse the escape sequences and
 /// relay the actions to the mux thread to apply them to the pane.
+fn read_from_guardian_live_output(
+    pane: Weak<dyn Pane>,
+    generation: Arc<PaneRegistrationGeneration>,
+    mut reader: Box<dyn GuardianLiveOutputReader>,
+    dead: Arc<AtomicBool>,
+    parser_done: std::sync::mpsc::Receiver<()>,
+) {
+    let data_writer_guard = LiveParserDataWriterGuard::new(&generation.live_parser_checkpoint);
+    let pane_for_lifecycle = Weak::clone(&pane);
+    let (pane_id, exit_behavior) = match pane.upgrade() {
+        Some(pane) => (pane.pane_id(), pane.exit_behavior()),
+        None => return,
+    };
+
+    while !dead.load(Ordering::Acquire) {
+        let result = reader.deliver_next_record(&mut |segment, output, payload| {
+            let _generation_lease = generation.try_acquire().ok_or_else(|| {
+                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
+            })?;
+            let expected_pane = pane.upgrade().ok_or_else(|| {
+                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
+            })?;
+            let mux = resolve_pane_reader_mux(&expected_pane, &generation).ok_or_else(|| {
+                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
+            })?;
+            let operation = mux.capture_pane_operation(pane_id).ok_or_else(|| {
+                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
+            })?;
+            if operation.wire_identity() != generation.wire_identity {
+                return Err(std::io::Error::other(
+                    LiveParserCheckpointError::StaleRegistration.to_string(),
+                ));
+            }
+            loop {
+                match operation.authorize_guardian_output_delivery(
+                    segment,
+                    output,
+                    Arc::clone(&payload),
+                ) {
+                    Ok(_) => break,
+                    Err(
+                        LiveParserCheckpointError::CheckpointBusy
+                        | LiveParserCheckpointError::GuardianDeliveryBusy
+                        | LiveParserCheckpointError::DeliveryWriteInFlight,
+                    ) => generation
+                        .live_parser_checkpoint
+                        .wait_for_guardian_delivery_slot()
+                        .map_err(|error| std::io::Error::other(error.to_string()))?,
+                    Err(error) => return Err(std::io::Error::other(error.to_string())),
+                }
+            }
+            generation
+                .live_parser_checkpoint
+                .write_delivered_bytes(payload.as_ref())
+        });
+        if let Err(error) = result {
+            log::error!(
+                "guardian record delivery failed before replay acknowledgement: pane {} {:?}",
+                pane_id,
+                error
+            );
+            break;
+        }
+    }
+
+    // The replay page remains unacknowledged on every delivery error. Closing
+    // the parser writer flushes only bytes already fenced into this exact
+    // generation; a successor resumes from its durable checkpoint boundary.
+    data_writer_guard.close();
+    let _ = parser_done.recv();
+
+    let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
+    schedule_pane_reader_eof(pane_for_lifecycle, generation, pane_id, exit_behavior);
+    dead.store(true, Ordering::Release);
+}
+
 fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
@@ -14077,7 +14185,10 @@ impl Mux {
         });
         pane.set_download_handler(&downloader);
 
-        let reader = pane.reader()?;
+        let reader = match pane.guardian_live_output_reader()? {
+            Some(reader) => Some(PreparedPaneReader::Guardian(reader)),
+            None => pane.reader()?.map(PreparedPaneReader::Raw),
+        };
         Ok(PreparedPaneRegistration {
             pane_id,
             reader,
@@ -14160,6 +14271,13 @@ impl Mux {
             registration_reservation,
         } = prepared;
         if let Some(reader) = reader {
+            let banner = self.banner.read().clone();
+            if matches!(&reader, PreparedPaneReader::Guardian(_)) && banner.is_some() {
+                generation.reader_dead.store(true, Ordering::Release);
+                return Err(anyhow!(
+                    "pane {pane_id} has authenticated guardian output and cannot accept an unauthenticated mux banner"
+                ));
+            }
             #[cfg(test)]
             let fault = self.pane_reader_preparation_fault.lock().take();
             #[cfg(test)]
@@ -14192,7 +14310,6 @@ impl Mux {
                 .map_err(|error| {
                     anyhow!("attach pane {pane_id} parser data/control channels: {error}")
                 })?;
-            let banner = self.banner.read().clone();
             let weak_pane = Arc::downgrade(pane);
             let coordinator = Arc::new(PaneReaderStartCoordinator::new());
             let dead = Arc::clone(&generation.reader_dead);
@@ -14287,16 +14404,25 @@ impl Mux {
                             return;
                         }
                         match reader_coordinator.wait() {
-                            PaneReaderStartDecision::Released => {
-                                read_from_pane_pty(
+                            PaneReaderStartDecision::Released => match reader {
+                                PreparedPaneReader::Raw(reader) => read_from_pane_pty(
                                     reader_pane,
                                     reader_generation,
                                     banner,
                                     reader,
                                     reader_dead,
                                     parser_done_rx,
-                                );
-                            }
+                                ),
+                                PreparedPaneReader::Guardian(reader) => {
+                                    read_from_guardian_live_output(
+                                        reader_pane,
+                                        reader_generation,
+                                        reader,
+                                        reader_dead,
+                                        parser_done_rx,
+                                    );
+                                }
+                            },
                             PaneReaderStartDecision::Cancelled => {}
                         }
                     })

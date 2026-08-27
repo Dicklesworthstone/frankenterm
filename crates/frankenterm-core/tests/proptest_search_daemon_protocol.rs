@@ -312,7 +312,7 @@ fn embed_response_preserves_empty_vector() {
     let bytes = resp.to_json_bytes().unwrap();
     let back = DaemonResponse::from_json_bytes(&bytes).unwrap();
     if let DaemonResponse::Embed(e) = back {
-        assert!(e.vector.is_empty());
+        assert_eq!(e.vector, [] as [f32; 0]);
     } else {
         panic!("Expected Embed response");
     }

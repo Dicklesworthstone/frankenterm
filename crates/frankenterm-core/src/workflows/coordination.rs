@@ -1417,7 +1417,7 @@ mod tests {
         let caps = caps_ready();
         let preconds = default_broadcast_preconditions();
         let failed = check_preconditions(&preconds, &caps);
-        assert!(failed.is_empty());
+        assert_eq!(failed, [] as [&str; 0]);
     }
 
     #[test]

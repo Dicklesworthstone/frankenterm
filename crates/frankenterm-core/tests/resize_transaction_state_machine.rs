@@ -120,7 +120,7 @@ fn state_machine_happy_path_commits_single_intent() {
 
     assert_eq!(model.phase, TxPhase::Idle);
     assert_eq!(model.committed, vec![1]);
-    assert!(model.cancelled.is_empty());
+    assert_eq!(model.cancelled, [] as [u64; 0]);
 }
 
 #[test]
@@ -203,8 +203,8 @@ fn default_model_starts_idle_with_no_sequences() {
     assert_eq!(model.phase, TxPhase::Idle);
     assert_eq!(model.active_seq, None);
     assert_eq!(model.latest_seq, None);
-    assert!(model.cancelled.is_empty());
-    assert!(model.committed.is_empty());
+    assert_eq!(model.cancelled, [] as [u64; 0]);
+    assert_eq!(model.committed, [] as [u64; 0]);
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn sequential_transactions_commit_independently() {
     assert!(model.start_present());
     assert!(model.commit());
     assert_eq!(model.committed, vec![1, 2]);
-    assert!(model.cancelled.is_empty());
+    assert_eq!(model.cancelled, [] as [u64; 0]);
 }
 
 #[test]
@@ -400,5 +400,5 @@ fn cancel_if_superseded_is_noop_when_latest_equals_active() {
     model.phase = TxPhase::Preparing;
     assert!(!model.cancel_if_superseded());
     assert_eq!(model.phase, TxPhase::Preparing);
-    assert!(model.cancelled.is_empty());
+    assert_eq!(model.cancelled, [] as [u64; 0]);
 }

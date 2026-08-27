@@ -107,12 +107,12 @@ fn generate_bundle_creates_all_files() {
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
         assert!(manifest["redacted"].as_bool().unwrap());
         assert!(manifest["file_count"].as_u64().unwrap() >= 8);
-        assert!(!manifest["wa_version"].as_str().unwrap().is_empty());
+        assert_ne!(manifest["wa_version"].as_str().unwrap(), "");
 
         // Verify environment.json
         let env_content = std::fs::read_to_string(output_dir.join("environment.json")).unwrap();
         let env_info: serde_json::Value = serde_json::from_str(&env_content).unwrap();
-        assert!(!env_info["wa_version"].as_str().unwrap().is_empty());
+        assert_ne!(env_info["wa_version"].as_str().unwrap(), "");
         assert_eq!(env_info["schema_version"], SCHEMA_VERSION);
 
         // Verify db_health.json
@@ -249,7 +249,7 @@ fn bundle_manifest_has_stable_metadata() {
 
         // Required fields
         assert!(manifest["wa_version"].is_string());
-        assert!(!manifest["wa_version"].as_str().unwrap().is_empty());
+        assert_ne!(manifest["wa_version"].as_str().unwrap(), "");
         assert!(manifest["generated_at_ms"].is_number());
         assert!(manifest["generated_at_ms"].as_u64().unwrap() > 0);
         assert!(manifest["file_count"].is_number());
@@ -360,7 +360,7 @@ fn bundle_includes_reservation_snapshot() {
             std::fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
         let history: serde_json::Value = serde_json::from_str(&hist_content).unwrap();
         let hist_arr = history.as_array().unwrap();
-        assert!(!hist_arr.is_empty());
+        assert_ne!(hist_arr.as_slice(), []);
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

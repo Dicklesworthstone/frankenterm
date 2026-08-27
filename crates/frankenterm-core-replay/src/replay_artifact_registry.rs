@@ -1070,7 +1070,10 @@ mod tests {
     fn manifest_default_is_empty() {
         let m = ArtifactManifest::new();
         assert_eq!(m.schema_version, MANIFEST_SCHEMA_VERSION);
-        assert!(m.artifacts.is_empty());
+        assert_eq!(
+            m.artifacts,
+            [] as [crate::replay_artifact_registry::ArtifactEntry; 0]
+        );
     }
 
     #[test]
@@ -1486,7 +1489,10 @@ mod tests {
             0,
             "oversized replay artifact must be rejected before read_file allocates"
         );
-        assert!(reg.manifest().artifacts.is_empty());
+        assert_eq!(
+            reg.manifest().artifacts,
+            [] as [crate::replay_artifact_registry::ArtifactEntry; 0]
+        );
     }
 
     #[test]
@@ -1516,7 +1522,10 @@ mod tests {
             )
             .unwrap_err();
         assert!(parent_err.contains("parent-directory"), "{parent_err}");
-        assert!(reg.manifest().artifacts.is_empty());
+        assert_eq!(
+            reg.manifest().artifacts,
+            [] as [crate::replay_artifact_registry::ArtifactEntry; 0]
+        );
     }
 
     #[test]
@@ -1623,7 +1632,10 @@ mod tests {
         });
         assert_eq!(result.pruned_count, 1);
         assert_eq!(result.pruned_paths, vec!["old.ftreplay"]);
-        assert!(reg.manifest().artifacts.is_empty());
+        assert_eq!(
+            reg.manifest().artifacts,
+            [] as [crate::replay_artifact_registry::ArtifactEntry; 0]
+        );
     }
 
     #[test]
@@ -1890,7 +1902,10 @@ mod tests {
         fs.add_file(PathBuf::from("/base/valid.ftreplay"), content.to_vec());
         let reg = setup_registry(vec![entry], fs);
         let errors = reg.validate();
-        assert!(errors.is_empty());
+        assert_eq!(
+            errors,
+            [] as [crate::replay_artifact_registry::ManifestValidationError; 0]
+        );
     }
 
     // ── Render tests ─────────────────────────────────────────────────────

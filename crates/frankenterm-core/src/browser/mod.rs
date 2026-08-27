@@ -4928,7 +4928,7 @@ mod tests {
             PlaywrightCapabilityProbeError::MissingCapability,
             PlaywrightCapabilityProbeError::InvalidOutput,
         ] {
-            assert!(!failure.detail().is_empty());
+            assert_ne!(failure.detail(), "");
         }
     }
 

@@ -358,7 +358,7 @@ mod tests {
             },
         };
         let results = emb.embed_batch(&[]).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [std::vec::Vec<f32>; 0]);
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         ];
         for e in variants {
             let dbg = format!("{:?}", e);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 

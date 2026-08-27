@@ -957,8 +957,11 @@ fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() 
     );
     assert_eq!(claimable.input.br_show.status, "open");
     assert!(claimable.input.br_show.assignee.is_none());
-    assert!(claimable.input.br_show.dependencies.is_empty());
-    assert!(claimable.input.dirty_paths.is_empty());
+    assert_eq!(
+        claimable.input.br_show.dependencies,
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(claimable.input.dirty_paths, [] as [std::string::String; 0]);
     assert_eq!(claimable.input.mail_state, "ok");
     assert_eq!(claimable.input.external_state, "none");
 }

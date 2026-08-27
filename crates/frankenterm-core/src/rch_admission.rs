@@ -2275,7 +2275,7 @@ mod tests {
         );
 
         assert_eq!(analysis.classification, "cargo_test");
-        assert!(analysis.package_scope.is_empty());
+        assert_eq!(analysis.package_scope, [] as [std::string::String; 0]);
         assert_eq!(analysis.test_scope, vec![String::from("rch_admission")]);
         assert_eq!(analysis.effective_jobs, 2);
     }
@@ -2295,7 +2295,7 @@ mod tests {
         );
         assert_eq!(analysis.target_dir.as_deref(), Some("/tmp/target-rch"));
         assert_eq!(analysis.package_scope, vec![String::from("mux")]);
-        assert!(analysis.test_scope.is_empty());
+        assert_eq!(analysis.test_scope, [] as [std::string::String; 0]);
         assert_eq!(analysis.explicit_jobs, Some(2));
         assert_eq!(
             analysis.job_source,
@@ -2640,8 +2640,8 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
-        assert!(report.reason_codes.is_empty());
-        assert!(report.recommendations.is_empty());
+        assert_eq!(report.reason_codes, [] as [rch_admission::RchAdmissionReasonCode; 0]);
+        assert_eq!(report.recommendations, [] as [rch_admission::RchAdmissionRecommendation; 0]);
         assert_eq!(report.cargo_jobs, Some(1));
         assert_eq!(report.estimated_slots, Some(1));
     }
@@ -2815,7 +2815,7 @@ mod tests {
             preflight.proof_command.proof_scope,
             Some(ProofScope::Package { ref package }) if package == "frankenterm-core"
         ));
-        assert!(preflight.proof_command.risks.is_empty());
+        assert_eq!(preflight.proof_command.risks, [] as [rch_admission::RchAdmissionProofCommandRisk; 0]);
         assert!(preflight.summary.contains("admitted: 1 worker"));
         assert!(preflight.summary.contains("package-scoped"));
     }
@@ -3003,7 +3003,7 @@ mod tests {
         assert_eq!(dirty[1].category, "untracked");
         assert_eq!(dirty[2].category, "deleted");
         assert_eq!(dirty[3].category, "added");
-        assert!(parse_git_porcelain_dirty("").is_empty());
+        assert_eq!(parse_git_porcelain_dirty(""), [] as [rch_admission::RchAdmissionGitDirtyPath; 0]);
     }
 
     #[test]
@@ -3035,7 +3035,7 @@ mod tests {
             rejections[0].reason_code,
             RchAdmissionReasonCode::NoAdmissibleWorkers
         );
-        assert!(parse_rch_status_worker_rejections("{}").is_empty());
+        assert_eq!(parse_rch_status_worker_rejections("{}"), [] as [rch_admission::RchAdmissionWorkerRejection; 0]);
     }
 
     #[test]
@@ -3049,7 +3049,7 @@ mod tests {
         assert_eq!(input.source, "ft doctor --rch-admission");
         // A real report can be built from the live input (the production gap).
         let report = build_rch_admission_report(&input);
-        assert!(!report.source.is_empty());
+        assert_ne!(report.source, "");
         // Agent-mail is always recorded as a bounded skip rather than hanging.
         assert!(
             input

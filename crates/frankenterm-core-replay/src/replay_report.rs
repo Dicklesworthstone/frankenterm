@@ -557,8 +557,8 @@ mod tests {
         let generator = ReportGenerator::new(sample_meta());
         let report = generator.generate(&sample_diff(), ReportFormat::Json);
         let parsed: JsonReport = serde_json::from_str(&report).unwrap();
-        assert!(!parsed.equivalence_level.is_empty());
-        assert!(!parsed.recommendation.is_empty());
+        assert_ne!(parsed.equivalence_level, "");
+        assert_ne!(parsed.recommendation, "");
         assert!(!parsed.divergences.is_empty());
     }
 
@@ -729,8 +729,8 @@ mod tests {
     #[test]
     fn default_meta() {
         let meta = ReportMeta::default();
-        assert!(meta.replay_run_id.is_empty());
-        assert!(meta.artifact_path.is_empty());
+        assert_eq!(meta.replay_run_id, "");
+        assert_eq!(meta.artifact_path, "");
     }
 
     // ── Custom scorer ──────────────────────────────────────────────────

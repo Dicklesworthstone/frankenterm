@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn allocate_weighted_empty_mix() {
         let alloc = allocate_weighted(5, &[]);
-        assert!(alloc.is_empty());
+        assert_eq!(alloc, [] as [u32; 0]);
     }
 
     // ── br-ft-4x6de: weight-sum overflow guard ──
@@ -2041,7 +2041,7 @@ mod tests {
         let mix = vec![agent_mix("a", 1), agent_mix("b", 0)];
         let spec = basic_spec("warn-test", mix);
         let plan = launcher.plan(&spec).unwrap();
-        assert!(!plan.warnings.is_empty());
+        assert_ne!(plan.warnings, [] as [std::string::String; 0]);
         assert!(plan.warnings[0].contains("weight 0"));
     }
 
@@ -2278,7 +2278,7 @@ mod tests {
 
         let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
 
-        assert!(outcome.bootstrap_dispatches.is_empty());
+        assert_eq!(outcome.bootstrap_dispatches, [] as [(u32, usize); 0]);
         assert!(outcome.pre_launch_checkpoint.is_none());
     }
 
@@ -2379,7 +2379,7 @@ mod tests {
         let spec = basic_spec("labels-test", vec![agent_mix("a", 2)]);
         let plan = launcher.plan(&spec).unwrap();
         let labels = plan.phase_labels();
-        assert!(!labels.is_empty());
+        assert_ne!(labels, [] as [std::string::String; 0]);
         // Parallel has a single "all" phase
         assert_eq!(labels, vec!["all"]);
     }

@@ -774,7 +774,10 @@ fn conflict_detection_stats_in_report() {
     ];
 
     let cr = ml.detect_conflicts(&d.assignment_set, &reservations, &[], 1000, &issues);
-    assert!(!cr.conflicts.is_empty());
+    assert_ne!(
+        cr.conflicts,
+        [] as [frankenterm_core::mission_loop::AssignmentConflict; 0]
+    );
 
     let report = ml.generate_operator_report(Some(&elog()), None);
     assert!(report.conflicts.total_detected > 0);

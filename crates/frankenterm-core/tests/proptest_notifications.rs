@@ -517,7 +517,7 @@ fn delivery_record_debug_nonempty() {
         error: None,
     };
     let debug = format!("{:?}", record);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 // ── Additional behavioral invariants ──────────────────────────────

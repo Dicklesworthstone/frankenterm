@@ -710,7 +710,7 @@ mod tests {
         ];
         for r in &results {
             let dbg = format!("{:?}", r);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 

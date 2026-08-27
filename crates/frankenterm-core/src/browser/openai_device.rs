@@ -1304,11 +1304,11 @@ mod tests {
     #[test]
     fn selectors_default_populated() {
         let sel = DevicePageSelectors::default();
-        assert!(!sel.code_input.is_empty());
-        assert!(!sel.submit_button.is_empty());
-        assert!(!sel.email_prompt.is_empty());
-        assert!(!sel.password_prompt.is_empty());
-        assert!(!sel.success_marker.is_empty());
+        assert_ne!(sel.code_input, "");
+        assert_ne!(sel.submit_button, "");
+        assert_ne!(sel.email_prompt, "");
+        assert_ne!(sel.password_prompt, "");
+        assert_ne!(sel.success_marker, "");
     }
 
     #[test]

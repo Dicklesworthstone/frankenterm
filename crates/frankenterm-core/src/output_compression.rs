@@ -744,7 +744,7 @@ mod tests {
         let template = extract_template(&lines);
 
         // Template should have variable positions where numbers differ.
-        assert!(!template.variable_positions.is_empty());
+        assert_ne!(template.variable_positions, [] as [usize; 0]);
         assert_eq!(template.instance_count, 3);
     }
 
@@ -752,7 +752,7 @@ mod tests {
     fn template_single_line() {
         let template = extract_template(&["single line"]);
         assert_eq!(template.pattern, "single line");
-        assert!(template.variable_positions.is_empty());
+        assert_eq!(template.variable_positions, [] as [usize; 0]);
         assert_eq!(template.instance_count, 1);
     }
 
@@ -760,7 +760,7 @@ mod tests {
     fn template_from_same_length_lines() {
         let lines = vec!["test_a: pass", "test_b: pass", "test_c: pass"];
         let template = extract_template(&lines);
-        assert!(!template.variable_positions.is_empty());
+        assert_ne!(template.variable_positions, [] as [usize; 0]);
         assert_eq!(template.instance_count, 3);
     }
 
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn compress_empty_input() {
         let compressed = compress("", &CompressionConfig::default());
-        assert!(compressed.templates.is_empty());
+        assert_eq!(compressed.templates, [] as [output_compression::OutputTemplate; 0]);
         assert!(compressed.entries.is_empty());
     }
 

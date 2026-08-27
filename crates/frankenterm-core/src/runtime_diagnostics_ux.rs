@@ -706,7 +706,7 @@ mod tests {
             "certification should pass: {:?}",
             report.render_summary()
         );
-        assert!(report.missing_classes.is_empty());
+        assert_eq!(report.missing_classes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -798,7 +798,7 @@ mod tests {
     fn catalog_robot_safe_commands() {
         let catalog = DiagnosticCatalog::standard();
         let cmds = catalog.robot_safe_commands(&FailureClass::Timeout);
-        assert!(!cmds.is_empty());
+        assert_ne!(cmds, [] as [std::string::String; 0]);
         assert!(cmds.iter().any(|c| c.contains("ft doctor")));
     }
 
@@ -808,7 +808,7 @@ mod tests {
         // Use a failure class we handle but check for a non-existent one.
         let empty_catalog = DiagnosticCatalog::from_templates(Vec::new());
         let cmds = empty_catalog.robot_safe_commands(&FailureClass::Timeout);
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [std::string::String; 0]);
     }
 
     #[test]

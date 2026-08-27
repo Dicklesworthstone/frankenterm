@@ -1328,24 +1328,42 @@ fn producer_coverage_requires_exact_direct_partial_and_gap_shapes() {
         .iter()
         .find(|variant| variant.producer_coverage == ProducerCoverage::Direct)
         .expect("checked-in catalog must retain at least one exact direct binding");
-    assert!(!direct.exact_producer_bindings.is_empty());
-    assert!(direct.partial_producer_bead_ids.is_empty());
+    assert_ne!(
+        direct.exact_producer_bindings,
+        [] as [frankenterm_core::product_journey_catalog::ExactProducerBinding; 0]
+    );
+    assert_eq!(
+        direct.partial_producer_bead_ids,
+        [] as [std::string::String; 0]
+    );
 
     let partial = catalog
         .variants
         .iter()
         .find(|variant| variant.producer_coverage == ProducerCoverage::Partial)
         .expect("checked-in catalog must expose at least one partial producer lane");
-    assert!(partial.exact_producer_bindings.is_empty());
-    assert!(!partial.partial_producer_bead_ids.is_empty());
+    assert_eq!(
+        partial.exact_producer_bindings,
+        [] as [frankenterm_core::product_journey_catalog::ExactProducerBinding; 0]
+    );
+    assert_ne!(
+        partial.partial_producer_bead_ids,
+        [] as [std::string::String; 0]
+    );
 
     let gap = catalog
         .variants
         .iter()
         .find(|variant| variant.producer_coverage == ProducerCoverage::Gap)
         .expect("checked-in catalog must retain required producer gaps fail-closed");
-    assert!(gap.exact_producer_bindings.is_empty());
-    assert!(gap.partial_producer_bead_ids.is_empty());
+    assert_eq!(
+        gap.exact_producer_bindings,
+        [] as [frankenterm_core::product_journey_catalog::ExactProducerBinding; 0]
+    );
+    assert_eq!(
+        gap.partial_producer_bead_ids,
+        [] as [std::string::String; 0]
+    );
 
     let mut missing_exact_binding = catalog.clone();
     let direct = missing_exact_binding
@@ -1687,8 +1705,8 @@ fn checked_in_negative_target_evidence_is_retained_per_lane() {
                 assert_eq!(qualification.freshness_state, FreshnessState::Unknown);
                 assert!(qualification.route_identity_ref.is_none());
                 assert!(qualification.candidate_identity_ref.is_none());
-                assert!(qualification.evidence_refs.is_empty());
-                assert!(qualification.blocker_refs.is_empty());
+                assert_eq!(qualification.evidence_refs, [] as [std::string::String; 0]);
+                assert_eq!(qualification.blocker_refs, [] as [std::string::String; 0]);
             } else if controller == "mac16_11_m4_pro"
                 && variant.coverage.fleet_point == FleetPoint::Q200
             {
@@ -1708,8 +1726,8 @@ fn checked_in_negative_target_evidence_is_retained_per_lane() {
                 assert_eq!(qualification.freshness_state, FreshnessState::Unknown);
                 assert!(qualification.route_identity_ref.is_none());
                 assert!(qualification.candidate_identity_ref.is_none());
-                assert!(qualification.evidence_refs.is_empty());
-                assert!(qualification.blocker_refs.is_empty());
+                assert_eq!(qualification.evidence_refs, [] as [std::string::String; 0]);
+                assert_eq!(qualification.blocker_refs, [] as [std::string::String; 0]);
             }
         }
     }
@@ -1720,7 +1738,7 @@ fn historical_readme_claim_fingerprints_match_signed_catalog_bytes() {
     let root = repository_root();
     let catalog = load_catalog(&root);
     for mapping in &catalog.readme_mappings {
-        assert!(!mapping.claim_text.trim().is_empty());
+        assert_ne!(mapping.claim_text.trim(), "");
         let actual = hex::encode(Sha256::digest(mapping.claim_text.as_bytes()));
         assert_eq!(
             mapping.claim_sha256, actual,

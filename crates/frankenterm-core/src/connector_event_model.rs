@@ -1134,7 +1134,7 @@ mod tests {
 
         let result = registry.validate_event(&event);
         assert!(result.valid);
-        assert!(result.errors.is_empty());
+        assert_eq!(result.errors, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1167,7 +1167,7 @@ mod tests {
         );
         let result = registry.validate_event(&inbound);
         assert!(result.valid); // warnings don't fail validation
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings, [] as [std::string::String; 0]);
 
         // Outbound without action_kind
         let outbound = CanonicalConnectorEvent::new(
@@ -1178,7 +1178,7 @@ mod tests {
         );
         let result = registry.validate_event(&outbound);
         assert!(result.valid);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1204,7 +1204,7 @@ mod tests {
         let v1 = SchemaVersion::new(1, 0);
         let report = check_compatibility(&registry, &v1, &v1);
         assert!(report.compatible);
-        assert!(report.missing_fields.is_empty());
+        assert_eq!(report.missing_fields, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1220,7 +1220,7 @@ mod tests {
             !report.compatible,
             "major-version skew must fail even when required field names overlap"
         );
-        assert!(report.missing_fields.is_empty());
+        assert_eq!(report.missing_fields, [] as [std::string::String; 0]);
     }
 
     #[test]

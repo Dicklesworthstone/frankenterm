@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn extract_event_ids_empty() {
         let metadata = HashMap::new();
-        assert!(extract_event_ids(&metadata).is_empty());
+        assert_eq!(extract_event_ids(&metadata), [] as [std::string::String; 0]);
     }
 
     // ── terminal_metadata_count ─────────────────────────────────────────

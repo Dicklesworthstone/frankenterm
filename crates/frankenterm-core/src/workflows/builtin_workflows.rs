@@ -1902,7 +1902,7 @@ mod tests {
     #[test]
     fn handle_compaction_description_nonempty() {
         let wf = HandleCompaction::new();
-        assert!(!wf.description().is_empty());
+        assert_ne!(wf.description(), "");
     }
 
     #[test]
@@ -2040,7 +2040,7 @@ mod tests {
     #[test]
     fn handle_usage_limits_description_nonempty() {
         let wf = HandleUsageLimits::new();
-        assert!(!wf.description().is_empty());
+        assert_ne!(wf.description(), "");
     }
 
     #[test]
@@ -2596,9 +2596,9 @@ mod tests {
 
     #[test]
     fn compaction_prompts_are_nonempty() {
-        assert!(!compaction_prompts::CLAUDE_CODE.is_empty());
-        assert!(!compaction_prompts::CODEX.is_empty());
-        assert!(!compaction_prompts::GEMINI.is_empty());
-        assert!(!compaction_prompts::UNKNOWN.is_empty());
+        assert_ne!(compaction_prompts::CLAUDE_CODE, "");
+        assert_ne!(compaction_prompts::CODEX, "");
+        assert_ne!(compaction_prompts::GEMINI, "");
+        assert_ne!(compaction_prompts::UNKNOWN, "");
     }
 }

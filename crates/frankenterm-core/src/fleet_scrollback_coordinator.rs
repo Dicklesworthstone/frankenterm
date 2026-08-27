@@ -1458,7 +1458,7 @@ mod tests {
     #[test]
     fn null_pane_access_returns_empty_ids() {
         let null = NullPaneScrollbackAccess;
-        assert!(null.pane_ids().is_empty());
+        assert_eq!(null.pane_ids(), [] as [u64; 0]);
     }
 
     #[test]

@@ -104,7 +104,10 @@ fn debug_snapshot_reports_guardrail_budget_split_and_deferral_signals() {
     let _ = scheduler.submit_intent(intent(7, 1, ResizeWorkClass::Interactive, 4, 200));
     let frame = scheduler.schedule_frame_with_input_backlog(4, 2);
 
-    assert!(frame.scheduled.is_empty());
+    assert_eq!(
+        frame.scheduled,
+        [] as [frankenterm_core::resize_scheduler::ScheduledResizeWork; 0]
+    );
     assert_eq!(frame.frame_budget_units, 4);
     assert_eq!(frame.effective_resize_budget_units, 2);
     assert_eq!(frame.input_reserved_units, 2);

@@ -2020,8 +2020,11 @@ mod tests {
                     ..
                 }
             ));
-            assert!(indexer.writer().docs.is_empty());
-            assert!(indexer.writer().deleted_ids.is_empty());
+            assert_eq!(
+                indexer.writer().docs,
+                [] as [crate::tantivy_ingest::IndexDocumentFields; 0]
+            );
+            assert_eq!(indexer.writer().deleted_ids, [] as [std::string::String; 0]);
             assert_eq!(indexer.writer().commits, 0);
             assert!(!missing_db.exists());
 
@@ -2047,8 +2050,11 @@ mod tests {
                     ..
                 }
             ));
-            assert!(indexer.writer().docs.is_empty());
-            assert!(indexer.writer().deleted_ids.is_empty());
+            assert_eq!(
+                indexer.writer().docs,
+                [] as [crate::tantivy_ingest::IndexDocumentFields; 0]
+            );
+            assert_eq!(indexer.writer().deleted_ids, [] as [std::string::String; 0]);
             assert_eq!(indexer.writer().commits, 0);
             assert!(!missing_log.exists());
         });
@@ -2482,7 +2488,10 @@ mod tests {
                     ..
                 } if event_id == "bad-1"
             ));
-            assert!(indexer.writer().docs.is_empty());
+            assert_eq!(
+                indexer.writer().docs,
+                [] as [crate::tantivy_ingest::IndexDocumentFields; 0]
+            );
             assert_eq!(indexer.writer().commits, 0);
             assert!(
                 storage
@@ -2546,7 +2555,7 @@ mod tests {
                 err,
                 IndexerError::IndexWrite(IndexWriteError::Transient { .. })
             ));
-            assert!(indexer.writer().written_docs().is_empty());
+            assert_eq!(indexer.writer().written_docs(), []);
             assert_eq!(indexer.writer().commits, 0);
         });
     }
@@ -2567,7 +2576,7 @@ mod tests {
             let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
             indexer.run(&storage).await.unwrap();
 
-            assert!(indexer.writer().deleted_ids.is_empty());
+            assert_eq!(indexer.writer().deleted_ids, [] as [std::string::String; 0]);
         });
     }
 

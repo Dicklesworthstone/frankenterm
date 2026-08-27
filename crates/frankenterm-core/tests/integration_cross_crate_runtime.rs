@@ -251,8 +251,14 @@ fn suite_report_from_standard_scenarios() {
     let report = SuiteReport::from_scenarios(&scenarios);
 
     assert_eq!(report.total_scenarios, scenarios.len());
-    assert!(!report.boundaries_covered.is_empty());
-    assert!(!report.categories_covered.is_empty());
+    assert_ne!(
+        report.boundaries_covered,
+        [] as [frankenterm_core::cross_crate_integration::CrateBoundary; 0]
+    );
+    assert_ne!(
+        report.categories_covered,
+        [] as [frankenterm_core::cross_crate_integration::ScenarioCategory; 0]
+    );
 
     let json = serde_json::to_string(&report).unwrap();
     let restored: SuiteReport = serde_json::from_str(&json).unwrap();
@@ -339,7 +345,7 @@ fn diagnostic_catalog_certification_pipeline() {
         report.pass_count, 10,
         "should certify all 10 failure classes"
     );
-    assert!(report.missing_classes.is_empty());
+    assert_eq!(report.missing_classes, [] as [std::string::String; 0]);
 
     // Serde roundtrip the certification report
     let json = serde_json::to_string(&report).unwrap();
@@ -641,7 +647,7 @@ fn telemetry_to_slo_to_gate_pipeline() {
 
     // Verify report is serializable
     let json = serde_json::to_string(&report).unwrap();
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
 }
 
 // =========================================================================

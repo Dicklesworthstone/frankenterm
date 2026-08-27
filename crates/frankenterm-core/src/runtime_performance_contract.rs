@@ -843,7 +843,7 @@ mod tests {
         assert!(result.passed);
         assert!(result.latency_pass);
         assert!(result.throughput_pass);
-        assert!(result.failure_reasons.is_empty());
+        assert_eq!(result.failure_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]

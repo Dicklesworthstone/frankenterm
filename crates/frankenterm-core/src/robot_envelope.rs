@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(envelope.source, "demo");
         assert_eq!(envelope.data, 42);
         assert!(!envelope.degraded);
-        assert!(!envelope.timestamp.is_empty());
+        assert_ne!(envelope.timestamp, "");
     }
 
     #[test]

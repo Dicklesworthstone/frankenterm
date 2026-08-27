@@ -192,7 +192,7 @@ mod tests {
         let r = RecorderHandle::new();
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
-        assert!(r.events().is_empty());
+        assert_eq!(r.events(), [] as [a11y_tree::AccessibilityEvent; 0]);
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         let drained = r.take();
         assert_eq!(drained.len(), 1);
         assert!(r.is_empty(), "recorder must be empty after take");
-        assert!(r.events().is_empty());
+        assert_eq!(r.events(), [] as [a11y_tree::AccessibilityEvent; 0]);
     }
 
     #[test]

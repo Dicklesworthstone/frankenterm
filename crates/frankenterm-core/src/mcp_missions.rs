@@ -1009,9 +1009,9 @@ mod tests {
     fn lifecycle_transition_entries_have_from_field() {
         let transitions = mcp_mission_lifecycle_transitions(MissionLifecycleState::Running);
         for t in &transitions {
-            assert!(!t.from.is_empty());
-            assert!(!t.to.is_empty());
-            assert!(!t.kind.is_empty());
+            assert_ne!(t.from, "");
+            assert_ne!(t.to, "");
+            assert_ne!(t.kind, "");
         }
     }
 

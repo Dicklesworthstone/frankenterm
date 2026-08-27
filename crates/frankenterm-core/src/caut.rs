@@ -1221,8 +1221,8 @@ mod tests {
     fn caut_error_remediation_not_installed() {
         let err = CautError::NotInstalled;
         let rem = err.remediation();
-        assert!(!rem.summary.is_empty());
-        assert!(!rem.commands.is_empty());
+        assert_ne!(rem.summary, "");
+        assert_ne!(rem.commands, [] as [error::RemediationCommand; 0]);
     }
 
     #[test]
@@ -1239,7 +1239,7 @@ mod tests {
             stderr: "auth failed".to_string(),
         };
         let rem = err.remediation();
-        assert!(!rem.summary.is_empty());
+        assert_ne!(rem.summary, "");
     }
 
     #[test]
@@ -1249,7 +1249,7 @@ mod tests {
             max_bytes: 256_000,
         };
         let rem = err.remediation();
-        assert!(!rem.summary.is_empty());
+        assert_ne!(rem.summary, "");
     }
 
     #[test]
@@ -1259,7 +1259,7 @@ mod tests {
             preview: "{bad".to_string(),
         };
         let rem = err.remediation();
-        assert!(!rem.summary.is_empty());
+        assert_ne!(rem.summary, "");
     }
 
     #[test]
@@ -1268,7 +1268,7 @@ mod tests {
             message: "permission denied".to_string(),
         };
         let rem = err.remediation();
-        assert!(!rem.summary.is_empty());
+        assert_ne!(rem.summary, "");
     }
 
     #[test]

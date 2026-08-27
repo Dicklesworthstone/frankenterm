@@ -1335,7 +1335,10 @@ mod tests {
     #[test]
     fn forensic_corpus_is_non_empty() {
         let corpus = build_forensic_corpus();
-        assert!(!corpus.is_empty());
+        assert_ne!(
+            corpus,
+            [] as [crate::tantivy_ingest::IndexDocumentFields; 0]
+        );
         assert!(corpus.len() >= 10);
     }
 
@@ -1669,7 +1672,7 @@ mod tests {
         let queries = forensic_golden_queries();
         assert!(!queries.is_empty());
         for q in &queries {
-            assert!(!q.name.is_empty());
+            assert_ne!(q.name, "");
             assert!(!q.assertions.is_empty());
         }
     }
@@ -1679,7 +1682,7 @@ mod tests {
         let queries = agent_workflow_golden_queries();
         assert!(!queries.is_empty());
         for q in &queries {
-            assert!(!q.name.is_empty());
+            assert_ne!(q.name, "");
             assert!(!q.assertions.is_empty());
         }
     }

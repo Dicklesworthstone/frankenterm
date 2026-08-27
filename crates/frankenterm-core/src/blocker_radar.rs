@@ -1888,7 +1888,7 @@ mod tests {
 
         assert_eq!(report.contract_id, BLOCKER_RADAR_CONTRACT_ID);
         assert_eq!(report.overall_state, BlockerRadarEvidenceState::Actionable);
-        assert!(report.blockers.is_empty());
+        assert_eq!(report.blockers, [] as [blocker_radar::BlockerRadarBlocker; 0]);
         assert_eq!(
             report.next_actions[0].action_kind,
             BlockerRadarActionKind::ChooseReadyBead

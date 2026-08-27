@@ -2224,7 +2224,7 @@ mod tests {
         assert_eq!(report.tab_count, 0);
         assert_eq!(report.pane_count, 0);
         assert_eq!(snapshot.pane_count(), 0);
-        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.windows, [] as [session_topology::WindowSnapshot; 0]);
 
         let json = snapshot.to_json().unwrap();
         let restored = TopologySnapshot::from_json(&json).unwrap();
@@ -2248,7 +2248,7 @@ mod tests {
         // Should parse without error (serde default ignores unknown fields)
         let snapshot: TopologySnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snapshot.schema_version, 2);
-        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.windows, [] as [session_topology::WindowSnapshot; 0]);
     }
 
     // -------------------------------------------------------------------------
@@ -2272,8 +2272,8 @@ mod tests {
 
         assert_eq!(mapping.mappings.get(&10), Some(&21)); // /project/a
         assert_eq!(mapping.mappings.get(&11), Some(&20)); // /project/b
-        assert!(mapping.unmatched_old.is_empty());
-        assert!(mapping.unmatched_new.is_empty());
+        assert_eq!(mapping.unmatched_old, [] as [u64; 0]);
+        assert_eq!(mapping.unmatched_new, [] as [u64; 0]);
     }
 
     #[test]
@@ -2292,7 +2292,7 @@ mod tests {
 
         let mapping = match_panes(&old_snapshot, &new_panes);
         assert_eq!(mapping.mappings.len(), 2);
-        assert!(mapping.unmatched_old.is_empty());
+        assert_eq!(mapping.unmatched_old, [] as [u64; 0]);
     }
 
     #[test]
@@ -2341,9 +2341,9 @@ mod tests {
         assert_eq!(snap.schema_version, TOPOLOGY_SCHEMA_VERSION);
         assert_eq!(snap.captured_at, 42);
         assert!(snap.workspace_id.is_none());
-        assert!(snap.windows.is_empty());
+        assert_eq!(snap.windows, [] as [session_topology::WindowSnapshot; 0]);
         assert_eq!(snap.pane_count(), 0);
-        assert!(snap.pane_ids().is_empty());
+        assert_eq!(snap.pane_ids(), [] as [u64; 0]);
     }
 
     #[test]
@@ -2727,7 +2727,7 @@ mod tests {
         let new_panes = vec![make_pane(1, 0, 0, 24, 80, None, None, true)];
         let mapping = match_panes(&old_snapshot, &new_panes);
         assert!(mapping.mappings.is_empty());
-        assert!(mapping.unmatched_old.is_empty());
+        assert_eq!(mapping.unmatched_old, [] as [u64; 0]);
         assert_eq!(mapping.unmatched_new, vec![1]);
     }
 
@@ -2738,7 +2738,7 @@ mod tests {
         let mapping = match_panes(&old_snapshot, &[]);
         assert!(mapping.mappings.is_empty());
         assert_eq!(mapping.unmatched_old, vec![1]);
-        assert!(mapping.unmatched_new.is_empty());
+        assert_eq!(mapping.unmatched_new, [] as [u64; 0]);
     }
 
     #[test]
@@ -2749,8 +2749,8 @@ mod tests {
         let new_panes = vec![make_pane(20, 0, 0, 24, 80, None, Some("vim"), true)];
         let mapping = match_panes(&old_snapshot, &new_panes);
         assert_eq!(mapping.mappings.get(&10), Some(&20));
-        assert!(mapping.unmatched_old.is_empty());
-        assert!(mapping.unmatched_new.is_empty());
+        assert_eq!(mapping.unmatched_old, [] as [u64; 0]);
+        assert_eq!(mapping.unmatched_new, [] as [u64; 0]);
     }
 
     #[test]
@@ -2856,7 +2856,7 @@ mod tests {
     #[test]
     fn topology_snapshot_pane_ids_empty() {
         let snap = TopologySnapshot::empty(1000);
-        assert!(snap.pane_ids().is_empty());
+        assert_eq!(snap.pane_ids(), [] as [u64; 0]);
     }
 
     #[test]

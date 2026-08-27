@@ -413,7 +413,7 @@ mod tests {
         for (sender, seq) in &history {
             state.apply_ingest(*sender, *seq);
         }
-        assert!(check_invariants(&state, &history).is_empty());
+        assert_eq!(check_invariants(&state, &history), [] as [wire_dedup_model::DedupSafetyViolation; 0]);
     }
 
     #[test]
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(session.last_seq, 2);
         assert_eq!(session.messages_received, 1);
         assert_eq!(session.duplicates_skipped, 2);
-        assert!(check_invariants(&state, &history).is_empty());
+        assert_eq!(check_invariants(&state, &history), [] as [wire_dedup_model::DedupSafetyViolation; 0]);
     }
 
     #[test]

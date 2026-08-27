@@ -1469,7 +1469,7 @@ mod tests {
         expect_capture(adapter.capture_egress(&seg));
 
         let evt = &sink.recorder_events()[0];
-        assert!(!evt.event_id.is_empty());
+        assert_ne!(evt.event_id, "");
         assert_eq!(evt.event_id.len(), 64); // SHA-256 hex
     }
 
@@ -2161,7 +2161,7 @@ mod tests {
         assert_eq!(sink.len(), 1);
         match &sink.recorder_events()[0].payload {
             RecorderEventPayload::EgressOutput { text, .. } => {
-                assert!(text.is_empty());
+                assert_eq!(text, "");
             }
             _ => panic!("expected EgressOutput"),
         }
@@ -2709,7 +2709,7 @@ mod tests {
             policy.t3_retention_days <= policy.t1_retention_days,
             "sensitive T3 retention must not exceed routine T1 retention"
         );
-        assert!(policy.custom_patterns.is_empty());
+        assert_eq!(policy.custom_patterns, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2820,7 +2820,7 @@ mod tests {
         let minimal = r#"{"enabled":false,"mode":"hash","t1_retention_days":1,"t2_retention_days":1,"t3_retention_days":1}"#;
         let parsed: CaptureRedactionPolicy =
             serde_json::from_str(minimal).expect("deserialize without custom_patterns");
-        assert!(parsed.custom_patterns.is_empty());
+        assert_eq!(parsed.custom_patterns, [] as [std::string::String; 0]);
         assert_eq!(parsed.mode, CaptureRedactionMode::Hash);
     }
 }

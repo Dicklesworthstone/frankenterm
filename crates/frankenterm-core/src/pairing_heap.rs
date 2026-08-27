@@ -524,7 +524,7 @@ mod tests {
             heap.insert(i, i);
         }
         assert_eq!(heap.nodes.len(), arena_len);
-        assert!(heap.free.is_empty());
+        assert_eq!(heap.free, [] as [usize; 0]);
     }
 
     // ── Merge scenarios ─────────────────────────────────────────────
@@ -665,7 +665,7 @@ mod tests {
         receiver.merge(&mut donor);
         assert!(donor.is_empty());
         assert!(donor.nodes.is_empty());
-        assert!(donor.free.is_empty());
+        assert_eq!(donor.free, [] as [usize; 0]);
 
         donor.insert(5, 50);
         donor.insert(3, 30);
@@ -767,14 +767,14 @@ mod tests {
     fn into_sorted_empty() {
         let heap: PairingHeap<i32, i32> = PairingHeap::new();
         let sorted = heap.into_sorted();
-        assert!(sorted.is_empty());
+        assert_eq!(sorted, [] as [(i32, i32); 0]);
     }
 
     #[test]
     fn sorted_empty() {
         let heap: PairingHeap<i32, i32> = PairingHeap::new();
         let sorted = heap.sorted();
-        assert!(sorted.is_empty());
+        assert_eq!(sorted, [] as [(i32, i32); 0]);
     }
 
     #[test]

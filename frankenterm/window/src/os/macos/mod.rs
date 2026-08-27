@@ -1,4 +1,11 @@
-#![allow(unexpected_cfgs)] // <https://github.com/SSheldon/rust-objc/issues/125>
+#![allow(unexpected_cfgs)]
+// <https://github.com/SSheldon/rust-objc/issues/125>
+// The whole macOS backend is written against the `cocoa`/`objc` crates, which
+// are deprecated wholesale in favour of `objc2`. Migrating is a large port
+// of inherited upstream WezTerm code, not something to do piecemeal per call
+// site; until then the deprecation lint would fail every
+// `-D warnings` gate run on macOS while changing nothing about behaviour.
+#![allow(deprecated)]
 use cocoa::base::{id, nil};
 use cocoa::foundation::NSString;
 use objc::rc::StrongPtr;

@@ -179,7 +179,7 @@ fn authorization_redaction_and_audit_integrity_for_sensitive_access() {
 
     let chain = AuditLog::verify_chain(&audit_log.entries(), GENESIS_HASH);
     assert!(chain.chain_intact);
-    assert!(chain.missing_ordinals.is_empty());
+    assert_eq!(chain.missing_ordinals, [] as [u64; 0]);
 
     let leaks = collect_leak_regressions(&audit_log.entries());
     assert!(leaks.is_empty(), "unexpected leak regressions: {leaks:#?}");

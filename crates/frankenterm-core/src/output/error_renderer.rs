@@ -884,7 +884,7 @@ mod tests {
         // Just verify it doesn't panic and renders
         let error = runtime_operation_error("test");
         let output = renderer.render(&error);
-        assert!(!output.is_empty());
+        assert_ne!(output, "");
     }
 
     #[test]

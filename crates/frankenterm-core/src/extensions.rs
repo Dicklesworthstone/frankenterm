@@ -908,7 +908,7 @@ mod tests {
     fn validate_nonexistent_file() {
         let result = validate_extension(Path::new("/tmp/does_not_exist_xyz.toml"));
         assert!(!result.valid);
-        assert!(!result.errors.is_empty());
+        assert_ne!(result.errors, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -956,7 +956,7 @@ anchors = ["test anchor"]
 
         let result = validate_extension(&path);
         assert!(!result.valid);
-        assert!(!result.errors.is_empty());
+        assert_ne!(result.errors, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -2462,9 +2462,9 @@ steps:
     fn trigger_defaults_empty_fields() {
         let json = r"{}";
         let trigger: DescriptorTrigger = serde_json::from_str(json).unwrap();
-        assert!(trigger.event_types.is_empty());
-        assert!(trigger.agent_types.is_empty());
-        assert!(trigger.rule_ids.is_empty());
+        assert_eq!(trigger.event_types, [] as [std::string::String; 0]);
+        assert_eq!(trigger.agent_types, [] as [std::string::String; 0]);
+        assert_eq!(trigger.rule_ids, [] as [std::string::String; 0]);
     }
 
     // ========================================================================

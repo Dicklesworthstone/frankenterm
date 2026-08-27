@@ -1022,7 +1022,7 @@ mod tests {
         assert_eq!(op_steps.len(), emergency.steps.len());
 
         // 7. Verify related runbooks link.
-        assert!(!emergency.related.is_empty());
+        assert_ne!(emergency.related, [] as [std::string::String; 0]);
 
         // 8. Check telemetry snapshot.
         let snap = registry.snapshot();
@@ -1042,7 +1042,7 @@ mod tests {
             .iter()
             .find(|t| t.tutorial_id == "TUT-001-getting-started")
             .expect("should have getting started");
-        assert!(gs.prerequisites.is_empty());
+        assert_eq!(gs.prerequisites, [] as [std::string::String; 0]);
 
         // After completing getting started, can proceed to incident response.
         let op_tuts = registry.tutorials_for_role(&OperatorRole::Operator);

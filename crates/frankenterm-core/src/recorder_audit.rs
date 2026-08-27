@@ -1163,7 +1163,7 @@ mod tests {
         let result = AuditLog::verify_chain(&[], GENESIS_HASH);
         assert!(result.chain_intact);
         assert_eq!(result.total_entries, 0);
-        assert!(result.missing_ordinals.is_empty());
+        assert_eq!(result.missing_ordinals, [] as [u64; 0]);
         assert!(result.ordinal_range.is_none());
     }
 
@@ -1182,7 +1182,7 @@ mod tests {
         let result = AuditLog::verify_chain(&entries, GENESIS_HASH);
         assert!(result.chain_intact);
         assert_eq!(result.total_entries, 5);
-        assert!(result.missing_ordinals.is_empty());
+        assert_eq!(result.missing_ordinals, [] as [u64; 0]);
         assert_eq!(result.first_break_at, None);
         assert_eq!(result.ordinal_range, Some((0, 4)));
     }
@@ -1875,10 +1875,10 @@ mod tests {
     #[test]
     fn audit_scope_default_empty() {
         let s = AuditScope::default();
-        assert!(s.pane_ids.is_empty());
+        assert_eq!(s.pane_ids, [] as [u64; 0]);
         assert!(s.time_range.is_none());
         assert!(s.query.is_none());
-        assert!(s.segment_ids.is_empty());
+        assert_eq!(s.segment_ids, [] as [std::string::String; 0]);
         assert!(s.result_count.is_none());
         let _ = format!("{:?}", s);
     }

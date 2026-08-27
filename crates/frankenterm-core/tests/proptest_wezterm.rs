@@ -561,7 +561,7 @@ fn cwd_parse_host_only() {
     let info = CwdInfo::parse("file://myhost");
     assert!(info.is_remote);
     assert_eq!(info.host, "myhost");
-    assert!(info.path.is_empty());
+    assert_eq!(info.path, "");
 }
 
 #[test]
@@ -574,21 +574,21 @@ fn pane_size_debug_nonempty() {
         dpi: None,
     };
     let debug = format!("{:?}", size);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 #[test]
 fn cursor_visibility_debug_nonempty() {
     let vis = CursorVisibility::Visible;
     let debug = format!("{:?}", vis);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 #[test]
 fn cwd_info_debug_nonempty() {
     let info = CwdInfo::parse("file:///home/user");
     let debug = format!("{:?}", info);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 #[test]

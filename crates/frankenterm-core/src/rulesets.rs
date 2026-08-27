@@ -778,8 +778,8 @@ mod tests {
     #[test]
     fn ruleset_manifest_entry_serde_default() {
         let back: RulesetManifestEntry = serde_json::from_str("{}").unwrap();
-        assert!(back.name.is_empty());
-        assert!(back.path.is_empty());
+        assert_eq!(back.name, "");
+        assert_eq!(back.path, "");
         assert!(back.description.is_none());
         assert!(back.created_at.is_none());
         assert!(back.updated_at.is_none());
@@ -841,8 +841,8 @@ mod tests {
     #[test]
     fn ruleset_manifest_entry_default() {
         let e = RulesetManifestEntry::default();
-        assert!(e.name.is_empty());
-        assert!(e.path.is_empty());
+        assert_eq!(e.name, "");
+        assert_eq!(e.path, "");
         assert!(e.description.is_none());
     }
 
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn ruleset_profile_file_default() {
         let f = RulesetProfileFile::default();
-        assert!(f.name.is_empty());
+        assert_eq!(f.name, "");
         assert!(f.description.is_none());
         assert!(f.inherits.is_none());
     }
@@ -936,7 +936,7 @@ mod tests {
             ..Default::default()
         };
         let result = patch.apply_to(&base);
-        assert!(result.packs.is_empty());
+        assert_eq!(result.packs, [] as [std::string::String; 0]);
     }
 
     #[test]

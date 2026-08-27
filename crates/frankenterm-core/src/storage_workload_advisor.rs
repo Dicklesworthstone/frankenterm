@@ -858,7 +858,7 @@ mod tests {
         let report = classify(&profile);
         match report {
             AdvisorReport::DataNeeded { reasons } => {
-                assert!(!reasons.is_empty());
+                assert_ne!(reasons, [] as [std::string::String; 0]);
                 assert!(reasons.iter().any(|r| r.contains("MIN_SAMPLE_OPS")));
             }
             other @ AdvisorReport::Recommendation(_) => {
@@ -1251,7 +1251,7 @@ mod tests {
         );
         match report {
             AdvisorReport::DataNeeded { reasons } => {
-                assert!(!reasons.is_empty());
+                assert_ne!(reasons, [] as [std::string::String; 0]);
                 assert!(reasons.iter().any(|r| r.contains("MIN_SAMPLE_OPS")));
             }
             other @ AdvisorReport::Recommendation(_) => {

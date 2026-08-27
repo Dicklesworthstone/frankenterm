@@ -328,7 +328,7 @@ fn test_bundle_collects_all_tier_results() {
 #[test]
 fn test_bundle_timestamp_present() {
     let bundle = build_all_green_bundle();
-    assert!(!bundle.timestamp.is_empty());
+    assert_ne!(bundle.timestamp, "");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -341,7 +341,10 @@ fn test_bundle_triage_summary_all_green() {
     assert_eq!(bundle.triage_summary.overall, "pass");
     assert_eq!(bundle.triage_summary.tiers_passed, 6);
     assert_eq!(bundle.triage_summary.tiers_failed, 0);
-    assert!(bundle.triage_summary.blocking_failures.is_empty());
+    assert_eq!(
+        bundle.triage_summary.blocking_failures,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -371,7 +374,10 @@ fn test_bundle_triage_summary_advisory_only() {
 
     let bundle = builder.build();
     assert_eq!(bundle.triage_summary.overall, "advisory_warn");
-    assert!(bundle.triage_summary.blocking_failures.is_empty());
+    assert_eq!(
+        bundle.triage_summary.blocking_failures,
+        [] as [std::string::String; 0]
+    );
     assert_eq!(bundle.triage_summary.advisory_warnings, vec!["T6"]);
 }
 
@@ -607,8 +613,8 @@ fn test_builder_new_sets_correlation() {
 fn test_builder_empty_produces_valid_bundle() {
     let builder = BundleBuilder::new("sha", "corr");
     let bundle = builder.build();
-    assert!(bundle.tier_results.is_empty());
-    assert!(bundle.perf_results.is_empty());
+    assert_eq!(bundle.tier_results, [] as [TierResult; 0]);
+    assert_eq!(bundle.perf_results, [] as [PerfResult; 0]);
     assert_eq!(bundle.triage_summary.overall, "pass"); // No failures
 }
 

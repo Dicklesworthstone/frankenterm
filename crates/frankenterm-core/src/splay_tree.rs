@@ -708,13 +708,13 @@ mod tests {
     #[test]
     fn keys_on_empty() {
         let tree: SplayTree<i32, i32> = SplayTree::new();
-        assert!(tree.keys().is_empty());
+        assert_eq!(tree.keys(), [] as [&i32; 0]);
     }
 
     #[test]
     fn iter_on_empty() {
         let tree: SplayTree<i32, i32> = SplayTree::new();
-        assert!(tree.iter().is_empty());
+        assert_eq!(tree.iter(), [] as [(&i32, &i32); 0]);
     }
 
     #[test]

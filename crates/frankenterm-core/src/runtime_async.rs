@@ -6036,7 +6036,7 @@ pub mod process {
                 .expect("bounded stdin roundtrip command");
             assert!(output.status.success());
             assert_eq!(output.stdout, b"bounded stdin roundtrip");
-            assert!(output.stderr.is_empty());
+            assert_eq!(output.stderr, [] as [u8; 0]);
         }
 
         #[cfg(unix)]
@@ -8796,7 +8796,7 @@ mod tests {
             "sleep task should complete under LabRuntime"
         );
         assert!(report.oracle_report.all_passed());
-        assert!(report.invariant_violations.is_empty());
+        assert_eq!(report.invariant_violations, [] as [std::string::String; 0]);
     }
 
     fn interruptible_sleep_kind_code(kind: SleepWithCxErrorKind) -> u8 {
@@ -8995,7 +8995,7 @@ mod tests {
             .expect_err("pre-cancelled output must fail before its first byte");
             assert_eq!(error.kind(), NonblockingWriteErrorKind::ContextCancelled);
             assert_eq!(error.bytes_written(), 0);
-            assert!(writer.bytes.is_empty());
+            assert_eq!(writer.bytes, [] as [u8; 0]);
         });
     }
 
@@ -9295,7 +9295,7 @@ mod tests {
                 );
             }
             assert!(oracle_report.oracle_report.all_passed());
-            assert!(oracle_report.invariant_violations.is_empty());
+            assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
         }
     }
 
@@ -9374,7 +9374,7 @@ mod tests {
         assert_eq!(service.snapshot().wake_completions, 1);
         assert_eq!(service.snapshot().max_wake_latency_ns, 0);
         assert!(oracle_report.oracle_report.all_passed());
-        assert!(oracle_report.invariant_violations.is_empty());
+        assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9427,7 +9427,7 @@ mod tests {
         assert_eq!(metrics.budget_exhaustions, 0);
         assert_eq!(metrics.context_failures, 0);
         assert!(oracle_report.oracle_report.all_passed());
-        assert!(oracle_report.invariant_violations.is_empty());
+        assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9666,7 +9666,7 @@ mod tests {
         assert_eq!(runtime.pending_timer_count(), 0);
         assert!(virtual_report.auto_advances >= 1);
         assert!(oracle_report.oracle_report.all_passed());
-        assert!(oracle_report.invariant_violations.is_empty());
+        assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9842,7 +9842,7 @@ mod tests {
             );
             let report = runtime.run_until_quiescent_with_report();
             assert!(report.oracle_report.all_passed());
-            assert!(report.invariant_violations.is_empty());
+            assert_eq!(report.invariant_violations, [] as [std::string::String; 0]);
         }
     }
 
@@ -9922,7 +9922,7 @@ mod tests {
         // Exact TimerFired counts plus the service completion counter are the
         // causal proof that every same-deadline follower was resumed.
         assert!(report.oracle_report.all_passed());
-        assert!(report.invariant_violations.is_empty());
+        assert_eq!(report.invariant_violations, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9965,7 +9965,7 @@ mod tests {
             "timeout should report elapsed once the budget deadline is reached"
         );
         assert!(report.oracle_report.all_passed());
-        assert!(report.invariant_violations.is_empty());
+        assert_eq!(report.invariant_violations, [] as [std::string::String; 0]);
     }
 
     fn arb_labruntime_timer_deadlines_ms() -> impl Strategy<Value = Vec<u64>> {
@@ -11074,7 +11074,7 @@ mod tests {
             .await;
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert!(!err.is_empty());
+            assert_ne!(err, "");
         });
     }
 
@@ -12115,7 +12115,7 @@ mod tests {
             let sem = Semaphore::new(0);
             let err = sem.try_acquire().unwrap_err();
             let dbg = format!("{:?}", err);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         });
     }
 
@@ -12127,7 +12127,7 @@ mod tests {
             sem.close();
             let err = sem.try_acquire().unwrap_err();
             let dbg = format!("{:?}", err);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         });
     }
 
@@ -12138,7 +12138,7 @@ mod tests {
             let sem = Semaphore::new(0);
             let err = sem.try_acquire().unwrap_err();
             let display = format!("{}", err);
-            assert!(!display.is_empty());
+            assert_ne!(display, "");
         });
     }
 
@@ -12150,7 +12150,7 @@ mod tests {
             sem.close();
             let err = sem.try_acquire().unwrap_err();
             let display = format!("{}", err);
-            assert!(!display.is_empty());
+            assert_ne!(display, "");
         });
     }
 
@@ -12175,7 +12175,7 @@ mod tests {
             sem.close();
             let err = sem.acquire().await.unwrap_err();
             let dbg = format!("{:?}", err);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         });
     }
 
@@ -12187,7 +12187,7 @@ mod tests {
             sem.close();
             let err = sem.acquire().await.unwrap_err();
             let display = format!("{}", err);
-            assert!(!display.is_empty());
+            assert_ne!(display, "");
         });
     }
 
@@ -13195,7 +13195,7 @@ mod tests {
             let (tx, rx) = oneshot::channel::<u32>();
             drop(tx);
             let err = oneshot_recv(rx).await.unwrap_err();
-            assert!(!err.is_empty());
+            assert_ne!(err, "");
         });
     }
 
@@ -16535,12 +16535,12 @@ mod tests {
     #[test]
     fn broadcast_try_recv_error_is_std_error() {
         let empty: &dyn std::error::Error = &broadcast::TryRecvError::Empty;
-        assert!(!empty.to_string().is_empty());
+        assert_ne!(empty.to_string(), "");
 
         let closed: &dyn std::error::Error = &broadcast::TryRecvError::Closed;
-        assert!(!closed.to_string().is_empty());
+        assert_ne!(closed.to_string(), "");
 
         let lagged: &dyn std::error::Error = &broadcast::TryRecvError::Lagged(5);
-        assert!(!lagged.to_string().is_empty());
+        assert_ne!(lagged.to_string(), "");
     }
 }

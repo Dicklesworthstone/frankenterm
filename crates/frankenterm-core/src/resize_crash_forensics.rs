@@ -555,9 +555,9 @@ mod tests {
         let ctx = ResizeCrashContextBuilder::new(0).build();
         assert_eq!(ctx.captured_at_ms, 0);
         assert!(!ctx.gate.active);
-        assert!(ctx.in_flight.is_empty());
-        assert!(ctx.policy_decisions.is_empty());
-        assert!(ctx.domain_budgets.is_empty());
+        assert_eq!(ctx.in_flight, [] as [resize_crash_forensics::InFlightTransaction; 0]);
+        assert_eq!(ctx.policy_decisions, [] as [resize_crash_forensics::PolicyDecision; 0]);
+        assert_eq!(ctx.domain_budgets, [] as [resize_crash_forensics::DomainBudgetEntry; 0]);
         assert_eq!(ctx.queue_depths.pending_intents, 0);
         assert_eq!(ctx.storm_state.tabs_in_storm, 0);
     }

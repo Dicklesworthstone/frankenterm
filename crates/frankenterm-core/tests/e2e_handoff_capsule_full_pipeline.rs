@@ -176,7 +176,10 @@ fn full_pipeline_register_promote_apply_then_preflight_allows_inherited_dispatch
         panic!("expected HandoffApplied, got {resp:?}");
     };
     assert_eq!(summary.accepted_indices, vec![0, 1]);
-    assert!(summary.skipped.is_empty());
+    assert_eq!(
+        summary.skipped,
+        [] as [frankenterm_core::headless_mux_server::HandoffSkipReport; 0]
+    );
     // 1 PassportExcerpt section applied; 1 ContextSummary deferred.
     assert_eq!(summary.passport_excerpt_applies.len(), 1);
     assert_eq!(
@@ -290,7 +293,10 @@ fn full_pipeline_declared_only_actor_cannot_inherit_passport_excerpt_ft_1650n_5(
     assert_eq!(summary.accepted_indices, vec![0]);
     assert_eq!(summary.skipped.len(), 1);
     assert_eq!(summary.skipped[0].section_label, "passport_excerpt");
-    assert!(summary.passport_excerpt_applies.is_empty());
+    assert_eq!(
+        summary.passport_excerpt_applies,
+        [] as [frankenterm_core::headless_mux_server::PassportExcerptApplyReport; 0]
+    );
 
     // Store does NOT contain the inherited passport.
     assert!(store.get(&inherited_pane_key()).is_none());

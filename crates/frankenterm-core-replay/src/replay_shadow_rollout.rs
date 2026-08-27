@@ -739,7 +739,7 @@ mod tests {
         let durations = BTreeMap::from([("smoke".into(), (25u64, 30u64))]);
         let trigger = evaluate_rollback_triggers(&flaky, &durations, &config);
         assert!(!trigger.triggered);
-        assert!(trigger.reasons.is_empty());
+        assert_eq!(trigger.reasons, [] as [std::string::String; 0]);
     }
 
     #[test]

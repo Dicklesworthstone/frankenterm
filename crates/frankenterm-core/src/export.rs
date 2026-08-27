@@ -1862,7 +1862,7 @@ mod tests {
             assert_eq!(header["_export"], true);
             assert_eq!(header["kind"], "events");
             assert_eq!(header["record_count"], 0);
-            assert!(records.is_empty());
+            assert_eq!(records, [] as [serde_json::Value; 0]);
 
             storage.shutdown().await.unwrap();
             let _ = std::fs::remove_file(&tmp);
@@ -2274,7 +2274,7 @@ mod tests {
             assert_fields_present(&header, &expected_header_fields(), "Segment export header");
             assert_eq!(header["_export"], true);
             assert_eq!(header["kind"], "segments");
-            assert!(!header["version"].as_str().unwrap().is_empty());
+            assert_ne!(header["version"].as_str().unwrap(), "");
 
             // Validate record schema
             assert_eq!(records.len(), 1);
@@ -2855,7 +2855,7 @@ mod tests {
         let (header, records) = parse_jsonl(output);
         assert_eq!(header["_export"], true);
         assert_eq!(header["record_count"], 0);
-        assert!(records.is_empty());
+        assert_eq!(records, [] as [serde_json::Value; 0]);
     }
 
     #[test]

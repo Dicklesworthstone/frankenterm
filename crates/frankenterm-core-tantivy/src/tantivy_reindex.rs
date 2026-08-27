@@ -3105,8 +3105,14 @@ mod tests {
                 error,
                 IndexerError::BackendIdentityMismatch { .. }
             ));
-            assert!(pipeline.backfill_writer().docs.is_empty());
-            assert!(pipeline.backfill_writer().deleted_ids.is_empty());
+            assert_eq!(
+                pipeline.backfill_writer().docs,
+                [] as [crate::tantivy_ingest::IndexDocumentFields; 0]
+            );
+            assert_eq!(
+                pipeline.backfill_writer().deleted_ids,
+                [] as [std::string::String; 0]
+            );
             assert_eq!(pipeline.backfill_writer().commits, 0);
             assert!(!db_path.exists());
             assert!(
@@ -3311,8 +3317,11 @@ mod tests {
             assert!(report.is_consistent);
             assert_eq!(report.log_events_scanned, 5);
             assert_eq!(report.index_matches, 5);
-            assert!(report.missing_from_index.is_empty());
-            assert!(report.offset_mismatches.is_empty());
+            assert_eq!(report.missing_from_index, [] as [std::string::String; 0]);
+            assert_eq!(
+                report.offset_mismatches,
+                [] as [crate::tantivy_reindex::OffsetMismatch; 0]
+            );
             assert_eq!(report.total_index_docs, Some(5));
         });
     }
@@ -4083,7 +4092,10 @@ mod tests {
             assert_eq!(progress.events_indexed, 2);
 
             // With dedup_on_replay=false, no deletes should be issued
-            assert!(pipeline.writer().deleted_ids.is_empty());
+            assert_eq!(
+                pipeline.writer().deleted_ids,
+                [] as [std::string::String; 0]
+            );
         });
     }
 
@@ -4800,7 +4812,10 @@ mod tests {
 
             assert_eq!(progress.events_indexed, 0);
             assert_eq!(progress.events_read, 0);
-            assert!(pipeline.backfill_writer().docs.is_empty());
+            assert_eq!(
+                pipeline.backfill_writer().docs,
+                [] as [crate::tantivy_ingest::IndexDocumentFields; 0]
+            );
         });
     }
 

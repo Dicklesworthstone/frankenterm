@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn ranked_ids_empty_input() {
         let ids = ranked_ids(&[], 5);
-        assert!(ids.is_empty());
+        assert_eq!(ids, [] as [u64; 0]);
     }
 
     #[test]
@@ -732,9 +732,9 @@ mod tests {
         let queries = default_semantic_eval_queries();
         assert!(!queries.is_empty());
         for q in &queries {
-            assert!(!q.name.is_empty());
+            assert_ne!(q.name, "");
             assert!(q.top_k > 0);
-            assert!(!q.relevant_ids.is_empty());
+            assert_ne!(q.relevant_ids, [] as [u64; 0]);
         }
     }
 

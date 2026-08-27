@@ -1478,7 +1478,7 @@ mod tests {
         }
         // Confirm no row was inserted.
         let listed = list_chunks_by_pane(&conn, 42, 0).unwrap();
-        assert!(listed.is_empty());
+        assert_eq!(listed, [] as [scrollback_cold_tier_pipeline::MetadataIndexRow; 0]);
     }
 
     /// ft-95vfk: duplicate chunk_id triggers SQLite's PRIMARY KEY

@@ -1267,8 +1267,8 @@ mod tests {
     #[test]
     fn all_categories_have_labels() {
         for cat in ActionCategory::ALL {
-            assert!(!cat.label().is_empty());
-            assert!(!cat.shortcut_prefix().is_empty());
+            assert_ne!(cat.label(), "");
+            assert_ne!(cat.shortcut_prefix(), "");
         }
     }
 

@@ -281,8 +281,8 @@ mod tests {
         let forecast = build_limits_forecast(1_000, 10, &[]);
         assert_eq!(forecast.usable_now, 10);
         assert_eq!(forecast.limited_now, 0);
-        assert!(forecast.timeline.is_empty());
-        assert!(forecast.active.is_empty());
+        assert_eq!(forecast.timeline, [] as [limit_forecast::LimitForecastPoint; 0]);
+        assert_eq!(forecast.active, [] as [limit_forecast::ActiveLimitWindow; 0]);
     }
 
     #[test]
@@ -452,6 +452,6 @@ mod tests {
 
     #[test]
     fn limit_windows_reset_between_empty() {
-        assert!(limit_windows_reset_between(0, 1_000, &[]).is_empty());
+        assert_eq!(limit_windows_reset_between(0, 1_000, &[]), [] as [limit_forecast::LimitWindowReset; 0]);
     }
 }

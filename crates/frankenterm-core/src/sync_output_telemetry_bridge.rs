@@ -378,7 +378,7 @@ mod tests {
     fn auditor_clean_state_returns_no_findings() {
         let (orch, wd) = fresh_telemetry();
         let auditor = TelemetryDriftAuditor::new(AuditorConfig::default());
-        assert!(auditor.audit(&orch, &wd).is_empty());
+        assert_eq!(auditor.audit(&orch, &wd), [] as [sync_output_telemetry_bridge::TelemetryDrift; 0]);
         assert!(auditor.invariants_hold(&orch, &wd));
     }
 

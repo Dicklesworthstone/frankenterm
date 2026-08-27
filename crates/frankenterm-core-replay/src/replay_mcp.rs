@@ -394,7 +394,7 @@ mod tests {
     fn schema_for_existing() {
         let s = schema_for(TOOL_REPLAY_INSPECT).unwrap();
         assert_eq!(s.name, TOOL_REPLAY_INSPECT);
-        assert!(!s.description.is_empty());
+        assert_ne!(s.description, "");
     }
 
     #[test]

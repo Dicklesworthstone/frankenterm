@@ -313,7 +313,7 @@ fn override_full_lifecycle_activate_evaluate_clear() {
 
     // Step 3: Clear override
     assert!(ml.clear_override("pin-1", 2000));
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
 
     // Step 4: Evaluate again — normal behavior resumes
     let decision2 = ml.evaluate(3000, MissionTrigger::CadenceTick, &issues, &agents, &c);
@@ -370,7 +370,7 @@ fn override_expired_auto_evicted_on_evaluate() {
     assert_eq!(ml.active_overrides().len(), 1);
 
     ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
 }
 
 #[test]
@@ -470,7 +470,10 @@ fn conflict_detection_active_claim_collision() {
         .iter()
         .any(|a| a.bead_id == "b-1")
     {
-        assert!(!report.conflicts.is_empty());
+        assert_ne!(
+            report.conflicts,
+            [] as [frankenterm_core::mission_loop::AssignmentConflict; 0]
+        );
     }
 }
 

@@ -2115,7 +2115,7 @@ mod tests {
         assert_eq!(stats.bytes_written, 10); // "hello" + "world"
 
         let bytes = std::fs::read(&path).unwrap();
-        assert!(!bytes.is_empty());
+        assert_ne!(bytes, [] as [u8; 0]);
     }
 
     #[test]
@@ -3611,7 +3611,7 @@ mod tests {
             let cloned = v.clone();
             assert_eq!(v, &cloned);
             let debug_str = format!("{:?}", v);
-            assert!(!debug_str.is_empty());
+            assert_ne!(debug_str, "");
         }
         // Verify Debug output contains variant-specific info
         let denied_debug = format!("{:?}", variants[1]);

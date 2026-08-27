@@ -2043,8 +2043,8 @@ mod tests {
         assert_eq!(engine.tracks().len(), 5);
         for track in engine.tracks() {
             assert!(!track.exercises.is_empty());
-            assert!(!track.name.is_empty());
-            assert!(!track.id.is_empty());
+            assert_ne!(track.name, "");
+            assert_ne!(track.id, "");
         }
     }
 
@@ -2074,10 +2074,10 @@ mod tests {
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
-        assert!(!engine.state().achievements.is_empty());
+        assert_ne!(engine.state().achievements, [] as [learn::Achievement; 0]);
 
         engine.handle_event(TutorialEvent::Reset).unwrap();
-        assert!(engine.state().achievements.is_empty());
+        assert_eq!(engine.state().achievements, [] as [learn::Achievement; 0]);
         assert!(engine.state().completed_exercises.is_empty());
     }
 
@@ -2880,7 +2880,7 @@ mod tests {
         let basics = engine.get_track("basics").unwrap();
         assert_eq!(basics.exercises.len(), 5);
         assert!(basics.exercises.iter().all(|e| e.can_simulate));
-        assert!(basics.exercises[0].requirements.is_empty());
+        assert_eq!(basics.exercises[0].requirements, [] as [learn::Requirement; 0]);
         assert!(basics.exercises[0].can_simulate);
 
         // basics.3 requires an active terminal backend bridge (current: WezTerm)
@@ -3002,7 +3002,7 @@ mod tests {
 
         let track = engine.get_track("advanced").unwrap();
         // advanced.1 (conceptual) has no requirements
-        assert!(track.exercises[0].requirements.is_empty());
+        assert_eq!(track.exercises[0].requirements, [] as [learn::Requirement; 0]);
         // advanced.2 (create pattern) requires WaConfigured
         assert!(
             track.exercises[1]
@@ -3016,7 +3016,7 @@ mod tests {
                 .contains(&Requirement::DbHasData)
         );
         // advanced.9 (track completion) has no requirements
-        assert!(track.exercises[8].requirements.is_empty());
+        assert_eq!(track.exercises[8].requirements, [] as [learn::Requirement; 0]);
     }
 
     #[test]

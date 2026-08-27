@@ -581,7 +581,7 @@ fn completion_token_tracks_capture_dedup_eviction_pipeline() {
     // Cause chain should have 4 entries
     let chain = tracker.cause_chain(&token_id).unwrap();
     assert_eq!(chain.len(), 4);
-    assert!(chain.failed_subsystems().is_empty());
+    assert_eq!(chain.failed_subsystems(), [] as [&str; 0]);
 }
 
 #[test]

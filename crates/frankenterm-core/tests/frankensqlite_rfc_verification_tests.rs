@@ -315,7 +315,7 @@ fn test_cursor_batch_exhaustion() {
     let batch = cursor.next_batch(100);
     assert_eq!(batch.len(), 5);
     let empty = cursor.next_batch(10);
-    assert!(empty.is_empty());
+    assert_eq!(empty, [] as [RfcEvent; 0]);
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn test_empty_source_empty_cursor() {
     let source = InMemorySource::new(Vec::new());
     assert_eq!(source.event_count(), 0);
     let mut cursor = source.open_cursor(None);
-    assert!(cursor.next_batch(10).is_empty());
+    assert_eq!(cursor.next_batch(10), [] as [RfcEvent; 0]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

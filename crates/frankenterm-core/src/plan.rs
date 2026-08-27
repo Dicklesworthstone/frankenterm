@@ -7388,7 +7388,7 @@ mod tests {
             let s1 = action.canonical_string();
             let s2 = action.canonical_string();
             assert_eq!(s1, s2, "StepAction canonical string not stable");
-            assert!(!s1.is_empty());
+            assert_ne!(s1, "");
         }
     }
 

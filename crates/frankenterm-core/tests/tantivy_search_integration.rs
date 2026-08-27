@@ -523,7 +523,10 @@ fn snippets_highlight_matched_terms() {
 
     let results = svc.search(&SearchQuery::simple("connection")).unwrap();
     assert_eq!(results.total_hits, 1);
-    assert!(!results.hits[0].snippets.is_empty());
+    assert_ne!(
+        results.hits[0].snippets,
+        [] as [frankenterm_core_tantivy::tantivy_query::Snippet; 0]
+    );
     let snippet = &results.hits[0].snippets[0];
     assert!(
         snippet.fragment.contains("\u{ab}connection\u{bb}"),
@@ -544,7 +547,10 @@ fn snippet_disabled_returns_no_snippets() {
     };
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 1);
-    assert!(results.hits[0].snippets.is_empty());
+    assert_eq!(
+        results.hits[0].snippets,
+        [] as [frankenterm_core_tantivy::tantivy_query::Snippet; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -734,7 +740,7 @@ fn mapped_control_has_correct_fields() {
     assert_eq!(doc.event_type, "control_marker");
     assert_eq!(doc.control_marker_type.as_deref(), Some("resize"));
     // Control markers have empty text (details in details_json)
-    assert!(doc.text.is_empty());
+    assert_eq!(doc.text, "");
     assert!(doc.details_json.contains("cols"));
 }
 

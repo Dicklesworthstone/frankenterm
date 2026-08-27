@@ -611,5 +611,5 @@ fn replay_result_empty() {
     assert_eq!(r.succeeded, 0);
     assert_eq!(r.failed, 0);
     assert_eq!(r.skipped, 0);
-    assert!(r.failed_ids.is_empty());
+    assert_eq!(r.failed_ids, [] as [u64; 0]);
 }

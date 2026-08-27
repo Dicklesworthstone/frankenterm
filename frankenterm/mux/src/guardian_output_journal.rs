@@ -1445,6 +1445,49 @@ pub struct GuardianOutputAppendReceipt {
 }
 
 impl GuardianOutputAppendReceipt {
+    /// Reconstitute the delivery-only portion of a receipt from one replay
+    /// record whose metadata and plaintext were already authenticated by the
+    /// guardian replay protocol.
+    ///
+    /// This is crate-private so an ordinary mux caller cannot manufacture
+    /// durable append authority from public fields. The replay decoder is the
+    /// only non-journal producer, and it consumes its nonduplicable plaintext
+    /// capability while deriving the private delivery digest here.
+    pub(crate) fn from_authenticated_replay(
+        segment_id: Uuid,
+        sequence: u64,
+        cumulative_plaintext_bytes: u64,
+        committed_log_bytes: u64,
+        record_digest: [u8; 32],
+        payload: &[u8],
+    ) -> Result<Self, GuardianOutputJournalError> {
+        let payload_bytes = u32::try_from(payload.len())
+            .map_err(|_| GuardianOutputJournalError::RecoveryPayloadBindingMismatch)?;
+        let minimum_committed_log_bytes = FILE_HEADER_BYTES_U64
+            .checked_add(RECORD_HEADER_BYTES_U64)
+            .and_then(|bytes| bytes.checked_add(u64::from(AEAD_TAG_BYTES)))
+            .and_then(|bytes| bytes.checked_add(u64::from(payload_bytes)))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        if segment_id.is_nil()
+            || sequence == 0
+            || payload_bytes == 0
+            || cumulative_plaintext_bytes < u64::from(payload_bytes)
+            || committed_log_bytes < minimum_committed_log_bytes
+            || record_digest == [0; 32]
+        {
+            return Err(GuardianOutputJournalError::RecoveryPayloadBindingMismatch);
+        }
+        Ok(Self {
+            segment_id,
+            sequence,
+            payload_bytes,
+            cumulative_plaintext_bytes,
+            committed_log_bytes,
+            record_digest,
+            plaintext_delivery_digest: plaintext_delivery_digest(segment_id, sequence, payload),
+        })
+    }
+
     #[must_use]
     pub const fn segment_id(self) -> Uuid {
         self.segment_id

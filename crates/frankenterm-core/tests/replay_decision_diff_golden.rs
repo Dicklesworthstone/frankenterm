@@ -268,19 +268,19 @@ fn g09_json_schema() {
     // All required fields present and populated.
     assert_eq!(parsed.replay_run_id, "golden_001");
     assert_eq!(parsed.artifact_path, "golden.ftreplay");
-    assert!(!parsed.equivalence_level.is_empty());
-    assert!(!parsed.recommendation.is_empty());
-    assert!(!parsed.timestamp.is_empty());
+    assert_ne!(parsed.equivalence_level, "");
+    assert_ne!(parsed.recommendation, "");
+    assert_ne!(parsed.timestamp, "");
 
     // Risk summary has all fields.
-    assert!(!parsed.risk_summary.max_severity.is_empty());
+    assert_ne!(parsed.risk_summary.max_severity, "");
 
     // Divergences have all fields.
     for div in &parsed.divergences {
-        assert!(!div.divergence_type.is_empty());
-        assert!(!div.severity.is_empty());
-        assert!(!div.rule_id.is_empty());
-        assert!(!div.root_cause.is_empty());
+        assert_ne!(div.divergence_type, "");
+        assert_ne!(div.severity, "");
+        assert_ne!(div.rule_id, "");
+        assert_ne!(div.root_cause, "");
     }
 }
 
@@ -508,14 +508,14 @@ fn g19_full_roundtrip() {
         GateResult::Pass => {}
         GateResult::Fail(violations) => {
             for v in violations {
-                assert!(!v.budget_dimension.is_empty());
-                assert!(!v.limit.is_empty());
-                assert!(!v.actual.is_empty());
+                assert_ne!(v.budget_dimension, "");
+                assert_ne!(v.limit, "");
+                assert_ne!(v.actual, "");
             }
         }
         GateResult::Warn(warnings) => {
             for w in warnings {
-                assert!(!w.message.is_empty());
+                assert_ne!(w.message, "");
             }
         }
     }

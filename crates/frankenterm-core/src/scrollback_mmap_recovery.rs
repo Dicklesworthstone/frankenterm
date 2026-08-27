@@ -2155,7 +2155,7 @@ mod tests {
             .map(|chunk| chunk.text.as_str())
             .collect::<String>();
         assert_eq!(replayed, "first\nsecond\x1b[31m");
-        assert!(plan.skipped.is_empty());
+        assert_eq!(plan.skipped, [] as [scrollback_mmap_recovery::MmapReplaySkippedRecord; 0]);
     }
 
     #[test]
@@ -2617,7 +2617,7 @@ mod tests {
             ErrorKind::WouldBlock
         );
         let snapshot = candidate.read_records(recovery_limits()).unwrap();
-        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.records, [] as [(scrollback_mmap_format::RecordKind, std::vec::Vec<u8>); 0]);
         assert_eq!(snapshot.header.pane_uuid, [0x61; 32]);
         drop(candidate);
         competing.try_lock_exclusive().unwrap();

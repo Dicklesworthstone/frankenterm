@@ -110,7 +110,7 @@ fn restore_single_pane() {
         assert_eq!(result.panes_created, 1);
         assert_eq!(result.windows_created, 1);
         assert_eq!(result.tabs_created, 1);
-        assert!(result.failed_panes.is_empty());
+        assert_eq!(result.failed_panes, [] as [(u64, std::string::String); 0]);
         assert!(result.pane_id_map.contains_key(&42));
     });
 }

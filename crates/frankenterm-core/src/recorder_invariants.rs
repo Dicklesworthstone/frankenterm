@@ -1702,7 +1702,7 @@ mod tests {
         assert!(c.check_causality);
         assert!(c.check_merge_order);
         assert_eq!(c.clock_future_skew_threshold_ms, 60_000);
-        assert!(c.expected_schema_version.is_empty());
+        assert_eq!(c.expected_schema_version, "");
     }
 
     #[test]
@@ -1779,7 +1779,7 @@ mod tests {
         };
         assert!(r.deterministic);
         assert!(r.divergence_index.is_none());
-        assert!(r.message.is_empty());
+        assert_eq!(r.message, "");
     }
 
     // -------------------------------------------------------------------------

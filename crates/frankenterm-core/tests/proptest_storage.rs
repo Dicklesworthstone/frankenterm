@@ -579,7 +579,7 @@ fn free_ratio_negative_values() {
 #[test]
 fn correlation_type_debug_nonempty() {
     let debug = format!("{:?}", CorrelationType::Failover);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 // ── Additional behavioral invariants ──────────────────────────────

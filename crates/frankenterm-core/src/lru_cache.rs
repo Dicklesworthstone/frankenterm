@@ -797,7 +797,7 @@ mod tests {
         cache.put(2, "two");
 
         let evicted = cache.resize(10);
-        assert!(evicted.is_empty());
+        assert_eq!(evicted, [] as [(i32, &str); 0]);
         assert_eq!(cache.capacity(), 10);
         assert_eq!(cache.len(), 2);
     }

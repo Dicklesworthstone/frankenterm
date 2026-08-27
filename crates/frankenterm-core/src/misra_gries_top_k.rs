@@ -258,7 +258,7 @@ mod tests {
         let s: SpaceSavingTopK<String> = SpaceSavingTopK::new(10);
         assert_eq!(s.total_inserts(), 0);
         assert_eq!(s.monitored_count(), 0);
-        assert!(s.top_k(5).is_empty());
+        assert_eq!(s.top_k(5), [] as [misra_gries_top_k::MonitoredItem<std::string::String>; 0]);
     }
 
     #[test]

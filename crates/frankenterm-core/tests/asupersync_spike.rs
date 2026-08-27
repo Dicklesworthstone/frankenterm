@@ -275,7 +275,7 @@ fn spike_labruntime_virtual_time_and_oracle_report() {
         "virtual-time sleep should not consume a real second"
     );
     assert!(report.oracle_report.all_passed());
-    assert!(report.invariant_violations.is_empty());
+    assert_eq!(report.invariant_violations, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -348,5 +348,8 @@ fn spike_select_and_race_semantics() {
         "sleep branch should win when no message arrives"
     );
     assert!(oracle_report.oracle_report.all_passed());
-    assert!(oracle_report.invariant_violations.is_empty());
+    assert_eq!(
+        oracle_report.invariant_violations,
+        [] as [std::string::String; 0]
+    );
 }

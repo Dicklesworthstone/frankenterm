@@ -562,9 +562,9 @@ mod tests {
     fn empty_input_roundtrip() {
         let compressor = ByteCompressor::default();
         let compressed = compressor.compress(b"");
-        assert!(compressed.is_empty());
+        assert_eq!(compressed, [] as [u8; 0]);
         let decompressed = compressor.decompress(&compressed).unwrap();
-        assert!(decompressed.is_empty());
+        assert_eq!(decompressed, [] as [u8; 0]);
     }
 
     #[test]
@@ -701,9 +701,9 @@ mod tests {
         assert_eq!(stats.buffer_count, 3);
         let decompressed = compressor.decompress_batch(&batch).unwrap();
         assert_eq!(decompressed.len(), 3);
-        assert!(decompressed[0].is_empty());
+        assert_eq!(decompressed[0], [] as [u8; 0]);
         assert_eq!(decompressed[1], b"non-empty");
-        assert!(decompressed[2].is_empty());
+        assert_eq!(decompressed[2], [] as [u8; 0]);
     }
 
     #[test]
@@ -748,7 +748,7 @@ mod tests {
         let seeds = terminal_dictionary_seeds();
         assert!(seeds.len() > 10);
         for seed in &seeds {
-            assert!(!seed.is_empty());
+            assert_ne!(seed.as_slice(), []);
         }
     }
 
@@ -860,6 +860,6 @@ mod tests {
         );
         // std::error::Error trait conformance
         let err: &dyn std::error::Error = &ByteCompressionError::InvalidInput("x".into());
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 }

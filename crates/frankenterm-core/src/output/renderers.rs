@@ -4654,7 +4654,7 @@ mod tests {
         let ctx = RenderContext::new(OutputFormat::Json);
         let output = HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
 
-        assert!(output.is_empty());
+        assert_eq!(output, "");
     }
 
     #[test]
@@ -5156,7 +5156,7 @@ mod tests {
 
         let deser: HealthSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(deser.timestamp, 1000);
-        assert!(deser.last_activity_by_pane.is_empty());
+        assert_eq!(deser.last_activity_by_pane, [] as [(u64, u64); 0]);
         assert!(deser.pane_priority_overrides.is_empty());
         assert!(deser.scheduler.is_none());
         assert!(deser.backpressure_tier.is_none());

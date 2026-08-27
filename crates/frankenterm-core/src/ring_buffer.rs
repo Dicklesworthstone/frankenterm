@@ -651,7 +651,7 @@ mod tests {
     fn drain_empty_buffer() {
         let mut rb: RingBuffer<i32> = RingBuffer::new(5);
         let drained = rb.drain();
-        assert!(drained.is_empty());
+        assert_eq!(drained, [] as [i32; 0]);
         assert!(rb.is_empty());
     }
 
@@ -755,7 +755,7 @@ mod tests {
     fn to_owned_vec_empty() {
         let rb: RingBuffer<String> = RingBuffer::new(3);
         let v = rb.to_owned_vec();
-        assert!(v.is_empty());
+        assert_eq!(v, [] as [std::string::String; 0]);
     }
 
     #[test]

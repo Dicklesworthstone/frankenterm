@@ -413,7 +413,7 @@ mod smart_selection_tests {
     #[test]
     fn empty_config_validates_clean() {
         let cfg = SmartSelectionConfig::default();
-        assert!(cfg.validate().is_empty());
+        assert_eq!(cfg.validate(), [] as [config::SmartSelectionPatternError; 0]);
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod smart_selection_tests {
         let cfg = SmartSelectionConfig {
             patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
         };
-        assert!(cfg.validate().is_empty());
+        assert_eq!(cfg.validate(), [] as [config::SmartSelectionPatternError; 0]);
     }
 
     #[test]
@@ -500,7 +500,7 @@ mod smart_selection_tests {
         let cfg = SmartSelectionConfig {
             patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
         };
-        assert!(cfg.validate().is_empty());
+        assert_eq!(cfg.validate(), [] as [config::SmartSelectionPatternError; 0]);
         let compiled = cfg.compile().expect("validated patterns compile");
         assert_eq!(compiled.len(), 1);
         assert_eq!(compiled[0].name, "issue-ref");
@@ -7849,8 +7849,8 @@ max_sender_id_len = 0
     #[test]
     fn pane_filter_default_allows_all() {
         let filter = PaneFilterConfig::default();
-        assert!(filter.include.is_empty());
-        assert!(filter.exclude.is_empty());
+        assert_eq!(filter.include, [] as [config::PaneFilterRule; 0]);
+        assert_eq!(filter.exclude, [] as [config::PaneFilterRule; 0]);
         assert!(!filter.has_rules());
 
         // With no rules, all panes should be observed
@@ -8788,10 +8788,10 @@ proxy_allow_mutating_tools = false
         assert!(nc.enabled);
         assert_eq!(nc.cooldown_ms, 30_000);
         assert_eq!(nc.dedup_window_ms, 300_000);
-        assert!(nc.include.is_empty());
-        assert!(nc.exclude.is_empty());
+        assert_eq!(nc.include, [] as [std::string::String; 0]);
+        assert_eq!(nc.exclude, [] as [std::string::String; 0]);
         assert!(nc.min_severity.is_none());
-        assert!(nc.agent_types.is_empty());
+        assert_eq!(nc.agent_types, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9314,7 +9314,7 @@ retention_days = 45
 retention_tiers = []
 ";
         let config = Config::from_toml(toml_str).expect("parse");
-        assert!(config.storage.retention_tiers.is_empty());
+        assert_eq!(config.storage.retention_tiers, [] as [config::RetentionTier; 0]);
         assert_eq!(
             config
                 .storage
@@ -9755,7 +9755,7 @@ retention_tiers = []
     #[test]
     fn extract_prompt_placeholders_none() {
         let result = extract_prompt_placeholders("no placeholders").unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9852,7 +9852,7 @@ retention_tiers = []
     fn backup_config_defaults() {
         let config = BackupConfig::default();
         assert!(!config.scheduled.enabled);
-        assert!(!config.scheduled.schedule.is_empty());
+        assert_ne!(config.scheduled.schedule, "");
     }
 
     #[test]
@@ -9984,7 +9984,7 @@ retention_tiers = []
     #[test]
     fn default_data_dir_is_non_empty() {
         let dir = default_data_dir();
-        assert!(!dir.is_empty());
+        assert_ne!(dir, "");
         #[cfg(target_os = "macos")]
         assert!(dir.contains("Library"));
         #[cfg(not(target_os = "macos"))]
@@ -10641,8 +10641,8 @@ mode = "periodic"
         assert!(!sc.allow_binary);
         assert!(sc.allow_config);
         assert!(sc.allow_snapshots);
-        assert!(sc.allow_paths.is_empty());
-        assert!(sc.deny_paths.is_empty());
+        assert_eq!(sc.allow_paths, [] as [std::string::String; 0]);
+        assert_eq!(sc.deny_paths, [] as [std::string::String; 0]);
         assert!(sc.targets.is_empty());
     }
 
@@ -10655,7 +10655,7 @@ mode = "periodic"
         assert!(dc.require_tls_for_non_loopback);
         assert_eq!(dc.auth_mode, DistributedAuthMode::Token);
         assert!(dc.token.is_none());
-        assert!(dc.allow_agent_ids.is_empty());
+        assert_eq!(dc.allow_agent_ids, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -10708,7 +10708,7 @@ mode = "periodic"
         assert!(cpc.by_agent.contains_key("unknown"));
         assert_eq!(cpc.max_prompt_len, 2000);
         assert_eq!(cpc.max_snippet_len, 400);
-        assert!(!cpc.default.is_empty());
+        assert_ne!(cpc.default, "");
     }
 
     #[test]
@@ -10724,7 +10724,7 @@ mode = "periodic"
     #[test]
     fn extract_prompt_placeholders_empty() {
         let r = extract_prompt_placeholders("no placeholders here").unwrap();
-        assert!(r.is_empty());
+        assert_eq!(r, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -10754,7 +10754,7 @@ mode = "periodic"
     #[test]
     fn pack_override_default_empty() {
         let po = PackOverride::default();
-        assert!(po.disabled_rules.is_empty());
+        assert_eq!(po.disabled_rules, [] as [std::string::String; 0]);
         assert!(po.severity_overrides.is_empty());
         assert!(po.extra.is_empty());
         let _ = format!("{:?}", po);

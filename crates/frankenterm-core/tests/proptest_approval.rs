@@ -691,7 +691,7 @@ fn approval_scope_debug_nonempty() {
     let input = PolicyInput::new(ActionKind::Spawn, ActorKind::Human);
     let scope = ApprovalScope::from_input("ws", &input);
     let d = format!("{:?}", scope);
-    assert!(!d.is_empty());
+    assert_ne!(d, "");
     assert!(d.contains("ApprovalScope"));
 }
 
@@ -713,7 +713,7 @@ fn audit_context_clone_preserves() {
 fn audit_context_debug_nonempty() {
     let ctx = ApprovalAuditContext::default();
     let d = format!("{:?}", ctx);
-    assert!(!d.is_empty());
+    assert_ne!(d, "");
 }
 
 // =============================================================================
@@ -740,7 +740,7 @@ fn approval_config_clone_preserves() {
 fn approval_config_debug_nonempty() {
     let cfg = ApprovalConfig::default();
     let d = format!("{:?}", cfg);
-    assert!(!d.is_empty());
+    assert_ne!(d, "");
 }
 
 // =============================================================================
@@ -805,7 +805,7 @@ proptest! {
 fn policy_input_debug_nonempty() {
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
     let d = format!("{:?}", input);
-    assert!(!d.is_empty());
+    assert_ne!(d, "");
 }
 
 #[test]

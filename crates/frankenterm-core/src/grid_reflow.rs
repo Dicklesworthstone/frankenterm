@@ -381,7 +381,7 @@ mod tests {
     fn ascii_short_line_no_wraps() {
         let cells = ascii("hello world");
         let w = compute_wrap_set(&cells, 80);
-        assert!(w.breaks.is_empty());
+        assert_eq!(w.breaks, [] as [usize; 0]);
         assert_eq!(w.row_count(), 1);
     }
 
@@ -416,7 +416,7 @@ mod tests {
         let mut cells = vec![Cell::new('a', 1, 0); 78];
         cells.push(Cell::new('中', 2, 0));
         let w = compute_wrap_set(&cells, 80);
-        assert!(w.breaks.is_empty());
+        assert_eq!(w.breaks, [] as [usize; 0]);
         assert_eq!(w.row_count(), 1);
     }
 
@@ -436,7 +436,7 @@ mod tests {
         ];
         // Total visual width = 2 + 2 + 2 + 2 = 8.
         let w = compute_wrap_set(&cells, 80);
-        assert!(w.breaks.is_empty());
+        assert_eq!(w.breaks, [] as [usize; 0]);
     }
 
     #[test]

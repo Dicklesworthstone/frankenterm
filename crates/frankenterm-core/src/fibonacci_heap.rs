@@ -1019,7 +1019,7 @@ mod tests {
     fn into_sorted_empty() {
         let heap: FibonacciHeap<i32, i32> = FibonacciHeap::new();
         let sorted = heap.into_sorted();
-        assert!(sorted.is_empty());
+        assert_eq!(sorted, [] as [(i32, i32); 0]);
     }
 
     #[test]

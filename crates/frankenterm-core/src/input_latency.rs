@@ -2311,7 +2311,7 @@ mod tests {
             let label = stage.label();
             let display = format!("{stage}");
             assert_eq!(label, display);
-            assert!(!label.is_empty());
+            assert_ne!(label, "");
         }
     }
 

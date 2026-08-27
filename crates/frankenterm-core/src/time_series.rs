@@ -457,7 +457,7 @@ mod tests {
         let mut ts = TimeSeries::new();
         ts.push(100, 1.0);
         let range = ts.range(200, 300);
-        assert!(range.is_empty());
+        assert_eq!(range, [] as [time_series::DataPoint; 0]);
     }
 
     #[test]

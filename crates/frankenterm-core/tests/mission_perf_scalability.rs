@@ -428,7 +428,7 @@ fn perf_report_json_serialization_fast() {
         "JSON serialization should be fast: {:?}",
         elapsed
     );
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
 }
 
 #[test]
@@ -522,7 +522,7 @@ fn perf_plain_text_report_fast() {
         "Plain text report formatting: {:?}",
         elapsed
     );
-    assert!(!text.is_empty());
+    assert_ne!(text, "");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -603,7 +603,7 @@ fn budget_override_history_bounded() {
     }
 
     // Active overrides should be zero (all cleared)
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
 }
 
 #[test]

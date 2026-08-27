@@ -1442,7 +1442,7 @@ mod tests {
         }
 
         det.reset();
-        assert!(det.current_centroid().is_empty());
+        assert_eq!(det.current_centroid(), []);
         assert!(det.total_observations() > 0, "Counters should persist");
     }
 
@@ -2160,7 +2160,7 @@ mod tests {
         let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
         let verdict = det.observe(&[1.0, f32::NAN, 3.0]);
         assert!(verdict.is_none());
-        assert!(det.current_centroid().is_empty());
+        assert_eq!(det.current_centroid(), []);
     }
 
     #[test]

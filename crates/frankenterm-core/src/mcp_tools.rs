@@ -16767,7 +16767,7 @@ mod tests {
         let (result, leases) = service
             .execute_request(request_cx, operation)
             .expect("pre-cancellation is a request-local result");
-        assert!(leases.is_empty());
+        assert_eq!(leases, [] as [storage::types::EventDeliveryLease; 0]);
         assert_eq!(
             result
                 .expect_err("pre-cancelled await must return a typed cancellation")
@@ -16849,7 +16849,7 @@ mod tests {
                 .join()
                 .expect("bounded request caller must not panic")
                 .expect("admitted request must receive its isolated result");
-            assert!(leases.is_empty());
+            assert_eq!(leases, [] as [storage::types::EventDeliveryLease; 0]);
             let error = result.expect_err("gated test request returns its identity as an error");
             assert!(results.insert(error.message));
         }
@@ -17037,7 +17037,7 @@ mod tests {
             .join()
             .expect("cancelled request caller must not panic")
             .expect("cancelled request must receive an isolated result");
-        assert!(first_leases.is_empty());
+        assert_eq!(first_leases, [] as [storage::types::EventDeliveryLease; 0]);
         assert_eq!(
             first_result
                 .expect_err("cancelled gated request returns a typed error")
@@ -17055,7 +17055,7 @@ mod tests {
             .join()
             .expect("uncancelled request caller must not panic")
             .expect("uncancelled request must receive its result");
-        assert!(second_leases.is_empty());
+        assert_eq!(second_leases, [] as [storage::types::EventDeliveryLease; 0]);
         assert_eq!(
             second_result
                 .expect_err("gated request returns its identity as a typed error")
@@ -17145,7 +17145,7 @@ mod tests {
             .join()
             .expect("queued request caller must not panic")
             .expect("queued cancellation must return a typed result");
-        assert!(queued_leases.is_empty());
+        assert_eq!(queued_leases, [] as [storage::types::EventDeliveryLease; 0]);
         assert_eq!(
             queued_result
                 .expect_err("cancelled queued request must not execute")
@@ -17264,7 +17264,7 @@ mod tests {
                 .join()
                 .expect("shutdown-stopped request caller must not panic")
                 .expect("shutdown-stopped request must receive its isolated result");
-            assert!(request_leases.is_empty());
+            assert_eq!(request_leases, [] as [storage::types::EventDeliveryLease; 0]);
             let error =
                 request_result.expect_err("shutdown-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:shutdown-") {
@@ -17322,7 +17322,7 @@ mod tests {
         let (result, leases) = service
             .execute_request(crate::cx::for_request(), operation)
             .expect("request-local storage-domain error must be returned normally");
-        assert!(leases.is_empty());
+        assert_eq!(leases, [] as [storage::types::EventDeliveryLease; 0]);
         assert_eq!(
             result
                 .expect_err("blocked-capacity result must remain a typed request error")
@@ -17481,7 +17481,7 @@ mod tests {
         let (result, leases) = service
             .execute_request(crate::cx::for_request(), operation)
             .expect("contained request panic must return a sanitized result");
-        assert!(leases.is_empty());
+        assert_eq!(leases, [] as [storage::types::EventDeliveryLease; 0]);
         let error = result.expect_err("contained request panic returns a typed error");
         assert!(!error.message.contains(SENTINEL));
         let recovered = wait_for_completion_stats(
@@ -17962,7 +17962,7 @@ mod tests {
                 .join()
                 .expect("epoch-stopped request caller must not panic")
                 .expect("epoch-stopped request must receive its isolated result");
-            assert!(request_leases.is_empty());
+            assert_eq!(request_leases, [] as [storage::types::EventDeliveryLease; 0]);
             let error =
                 request_result.expect_err("epoch-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:invalidated-epoch-") {
@@ -18000,7 +18000,7 @@ mod tests {
         let (request_result, request_leases) = executor
             .execute_request(request_cx, request_operation)
             .expect("replacement epoch must serve an ordinary await request");
-        assert!(request_leases.is_empty());
+        assert_eq!(request_leases, [] as [storage::types::EventDeliveryLease; 0]);
         assert_eq!(
             request_result
                 .expect_err("test request returns its observed database path")
@@ -21739,11 +21739,10 @@ mod tests {
                 .len(),
             3
         );
-        assert!(
-            !envelope["data"]["legal_transitions"]
+        assert_ne!(
+            envelope["data"]["legal_transitions"]
                 .as_array()
-                .expect("transitions array")
-                .is_empty()
+                .expect("transitions array").as_slice(), []
         );
     }
 
@@ -22416,7 +22415,7 @@ mod tests {
         let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
         assert_eq!(persisted.lifecycle_state, MissionTxState::Failed);
         assert_eq!(persisted.outcome, TxOutcome::Failed);
-        assert!(persisted.receipts.is_empty());
+        assert_eq!(persisted.receipts, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -22460,7 +22459,7 @@ mod tests {
         let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
         assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
         assert_eq!(persisted.outcome, TxOutcome::Compensated);
-        assert!(!persisted.receipts.is_empty());
+        assert_ne!(persisted.receipts, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -22493,7 +22492,7 @@ mod tests {
         let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
         assert_eq!(persisted.lifecycle_state, MissionTxState::Compensated);
         assert_eq!(persisted.outcome, TxOutcome::Compensated);
-        assert!(!persisted.receipts.is_empty());
+        assert_ne!(persisted.receipts, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -22660,7 +22659,7 @@ mod tests {
 
         let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
         assert_eq!(persisted.lifecycle_state, MissionTxState::Committed);
-        assert!(persisted.receipts.is_empty());
+        assert_eq!(persisted.receipts, [] as [serde_json::Value; 0]);
     }
 
     #[test]

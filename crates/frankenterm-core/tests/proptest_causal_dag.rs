@@ -577,7 +577,7 @@ fn time_series_new_is_empty() {
     let ts = PaneTimeSeries::new(100);
     assert!(ts.is_empty());
     assert_eq!(ts.len(), 0);
-    assert!(ts.as_slice_ordered().is_empty());
+    assert_eq!(ts.as_slice_ordered(), [] as [f64; 0]);
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn config_serde_deterministic() {
 fn config_debug_nonempty() {
     let config = CausalDagConfig::default();
     let debug = format!("{:?}", config);
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 #[test]

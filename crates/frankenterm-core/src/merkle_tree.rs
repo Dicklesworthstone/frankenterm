@@ -624,8 +624,8 @@ mod tests {
         ]);
         let diff = tree1.diff(&tree2);
         assert_eq!(diff.added, vec![b"b".to_vec()]);
-        assert!(diff.removed.is_empty());
-        assert!(diff.changed.is_empty());
+        assert_eq!(diff.removed, [] as [std::vec::Vec<u8>; 0]);
+        assert_eq!(diff.changed, [] as [std::vec::Vec<u8>; 0]);
     }
 
     #[test]
@@ -636,7 +636,7 @@ mod tests {
         ]);
         let tree2 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"1".to_vec())]);
         let diff = tree1.diff(&tree2);
-        assert!(diff.added.is_empty());
+        assert_eq!(diff.added, [] as [std::vec::Vec<u8>; 0]);
         assert_eq!(diff.removed, vec![b"b".to_vec()]);
     }
 
@@ -645,8 +645,8 @@ mod tests {
         let tree1 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"old".to_vec())]);
         let tree2 = MerkleTree::from_entries(vec![(b"a".to_vec(), b"new".to_vec())]);
         let diff = tree1.diff(&tree2);
-        assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
+        assert_eq!(diff.added, [] as [std::vec::Vec<u8>; 0]);
+        assert_eq!(diff.removed, [] as [std::vec::Vec<u8>; 0]);
         assert_eq!(diff.changed, vec![b"a".to_vec()]);
     }
 
@@ -887,7 +887,7 @@ mod tests {
         let t = MerkleTree::from_entries(vec![(b"only".to_vec(), b"val".to_vec())]);
         let proof = t.proof(b"only").unwrap();
         assert!(proof.verify(&t.root_hash()));
-        assert!(proof.path.is_empty()); // single leaf, no siblings
+        assert_eq!(proof.path, [] as [merkle_tree::ProofStep; 0]); // single leaf, no siblings
     }
 
     #[test]

@@ -435,5 +435,5 @@ fn standard_suite_summary_renders() {
     exec.complete(1000);
     let report = RehearsalReport::from_execution(&exec);
     let summary = report.render_summary();
-    assert!(!summary.is_empty());
+    assert_ne!(summary, "");
 }

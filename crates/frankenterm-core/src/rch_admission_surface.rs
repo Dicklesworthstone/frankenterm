@@ -333,7 +333,7 @@ mod tests {
         let reason = &surface.reasons[0];
         assert!(reason.blocks_proof);
         assert!(reason.operator_approval_required);
-        assert!(!reason.recommendation.is_empty());
+        assert_ne!(reason.recommendation, "");
         let text = surface.doctor_lines().join("\n");
         assert!(
             text.contains("BLOCKED"),
@@ -362,7 +362,7 @@ mod tests {
             report_with(RchAdmissionProofStatus::Runnable, Vec::new()),
         );
         assert!(!surface.proof_blocked);
-        assert!(surface.reasons.is_empty());
+        assert_eq!(surface.reasons, [] as [rch_admission_surface::RchAdmissionSurfaceReason; 0]);
         let text = surface.doctor_lines().join("\n");
         assert!(text.contains("runnable"), "{text}");
         assert!(

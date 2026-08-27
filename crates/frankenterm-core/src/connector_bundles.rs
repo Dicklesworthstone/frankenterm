@@ -1423,7 +1423,7 @@ mod tests {
         let tier1 = reg.find_by_tier(BundleTier::Tier1);
         assert_eq!(tier1.len(), 2);
         let tier2 = reg.find_by_tier(BundleTier::Tier2);
-        assert!(tier2.is_empty());
+        assert_eq!(tier2, [] as [&connector_bundles::ConnectorBundle; 0]);
     }
 
     #[test]
@@ -1449,7 +1449,7 @@ mod tests {
         let slack = reg.find_by_package("conn-slack");
         assert_eq!(slack.len(), 1);
         let nope = reg.find_by_package("conn-nope");
-        assert!(nope.is_empty());
+        assert_eq!(nope, [] as [&connector_bundles::ConnectorBundle; 0]);
     }
 
     #[test]

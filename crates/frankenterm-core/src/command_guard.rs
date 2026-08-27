@@ -2690,7 +2690,7 @@ mod tests {
         let config = PaneGuardConfig::default();
         assert_eq!(config.trust_level, TrustLevel::Strict);
         assert!(config.enabled_packs.is_none());
-        assert!(config.allowlist_patterns.is_empty());
+        assert_eq!(config.allowlist_patterns, [] as [std::string::String; 0]);
         assert_eq!(config.budget_us, 100);
     }
 
@@ -2724,7 +2724,7 @@ mod tests {
         let policy = GuardPolicy::default();
         assert_eq!(policy.default_trust, TrustLevel::Strict);
         assert_eq!(policy.enabled_packs.len(), 8);
-        assert!(policy.disabled_packs.is_empty());
+        assert_eq!(policy.disabled_packs, [] as [std::string::String; 0]);
         assert!(policy.pane_overrides.is_empty());
         assert_eq!(policy.audit_capacity, 10_000);
     }
@@ -2854,8 +2854,8 @@ mod tests {
         let result = evaluate_stateless("rm -rf /tmp/important");
         assert!(result.is_some());
         let (rule_id, pack, _reason, _suggestions) = result.unwrap();
-        assert!(!rule_id.is_empty());
-        assert!(!pack.is_empty());
+        assert_ne!(rule_id, "");
+        assert_ne!(pack, "");
     }
 
     #[test]

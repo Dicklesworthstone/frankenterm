@@ -1079,7 +1079,7 @@ mod tests {
 
         assert_eq!(report.panes_trimmed, 2);
         assert_eq!(report.segments_removed, 5400); // 5000 + 400
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1812,7 +1812,7 @@ mod tests {
         let r = EvictionReport::default();
         assert_eq!(r.panes_trimmed, 0);
         assert_eq!(r.segments_removed, 0);
-        assert!(r.errors.is_empty());
+        assert_eq!(r.errors, [] as [std::string::String; 0]);
     }
 
     // ===================================================================

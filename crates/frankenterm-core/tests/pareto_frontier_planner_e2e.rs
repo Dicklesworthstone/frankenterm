@@ -272,7 +272,10 @@ fn e2e_compression_sweep_all_pareto_optimal() {
                 4,
                 "every compression level must stay on frontier"
             );
-            assert!(dominated.is_empty());
+            assert_eq!(
+                dominated,
+                [] as [frankenterm_core::pareto_frontier_planner::DominatedExplanation; 0]
+            );
             // Lex order: compression 0 → 3.
             for (idx, p) in frontier.iter().enumerate() {
                 assert_eq!(p.config.output_compression_level as usize, idx);
@@ -444,7 +447,7 @@ fn e2e_sparse_evidence_requests_more_data() {
     let report = replay("sparse_evidence", &points);
     match report {
         PlannerReport::DataNeeded { reasons } => {
-            assert!(!reasons.is_empty());
+            assert_ne!(reasons, [] as [std::string::String; 0]);
             // The substrate's reason string mentions the threshold.
             assert!(
                 reasons

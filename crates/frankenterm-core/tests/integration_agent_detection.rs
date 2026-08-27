@@ -503,13 +503,19 @@ fn agent_inventory_serde_roundtrip_with_running_agents() {
 #[test]
 fn agent_inventory_default_is_empty() {
     let inv = AgentInventory::default();
-    assert!(inv.installed.is_empty());
+    assert_eq!(
+        inv.installed,
+        [] as [frankenterm_core::agent_correlator::InstalledAgentInventoryEntry; 0]
+    );
     assert!(inv.running.is_empty());
 
     // Default roundtrips cleanly
     let json = serde_json::to_string(&inv).unwrap();
     let back: AgentInventory = serde_json::from_str(&json).unwrap();
-    assert!(back.installed.is_empty());
+    assert_eq!(
+        back.installed,
+        [] as [frankenterm_core::agent_correlator::InstalledAgentInventoryEntry; 0]
+    );
     assert!(back.running.is_empty());
 }
 

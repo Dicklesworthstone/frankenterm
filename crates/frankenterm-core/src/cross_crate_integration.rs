@@ -727,7 +727,7 @@ mod tests {
     fn suite_report_tracks_boundaries() {
         let scenarios = standard_scenarios();
         let report = SuiteReport::from_scenarios(&scenarios);
-        assert!(!report.boundaries_covered.is_empty());
+        assert_ne!(report.boundaries_covered, [] as [cross_crate_integration::CrateBoundary; 0]);
         assert!(
             report
                 .boundaries_covered
@@ -748,7 +748,7 @@ mod tests {
         let scenarios = vec![standard_scenarios().into_iter().next().unwrap()];
         let report = SuiteReport::from_scenarios(&scenarios);
         let gaps = report.coverage_gaps();
-        assert!(!gaps.is_empty());
+        assert_ne!(gaps, [] as [cross_crate_integration::ScenarioCategory; 0]);
     }
 
     #[test]

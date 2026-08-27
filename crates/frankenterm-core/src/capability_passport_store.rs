@@ -608,9 +608,9 @@ mod tests {
     #[test]
     fn jsonl_handles_empty_input() {
         let parsed = from_jsonl("").expect("empty input should parse cleanly");
-        assert!(parsed.is_empty());
+        assert_eq!(parsed, [] as [capability_passport::CapabilityPassport; 0]);
         let parsed_blank_lines = from_jsonl("\n\n\n").expect("blank lines should be skipped");
-        assert!(parsed_blank_lines.is_empty());
+        assert_eq!(parsed_blank_lines, [] as [capability_passport::CapabilityPassport; 0]);
     }
 
     #[test]

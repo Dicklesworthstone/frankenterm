@@ -247,7 +247,10 @@ fn long_haul_plans_are_deterministic_at_every_required_scale() {
         assert_eq!(first.plan_sha256.len(), 64);
         assert_eq!(first.base_seed, corpus.base_seed);
         assert_eq!(first.phases.len(), corpus.phases.len());
-        assert!(!first.actions.is_empty());
+        assert_ne!(
+            first.actions,
+            [] as [frankenterm_core::soak_confidence_gate::SoakScheduledAction; 0]
+        );
         assert_eq!(
             u32::try_from(
                 first
@@ -946,7 +949,7 @@ fn confidence_verdict_summary_renders() {
     let gate = ConfidenceGate::standard();
     let verdict = gate.evaluate(&exec);
     let summary = verdict.render_summary();
-    assert!(!summary.is_empty());
+    assert_ne!(summary, "");
 }
 
 // =============================================================================

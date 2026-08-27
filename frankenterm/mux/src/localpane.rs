@@ -1,8 +1,8 @@
 use crate::domain::DomainId;
 use crate::guardian_checkpoint::{LiveParserCaptureAuthority, LiveParserPaneCaptureError};
 use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, GuardianLiveOutputReader, LogicalLine, Pane,
+    PaneId, Pattern, SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -1012,6 +1012,7 @@ pub struct LocalPane {
     terminal: Arc<Mutex<Terminal>>,
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
+    guardian_live_output_reader: Mutex<Option<Box<dyn GuardianLiveOutputReader>>>,
     resize_queue: Arc<Mutex<ResizeQueueState>>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
@@ -1439,6 +1440,12 @@ impl Pane for LocalPane {
             let w: &mut dyn std::io::Write = writer;
             w
         })
+    }
+
+    fn guardian_live_output_reader(
+        &self,
+    ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
+        Ok(self.guardian_live_output_reader.lock().take())
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
@@ -2827,14 +2834,17 @@ impl LocalPane {
             domain_id,
             durable_pane_id,
             command_description,
+            None,
             LocalPaneOwnership::LegacyMuxOwned,
         )
     }
 
     /// Construct a LocalPane over guardian-backed PTY/process proxy objects.
     ///
-    /// Read, write, resize, status, and signal operations continue through the
+    /// Write, resize, status, and signal operations continue through the
     /// existing object-safe portable-pty interfaces supplied by the caller.
+    /// Output uses the record-aware reader so authenticated guardian receipts
+    /// remain attached to their exact plaintext through parser delivery.
     /// The explicit ownership value changes only lifetime behavior: `kill`
     /// performs one fenced guardian close, while dropping the mux-side pane
     /// retires only its lease and never invokes the child killer. This
@@ -2851,6 +2861,7 @@ impl LocalPane {
         lease_identity: GuardianPaneLeaseIdentity,
         lease_control: Arc<dyn GuardianPaneLeaseControl>,
         command_description: String,
+        guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
     ) -> Self {
         Self::new_with_ownership(
             pane_id,
@@ -2861,6 +2872,7 @@ impl LocalPane {
             domain_id,
             *lease_identity.pane_id().as_bytes(),
             command_description,
+            Some(guardian_live_output_reader),
             LocalPaneOwnership::guardian(lease_identity, lease_control),
         )
     }
@@ -2875,6 +2887,7 @@ impl LocalPane {
         domain_id: DomainId,
         durable_pane_id: [u8; 16],
         command_description: String,
+        guardian_live_output_reader: Option<Box<dyn GuardianLiveOutputReader>>,
         ownership: LocalPaneOwnership,
     ) -> Self {
         let mux_registration = Arc::new(PaneRegistrationSlot::default());
@@ -2908,6 +2921,7 @@ impl LocalPane {
             terminal: Arc::new(Mutex::new(terminal)),
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
+            guardian_live_output_reader: Mutex::new(guardian_live_output_reader),
             resize_queue: Arc::new(Mutex::new(ResizeQueueState::default())),
             writer: Mutex::new(writer),
             domain_id,
@@ -3274,6 +3288,24 @@ mod tests {
         }
     }
 
+    struct GuardianLifetimeTestOutputReader;
+
+    impl GuardianLiveOutputReader for GuardianLifetimeTestOutputReader {
+        fn deliver_next_record(
+            &mut self,
+            _deliver: &mut dyn FnMut(
+                crate::guardian_output_journal::GuardianOutputSegmentIdentity,
+                crate::guardian_output_journal::GuardianOutputAppendReceipt,
+                Arc<[u8]>,
+            ) -> std::io::Result<()>,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "guardian lifetime fixture has no output",
+            ))
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct KillCountingChild {
         kills: Arc<AtomicUsize>,
@@ -3380,6 +3412,7 @@ mod tests {
             identity,
             control,
             "guardian-lifetime-test".to_string(),
+            Box::new(GuardianLifetimeTestOutputReader),
         )
     }
 

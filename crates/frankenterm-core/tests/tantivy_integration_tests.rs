@@ -546,8 +546,11 @@ fn integrity_check_after_full_indexing() {
         let report = IntegrityChecker::check(&lookup, &check_config).unwrap();
         assert!(report.is_consistent);
         assert_eq!(report.index_matches, 15);
-        assert!(report.missing_from_index.is_empty());
-        assert!(report.offset_mismatches.is_empty());
+        assert_eq!(report.missing_from_index, [] as [std::string::String; 0]);
+        assert_eq!(
+            report.offset_mismatches,
+            [] as [frankenterm_core_tantivy::tantivy_reindex::OffsetMismatch; 0]
+        );
         assert_eq!(report.total_index_docs, Some(15));
     });
 }
@@ -905,7 +908,10 @@ fn snippets_extracted_from_indexed_data() {
             .iter()
             .find(|h| h.doc.event_id == "snip-1")
             .unwrap();
-        assert!(!hit.snippets.is_empty());
+        assert_ne!(
+            hit.snippets,
+            [] as [frankenterm_core_tantivy::tantivy_query::Snippet; 0]
+        );
         // Default snippet markers are \u{ab} and \u{bb}
         assert!(hit.snippets[0].fragment.contains("\u{ab}"));
         assert!(hit.snippets[0].fragment.contains("\u{bb}"));

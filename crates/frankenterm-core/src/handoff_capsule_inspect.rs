@@ -1324,7 +1324,7 @@ mod tests {
         let inspector = CapsuleInspector::at(2_000);
         let inspection = inspector.inspect(&capsule);
         // ContextSummary requires no capabilities.
-        assert!(inspection.sections[0].required_capabilities.is_empty());
+        assert_eq!(inspection.sections[0].required_capabilities, [] as [capability_passport::CapabilityClass; 0]);
         // MissionState requires SafetyConstraint("inherit_mission_state").
         assert_eq!(inspection.sections[1].required_capabilities.len(), 1);
     }
@@ -1424,7 +1424,7 @@ mod tests {
         let capsule = capsule_with(Vec::new(), 1_000);
         let inspector = CapsuleInspector::at(2_000);
         assert!(inspector.inspect_text(&capsule).contains("(no sections)"));
-        assert!(inspector.inspect(&capsule).sections.is_empty());
+        assert_eq!(inspector.inspect(&capsule).sections, [] as [handoff_capsule_inspect::SectionInspection; 0]);
     }
 
     /// SEC fail-closed canary [ft-yk9lp]: a planted credential in a

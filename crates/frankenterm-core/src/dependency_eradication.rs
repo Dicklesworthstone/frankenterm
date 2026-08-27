@@ -709,8 +709,8 @@ mod tests {
         assert!(patterns.len() >= 7);
         // All should have non-empty pattern and ID.
         for p in &patterns {
-            assert!(!p.pattern_id.is_empty());
-            assert!(!p.pattern.is_empty());
+            assert_ne!(p.pattern_id, "");
+            assert_ne!(p.pattern, "");
         }
     }
 

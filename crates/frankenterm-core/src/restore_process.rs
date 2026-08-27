@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn unmapped_panes_are_not_planned() {
         let plans = ProcessLauncher::plan(&HashMap::new(), &[pane(1)]);
-        assert!(plans.is_empty());
+        assert_eq!(plans, [] as [restore_process::ProcessPlan; 0]);
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
         let report = ProcessLauncher::execute_cx(&cx, &plans);
         assert_eq!(report.plans_total, 1);
         assert_eq!(report.plans_settled, 0);
-        assert!(report.result_sample.is_empty());
+        assert_eq!(report.result_sample, [] as [restore_process::LaunchResult; 0]);
         assert_eq!(report.manual, 0);
         assert_eq!(
             report.interruption,

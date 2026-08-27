@@ -108,7 +108,10 @@ fn launch_default_config_produces_valid_initial_state() {
     let state = ml.state();
     assert_eq!(state.cycle_count, 0);
     assert!(state.last_evaluation_ms.is_none());
-    assert!(state.pending_triggers.is_empty());
+    assert_eq!(
+        state.pending_triggers,
+        [] as [frankenterm_core::mission_loop::MissionTrigger; 0]
+    );
     assert!(state.last_decision.is_none());
     assert_eq!(state.total_assignments_made, 0);
     assert_eq!(state.total_rejections, 0);
@@ -322,7 +325,7 @@ fn override_full_lifecycle_apply_inspect_clear() {
     let mut ml = MissionLoop::new(MissionLoopConfig::default());
 
     // Step 1: No overrides initially
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
 
     // Step 2: Apply pin override
     ml.apply_override(ovr(
@@ -341,7 +344,7 @@ fn override_full_lifecycle_apply_inspect_clear() {
     // Step 4: Clear
     let cleared = ml.clear_override("pin-b1", 5000);
     assert!(cleared);
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
 
     // Step 5: Clear non-existent returns false
     assert!(!ml.clear_override("nonexistent", 6000));
@@ -397,7 +400,7 @@ fn override_ttl_auto_eviction() {
 
     // After expiry — override evicted, bead assignable
     let d2 = ml.evaluate(35_000, MissionTrigger::CadenceTick, &issues, &agents, &c);
-    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.active_overrides(), []);
     assert!(!d2.assignment_set.assignments.is_empty());
 }
 
@@ -661,7 +664,10 @@ fn diag_conflict_stats_reflect_detected_conflicts() {
         },
     ];
     let cr = ml.detect_conflicts(&d.assignment_set, &reservations, &[], 1000, &issues);
-    assert!(!cr.conflicts.is_empty());
+    assert_ne!(
+        cr.conflicts,
+        [] as [frankenterm_core::mission_loop::AssignmentConflict; 0]
+    );
 
     let (total, _auto) = ml.conflict_stats();
     assert!(total > 0);
@@ -829,7 +835,7 @@ fn adoption_observe_before_modify_pattern() {
 
     // Operator can inspect all metrics before making tuning decisions
     assert!(report.status.cycle_count >= 5);
-    assert!(!text.is_empty());
+    assert_ne!(text, "");
     assert!(ml.latest_metrics().is_some());
 }
 

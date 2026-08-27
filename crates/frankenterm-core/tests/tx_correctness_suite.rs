@@ -734,7 +734,7 @@ fn receipts_monotonic_through_commit() {
     )
     .unwrap();
 
-    assert!(!report.receipts.is_empty());
+    assert_ne!(report.receipts, [] as [serde_json::Value; 0]);
     let mut prev = 0u64;
     for r in &report.receipts {
         let seq = receipt_seq(r);
@@ -957,8 +957,14 @@ fn resume_no_progress_shows_all_pending() {
     let contract = build_contract(4, MissionTxState::Prepared);
     let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
     assert_eq!(resume.pending_step_ids.len(), 4);
-    assert!(resume.committed_step_ids.is_empty());
-    assert!(resume.compensated_step_ids.is_empty());
+    assert_eq!(
+        resume.committed_step_ids,
+        [] as [frankenterm_core::plan::TxStepId; 0]
+    );
+    assert_eq!(
+        resume.compensated_step_ids,
+        [] as [frankenterm_core::plan::TxStepId; 0]
+    );
     assert!(!resume.commit_phase_completed);
     assert!(!resume.compensation_phase_completed);
 }
@@ -993,7 +999,10 @@ fn resume_after_full_commit_no_pending() {
     assert_eq!(resume.committed_step_ids.len(), 3);
     assert!(resume.commit_phase_completed);
     assert!(resume.is_fully_resolved());
-    assert!(resume.pending_step_ids.is_empty());
+    assert_eq!(
+        resume.pending_step_ids,
+        [] as [frankenterm_core::plan::TxStepId; 0]
+    );
 }
 
 #[test]
@@ -1247,7 +1256,7 @@ fn reason_codes_on_success() {
     )
     .unwrap();
 
-    assert!(!report.reason_code.is_empty());
+    assert_ne!(report.reason_code, "");
     assert!(report.error_code.is_none());
 }
 
@@ -1264,7 +1273,7 @@ fn reason_codes_on_failure() {
     )
     .unwrap();
 
-    assert!(!report.reason_code.is_empty());
+    assert_ne!(report.reason_code, "");
     assert!(report.error_code.is_some());
 }
 

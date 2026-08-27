@@ -803,12 +803,12 @@ fn query_comparison_has_all_three_lanes() {
     let report = SemanticQualityHarness::new(default_semantic_eval_queries()).run();
 
     for qr in &report.queries {
-        assert!(!qr.name.is_empty());
+        assert_ne!(qr.name, "");
         assert!(qr.top_k > 0);
         // All three lanes should be populated
-        assert!(!qr.lexical.ranked_ids.is_empty());
-        assert!(!qr.semantic.ranked_ids.is_empty());
-        assert!(!qr.hybrid.ranked_ids.is_empty());
+        assert_ne!(qr.lexical.ranked_ids, [] as [u64; 0]);
+        assert_ne!(qr.semantic.ranked_ids, [] as [u64; 0]);
+        assert_ne!(qr.hybrid.ranked_ids, [] as [u64; 0]);
     }
 }
 
@@ -916,11 +916,11 @@ fn empty_lexical_candidates() {
     let report = SemanticQualityHarness::new(vec![q]).run();
     let qr = &report.queries[0];
 
-    assert!(qr.lexical.ranked_ids.is_empty());
+    assert_eq!(qr.lexical.ranked_ids, [] as [u64; 0]);
     assert!(qr.lexical.metrics.precision_at_k.abs() < EPS);
     assert!(qr.lexical.metrics.mrr.abs() < EPS);
     // Hybrid should still work using semantic lane
-    assert!(!qr.hybrid.ranked_ids.is_empty());
+    assert_ne!(qr.hybrid.ranked_ids, [] as [u64; 0]);
 }
 
 #[test]
@@ -935,10 +935,10 @@ fn empty_semantic_candidates() {
     let report = SemanticQualityHarness::new(vec![q]).run();
     let qr = &report.queries[0];
 
-    assert!(qr.semantic.ranked_ids.is_empty());
+    assert_eq!(qr.semantic.ranked_ids, [] as [u64; 0]);
     assert!(qr.semantic.metrics.precision_at_k.abs() < EPS);
     // Hybrid should still work using lexical lane
-    assert!(!qr.hybrid.ranked_ids.is_empty());
+    assert_ne!(qr.hybrid.ranked_ids, [] as [u64; 0]);
 }
 
 #[test]
@@ -947,9 +947,9 @@ fn both_lanes_empty() {
     let report = SemanticQualityHarness::new(vec![q]).run();
     let qr = &report.queries[0];
 
-    assert!(qr.lexical.ranked_ids.is_empty());
-    assert!(qr.semantic.ranked_ids.is_empty());
-    assert!(qr.hybrid.ranked_ids.is_empty());
+    assert_eq!(qr.lexical.ranked_ids, [] as [u64; 0]);
+    assert_eq!(qr.semantic.ranked_ids, [] as [u64; 0]);
+    assert_eq!(qr.hybrid.ranked_ids, [] as [u64; 0]);
     assert!(qr.hybrid.metrics.precision_at_k.abs() < EPS);
     assert!(qr.hybrid.metrics.recall_at_k.abs() < EPS);
 }

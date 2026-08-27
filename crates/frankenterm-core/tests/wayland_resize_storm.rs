@@ -337,7 +337,10 @@ fn matrix_snapshot_passes_when_all_tier1_clean() {
         ));
     }
     assert!(m.all_tier1_passed());
-    assert!(m.missing_tier1().is_empty());
+    assert_eq!(
+        m.missing_tier1(),
+        [] as [frankenterm_core::wayland_compositor_matrix::CompositorIdentity; 0]
+    );
     assert_eq!(m.bead, "ft-28opz");
 }
 

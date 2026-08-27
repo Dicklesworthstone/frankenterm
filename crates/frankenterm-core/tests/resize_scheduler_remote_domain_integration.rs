@@ -266,7 +266,10 @@ fn emergency_disable_returns_legacy_fallback_hint_for_remote_submissions() {
     ));
 
     let frame = scheduler.schedule_frame();
-    assert!(frame.scheduled.is_empty());
+    assert_eq!(
+        frame.scheduled,
+        [] as [frankenterm_core::resize_scheduler::ScheduledResizeWork; 0]
+    );
 
     let debug = scheduler.debug_snapshot(8);
     assert!(!debug.gate.active);

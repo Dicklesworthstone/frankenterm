@@ -293,7 +293,7 @@ fn error_types_implement_display_and_error() {
     ];
     for err in &errors {
         let display = format!("{err}");
-        assert!(!display.is_empty());
+        assert_ne!(display, "");
         let source: &dyn std::error::Error = err;
         let _ = format!("{source}");
     }

@@ -3427,7 +3427,7 @@ mod tests {
     #[test]
     fn cleanup_table_summary_default() {
         let s = CleanupTableSummary::default();
-        assert!(s.table.is_empty());
+        assert_eq!(s.table, "");
         assert_eq!(s.eligible_rows, 0);
         assert_eq!(s.deleted_rows, 0);
         assert_eq!(s.retention_days, 0);

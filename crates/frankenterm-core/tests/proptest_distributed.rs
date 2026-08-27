@@ -438,8 +438,8 @@ fn security_error_variants_exist() {
         DistributedSecurityError::MessageTimeout,
     ];
     for err in &errors {
-        assert!(!err.code().is_empty());
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.code(), "");
+        assert_ne!(err.to_string(), "");
     }
 }
 

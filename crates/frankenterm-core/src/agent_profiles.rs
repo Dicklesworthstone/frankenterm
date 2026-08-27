@@ -1318,7 +1318,7 @@ mod tests {
         };
         assert_eq!(p.name, "minimal");
         assert_eq!(p.role, "");
-        assert!(p.tags.is_empty());
+        assert_eq!(p.tags, [] as [std::string::String; 0]);
         assert_eq!(p.shell, "");
         assert_eq!(p.command, None);
         assert!(p.env.is_empty());
@@ -1625,7 +1625,7 @@ mod tests {
             vec!["agent_compatibility:certified".to_string()]
         );
         assert!(gate.receipt_id.is_some());
-        assert!(gate.missing_requirements.is_empty());
+        assert_eq!(gate.missing_requirements, [] as [std::string::String; 0]);
     }
 
     #[test]

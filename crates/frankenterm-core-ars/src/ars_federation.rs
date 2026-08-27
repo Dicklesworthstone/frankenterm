@@ -821,7 +821,7 @@ mod tests {
 
         let mut engine = FederationEngine::with_defaults();
         let exports = engine.export(&store, 5000);
-        assert!(exports.is_empty());
+        assert_eq!(exports, [] as [crate::ars_federation::ReflexExport; 0]);
     }
 
     #[test]
@@ -1183,7 +1183,7 @@ mod federation_payload_drop_tests {
         reset_ars_federation_payload_serde_drop_count_for_test();
         let event = sample_event();
         let payload = event.to_generic_payload();
-        assert!(!payload.is_empty());
+        assert_ne!(payload, "");
         // Must round-trip back to a FederationEvent.
         let parsed: FederationEvent = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed.swarm_id, event.swarm_id);
@@ -1221,7 +1221,7 @@ mod federation_payload_drop_tests {
             event.summary = format!("event-{i}");
             event.metadata.insert(format!("k{i}"), format!("v{i}"));
             let payload = event.to_generic_payload();
-            assert!(!payload.is_empty());
+            assert_ne!(payload, "");
         }
         // Typed Serialize never fails for this struct; counter must stay at zero.
         assert_eq!(ars_federation_payload_serde_drop_count(), 0);

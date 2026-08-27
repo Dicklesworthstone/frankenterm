@@ -6126,7 +6126,7 @@ mod tests {
     fn handle_session_end_name_and_description() {
         let h = HandleSessionEnd::new();
         assert_eq!(h.name(), "handle_session_end");
-        assert!(!h.description().is_empty());
+        assert_ne!(h.description(), "");
     }
 
     #[test]
@@ -6855,7 +6855,7 @@ mod tests {
         assert!(plan.resume_session_id.is_none());
         assert!(plan.retry_after_ms.is_none());
         assert_eq!(plan.account_id.as_deref(), Some("openai-team"));
-        assert!(!plan.operator_steps.is_empty());
+        assert_ne!(plan.operator_steps, [] as [std::string::String; 0]);
         assert!(plan.operator_steps[0].contains("bootstrap"));
     }
 

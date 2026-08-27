@@ -1114,7 +1114,7 @@ mod tests {
         let original: Vec<f32> = vec![];
         let blob = encode_f32_embedding_blob(&original);
         let decoded = decode_f32_embedding_blob(&blob, 0).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, [] as [f32; 0]);
     }
 
     #[test]
@@ -1481,7 +1481,7 @@ mod tests {
         let hits = store
             .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
             .unwrap();
-        assert!(hits.is_empty());
+        assert_eq!(hits, [] as [search::chunk_vector_store::ChunkVectorHit; 0]);
     }
 
     #[test]
@@ -1559,7 +1559,7 @@ mod tests {
         let hits = store
             .semantic_search("prof-1", "gen-1", &make_normalized_vec(8), 10)
             .unwrap();
-        assert!(hits.is_empty());
+        assert_eq!(hits, [] as [search::chunk_vector_store::ChunkVectorHit; 0]);
     }
 
     // ── Store: drift_report tests ─────────────────────────────────────────
@@ -1686,11 +1686,10 @@ mod tests {
         }
 
         let reopened = ChunkVectorStore::open(&path).unwrap();
-        assert!(
+        assert_eq!(
             reopened
                 .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
-                .unwrap()
-                .is_empty()
+                .unwrap(), [] as [search::chunk_vector_store::ChunkVectorHit; 0]
         );
         assert_eq!(
             reopened
@@ -1731,11 +1730,10 @@ mod tests {
         }
 
         let reopened = ChunkVectorStore::open(&path).unwrap();
-        assert!(
+        assert_eq!(
             reopened
                 .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
-                .unwrap()
-                .is_empty()
+                .unwrap(), [] as [search::chunk_vector_store::ChunkVectorHit; 0]
         );
         assert_eq!(
             reopened

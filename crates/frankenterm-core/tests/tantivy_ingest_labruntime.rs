@@ -591,7 +591,7 @@ fn indexer_no_dedup_when_disabled() {
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
         indexer.run(&storage).await.unwrap();
 
-        assert!(indexer.writer().deleted_ids.is_empty());
+        assert_eq!(indexer.writer().deleted_ids, [] as [std::string::String; 0]);
     });
 }
 

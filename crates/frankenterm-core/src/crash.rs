@@ -8541,7 +8541,7 @@ mod tests {
         )
         .expect("robot_state source");
 
-        assert!(files.is_empty());
+        assert_eq!(files, [] as [std::string::String; 0]);
         assert_eq!(total_size, 0);
         assert_eq!(sources.len(), 1);
         let source = &sources[0];
@@ -9500,7 +9500,7 @@ mod tests {
         assert_eq!(source.source_surface, "fixture::agent-mail-health");
         assert_eq!(source.file.as_deref(), Some("sources/agent_mail.json"));
         assert!(!source.mutates_state);
-        assert!(source.warning_ids.is_empty());
+        assert_eq!(source.warning_ids, [] as [std::string::String; 0]);
         assert!(files.contains(&"sources/agent_mail.json".to_string()));
         assert!(total_size > 0);
 
@@ -9846,7 +9846,7 @@ mod tests {
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
 
         assert_eq!(manifest.wa_version, crate::VERSION);
-        assert!(!manifest.created_at.is_empty());
+        assert_ne!(manifest.created_at, "");
     }
 
     #[test]
@@ -10251,10 +10251,10 @@ mod tests {
         let markers_json =
             fs::read_to_string(bundle_path.join("environment_markers.json")).unwrap();
         let markers: CrashEnvironmentMarkers = serde_json::from_str(&markers_json).unwrap();
-        assert!(!markers.session_phase.is_empty());
-        assert!(!markers.screen_mode.is_empty());
+        assert_ne!(markers.session_phase, "");
+        assert_ne!(markers.screen_mode, "");
         assert_eq!(markers.backpressure_tier, "Yellow");
-        assert!(!markers.feature_flags.is_empty());
+        assert_ne!(markers.feature_flags, [] as [std::string::String; 0]);
 
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
@@ -11751,7 +11751,7 @@ mod tests {
         assert_eq!(cp.version, CHECKPOINT_FORMAT_VERSION);
         assert_eq!(cp.created_at, 1000);
         assert_eq!(cp.wa_version, crate::VERSION);
-        assert!(cp.panes.is_empty());
+        assert_eq!(cp.panes, [] as [crash::PaneCaptureState; 0]);
     }
 
     #[test]
@@ -12376,7 +12376,7 @@ mod tests {
         assert!(parsed.pane_priority_overrides.is_empty());
         assert!(parsed.scheduler.is_none());
         assert!(parsed.backpressure_tier.is_none());
-        assert!(parsed.last_activity_by_pane.is_empty());
+        assert_eq!(parsed.last_activity_by_pane, [] as [(u64, u64); 0]);
         assert_eq!(parsed.restart_count, 0);
         assert!(parsed.last_crash_at.is_none());
         assert_eq!(parsed.consecutive_crashes, 0);

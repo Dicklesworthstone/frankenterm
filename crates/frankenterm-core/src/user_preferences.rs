@@ -1121,7 +1121,7 @@ mod tests {
         }
 
         let scores = monitor.priority_scores();
-        assert!(!scores.is_empty());
+        assert_ne!(scores, [] as [(u64, f64); 0]);
     }
 
     #[test]
@@ -1621,7 +1621,7 @@ mod tests {
     fn preference_monitor_empty_scores() {
         let monitor = PreferenceMonitor::new(IrlConfig::default());
         let scores = monitor.priority_scores();
-        assert!(scores.is_empty());
+        assert_eq!(scores, [] as [(u64, f64); 0]);
     }
 
     #[test]

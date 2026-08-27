@@ -893,11 +893,11 @@ mod tests {
     #[test]
     fn selectors_have_sensible_defaults() {
         let sel = AnthropicPageSelectors::default();
-        assert!(!sel.logged_in_marker.is_empty());
-        assert!(!sel.email_input.is_empty());
-        assert!(!sel.password_prompt.is_empty());
-        assert!(!sel.sso_indicator.is_empty());
-        assert!(!sel.captcha_indicator.is_empty());
+        assert_ne!(sel.logged_in_marker, "");
+        assert_ne!(sel.email_input, "");
+        assert_ne!(sel.password_prompt, "");
+        assert_ne!(sel.sso_indicator, "");
+        assert_ne!(sel.captcha_indicator, "");
     }
 
     // =========================================================================
@@ -1473,7 +1473,7 @@ mod tests {
         ];
         for kind in &kinds {
             let dbg = format!("{:?}", kind);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 
@@ -1488,7 +1488,7 @@ mod tests {
     #[test]
     fn default_selectors_have_non_empty_fields() {
         let sel = AnthropicPageSelectors::default();
-        assert!(!sel.email_input.is_empty());
-        assert!(!sel.email_submit.is_empty());
+        assert_ne!(sel.email_input, "");
+        assert_ne!(sel.email_submit, "");
     }
 }

@@ -544,8 +544,8 @@ mod tests {
             assert!(SEARCH_LIMIT_DEFAULT <= SEARCH_LIMIT_MAX);
             assert!(SEARCH_SNIPPET_MAX_TOKENS > 0);
         }
-        assert!(!SEARCH_HIGHLIGHT_PREFIX.is_empty());
-        assert!(!SEARCH_HIGHLIGHT_SUFFIX.is_empty());
+        assert_ne!(SEARCH_HIGHLIGHT_PREFIX, "");
+        assert_ne!(SEARCH_HIGHLIGHT_SUFFIX, "");
     }
 
     // ── SearchQueryValidationError ─────────────────────────────────────
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn search_query_input_default() {
         let input = SearchQueryInput::default();
-        assert!(input.query.is_empty());
+        assert_eq!(input.query, "");
         assert!(input.limit.is_none());
         assert!(input.pane.is_none());
         assert!(input.zone.is_none());

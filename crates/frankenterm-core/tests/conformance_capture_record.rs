@@ -91,7 +91,10 @@ fn conformance_constants_still_match_encoder() {
 #[test]
 fn conformance_empty_stream_is_valid_empty_recording() {
     let recording = Recording::from_bytes(&[]).expect("empty stream should be accepted");
-    assert!(recording.frames.is_empty());
+    assert_eq!(
+        recording.frames,
+        [] as [frankenterm_core::recording::RecordingFrame; 0]
+    );
     assert_eq!(recording.duration_ms, 0);
 }
 
@@ -104,7 +107,7 @@ fn conformance_minimal_zero_payload_round_trip() {
     assert_eq!(frame.header.frame_type, FrameType::Output);
     assert_eq!(frame.header.flags, 0);
     assert_eq!(frame.header.payload_len, 0);
-    assert!(frame.payload.is_empty());
+    assert_eq!(frame.payload, [] as [u8; 0]);
 }
 
 #[test]

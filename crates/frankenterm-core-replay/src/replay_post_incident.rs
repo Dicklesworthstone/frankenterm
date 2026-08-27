@@ -485,7 +485,10 @@ mod tests {
         let result = execute_pipeline(&input);
         assert!(!result.success);
         assert!(result.error.is_some());
-        assert!(result.steps.is_empty());
+        assert_eq!(
+            result.steps,
+            [] as [crate::replay_post_incident::StepResult; 0]
+        );
     }
 
     #[test]

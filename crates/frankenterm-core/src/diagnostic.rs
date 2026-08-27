@@ -888,9 +888,9 @@ mod tests {
     #[test]
     fn environment_info_populated() {
         let env = gather_environment(&DiagnosticOptions::default());
-        assert!(!env.wa_version.is_empty());
-        assert!(!env.os.is_empty());
-        assert!(!env.arch.is_empty());
+        assert_ne!(env.wa_version, "");
+        assert_ne!(env.os, "");
+        assert_ne!(env.arch, "");
         assert_eq!(env.schema_version, SCHEMA_VERSION);
         assert!(env.rust_version.is_some());
     }
@@ -1233,12 +1233,12 @@ mod tests {
             let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
             assert!(manifest["redacted"].as_bool().unwrap());
             assert!(manifest["file_count"].as_u64().unwrap() >= 8);
-            assert!(!manifest["wa_version"].as_str().unwrap().is_empty());
+            assert_ne!(manifest["wa_version"].as_str().unwrap(), "");
 
             // Verify environment.json
             let env_content = fs::read_to_string(output_dir.join("environment.json")).unwrap();
             let env_info: serde_json::Value = serde_json::from_str(&env_content).unwrap();
-            assert!(!env_info["wa_version"].as_str().unwrap().is_empty());
+            assert_ne!(env_info["wa_version"].as_str().unwrap(), "");
             assert_eq!(env_info["schema_version"], SCHEMA_VERSION);
 
             // Verify db_health.json
@@ -1458,7 +1458,7 @@ mod tests {
 
             // Required fields
             assert!(manifest["wa_version"].is_string());
-            assert!(!manifest["wa_version"].as_str().unwrap().is_empty());
+            assert_ne!(manifest["wa_version"].as_str().unwrap(), "");
             assert!(manifest["generated_at_ms"].is_number());
             assert!(manifest["generated_at_ms"].as_u64().unwrap() > 0);
             assert!(manifest["file_count"].is_number());
@@ -1570,7 +1570,7 @@ mod tests {
                 fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
             let history: serde_json::Value = serde_json::from_str(&hist_content).unwrap();
             let hist_arr = history.as_array().unwrap();
-            assert!(!hist_arr.is_empty());
+            assert_ne!(hist_arr.as_slice(), []);
 
             storage.shutdown().await.unwrap();
             let _ = fs::remove_file(&tmp);
@@ -2813,7 +2813,7 @@ mod tests {
         let json = serde_json::to_string(&wf).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed["step_count"], 0);
-        assert!(parsed["steps"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["steps"].as_array().unwrap().as_slice(), []);
         assert!(parsed["completed_at"].is_null());
     }
 
@@ -2854,7 +2854,7 @@ mod tests {
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
-        assert!(parsed["files"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["files"].as_array().unwrap().as_slice(), []);
         assert_eq!(parsed["file_count"], 0);
         assert!(!parsed["redacted"].as_bool().unwrap());
     }

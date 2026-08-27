@@ -411,7 +411,7 @@ mod tests {
         // First rotation has no previous_context.
         assert_eq!(p.rotations[0].previous_context, None);
         assert_eq!(p.active, Some(p.rotations[0].new_context));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_context_state_machine::ContextSafetyViolation; 0]);
     }
 
     #[test]

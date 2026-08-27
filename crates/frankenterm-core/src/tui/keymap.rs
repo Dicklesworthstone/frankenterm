@@ -1001,7 +1001,7 @@ mod tests {
     fn all_global_bindings_have_labels() {
         for b in KEYMAP.iter().filter(|b| b.scope == Scope::Global) {
             let label = action_label(&b.action);
-            assert!(!label.is_empty());
+            assert_ne!(label, "");
         }
     }
 

@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(dlx.num_columns(), 0);
         assert_eq!(dlx.num_rows(), 0);
         let solution = dlx.solve().unwrap();
-        assert!(solution.is_empty());
+        assert_eq!(solution, [] as [usize; 0]);
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
         let mut dlx = DancingLinks::new(0);
         let solutions = dlx.solve_all();
         assert_eq!(solutions.len(), 1);
-        assert!(solutions[0].is_empty());
+        assert_eq!(solutions[0], [] as [usize; 0]);
     }
 
     #[test]
@@ -696,7 +696,7 @@ mod tests {
         dlx.add_row(&[0]);
         dlx.add_row(&[1]);
         let solutions = dlx.solve_limited(0);
-        assert!(solutions.is_empty());
+        assert_eq!(solutions, [] as [std::vec::Vec<usize>; 0]);
     }
 
     #[test]
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(dlx.num_columns(), 0);
         assert_eq!(dlx.num_rows(), 0);
         let solution = dlx.solve().unwrap();
-        assert!(solution.is_empty());
+        assert_eq!(solution, [] as [usize; 0]);
     }
 
     #[test]
@@ -926,7 +926,7 @@ mod tests {
         ];
 
         let solutions = dlx.solve_all();
-        assert!(!solutions.is_empty());
+        assert_ne!(solutions, [] as [std::vec::Vec<usize>; 0]);
 
         for solution in &solutions {
             let mut covered = [false; 6];
@@ -1156,7 +1156,7 @@ mod tests {
         // No row covers column 2
 
         assert!(dlx.solve().is_none());
-        assert!(dlx.solve_all().is_empty());
+        assert_eq!(dlx.solve_all(), [] as [std::vec::Vec<usize>; 0]);
     }
 
     #[test]
@@ -1231,7 +1231,7 @@ mod tests {
     fn single_column_without_rows_is_unsolvable() {
         let mut dlx = DancingLinks::new(1);
         assert!(dlx.solve().is_none());
-        assert!(dlx.solve_all().is_empty());
+        assert_eq!(dlx.solve_all(), [] as [std::vec::Vec<usize>; 0]);
     }
 
     #[test]
@@ -1240,7 +1240,7 @@ mod tests {
         dlx.add_row(&[1]);
 
         assert!(dlx.solve().is_none());
-        assert!(dlx.solve_all().is_empty());
+        assert_eq!(dlx.solve_all(), [] as [std::vec::Vec<usize>; 0]);
     }
 
     #[test]
@@ -1282,7 +1282,7 @@ mod tests {
         assert_eq!(dlx.num_columns(), 0);
         assert_eq!(dlx.num_rows(), 0);
         let solution = dlx.solve().unwrap();
-        assert!(solution.is_empty());
+        assert_eq!(solution, [] as [usize; 0]);
     }
 
     #[test]

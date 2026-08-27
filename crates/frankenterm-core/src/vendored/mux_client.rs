@@ -5742,7 +5742,7 @@ mod tests {
             let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let panes = client.list_panes().await.expect("list panes");
-            assert!(panes.tabs.is_empty());
+            assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
         });
     }
 
@@ -5812,7 +5812,7 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect("list panes with cx");
-            assert!(panes.tabs.is_empty());
+            assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
         });
     }
 
@@ -5953,7 +5953,7 @@ mod tests {
                 .expect("get lines with cx");
             assert_eq!(lines.pane_id, 34);
             let (extracted, _images) = lines.lines.extract_data();
-            assert!(extracted.is_empty());
+            assert_eq!(extracted, [] as [(isize, frankenterm_term::Line); 0]);
 
             client
                 .write_to_pane_with_cx(&cx, 56, b"hello".to_vec())
@@ -6285,7 +6285,7 @@ mod tests {
                 .list_panes()
                 .await
                 .expect("aligned client should serve a valid request after local rejections");
-            assert!(panes.tabs.is_empty());
+            assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
 
             client
                 .outstanding_requests
@@ -6713,8 +6713,8 @@ mod tests {
                 .await
                 .expect("cached render snapshot should be reused");
             assert_eq!(second.seqno, 14);
-            assert!(second.dirty_lines.is_empty());
-            assert!(second.bonus_lines.extract_data().0.is_empty());
+            assert_eq!(second.dirty_lines, [] as [std::ops::Range<isize>; 0]);
+            assert_eq!(second.bonus_lines.extract_data().0, [] as [(isize, frankenterm_term::Line); 0]);
             assert_eq!(second.title, "cached-pane");
             assert_eq!(second.dimensions.cols, 120);
 
@@ -7385,7 +7385,7 @@ mod tests {
                 for (response, pane_id) in reused.iter().zip(1..=depth) {
                     assert_eq!(response.pane_id, pane_id);
                     assert_eq!(response.seqno, pane_id);
-                    assert!(response.dirty_lines.is_empty());
+                    assert_eq!(response.dirty_lines, [] as [std::ops::Range<isize>; 0]);
                     assert_eq!(
                         response
                             .bonus_lines
@@ -9733,7 +9733,7 @@ mod tests {
             assert_eq!(responses[0].pane_id, 11);
             assert_eq!(responses[0].seqno, 41);
             assert_eq!(responses[0].title, "cached-batch-snapshot");
-            assert!(responses[0].dirty_lines.is_empty());
+            assert_eq!(responses[0].dirty_lines, [] as [std::ops::Range<isize>; 0]);
             assert!(!client.connection_poisoned);
             assert!(client.outstanding_requests.is_empty());
 
@@ -12037,7 +12037,7 @@ mod tests {
                 .list_panes()
                 .await
                 .expect("mismatch is framed and must preserve stream alignment");
-            assert!(aligned.tabs.is_empty());
+            assert_eq!(aligned.tabs, [] as [mux::tab::PaneNode; 0]);
             assert!(!client.connection_poisoned);
             drop(client);
             server.await.expect("server task");
@@ -13231,7 +13231,7 @@ mod tests {
                 .list_panes()
                 .await
                 .expect("list_panes should succeed with split response frame");
-            assert!(panes.tabs.is_empty());
+            assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);
 
@@ -13478,7 +13478,7 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect("list_panes_with_cx should succeed with split response frame");
-            assert!(panes.tabs.is_empty());
+            assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);
 
@@ -14867,7 +14867,7 @@ mod tests {
     #[test]
     fn render_changes_dirty_lines_only_still_produces_output_delta() {
         let changes = test_render_change(4, 5, "t");
-        assert!(!changes.dirty_lines.is_empty());
+        assert_ne!(changes.dirty_lines, [] as [std::ops::Range<isize>; 0]);
         let delta = render_changes_to_output_delta(4, changes)
             .expect("dirty-lines update must emit an output delta");
         match delta {

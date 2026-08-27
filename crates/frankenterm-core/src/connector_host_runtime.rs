@@ -1726,7 +1726,7 @@ mod tests {
         ];
         for err in &errors {
             let display = err.to_string();
-            assert!(!display.is_empty());
+            assert_ne!(display, "");
         }
     }
 

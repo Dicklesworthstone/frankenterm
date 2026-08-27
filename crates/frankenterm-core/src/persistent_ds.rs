@@ -1175,9 +1175,9 @@ mod tests {
             .insert("a".to_string(), 1)
             .insert("b".to_string(), 2);
         let diff = m.diff(&m);
-        assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
-        assert!(diff.changed.is_empty());
+        assert_eq!(diff.added, [] as [(std::string::String, i32); 0]);
+        assert_eq!(diff.removed, [] as [std::string::String; 0]);
+        assert_eq!(diff.changed, [] as [(std::string::String, i32); 0]);
     }
 
     #[test]
@@ -1187,7 +1187,7 @@ mod tests {
         let diff = m1.diff(&m2);
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.added[0], ("b".to_string(), 2));
-        assert!(diff.removed.is_empty());
+        assert_eq!(diff.removed, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1198,7 +1198,7 @@ mod tests {
         let m2 = m1.remove(&"a".to_string());
         let diff = m1.diff(&m2);
         assert_eq!(diff.removed, vec!["a".to_string()]);
-        assert!(diff.added.is_empty());
+        assert_eq!(diff.added, [] as [(std::string::String, i32); 0]);
     }
 
     #[test]
@@ -1566,9 +1566,9 @@ mod tests {
         let m1: PersistentMap<String, i32> = PersistentMap::new();
         let m2: PersistentMap<String, i32> = PersistentMap::new();
         let diff = m1.diff(&m2);
-        assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
-        assert!(diff.changed.is_empty());
+        assert_eq!(diff.added, [] as [(std::string::String, i32); 0]);
+        assert_eq!(diff.removed, [] as [std::string::String; 0]);
+        assert_eq!(diff.changed, [] as [(std::string::String, i32); 0]);
     }
 
     #[test]
@@ -1579,8 +1579,8 @@ mod tests {
             .insert("y".to_string(), 20);
         let diff = m1.diff(&m2);
         assert_eq!(diff.added.len(), 2);
-        assert!(diff.removed.is_empty());
-        assert!(diff.changed.is_empty());
+        assert_eq!(diff.removed, [] as [std::string::String; 0]);
+        assert_eq!(diff.changed, [] as [(std::string::String, i32); 0]);
     }
 
     #[test]
@@ -1590,8 +1590,8 @@ mod tests {
             .insert("y".to_string(), 20);
         let m2: PersistentMap<String, i32> = PersistentMap::new();
         let diff = m1.diff(&m2);
-        assert!(diff.added.is_empty());
+        assert_eq!(diff.added, [] as [(std::string::String, i32); 0]);
         assert_eq!(diff.removed.len(), 2);
-        assert!(diff.changed.is_empty());
+        assert_eq!(diff.changed, [] as [(std::string::String, i32); 0]);
     }
 }

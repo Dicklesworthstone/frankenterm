@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn script_empty() {
         let ops = edit_script(b"", b"");
-        assert!(ops.is_empty());
+        assert_eq!(ops, [] as [edit_distance::EditOp; 0]);
     }
 
     #[test]
@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn nn_empty_targets() {
         let nn = nearest_neighbors(b"abc", &[], 5);
-        assert!(nn.is_empty());
+        assert_eq!(nn, [] as [(usize, usize); 0]);
     }
 
     // -- N-gram similarity --

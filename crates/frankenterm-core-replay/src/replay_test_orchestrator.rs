@@ -869,7 +869,10 @@ mod tests {
     fn retention_empty_files() {
         let policy = RetentionPolicy::default();
         let decisions = evaluate_retention(&[], &policy, 0);
-        assert!(decisions.is_empty());
+        assert_eq!(
+            decisions,
+            [] as [crate::replay_test_orchestrator::PruneDecision; 0]
+        );
     }
 
     #[test]

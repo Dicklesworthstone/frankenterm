@@ -315,7 +315,7 @@ mod tests {
         let path = temp_fsvi_path(&dir, "empty_search.fsvi");
         let adapter = FsviAdapter::create(&path, "test", 4).unwrap();
         let results = adapter.search(&[1.0, 0.0, 0.0, 0.0], 5);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(u64, f32); 0]);
     }
 
     #[test]
@@ -325,7 +325,7 @@ mod tests {
         let adapter = FsviAdapter::create(&path, "test", 4).unwrap();
         // Query has wrong dimension
         let results = adapter.search(&[1.0, 0.0], 5);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(u64, f32); 0]);
     }
 
     #[test]
@@ -335,7 +335,7 @@ mod tests {
         let mut adapter = FsviAdapter::create(&path, "test", 4).unwrap();
         adapter.append(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         let results = adapter.search(&[1.0, 0.0, 0.0, 0.0], 0);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(u64, f32); 0]);
     }
 
     #[test]
@@ -420,7 +420,7 @@ mod tests {
 
         // Search should find id=1 as best match for [1,0,0,0]
         let results = adapter.search(&[1.0, 0.0, 0.0, 0.0], 2);
-        assert!(!results.is_empty());
+        assert_ne!(results, [] as [(u64, f32); 0]);
         assert_eq!(results[0].0, 1);
     }
 

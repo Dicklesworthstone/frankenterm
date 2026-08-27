@@ -1002,7 +1002,7 @@ mod tests {
     fn schema_files_are_nonempty() {
         let reg = SchemaRegistry::canonical();
         let files = reg.schema_files();
-        assert!(!files.is_empty());
+        assert_ne!(files, [] as [&str; 0]);
         for f in &files {
             assert!(
                 std::path::Path::new(f)
@@ -1029,7 +1029,7 @@ mod tests {
         let reg = SchemaRegistry::canonical();
         let on_disk: Vec<String> = reg.schema_files().iter().map(|s| s.to_string()).collect();
         let uncovered = reg.uncovered_schemas(&on_disk);
-        assert!(uncovered.is_empty());
+        assert_eq!(uncovered, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1477,7 +1477,7 @@ mod tests {
     fn schema_registry_default() {
         let reg = SchemaRegistry::default();
         assert!(reg.endpoints.is_empty());
-        assert!(reg.version.is_empty());
+        assert_eq!(reg.version, "");
     }
 
     #[test]
@@ -1600,9 +1600,9 @@ mod tests {
     #[test]
     fn schema_diff_default() {
         let d = SchemaDiffResult::default();
-        assert!(d.from_version.is_empty());
-        assert!(d.to_version.is_empty());
-        assert!(d.changes.is_empty());
+        assert_eq!(d.from_version, "");
+        assert_eq!(d.to_version, "");
+        assert_eq!(d.changes, [] as [api_schema::SchemaChange; 0]);
         assert!(!d.has_breaking_changes());
     }
 
@@ -1687,6 +1687,6 @@ mod tests {
     fn uncovered_schemas_empty_disk() {
         let reg = SchemaRegistry::canonical();
         let uncovered = reg.uncovered_schemas(&[]);
-        assert!(uncovered.is_empty());
+        assert_eq!(uncovered, [] as [std::string::String; 0]);
     }
 }

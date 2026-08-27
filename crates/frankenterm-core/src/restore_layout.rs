@@ -2057,7 +2057,7 @@ mod tests {
             assert_eq!(result.panes_created, 1);
             assert_eq!(result.windows_created, 1);
             assert_eq!(result.tabs_created, 1);
-            assert!(result.failed_panes.is_empty());
+            assert_eq!(result.failed_panes, [] as [(u64, std::string::String); 0]);
             assert!(result.pane_id_map.contains_key(&42));
         });
     }
@@ -3193,7 +3193,7 @@ mod tests {
     fn restore_result_new_is_empty() {
         let r = RestoreResult::new();
         assert!(r.pane_id_map.is_empty());
-        assert!(r.failed_panes.is_empty());
+        assert_eq!(r.failed_panes, [] as [(u64, std::string::String); 0]);
         assert_eq!(r.windows_created, 0);
         assert_eq!(r.tabs_created, 0);
         assert_eq!(r.panes_created, 0);

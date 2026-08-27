@@ -166,7 +166,7 @@ fn detection_to_inventory_to_autoconfig_plan() {
             "{}: should be Create",
             item.slug
         );
-        assert!(!item.content_preview.is_empty());
+        assert_ne!(item.content_preview, "");
     }
 
     log_phase(&TestLogEntry {
@@ -265,7 +265,10 @@ fn running_agents_without_installed_inventory_still_generate_configs() {
 
     let inv = correlator.inventory();
     assert_eq!(inv.running.len(), 1);
-    assert!(inv.installed.is_empty()); // No filesystem detection happened
+    assert_eq!(
+        inv.installed,
+        [] as [frankenterm_core::agent_correlator::InstalledAgentInventoryEntry; 0]
+    ); // No filesystem detection happened
 
     // Should still be able to generate configs from running slugs
     let slugs: Vec<String> = inv.running.values().map(|r| r.slug.clone()).collect();
@@ -421,8 +424,8 @@ fn installed_inventory_undetected_entry() {
     let back: InstalledAgentInventoryEntry = serde_json::from_str(&json).unwrap();
 
     assert!(!back.detected);
-    assert!(back.evidence.is_empty());
-    assert!(back.root_paths.is_empty());
+    assert_eq!(back.evidence, [] as [std::string::String; 0]);
+    assert_eq!(back.root_paths, [] as [std::string::String; 0]);
     assert!(back.config_path.is_none());
 }
 

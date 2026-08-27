@@ -718,7 +718,10 @@ watchdog_timeout_ms = 5000
             tracker.record_event(i);
         }
         let violations = tracker.violations();
-        assert!(!violations.is_empty());
+        assert_ne!(
+            violations,
+            [] as [crate::replay_guardrails::LimitViolation; 0]
+        );
     }
 
     // ── ConcurrencyGate ─────────────────────────────────────────────────
@@ -786,7 +789,10 @@ watchdog_timeout_ms = 5000
         }
         let report = GuardrailReport::from_tracker(&tracker, true);
         assert_eq!(report.events_processed, 10);
-        assert!(report.violations.is_empty());
+        assert_eq!(
+            report.violations,
+            [] as [crate::replay_guardrails::LimitViolation; 0]
+        );
         assert!(!report.halted_by_guardrail);
         assert!(report.cleanup_complete);
         assert!(report.is_safe());
@@ -804,7 +810,10 @@ watchdog_timeout_ms = 5000
         }
         let report = GuardrailReport::from_tracker(&tracker, true);
         assert!(report.halted_by_guardrail);
-        assert!(!report.violations.is_empty());
+        assert_ne!(
+            report.violations,
+            [] as [crate::replay_guardrails::LimitViolation; 0]
+        );
     }
 
     #[test]

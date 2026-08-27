@@ -551,7 +551,7 @@ mod tests {
     fn get_nodes_empty_ring() {
         let ring: HashRing<&str> = HashRing::new(100);
         let nodes = ring.get_nodes("key", 3);
-        assert!(nodes.is_empty());
+        assert_eq!(nodes, [] as [&&str; 0]);
     }
 
     #[test]
@@ -559,7 +559,7 @@ mod tests {
         let mut ring = HashRing::new(100);
         ring.add_node("A");
         let nodes = ring.get_nodes("key", 0);
-        assert!(nodes.is_empty());
+        assert_eq!(nodes, [] as [&&str; 0]);
     }
 
     #[test]

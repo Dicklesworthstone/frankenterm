@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(bead.id, "x");
         assert_eq!(bead.issue_type, BeadIssueType::Bug);
         assert!(bead.assignee.is_none());
-        assert!(bead.labels.is_empty());
+        assert_eq!(bead.labels, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -868,8 +868,8 @@ mod tests {
     fn readiness_empty_input() {
         let report = resolve_bead_readiness(&[]);
         assert!(report.candidates.is_empty());
-        assert!(report.ready_ids.is_empty());
-        assert!(report.degraded_reason_codes.is_empty());
+        assert_eq!(report.ready_ids, [] as [std::string::String; 0]);
+        assert_eq!(report.degraded_reason_codes, [] as [beads_types::BeadResolverReasonCode; 0]);
         assert_eq!(report.ready_count(), 0);
     }
 
@@ -882,7 +882,7 @@ mod tests {
         let c = &report.candidates[0];
         assert!(c.ready);
         assert_eq!(c.blocker_count, 0);
-        assert!(c.blocker_ids.is_empty());
+        assert_eq!(c.blocker_ids, [] as [std::string::String; 0]);
         assert_eq!(c.transitive_unblock_count, 0);
         assert_eq!(c.critical_path_depth_hint, 0);
     }
@@ -904,7 +904,7 @@ mod tests {
         ];
         let report = resolve_bead_readiness(&issues);
         assert!(report.candidates.is_empty());
-        assert!(report.ready_ids.is_empty());
+        assert_eq!(report.ready_ids, [] as [std::string::String; 0]);
     }
 
     #[test]

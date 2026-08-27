@@ -1195,7 +1195,7 @@ mod tests {
     #[test]
     fn tokenize_empty() {
         let tokens = tokenize("");
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, [] as [crate::ars_symbolic_exec::ShellToken; 0]);
     }
 
     #[test]

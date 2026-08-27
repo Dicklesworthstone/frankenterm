@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn scenario_has_description() {
         for s in &ALL_SCENARIOS {
-            assert!(!s.description().is_empty());
+            assert_ne!(s.description(), "");
         }
     }
 
@@ -786,7 +786,10 @@ mod tests {
     fn log_creation() {
         let log = FeedbackLog::new("P1", "2026-01-01T00:00:00Z");
         assert_eq!(log.pilot_id, "P1");
-        assert!(log.results.is_empty());
+        assert_eq!(
+            log.results,
+            [] as [crate::replay_usability_pilot::ScenarioResult; 0]
+        );
     }
 
     #[test]
@@ -909,7 +912,7 @@ mod tests {
         let log = sample_log();
         let eval = evaluate_pilot(&log, &SuccessCriteria::default());
         assert!(eval.passed);
-        assert!(eval.violations.is_empty());
+        assert_eq!(eval.violations, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1053,7 +1056,10 @@ mod tests {
     fn extract_improvements_from_log() {
         let log = sample_log();
         let items = extract_improvements(&log);
-        assert!(!items.is_empty());
+        assert_ne!(
+            items,
+            [] as [crate::replay_usability_pilot::ImprovementItem; 0]
+        );
     }
 
     #[test]

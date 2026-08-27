@@ -1134,14 +1134,14 @@ mod tests {
     #[test]
     fn prefix_search_empty_tree() {
         let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
-        assert!(tree.prefix_search(b"hello").is_empty());
+        assert_eq!(tree.prefix_search(b"hello"), [] as [(std::vec::Vec<u8>, &i32); 0]);
     }
 
     #[test]
     fn prefix_search_no_match() {
         let mut tree = AdaptiveRadixTree::new();
         tree.insert(b"hello", 1);
-        assert!(tree.prefix_search(b"world").is_empty());
+        assert_eq!(tree.prefix_search(b"world"), [] as [(std::vec::Vec<u8>, &i32); 0]);
     }
 
     #[test]
@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn iter_empty() {
         let tree: AdaptiveRadixTree<i32> = AdaptiveRadixTree::new();
-        assert!(tree.iter().is_empty());
+        assert_eq!(tree.iter(), [] as [(std::vec::Vec<u8>, &i32); 0]);
     }
 
     #[test]

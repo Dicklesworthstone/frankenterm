@@ -1668,7 +1668,7 @@ mod tests {
             .request_lease("conn-1", "cred-1", scope, 2000)
             .unwrap();
         let expired = broker.expire_leases(2001);
-        assert!(expired.is_empty());
+        assert_eq!(expired, [] as [std::string::String; 0]);
     }
 
     // ---- Rotation tests ----
@@ -2017,8 +2017,8 @@ mod tests {
     #[test]
     fn default_broker() {
         let broker = ConnectorCredentialBroker::default();
-        assert!(broker.provider_ids().is_empty());
-        assert!(broker.credential_ids().is_empty());
+        assert_eq!(broker.provider_ids(), [] as [std::string::String; 0]);
+        assert_eq!(broker.credential_ids(), [] as [std::string::String; 0]);
     }
 
     // ---- Audit type display ----

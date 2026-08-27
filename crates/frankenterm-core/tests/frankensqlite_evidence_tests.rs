@@ -535,9 +535,9 @@ fn test_gap_report_lists_all_missing_artifacts() {
 fn test_gap_report_empty_for_complete_package() {
     let package = EvidenceBuilder::new("sha9").build_complete_passing();
     let report = check_evidence_completeness(&package);
-    assert!(report.missing_tiers.is_empty());
-    assert!(report.empty_artifacts.is_empty());
-    assert!(report.failing_tiers.is_empty());
+    assert_eq!(report.missing_tiers, [] as [EvidenceTier; 0]);
+    assert_eq!(report.empty_artifacts, [] as [std::string::String; 0]);
+    assert_eq!(report.failing_tiers, [] as [(EvidenceTier, u32); 0]);
 }
 
 #[test]

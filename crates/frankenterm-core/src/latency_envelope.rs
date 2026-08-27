@@ -656,7 +656,7 @@ mod tests {
         let certificate = certificate_for_test();
         let report = adversarial_arrival_replay(&certificate, 64).unwrap();
 
-        assert!(!report.samples.is_empty());
+        assert_ne!(report.samples, [] as [latency_envelope::LatencyEnvelopeSample; 0]);
         assert_eq!(report.violation_count, 0);
         assert!(
             report.max_delay_ms <= report.bound_ms + REPLAY_EPSILON_MS,

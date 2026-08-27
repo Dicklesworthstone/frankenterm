@@ -951,7 +951,7 @@ mod tests {
 
         chain.record("audit", StepOutcome::Ok, "ok");
         assert!(boundary.is_satisfied(&chain));
-        assert!(boundary.pending_subsystems(&chain).is_empty());
+        assert_eq!(boundary.pending_subsystems(&chain), [] as [&str; 0]);
     }
 
     #[test]
@@ -1403,7 +1403,7 @@ mod tests {
         let chain = CauseChain::default();
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
-        assert!(chain.failed_subsystems().is_empty());
+        assert_eq!(chain.failed_subsystems(), [] as [&str; 0]);
     }
 
     #[test]
@@ -1441,8 +1441,8 @@ mod tests {
         let chain = CauseChain::new();
         // Empty boundary is always satisfied
         assert!(b.is_satisfied(&chain));
-        assert!(b.pending_subsystems(&chain).is_empty());
-        assert!(b.required().is_empty());
+        assert_eq!(b.pending_subsystems(&chain), [] as [&str; 0]);
+        assert_eq!(b.required(), []);
     }
 
     #[test]

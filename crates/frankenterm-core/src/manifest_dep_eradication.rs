@@ -1087,7 +1087,7 @@ mod tests {
 
         // All crate names in the map must be non-empty
         for name in by_crate.keys() {
-            assert!(!name.is_empty());
+            assert_ne!(name, "");
         }
     }
 
@@ -1145,9 +1145,9 @@ mod tests {
         assert_eq!(alignments.len(), 7, "expected 7 alignment checks");
 
         for a in &alignments {
-            assert!(!a.crate_name.is_empty());
-            assert!(!a.legacy_feature.is_empty());
-            assert!(!a.migration_feature.is_empty());
+            assert_ne!(a.crate_name, "");
+            assert_ne!(a.legacy_feature, "");
+            assert_ne!(a.migration_feature, "");
         }
     }
 

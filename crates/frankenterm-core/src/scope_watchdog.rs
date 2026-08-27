@@ -1139,7 +1139,7 @@ mod tests {
             "fix it".to_string(),
         );
         let s = alert.to_string();
-        assert!(!s.is_empty());
+        assert_ne!(s, "");
         assert!(s.contains("ERROR"));
         assert!(s.contains("orphan"));
     }

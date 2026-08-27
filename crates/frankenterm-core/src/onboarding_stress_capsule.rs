@@ -296,10 +296,10 @@ mod tests {
     fn all_pass_is_eligible() {
         let report = compile_report(&pass_all());
         assert!(report.eligible_for_high_risk_tasks);
-        assert!(report.machine_local_failures.is_empty());
-        assert!(report.repo_code_failures.is_empty());
+        assert_eq!(report.machine_local_failures, [] as [onboarding_stress_capsule::FailedCheck; 0]);
+        assert_eq!(report.repo_code_failures, [] as [onboarding_stress_capsule::FailedCheck; 0]);
         assert_eq!(report.passed.len(), 8);
-        assert!(report.skipped.is_empty());
+        assert_eq!(report.skipped, [] as [onboarding_stress_capsule::SkippedCheck; 0]);
     }
 
     /// A single MachineLocal Fail blocks eligibility AND lands in
@@ -317,7 +317,7 @@ mod tests {
         let report = compile_report(&probes);
         assert!(!report.eligible_for_high_risk_tasks);
         assert_eq!(report.machine_local_failures.len(), 1);
-        assert!(report.repo_code_failures.is_empty());
+        assert_eq!(report.repo_code_failures, [] as [onboarding_stress_capsule::FailedCheck; 0]);
         assert_eq!(
             report.machine_local_failures[0].check,
             OnboardingCheck::StoragePathWritable
@@ -338,7 +338,7 @@ mod tests {
         );
         let report = compile_report(&probes);
         assert!(!report.eligible_for_high_risk_tasks);
-        assert!(report.machine_local_failures.is_empty());
+        assert_eq!(report.machine_local_failures, [] as [onboarding_stress_capsule::FailedCheck; 0]);
         assert_eq!(report.repo_code_failures.len(), 1);
         assert_eq!(
             report.repo_code_failures[0].check,
@@ -479,7 +479,7 @@ mod tests {
         let probes = OnboardingProbeResults::new();
         let report = compile_report(&probes);
         assert!(report.eligible_for_high_risk_tasks);
-        assert!(report.passed.is_empty());
+        assert_eq!(report.passed, [] as [onboarding_stress_capsule::OnboardingCheck; 0]);
     }
 
     /// OnboardingReport serde roundtrip preserves every section

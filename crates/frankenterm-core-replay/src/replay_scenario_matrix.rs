@@ -3051,10 +3051,9 @@ label = "b"
             ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
 
         assert!(matrix.hardware_claims_proven(64, 274_877_906_944));
-        assert!(
-            matrix
-                .unproven_hardware_claims(64, 274_877_906_944)
-                .is_empty()
+        assert_eq!(
+            matrix.unproven_hardware_claims(64, 274_877_906_944),
+            [] as [std::string::String; 0]
         );
 
         let summary = matrix.coverage_summary();

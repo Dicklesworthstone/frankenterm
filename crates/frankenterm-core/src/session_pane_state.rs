@@ -998,7 +998,7 @@ mod tests {
         assert!(restored.cwd.is_none());
         assert!(restored.shell.is_none());
         assert!(restored.agent.is_none());
-        assert!(restored.terminal.title.is_empty());
+        assert_eq!(restored.terminal.title, "");
     }
 
     #[test]
@@ -1015,12 +1015,11 @@ mod tests {
         let (json, truncated) = snapshot.to_json_budgeted().unwrap();
         assert!(truncated);
         assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
-        assert!(
+        assert_eq!(
             PaneStateSnapshot::from_json(&json)
                 .unwrap()
                 .terminal
-                .title
-                .is_empty()
+                .title, ""
         );
     }
 
@@ -1323,7 +1322,7 @@ mod tests {
         assert_eq!(terminal.cursor_row, 0);
         assert_eq!(terminal.cursor_col, 0);
         assert!(!terminal.is_alt_screen);
-        assert!(terminal.title.is_empty());
+        assert_eq!(terminal.title, "");
     }
 
     // ---- Constants ----
@@ -1516,7 +1515,7 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
         let snapshot = PaneStateSnapshot::from_pane_info(&pane, 2000, true);
-        assert!(snapshot.terminal.title.is_empty());
+        assert_eq!(snapshot.terminal.title, "");
         // Cursor defaults to 0 when not present
         assert_eq!(snapshot.terminal.cursor_row, 0);
         assert_eq!(snapshot.terminal.cursor_col, 0);
@@ -1779,7 +1778,7 @@ mod tests {
         };
         let json = serde_json::to_string(&p).unwrap();
         let restored: ProcessInfo = serde_json::from_str(&json).unwrap();
-        assert!(restored.name.is_empty());
+        assert_eq!(restored.name, "");
     }
 
     // ---- AgentMetadata deserializes with unknown fields ----

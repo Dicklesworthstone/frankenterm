@@ -959,13 +959,13 @@ mod tests {
     #[test]
     fn selectors_have_sensible_defaults() {
         let sel = GooglePageSelectors::default();
-        assert!(!sel.signed_in_marker.is_empty());
-        assert!(!sel.email_input.is_empty());
-        assert!(!sel.password_prompt.is_empty());
-        assert!(!sel.mfa_indicator.is_empty());
-        assert!(!sel.security_key_indicator.is_empty());
-        assert!(!sel.sso_indicator.is_empty());
-        assert!(!sel.verify_indicator.is_empty());
+        assert_ne!(sel.signed_in_marker, "");
+        assert_ne!(sel.email_input, "");
+        assert_ne!(sel.password_prompt, "");
+        assert_ne!(sel.mfa_indicator, "");
+        assert_ne!(sel.security_key_indicator, "");
+        assert_ne!(sel.sso_indicator, "");
+        assert_ne!(sel.verify_indicator, "");
     }
 
     // =========================================================================
@@ -1547,7 +1547,7 @@ mod tests {
         ];
         for kind in &kinds {
             let dbg = format!("{:?}", kind);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 

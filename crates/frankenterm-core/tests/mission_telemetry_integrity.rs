@@ -434,8 +434,8 @@ fn metrics_workspace_and_track_labels_propagated() {
     ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
 
     let latest = ml.latest_metrics().unwrap();
-    assert!(!latest.workspace_label.is_empty());
-    assert!(!latest.track_label.is_empty());
+    assert_ne!(latest.workspace_label, "");
+    assert_ne!(latest.track_label, "");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -327,7 +327,7 @@ fn mock_clear_screen() {
         mock.inject(0, MockEvent::ClearScreen).await.unwrap();
 
         let text = mock.get_text(0, false).await.unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     });
 }
 

@@ -347,7 +347,7 @@ mod tests {
     fn diff_empty_when_identical() {
         let a = AccessibilityPreferences::default();
         let b = AccessibilityPreferences::default();
-        assert!(a.diff(&b).is_empty());
+        assert_eq!(a.diff(&b), [] as [accessibility_preferences::PreferenceChange; 0]);
         assert!(!a.has_changed(&b));
     }
 

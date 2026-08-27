@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn bin_series_empty() {
-        assert!(bin_series(&[], 4).is_empty());
+        assert_eq!(bin_series(&[], 4), [] as [usize; 0]);
     }
 
     // ── Transfer entropy ─────────────────────────────────────────────────
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn dag_downstream_no_edges() {
         let dag = CausalDag::new(CausalDagConfig::default());
-        assert!(dag.downstream(1).is_empty());
+        assert_eq!(dag.downstream(1), [] as [u64; 0]);
     }
 
     #[test]
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn bin_series_zero_bins_returns_empty() {
         let series = vec![1.0, 2.0, 3.0];
-        assert!(bin_series(&series, 0).is_empty());
+        assert_eq!(bin_series(&series, 0), [] as [usize; 0]);
     }
 
     #[test]
@@ -1006,7 +1006,7 @@ mod tests {
     fn fisher_yates_empty_slice() {
         let mut data: Vec<f64> = vec![];
         fisher_yates_deterministic(&mut data, 42);
-        assert!(data.is_empty());
+        assert_eq!(data, [] as [f64; 0]);
     }
 
     #[test]
@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn dag_upstream_no_edges() {
         let dag = CausalDag::new(CausalDagConfig::default());
-        assert!(dag.upstream(42).is_empty());
+        assert_eq!(dag.upstream(42), [] as [u64; 0]);
     }
 
     #[test]
@@ -1171,8 +1171,8 @@ mod tests {
             p_value: 0.001,
             lag_samples: 1,
         }];
-        assert!(dag.downstream(5).is_empty());
-        assert!(dag.upstream(5).is_empty());
+        assert_eq!(dag.downstream(5), [] as [u64; 0]);
+        assert_eq!(dag.upstream(5), [] as [u64; 0]);
     }
 
     #[test]

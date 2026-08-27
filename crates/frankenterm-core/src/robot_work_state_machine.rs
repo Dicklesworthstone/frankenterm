@@ -574,7 +574,7 @@ mod tests {
             w.claims.get(&0),
             Some(ClaimState::Claimed { owner: 1 })
         ));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
             w.claims.get(&0),
             Some(ClaimState::Claimed { owner: 1 })
         ));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(outcome, WorkOutcome::ClaimSucceeded);
         // No new event.
         assert_eq!(w.events.len(), prior.events.len());
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -628,7 +628,7 @@ mod tests {
             w.claims.get(&0),
             Some(ClaimState::Completed { owner: 1 })
         ));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -645,7 +645,7 @@ mod tests {
             }
         );
         assert_eq!(w, prior);
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -662,7 +662,7 @@ mod tests {
         );
         // No new event for the duplicate complete.
         assert_eq!(w.events.len(), prior.events.len());
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -679,7 +679,7 @@ mod tests {
             }
         ));
         assert_eq!(w.claims.get(&0).copied(), Some(ClaimState::Unclaimed));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -716,7 +716,7 @@ mod tests {
             w.claims.get(&2),
             Some(ClaimState::Claimed { owner: 2 })
         ));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -735,7 +735,7 @@ mod tests {
             Some(ClaimState::Completed { owner: 1 })
         ));
         assert_eq!(w.claims.get(&1).copied(), Some(ClaimState::Unclaimed));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     #[test]
@@ -835,7 +835,7 @@ mod tests {
         );
         // Even though agent 2 was not the owner (there was none),
         // the invariant must accept the no-op release.
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_work_state_machine::WorkSafetyViolation; 0]);
     }
 
     /// Defense regression guard: a buggy handler attempting to

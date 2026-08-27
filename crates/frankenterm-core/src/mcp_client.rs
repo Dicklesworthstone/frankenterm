@@ -798,7 +798,7 @@ mod tests {
         config.mcp_client.discovery_paths = Vec::new();
 
         let discovered = discover_servers(&config).expect("discover servers");
-        assert!(discovered.is_empty());
+        assert_eq!(discovered, [] as [frankenterm_core_mcp::ExternalServerConfig; 0]);
     }
 
     #[test]

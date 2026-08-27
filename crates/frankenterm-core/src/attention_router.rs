@@ -3725,7 +3725,7 @@ mod tests {
             assert_eq!(item.classification, classification);
             assert_eq!(item.severity, severity);
             assert_eq!(item.recommended_action.action, action);
-            assert!(!item.redacted_summary.trim().is_empty());
+            assert_ne!(item.redacted_summary.trim(), "");
             assert!(item.redacted_summary.chars().count() <= ATTENTION_ROUTER_SUMMARY_MAX_CHARS);
             assert!(item.freshness_ms.is_some());
             assert!(

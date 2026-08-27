@@ -1273,8 +1273,8 @@ mod tests {
     fn cass_error_remediation_not_installed() {
         let err = CassError::NotInstalled;
         let rem = err.remediation();
-        assert!(!rem.summary.is_empty());
-        assert!(!rem.commands.is_empty());
+        assert_ne!(rem.summary, "");
+        assert_ne!(rem.commands, [] as [error::RemediationCommand; 0]);
     }
 
     #[test]

@@ -404,8 +404,8 @@ fn standard_keybindings_nonempty() {
     let bindings = standard_keybindings();
     assert!(!bindings.is_empty());
     for binding in &bindings {
-        assert!(!binding.keys.is_empty());
-        assert!(!binding.label.is_empty());
+        assert_ne!(binding.keys, "");
+        assert_ne!(binding.label, "");
     }
 }
 

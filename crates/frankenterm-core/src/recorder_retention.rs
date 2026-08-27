@@ -401,7 +401,7 @@ mod tests {
         assert!(!SegmentPhase::Active.can_transition_to(SegmentPhase::Purged));
         assert!(SegmentPhase::Sealed.can_transition_to(SegmentPhase::Archived));
         assert!(SegmentPhase::Archived.can_transition_to(SegmentPhase::Purged));
-        assert!(SegmentPhase::Purged.valid_transitions().is_empty());
+        assert_eq!(SegmentPhase::Purged.valid_transitions(), []);
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
 
         let now = ms(24) + ms_days(1) + ms_days(2);
         let result = mgr.sweep(now, &holders);
-        assert!(result.purged.is_empty());
+        assert_eq!(result.purged, [] as [std::string::String; 0]);
         assert_eq!(result.held.len(), 1);
         assert_eq!(result.held[0], ("s1".to_string(), "indexer".to_string()));
     }
@@ -1071,7 +1071,7 @@ mod tests {
             SegmentPhase::Archived.valid_transitions(),
             &[SegmentPhase::Purged]
         );
-        assert!(SegmentPhase::Purged.valid_transitions().is_empty());
+        assert_eq!(SegmentPhase::Purged.valid_transitions(), []);
     }
 
     #[test]
@@ -1112,11 +1112,11 @@ mod tests {
     #[test]
     fn retention_sweep_result_default_empty() {
         let r = RetentionSweepResult::default();
-        assert!(r.sealed.is_empty());
-        assert!(r.archived.is_empty());
-        assert!(r.purge_candidates.is_empty());
-        assert!(r.purged.is_empty());
-        assert!(r.held.is_empty());
+        assert_eq!(r.sealed, [] as [std::string::String; 0]);
+        assert_eq!(r.archived, [] as [std::string::String; 0]);
+        assert_eq!(r.purge_candidates, [] as [std::string::String; 0]);
+        assert_eq!(r.purged, [] as [std::string::String; 0]);
+        assert_eq!(r.held, [] as [(std::string::String, std::string::String); 0]);
         let _ = format!("{:?}", r);
     }
 

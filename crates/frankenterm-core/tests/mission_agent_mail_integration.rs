@@ -95,7 +95,10 @@ fn conflict_path_degrades_then_recovers() {
         "taking over scheduler shard",
     );
     assert_eq!(first.attempted, 1);
-    assert!(first.delivered.is_empty());
+    assert_eq!(
+        first.delivered,
+        [] as [frankenterm_core::mission_agent_mail::DispatchedCoordinationMessage; 0]
+    );
     assert_eq!(first.failed.len(), 1);
 
     let second = kernel.emit_handoff_notice_at(
@@ -107,7 +110,10 @@ fn conflict_path_degrades_then_recovers() {
     );
     assert_eq!(second.attempted, 1);
     assert_eq!(second.delivered.len(), 1);
-    assert!(second.failed.is_empty());
+    assert_eq!(
+        second.failed,
+        [] as [frankenterm_core::mission_agent_mail::FailedCoordinationMessage; 0]
+    );
 }
 
 #[test]
@@ -133,7 +139,10 @@ fn ack_required_roundtrip_is_enforceable() {
     let ack_report =
         kernel.emit_acknowledgements_at(10_050, "AgentX", &pending.pending, "acknowledged");
     assert_eq!(ack_report.delivered.len(), 1);
-    assert!(ack_report.failed.is_empty());
+    assert_eq!(
+        ack_report.failed,
+        [] as [frankenterm_core::mission_agent_mail::FailedCoordinationMessage; 0]
+    );
 
     let coordinator_inbox = kernel.consume_inbox("mission-kernel");
     assert!(coordinator_inbox.parsed.iter().any(|message| {

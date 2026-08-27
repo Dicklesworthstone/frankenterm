@@ -1267,7 +1267,7 @@ mod tests {
 
         let report = correlator.swarm_scent_report(1_700_000_000_000, DEFAULT_SWARM_SCENT_TTL_MS);
 
-        assert!(report.agents.is_empty());
+        assert_eq!(report.agents, [] as [agent_correlator::SwarmScentAgent; 0]);
         assert_eq!(report.summary.tracked_agents, 1);
         assert_eq!(report.summary.expired_agents, 1);
         assert!(

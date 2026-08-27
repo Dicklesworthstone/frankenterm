@@ -1351,8 +1351,8 @@ mod tests {
     #[test]
     fn all_surfaces_have_command_names() {
         for surface in ApiSurface::ALL {
-            assert!(!surface.command_name().is_empty());
-            assert!(!surface.category().is_empty());
+            assert_ne!(surface.command_name(), "");
+            assert_ne!(surface.category(), "");
         }
     }
 

@@ -786,7 +786,7 @@ fn security_error_display_is_descriptive() {
 
     let err = DistributedSecurityError::MissingToken;
     let msg = err.to_string();
-    assert!(!msg.is_empty());
+    assert_ne!(msg, "");
     assert!(msg.contains("token"));
 }
 

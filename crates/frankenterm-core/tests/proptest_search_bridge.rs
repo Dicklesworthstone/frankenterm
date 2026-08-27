@@ -667,7 +667,7 @@ fn bridge_debug_no_panic() {
     // which needs disk, so we skip full construction in proptest)
     let token = BridgeCancellationToken::new();
     let debug = format!("{token:?}");
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 #[test]

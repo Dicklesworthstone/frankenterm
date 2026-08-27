@@ -1389,7 +1389,7 @@ mod tests {
                 .iter()
                 .any(|decision| decision.phase == "bisect_probe")
         );
-        assert!(report.skipped_snapshots.is_empty());
+        assert_eq!(report.skipped_snapshots, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2312,7 +2312,7 @@ mod tests {
         let base = BaseSnapshot::new(500, make_topology(&[]), vec![]);
         assert_eq!(base.pane_states.len(), 0);
         assert_eq!(base.captured_at, 500);
-        assert!(base.topology.windows[0].tabs.is_empty());
+        assert_eq!(base.topology.windows[0].tabs, [] as [session_topology::TabSnapshot; 0]);
     }
 
     #[test]

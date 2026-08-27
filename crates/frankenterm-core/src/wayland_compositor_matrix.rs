@@ -390,7 +390,7 @@ mod tests {
     fn every_compositor_has_a_tier_and_slug() {
         for c in CompositorIdentity::ALL {
             let _ = c.tier();
-            assert!(!c.slug().is_empty());
+            assert_ne!(c.slug(), "");
         }
     }
 
@@ -476,7 +476,7 @@ mod tests {
             ));
         }
         assert!(m.all_tier1_passed());
-        assert!(m.missing_tier1().is_empty());
+        assert_eq!(m.missing_tier1(), [] as [wayland_compositor_matrix::CompositorIdentity; 0]);
     }
 
     #[test]

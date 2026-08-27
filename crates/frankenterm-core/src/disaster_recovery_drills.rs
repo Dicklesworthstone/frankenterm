@@ -1116,7 +1116,7 @@ mod tests {
         let report = runner.execute_with_metrics(&metrics_map);
         assert!(report.overall_verdict.is_fail());
         assert_eq!(report.summary.failed, 1);
-        assert!(!report.results[0].errors.is_empty());
+        assert_ne!(report.results[0].errors, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -1206,7 +1206,7 @@ mod tests {
 
         assert_eq!(report.attempted, 2);
         assert_eq!(report.delivered.len(), 2);
-        assert!(report.failed.is_empty());
+        assert_eq!(report.failed, [] as [mission_agent_mail::FailedCoordinationMessage; 0]);
         assert!(report.delivered.iter().all(|item| item.ack_required));
         assert!(
             report
@@ -1404,7 +1404,7 @@ mod tests {
 
         let report = kernel.emit_acknowledgements_at(9_000, "AgentA", &pending, "ack");
         assert_eq!(report.delivered.len(), 1);
-        assert!(report.failed.is_empty());
+        assert_eq!(report.failed, [] as [mission_agent_mail::FailedCoordinationMessage; 0]);
 
         let sent = kernel.transport.sent();
         assert_eq!(sent.len(), 1);
@@ -1433,7 +1433,7 @@ mod tests {
         }];
 
         let report = kernel.emit_acknowledgements_at(9_000, "AgentA", &pending, "");
-        assert!(report.delivered.is_empty());
+        assert_eq!(report.delivered, [] as [mission_agent_mail::DispatchedCoordinationMessage; 0]);
         assert_eq!(report.failed.len(), 1);
     }
 

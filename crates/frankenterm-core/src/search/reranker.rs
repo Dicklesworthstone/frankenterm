@@ -847,7 +847,7 @@ mod tests {
             score: 0.5,
         }];
         let result = reranker.rerank("q", docs).unwrap();
-        assert!(result[0].text.is_empty());
+        assert_eq!(result[0].text, "");
     }
 
     #[test]
@@ -1052,7 +1052,7 @@ mod tests {
     fn rerank_outcome_default() {
         let outcome = RerankOutcome::default();
         assert!(!outcome.reranked);
-        assert!(outcome.backend_used.is_empty());
+        assert_eq!(outcome.backend_used, "");
         assert_eq!(outcome.candidates_reranked, 0);
         assert!(outcome.skip_reason.is_none());
     }

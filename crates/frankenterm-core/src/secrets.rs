@@ -891,7 +891,7 @@ mod tests {
         engine.scan_segment(&segment, &options, &mut report);
         assert!(!report.samples.is_empty());
         // Pattern name should be non-empty
-        assert!(!report.samples[0].pattern.is_empty());
+        assert_ne!(report.samples[0].pattern, "");
     }
 
     // ========================================================================

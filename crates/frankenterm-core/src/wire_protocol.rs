@@ -1486,7 +1486,7 @@ mod tests {
             WirePayload::PaneDelta(d) => {
                 assert_eq!(d.pane_id, 1);
                 assert_eq!(d.seq, 42);
-                assert!(d.content.is_empty());
+                assert_eq!(d.content, "");
                 assert_eq!(d.content_len, 0);
             }
             other => panic!("expected PaneDelta, got: {other:?}"),
@@ -3024,7 +3024,7 @@ mod tests {
         ];
         for p in &payloads {
             let dbg = format!("{:?}", p);
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
             let p2 = p.clone();
             assert_eq!(*p, p2);
         }

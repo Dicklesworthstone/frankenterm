@@ -1117,7 +1117,7 @@ mod tests {
 
         assert_eq!(meta.pid, std::process::id());
         assert_eq!(meta.cargo_command, "test");
-        assert!(!meta.ft_version.is_empty());
+        assert_ne!(meta.ft_version, "");
         assert!(meta.started_at > 0);
     }
 

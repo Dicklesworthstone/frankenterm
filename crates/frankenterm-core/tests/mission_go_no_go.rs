@@ -309,7 +309,7 @@ fn evidence_chain_verification_detects_integrity() {
         "sequential appends should produce intact chain"
     );
     assert_eq!(verification.total_records, 5);
-    assert!(verification.missing_ordinals.is_empty());
+    assert_eq!(verification.missing_ordinals, [] as [u64; 0]);
 }
 
 #[test]
@@ -400,7 +400,7 @@ fn evidence_no_redaction_preserves_all_data() {
     );
 
     assert_eq!(bundle.redaction.fields_redacted, 0);
-    assert!(bundle.redaction.categories.is_empty());
+    assert_eq!(bundle.redaction.categories, [] as [std::string::String; 0]);
 }
 
 // ── Category 3: Threshold Validation ─────────────────────────────────
@@ -522,7 +522,7 @@ fn rollback_completed_ledger_reports_already_complete() {
     ledger.transition_phase(TxPhase::Completed).unwrap();
 
     let resume = frankenterm_core::tx_idempotency::ResumeContext::from_ledger(&ledger, &plan);
-    assert!(resume.remaining_steps.is_empty());
+    assert_eq!(resume.remaining_steps, [] as [std::string::String; 0]);
     assert_eq!(resume.completed_steps.len(), 2);
     let is_complete = matches!(
         resume.recommendation,

@@ -908,7 +908,7 @@ mod tests {
         let redactor = Redactor::new();
         let mut val = json!([]);
         redact_json_value(&mut val, &redactor);
-        assert!(val.as_array().unwrap().is_empty());
+        assert_eq!(val.as_array().unwrap().as_slice(), []);
     }
 
     #[test]
@@ -1175,7 +1175,7 @@ mod tests {
         let view = EventAnnotationsView::from_stored(annotations, &redactor);
         assert!(view.triage_state.is_none());
         assert!(view.note.is_none());
-        assert!(view.labels.is_empty());
+        assert_eq!(view.labels, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1279,7 +1279,7 @@ mod tests {
         };
         let view = BookmarkView::from_query(bookmark, &redactor);
         assert!(view.description.is_none());
-        assert!(view.tags.is_empty());
+        assert_eq!(view.tags, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1424,7 +1424,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["total"], 0);
-        assert!(json["panes"].as_array().unwrap().is_empty());
+        assert_eq!(json["panes"].as_array().unwrap().as_slice(), []);
     }
 
     #[test]
@@ -1435,7 +1435,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["total"], 0);
-        assert!(json["events"].as_array().unwrap().is_empty());
+        assert_eq!(json["events"].as_array().unwrap().as_slice(), []);
     }
 
     #[test]
@@ -1446,7 +1446,7 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["total"], 0);
-        assert!(json["results"].as_array().unwrap().is_empty());
+        assert_eq!(json["results"].as_array().unwrap().as_slice(), []);
     }
 
     #[test]

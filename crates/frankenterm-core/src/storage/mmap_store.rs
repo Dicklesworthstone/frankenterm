@@ -2748,7 +2748,7 @@ mod tests {
     #[test]
     fn build_offsets_empty() {
         let offsets = build_offsets_from_lengths(&[]);
-        assert!(offsets.is_empty());
+        assert_eq!(offsets, [] as [storage::mmap_store::LineOffset; 0]);
     }
 
     #[test]
@@ -2942,7 +2942,7 @@ mod tests {
         store.append_line(1, "data").unwrap();
 
         let lines = store.tail_lines(1, 0).unwrap();
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3897,7 +3897,7 @@ mod tests {
         sqlite.append_line_auto_seq(1, "data").unwrap();
 
         let lines = sqlite.tail_lines(1, 0).unwrap();
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3972,7 +3972,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
 
         let (offsets, len) = PaneFile::scan_offsets(&path).unwrap();
-        assert!(offsets.is_empty());
+        assert_eq!(offsets, [] as [storage::mmap_store::LineOffset; 0]);
         assert_eq!(len, 0);
     }
 

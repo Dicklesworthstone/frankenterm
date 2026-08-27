@@ -1693,7 +1693,7 @@ mod tests {
         let unannotated = events.get(1).expect("unannotated event");
         assert!(unannotated.triage_state.is_none());
         assert!(unannotated.note.is_none());
-        assert!(unannotated.labels.is_empty());
+        assert_eq!(unannotated.labels, [] as [std::string::String; 0]);
 
         drop(client);
         runtime.block_on(async {

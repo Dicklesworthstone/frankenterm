@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn neighbors_out_of_range_is_empty() {
         let g = simple_chain();
-        assert!(g.neighbors(99).is_empty());
+        assert_eq!(g.neighbors(99), []);
     }
 
     // -- Dijkstra --
@@ -853,7 +853,7 @@ mod tests {
     fn ksp_basic() {
         let g = diamond_graph();
         let paths = k_shortest_paths(&g, 0, 3, 3);
-        assert!(!paths.is_empty());
+        assert_ne!(paths, [] as [(f64, std::vec::Vec<usize>); 0]);
         // First path should be shortest
         assert!((paths[0].0 - 4.0).abs() < f64::EPSILON);
         // Paths should be in non-decreasing order
@@ -866,26 +866,26 @@ mod tests {
     fn ksp_unreachable() {
         let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0)]);
         let paths = k_shortest_paths(&g, 0, 2, 5);
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [(f64, std::vec::Vec<usize>); 0]);
     }
 
     #[test]
     fn ksp_zero_k_returns_empty() {
         let g = diamond_graph();
-        assert!(k_shortest_paths(&g, 0, 3, 0).is_empty());
+        assert_eq!(k_shortest_paths(&g, 0, 3, 0), [] as [(f64, std::vec::Vec<usize>); 0]);
     }
 
     #[test]
     fn ksp_out_of_range_returns_empty() {
         let g = diamond_graph();
-        assert!(k_shortest_paths(&g, 99, 3, 2).is_empty());
-        assert!(k_shortest_paths(&g, 0, 99, 2).is_empty());
+        assert_eq!(k_shortest_paths(&g, 99, 3, 2), [] as [(f64, std::vec::Vec<usize>); 0]);
+        assert_eq!(k_shortest_paths(&g, 0, 99, 2), [] as [(f64, std::vec::Vec<usize>); 0]);
     }
 
     #[test]
     fn ksp_negative_weights_return_empty() {
         let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0), (1, 2, -1.0)]);
-        assert!(k_shortest_paths(&g, 0, 2, 2).is_empty());
+        assert_eq!(k_shortest_paths(&g, 0, 2, 2), [] as [(f64, std::vec::Vec<usize>); 0]);
     }
 
     // -- Serde --
@@ -904,7 +904,7 @@ mod tests {
     fn empty_graph() {
         let g = WeightedGraph::new(0);
         let fw = floyd_warshall(&g).unwrap();
-        assert!(fw.is_empty());
+        assert_eq!(fw, [] as [std::vec::Vec<f64>; 0]);
     }
 
     #[test]
@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(bfs_shortest(&g, 0).distance_to(0), f64::INFINITY);
         assert_eq!(bellman_ford(&g, 0).unwrap().distance_to(0), f64::INFINITY);
         assert!(shortest_path(&g, 0, 0).is_none());
-        assert!(k_shortest_paths(&g, 0, 0, 1).is_empty());
+        assert_eq!(k_shortest_paths(&g, 0, 0, 1), [] as [(f64, std::vec::Vec<usize>); 0]);
     }
 
     #[test]

@@ -2360,8 +2360,8 @@ mod tests {
         let ctx = PlannerExtractionContext::default();
         let config = PlannerExtractionConfig::default();
         let result = extract_planner_features(&report, &agents, &ctx, &config);
-        assert!(result.features.is_empty());
-        assert!(result.ranked_ids.is_empty());
+        assert_eq!(result.features, [] as [planner_features::PlannerFeatureVector; 0]);
+        assert_eq!(result.ranked_ids, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3028,7 +3028,7 @@ mod tests {
     fn scorer_empty_input() {
         let report = score_candidates(&[], &ScorerConfig::default());
         assert!(report.scored.is_empty());
-        assert!(report.ranked_ids.is_empty());
+        assert_eq!(report.ranked_ids, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -4174,9 +4174,9 @@ mod tests {
             assert_eq!(v.action, GovernorAction::Allow);
             assert!((v.adjusted_score - v.original_score).abs() < f64::EPSILON);
         }
-        assert!(report.thrashing_bead_ids.is_empty());
-        assert!(report.starving_bead_ids.is_empty());
-        assert!(report.cooldown_bead_ids.is_empty());
+        assert_eq!(report.thrashing_bead_ids, [] as [std::string::String; 0]);
+        assert_eq!(report.starving_bead_ids, [] as [std::string::String; 0]);
+        assert_eq!(report.cooldown_bead_ids, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -4224,7 +4224,7 @@ mod tests {
         let report = gov.evaluate(&candidates);
         // Cooldown was 2 cycles, we're 2 cycles past assignment → allowed.
         // But it might detect thrash or starvation; check cooldown specifically.
-        assert!(report.cooldown_bead_ids.is_empty());
+        assert_eq!(report.cooldown_bead_ids, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -4349,7 +4349,7 @@ mod tests {
 
         let candidates = vec![make_scored("b1", 0.8)];
         let report = gov.evaluate(&candidates);
-        assert!(report.thrashing_bead_ids.is_empty());
+        assert_eq!(report.thrashing_bead_ids, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -4578,8 +4578,8 @@ mod tests {
         for kind in kinds {
             let profile = MissionProfile::from_kind(kind);
             assert_eq!(profile.kind, kind);
-            assert!(!profile.name.is_empty());
-            assert!(!profile.description.is_empty());
+            assert_ne!(profile.name, "");
+            assert_ne!(profile.description, "");
         }
     }
 
@@ -5659,7 +5659,7 @@ mod tests {
         let total = assignments.assignment_count() + assignments.rejected.len();
         assert_eq!(explain_report.explanations.len(), total);
         for expl in &explain_report.explanations {
-            assert!(!expl.summary.is_empty());
+            assert_ne!(expl.summary, "");
             assert!(!expl.factors.is_empty());
         }
     }

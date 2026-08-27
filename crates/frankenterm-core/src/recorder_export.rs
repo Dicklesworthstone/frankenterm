@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(req.format, ExportFormat::Transcript);
         assert_eq!(req.time_range.unwrap().start_ms, 1000);
         assert_eq!(req.time_range.unwrap().end_ms, 5000);
-        assert!(req.pane_ids.is_empty());
+        assert_eq!(req.pane_ids, [] as [u64; 0]);
         assert!(req.include_text);
     }
 
@@ -1066,8 +1066,8 @@ mod tests {
         let req = ExportRequest::default();
         assert_eq!(req.format, ExportFormat::JsonLines);
         assert!(req.time_range.is_none());
-        assert!(req.pane_ids.is_empty());
-        assert!(req.kind_filter.is_empty());
+        assert_eq!(req.pane_ids, [] as [u64; 0]);
+        assert_eq!(req.kind_filter, [] as [recorder_query::QueryEventKind; 0]);
         assert_eq!(req.max_events, 0);
         assert!(req.include_text);
         assert!(req.max_sensitivity.is_none());

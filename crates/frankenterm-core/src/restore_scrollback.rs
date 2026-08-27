@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(r.failure_count(), 0);
         assert_eq!(r.total_bytes(), 0);
         assert_eq!(r.skipped_count(), 0);
-        assert!(r.skipped_sample().is_empty());
+        assert_eq!(r.skipped_sample(), []);
     }
 
     #[test]
@@ -995,7 +995,7 @@ mod tests {
                 .expect_err("large mapped replay must fail before allocating replay content");
 
             let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-            assert!(text.is_empty());
+            assert_eq!(text, "");
         });
     }
 
@@ -1012,7 +1012,7 @@ mod tests {
             assert_eq!(report.success_count(), 0);
             assert_eq!(report.failure_count(), 0);
             assert_eq!(report.skipped_count(), 0);
-            assert!(report.skipped_sample().is_empty());
+            assert_eq!(report.skipped_sample(), []);
         });
     }
 
@@ -1084,7 +1084,7 @@ mod tests {
     fn scrollback_data_truncate_to_zero() {
         let mut data = ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into()]);
         data.truncate(0);
-        assert!(data.lines.is_empty());
+        assert_eq!(data.lines, [] as [std::string::String; 0]);
         assert_eq!(data.total_bytes(), 0);
     }
 

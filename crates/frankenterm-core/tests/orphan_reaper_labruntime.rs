@@ -35,7 +35,7 @@ fn reap_orphans_async_returns_report() {
         let report: ReapReport = reap_orphans(999_999).await;
         assert_eq!(report.scanned, 0);
         assert_eq!(report.killed, 0);
-        assert!(report.killed_pids.is_empty());
+        assert_eq!(report.killed_pids, [] as [u32; 0]);
         assert_eq!(
             report.errors,
             vec!["reap disabled: no handle-owned child identity".to_string()]
@@ -50,7 +50,7 @@ fn reap_orphans_async_zero_max_age() {
         let report: ReapReport = reap_orphans(0).await;
         assert_eq!(report.scanned, 0);
         assert_eq!(report.killed, 0);
-        assert!(report.killed_pids.is_empty());
+        assert_eq!(report.killed_pids, [] as [u32; 0]);
     });
 }
 

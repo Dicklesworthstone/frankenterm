@@ -1574,7 +1574,7 @@ mod tests {
         let meta: LockMetadata = serde_json::from_str(&meta_contents).unwrap();
 
         assert_eq!(meta.pid, std::process::id());
-        assert!(!meta.wa_version.is_empty());
+        assert_ne!(meta.wa_version, "");
         assert!(meta.started_at > 0);
     }
 
@@ -1624,7 +1624,7 @@ mod tests {
         assert_eq!(meta.pid, std::process::id());
         assert!(meta.started_at > 0);
         assert!(meta.started_at_human.starts_with("unix:"));
-        assert!(!meta.wa_version.is_empty());
+        assert_ne!(meta.wa_version, "");
         assert_eq!(meta.instance_id.len(), LOCK_INSTANCE_ID_HEX_LEN);
         assert!(meta.is_admissible());
     }
@@ -2399,7 +2399,7 @@ mod tests {
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();
-        assert!(back.wa_version.is_empty());
+        assert_eq!(back.wa_version, "");
     }
 
     #[test]

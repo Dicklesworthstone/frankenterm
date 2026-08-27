@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         if let Content::Text { text } = &result[0] {
             // TOON output should be different from raw JSON
-            assert!(!text.is_empty());
+            assert_ne!(text, "");
         }
     }
 

@@ -4004,7 +4004,7 @@ mod tests {
             assert!(artifact.dry_run);
             assert!(artifact.read_only);
             assert!(!artifact.external_provider_calls);
-            assert!(!artifact.command.command.is_empty());
+            assert_ne!(artifact.command.command, "");
             assert_eq!(artifact.command.target_dir, "/tmp/ft-booek-5-cod5-target");
             if artifact.command.remote_cargo_reached || artifact.command.cargo_test_reached {
                 assert!(

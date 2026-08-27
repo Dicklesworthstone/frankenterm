@@ -990,7 +990,7 @@ mod tests {
     fn parse_empty_schema() {
         let schema = serde_json::json!({});
         let doc = parse_schema(&schema);
-        assert!(doc.title.is_empty());
+        assert_eq!(doc.title, "");
         assert!(doc.properties.is_empty());
         assert!(doc.definitions.is_empty());
     }
@@ -1404,7 +1404,7 @@ mod tests {
         assert!(parsed.minimum.is_none());
         assert!(parsed.maximum.is_none());
         assert!(parsed.pattern.is_none());
-        assert!(parsed.enum_values.is_empty());
+        assert_eq!(parsed.enum_values, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1953,8 +1953,8 @@ mod tests {
     fn parse_schema_null_value() {
         let schema = Value::Null;
         let doc = parse_schema(&schema);
-        assert!(doc.title.is_empty());
-        assert!(doc.description.is_empty());
+        assert_eq!(doc.title, "");
+        assert_eq!(doc.description, "");
         assert!(doc.properties.is_empty());
         assert!(doc.definitions.is_empty());
     }
@@ -1963,7 +1963,7 @@ mod tests {
     fn parse_schema_string_value() {
         let schema = Value::String("not a schema".into());
         let doc = parse_schema(&schema);
-        assert!(doc.title.is_empty());
+        assert_eq!(doc.title, "");
         assert!(doc.properties.is_empty());
     }
 
@@ -1971,7 +1971,7 @@ mod tests {
     fn parse_schema_number_value() {
         let schema = serde_json::json!(42);
         let doc = parse_schema(&schema);
-        assert!(doc.title.is_empty());
+        assert_eq!(doc.title, "");
         assert!(doc.properties.is_empty());
     }
 

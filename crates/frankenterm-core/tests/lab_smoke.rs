@@ -60,7 +60,7 @@ fn smoke_run_lab_test_writes_structured_event_log() {
         event_log_path.starts_with(tmp.path()),
         "event log should be written under the configured artifact dir"
     );
-    assert!(!report.correlation_id.is_empty());
+    assert_ne!(report.correlation_id, "");
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn smoke_mock_unix_stream_empty_read() {
 
         // Reading from empty buffer returns empty vec
         let data = stream_b.read(&cx, 1024).await.expect("read empty");
-        assert!(data.is_empty());
+        assert_eq!(data, [] as [u8; 0]);
     });
 }
 

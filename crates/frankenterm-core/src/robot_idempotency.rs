@@ -1074,7 +1074,7 @@ mod tests {
         let result = guard.check_batch(&[send, split], 1001);
         assert_eq!(result.dedup_keys, vec!["shared-client-key".to_string()]);
         assert_eq!(result.new_keys, vec!["shared-client-key".to_string()]);
-        assert!(result.expired_keys.is_empty());
+        assert_eq!(result.expired_keys, [] as [std::string::String; 0]);
     }
 
     // -- Key helper tests --

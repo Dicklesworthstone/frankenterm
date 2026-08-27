@@ -657,7 +657,7 @@ proptest! {
             scheduler.deregister_agent(agent);
         }
         let snapshots = scheduler.agent_snapshots(&queue, 3);
-        assert!(snapshots.is_empty());
+        assert_eq!(snapshots, [] as [frankenterm_core::swarm_scheduler::AgentLoadSnapshot; 0]);
     }
 
     #[test]
@@ -868,7 +868,7 @@ proptest! {
         let decision = scheduler.evaluate(&mut queue, 10_000);
         match decision {
             SchedulerDecision::AssignWork { assignments } => {
-                assert!(!assignments.is_empty());
+                assert_ne!(assignments, [] as [frankenterm_core::swarm_scheduler::WorkAssignment; 0]);
                 // Never assigns more than agent capacity
                 assert!(assignments.len() as u32 <= queue.config().max_concurrent_per_agent);
             }
@@ -885,7 +885,7 @@ proptest! {
     #[test]
     fn scheduler_error_display_non_empty(e in arb_scheduler_error()) {
         let msg = format!("{e}");
-        assert!(!msg.is_empty());
+        assert_ne!(msg, "");
     }
 
     #[test]
@@ -927,7 +927,7 @@ proptest! {
         };
         match d {
             SchedulerDecision::AssignWork { assignments: a } => {
-                assert!(!a.is_empty());
+                assert_ne!(a, [] as [frankenterm_core::swarm_scheduler::WorkAssignment; 0]);
                 assert_eq!(a.len(), assignments.len());
             }
             _ => unreachable!(),
@@ -957,7 +957,7 @@ proptest! {
         };
         match d {
             SchedulerDecision::ReclaimStale { reclaimed_items } => {
-                assert!(!reclaimed_items.is_empty());
+                assert_ne!(reclaimed_items, [] as [std::string::String; 0]);
                 assert_eq!(reclaimed_items.len(), items.len());
             }
             _ => unreachable!(),

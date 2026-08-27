@@ -988,7 +988,7 @@ mod tests {
         assert_eq!(diag.source, ProviderResolutionSource::ProcessName);
         assert_eq!(diag.input, "bash");
         assert_eq!(diag.normalized, "bash");
-        assert!(diag.candidates.is_empty());
+        assert_eq!(diag.candidates, [] as [agent_provider::AgentProvider; 0]);
         assert_eq!(diag.selected, None);
         assert!(!diag.ambiguous);
         assert!(diag.is_unknown());
@@ -1019,7 +1019,7 @@ mod tests {
     fn test_diagnostics_from_slug_unknown() {
         let diag = AgentProvider::diagnostics_from_slug("x-new-agent");
         assert_eq!(diag.source, ProviderResolutionSource::Slug);
-        assert!(diag.candidates.is_empty());
+        assert_eq!(diag.candidates, [] as [agent_provider::AgentProvider; 0]);
         assert_eq!(
             diag.selected,
             Some(AgentProvider::Unknown("x-new-agent".to_string()))
@@ -1048,7 +1048,7 @@ mod tests {
             diag.selected,
             Some(AgentProvider::Unknown("unknown".to_string()))
         );
-        assert!(diag.candidates.is_empty());
+        assert_eq!(diag.candidates, [] as [agent_provider::AgentProvider; 0]);
         assert!(diag.is_unknown());
     }
 }

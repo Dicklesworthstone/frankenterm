@@ -2083,7 +2083,7 @@ mod tests {
 
             let pool = MuxPool::new(pool_config(socket_path, 4));
             let result = pool.list_panes().await.expect("list_panes should succeed");
-            assert!(result.tabs.is_empty());
+            assert_eq!(result.tabs, [] as [mux::tab::PaneNode; 0]);
 
             let stats = pool.stats().await;
             assert_eq!(stats.connections_created, 1);
@@ -2142,7 +2142,7 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect("list_panes_with_cx should succeed");
-            assert!(result.tabs.is_empty());
+            assert_eq!(result.tabs, [] as [mux::tab::PaneNode; 0]);
 
             let stats = pool.stats().await;
             assert_eq!(stats.connections_created, 1);
@@ -2413,7 +2413,7 @@ mod tests {
                 .list_panes()
                 .await
                 .expect("follow-up should reuse the aligned connection");
-            assert!(resp.tabs.is_empty());
+            assert_eq!(resp.tabs, [] as [mux::tab::PaneNode; 0]);
 
             let stats = pool.stats().await;
             assert_eq!(stats.recovery_attempts, 0);
@@ -2608,7 +2608,7 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect("follow-up should reuse the still-aligned connection");
-            assert!(resp.tabs.is_empty());
+            assert_eq!(resp.tabs, [] as [mux::tab::PaneNode; 0]);
 
             let stats = pool.stats().await;
             assert_eq!(stats.recovery_attempts, 0);
@@ -3566,7 +3566,7 @@ mod tests {
 
         let disconnected_err = MuxPoolError::Mux(DirectMuxError::Disconnected);
         let display2 = format!("{disconnected_err}");
-        assert!(!display2.is_empty());
+        assert_ne!(display2, "");
 
         // Debug also works
         let debug = format!("{timeout_err:?}");

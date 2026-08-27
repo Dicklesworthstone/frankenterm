@@ -2506,9 +2506,9 @@ mod tests {
     #[test]
     fn pool_error_boxed_std_error() {
         let err: Box<dyn std::error::Error> = Box::new(PoolError::AcquireTimeout);
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
         let err2: Box<dyn std::error::Error> = Box::new(PoolError::Closed);
-        assert!(!err2.to_string().is_empty());
+        assert_ne!(err2.to_string(), "");
     }
 
     #[test]

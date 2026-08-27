@@ -2245,21 +2245,21 @@ mod tests {
             ..Default::default()
         };
         let snippets = extract_snippets("hello world", &["hello".to_string()], &config);
-        assert!(snippets.is_empty());
+        assert_eq!(snippets, [] as [crate::tantivy_query::Snippet; 0]);
     }
 
     #[test]
     fn snippet_empty_text() {
         let config = SnippetConfig::default();
         let snippets = extract_snippets("", &["hello".to_string()], &config);
-        assert!(snippets.is_empty());
+        assert_eq!(snippets, [] as [crate::tantivy_query::Snippet; 0]);
     }
 
     #[test]
     fn snippet_no_terms() {
         let config = SnippetConfig::default();
         let snippets = extract_snippets("hello world", &[], &config);
-        assert!(snippets.is_empty());
+        assert_eq!(snippets, [] as [crate::tantivy_query::Snippet; 0]);
     }
 
     #[test]
@@ -2303,7 +2303,7 @@ mod tests {
 
     #[test]
     fn tokenize_empty() {
-        assert!(tokenize_query("").is_empty());
+        assert_eq!(tokenize_query(""), [] as [std::string::String; 0]);
     }
 
     // =========================================================================
@@ -2869,7 +2869,7 @@ mod tests {
             reason: "test".to_string(),
         };
         let err: &dyn std::error::Error = &e;
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     // -- InMemorySearchService --

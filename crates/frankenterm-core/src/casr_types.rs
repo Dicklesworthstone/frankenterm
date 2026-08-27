@@ -515,7 +515,7 @@ mod tests {
         let json_str = json!({"ok": false});
         let out: CasrResumeOutput = serde_json::from_value(json_str).unwrap();
         assert!(!out.ok);
-        assert!(out.warnings.is_empty());
+        assert_eq!(out.warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         let json_str = json!({"name": "X", "slug": "x"});
         let status: CasrProviderStatus = serde_json::from_value(json_str).unwrap();
         assert!(!status.installed);
-        assert!(status.evidence.is_empty());
+        assert_eq!(status.evidence, [] as [std::string::String; 0]);
     }
 
     #[test]

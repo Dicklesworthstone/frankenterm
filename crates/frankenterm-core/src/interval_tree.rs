@@ -857,7 +857,7 @@ mod tests {
         tree.insert(iv(1, 5), "a".to_string());
 
         let removed = tree.remove(&iv(10, 20));
-        assert!(removed.is_empty());
+        assert_eq!(removed, [] as [std::string::String; 0]);
         assert_eq!(tree.len(), 1);
     }
 

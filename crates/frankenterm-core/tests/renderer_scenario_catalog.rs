@@ -624,9 +624,9 @@ fn assert_resolved_anchor_topology(
     );
     assert_eq!(anchor.tabs.len(), usize::from(fleet_point.tab_count()));
     assert_eq!(anchor.panes.len(), usize::from(fleet_point.pane_count()));
-    assert!(!anchor.layout_profile_id.is_empty());
-    assert!(!anchor.layout_stable_id_revision.is_empty());
-    assert!(!anchor.content_distribution_profile_id.is_empty());
+    assert_ne!(anchor.layout_profile_id, "");
+    assert_ne!(anchor.layout_stable_id_revision, "");
+    assert_ne!(anchor.content_distribution_profile_id, "");
     assert!(anchor.content_distribution_profile_revision > 0);
 
     for (position, window) in anchor.windows.iter().enumerate() {
@@ -685,7 +685,7 @@ fn assert_resolved_anchor_topology(
             .map(|pane| pane.pane_id.clone())
             .collect::<Vec<_>>();
         assert_eq!(tab.ordered_pane_ids, expected_panes);
-        assert!(!tab.ordered_pane_ids.is_empty());
+        assert_ne!(tab.ordered_pane_ids, [] as [std::string::String; 0]);
     }
     assert_eq!(
         anchor.tabs.iter().filter(|tab| tab.active).count(),
@@ -2209,26 +2209,41 @@ fn schema_rejects_unknown_versions_fields_and_missing_required_collections() {
 
     let mut unknown_version = canonical.clone();
     unknown_version["schema_version"] = json!(2);
-    assert!(!schema_errors(&validator, &unknown_version).is_empty());
+    assert_ne!(
+        schema_errors(&validator, &unknown_version),
+        [] as [std::string::String; 0]
+    );
 
     let mut old_catalog_revision = canonical.clone();
     old_catalog_revision["catalog_revision"] = json!(1);
-    assert!(!schema_errors(&validator, &old_catalog_revision).is_empty());
+    assert_ne!(
+        schema_errors(&validator, &old_catalog_revision),
+        [] as [std::string::String; 0]
+    );
 
     let mut unknown_field = canonical.clone();
     unknown_field["native_target_passed"] = json!(true);
-    assert!(!schema_errors(&validator, &unknown_field).is_empty());
+    assert_ne!(
+        schema_errors(&validator, &unknown_field),
+        [] as [std::string::String; 0]
+    );
 
     let mut missing_scenarios = canonical.clone();
     missing_scenarios
         .as_object_mut()
         .expect("catalog is an object")
         .remove("scenarios");
-    assert!(!schema_errors(&validator, &missing_scenarios).is_empty());
+    assert_ne!(
+        schema_errors(&validator, &missing_scenarios),
+        [] as [std::string::String; 0]
+    );
 
     let mut bad_overlay = canonical;
     bad_overlay["coverage_overlay_profiles"][0]["overlay_id"] = json!("future_overlay");
-    assert!(!schema_errors(&validator, &bad_overlay).is_empty());
+    assert_ne!(
+        schema_errors(&validator, &bad_overlay),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]

@@ -994,8 +994,8 @@ mod tests {
     fn replay_old_new_transcript_emits_alert_and_redacted_fixture() {
         let mut canary = PromptDriftCanary::new(replay_config(4));
         let baseline = canary.evaluate_window(&old_window());
-        assert!(baseline.alerts.is_empty());
-        assert!(baseline.fixture_candidates.is_empty());
+        assert_eq!(baseline.alerts, [] as [prompt_drift_canary::PromptDriftSignalAlert; 0]);
+        assert_eq!(baseline.fixture_candidates, [] as [prompt_drift_canary::FixtureCandidate; 0]);
 
         let drifted = canary.evaluate_window(&drifted_window());
         assert!(

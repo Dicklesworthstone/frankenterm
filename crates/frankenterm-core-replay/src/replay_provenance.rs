@@ -887,7 +887,7 @@ mod tests {
         let emitter = ReplayProvenanceEmitter::with_defaults("run_hash".into());
         emitter.record(make_params("e", DecisionType::PatternMatch, "r"));
         let e = &emitter.entries()[0];
-        assert!(!e.input_hash.is_empty());
+        assert_ne!(e.input_hash, "");
         assert_eq!(e.input_hash.len(), 64); // SHA-256 hex
     }
 
@@ -1173,7 +1173,7 @@ mod tests {
         let v = trail.verify();
         assert!(v.chain_intact);
         assert_eq!(v.total_entries, 3);
-        assert!(v.missing_ordinals.is_empty());
+        assert_eq!(v.missing_ordinals, [] as [u64; 0]);
     }
 
     #[test]
@@ -1259,7 +1259,7 @@ mod tests {
         let v = verify_chain(&entries);
         assert!(!v.chain_intact);
         assert_eq!(v.first_break_at, Some(0));
-        assert!(v.missing_ordinals.is_empty());
+        assert_eq!(v.missing_ordinals, [] as [u64; 0]);
     }
 
     #[test]

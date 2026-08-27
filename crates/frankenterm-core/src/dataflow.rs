@@ -2383,7 +2383,7 @@ mod tests {
         let g = DataflowGraph::new();
         let snap = g.snapshot();
         assert!(snap.nodes.is_empty());
-        assert!(snap.edges.is_empty());
+        assert_eq!(snap.edges, [] as [(u64, u64); 0]);
     }
 
     #[test]

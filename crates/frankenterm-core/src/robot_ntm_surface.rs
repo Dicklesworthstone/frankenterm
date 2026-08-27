@@ -1786,7 +1786,7 @@ mod tests {
         }));
         let eq = cmd.ntm_equivalence();
         assert_eq!(eq.classification, ConvergenceClassification::Novel);
-        assert!(eq.ntm_commands.is_empty());
+        assert_eq!(eq.ntm_commands, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(cfg.max_entropy_token_len, 256);
         assert!(cfg.scan_output);
         assert!(cfg.entropy_detection_enabled);
-        assert!(cfg.extra_patterns.is_empty());
+        assert_eq!(cfg.extra_patterns, [] as [std::string::String; 0]);
     }
 
     #[test]

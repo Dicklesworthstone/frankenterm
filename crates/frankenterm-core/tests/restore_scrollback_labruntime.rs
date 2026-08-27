@@ -65,7 +65,7 @@ fn inject_single_pane_fails_closed() {
             .expect_err("mapped replay must report the unsupported safe-output channel");
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     });
 }
 
@@ -169,7 +169,7 @@ fn inject_large_scrollback_does_not_write() {
             .expect_err("large mapped replay must fail before allocating replay content");
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     });
 }
 
@@ -193,7 +193,7 @@ fn inject_no_scrollbacks() {
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failure_count(), 0);
         assert_eq!(report.skipped_count(), 0);
-        assert!(report.skipped_sample().is_empty());
+        assert_eq!(report.skipped_sample(), []);
     });
 }
 

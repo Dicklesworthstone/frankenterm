@@ -600,7 +600,7 @@ mod tests {
         let result = GuardSuiteResult::evaluate(&config, &scan);
 
         assert!(result.overall_pass);
-        assert!(result.blocking_failures.is_empty());
+        assert_eq!(result.blocking_failures, [] as [std::string::String; 0]);
         assert_eq!(result.exit_code(), 0);
     }
 
@@ -616,7 +616,7 @@ mod tests {
         let result = GuardSuiteResult::evaluate(&config, &scan);
 
         assert!(!result.overall_pass);
-        assert!(!result.blocking_failures.is_empty());
+        assert_ne!(result.blocking_failures, [] as [std::string::String; 0]);
         assert_eq!(result.exit_code(), 1);
     }
 
@@ -697,7 +697,7 @@ mod tests {
                 "Expected {} to be isolated by default",
                 iso.feature_name
             );
-            assert!(iso.leaked_modules.is_empty());
+            assert_eq!(iso.leaked_modules, [] as [std::string::String; 0]);
         }
     }
 
@@ -936,8 +936,8 @@ mod tests {
 
         for g in &guards {
             assert!(g.active, "Guard {} should be active by default", g.guard_id);
-            assert!(!g.cfg_expression.is_empty());
-            assert!(!g.compile_error_message.is_empty());
+            assert_ne!(g.cfg_expression, "");
+            assert_ne!(g.compile_error_message, "");
         }
     }
 
@@ -1005,7 +1005,7 @@ mod tests {
 
         let ids = result.blocking_failure_ids();
         // At minimum the severity-threshold check and DG-01 (tokio) should fail.
-        assert!(!ids.is_empty());
+        assert_ne!(ids, [] as [&str; 0]);
         // All returned IDs must correspond to failed blocking checks.
         for id in &ids {
             let check = result

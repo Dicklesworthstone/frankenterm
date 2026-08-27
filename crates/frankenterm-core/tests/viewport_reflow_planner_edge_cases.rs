@@ -23,7 +23,10 @@ fn zero_viewport_height_returns_empty_plan() {
         frame_budget_units: 8,
     };
     let plan = ViewportReflowPlanner::plan(&input);
-    assert!(plan.batches.is_empty());
+    assert_eq!(
+        plan.batches,
+        [] as [frankenterm_core::viewport_reflow_planner::ReflowBatch; 0]
+    );
     assert_eq!(plan.frame_work_units, 0);
 }
 
@@ -39,7 +42,10 @@ fn zero_max_batch_lines_treated_as_one() {
         frame_budget_units: 100,
     };
     let plan = ViewportReflowPlanner::plan(&input);
-    assert!(!plan.batches.is_empty());
+    assert_ne!(
+        plan.batches,
+        [] as [frankenterm_core::viewport_reflow_planner::ReflowBatch; 0]
+    );
     assert!(
         plan.batches.iter().all(|b| b
             .range
@@ -62,7 +68,10 @@ fn zero_lines_per_work_unit_treated_as_one() {
         frame_budget_units: 100,
     };
     let plan = ViewportReflowPlanner::plan(&input);
-    assert!(!plan.batches.is_empty());
+    assert_ne!(
+        plan.batches,
+        [] as [frankenterm_core::viewport_reflow_planner::ReflowBatch; 0]
+    );
     for batch in &plan.batches {
         let lines = batch
             .range
@@ -85,7 +94,10 @@ fn zero_frame_budget_still_selects_first_batch() {
         frame_budget_units: 0,
     };
     let plan = ViewportReflowPlanner::plan(&input);
-    assert!(!plan.batches.is_empty());
+    assert_ne!(
+        plan.batches,
+        [] as [frankenterm_core::viewport_reflow_planner::ReflowBatch; 0]
+    );
     assert!(
         plan.batches[0].selected_for_frame,
         "first batch must always be selected to guarantee visible progress"
@@ -237,7 +249,10 @@ fn viewport_height_exceeds_buffer_covers_all_as_viewport() {
         frame_budget_units: 10,
     };
     let plan = ViewportReflowPlanner::plan(&input);
-    assert!(!plan.batches.is_empty());
+    assert_ne!(
+        plan.batches,
+        [] as [frankenterm_core::viewport_reflow_planner::ReflowBatch; 0]
+    );
     assert!(
         plan.batches
             .iter()
@@ -457,7 +472,10 @@ fn near_u32_max_total_lines_does_not_overflow() {
         frame_budget_units: 10,
     };
     let plan = ViewportReflowPlanner::plan(&input);
-    assert!(!plan.batches.is_empty());
+    assert_ne!(
+        plan.batches,
+        [] as [frankenterm_core::viewport_reflow_planner::ReflowBatch; 0]
+    );
     for batch in &plan.batches {
         let len = batch
             .range

@@ -332,11 +332,11 @@ fn policy_denial_includes_details() {
 fn empty_report_handles_gracefully() {
     let report = DryRunReport::new();
 
-    assert!(report.command.is_empty());
+    assert_eq!(report.command, "");
     assert!(report.target_resolution.is_none());
     assert!(report.policy_evaluation.is_none());
     assert!(report.expected_actions.is_empty());
-    assert!(report.warnings.is_empty());
+    assert_eq!(report.warnings, [] as [std::string::String; 0]);
     assert!(!report.has_warnings());
     assert_eq!(report.action_count(), 0);
     // policy_passed returns true when no evaluation exists
@@ -418,7 +418,7 @@ fn json_format_policy_evaluation_structure() {
 
     let policy = &parsed["policy_evaluation"];
     let checks = policy["checks"].as_array().unwrap();
-    assert!(!checks.is_empty());
+    assert_ne!(checks.as_slice(), []);
 
     for check in checks {
         assert!(check["name"].is_string());

@@ -1,5 +1,6 @@
 use crate::domain::DomainId;
 use crate::guardian_checkpoint::{LiveParserCaptureAuthority, LiveParserPaneCaptureError};
+use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity};
 use crate::renderable::*;
 use crate::ExitBehavior;
 use async_trait::async_trait;
@@ -364,6 +365,23 @@ fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZ
 }
 
 /// A Pane represents a view on a terminal
+///
+/// Guardian-backed panes use a record-aware reader so authenticated journal
+/// metadata cannot be flattened away before the live parser registers its
+/// exact receipt. Implementations must invoke `deliver` exactly once for the
+/// next record and must not acknowledge that record or its replay page unless
+/// the callback returns success.
+pub trait GuardianLiveOutputReader: Send {
+    fn deliver_next_record(
+        &mut self,
+        deliver: &mut dyn FnMut(
+            GuardianOutputSegmentIdentity,
+            GuardianOutputAppendReceipt,
+            Arc<[u8]>,
+        ) -> std::io::Result<()>,
+    ) -> std::io::Result<()>;
+}
+
 // `async_trait` keeps this trait object-safe by generating boxed `Future`
 // returns. The macro's own `#[must_use]` annotation duplicates the future's
 // intrinsic must-use contract under newer Clippy, so scope the compatibility
@@ -502,6 +520,14 @@ pub trait Pane: Downcast + Send + Sync {
         Progress::None
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
+    /// Take the record-aware guardian reader, if this pane owns one. The mux
+    /// calls this before `reader`; a pane must expose at most one of the two
+    /// reader authorities for a registration.
+    fn guardian_live_output_reader(
+        &self,
+    ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
+        Ok(None)
+    }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;

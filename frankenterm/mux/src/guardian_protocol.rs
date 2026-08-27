@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -28,6 +29,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::guardian_checkpoint::{
     GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointGenesisSpawnPermitV1,
     GuardianCheckpointOriginV1, GuardianGenesisReservationIdentityV1, LiveParserCheckpointAck,
+};
+use crate::guardian_output_journal::{
+    GuardianOutputAppendReceipt, GuardianOutputJournalError, GuardianOutputPredecessor,
+    GuardianOutputSegmentIdentity,
 };
 
 pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
@@ -4541,6 +4546,8 @@ pub enum GuardianReplayDeliveryError {
     Protocol(#[from] GuardianProtocolError),
     #[error("guardian replay plaintext delivery failed")]
     Io(#[source] std::io::Error),
+    #[error(transparent)]
+    Journal(#[from] GuardianOutputJournalError),
 }
 
 /// Single-use replay record. Plaintext stays in a zeroizing allocation and is
@@ -4583,6 +4590,57 @@ impl GuardianReplayRecordDelivery {
     #[must_use]
     pub const fn metadata(&self) -> GuardianReplayRecordMetadataV1 {
         self.metadata
+    }
+
+    /// Consume this authenticated, nonduplicable replay record into the exact
+    /// segment/receipt/payload tuple accepted by the live mux parser fence.
+    /// The private receipt delivery digest is derived only after replay has
+    /// revalidated the protected plaintext digest.
+    pub fn into_live_output(
+        self,
+        durable_pane_id: Uuid,
+    ) -> Result<
+        (
+            GuardianOutputSegmentIdentity,
+            GuardianOutputAppendReceipt,
+            Arc<[u8]>,
+        ),
+        GuardianReplayDeliveryError,
+    > {
+        if !replay_record_plaintext_digest(self.metadata, self.plaintext.as_slice())?
+            .matches(&self.plaintext_digest)
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload.into());
+        }
+        let predecessor = self
+            .metadata
+            .predecessor()
+            .map(|previous| {
+                GuardianOutputPredecessor::new(
+                    previous.segment_id(),
+                    previous.last_sequence(),
+                    previous.terminal_record_digest(),
+                    previous.cumulative_plaintext_bytes(),
+                    previous.committed_log_bytes(),
+                )
+            })
+            .transpose()?;
+        let segment = GuardianOutputSegmentIdentity::new(
+            durable_pane_id,
+            self.metadata.segment_id(),
+            self.metadata.segment_first_sequence(),
+            predecessor,
+        )?;
+        let payload: Arc<[u8]> = Arc::from(self.plaintext.as_slice());
+        let output = GuardianOutputAppendReceipt::from_authenticated_replay(
+            self.metadata.segment_id(),
+            self.metadata.sequence(),
+            self.metadata.cumulative_plaintext_bytes(),
+            self.metadata.committed_log_bytes(),
+            self.metadata.record_digest(),
+            payload.as_ref(),
+        )?;
+        Ok((segment, output, payload))
     }
 
     pub fn write_all_bounded<W: std::io::Write>(

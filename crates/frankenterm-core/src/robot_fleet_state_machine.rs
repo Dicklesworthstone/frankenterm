@@ -635,7 +635,7 @@ mod tests {
             w.fleets.get(&1),
             Some(FleetLifecycleState::Prepared { name: 7 })
         ));
-        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+        assert_eq!(check_invariants(&prior, &w, action, outcome), [] as [robot_fleet_state_machine::FleetSafetyViolation; 0]);
     }
 
     #[test]

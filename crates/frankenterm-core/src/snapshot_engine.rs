@@ -19293,7 +19293,7 @@ mod tests {
     #[test]
     fn snapshot_trigger_debug_not_empty() {
         let dbg = format!("{:?}", SnapshotTrigger::WorkCompleted);
-        assert!(!dbg.is_empty());
+        assert_ne!(dbg, "");
         assert!(dbg.contains("WorkCompleted"));
     }
 

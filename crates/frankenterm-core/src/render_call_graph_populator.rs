@@ -833,7 +833,7 @@ fn unrelated() {
             &[("mod.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
         );
-        assert!(out.entry_points.is_empty());
+        assert_eq!(out.entry_points, [] as [render_call_graph_audit::RenderEntryPoint; 0]);
         let outcome = audit_render_call_graph(
             &out.graph,
             &out.entry_points,
@@ -874,8 +874,8 @@ fn unrelated() {
             &[("empty.rs".to_string(), String::new())],
             &PopulatorConfig::default(),
         );
-        assert!(out.entry_points.is_empty());
-        assert!(out.guard_sites.is_empty());
+        assert_eq!(out.entry_points, [] as [render_call_graph_audit::RenderEntryPoint; 0]);
+        assert_eq!(out.guard_sites, [] as [render_call_graph_audit::GuardConstructionSite; 0]);
         assert!(out.function_to_id.is_empty());
     }
 }

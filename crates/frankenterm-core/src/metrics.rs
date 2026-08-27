@@ -1878,7 +1878,7 @@ mod pure_tests {
         assert_eq!(snap.native_output_input_events, 0);
         assert_eq!(snap.native_output_batches_emitted, 0);
         assert!(snap.event_bus.is_none());
-        assert!(snap.cost_attribution_estimates.is_empty());
+        assert_eq!(snap.cost_attribution_estimates, [] as [cost_tracker::CostAttributionEstimateSummary; 0]);
     }
 
     #[test]
@@ -2219,7 +2219,7 @@ mod pure_tests {
     fn render_prometheus_output_is_nonempty() {
         let snap = MetricsSnapshot::default();
         let rendered = snap.render_prometheus("ft");
-        assert!(!rendered.is_empty());
+        assert_ne!(rendered, "");
     }
 
     #[test]

@@ -285,7 +285,7 @@ fn standard_catalog_certification_passes() {
     let report = CertificationReport::certify(&catalog);
     assert!(report.overall_pass);
     assert_eq!(report.pass_count, 10);
-    assert!(report.missing_classes.is_empty());
+    assert_eq!(report.missing_classes, [] as [std::string::String; 0]);
 }
 
 // =========================================================================

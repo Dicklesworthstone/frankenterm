@@ -555,7 +555,7 @@ mod tests {
     fn check_invariants_clean_at_baseline() {
         let h = ElasticBufferGpuHealth::baseline();
         let v = check_invariants(&h, &h, BufferLifecycleEvent::IdleTick);
-        assert!(v.is_empty());
+        assert_eq!(v, [] as [elastic_buffer_gpu_telemetry::BufferLifecycleViolation; 0]);
     }
 
     #[test]

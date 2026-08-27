@@ -363,7 +363,7 @@ mod tests {
     fn test_tracked_panes() {
         let mut tracker = ScreenStateTracker::new();
 
-        assert!(tracker.tracked_panes().is_empty());
+        assert_eq!(tracker.tracked_panes(), [] as [u64; 0]);
 
         tracker.process_output(5, b"some output");
         tracker.process_output(10, b"other output");
@@ -566,7 +566,7 @@ mod tests {
         let mut tracker = ScreenStateTracker::new();
         // Clearing a pane that was never tracked should not panic.
         tracker.clear_pane(999);
-        assert!(tracker.tracked_panes().is_empty());
+        assert_eq!(tracker.tracked_panes(), [] as [u64; 0]);
     }
 
     #[test]
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn set_alt_screen_creates_pane_entry() {
         let mut tracker = ScreenStateTracker::new();
-        assert!(tracker.tracked_panes().is_empty());
+        assert_eq!(tracker.tracked_panes(), [] as [u64; 0]);
 
         tracker.set_alt_screen(5, true);
         assert!(tracker.tracked_panes().contains(&5));

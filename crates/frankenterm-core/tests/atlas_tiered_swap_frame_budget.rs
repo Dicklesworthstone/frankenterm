@@ -61,14 +61,20 @@ fn staging_swap_deferrer_requires_frame_boundary_reset_for_deferred_work() {
 
     let (still_admitted, still_deferred) = deferrer.partition(&delayed, 3);
 
-    assert!(still_admitted.is_empty());
+    assert_eq!(
+        still_admitted,
+        [] as [frankenterm_core::atlas_tiered_swap::StagingTransferEvent; 0]
+    );
     assert_eq!(still_deferred, delayed);
 
     deferrer.reset_for_new_frame();
     let (next_frame_admitted, next_frame_deferred) = deferrer.partition(&delayed, 3);
 
     assert_eq!(next_frame_admitted, delayed);
-    assert!(next_frame_deferred.is_empty());
+    assert_eq!(
+        next_frame_deferred,
+        [] as [frankenterm_core::atlas_tiered_swap::StagingTransferEvent; 0]
+    );
     assert_eq!(deferrer.admitted_bytes(), 2000);
 }
 
@@ -85,14 +91,20 @@ fn disk_budget_estimator_requires_frame_boundary_reset_for_deferred_handoffs() {
 
     let (still_admitted, still_deferred) = estimator.partition(&deferred, 3);
 
-    assert!(still_admitted.is_empty());
+    assert_eq!(
+        still_admitted,
+        [] as [frankenterm_core::atlas_tiered_swap::DiskTierHandoff; 0]
+    );
     assert_eq!(still_deferred, deferred);
 
     estimator.reset_for_new_frame();
     let (next_frame_admitted, next_frame_deferred) = estimator.partition(&deferred, 3);
 
     assert_eq!(next_frame_admitted, deferred);
-    assert!(next_frame_deferred.is_empty());
+    assert_eq!(
+        next_frame_deferred,
+        [] as [frankenterm_core::atlas_tiered_swap::DiskTierHandoff; 0]
+    );
     assert_eq!(estimator.admitted_bytes(), 2000);
 }
 

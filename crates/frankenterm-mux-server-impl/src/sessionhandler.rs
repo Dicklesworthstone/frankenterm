@@ -9282,6 +9282,9 @@ mod tests {
 
     #[test]
     fn sampled_paste_applies_once_and_records_content_free_p4_p5() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let recorder = trace_recorder(1);
         let pane = Arc::new(FakePane::new_with_id(7_007, None));
         let mut harness = SampledReliableHarness::new(

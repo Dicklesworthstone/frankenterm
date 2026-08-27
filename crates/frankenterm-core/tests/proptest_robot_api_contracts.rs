@@ -505,7 +505,10 @@ fn standard_matrix_covers_all_surfaces() {
         covered, expected_total,
         "standard matrix should cover all surfaces"
     );
-    assert!(matrix.uncovered_surfaces().is_empty());
+    assert_eq!(
+        matrix.uncovered_surfaces(),
+        [] as [frankenterm_core::robot_api_contracts::ApiSurface; 0]
+    );
 }
 
 #[test]
@@ -529,7 +532,7 @@ fn standard_matrix_coverage_markdown_has_table() {
 fn standard_matrix_json_snapshot_is_valid() {
     let matrix = standard_contract_matrix();
     let json = matrix.render_json_snapshot().unwrap();
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
     // Should parse back
     let _: serde_json::Value = serde_json::from_str(&json).unwrap();
 }
@@ -537,10 +540,10 @@ fn standard_matrix_json_snapshot_is_valid() {
 #[test]
 fn standard_export_artifacts_complete() {
     let artifacts = standard_contract_export_artifacts().unwrap();
-    assert!(!artifacts.matrix_json.is_empty());
-    assert!(!artifacts.coverage_markdown.is_empty());
-    assert!(!artifacts.execution_trace_json.is_empty());
-    assert!(!artifacts.report_json.is_empty());
+    assert_ne!(artifacts.matrix_json, "");
+    assert_ne!(artifacts.coverage_markdown, "");
+    assert_ne!(artifacts.execution_trace_json, "");
+    assert_ne!(artifacts.report_json, "");
 
     // All JSON artifacts should be valid JSON
     let _: serde_json::Value = serde_json::from_str(&artifacts.matrix_json).unwrap();

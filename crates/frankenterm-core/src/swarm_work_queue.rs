@@ -1717,7 +1717,7 @@ mod tests {
         ];
         for e in &errors {
             let msg = format!("{e}");
-            assert!(!msg.is_empty());
+            assert_ne!(msg, "");
         }
     }
 

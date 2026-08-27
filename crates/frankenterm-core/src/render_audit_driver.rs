@@ -490,7 +490,7 @@ fn helper() {
         assert!(row.entry_label.contains("paint_impl"));
         assert!(row.guard_label.contains("guard[MUT]"));
         assert_eq!(row.guard_kind, "Mutation");
-        assert!(!row.path_labels.is_empty());
+        assert_ne!(row.path_labels, [] as [std::string::String; 0]);
     }
 
     #[test]

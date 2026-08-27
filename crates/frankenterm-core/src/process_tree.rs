@@ -1066,7 +1066,7 @@ mod tests {
         let pid = std::process::id();
         if let Some(tree) = capture_tree(pid, &config) {
             // At max_depth=0, root should have no children (even if real process does)
-            assert!(tree.root.children.is_empty());
+            assert_eq!(tree.root.children, [] as [process_tree::ProcessNode; 0]);
         }
     }
 

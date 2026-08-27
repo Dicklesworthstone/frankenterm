@@ -1083,7 +1083,7 @@ mod tests {
     fn entries_to_texts_empty() {
         let entries: Vec<SingleEmbedEntry> = vec![];
         let texts = entries_to_texts(&entries);
-        assert!(texts.is_empty());
+        assert_eq!(texts, [] as [&str; 0]);
     }
 
     #[test]
@@ -1127,7 +1127,7 @@ mod tests {
     #[test]
     fn vectors_to_results_empty() {
         let results = vectors_to_results(&[], &[], "m", 0);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [search::daemon_bridge::SingleEmbedResult; 0]);
     }
 
     #[test]

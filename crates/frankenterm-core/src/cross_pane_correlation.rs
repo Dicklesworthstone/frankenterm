@@ -1169,7 +1169,7 @@ mod tests {
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Correlation = serde_json::from_str(&json).unwrap();
-        assert!(parsed.participating_panes.is_empty());
+        assert_eq!(parsed.participating_panes, [] as [u64; 0]);
     }
 
     #[test]

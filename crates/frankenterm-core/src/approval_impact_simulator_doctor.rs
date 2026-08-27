@@ -396,7 +396,7 @@ mod tests {
         let rendering = ImpactReportRenderer::new().render(&report);
         match rendering {
             ImpactReportRendering::ManualApproval { reasons } => {
-                assert!(!reasons.is_empty());
+                assert_ne!(reasons, [] as [std::string::String; 0]);
                 assert!(reasons.iter().any(|r| r.contains("sensitive credentials")));
             }
             ImpactReportRendering::Automation { .. } => {

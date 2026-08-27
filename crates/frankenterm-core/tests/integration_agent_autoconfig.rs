@@ -338,7 +338,10 @@ fn detected_agent_list_produces_correct_templates() {
 #[test]
 fn undetected_agents_produce_no_templates() {
     let templates = generate_templates_for_detected(&[]);
-    assert!(templates.is_empty());
+    assert_eq!(
+        templates,
+        [] as [frankenterm_core::agent_config_templates::AgentConfigTemplate; 0]
+    );
 }
 
 // =========================================================================

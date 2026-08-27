@@ -1115,7 +1115,10 @@ mod tests {
         let mut engine = PruneEngine::new(config);
         let result = store.prune(&mut engine, 10_000_000);
         assert_eq!(result.e_value_pruned.len(), 1);
-        assert!(result.blacklisted.is_empty());
+        assert_eq!(
+            result.blacklisted,
+            [] as [crate::ars_serialize::BlacklistEntry; 0]
+        );
         assert!(!store.is_blacklisted(1));
     }
 

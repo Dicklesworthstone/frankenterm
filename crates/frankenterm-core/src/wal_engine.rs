@@ -1380,7 +1380,7 @@ mod tests {
         let mut wal = default_wal();
         wal.append("a".to_string(), 100);
         let result: Vec<_> = wal.since(999).collect();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [&wal_engine::WalEntry<std::string::String>; 0]);
     }
 
     #[test]
@@ -1391,7 +1391,7 @@ mod tests {
         }
         // from > to should return empty
         let result: Vec<_> = wal.range(5, 2).collect();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [&wal_engine::WalEntry<std::string::String>; 0]);
     }
 
     #[test]
@@ -1399,7 +1399,7 @@ mod tests {
         let mut wal = default_wal();
         wal.append("a".to_string(), 100);
         let result: Vec<_> = wal.range(100, 200).collect();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [&wal_engine::WalEntry<std::string::String>; 0]);
     }
 
     #[test]
@@ -1528,7 +1528,7 @@ mod tests {
     fn replay_cursor_empty_wal() {
         let wal = default_wal();
         let result: Vec<_> = ReplayCursor::new(&wal, 1, 10).collect();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [&std::string::String; 0]);
     }
 
     #[test]
@@ -1537,7 +1537,7 @@ mod tests {
         wal.append("a".to_string(), 100);
         wal.append("b".to_string(), 200);
         let result: Vec<_> = ReplayCursor::new(&wal, 10, 5).collect();
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [&std::string::String; 0]);
     }
 
     #[test]
@@ -1558,7 +1558,7 @@ mod tests {
     fn replay_mutations_empty_wal() {
         let wal = default_wal();
         let result = super::replay_mutations(&wal, 1, 10);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [&std::string::String; 0]);
     }
 
     // ── CRC32 Tests ──────────────────────────────────────────────

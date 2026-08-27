@@ -908,7 +908,7 @@ mod tests {
 
         assert_eq!(receipt.status, FleetMutationReceiptStatus::DryRun);
         assert_eq!(receipt.steps[0].status, FleetMutationStepStatus::Planned);
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
         assert_eq!(receipt.completed_count, 0);
     }
 
@@ -929,7 +929,7 @@ mod tests {
 
         assert_eq!(receipt.status, FleetMutationReceiptStatus::Denied);
         assert_eq!(receipt.skipped_count, 2);
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -955,7 +955,7 @@ mod tests {
             receipt.steps[0].policy,
             FleetMutationPolicyDecision::RequireApproval { .. }
         ));
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1038,7 +1038,7 @@ mod tests {
         assert_eq!(receipt.status, FleetMutationReceiptStatus::Denied);
         assert_eq!(receipt.skipped_count, 2);
         assert_eq!(receipt.steps[0].target_id, "work:ft-work-denied");
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1246,7 +1246,7 @@ mod tests {
             err,
             FleetMutationPlanError::DuplicateStepId { .. }
         ));
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1260,7 +1260,7 @@ mod tests {
             .expect_err("whitespace plan_id should fail");
 
         assert_eq!(err, FleetMutationPlanError::EmptyPlanId);
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1274,7 +1274,7 @@ mod tests {
             .expect_err("whitespace step_id should fail");
 
         assert_eq!(err, FleetMutationPlanError::EmptyStepId { step_index: 0 });
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, [] as [std::string::String; 0]);
     }
 
     #[test]

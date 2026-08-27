@@ -260,7 +260,7 @@ impl Drop for EnteredDomainLifecycle {
 
 impl DomainLifecycleGuard {
     /// Retain this exact lifecycle ticket across an uncancellable worker.
-    #[must_use]
+    #[must_use = "dropping the hold releases the lifecycle ticket before the worker finishes"]
     pub fn worker_hold(&self) -> DomainLifecycleWorkerHold {
         DomainLifecycleWorkerHold {
             _entry: Arc::clone(&self.entry),

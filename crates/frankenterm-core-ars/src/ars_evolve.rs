@@ -682,7 +682,7 @@ mod tests {
     fn lineage_empty_for_original() {
         let mut engine = make_engine();
         let v1 = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
-        assert!(engine.lineage(v1).is_empty());
+        assert_eq!(engine.lineage(v1), [] as [u64; 0]);
         assert_eq!(engine.lineage_depth(v1), 0);
     }
 

@@ -331,7 +331,7 @@ fn default_health_status_is_unknown() {
 
 #[test]
 fn schema_version_not_empty() {
-    assert!(!SCHEMA_VERSION.is_empty());
+    assert_ne!(SCHEMA_VERSION, "");
 }
 
 // =============================================================================

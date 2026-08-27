@@ -1140,7 +1140,7 @@ mod tests {
     fn dry_run_context_default() {
         let ctx = DryRunContext::default();
         assert!(!ctx.enabled);
-        assert!(ctx.report.command.is_empty());
+        assert_eq!(ctx.report.command, "");
         assert!(ctx.report.expected_actions.is_empty());
     }
 
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn dry_run_report_new_is_default() {
         let r = DryRunReport::new();
-        assert!(r.command.is_empty());
+        assert_eq!(r.command, "");
         assert!(r.target_resolution.is_none());
         assert!(r.policy_evaluation.is_none());
         assert!(r.expected_actions.is_empty());

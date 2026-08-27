@@ -534,8 +534,8 @@ mod tests {
     fn unguarded_sections_require_no_capabilities() {
         let context = CapsuleSection::ContextSummary { text: "x".into() };
         let checklist = CapsuleSection::VerificationChecklist { items: vec![] };
-        assert!(context.required_capabilities().is_empty());
-        assert!(checklist.required_capabilities().is_empty());
+        assert_eq!(context.required_capabilities(), [] as [capability_passport::CapabilityClass; 0]);
+        assert_eq!(checklist.required_capabilities(), [] as [capability_passport::CapabilityClass; 0]);
     }
 
     #[test]
@@ -619,7 +619,7 @@ mod tests {
             .expect("validate ok");
         assert!(outcome.is_fully_accepted());
         assert_eq!(outcome.accepted.len(), 6);
-        assert!(outcome.skipped.is_empty());
+        assert_eq!(outcome.skipped, [] as [handoff_capsule::SkipReason; 0]);
     }
 
     #[test]

@@ -251,7 +251,7 @@ fn health_warning_threshold_generates_warnings() {
             leak_risk_inventory: crate::crash::LeakRiskInventorySnapshot::default(),
         };
 
-        assert!(!snapshot.warnings.is_empty());
+        assert_ne!(snapshot.warnings, [] as [std::string::String; 0]);
         assert!(snapshot.warnings[0].contains("backpressure"));
         assert!(snapshot.warnings[0].contains("80%"));
     });

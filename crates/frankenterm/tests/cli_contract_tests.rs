@@ -4064,7 +4064,7 @@ fn session_list_orphans_scan_rejection_returns_structured_exit_2() {
         serde_json::from_slice(&output.stdout).expect("scan rejection stdout should be JSON");
     assert_eq!(payload["ok"], false);
     assert_eq!(payload["error_code"], "session.orphan_scan_failed");
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, [] as [u8; 0]);
 }
 
 #[cfg(unix)]
@@ -4580,6 +4580,8 @@ fn contract_session_restorer_detects_unclean_session_on_startup() {
 
     let storage_config = frankenterm_core::storage::StorageConfig::default();
     let cx = frankenterm_core::cx::for_request();
+    // `block_on` lives on the `CompatRuntime` trait, not inherently on `Runtime`.
+    use frankenterm_core::runtime_async::CompatRuntime as _;
     let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
         .build()
         .expect("runtime");
@@ -4594,7 +4596,12 @@ fn contract_session_restorer_detects_unclean_session_on_startup() {
         .expect("storage init");
 
         storage
-            .insert_session("sess-unclean-startup", 1000, "0.15.1")
+            .insert_mux_session(
+                "sess-unclean-startup".to_string(),
+                "{}".to_string(),
+                "0.15.1".to_string(),
+                None,
+            )
             .await
             .expect("insert session");
 

@@ -2964,7 +2964,7 @@ mod tests {
         else {
             panic!("expected ingress payload");
         };
-        assert!(text.is_empty());
+        assert_eq!(text, "");
         assert_eq!(*redaction, RecorderRedactionLevel::Full);
     }
 

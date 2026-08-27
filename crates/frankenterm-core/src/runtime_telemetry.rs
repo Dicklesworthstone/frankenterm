@@ -14376,11 +14376,11 @@ mod tests {
             certificate.bottleneck_stage,
             Some(SwarmCapacityStage::StorageWrite)
         );
-        assert!(certificate.assumption_flags.is_empty());
+        assert_eq!(certificate.assumption_flags, [] as [runtime_telemetry::SwarmCapacityAssumptionFlag; 0]);
 
         let stage = capacity_stage_certificate(&certificate, SwarmCapacityStage::StorageWrite);
         assert_eq!(stage.status, SwarmCapacityCertificateStatus::Safe);
-        assert!(stage.assumption_flags.is_empty());
+        assert_eq!(stage.assumption_flags, [] as [runtime_telemetry::SwarmCapacityAssumptionFlag; 0]);
         assert_option_f64_close(stage.arrival_rate_per_s, 0.1);
         assert_option_f64_close(stage.service_rate_per_s, 20.0);
         assert!(stage.utilization.is_some_and(|rho| rho < 0.01));
@@ -14634,10 +14634,9 @@ mod tests {
 
         assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
         assert_eq!(certificate.stages.len(), 2);
-        assert!(
+        assert_eq!(
             capacity_stage_certificate(&certificate, SwarmCapacityStage::RobotMcp)
-                .assumption_flags
-                .is_empty()
+                .assumption_flags, [] as [runtime_telemetry::SwarmCapacityAssumptionFlag; 0]
         );
 
         let missing_mux = capacity_stage_certificate(&certificate, SwarmCapacityStage::MuxIpc);
@@ -17345,10 +17344,10 @@ mod tests {
             detailed.planned_controller_action,
             Some(SwarmCapacityDecisionAction::BlockAdmission)
         );
-        assert!(!detailed.reason_codes.is_empty());
+        assert_ne!(detailed.reason_codes, [] as [std::string::String; 0]);
         assert!(detailed.proof_artifacts.is_some());
-        assert!(compact.reason_codes.is_empty());
-        assert!(compact.decisions.is_empty());
+        assert_eq!(compact.reason_codes, [] as [std::string::String; 0]);
+        assert_eq!(compact.decisions, [] as [runtime_telemetry::SwarmCapacityOperatorDecisionSummary; 0]);
         assert!(compact.proof_artifacts.is_none());
     }
 
@@ -17821,7 +17820,7 @@ mod tests {
                     && tier.actual_bytes == 2_048
                     && tier.refused_bytes == 64)
         );
-        assert!(!cockpit.slowest_latency_cohorts.is_empty());
+        assert_ne!(cockpit.slowest_latency_cohorts, [] as [runtime_telemetry::SwarmResourceCockpitLatencyCohort; 0]);
         assert_eq!(
             cockpit.resource_admission_decisions[0].action,
             crate::swarm_scheduler::AdmissionAction::Degrade

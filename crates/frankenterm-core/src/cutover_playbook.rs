@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn stage_labels_non_empty() {
         for stage in CutoverStage::ALL {
-            assert!(!stage.label().is_empty());
+            assert_ne!(stage.label(), "");
         }
     }
 
@@ -1288,7 +1288,7 @@ mod tests {
 
         pb.confirm_recovery(2000, "root cause fixed");
         assert!(!pb.halted);
-        assert!(pb.halt_reason.is_empty());
+        assert_eq!(pb.halt_reason, "");
         assert_eq!(pb.rollbacks[0].recovered_at_ms, 2000);
     }
 

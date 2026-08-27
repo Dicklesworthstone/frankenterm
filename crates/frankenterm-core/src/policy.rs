@@ -12645,7 +12645,7 @@ mod tests {
 
         let risk = engine.calculate_risk(&input);
         assert!(risk.is_low());
-        assert!(risk.factors.is_empty());
+        assert_eq!(risk.factors, [] as [policy::AppliedRiskFactor; 0]);
     }
 
     #[test]
@@ -13484,9 +13484,9 @@ mod tests {
         // Verify empty defaults
         assert_eq!(ctx.timestamp_ms, 0);
         assert_eq!(ctx.surface, PolicySurface::Unknown);
-        assert!(ctx.rules_evaluated.is_empty());
+        assert_eq!(ctx.rules_evaluated, [] as [policy::RuleEvaluation; 0]);
         assert!(ctx.determining_rule.is_none());
-        assert!(ctx.evidence.is_empty());
+        assert_eq!(ctx.evidence, [] as [policy::DecisionEvidence; 0]);
         assert!(ctx.risk.is_none());
 
         // Record a rule
@@ -13682,8 +13682,8 @@ mod tests {
         assert_eq!(context.text_summary.as_deref(), Some("summary"));
         assert_eq!(context.workflow_id.as_deref(), Some("wf-9"));
         assert_eq!(context.capabilities, PaneCapabilities::default());
-        assert!(context.rules_evaluated.is_empty());
-        assert!(context.evidence.is_empty());
+        assert_eq!(context.rules_evaluated, [] as [policy::RuleEvaluation; 0]);
+        assert_eq!(context.evidence, [] as [policy::DecisionEvidence; 0]);
         assert!(context.rate_limit.is_none());
         assert!(context.risk.is_none());
     }
@@ -14089,7 +14089,7 @@ mod tests {
     fn risk_score_zero() {
         let r = RiskScore::zero();
         assert_eq!(r.score, 0);
-        assert!(r.factors.is_empty());
+        assert_eq!(r.factors, [] as [policy::AppliedRiskFactor; 0]);
     }
 
     #[test]
@@ -15414,7 +15414,7 @@ mod tests {
     #[test]
     fn quarantine_registry_initially_empty() {
         let engine = PolicyEngine::permissive();
-        assert!(engine.quarantine_registry().active_quarantines().is_empty());
+        assert_eq!(engine.quarantine_registry().active_quarantines(), [] as [std::string::String; 0]);
         assert!(
             engine
                 .quarantine_registry()
@@ -16249,7 +16249,7 @@ mod tests {
     fn credential_broker_default_in_policy_engine() {
         let engine = PolicyEngine::new(30, 100, true);
         // Broker exists and is empty by default
-        assert!(engine.credential_broker().credential_ids().is_empty());
+        assert_eq!(engine.credential_broker().credential_ids(), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -16264,7 +16264,7 @@ mod tests {
             ..Default::default()
         };
         let engine = PolicyEngine::from_safety_config(&config);
-        assert!(engine.credential_broker().credential_ids().is_empty());
+        assert_eq!(engine.credential_broker().credential_ids(), [] as [std::string::String; 0]);
         assert_eq!(
             engine.credential_broker_config.max_sensitivity,
             CredentialSensitivity::Medium,
@@ -16756,11 +16756,10 @@ mod tests {
             ..Default::default()
         };
         let engine = PolicyEngine::from_safety_config(&config);
-        assert!(
+        assert_eq!(
             engine
                 .connector_host_runtime()
-                .transition_history()
-                .is_empty()
+                .transition_history(), [] as [connector_host_runtime::ConnectorLifecycleTransition; 0]
         );
     }
 
@@ -18649,11 +18648,11 @@ mod tests {
         let report = engine.generate_forensic_report(&query, 10000);
 
         assert_eq!(report.generated_at_ms, 10000);
-        assert!(report.decisions.is_empty());
-        assert!(report.revocations.is_empty());
-        assert!(report.approvals.is_empty());
-        assert!(report.namespace_violations.is_empty());
-        assert!(report.quarantine_active.is_empty());
+        assert_eq!(report.decisions, [] as [policy_decision_log::PolicyDecisionEntry; 0]);
+        assert_eq!(report.revocations, [] as [policy::RevocationRecord; 0]);
+        assert_eq!(report.approvals, [] as [policy::ApprovalEntry; 0]);
+        assert_eq!(report.namespace_violations, [] as [policy::ForensicNamespaceEvent; 0]);
+        assert_eq!(report.quarantine_active, [] as [std::string::String; 0]);
         assert!(!report.kill_switch_active);
         assert_eq!(report.compliance_summary.total_evaluations, 0);
     }
@@ -18955,7 +18954,7 @@ mod tests {
         assert_eq!(snap.decision_log.current_entries, 0);
         assert_eq!(snap.quarantine.active_quarantines, 0);
         assert_eq!(snap.compliance.active_violations.len(), 0);
-        assert!(snap.connector_reliability.is_empty());
+        assert_eq!(snap.connector_reliability, [] as [frankenterm_core_connector_types::ConnectorReliabilitySnapshot; 0]);
         assert_eq!(snap.approval_tracker.total, 0);
         assert_eq!(snap.revocation_registry.total_records, 0);
         assert!(!snap.namespace_isolation_enabled);
@@ -18966,7 +18965,7 @@ mod tests {
         let mut engine = PolicyEngine::new(10, 100, true);
         let snap = engine.telemetry_snapshot(1_700_000_000_000);
         let json = serde_json::to_string(&snap).expect("should serialize");
-        assert!(!json.is_empty());
+        assert_ne!(json, "");
         let val: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
         let obj = val.as_object().expect("should be object");
         assert!(obj.contains_key("decision_log"));

@@ -1318,8 +1318,14 @@ mod tests {
 
         let show = store.show_payload("ft-ogr3n2-valid").unwrap();
         assert_eq!(show.surface, "show");
-        assert!(!show.evidence_refs.is_empty());
-        assert!(!show.root_cause_candidates.is_empty());
+        assert_ne!(
+            show.evidence_refs,
+            [] as [crate::replay_incidents::IncidentEvidenceRef; 0]
+        );
+        assert_ne!(
+            show.root_cause_candidates,
+            [] as [crate::replay_incidents::IncidentNodeSummary; 0]
+        );
         assert_eq!(
             show.incident.outcome,
             IncidentOutcome::ContaminatedProofAttempt

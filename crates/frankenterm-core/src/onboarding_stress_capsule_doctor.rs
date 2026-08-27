@@ -343,8 +343,8 @@ mod tests {
         assert_eq!(rendering.summary.passed, 8);
         assert_eq!(rendering.summary.machine_local_failures, 0);
         assert_eq!(rendering.summary.repo_code_failures, 0);
-        assert!(rendering.machine_local_failures.is_empty());
-        assert!(rendering.repo_code_failures.is_empty());
+        assert_eq!(rendering.machine_local_failures, [] as [onboarding_stress_capsule_doctor::FailedCheckRendering; 0]);
+        assert_eq!(rendering.repo_code_failures, [] as [onboarding_stress_capsule_doctor::FailedCheckRendering; 0]);
     }
 
     #[test]

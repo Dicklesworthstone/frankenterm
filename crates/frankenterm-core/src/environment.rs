@@ -1901,9 +1901,9 @@ mod tests {
         let auto = AutoConfig::from_environment(&env);
         for rec in &auto.recommendations {
             assert_eq!(rec.source, ConfigSource::AutoDetected);
-            assert!(!rec.key.is_empty());
-            assert!(!rec.value.is_empty());
-            assert!(!rec.reason.is_empty());
+            assert_ne!(rec.key, "");
+            assert_ne!(rec.value, "");
+            assert_ne!(rec.reason, "");
         }
     }
 

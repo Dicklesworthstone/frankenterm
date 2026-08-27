@@ -664,7 +664,7 @@ mod tests {
         let items = vec![(pt(1.0, 1.0), 1), (pt(2.0, 2.0), 2)];
         let tree = KdTree::build(items, 2);
         let results = tree.range_query(&[10.0, 10.0], &[20.0, 20.0]);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(&kd_tree::VecPoint, &i32); 0]);
     }
 
     #[test]
@@ -777,28 +777,28 @@ mod tests {
     fn k_nearest_zero_returns_empty() {
         let tree = KdTree::build(vec![(pt(0.0, 0.0), 1)], 2);
         let results = tree.k_nearest(&pt(0.0, 0.0), 0);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(&kd_tree::VecPoint, &i32, f64); 0]);
     }
 
     #[test]
     fn k_nearest_on_empty_tree() {
         let tree: KdTree<VecPoint, i32> = KdTree::new(2);
         let results = tree.k_nearest(&pt(0.0, 0.0), 5);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(&kd_tree::VecPoint, &i32, f64); 0]);
     }
 
     #[test]
     fn range_query_on_empty_tree() {
         let tree: KdTree<VecPoint, i32> = KdTree::new(2);
         let results = tree.range_query(&[0.0, 0.0], &[10.0, 10.0]);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(&kd_tree::VecPoint, &i32); 0]);
     }
 
     #[test]
     fn radius_query_on_empty_tree() {
         let tree: KdTree<VecPoint, i32> = KdTree::new(2);
         let results = tree.radius_query(&pt(0.0, 0.0), 10.0);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(&kd_tree::VecPoint, &i32, f64); 0]);
     }
 
     #[test]
@@ -1056,7 +1056,7 @@ mod tests {
     fn range_query_single_point_out_of_range() {
         let tree = KdTree::build(vec![(pt(5.0, 5.0), 1)], 2);
         let results = tree.range_query(&[0.0, 0.0], &[1.0, 1.0]);
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(&kd_tree::VecPoint, &i32); 0]);
     }
 
     #[test]

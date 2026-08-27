@@ -1295,7 +1295,7 @@ mod tests {
             admitted_record.decision,
             DeferredProofReplayDecision::WouldRunRemote
         );
-        assert!(admitted_record.blockers.is_empty());
+        assert_eq!(admitted_record.blockers, [] as [std::string::String; 0]);
         assert!(!admitted_record.replay_allowed_now);
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(record.selected_worker.as_deref(), Some("vmi1149989"));
         assert_eq!(record.rch_job_id.as_deref(), Some("j-29862592113541150"));
         assert!(record.remote_cargo_reached);
-        assert!(record.blockers.is_empty());
+        assert_eq!(record.blockers, [] as [std::string::String; 0]);
         assert!(record.source_receipt_digest.starts_with("sha256:"));
     }
 

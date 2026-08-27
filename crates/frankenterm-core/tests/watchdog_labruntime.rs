@@ -196,7 +196,7 @@ fn mux_watchdog_records_successful_check() {
         assert!(sample.ping_ok);
         assert_eq!(sample.status, HealthStatus::Healthy);
         assert_eq!(sample.warning_count, 0);
-        assert!(sample.watchdog_warnings.is_empty());
+        assert_eq!(sample.watchdog_warnings, [] as [std::string::String; 0]);
 
         let report = watchdog.report();
         assert_eq!(report.consecutive_failures, 0);

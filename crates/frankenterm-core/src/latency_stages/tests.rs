@@ -1025,7 +1025,7 @@ fn test_correlation_context_new() {
     assert_eq!(ctx.correlation_id, "run-001");
     assert!(ctx.propagation_intact);
     assert_eq!(ctx.next_expected, Some(LatencyStage::PtyCapture));
-    assert!(ctx.timings.is_empty());
+    assert_eq!(ctx.timings, [] as [latency_stages::instrumentation::StageTiming; 0]);
     assert_eq!(ctx.created_at_us, 1_000_000);
 }
 
@@ -1062,7 +1062,7 @@ fn test_correlation_context_full_pipeline() {
     }
     assert_eq!(ctx.stage_count(), 8);
     assert!(ctx.propagation_intact);
-    assert!(ctx.missing_stages().is_empty());
+    assert_eq!(ctx.missing_stages(), [] as [latency_stages::stage::LatencyStage; 0]);
     // next_expected should be None after last stage
     assert_eq!(ctx.next_expected, None);
 }
@@ -1375,7 +1375,7 @@ fn test_validation_valid_context() {
     let probe = ctx.begin_stage(LatencyStage::PtyCapture, 1000);
     ctx.end_stage(probe, 1500);
     let errors = ctx.validate();
-    assert!(errors.is_empty());
+    assert_eq!(errors, [] as [latency_stages::instrumentation::InstrumentationError; 0]);
 }
 
 #[test]
@@ -1565,7 +1565,7 @@ fn test_enforcer_diagnostic_snapshot() {
     assert_eq!(diag.degradation, InstrumentationDegradation::Full);
     assert_eq!(diag.completed_runs, 0);
     assert_eq!(diag.overhead.probe_count, 1);
-    assert!(diag.last_validation_errors.is_empty());
+    assert_eq!(diag.last_validation_errors, [] as [latency_stages::instrumentation::InstrumentationError; 0]);
 }
 
 #[test]
@@ -1585,7 +1585,7 @@ fn test_enforcer_process_validated_run() {
     ctx.end_stage(probe, 50);
     let (results, errors) = ie.process_validated_run(&ctx);
     assert_eq!(results.len(), 1);
-    assert!(errors.is_empty());
+    assert_eq!(errors, [] as [latency_stages::instrumentation::InstrumentationError; 0]);
 }
 
 #[test]
@@ -1593,8 +1593,8 @@ fn test_enforcer_process_validated_run_with_errors() {
     let mut ie = InstrumentedEnforcer::new();
     let ctx = CorrelationContext::new("run-empty-val", 0); // empty run
     let (results, errors) = ie.process_validated_run(&ctx);
-    assert!(results.is_empty());
-    assert!(!errors.is_empty());
+    assert_eq!(results, [] as [latency_stages::budget_enforcer::ObservationResult; 0]);
+    assert_ne!(errors, [] as [latency_stages::instrumentation::InstrumentationError; 0]);
 }
 
 // ── FastProbe ──
@@ -2145,7 +2145,7 @@ fn test_allocator_warmup_noop() {
     let d = alloc.allocate(&pressures, "test-warmup");
     assert!(d.warmup);
     assert_eq!(d.reason, AllocationReason::Warmup);
-    assert!(d.adjustments.is_empty());
+    assert_eq!(d.adjustments, [] as [latency_stages::adaptive_allocator::StageAdjustment; 0]);
 }
 
 #[test]
@@ -2918,7 +2918,7 @@ fn test_scheduler_config_cpu_share_overflow() {
         ..Default::default()
     };
     let errors = cfg.validate();
-    assert!(!errors.is_empty());
+    assert_ne!(errors, [] as [std::string::String; 0]);
     assert!(errors[0].contains("CPU shares"));
 }
 
@@ -3691,7 +3691,7 @@ fn test_pi_lock_order_valid_ascending() {
     let r3 = tracker.acquire(Resource::EventBusLock, "task-1", Priority::Normal, 300);
     assert_eq!(r3, LockResult::Acquired);
 
-    assert!(tracker.check_lock_order("task-1").is_empty());
+    assert_eq!(tracker.check_lock_order("task-1"), [] as [(latency_stages::priority_inheritance::Resource, latency_stages::priority_inheritance::Resource); 0]);
 }
 
 #[test]
@@ -3718,7 +3718,7 @@ fn test_pi_status_line() {
 fn test_pi_release_nonexistent() {
     let mut tracker = PriorityInheritanceTracker::with_defaults();
     let promoted = tracker.release(Resource::StorageLock, "nobody", 100);
-    assert!(promoted.is_empty());
+    assert_eq!(promoted, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -3726,7 +3726,7 @@ fn test_pi_release_wrong_holder() {
     let mut tracker = PriorityInheritanceTracker::with_defaults();
     tracker.acquire(Resource::StorageLock, "owner", Priority::Normal, 100);
     let promoted = tracker.release(Resource::StorageLock, "impostor", 200);
-    assert!(promoted.is_empty());
+    assert_eq!(promoted, [] as [std::string::String; 0]);
     assert!(tracker.is_held_by(Resource::StorageLock, "owner"));
 }
 
@@ -4047,7 +4047,7 @@ fn test_starvation_no_starvation_when_all_served() {
     let mut tracker = StarvationTracker::with_defaults();
     for _ in 0..10 {
         let promoted = tracker.observe_epoch(&[5, 3, 2], &[0.5, 0.3, 0.2]);
-        assert!(promoted.is_empty());
+        assert_eq!(promoted, [] as [latency_stages::lane_scheduler::SchedulerLane; 0]);
     }
     assert!(!tracker.any_starving());
 }
@@ -4064,7 +4064,7 @@ fn test_starvation_detected_after_threshold() {
     for i in 0..3 {
         let promoted = tracker.observe_epoch(&[5, 3, 0], &[0.5, 0.3, 0.0]);
         if i < 2 {
-            assert!(promoted.is_empty());
+            assert_eq!(promoted, [] as [latency_stages::lane_scheduler::SchedulerLane; 0]);
         } else {
             assert_eq!(promoted, vec![SchedulerLane::Bulk]);
         }
@@ -9858,7 +9858,7 @@ fn test_canonicalizer_diagnose_mismatches_none() {
         None,
     );
     let mismatches = c.diagnose_mismatches(&t1, &t1);
-    assert!(mismatches.is_empty());
+    assert_eq!(mismatches, [] as [latency_stages::replay_canonicalizer::TraceMismatch; 0]);
 }
 
 #[test]
@@ -11307,7 +11307,7 @@ fn test_fault_isolation_reset() {
     for d in FaultDomain::ALL {
         assert_eq!(mgr.domain_health(*d), DomainHealth::Healthy);
     }
-    assert!(mgr.fault_history().is_empty());
+    assert_eq!(mgr.fault_history(), [] as [latency_stages::fault_isolation::FaultEvent; 0]);
 }
 
 // ── F1 Impl: Bridge method tests ─────────────────────────────
@@ -11419,7 +11419,7 @@ fn test_blast_radius_recovery_transitive() {
 fn test_blast_radius_no_cascades_from_budget() {
     let bra = BlastRadiusAnalyzer::default_graph();
     let report = bra.analyze(FaultDomain::Budget);
-    assert!(report.direct_risk.is_empty());
+    assert_eq!(report.direct_risk, [] as [latency_stages::fault_isolation::FaultDomain; 0]);
     assert_eq!(report.total_at_risk, 0);
 }
 
@@ -11527,7 +11527,7 @@ fn test_instrumented_drain_log() {
     mgr.record_fault(FaultDomain::Storage, "x".to_string(), 100);
     let drained = mgr.drain_log();
     assert_eq!(drained.len(), 1);
-    assert!(mgr.transition_log().is_empty());
+    assert_eq!(mgr.transition_log(), []);
 }
 
 #[test]
@@ -12274,7 +12274,7 @@ fn test_breaker_total_consecutive_failures() {
 #[test]
 fn test_breaker_open_stages() {
     let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-    assert!(mgr.open_stages().is_empty());
+    assert_eq!(mgr.open_stages(), [] as [latency_stages::stage::LatencyStage; 0]);
     for i in 0..5 {
         mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
     }
@@ -12304,7 +12304,7 @@ fn test_breaker_closed_stages() {
 #[test]
 fn test_breaker_plan_recovery_empty_when_all_closed() {
     let mgr = BreakerManager::new(StageBreakerConfig::default());
-    assert!(mgr.plan_recovery().is_empty());
+    assert_eq!(mgr.plan_recovery(), [] as [latency_stages::breaker_manager::RecoveryStep; 0]);
 }
 
 #[test]
@@ -12542,7 +12542,7 @@ fn test_ack_protocol_sweep_timeouts() {
     mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
     // Before deadline.
     let results = mgr.sweep_timeouts(4_000_000);
-    assert!(results.is_empty());
+    assert_eq!(results, [] as [latency_stages::ack_protocol::DeferredResult; 0]);
     assert_eq!(mgr.pending_count(), 1);
     // After deadline (5_000_000 default).
     let results = mgr.sweep_timeouts(6_100_000);
@@ -13337,7 +13337,7 @@ fn test_matrix_passing_failing_gates() {
         artifacts: vec![],
     });
     assert_eq!(matrix.passing_gates(), vec!["canary".to_string()]);
-    assert!(matrix.failing_gates().is_empty());
+    assert_eq!(matrix.failing_gates(), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -13359,7 +13359,7 @@ fn test_matrix_missing_required() {
         failure_message: None,
         artifacts: vec![],
     });
-    assert!(matrix.missing_required().is_empty());
+    assert_eq!(matrix.missing_required(), [] as [std::string::String; 0]);
 }
 
 #[test]

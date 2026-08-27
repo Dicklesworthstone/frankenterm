@@ -1040,7 +1040,7 @@ mod tests {
     fn standard_policy_allows_reversal() {
         let policy = ReversibilityPolicy::standard();
         assert!(policy.reversal_allowed);
-        assert!(!policy.conditions.is_empty());
+        assert_ne!(policy.conditions, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(snap.completed_phases, 3);
         assert_eq!(snap.total_phases, plan.phases.len());
         assert_eq!(snap.doc_coverage_rate, 1.0);
-        assert!(snap.missing_topics.is_empty());
+        assert_eq!(snap.missing_topics, [] as [std::string::String; 0]);
     }
 
     // --- Render tests ---

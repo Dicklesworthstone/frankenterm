@@ -450,12 +450,12 @@ mod tests {
     fn email_config_default_values() {
         let config = EmailNotifyConfig::default();
         assert!(!config.enabled);
-        assert!(config.smtp_host.is_empty());
+        assert_eq!(config.smtp_host, "");
         assert_eq!(config.smtp_port, 587);
         assert!(config.username.is_none());
         assert!(config.password.is_none());
-        assert!(config.from.is_empty());
-        assert!(config.to.is_empty());
+        assert_eq!(config.from, "");
+        assert_eq!(config.to, [] as [std::string::String; 0]);
         assert_eq!(config.subject_prefix, "[ft]");
         assert_eq!(config.tls, EmailTlsMode::StartTls);
         assert_eq!(config.timeout_secs, 10);
@@ -652,7 +652,7 @@ mod tests {
         assert!(config.username.is_none());
         assert!(config.password.is_none());
         assert_eq!(config.from, "");
-        assert!(config.to.is_empty());
+        assert_eq!(config.to, [] as [std::string::String; 0]);
         assert_eq!(config.subject_prefix, "[ft]");
         assert_eq!(config.tls, EmailTlsMode::StartTls);
         assert_eq!(config.timeout_secs, 10);

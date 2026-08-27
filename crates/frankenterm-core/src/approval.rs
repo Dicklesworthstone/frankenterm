@@ -1396,7 +1396,7 @@ mod tests {
     #[test]
     fn generate_allow_once_code_zero_length() {
         let code = generate_allow_once_code(0);
-        assert!(code.is_empty());
+        assert_eq!(code, "");
     }
 
     #[test]

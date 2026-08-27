@@ -2353,19 +2353,19 @@ mod tests {
 
     #[test]
     fn metric_constants_not_empty() {
-        assert!(!METRIC_APPEND_LATENCY_US.is_empty());
-        assert!(!METRIC_FLUSH_LATENCY_US.is_empty());
-        assert!(!METRIC_CHECKPOINT_LATENCY_US.is_empty());
-        assert!(!METRIC_BATCH_SIZE.is_empty());
-        assert!(!COUNTER_EVENTS_APPENDED.is_empty());
-        assert!(!COUNTER_BATCHES_PROCESSED.is_empty());
-        assert!(!COUNTER_BYTES_WRITTEN.is_empty());
-        assert!(!COUNTER_FLUSHES.is_empty());
-        assert!(!COUNTER_CHECKPOINTS.is_empty());
-        assert!(!COUNTER_CHECKPOINT_ADVANCED.is_empty());
-        assert!(!COUNTER_CHECKPOINT_NOOP.is_empty());
-        assert!(!COUNTER_IDEMPOTENT_REPLAYS.is_empty());
-        assert!(!COUNTER_ERROR_OVERLOAD.is_empty());
+        assert_ne!(METRIC_APPEND_LATENCY_US, "");
+        assert_ne!(METRIC_FLUSH_LATENCY_US, "");
+        assert_ne!(METRIC_CHECKPOINT_LATENCY_US, "");
+        assert_ne!(METRIC_BATCH_SIZE, "");
+        assert_ne!(COUNTER_EVENTS_APPENDED, "");
+        assert_ne!(COUNTER_BATCHES_PROCESSED, "");
+        assert_ne!(COUNTER_BYTES_WRITTEN, "");
+        assert_ne!(COUNTER_FLUSHES, "");
+        assert_ne!(COUNTER_CHECKPOINTS, "");
+        assert_ne!(COUNTER_CHECKPOINT_ADVANCED, "");
+        assert_ne!(COUNTER_CHECKPOINT_NOOP, "");
+        assert_ne!(COUNTER_IDEMPOTENT_REPLAYS, "");
+        assert_ne!(COUNTER_ERROR_OVERLOAD, "");
     }
 
     // -------------------------------------------------------------------------

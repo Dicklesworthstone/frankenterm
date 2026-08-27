@@ -1773,7 +1773,7 @@ mod tests {
             row.message.len()
         );
         // Negative timestamp → falls through to raw number display
-        assert!(!row.timestamp.is_empty());
+        assert_ne!(row.timestamp, "");
         // Unknown severity → DarkGray
         assert_field!(
             "event",
@@ -2839,7 +2839,7 @@ mod tests {
         let mut event = sample_timeline_event();
         event.correlations.clear();
         let row = adapt_timeline_event(&event);
-        assert!(row.correlation_label.is_empty());
+        assert_eq!(row.correlation_label, "");
     }
 
     #[test]
@@ -2868,7 +2868,7 @@ mod tests {
 
     #[test]
     fn format_correlations_empty() {
-        assert!(format_correlations(&[]).is_empty());
+        assert_eq!(format_correlations(&[]), "");
     }
 
     #[test]

@@ -188,7 +188,7 @@ fn type_name_matches_serde_tag_for_every_variant() {
             tag,
             "type_name() must equal the serde `type` tag"
         );
-        assert!(!event.type_name().is_empty());
+        assert_ne!(event.type_name(), "");
     }
 }
 

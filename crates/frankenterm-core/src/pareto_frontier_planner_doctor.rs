@@ -412,7 +412,7 @@ mod tests {
         let rendering = PlannerReportRenderer::new().render(&report);
         match rendering {
             PlannerReportRendering::DataNeeded { reasons } => {
-                assert!(!reasons.is_empty());
+                assert_ne!(reasons, [] as [std::string::String; 0]);
                 assert!(reasons[0].contains("at least 3"));
             }
             PlannerReportRendering::Frontier { .. } => panic!("expected DataNeeded variant"),

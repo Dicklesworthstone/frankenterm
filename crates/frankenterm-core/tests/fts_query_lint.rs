@@ -99,8 +99,11 @@ fn consecutive_operators_are_flagged() {
 
 #[test]
 fn clean_query_has_no_lints() {
-    assert!(codes("error timeout").is_empty());
-    assert!(codes("\"exact phrase\" AND retry").is_empty());
+    assert_eq!(codes("error timeout"), [] as [std::string::String; 0]);
+    assert_eq!(
+        codes("\"exact phrase\" AND retry"),
+        [] as [std::string::String; 0]
+    );
 }
 
 proptest! {

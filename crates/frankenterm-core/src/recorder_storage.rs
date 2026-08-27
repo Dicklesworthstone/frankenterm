@@ -4877,7 +4877,7 @@ recorder_backend = "frankensqlite"
                 .unwrap();
 
             let lag = storage.lag_metrics().await.unwrap();
-            assert!(lag.consumers.is_empty());
+            assert_eq!(lag.consumers, [] as [recorder_storage::RecorderConsumerLag; 0]);
             assert!(lag.latest_offset.is_some());
         });
     }
@@ -5179,7 +5179,7 @@ recorder_backend = "frankensqlite"
 
             let lag = storage.lag_metrics().await.unwrap();
             assert!(lag.latest_offset.is_none());
-            assert!(lag.consumers.is_empty());
+            assert_eq!(lag.consumers, [] as [recorder_storage::RecorderConsumerLag; 0]);
         });
     }
 
@@ -5350,7 +5350,7 @@ recorder_backend = "frankensqlite"
             // Appended durability should have written state file
             assert!(state_path.exists());
             let bytes = std::fs::read(&state_path).unwrap();
-            assert!(!bytes.is_empty());
+            assert_ne!(bytes, [] as [u8; 0]);
 
             // Verify state content is valid JSON
             let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

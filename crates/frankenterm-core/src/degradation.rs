@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(dm.disabled_patterns().len(), 1);
 
         dm.recover(Subsystem::PatternEngine);
-        assert!(dm.disabled_patterns().is_empty());
+        assert_eq!(dm.disabled_patterns(), []);
     }
 
     #[test]
@@ -1208,7 +1208,7 @@ mod tests {
 
         dm.resume_workflow("wf-123");
         assert!(!dm.is_workflow_paused("wf-123"));
-        assert!(dm.paused_workflows().is_empty());
+        assert_eq!(dm.paused_workflows(), []);
     }
 
     #[test]
@@ -1717,7 +1717,7 @@ mod tests {
             safe_mode_active: false,
             legacy_fallback_enabled: false,
         });
-        assert!(full.correctness_guards.is_empty());
+        assert_eq!(full.correctness_guards, [] as [std::string::String; 0]);
 
         let qr = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
             stalled_total: 1,
@@ -1776,7 +1776,7 @@ mod tests {
             safe_mode_active: false,
             legacy_fallback_enabled: false,
         });
-        assert!(full.availability_changes.is_empty());
+        assert_eq!(full.availability_changes, [] as [std::string::String; 0]);
 
         let qr = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
             stalled_total: 1,
@@ -1788,7 +1788,7 @@ mod tests {
             safe_mode_active: false,
             legacy_fallback_enabled: false,
         });
-        assert!(qr.availability_changes.is_empty());
+        assert_eq!(qr.availability_changes, [] as [std::string::String; 0]);
 
         let cg = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
             stalled_total: 2,
@@ -1800,7 +1800,7 @@ mod tests {
             safe_mode_active: false,
             legacy_fallback_enabled: false,
         });
-        assert!(cg.availability_changes.is_empty());
+        assert_eq!(cg.availability_changes, [] as [std::string::String; 0]);
 
         let ec = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
             stalled_total: 2,
@@ -2013,7 +2013,7 @@ mod tests {
 
         // Recover only PatternEngine
         dm.recover(Subsystem::PatternEngine);
-        assert!(dm.disabled_patterns().is_empty());
+        assert_eq!(dm.disabled_patterns(), []);
         // Workflows should still be paused
         assert_eq!(dm.paused_workflows().len(), 2);
         assert!(dm.is_workflow_paused("wf-100"));
@@ -2021,7 +2021,7 @@ mod tests {
 
         // Now recover WorkflowEngine too
         dm.recover(Subsystem::WorkflowEngine);
-        assert!(dm.paused_workflows().is_empty());
+        assert_eq!(dm.paused_workflows(), []);
         assert_eq!(dm.overall_status(), OverallStatus::Healthy);
     }
 
@@ -2907,7 +2907,7 @@ mod tests {
     fn resume_nonexistent_workflow_is_noop() {
         let mut dm = DegradationManager::new();
         dm.resume_workflow("does-not-exist");
-        assert!(dm.paused_workflows().is_empty());
+        assert_eq!(dm.paused_workflows(), []);
     }
 
     #[test]
@@ -3082,8 +3082,8 @@ mod tests {
         let dm = DegradationManager::default();
         assert_eq!(dm.queued_write_count(), 0);
         assert_eq!(dm.queued_write_bytes(), 0);
-        assert!(dm.disabled_patterns().is_empty());
-        assert!(dm.paused_workflows().is_empty());
+        assert_eq!(dm.disabled_patterns(), []);
+        assert_eq!(dm.paused_workflows(), []);
         assert!(dm.snapshots().is_empty());
     }
 

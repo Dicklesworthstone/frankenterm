@@ -974,7 +974,7 @@ mod tests {
         > = Vec::new();
         let results: Vec<i32> =
             runtime.block_on(async { spawn_bounded_with_cx(&cx, 4, tasks).await });
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [i32; 0]);
     }
 
     #[test]

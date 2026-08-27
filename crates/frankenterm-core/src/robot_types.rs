@@ -5829,7 +5829,7 @@ mod tests {
         let parsed: SearchScoringBreakdown = serde_json::from_value(json).unwrap();
         assert!((parsed.final_score - 5.0).abs() < 1e-10);
         assert!(parsed.bm25_score.is_none());
-        assert!(parsed.matching_terms.is_empty());
+        assert_eq!(parsed.matching_terms, [] as [std::string::String; 0]);
         assert!(parsed.semantic_similarity.is_none());
         assert!(parsed.reranker_score.is_none());
     }
@@ -7557,7 +7557,7 @@ mod tests {
         assert_eq!(data.leak_risk.pane_arena_peak_bytes, 2 * 1024 * 1024);
         assert_eq!(data.leak_risk.storage_lock_contention_events, 5);
         assert!(!data.leak_risk.watchdog_unhealthy);
-        assert!(data.leak_risk.unhealthy_components.is_empty());
+        assert_eq!(data.leak_risk.unhealthy_components, [] as [std::string::String; 0]);
     }
 
     #[test]

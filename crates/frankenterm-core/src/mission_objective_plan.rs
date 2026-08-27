@@ -2075,7 +2075,7 @@ mod tests {
         let plan = plan_mission_objective(&input_with_sources());
 
         assert_eq!(plan.plan_status, MissionObjectivePlanStatus::NoReadyWork);
-        assert!(plan.plan_steps.is_empty());
+        assert_eq!(plan.plan_steps, [] as [mission_objective_plan::MissionObjectivePlanStep; 0]);
         assert_eq!(plan.fallback_steps.len(), 3);
         assert_eq!(
             plan.fallback_steps[0].action_kind,

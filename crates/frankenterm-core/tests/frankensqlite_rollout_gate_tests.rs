@@ -344,7 +344,7 @@ fn test_rollout_stages_ordered() {
 #[test]
 fn test_rollout_stages_all_have_descriptions() {
     for stage in RolloutStage::all() {
-        assert!(!stage.description().is_empty());
+        assert_ne!(stage.description(), "");
     }
 }
 
@@ -593,13 +593,13 @@ fn test_gate_evidence_schema_version() {
 #[test]
 fn test_gate_evidence_has_commit_sha() {
     let gate = evaluate_r0(&all_tiers_green(), true);
-    assert!(!gate.commit_sha.is_empty());
+    assert_ne!(gate.commit_sha, "");
 }
 
 #[test]
 fn test_gate_evidence_has_timestamp() {
     let gate = evaluate_r0(&all_tiers_green(), true);
-    assert!(!gate.timestamp.is_empty());
+    assert_ne!(gate.timestamp, "");
 }
 
 #[test]

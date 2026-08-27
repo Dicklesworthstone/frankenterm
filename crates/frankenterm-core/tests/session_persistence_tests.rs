@@ -798,7 +798,10 @@ fn topology_roundtrip_complex() {
 fn topology_empty_snapshot() {
     let topo = TopologySnapshot::empty(1000);
     assert_eq!(topo.pane_count(), 0);
-    assert!(topo.windows.is_empty());
+    assert_eq!(
+        topo.windows,
+        [] as [frankenterm_core::session_topology::WindowSnapshot; 0]
+    );
 
     let json = topo.to_json().unwrap();
     let restored = TopologySnapshot::from_json(&json).unwrap();

@@ -1786,7 +1786,7 @@ mod tests {
 
     #[test]
     fn mcp_version_is_set() {
-        assert!(!MCP_VERSION.is_empty());
+        assert_ne!(MCP_VERSION, "");
         assert!(
             MCP_VERSION.starts_with('v')
                 || MCP_VERSION.starts_with("0.")
@@ -4064,9 +4064,9 @@ mod tests {
         let catalog = mcp_mission_failure_catalog();
         assert!(!catalog.is_empty());
         for entry in &catalog {
-            assert!(!entry.code.is_empty());
-            assert!(!entry.reason_code.is_empty());
-            assert!(!entry.error_code.is_empty());
+            assert_ne!(entry.code, "");
+            assert_ne!(entry.reason_code, "");
+            assert_ne!(entry.error_code, "");
         }
     }
 

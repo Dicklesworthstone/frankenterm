@@ -825,7 +825,7 @@ fn domain_budget_empty_key() {
     };
     let json = serde_json::to_string(&entry).unwrap();
     let rt: DomainBudgetEntry = serde_json::from_str(&json).unwrap();
-    assert!(rt.domain_key.is_empty());
+    assert_eq!(rt.domain_key, "");
 }
 
 // ── Clone and equality ───────────────────────────────────────────────
@@ -867,7 +867,7 @@ fn policy_decision_with_empty_rationale() {
     };
     let json = serde_json::to_string(&decision).unwrap();
     let rt: PolicyDecision = serde_json::from_str(&json).unwrap();
-    assert!(rt.rationale.is_empty());
+    assert_eq!(rt.rationale, "");
 }
 
 // ── Crash bundle integration ─────────────────────────────────────────

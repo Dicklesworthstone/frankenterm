@@ -105,7 +105,7 @@ fn health_tier_display_is_lowercase() {
         let display = tier.to_string();
         let lower = display.to_lowercase();
         assert_eq!(display, lower, "HealthTier::Display should be lowercase");
-        assert!(!display.is_empty());
+        assert_ne!(display, "");
     }
 }
 
