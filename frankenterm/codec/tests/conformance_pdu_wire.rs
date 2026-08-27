@@ -1087,7 +1087,7 @@ fn legacy46_pdu4_rejects_title_overflow_cardinality_mismatch_and_duplicate_windo
     assert!(format!("{error:#}").contains("cardinality mismatch"));
 
     let mut duplicate = [leb128_u64(0), leb128_u64(0), leb128_u64(2)].concat();
-    for title in [b'a', b'b'] {
+    for title in *b"ab" {
         duplicate.extend(leb128_u64(7));
         duplicate.extend(leb128_u64(1));
         duplicate.push(title);
@@ -1366,7 +1366,7 @@ fn legacy46_text_only_pdu23_and_pdu25_remain_available() {
             reverse_video: false,
         },
         tiered_scrollback_status: None,
-        dirty_lines: vec![5..6],
+        dirty_lines: std::iter::once(5..6).collect(),
         title: "legacy".to_string(),
         working_dir: None,
         bonus_lines: text_lines(),
