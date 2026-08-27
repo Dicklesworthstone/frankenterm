@@ -18,11 +18,12 @@
 //! service now admits new authenticated Spawn requests through one capacity-one
 //! durability worker and exposes exact lost-reply Query recovery. Recovered
 //! catalog members remain read-only and cannot share a pane, effect, journal,
-//! or origin-request namespace with a new Spawn. Effect acknowledgement,
+//! or origin-request namespace with a new Spawn. Exact effect acknowledgement
+//! now durably transfers a retained Spawn result into live-pane authority;
 //! retained-result reclamation, live-pane Census integration, activation
 //! wiring, startup adoption, durable output replay, and successor lease rotation
-//! must land before any production selector may start it. The process-local PTY
-//! typestate below therefore still does **not** prove guardian-`SIGKILL`
+//! must still land before any production selector may start it. The
+//! process-local PTY typestate below therefore still does **not** prove guardian-`SIGKILL`
 //! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
 //! never proof that a child exists, and recovered lifecycle rows explicitly
 //! report that PTY, lease, output-replay, and mutation authorities are absent.
@@ -58,9 +59,9 @@ use crate::output::{
     GuardianOutputPipeline, GuardianPaneOutputJournal, GuardianPublishedGenesisAdmissionPermitV1,
 };
 use crate::transport::{
-    GuardianServiceError, GuardianTokenPathAuthority, SocketPathAuthority,
-    bind_private_unix_listener, load_guardian_secret, load_guardian_secret_with_authority,
-    validate_existing_socket,
+    GuardianServiceError, GuardianTokenEffectLease, GuardianTokenPathAuthority,
+    SocketPathAuthority, bind_private_unix_listener, load_guardian_secret,
+    load_guardian_secret_with_authority, validate_existing_socket,
 };
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::net::{UnixListener, UnixStream};
@@ -2314,6 +2315,7 @@ struct BrokerSpawnWorkerJobV1 {
     fingerprint: BrokerSpawnWorkerFingerprintV1,
     owner: BrokerGuardianOwnerIdentity,
     request: BrokerSpawnControlRequestV1,
+    token_effect_lease: GuardianTokenEffectLease,
 }
 
 impl BrokerSpawnWorkerJobV1 {
@@ -2322,6 +2324,7 @@ impl BrokerSpawnWorkerJobV1 {
         header: BrokerControlRequestHeaderV1,
         owner: BrokerGuardianOwnerIdentity,
         request: BrokerSpawnControlRequestV1,
+        token_effect_lease: GuardianTokenEffectLease,
     ) -> Result<Self, BrokerControlProtocolError> {
         request.validate()?;
         request.validate_control_header(header)?;
@@ -2347,6 +2350,7 @@ impl BrokerSpawnWorkerJobV1 {
             fingerprint,
             owner,
             request,
+            token_effect_lease,
         })
     }
 }
@@ -2366,6 +2370,7 @@ enum BrokerSpawnWorkerSubmitErrorV1 {
 }
 
 enum BrokerSpawnWorkerFailureV1 {
+    TokenAuthority,
     Identity(BrokerSpawnWalError),
     Catalog(BrokerSpawnWalError),
     Output(crate::output::GuardianOutputError),
@@ -2399,6 +2404,7 @@ enum BrokerSpawnWorkerOutcomeV1 {
 struct BrokerSpawnWorkerCompletionV1 {
     fingerprint: BrokerSpawnWorkerFingerprintV1,
     outcome: BrokerSpawnWorkerOutcomeV1,
+    token_authority_failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2410,12 +2416,14 @@ struct BrokerSpawnAckFingerprintV1 {
 struct BrokerSpawnAckWorkerJobV1 {
     fingerprint: BrokerSpawnAckFingerprintV1,
     retained: Box<BrokerSpawnWorkerCompletionV1>,
+    token_effect_lease: GuardianTokenEffectLease,
 }
 
 impl BrokerSpawnAckWorkerJobV1 {
     fn new(
         ack_id: Uuid,
         retained: Box<BrokerSpawnWorkerCompletionV1>,
+        token_effect_lease: GuardianTokenEffectLease,
     ) -> Result<Self, Box<BrokerSpawnWorkerCompletionV1>> {
         if ack_id.is_nil()
             || !matches!(
@@ -2431,6 +2439,7 @@ impl BrokerSpawnAckWorkerJobV1 {
                 ack_id,
             },
             retained,
+            token_effect_lease,
         })
     }
 }
@@ -2438,7 +2447,8 @@ impl BrokerSpawnAckWorkerJobV1 {
 struct BrokerSpawnAckWorkerCompletionV1 {
     fingerprint: BrokerSpawnAckFingerprintV1,
     retained: Box<BrokerSpawnWorkerCompletionV1>,
-    result: Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError>,
+    result: Option<Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError>>,
+    token_authority_failed: bool,
 }
 
 // Keep the admitted Spawn job inline so queue admission cannot fail after a
@@ -2488,6 +2498,12 @@ struct BrokerSpawnAckWorkerSubmitErrorV1 {
     job: BrokerSpawnAckWorkerJobV1,
 }
 
+#[cfg(test)]
+struct BrokerSpawnWorkerEffectLeaseProbeV1 {
+    entered: SyncSender<BrokerSpawnWorkerActiveV1>,
+    release: Receiver<()>,
+}
+
 struct BrokerSpawnWorkerStateV1 {
     spawn_catalog: BrokerSpawnWalCatalogV1,
     spawn_authenticator: GuardianBrokerSpawnWalAuthenticatorV1,
@@ -2495,6 +2511,8 @@ struct BrokerSpawnWorkerStateV1 {
     exec_launch: BrokerExecBootstrapLaunchV1,
     broker_incarnation: Uuid,
     limits: BrokerResourceLimitsV1,
+    #[cfg(test)]
+    effect_lease_probe: Option<BrokerSpawnWorkerEffectLeaseProbeV1>,
 }
 
 impl BrokerSpawnWorkerStateV1 {
@@ -2504,7 +2522,7 @@ impl BrokerSpawnWorkerStateV1 {
                 BrokerSpawnWorkerEventV1::Spawn(self.execute_spawn(job))
             }
             BrokerSpawnWorkerCommandV1::Acknowledge(job) => {
-                BrokerSpawnWorkerEventV1::Acknowledge(Self::execute_acknowledgement(job))
+                BrokerSpawnWorkerEventV1::Acknowledge(self.execute_acknowledgement(job))
             }
         }
     }
@@ -2514,7 +2532,34 @@ impl BrokerSpawnWorkerStateV1 {
             fingerprint,
             owner,
             request,
+            mut token_effect_lease,
         } = job;
+        let authority_valid_before = token_effect_lease.validate().is_ok();
+        #[cfg(test)]
+        if authority_valid_before {
+            self.block_under_effect_lease(&BrokerSpawnWorkerActiveV1::Spawn(fingerprint));
+        }
+        let outcome = if authority_valid_before {
+            self.execute_spawn_effect(owner, request)
+        } else {
+            BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                journal: None,
+                error: BrokerSpawnWorkerFailureV1::TokenAuthority,
+            }
+        };
+        let authority_valid_after = token_effect_lease.validate().is_ok();
+        BrokerSpawnWorkerCompletionV1 {
+            fingerprint,
+            outcome,
+            token_authority_failed: !authority_valid_before || !authority_valid_after,
+        }
+    }
+
+    fn execute_spawn_effect(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: BrokerSpawnControlRequestV1,
+    ) -> BrokerSpawnWorkerOutcomeV1 {
         let BrokerSpawnControlRequestV1 {
             journal_id,
             attempt_id,
@@ -2529,12 +2574,9 @@ impl BrokerSpawnWorkerStateV1 {
         ) {
             Ok(identity) => identity,
             Err(error) => {
-                return BrokerSpawnWorkerCompletionV1 {
-                    fingerprint,
-                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
-                        journal: None,
-                        error: BrokerSpawnWorkerFailureV1::Identity(error),
-                    },
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: None,
+                    error: BrokerSpawnWorkerFailureV1::Identity(error),
                 };
             }
         };
@@ -2544,12 +2586,9 @@ impl BrokerSpawnWorkerStateV1 {
         {
             Ok(journal) => journal,
             Err(error) => {
-                return BrokerSpawnWorkerCompletionV1 {
-                    fingerprint,
-                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
-                        journal: None,
-                        error: BrokerSpawnWorkerFailureV1::Catalog(error),
-                    },
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: None,
+                    error: BrokerSpawnWorkerFailureV1::Catalog(error),
                 };
             }
         };
@@ -2559,12 +2598,9 @@ impl BrokerSpawnWorkerStateV1 {
         {
             Ok(published_output) => published_output,
             Err(error) => {
-                return BrokerSpawnWorkerCompletionV1 {
-                    fingerprint,
-                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
-                        journal: Some(journal),
-                        error: BrokerSpawnWorkerFailureV1::Output(error),
-                    },
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: Some(journal),
+                    error: BrokerSpawnWorkerFailureV1::Output(error),
                 };
             }
         };
@@ -2580,24 +2616,18 @@ impl BrokerSpawnWorkerStateV1 {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return BrokerSpawnWorkerCompletionV1 {
-                    fingerprint,
-                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
-                        journal: Some(journal),
-                        error: BrokerSpawnWorkerFailureV1::Broker(error),
-                    },
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: Some(journal),
+                    error: BrokerSpawnWorkerFailureV1::Broker(error),
                 };
             }
         };
         let prepared = match prepared.bind_fresh_published_output_journal(published_output) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return BrokerSpawnWorkerCompletionV1 {
-                    fingerprint,
-                    outcome: BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
-                        journal: Some(journal),
-                        error: BrokerSpawnWorkerFailureV1::Broker(error),
-                    },
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: Some(journal),
+                    error: BrokerSpawnWorkerFailureV1::Broker(error),
                 };
             }
         };
@@ -2640,16 +2670,22 @@ impl BrokerSpawnWorkerStateV1 {
                 error: BrokerSpawnWorkerFailureV1::Commit(error),
             },
         };
-        BrokerSpawnWorkerCompletionV1 {
-            fingerprint,
-            outcome,
-        }
+        outcome
     }
 
+    // Production state has no probe field, but retaining this as a state method
+    // keeps the test-only lease boundary on the exact worker execution path.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn execute_acknowledgement(
+        &self,
         mut job: BrokerSpawnAckWorkerJobV1,
     ) -> BrokerSpawnAckWorkerCompletionV1 {
-        let result = match &mut job.retained.outcome {
+        let authority_valid_before = job.token_effect_lease.validate().is_ok();
+        #[cfg(test)]
+        if authority_valid_before {
+            self.block_under_effect_lease(&BrokerSpawnWorkerActiveV1::Acknowledge(job.fingerprint));
+        }
+        let result = authority_valid_before.then(|| match &mut job.retained.outcome {
             BrokerSpawnWorkerOutcomeV1::Applied {
                 journal, adoption, ..
             } => journal.acknowledge_spawn_reply_and_sync(
@@ -2657,12 +2693,29 @@ impl BrokerSpawnWorkerStateV1 {
                 adoption.pane.kernel_child_identity(),
             ),
             _ => Err(BrokerSpawnWalError::InvalidTransition),
-        };
+        });
+        let authority_valid_after = job.token_effect_lease.validate().is_ok();
         BrokerSpawnAckWorkerCompletionV1 {
             fingerprint: job.fingerprint,
             retained: job.retained,
             result,
+            token_authority_failed: !authority_valid_before || !authority_valid_after,
         }
+    }
+
+    #[cfg(test)]
+    fn block_under_effect_lease(&self, active: &BrokerSpawnWorkerActiveV1) {
+        let Some(probe) = self.effect_lease_probe.as_ref() else {
+            return;
+        };
+        probe
+            .entered
+            .send(*active)
+            .expect("publish worker effect-lease probe entry");
+        probe
+            .release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release worker effect-lease probe");
     }
 }
 
@@ -3303,6 +3356,8 @@ impl BrokerControlServiceV1 {
                 exec_launch,
                 broker_incarnation,
                 limits: BrokerResourceLimitsV1::default(),
+                #[cfg(test)]
+                effect_lease_probe: None,
             },
             spawn_completion_waker,
         )?;
@@ -3527,6 +3582,7 @@ impl BrokerControlServiceV1 {
         if self.blocked_spawn_completion.is_some()
             || self.blocked_ack_completion.is_some()
             || !self.blocked_worker_events.is_empty()
+            || completion.token_authority_failed
             || represented_panes >= GUARDIAN_MAX_PANES
             || self.retained_spawns.contains_key(&durable_pane_id)
             || self.live_spawns.contains_key(&durable_pane_id)
@@ -3554,10 +3610,15 @@ impl BrokerControlServiceV1 {
         let spawn_effect_id = completion.fingerprint.spawn.binding.spawn_effect_id;
         let journal_id = completion.fingerprint.spawn.journal_id;
         let origin_request_id = completion.fingerprint.spawn.binding.origin_request_id;
+        if completion.token_authority_failed {
+            self.blocked_ack_completion = Some(Box::new(completion));
+            self.spawn_worker_unavailable = true;
+            return;
+        }
         let Some(acknowledgement) = completion
             .result
             .as_ref()
-            .ok()
+            .and_then(|result| result.as_ref().ok())
             .copied()
             .filter(|receipt| receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
         else {
@@ -3900,11 +3961,26 @@ impl BrokerControlServiceV1 {
                 .map_err(|_| ());
             }
         };
+        let token_effect_lease = match self.token_authority.acquire_effect_lease() {
+            Ok(lease) => lease,
+            Err(_) => {
+                self.spawn_worker_unavailable = true;
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
         let job = match BrokerSpawnWorkerJobV1::new(
             self.broker_incarnation,
             request.header,
             owner,
             control_spawn,
+            token_effect_lease,
         ) {
             Ok(job) => job,
             Err(_) => {
@@ -4151,10 +4227,28 @@ impl BrokerControlServiceV1 {
                 )
                 .map_err(|_| ());
             }
+            let token_effect_lease = match self.token_authority.acquire_effect_lease() {
+                Ok(lease) => lease,
+                Err(_) => {
+                    self.spawn_worker_unavailable = true;
+                    return BrokerControlResponseV1::new(
+                        self.response_header(
+                            request.header,
+                            BrokerControlResponseStatusV1::Quarantined,
+                        ),
+                        &[],
+                    )
+                    .map_err(|_| ());
+                }
+            };
             let Some(retained) = self.retained_spawns.remove(&durable_pane_id) else {
                 return Err(());
             };
-            let job = match BrokerSpawnAckWorkerJobV1::new(ack_id, Box::new(retained)) {
+            let job = match BrokerSpawnAckWorkerJobV1::new(
+                ack_id,
+                Box::new(retained),
+                token_effect_lease,
+            ) {
                 Ok(job) => job,
                 Err(retained) => {
                     self.retained_spawns.insert(durable_pane_id, *retained);
@@ -16688,6 +16782,8 @@ mod tests {
             .expect("make Spawn catalog private");
         let token_path = root.join("broker.token");
         let (exec_launch, spawn_authenticator) = unit_test_exec_bootstrap_launch(&token_path, 0xd1);
+        let (_secret, mut token_authority) = load_guardian_secret_with_authority(&token_path)
+            .expect("load Spawn worker token authority");
         let poll = Poll::new().expect("create Spawn worker completion poll");
         let completion_waker = Arc::new(
             Waker::new(poll.registry(), Token(1)).expect("create Spawn worker completion waker"),
@@ -16734,12 +16830,23 @@ mod tests {
             lease_generation: 0,
             operation_id: binding.spawn_effect_id,
         };
-        let make_job = |header| {
+        let mut make_job = |header| {
             let request = BrokerSpawnControlRequestV1::decode(&encoded_spawn)
                 .expect("decode independent worker Spawn authority");
-            BrokerSpawnWorkerJobV1::new(broker_incarnation, header, authority.owner, request)
-                .expect("construct authenticated worker job")
+            let token_effect_lease = token_authority
+                .acquire_effect_lease()
+                .expect("acquire Spawn worker effect lease");
+            BrokerSpawnWorkerJobV1::new(
+                broker_incarnation,
+                header,
+                authority.owner,
+                request,
+                token_effect_lease,
+            )
+            .expect("construct authenticated worker job")
         };
+        let (effect_entered_tx, effect_entered_rx) = sync_channel(1);
+        let (effect_release_tx, effect_release_rx) = sync_channel(1);
         let worker = BrokerSpawnWorkerV1::start(
             BrokerSpawnWorkerStateV1 {
                 spawn_catalog,
@@ -16748,10 +16855,37 @@ mod tests {
                 exec_launch,
                 broker_incarnation,
                 limits: BrokerResourceLimitsV1::default(),
+                effect_lease_probe: Some(BrokerSpawnWorkerEffectLeaseProbeV1 {
+                    entered: effect_entered_tx,
+                    release: effect_release_rx,
+                }),
             },
             completion_waker,
         )
         .expect("start capacity-one Spawn worker");
+
+        let prevalidation_job = make_job(header);
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o640))
+            .expect("make worker token insecure before validation");
+        assert_eq!(
+            worker.try_submit(prevalidation_job),
+            Ok(BrokerSpawnWorkerSubmissionV1::Submitted)
+        );
+        let prevalidation_failure = spawn_worker_completion(&worker);
+        assert!(prevalidation_failure.token_authority_failed);
+        assert!(matches!(
+            prevalidation_failure.outcome,
+            BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                journal: None,
+                error: BrokerSpawnWorkerFailureV1::TokenAuthority,
+            }
+        ));
+        assert!(
+            !sentinel.exists(),
+            "invalid pre-effect token authority created a user child"
+        );
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))
+            .expect("restore private worker token permissions");
 
         assert_eq!(
             worker.try_submit(make_job(header)),
@@ -16769,9 +16903,29 @@ mod tests {
             Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight),
             "mutated retry shared the in-flight authority"
         );
+        assert_eq!(
+            effect_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Spawn worker reached effect-lease boundary"),
+            BrokerSpawnWorkerActiveV1::Spawn(make_job(header).fingerprint)
+        );
+        assert!(
+            !crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication while Spawn worker is blocked"),
+            "cooperative token publication crossed the worker-owned Spawn effect lease"
+        );
+        effect_release_tx
+            .send(())
+            .expect("release Spawn worker effect-lease boundary");
 
         let completion = spawn_worker_completion(&worker);
         assert_eq!(completion.fingerprint.header, header);
+        assert!(!completion.token_authority_failed);
+        assert!(
+            crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication after Spawn completion"),
+            "Spawn completion retained the worker effect lease"
+        );
         let child_identity = match &completion.outcome {
             BrokerSpawnWorkerOutcomeV1::Applied {
                 journal,
@@ -16798,9 +16952,14 @@ mod tests {
             "one admitted Spawn created a duplicate child"
         );
 
+        drop(make_job);
         let ack_id = id(7_209);
-        let ack_job = BrokerSpawnAckWorkerJobV1::new(ack_id, Box::new(completion))
-            .unwrap_or_else(|_| panic!("construct worker acknowledgement job"));
+        let ack_token_effect_lease = token_authority
+            .acquire_effect_lease()
+            .expect("acquire Spawn acknowledgement effect lease");
+        let ack_job =
+            BrokerSpawnAckWorkerJobV1::new(ack_id, Box::new(completion), ack_token_effect_lease)
+                .unwrap_or_else(|_| panic!("construct worker acknowledgement job"));
         {
             let mut active = worker.active.lock().expect("lock worker authority fixture");
             assert!(active.is_none());
@@ -16831,6 +16990,19 @@ mod tests {
             worker.try_submit_acknowledgement(rejected.job).ok(),
             Some(BrokerSpawnWorkerSubmissionV1::Submitted)
         );
+        assert_eq!(
+            effect_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("acknowledgement worker reached effect-lease boundary"),
+            BrokerSpawnWorkerActiveV1::Acknowledge(acknowledgement_fingerprint)
+        );
+        assert!(
+            !crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication while acknowledgement worker is blocked"),
+            "cooperative token publication crossed the worker-owned Ack effect lease"
+        );
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o640))
+            .expect("drift worker token after Ack prevalidation");
         {
             let mut active = worker
                 .active
@@ -16846,6 +17018,9 @@ mod tests {
                 acknowledgement_fingerprint.spawn,
             ));
         }
+        effect_release_tx
+            .send(())
+            .expect("release acknowledgement worker effect-lease boundary");
         let deadline = Instant::now() + Duration::from_secs(5);
         let acknowledged = loop {
             match worker.try_completion() {
@@ -16870,9 +17045,20 @@ mod tests {
             }
         };
         assert_eq!(acknowledged.fingerprint.ack_id, ack_id);
+        assert!(
+            acknowledged.token_authority_failed,
+            "post-Ack token drift was reported as normal live authority"
+        );
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))
+            .expect("restore worker token after Ack drift proof");
+        assert!(
+            crate::transport::guardian_token_publication_lock_is_available(&token_path)
+                .expect("probe token publication after acknowledgement completion"),
+            "acknowledgement completion retained the worker effect lease"
+        );
         assert!(matches!(
             acknowledged.result.as_ref(),
-            Ok(receipt) if receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged
+            Some(Ok(receipt)) if receipt.phase() == BrokerSpawnWalPhaseV1::ReplyAcknowledged
         ));
         let retained = *acknowledged.retained;
         let BrokerSpawnWorkerOutcomeV1::Applied {
