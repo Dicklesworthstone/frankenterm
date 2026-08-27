@@ -10,16 +10,18 @@
 //! the guardian synchronizes durable intent before granting one PTY-write
 //! permit, then synchronizes the terminal disposition before replying. A caller
 //! that loses the reply can query the exact effect by its sequence, byte length,
-//! and authenticated SHA-256 commitment without retaining plaintext. Output
+//! and authenticated SHA-256 commitment without retaining plaintext.
 //! Authenticated output replay and checkpoint Stage/catalog adoption are live
 //! behind typed, identity-bound transport operations. Production guardian
 //! selection, Genesis recovery-base creation, topology publication, service
 //! activation, and automated mux migration remain intentionally rejected until
 //! their anti-rollback and recovery authorities are integrated. The
-//! production-disabled broker separately exposes a
-//! content-free, paginated view of authenticated recovered Spawn journals, but
-//! that view grants no PTY, lease, output-replay, or mutation authority. The
-//! service can be stopped through an authenticated guarded
+//! production-disabled broker separately exposes a content-free, paginated
+//! view of authenticated recovered Spawn journals. A live pre-acknowledgement
+//! Spawn also mints one plaintext recovery capability while persisting only its
+//! pane-bound verifier; recovered-journal Census entries still grant no PTY,
+//! lease, output-replay, or mutation authority. The service can be stopped
+//! through an authenticated guarded
 //! transaction only while it owns no panes; a successful stop deliberately
 //! retains the socket path, so restart remains fail-closed until an explicit
 //! non-overwriting retirement design lands.
@@ -83,7 +85,9 @@ pub use broker::{
     BrokerCensusDispositionV1, BrokerCensusEntryV1, BrokerCensusPageRequestV1, BrokerCensusPageV1,
     BrokerCensusV1, BrokerControlClientError, BrokerControlClientV1, BrokerControlServiceConfigV1,
     BrokerControlServiceError, BrokerControlServiceV1, BrokerExecBootstrapErrorV1,
-    BrokerGuardianConnectionIdentityV1, run_broker_exec_bootstrap,
+    BrokerGuardianConnectionIdentityV1, BrokerInitialPaneClaimV1, BrokerPaneRecoverySecretV1,
+    BrokerSpawnClaimQueryV1, BrokerSpawnEffectAcknowledgementV1, BrokerSpawnEffectQueryV1,
+    BrokerSpawnSubmissionV1, run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};

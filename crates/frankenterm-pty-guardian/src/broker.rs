@@ -64,6 +64,7 @@ use crate::transport::{
     load_guardian_secret_with_authority, validate_existing_socket,
 };
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use hmac::{Hmac, KeyInit, Mac};
 use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -100,9 +101,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const BROKER_ABSOLUTE_MAX_SUCCESSOR_HANDOFFS: u32 = 1_024;
+const BROKER_PANE_RECOVERY_SECRET_BYTES: usize = 32;
+const BROKER_PANE_RECOVERY_VERIFIER_DOMAIN: &[u8] =
+    b"frankenterm.guardian-broker-pane-recovery-verifier.v1\0";
 const BROKER_CATALOG_CHECKSUM_BYTES: usize = 32;
 const BROKER_DEFAULT_MAX_PROXY_OPERATION_BYTES: usize = 64 * 1024;
 const BROKER_DEFAULT_MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -112,18 +116,18 @@ const BROKER_SPAWN_WAL_FILE_MAGIC: [u8; 8] = *b"FTBSW001";
 const BROKER_SPAWN_HEAD_FILE_MAGIC: [u8; 8] = *b"FTBSH001";
 const BROKER_SPAWN_WAL_RECORD_MAGIC: [u8; 8] = *b"FTBSR001";
 const BROKER_SPAWN_HEAD_RECORD_MAGIC: [u8; 8] = *b"FTBHR001";
-const BROKER_SPAWN_WAL_FORMAT_VERSION: u32 = 1;
+const BROKER_SPAWN_WAL_FORMAT_VERSION: u32 = 2;
 const BROKER_SPAWN_WAL_FILE_HEADER_BYTES: usize = 224;
 const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U32: u32 = 224;
 const BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64: u64 = 224;
-const BROKER_SPAWN_WAL_RECORD_BYTES: usize = 176;
-const BROKER_SPAWN_WAL_RECORD_BYTES_U32: u32 = 176;
-const BROKER_SPAWN_WAL_RECORD_BYTES_U64: u64 = 176;
+const BROKER_SPAWN_WAL_RECORD_BYTES: usize = 208;
+const BROKER_SPAWN_WAL_RECORD_BYTES_U32: u32 = 208;
+const BROKER_SPAWN_WAL_RECORD_BYTES_U64: u64 = 208;
 const BROKER_SPAWN_HEAD_RECORD_BYTES: usize = 120;
 const BROKER_SPAWN_HEAD_RECORD_BYTES_U32: u32 = 120;
 const BROKER_SPAWN_HEAD_RECORD_BYTES_U64: u64 = 120;
 const BROKER_SPAWN_WAL_AUTHENTICATED_HEADER_BYTES: usize = 192;
-const BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES: usize = 144;
+const BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES: usize = 176;
 const BROKER_SPAWN_HEAD_AUTHENTICATED_RECORD_BYTES: usize = 88;
 const BROKER_SPAWN_WAL_MAC_BYTES: usize = 32;
 const BROKER_SPAWN_WAL_KEY_ID_BYTES: usize = 8;
@@ -201,6 +205,120 @@ const BROKER_EXEC_BOOTSTRAP_TEST_PREAMBLE_MAX_BYTES: usize = 1_024;
 #[cfg(test)]
 const BROKER_EXEC_BOOTSTRAP_TEST_ENTRY: &str =
     "broker::tests::broker_exec_bootstrap_subprocess_entry";
+
+type BrokerPaneRecoveryHmacV1 = Hmac<Sha256>;
+
+/// Server-minted bearer capability for one pane lease lineage.
+///
+/// The plaintext is delivered only on the authenticated pre-acknowledgement
+/// Spawn/Query path and is never written to the broker catalog. The catalog
+/// stores only a domain- and pane-bound verifier. This value deliberately does
+/// not implement `Clone`, `Copy`, serialization, or byte-revealing `Debug`.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct BrokerPaneRecoverySecretV1([u8; BROKER_PANE_RECOVERY_SECRET_BYTES]);
+
+impl BrokerPaneRecoverySecretV1 {
+    fn generate() -> Result<Self, BrokerError> {
+        let mut bytes = [0_u8; BROKER_PANE_RECOVERY_SECRET_BYTES];
+        getrandom::fill(&mut bytes).map_err(|_| BrokerError::RecoverySecretEntropy)?;
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(BrokerError::RecoverySecretEntropy);
+        }
+        Ok(Self(bytes))
+    }
+
+    fn from_wire(bytes: &[u8]) -> Result<Self, BrokerControlProtocolError> {
+        let secret: [u8; BROKER_PANE_RECOVERY_SECRET_BYTES] = bytes
+            .try_into()
+            .map_err(|_| BrokerControlProtocolError::InvalidLength)?;
+        if secret.iter().all(|byte| *byte == 0) {
+            return Err(BrokerControlProtocolError::InvalidIdentity);
+        }
+        Ok(Self(secret))
+    }
+
+    fn verifier(
+        &self,
+        identity: BrokerSpawnWalIdentityV1,
+        lease_generation: u64,
+    ) -> Result<BrokerPaneRecoveryVerifierV1, BrokerError> {
+        if lease_generation == 0 {
+            return Err(BrokerError::InvalidRecoveryVerifier);
+        }
+        let mut mac = BrokerPaneRecoveryHmacV1::new_from_slice(&self.0)
+            .map_err(|_| BrokerError::InvalidRecoveryVerifier)?;
+        update_broker_pane_recovery_scope(&mut mac, identity, lease_generation);
+        let mut verifier = [0_u8; BROKER_PANE_RECOVERY_SECRET_BYTES];
+        verifier.copy_from_slice(&mac.finalize().into_bytes());
+        if verifier.iter().all(|byte| *byte == 0) {
+            return Err(BrokerError::InvalidRecoveryVerifier);
+        }
+        Ok(BrokerPaneRecoveryVerifierV1(verifier))
+    }
+
+    fn as_wire(&self) -> &[u8; BROKER_PANE_RECOVERY_SECRET_BYTES] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BrokerPaneRecoverySecretV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BrokerPaneRecoverySecretV1([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct BrokerPaneRecoveryVerifierV1([u8; BROKER_PANE_RECOVERY_SECRET_BYTES]);
+
+impl BrokerPaneRecoveryVerifierV1 {
+    fn from_record(bytes: [u8; BROKER_PANE_RECOVERY_SECRET_BYTES]) -> Option<Self> {
+        (!bytes.iter().all(|byte| *byte == 0)).then_some(Self(bytes))
+    }
+
+    fn verifies(
+        self,
+        secret: &BrokerPaneRecoverySecretV1,
+        identity: BrokerSpawnWalIdentityV1,
+        lease_generation: u64,
+    ) -> bool {
+        if lease_generation == 0 {
+            return false;
+        }
+        let Ok(mut mac) = BrokerPaneRecoveryHmacV1::new_from_slice(&secret.0) else {
+            return false;
+        };
+        update_broker_pane_recovery_scope(&mut mac, identity, lease_generation);
+        mac.verify_slice(&self.0).is_ok()
+    }
+
+    const fn into_bytes(self) -> [u8; BROKER_PANE_RECOVERY_SECRET_BYTES] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for BrokerPaneRecoveryVerifierV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BrokerPaneRecoveryVerifierV1([REDACTED])")
+    }
+}
+
+fn update_broker_pane_recovery_scope(
+    mac: &mut BrokerPaneRecoveryHmacV1,
+    identity: BrokerSpawnWalIdentityV1,
+    lease_generation: u64,
+) {
+    mac.update(BROKER_PANE_RECOVERY_VERIFIER_DOMAIN);
+    mac.update(identity.broker_lineage_id.as_bytes());
+    mac.update(identity.journal_id.as_bytes());
+    mac.update(identity.mux_incarnation.as_bytes());
+    mac.update(identity.durable_pane_id.as_bytes());
+    mac.update(identity.spawn_effect_id.as_bytes());
+    mac.update(identity.origin_request_id.as_bytes());
+    mac.update(&identity.spawn_payload_bytes.to_le_bytes());
+    mac.update(&identity.spawn_payload_digest);
+    mac.update(&identity.binding_digest);
+    mac.update(&lease_generation.to_le_bytes());
+}
 
 #[cfg(test)]
 fn record_broker_exec_bootstrap_test_stage(stage: &str) {
@@ -1383,7 +1501,7 @@ impl BrokerControlRequestHeaderV1 {
                     && !self.operation_id.is_nil()
                     && payload_bytes > 0
             }
-            BrokerControlOperationV1::QueryEffect | BrokerControlOperationV1::AcknowledgeEffect => {
+            BrokerControlOperationV1::QueryEffect => {
                 // Generation zero is reserved for querying or acknowledging
                 // the pre-lease Spawn effect. Once a pane lease exists, the
                 // exact nonzero generation fences every other effect receipt.
@@ -1391,6 +1509,13 @@ impl BrokerControlRequestHeaderV1 {
                     && !self.durable_pane_id.is_nil()
                     && !self.operation_id.is_nil()
                     && payload_bytes == 0
+            }
+            BrokerControlOperationV1::AcknowledgeEffect => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && self.lease_generation == 0
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
             }
             BrokerControlOperationV1::AttachSuccessor | BrokerControlOperationV1::ClosePane => {
                 !self.broker_incarnation.is_nil()
@@ -1552,11 +1677,14 @@ impl BrokerControlResponseHeaderV1 {
                 pane_scoped
                     && self.output_sequence_start == 0
                     && self.output_sequence_end == 0
-                    && payload_bytes == 0
-                    && ((successful && self.lease_generation == 1 && self.child_identity.is_some())
+                    && ((successful
+                        && self.lease_generation == 1
+                        && self.child_identity.is_some()
+                        && matches!(payload_bytes, 0 | BROKER_PANE_RECOVERY_SECRET_BYTES))
                         || (unsuccessful
                             && self.lease_generation == 0
-                            && self.child_identity.is_none()))
+                            && self.child_identity.is_none()
+                            && payload_bytes == 0))
             }
             BrokerControlOperationV1::QueryEffect => {
                 pane_scoped
@@ -1566,6 +1694,10 @@ impl BrokerControlResponseHeaderV1 {
                         && payload_bytes == 0
                         && ((self.lease_generation == 0 && self.child_identity.is_some())
                             || (self.lease_generation > 0 && self.child_identity.is_none())))
+                        || (successful
+                            && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
+                            && self.lease_generation == 0
+                            && self.child_identity.is_some())
                         || (self.status == BrokerControlResponseStatusV1::Quarantined
                             && self.lease_generation == 0
                             && self.child_identity.is_none()
@@ -2384,6 +2516,7 @@ enum BrokerSpawnWorkerOutcomeV1 {
         journal: BrokerSpawnJournalV1,
         adoption: Box<BrokerAdoptionV1>,
         spawn_observed: BrokerSpawnWalReceiptV1,
+        recovery_secret: BrokerPaneRecoverySecretV1,
     },
     Reconciled {
         journal: BrokerSpawnJournalV1,
@@ -2412,6 +2545,7 @@ struct BrokerSpawnWorkerCompletionV1 {
 struct BrokerSpawnAckFingerprintV1 {
     spawn: BrokerSpawnWorkerFingerprintV1,
     ack_id: Uuid,
+    recovery_verifier: BrokerPaneRecoveryVerifierV1,
 }
 
 struct BrokerSpawnAckWorkerJobV1 {
@@ -2426,18 +2560,22 @@ impl BrokerSpawnAckWorkerJobV1 {
         retained: Box<BrokerSpawnWorkerCompletionV1>,
         token_effect_lease: GuardianTokenEffectLease,
     ) -> Result<Self, Box<BrokerSpawnWorkerCompletionV1>> {
-        if ack_id.is_nil()
-            || !matches!(
-                &retained.outcome,
-                BrokerSpawnWorkerOutcomeV1::Applied { .. }
-            )
-        {
+        let Some(recovery_verifier) = (match &retained.outcome {
+            BrokerSpawnWorkerOutcomeV1::Applied { journal, .. } => {
+                journal.status().recovery_verifier
+            }
+            _ => None,
+        }) else {
+            return Err(retained);
+        };
+        if ack_id.is_nil() {
             return Err(retained);
         }
         Ok(Self {
             fingerprint: BrokerSpawnAckFingerprintV1 {
                 spawn: retained.fingerprint,
                 ack_id,
+                recovery_verifier,
             },
             retained,
             token_effect_lease,
@@ -2581,6 +2719,24 @@ impl BrokerSpawnWorkerStateV1 {
                 };
             }
         };
+        let recovery_secret = match BrokerPaneRecoverySecretV1::generate() {
+            Ok(secret) => secret,
+            Err(error) => {
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: None,
+                    error: BrokerSpawnWorkerFailureV1::Broker(error),
+                };
+            }
+        };
+        let recovery_verifier = match recovery_secret.verifier(identity, 1) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                return BrokerSpawnWorkerOutcomeV1::FailedBeforeDurableAttempt {
+                    journal: None,
+                    error: BrokerSpawnWorkerFailureV1::Broker(error),
+                };
+            }
+        };
         let mut journal = match self
             .spawn_catalog
             .create_spawn_journal(identity, self.spawn_authenticator.clone())
@@ -2636,11 +2792,12 @@ impl BrokerSpawnWorkerStateV1 {
             binding,
             catalog_candidate_checksum,
         };
-        let outcome = match prepared.commit_with_exec_barrier_wal_proof(
+        let outcome = match prepared.commit_with_exec_barrier_wal_proof_and_recovery(
             control,
             &proof,
             &mut journal,
             attempt_id,
+            recovery_verifier,
             &self.exec_launch,
         ) {
             Ok(BrokerDurableExecBarrierCommitV1::Applied {
@@ -2650,6 +2807,7 @@ impl BrokerSpawnWorkerStateV1 {
                 journal,
                 adoption,
                 spawn_observed,
+                recovery_secret,
             },
             Ok(BrokerDurableExecBarrierCommitV1::Reconciled(status)) => {
                 BrokerSpawnWorkerOutcomeV1::Reconciled { journal, status }
@@ -3178,6 +3336,7 @@ struct BrokerLiveSpawnV1 {
     ack_id: Uuid,
     journal: BrokerSpawnJournalV1,
     adoption: Box<BrokerAdoptionV1>,
+    recovery_verifier: BrokerPaneRecoveryVerifierV1,
     last_lease_mux_incarnation: Uuid,
 }
 
@@ -3204,6 +3363,8 @@ impl BrokerLiveSpawnV1 {
                     ..
                 } if journal.status().phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
                     && journal.status().reply_ack_id == Some(completion.fingerprint.ack_id)
+                    && journal.status().recovery_verifier
+                        == Some(completion.fingerprint.recovery_verifier)
                     && journal.status().child_identity
                         == Some(adoption.pane.kernel_child_identity())
                     && acknowledgement.sequence().checked_add(1)
@@ -3228,14 +3389,35 @@ impl BrokerLiveSpawnV1 {
             BrokerSpawnWorkerOutcomeV1::Applied {
                 journal,
                 adoption,
-                spawn_observed: _,
-            } => Ok(Self {
-                fingerprint,
-                ack_id: acknowledgement_fingerprint.ack_id,
-                journal,
-                adoption,
-                last_lease_mux_incarnation: fingerprint.binding.mux_incarnation,
-            }),
+                spawn_observed,
+                recovery_secret,
+            } => {
+                let Some(recovery_verifier) = journal.status().recovery_verifier else {
+                    return Err(Box::new(BrokerSpawnAckWorkerCompletionV1 {
+                        fingerprint: acknowledgement_fingerprint,
+                        retained: Box::new(BrokerSpawnWorkerCompletionV1 {
+                            fingerprint,
+                            outcome: BrokerSpawnWorkerOutcomeV1::Applied {
+                                journal,
+                                adoption,
+                                spawn_observed,
+                                recovery_secret,
+                            },
+                            token_authority_failed: retained_token_authority_failed,
+                        }),
+                        result,
+                        token_authority_failed,
+                    }));
+                };
+                Ok(Self {
+                    fingerprint,
+                    ack_id: acknowledgement_fingerprint.ack_id,
+                    journal,
+                    adoption,
+                    recovery_verifier,
+                    last_lease_mux_incarnation: fingerprint.binding.mux_incarnation,
+                })
+            }
             outcome => Err(Box::new(BrokerSpawnAckWorkerCompletionV1 {
                 fingerprint: acknowledgement_fingerprint,
                 retained: Box::new(BrokerSpawnWorkerCompletionV1 {
@@ -4198,6 +4380,7 @@ impl BrokerControlServiceV1 {
                     BrokerControlResponseStatusV1::Recovered,
                     live.adoption.pane.kernel_child_identity(),
                     pane_status.lease_generation,
+                    None,
                 )
             } else if pane_status.lifecycle == BrokerPaneLifecycleV1::AwaitingSuccessor
                 && live.last_lease_mux_incarnation == owner.mux_incarnation
@@ -4230,13 +4413,17 @@ impl BrokerControlServiceV1 {
                 .map_err(|_| ());
             }
             return match &retained.outcome {
-                BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } => self
-                    .successful_spawn_response(
-                        request.header,
-                        BrokerControlResponseStatusV1::Recovered,
-                        adoption.pane.kernel_child_identity(),
-                        1,
-                    ),
+                BrokerSpawnWorkerOutcomeV1::Applied {
+                    adoption,
+                    recovery_secret,
+                    ..
+                } => self.successful_spawn_response(
+                    request.header,
+                    BrokerControlResponseStatusV1::Recovered,
+                    adoption.pane.kernel_child_identity(),
+                    1,
+                    Some(recovery_secret),
+                ),
                 _ => BrokerControlResponseV1::new(
                     self.response_header(
                         request.header,
@@ -4333,11 +4520,16 @@ impl BrokerControlServiceV1 {
         status: BrokerControlResponseStatusV1,
         child_identity: BrokerKernelChildIdentityV1,
         lease_generation: u64,
+        recovery_secret: Option<&BrokerPaneRecoverySecretV1>,
     ) -> Result<BrokerControlResponseV1, ()> {
         let mut header = self.response_header(request, status);
         header.lease_generation = lease_generation;
         header.child_identity = Some(child_identity);
-        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+        BrokerControlResponseV1::new(
+            header,
+            recovery_secret.map_or(&[][..], |secret| secret.as_wire().as_slice()),
+        )
+        .map_err(|_| ())
     }
 
     fn dispatch_spawn_acknowledgement(
@@ -4348,6 +4540,16 @@ impl BrokerControlServiceV1 {
         let durable_pane_id = request.header.durable_pane_id;
         let spawn_effect_id = request.header.operation_id;
         let ack_id = request.header.request_id;
+        let recovery_secret = match BrokerPaneRecoverySecretV1::from_wire(request.payload()) {
+            Ok(secret) => secret,
+            Err(_) => {
+                return BrokerControlResponseV1::new(
+                    self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+        };
 
         if let Some(live) = self.live_spawns.get(&durable_pane_id)
             && live.fingerprint.binding.mux_incarnation == owner.mux_incarnation
@@ -4357,6 +4559,9 @@ impl BrokerControlServiceV1 {
                 && live.ack_id == ack_id
                 && journal_status.phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
                 && journal_status.reply_ack_id == Some(ack_id)
+                && live
+                    .recovery_verifier
+                    .verifies(&recovery_secret, live.journal.identity(), 1)
             {
                 BrokerControlResponseStatusV1::Recovered
             } else {
@@ -4373,7 +4578,18 @@ impl BrokerControlServiceV1 {
                 let namespace_conflict = active.spawn.binding.durable_pane_id == durable_pane_id
                     || active.spawn.binding.spawn_effect_id == spawn_effect_id;
                 if exact_effect || namespace_conflict {
-                    let status = if exact_effect && active.ack_id == ack_id {
+                    let recovery_identity = BrokerSpawnWalIdentityV1::from_binding(
+                        active.spawn.journal_id,
+                        self.broker_lineage_id,
+                        active.spawn.binding,
+                    );
+                    let status = if exact_effect
+                        && active.ack_id == ack_id
+                        && recovery_identity.is_ok_and(|identity| {
+                            active
+                                .recovery_verifier
+                                .verifies(&recovery_secret, identity, 1)
+                        }) {
                         BrokerControlResponseStatusV1::Retryable
                     } else {
                         BrokerControlResponseStatusV1::Quarantined
@@ -4419,6 +4635,24 @@ impl BrokerControlServiceV1 {
                     BrokerSpawnWorkerOutcomeV1::Applied { .. }
                 )
             {
+                return BrokerControlResponseV1::new(
+                    self.response_header(
+                        request.header,
+                        BrokerControlResponseStatusV1::Quarantined,
+                    ),
+                    &[],
+                )
+                .map_err(|_| ());
+            }
+            let recovery_is_exact = match &retained.outcome {
+                BrokerSpawnWorkerOutcomeV1::Applied { journal, .. } => {
+                    journal.status().recovery_verifier.is_some_and(|verifier| {
+                        verifier.verifies(&recovery_secret, journal.identity(), 1)
+                    })
+                }
+                _ => false,
+            };
+            if !recovery_is_exact {
                 return BrokerControlResponseV1::new(
                     self.response_header(
                         request.header,
@@ -4554,6 +4788,9 @@ impl BrokerControlServiceV1 {
         ) {
             let response_status = if status.phase == Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
                 && status.reply_ack_id == Some(ack_id)
+                && status
+                    .recovery_verifier
+                    .is_some_and(|verifier| verifier.verifies(&recovery_secret, status.identity, 1))
             {
                 BrokerControlResponseStatusV1::Recovered
             } else {
@@ -4744,13 +4981,18 @@ impl BrokerControlServiceV1 {
                     .map_err(|_| ());
                 }
                 return match &retained.outcome {
-                    BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } => {
+                    BrokerSpawnWorkerOutcomeV1::Applied {
+                        adoption,
+                        recovery_secret,
+                        ..
+                    } => {
                         let mut header = self.response_header(
                             request.header,
                             BrokerControlResponseStatusV1::Recovered,
                         );
                         header.child_identity = Some(adoption.pane.kernel_child_identity());
-                        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+                        BrokerControlResponseV1::new(header, recovery_secret.as_wire())
+                            .map_err(|_| ())
                     }
                     _ => BrokerControlResponseV1::new(
                         self.response_header(
@@ -5112,6 +5354,64 @@ pub enum BrokerSpawnEffectQueryV1 {
     RecoveredWithoutPty(BrokerCensusEntryV1),
 }
 
+/// Authenticated pre-acknowledgement result that carries the one plaintext
+/// recovery capability for a newly spawned pane.
+///
+/// The broker can replay this exact capability while the Spawn result remains
+/// unacknowledged. A successful acknowledgement durably proves that the mux
+/// received it; the broker then drops its plaintext copy and retains only the
+/// verifier.
+pub struct BrokerInitialPaneClaimV1 {
+    durable_pane_id: Uuid,
+    spawn_effect_id: Uuid,
+    child_identity: BrokerKernelChildIdentityV1,
+    recovery_secret: BrokerPaneRecoverySecretV1,
+}
+
+impl BrokerInitialPaneClaimV1 {
+    #[must_use]
+    pub const fn durable_pane_id(&self) -> Uuid {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn spawn_effect_id(&self) -> Uuid {
+        self.spawn_effect_id
+    }
+
+    #[must_use]
+    pub const fn child_identity(&self) -> BrokerKernelChildIdentityV1 {
+        self.child_identity
+    }
+
+    #[must_use]
+    pub const fn recovery_secret(&self) -> &BrokerPaneRecoverySecretV1 {
+        &self.recovery_secret
+    }
+}
+
+impl std::fmt::Debug for BrokerInitialPaneClaimV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerInitialPaneClaimV1")
+            .field("durable_pane_id", &self.durable_pane_id)
+            .field("spawn_effect_id", &self.spawn_effect_id)
+            .field("child_identity", &self.child_identity)
+            .field("recovery_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum BrokerSpawnClaimQueryV1 {
+    Absent,
+    Pending,
+    Claim(BrokerInitialPaneClaimV1),
+    Acknowledged { lease_generation: u64 },
+    Quarantined,
+    RecoveredWithoutPty(BrokerCensusEntryV1),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrokerSpawnEffectAcknowledgementV1 {
     Absent,
@@ -5251,8 +5551,12 @@ impl BrokerControlClientV1 {
     /// one asynchronous Spawn to the broker durability worker.
     ///
     /// `Pending` means the authenticated effect is owned by the broker and
-    /// must be recovered with `query_spawn_effect`; it does not authorize a
-    /// second Spawn. A fast exact retry may instead recover `Applied` directly.
+    /// must be recovered with `query_spawn_claim`; it does not authorize a
+    /// second Spawn. A fast exact retry may instead recover `Applied` directly,
+    /// but the caller must still obtain and durably protect the capability with
+    /// `query_spawn_claim` before acknowledging the Spawn. The status-only
+    /// `query_spawn_effect` API deliberately destroys any plaintext capability
+    /// returned on the wire.
     pub(crate) fn spawn_from_published_admission(
         &mut self,
         permit: GuardianPublishedGenesisAdmissionPermitV1,
@@ -5296,8 +5600,17 @@ impl BrokerControlClientV1 {
                 })
             }
             BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
-                if response.payload().is_empty() && response.header.child_identity.is_some() =>
+                if matches!(
+                    response.payload().len(),
+                    0 | BROKER_PANE_RECOVERY_SECRET_BYTES
+                ) && response.header.child_identity.is_some() =>
             {
+                if !response.payload().is_empty() {
+                    drop(
+                        BrokerPaneRecoverySecretV1::from_wire(response.payload())
+                            .map_err(|_| BrokerControlClientError::Protocol)?,
+                    );
+                }
                 Ok(BrokerSpawnSubmissionV1::Applied {
                     durable_pane_id: binding.durable_pane_id,
                     spawn_effect_id: binding.spawn_effect_id,
@@ -5325,12 +5638,16 @@ impl BrokerControlClientV1 {
     ///
     /// The caller owns `ack_id` and must reuse it after any lost reply. A
     /// `Pending` response means the worker owns the retained pane authority;
-    /// exact retries remain inert until `Acknowledged` is recovered.
+    /// exact retries remain inert until `Acknowledged` is recovered. The
+    /// recovery capability must already be stored durably by the caller: a
+    /// successful acknowledgement causes the broker to destroy its plaintext
+    /// copy and retain only the authenticated verifier.
     pub fn acknowledge_spawn_effect(
         &mut self,
         durable_pane_id: Uuid,
         spawn_effect_id: Uuid,
         ack_id: Uuid,
+        recovery_secret: &BrokerPaneRecoverySecretV1,
     ) -> Result<BrokerSpawnEffectAcknowledgementV1, BrokerControlClientError> {
         if durable_pane_id.is_nil() || spawn_effect_id.is_nil() || ack_id.is_nil() {
             return Err(BrokerControlClientError::UnexpectedResponse);
@@ -5349,7 +5666,7 @@ impl BrokerControlClientV1 {
                 lease_generation: 0,
                 operation_id: spawn_effect_id,
             },
-            &[],
+            recovery_secret.as_wire(),
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
         let response = self.exchange(&request)?;
@@ -5420,8 +5737,13 @@ impl BrokerControlClientV1 {
                 })
             }
             BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
-                if response.payload().is_empty() && response.header.child_identity.is_some() =>
+                if response.payload().len() == BROKER_PANE_RECOVERY_SECRET_BYTES
+                    && response.header.child_identity.is_some() =>
             {
+                drop(
+                    BrokerPaneRecoverySecretV1::from_wire(response.payload())
+                        .map_err(|_| BrokerControlClientError::Protocol)?,
+                );
                 Ok(BrokerSpawnEffectQueryV1::Applied(
                     response
                         .header
@@ -5443,6 +5765,94 @@ impl BrokerControlClientV1 {
                     return Err(BrokerControlClientError::UnexpectedResponse);
                 }
                 Ok(BrokerSpawnEffectQueryV1::RecoveredWithoutPty(entry))
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Recover the exact pre-acknowledgement Spawn result together with its
+    /// server-minted pane recovery capability.
+    ///
+    /// The caller must retain the returned claim across acknowledgement reply
+    /// loss and must durably protect the capability before acknowledging the
+    /// Spawn. Once acknowledgement succeeds, the broker destroys its
+    /// plaintext copy and cannot reissue it.
+    pub fn query_spawn_claim(
+        &mut self,
+        durable_pane_id: Uuid,
+        spawn_effect_id: Uuid,
+    ) -> Result<BrokerSpawnClaimQueryV1, BrokerControlClientError> {
+        if durable_pane_id.is_nil() || spawn_effect_id.is_nil() {
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryEffect,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id,
+                lease_generation: 0,
+                operation_id: spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange(&request)?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
+                Ok(BrokerSpawnClaimQueryV1::Absent)
+            }
+            BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                Ok(BrokerSpawnClaimQueryV1::Pending)
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().is_empty()
+                    && response.header.child_identity.is_none()
+                    && response.header.lease_generation > 0 =>
+            {
+                Ok(BrokerSpawnClaimQueryV1::Acknowledged {
+                    lease_generation: response.header.lease_generation,
+                })
+            }
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if response.payload().len() == BROKER_PANE_RECOVERY_SECRET_BYTES
+                    && response.header.child_identity.is_some()
+                    && response.header.lease_generation == 0 =>
+            {
+                let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(response.payload())
+                    .map_err(|_| BrokerControlClientError::Protocol)?;
+                Ok(BrokerSpawnClaimQueryV1::Claim(BrokerInitialPaneClaimV1 {
+                    durable_pane_id,
+                    spawn_effect_id,
+                    child_identity: response
+                        .header
+                        .child_identity
+                        .ok_or(BrokerControlClientError::UnexpectedResponse)?,
+                    recovery_secret,
+                }))
+            }
+            BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
+                Ok(BrokerSpawnClaimQueryV1::Quarantined)
+            }
+            BrokerControlResponseStatusV1::Quarantined => {
+                let entry = BrokerCensusEntryV1::decode(response.payload())
+                    .map_err(|_| BrokerControlClientError::Protocol)?;
+                if entry.durable_pane_id != durable_pane_id
+                    || entry.spawn_effect_id != spawn_effect_id
+                    || entry.mux_incarnation != self.identity.mux_incarnation
+                {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+                Ok(BrokerSpawnClaimQueryV1::RecoveredWithoutPty(entry))
             }
             _ => {
                 self.poisoned = true;
@@ -5720,8 +6130,17 @@ impl BrokerControlClientV1 {
         match response.header.status {
             BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => Ok(None),
             BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
-                if response.payload().is_empty() =>
+                if matches!(
+                    response.payload().len(),
+                    0 | BROKER_PANE_RECOVERY_SECRET_BYTES
+                ) =>
             {
+                if !response.payload().is_empty() {
+                    drop(
+                        BrokerPaneRecoverySecretV1::from_wire(response.payload())
+                            .map_err(|_| BrokerControlClientError::Protocol)?,
+                    );
+                }
                 Err(BrokerControlClientError::SpawnPtyAvailable)
             }
             BrokerControlResponseStatusV1::Quarantined if response.payload().is_empty() => {
@@ -6429,6 +6848,7 @@ pub struct BrokerSpawnWalStatusV1 {
     pub attempt_id: Option<Uuid>,
     pub child_identity: Option<BrokerKernelChildIdentityV1>,
     pub reply_ack_id: Option<Uuid>,
+    recovery_verifier: Option<BrokerPaneRecoveryVerifierV1>,
     pub committed_records: u64,
     pub committed_wal_bytes: u64,
     pub committed_head_bytes: u64,
@@ -7149,6 +7569,7 @@ struct BrokerSpawnWalRecordState {
     operation_id: Uuid,
     attempt_id: Uuid,
     child_identity: Option<BrokerKernelChildIdentityV1>,
+    recovery_verifier: Option<BrokerPaneRecoveryVerifierV1>,
     receipt: BrokerSpawnWalReceiptV1,
 }
 
@@ -7584,6 +8005,8 @@ pub enum BrokerSpawnWalError {
     DirectoryEntryNotDurable,
     #[error("broker Spawn WAL recovery append authority is withheld")]
     RecoveryAuthorityUnavailable,
+    #[error("broker Spawn WAL could not create a pane recovery verifier")]
+    RecoveryVerifierUnavailable,
     #[error("broker Spawn WAL filesystem revalidation authority does not match")]
     FilesystemRevalidationMismatch,
     #[error("broker Spawn WAL is poisoned after an ambiguous append or sync failure")]
@@ -8017,9 +8440,16 @@ fn encode_broker_spawn_wal_record(
     operation_id: Uuid,
     attempt_id: Uuid,
     child_identity: Option<BrokerKernelChildIdentityV1>,
+    recovery_verifier: Option<BrokerPaneRecoveryVerifierV1>,
     previous_record_mac: [u8; BROKER_SPAWN_WAL_MAC_BYTES],
 ) -> Result<[u8; BROKER_SPAWN_WAL_RECORD_BYTES], BrokerSpawnWalError> {
-    validate_broker_spawn_record_fields(phase, operation_id, attempt_id, child_identity)?;
+    validate_broker_spawn_record_fields(
+        phase,
+        operation_id,
+        attempt_id,
+        child_identity,
+        recovery_verifier,
+    )?;
     let mut record = [0_u8; BROKER_SPAWN_WAL_RECORD_BYTES];
     record[0..8].copy_from_slice(&BROKER_SPAWN_WAL_RECORD_MAGIC);
     record[8..12].copy_from_slice(&BROKER_SPAWN_WAL_RECORD_BYTES_U32.to_le_bytes());
@@ -8032,14 +8462,17 @@ fn encode_broker_spawn_wal_record(
         record[72..76].copy_from_slice(&child_identity.process_id.to_le_bytes());
         record[80..112].copy_from_slice(&child_identity.kernel_start_identity_digest);
     }
-    record[112..144].copy_from_slice(&previous_record_mac);
+    if let Some(recovery_verifier) = recovery_verifier {
+        record[112..144].copy_from_slice(&recovery_verifier.into_bytes());
+    }
+    record[144..176].copy_from_slice(&previous_record_mac);
     let mut authenticated =
         [0_u8; BROKER_SPAWN_WAL_MAC_BYTES + BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES];
     authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&header_mac);
     authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
         .copy_from_slice(&record[..BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES]);
     let tag = broker_spawn_wal_authenticate(authenticator, &authenticated)?;
-    record[144..176].copy_from_slice(&tag);
+    record[176..208].copy_from_slice(&tag);
     Ok(record)
 }
 
@@ -8065,7 +8498,7 @@ fn decode_broker_spawn_wal_record(
     if sequence != expected_sequence {
         return Err(BrokerSpawnWalError::SequenceMismatch);
     }
-    if record[112..144] != expected_previous_mac {
+    if record[144..176] != expected_previous_mac {
         return Err(BrokerSpawnWalError::RecordChainMismatch);
     }
     let mut authenticated =
@@ -8073,7 +8506,7 @@ fn decode_broker_spawn_wal_record(
     authenticated[..BROKER_SPAWN_WAL_MAC_BYTES].copy_from_slice(&header_mac);
     authenticated[BROKER_SPAWN_WAL_MAC_BYTES..]
         .copy_from_slice(&record[..BROKER_SPAWN_WAL_AUTHENTICATED_RECORD_BYTES]);
-    broker_spawn_wal_verify(authenticator, &authenticated, &record[144..176])?;
+    broker_spawn_wal_verify(authenticator, &authenticated, &record[176..208])?;
 
     let phase = BrokerSpawnWalPhaseV1::from_wire(record[12])?;
     let operation_id = read_broker_uuid(&record[24..40]);
@@ -8093,14 +8526,29 @@ fn decode_broker_spawn_wal_record(
             kernel_start_identity_digest,
         })
     };
-    validate_broker_spawn_record_fields(phase, operation_id, attempt_id, child_identity)?;
-    validate_broker_spawn_record_transition(previous, phase, attempt_id, child_identity)?;
-    let record_mac = read_broker_array_32(&record[144..176]);
+    let recovery_verifier =
+        BrokerPaneRecoveryVerifierV1::from_record(read_broker_array_32(&record[112..144]));
+    validate_broker_spawn_record_fields(
+        phase,
+        operation_id,
+        attempt_id,
+        child_identity,
+        recovery_verifier,
+    )?;
+    validate_broker_spawn_record_transition(
+        previous,
+        phase,
+        attempt_id,
+        child_identity,
+        recovery_verifier,
+    )?;
+    let record_mac = read_broker_array_32(&record[176..208]);
     Ok(BrokerSpawnWalRecordState {
         phase,
         operation_id,
         attempt_id,
         child_identity,
+        recovery_verifier,
         receipt: BrokerSpawnWalReceiptV1 {
             sequence,
             phase,
@@ -8170,16 +8618,21 @@ fn validate_broker_spawn_record_fields(
     operation_id: Uuid,
     attempt_id: Uuid,
     child_identity: Option<BrokerKernelChildIdentityV1>,
+    recovery_verifier: Option<BrokerPaneRecoveryVerifierV1>,
 ) -> Result<(), BrokerSpawnWalError> {
     if operation_id.is_nil() {
         return Err(BrokerSpawnWalError::NonCanonicalRecord);
     }
     match phase {
-        BrokerSpawnWalPhaseV1::Intent if attempt_id.is_nil() && child_identity.is_none() => {}
+        BrokerSpawnWalPhaseV1::Intent
+            if attempt_id.is_nil() && child_identity.is_none() && recovery_verifier.is_none() => {}
         BrokerSpawnWalPhaseV1::Attempted
-            if !attempt_id.is_nil() && operation_id == attempt_id && child_identity.is_none() => {}
+            if !attempt_id.is_nil()
+                && operation_id == attempt_id
+                && child_identity.is_none()
+                && recovery_verifier.is_none() => {}
         BrokerSpawnWalPhaseV1::SpawnObserved | BrokerSpawnWalPhaseV1::ReplyAcknowledged
-            if !attempt_id.is_nil() && child_identity.is_some() =>
+            if !attempt_id.is_nil() && child_identity.is_some() && recovery_verifier.is_some() =>
         {
             child_identity.expect("checked child identity").validate()?;
         }
@@ -8193,6 +8646,7 @@ fn validate_broker_spawn_record_transition(
     phase: BrokerSpawnWalPhaseV1,
     attempt_id: Uuid,
     child_identity: Option<BrokerKernelChildIdentityV1>,
+    recovery_verifier: Option<BrokerPaneRecoveryVerifierV1>,
 ) -> Result<(), BrokerSpawnWalError> {
     match (previous, phase) {
         (None, BrokerSpawnWalPhaseV1::Intent) => Ok(()),
@@ -8203,14 +8657,16 @@ fn validate_broker_spawn_record_transition(
         }
         (Some(previous), BrokerSpawnWalPhaseV1::SpawnObserved)
             if previous.phase == BrokerSpawnWalPhaseV1::Attempted
-                && previous.attempt_id == attempt_id =>
+                && previous.attempt_id == attempt_id
+                && recovery_verifier.is_some() =>
         {
             Ok(())
         }
         (Some(previous), BrokerSpawnWalPhaseV1::ReplyAcknowledged)
             if previous.phase == BrokerSpawnWalPhaseV1::SpawnObserved
                 && previous.attempt_id == attempt_id
-                && previous.child_identity == child_identity =>
+                && previous.child_identity == child_identity
+                && previous.recovery_verifier == recovery_verifier =>
         {
             Ok(())
         }
@@ -10054,6 +10510,7 @@ impl BrokerSpawnJournalV1 {
             reply_ack_id: terminal
                 .filter(|record| record.phase == BrokerSpawnWalPhaseV1::ReplyAcknowledged)
                 .map(|record| record.operation_id),
+            recovery_verifier: terminal.and_then(|record| record.recovery_verifier),
             committed_records: u64::try_from(self.records.len()).unwrap_or(u64::MAX),
             committed_wal_bytes: self.committed_wal_bytes,
             committed_head_bytes: self.committed_head_bytes,
@@ -10404,6 +10861,7 @@ impl BrokerSpawnJournalV1 {
             self.identity.origin_request_id,
             Uuid::nil(),
             None,
+            None,
         )
     }
 
@@ -10426,6 +10884,7 @@ impl BrokerSpawnJournalV1 {
                     BrokerSpawnWalPhaseV1::Attempted,
                     attempt_id,
                     attempt_id,
+                    None,
                     None,
                 )?;
                 Ok(BrokerSpawnAttemptAdmissionV1::Authorized(
@@ -10455,9 +10914,23 @@ impl BrokerSpawnJournalV1 {
     /// callback returned. Failure after the callback leaves Attempt durable and
     /// permanently ambiguous; the caller still owns the callback's returned
     /// value and must retain/quarantine it rather than retrying Spawn.
+    #[cfg(test)]
     pub fn append_spawn_observed_and_sync(
         &mut self,
         observation: BrokerSpawnObservationPermitV1,
+    ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
+        let recovery_secret = BrokerPaneRecoverySecretV1::generate()
+            .map_err(|_| BrokerSpawnWalError::RecoveryVerifierUnavailable)?;
+        let recovery_verifier = recovery_secret
+            .verifier(observation.identity, 1)
+            .map_err(|_| BrokerSpawnWalError::RecoveryVerifierUnavailable)?;
+        self.append_spawn_observed_with_recovery_and_sync(observation, recovery_verifier)
+    }
+
+    fn append_spawn_observed_with_recovery_and_sync(
+        &mut self,
+        observation: BrokerSpawnObservationPermitV1,
+        recovery_verifier: BrokerPaneRecoveryVerifierV1,
     ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
         observation.child_identity.validate()?;
         if observation.identity != self.identity {
@@ -10481,6 +10954,7 @@ impl BrokerSpawnJournalV1 {
                     observation.attempt_id,
                     observation.attempt_id,
                     Some(observation.child_identity),
+                    Some(recovery_verifier),
                 ),
             Some(record)
                 if matches!(
@@ -10489,7 +10963,11 @@ impl BrokerSpawnJournalV1 {
                 ) && record.attempt_id == observation.attempt_id
                     && record.child_identity == Some(observation.child_identity) =>
             {
-                Ok(record.receipt)
+                if record.recovery_verifier == Some(recovery_verifier) {
+                    Ok(record.receipt)
+                } else {
+                    Err(BrokerSpawnWalError::EffectIdentityConflict)
+                }
             }
             Some(_) => Err(BrokerSpawnWalError::EffectIdentityConflict),
             None => Err(BrokerSpawnWalError::InvalidTransition),
@@ -10519,6 +10997,7 @@ impl BrokerSpawnJournalV1 {
                     ack_id,
                     record.attempt_id,
                     Some(child_identity),
+                    record.recovery_verifier,
                 )
             }
             Some(record)
@@ -10539,11 +11018,24 @@ impl BrokerSpawnJournalV1 {
         operation_id: Uuid,
         attempt_id: Uuid,
         child_identity: Option<BrokerKernelChildIdentityV1>,
+        recovery_verifier: Option<BrokerPaneRecoveryVerifierV1>,
     ) -> Result<BrokerSpawnWalReceiptV1, BrokerSpawnWalError> {
         self.require_append_authority()?;
         let previous = self.records.last().copied();
-        validate_broker_spawn_record_transition(previous, phase, attempt_id, child_identity)?;
-        validate_broker_spawn_record_fields(phase, operation_id, attempt_id, child_identity)?;
+        validate_broker_spawn_record_transition(
+            previous,
+            phase,
+            attempt_id,
+            child_identity,
+            recovery_verifier,
+        )?;
+        validate_broker_spawn_record_fields(
+            phase,
+            operation_id,
+            attempt_id,
+            child_identity,
+            recovery_verifier,
+        )?;
         let sequence = u64::try_from(self.records.len())
             .map_err(|_| BrokerSpawnWalError::CapacityExhausted)?;
         let previous_record_mac =
@@ -10556,9 +11048,10 @@ impl BrokerSpawnJournalV1 {
             operation_id,
             attempt_id,
             child_identity,
+            recovery_verifier,
             previous_record_mac,
         )?;
-        let record_mac = read_broker_array_32(&wal_record[144..176]);
+        let record_mac = read_broker_array_32(&wal_record[176..208]);
         let head_record = encode_broker_spawn_head_record(
             self.head_header_mac,
             &self.authenticator,
@@ -10621,6 +11114,7 @@ impl BrokerSpawnJournalV1 {
             operation_id,
             attempt_id,
             child_identity,
+            recovery_verifier,
             receipt,
         });
         self.committed_wal_bytes = projected_wal_bytes;
@@ -11507,6 +12001,7 @@ impl BrokerPreparedPaneV1 {
     /// that record is durable, all exits are explicit reconciled or
     /// indeterminate outcomes that retain any adopted pane rather than an
     /// ordinary error path that could drop the sole PTY/child authority.
+    #[cfg(test)]
     pub(crate) fn commit_after_durable_pre_spawn_intent_with_wal(
         self,
         control: BrokerControlLeaseV1,
@@ -11521,6 +12016,7 @@ impl BrokerPreparedPaneV1 {
     /// Execute the production Spawn ordering through a same-binary child
     /// barrier: Ready, Prepare, and Prepared precede kernel observation;
     /// authenticated Release follows a synchronized SpawnObserved record.
+    #[cfg(test)]
     pub(crate) fn commit_after_durable_pre_spawn_intent_with_exec_barrier(
         self,
         control: BrokerControlLeaseV1,
@@ -11533,12 +12029,34 @@ impl BrokerPreparedPaneV1 {
         self.commit_with_exec_barrier_wal_proof(control, &proof, journal, attempt_id, launch)
     }
 
+    #[cfg(test)]
     fn commit_with_exec_barrier_wal_proof(
         self,
         control: BrokerControlLeaseV1,
         proof: &BrokerDurablePreSpawnIntentProof,
         journal: &mut BrokerSpawnJournalV1,
         attempt_id: Uuid,
+        launch: &BrokerExecBootstrapLaunchV1,
+    ) -> Result<BrokerDurableExecBarrierCommitV1, BrokerDurableSpawnCommitErrorV1> {
+        let recovery_secret = BrokerPaneRecoverySecretV1::generate()?;
+        let recovery_verifier = recovery_secret.verifier(journal.identity(), 1)?;
+        self.commit_with_exec_barrier_wal_proof_and_recovery(
+            control,
+            proof,
+            journal,
+            attempt_id,
+            recovery_verifier,
+            launch,
+        )
+    }
+
+    fn commit_with_exec_barrier_wal_proof_and_recovery(
+        self,
+        control: BrokerControlLeaseV1,
+        proof: &BrokerDurablePreSpawnIntentProof,
+        journal: &mut BrokerSpawnJournalV1,
+        attempt_id: Uuid,
+        recovery_verifier: BrokerPaneRecoveryVerifierV1,
         launch: &BrokerExecBootstrapLaunchV1,
     ) -> Result<BrokerDurableExecBarrierCommitV1, BrokerDurableSpawnCommitErrorV1> {
         self.validate_commit_preflight(&control, proof)?;
@@ -11641,7 +12159,9 @@ impl BrokerPreparedPaneV1 {
             BrokerSpawnAttemptExecutionV1::EffectSucceeded {
                 value: pending,
                 observation,
-            } => match journal.append_spawn_observed_and_sync(*observation) {
+            } => match journal
+                .append_spawn_observed_with_recovery_and_sync(*observation, recovery_verifier)
+            {
                 Ok(spawn_observed) => {
                     let mut pending = pending;
                     match pending.release() {
@@ -11848,6 +12368,7 @@ impl BrokerPreparedPaneV1 {
         })
     }
 
+    #[cfg(test)]
     fn commit_with_wal_proof(
         self,
         control: BrokerControlLeaseV1,
@@ -13182,6 +13703,10 @@ pub enum BrokerError {
     ExecBootstrapHandshakeFailed(BrokerExecBootstrapHandshakeStageV1),
     #[error("broker child did not expose an exact process identity")]
     ChildIdentityUnavailable,
+    #[error("broker could not obtain entropy for a pane recovery capability")]
+    RecoverySecretEntropy,
+    #[error("broker pane recovery verifier is invalid or does not match the capability")]
+    InvalidRecoveryVerifier,
     #[error("conflicting authenticated control EOF quarantined the pane")]
     ConflictingControlEof,
     #[error("conflicting successor handoff quarantined the pane")]
@@ -14456,10 +14981,14 @@ mod tests {
             );
         }
 
-        for operation in [
-            BrokerControlOperationV1::QueryEffect,
-            BrokerControlOperationV1::AcknowledgeEffect,
-        ] {
+        let pre_lease_operations: [(BrokerControlOperationV1, &[u8]); 2] = [
+            (BrokerControlOperationV1::QueryEffect, &[]),
+            (
+                BrokerControlOperationV1::AcknowledgeEffect,
+                &[0x73; BROKER_PANE_RECOVERY_SECRET_BYTES],
+            ),
+        ];
+        for (operation, payload) in pre_lease_operations {
             BrokerControlRequestV1::new(
                 BrokerControlRequestHeaderV1 {
                     operation,
@@ -14474,10 +15003,29 @@ mod tests {
                     lease_generation: 0,
                     operation_id: id(710),
                 },
-                &[],
+                payload,
             )
             .expect("generation zero is reserved for the pre-lease Spawn receipt");
         }
+        assert!(matches!(
+            BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation: BrokerControlOperationV1::AcknowledgeEffect,
+                    request_id: id(709),
+                    broker_incarnation: id(705),
+                    guardian_incarnation: id(702),
+                    connection_id: id(703),
+                    mux_incarnation: id(704),
+                    guardian_build_identity_digest: [0x71; 32],
+                    mux_build_identity_digest: [0x72; 32],
+                    durable_pane_id: id(707),
+                    lease_generation: 0,
+                    operation_id: id(710),
+                },
+                &[],
+            ),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
 
         let child_identity = BrokerKernelChildIdentityV1 {
             process_id: 711,
@@ -17329,6 +17877,7 @@ mod tests {
                 journal,
                 adoption,
                 spawn_observed,
+                ..
             } => {
                 assert_eq!(spawn_observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
                 assert_eq!(
@@ -17617,6 +18166,14 @@ mod tests {
             BrokerSpawnEffectQueryV1::Applied(child_identity),
             "recovered-only compatibility result poisoned the live Spawn connection"
         );
+        let initial_claim = match client
+            .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
+            .expect("recover the initial pane claim and recovery capability")
+        {
+            BrokerSpawnClaimQueryV1::Claim(claim) => claim,
+            outcome => panic!("control Spawn did not expose its initial claim: {outcome:?}"),
+        };
+        assert_eq!(initial_claim.child_identity(), child_identity);
         let other_mux_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_311),
             id(7_312),
@@ -17643,15 +18200,35 @@ mod tests {
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_313),
+                    initial_claim.recovery_secret(),
                 )
                 .expect("acknowledge another mux's live Spawn identity"),
             BrokerSpawnEffectAcknowledgementV1::Absent
         );
         drop(other_mux_client);
         let ack_id = id(7_308);
+        let forged_recovery_secret =
+            BrokerPaneRecoverySecretV1::from_wire(&[0xa5; BROKER_PANE_RECOVERY_SECRET_BYTES])
+                .expect("construct nonzero forged recovery capability");
         assert_eq!(
             client
-                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id,)
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    ack_id,
+                    &forged_recovery_secret,
+                )
+                .expect("reject forged pane recovery capability"),
+            BrokerSpawnEffectAcknowledgementV1::Quarantined
+        );
+        assert_eq!(
+            client
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    ack_id,
+                    initial_claim.recovery_secret(),
+                )
                 .expect("submit asynchronous Spawn acknowledgement"),
             BrokerSpawnEffectAcknowledgementV1::Pending
         );
@@ -17661,26 +18238,42 @@ mod tests {
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_309),
+                    initial_claim.recovery_secret(),
                 )
                 .expect("reject mutated Spawn acknowledgement identity"),
             BrokerSpawnEffectAcknowledgementV1::Quarantined
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(binding.durable_pane_id, id(7_314), ack_id,)
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    id(7_314),
+                    ack_id,
+                    initial_claim.recovery_secret(),
+                )
                 .expect("reject acknowledgement with a conflicting effect namespace"),
             BrokerSpawnEffectAcknowledgementV1::Quarantined
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(id(7_315), binding.spawn_effect_id, ack_id)
+                .acknowledge_spawn_effect(
+                    id(7_315),
+                    binding.spawn_effect_id,
+                    ack_id,
+                    initial_claim.recovery_secret(),
+                )
                 .expect("reject acknowledgement with a conflicting pane namespace"),
             BrokerSpawnEffectAcknowledgementV1::Quarantined
         );
         let ack_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match client
-                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id)
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    ack_id,
+                    initial_claim.recovery_secret(),
+                )
                 .expect("recover asynchronous Spawn acknowledgement")
             {
                 BrokerSpawnEffectAcknowledgementV1::Pending if Instant::now() < ack_deadline => {
@@ -17692,7 +18285,12 @@ mod tests {
         }
         assert_eq!(
             client
-                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id,)
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    ack_id,
+                    initial_claim.recovery_secret(),
+                )
                 .expect("recover a second exact acknowledgement reply"),
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
         );
@@ -17704,6 +18302,14 @@ mod tests {
                 lease_generation: 1
             }
         );
+        assert!(matches!(
+            client
+                .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("query acknowledged claim without plaintext reissue"),
+            BrokerSpawnClaimQueryV1::Acknowledged {
+                lease_generation: 1
+            }
+        ));
         let live_census = client
             .census()
             .expect("collect acknowledged live Spawn Census");
@@ -17734,6 +18340,10 @@ mod tests {
             BrokerControlResponseStatusV1::Recovered
         );
         assert_eq!(recovered.header.child_identity, Some(child_identity));
+        assert!(
+            recovered.payload().is_empty(),
+            "acknowledged Spawn retry reissued the plaintext recovery capability"
+        );
 
         let mut mutated_header = header;
         mutated_header.request_id = id(7_305);
@@ -17805,12 +18415,20 @@ mod tests {
         let [journal] = journals.as_slice() else {
             panic!("expected exactly one acknowledged control Spawn journal")
         };
+        let durable_status = journal.status();
         assert_eq!(
-            journal.status().phase,
+            durable_status.phase,
             Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
         );
-        assert_eq!(journal.status().reply_ack_id, Some(ack_id));
-        assert_eq!(journal.status().child_identity, Some(child_identity));
+        assert_eq!(durable_status.reply_ack_id, Some(ack_id));
+        assert_eq!(durable_status.child_identity, Some(child_identity));
+        assert!(
+            durable_status
+                .recovery_verifier
+                .expect("acknowledged Spawn retained its durable recovery verifier")
+                .verifies(initial_claim.recovery_secret(), durable_status.identity, 1,),
+            "durable recovery verifier did not authenticate the issued capability"
+        );
         drop(journals);
         drop(catalog);
         drop(authenticator);
@@ -17839,7 +18457,12 @@ mod tests {
         .expect("connect to restarted acknowledged Spawn service");
         assert_eq!(
             restarted_client
-                .acknowledge_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id, ack_id,)
+                .acknowledge_spawn_effect(
+                    binding.durable_pane_id,
+                    binding.spawn_effect_id,
+                    ack_id,
+                    initial_claim.recovery_secret(),
+                )
                 .expect("recover durable acknowledgement after broker restart"),
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
         );
@@ -17849,6 +18472,7 @@ mod tests {
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_310),
+                    initial_claim.recovery_secret(),
                 )
                 .expect("reject mutated durable acknowledgement after broker restart"),
             BrokerSpawnEffectAcknowledgementV1::Quarantined
@@ -20948,6 +21572,9 @@ mod tests {
         assert_eq!(observed.phase(), BrokerSpawnWalPhaseV1::SpawnObserved);
         let query = journal.status();
         assert_eq!(query.child_identity, Some(child_identity));
+        let recovery_verifier = query
+            .recovery_verifier
+            .expect("SpawnObserved durably records one recovery verifier");
         assert!(query.fences_legacy_spawn());
         assert!(!query.spawn_outcome_is_indeterminate());
         match journal
@@ -20978,10 +21605,15 @@ mod tests {
             "exact acknowledgement retry appended a second record"
         );
         assert_eq!(journal.status().committed_records, 4);
+        assert_eq!(
+            journal.status().recovery_verifier,
+            Some(recovery_verifier),
+            "ReplyAcknowledged changed the durable pane recovery verifier"
+        );
         drop(journal);
 
         let mut recovered =
-            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator);
+            reopen_test_spawn_journal(&wal_path, &head_path, identity, authenticator.clone());
         let recovered_status = recovered.status();
         assert_eq!(
             recovered_status.phase,
@@ -20989,6 +21621,7 @@ mod tests {
         );
         assert_eq!(recovered_status.reply_ack_id, Some(ack_id));
         assert_eq!(recovered_status.child_identity, Some(child_identity));
+        assert_eq!(recovered_status.recovery_verifier, Some(recovery_verifier));
         assert_eq!(
             recovered_status
                 .durable_protocol_fence()
@@ -21001,6 +21634,33 @@ mod tests {
             .reconcile_recovered_head_and_activate(revalidation)
             .expect("activate exact recovered WAL/head pair");
         assert!(!recovered.status().append_authority_withheld);
+        drop(recovered);
+
+        let recovery_verifier_offset =
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64 + 2 * BROKER_SPAWN_WAL_RECORD_BYTES_U64 + 112;
+        let mut wal = open_existing_test_file(&wal_path);
+        wal.seek(SeekFrom::Start(recovery_verifier_offset))
+            .expect("seek to durable recovery verifier");
+        let mut planted = [0_u8; 1];
+        wal.read_exact(&mut planted)
+            .expect("read durable recovery verifier byte");
+        planted[0] ^= 1;
+        wal.seek(SeekFrom::Start(recovery_verifier_offset))
+            .expect("rewind to durable recovery verifier");
+        wal.write_all(&planted)
+            .expect("plant recovery verifier mutation");
+        wal.sync_all()
+            .expect("synchronize recovery verifier mutation");
+        drop(wal);
+        assert!(matches!(
+            BrokerSpawnJournalV1::open(
+                open_existing_test_file(&wal_path),
+                open_existing_test_file(&head_path),
+                identity,
+                authenticator,
+            ),
+            Err(BrokerSpawnWalError::AuthenticationFailed)
+        ));
     }
 
     #[test]

@@ -32,6 +32,7 @@ frankenterm-build-identity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 getrandom.workspace = true
+hmac.workspace = true
 frankenterm-sigpipe.workspace = true
 libc.workspace = true
 mio = { workspace = true, features = ["net", "os-ext", "os-poll"] }
