@@ -565,7 +565,7 @@ fn endpoint_category_all_returns_seven() {
 fn endpoint_category_titles_nonempty_and_distinct() {
     let titles: Vec<&str> = EndpointCategory::all().iter().map(|c| c.title()).collect();
     for title in &titles {
-        assert_ne!(title, "");
+        assert_ne!(*title, "");
     }
     // All distinct
     let mut sorted = titles.clone();
