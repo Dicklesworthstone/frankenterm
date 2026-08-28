@@ -638,10 +638,7 @@ impl SnapshotRecoveryEvidence {
     /// Evidence profile for an independently verified live mux content dump.
     #[must_use]
     pub const fn verified_mux_forensic_dump(complete: bool) -> Self {
-        Self::verified_forensic(
-            SnapshotRecoveryArtifactKind::LiveMuxForensicDump,
-            complete,
-        )
+        Self::verified_forensic(SnapshotRecoveryArtifactKind::LiveMuxForensicDump, complete)
     }
 
     /// Evidence profile for an independently verified checkpoint/scrollback export.
@@ -690,13 +687,20 @@ impl SnapshotRecoveryEvidence {
         }
 
         if capability == SnapshotRecoveryCapability::ForensicContentExport {
-            if self.artifact_kind == SnapshotRecoveryArtifactKind::WholeMuxRecoveryImage
-                || !matches!(
+            let artifact_matches = match self.artifact_kind {
+                SnapshotRecoveryArtifactKind::LiveMuxForensicDump
+                | SnapshotRecoveryArtifactKind::CheckpointScrollbackExport => matches!(
                     self.semantics,
                     SnapshotRecoverySemantics::ForensicPartial
                         | SnapshotRecoverySemantics::ForensicComplete
-                )
-            {
+                ),
+                SnapshotRecoveryArtifactKind::WholeMuxRecoveryImage => matches!(
+                    self.semantics,
+                    SnapshotRecoverySemantics::TerminalStateComplete
+                        | SnapshotRecoverySemantics::WholeMuxComplete
+                ),
+            };
+            if !artifact_matches {
                 return Err(SnapshotRecoveryClaimError::ArtifactCapabilityMismatch);
             }
             if readiness != SnapshotRecoveryReadiness::Candidate {
@@ -864,6 +868,213 @@ pub enum SnapshotRecoveryCapabilityAvailability {
     Forbidden,
 }
 
+/// Availability of the key material required to authenticate and decrypt a
+/// recovery generation. An independent wrapper is not inferred from artifact
+/// possession or replica durability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryKeyAvailability {
+    PrimaryAvailable,
+    IndependentWrapperAvailable,
+    Missing,
+    Conflict,
+}
+
+impl SnapshotRecoveryKeyAvailability {
+    /// Stable exhaustive order used by the multidimensional contract fixture.
+    pub const ALL: [Self; 4] = [
+        Self::PrimaryAvailable,
+        Self::IndependentWrapperAvailable,
+        Self::Missing,
+        Self::Conflict,
+    ];
+}
+
+/// Highest independently discoverable storage rank for the selected root.
+/// This is checked against, but never inferred from, a durability receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryReplicaRank {
+    None,
+    LocalPrimary,
+    IndependentReplica,
+    Offsite,
+}
+
+impl SnapshotRecoveryReplicaRank {
+    /// Stable exhaustive order used by the multidimensional contract fixture.
+    pub const ALL: [Self; 4] = [
+        Self::None,
+        Self::LocalPrimary,
+        Self::IndependentReplica,
+        Self::Offsite,
+    ];
+}
+
+/// Publication capability of the recovery destination filesystem.
+/// Readability or atomic rename alone never implies power-loss-safe mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryFilesystemCapability {
+    PowerLossPublicationProven,
+    ReadOnlyRecoveryOnly,
+    Unsupported,
+    Unknown,
+}
+
+impl SnapshotRecoveryFilesystemCapability {
+    /// Stable exhaustive order used by the multidimensional contract fixture.
+    pub const ALL: [Self; 4] = [
+        Self::PowerLossPublicationProven,
+        Self::ReadOnlyRecoveryOnly,
+        Self::Unsupported,
+        Self::Unknown,
+    ];
+}
+
+/// Result of evaluating one multidimensional contract fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryCrossProductDisposition {
+    /// Evidence may be inspected but has no activation or mutation authority.
+    CandidateOnly,
+    /// The requested phase may proceed to the exact runtime claim guards.
+    EligibleForExactGuards,
+    /// The requested phase contradicts or lacks a mandatory independent fact.
+    Forbidden,
+}
+
+/// One fixture spanning facts that must remain independent in recovery policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotRecoveryCrossProductCell {
+    pub failure: SnapshotRecoveryFailureClass,
+    pub durability: SnapshotRecoveryDurabilityGrade,
+    pub key_availability: SnapshotRecoveryKeyAvailability,
+    pub replica_rank: SnapshotRecoveryReplicaRank,
+    pub filesystem_capability: SnapshotRecoveryFilesystemCapability,
+    pub phase: SnapshotRecoveryReadiness,
+    pub operator_acknowledged: bool,
+    pub disposition: SnapshotRecoveryCrossProductDisposition,
+    pub terminal_nonclaim: &'static str,
+}
+
+const fn durability_matches_rank(
+    durability: SnapshotRecoveryDurabilityGrade,
+    replica_rank: SnapshotRecoveryReplicaRank,
+) -> bool {
+    match durability {
+        SnapshotRecoveryDurabilityGrade::Unverified => true,
+        SnapshotRecoveryDurabilityGrade::LocalVerified => {
+            !matches!(replica_rank, SnapshotRecoveryReplicaRank::None)
+        }
+        SnapshotRecoveryDurabilityGrade::ReplicatedVerified => matches!(
+            replica_rank,
+            SnapshotRecoveryReplicaRank::IndependentReplica | SnapshotRecoveryReplicaRank::Offsite
+        ),
+        SnapshotRecoveryDurabilityGrade::OffsiteVerified => {
+            matches!(replica_rank, SnapshotRecoveryReplicaRank::Offsite)
+        }
+    }
+}
+
+/// Evaluate one fixture in the failure/durability/key/replica/filesystem/phase
+/// cross-product. `EligibleForExactGuards` is deliberately not a recovery
+/// receipt: validity, semantics, freshness, authority, scrub, and drill checks
+/// still run independently after this policy classification.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub const fn snapshot_recovery_cross_product_cell(
+    failure: SnapshotRecoveryFailureClass,
+    durability: SnapshotRecoveryDurabilityGrade,
+    key_availability: SnapshotRecoveryKeyAvailability,
+    replica_rank: SnapshotRecoveryReplicaRank,
+    filesystem_capability: SnapshotRecoveryFilesystemCapability,
+    phase: SnapshotRecoveryReadiness,
+    operator_acknowledged: bool,
+) -> SnapshotRecoveryCrossProductCell {
+    use SnapshotRecoveryCrossProductDisposition as D;
+    use SnapshotRecoveryFailureClass as F;
+    use SnapshotRecoveryFilesystemCapability as Fs;
+    use SnapshotRecoveryKeyAvailability as K;
+    use SnapshotRecoveryReadiness as P;
+    use SnapshotRecoveryReplicaRank as R;
+
+    let (disposition, terminal_nonclaim) = if matches!(phase, P::Candidate) {
+        (
+            D::CandidateOnly,
+            "candidate inspection never grants activation or mutation authority",
+        )
+    } else if !durability_matches_rank(durability, replica_rank) {
+        (
+            D::Forbidden,
+            "durability grade and surviving replica rank are contradictory independent facts",
+        )
+    } else if matches!(key_availability, K::Missing | K::Conflict) {
+        (
+            D::Forbidden,
+            "missing or conflicting key authority forbids executable recovery",
+        )
+    } else if !matches!(filesystem_capability, Fs::PowerLossPublicationProven) {
+        (
+            D::Forbidden,
+            "readability or atomic rename alone cannot authorize durable recovery mutation",
+        )
+    } else if matches!(durability, SnapshotRecoveryDurabilityGrade::Unverified) {
+        (
+            D::Forbidden,
+            "interactive recovery requires an independently verified durability receipt",
+        )
+    } else if snapshot_recovery_failure_contract(failure).operator_acknowledgement
+        && !operator_acknowledged
+    {
+        (
+            D::Forbidden,
+            "the failure row requires explicit operator acknowledgement before activation",
+        )
+    } else if matches!(failure, F::ForkOrSplitView) {
+        (
+            D::Forbidden,
+            "operator acknowledgement alone cannot select authority from a split view",
+        )
+    } else if matches!(
+        failure,
+        F::LocalMediaLoss | F::CompleteHostLoss | F::LocalCredentialStoreLoss
+    ) && (!matches!(replica_rank, R::IndependentReplica | R::Offsite)
+        || !matches!(key_availability, K::IndependentWrapperAvailable))
+    {
+        (
+            D::Forbidden,
+            "local loss requires an independent replica and independent key wrapper",
+        )
+    } else if matches!(failure, F::CorrelatedSiteLoss)
+        && (!matches!(replica_rank, R::Offsite)
+            || !matches!(durability, SnapshotRecoveryDurabilityGrade::OffsiteVerified)
+            || !matches!(key_availability, K::IndependentWrapperAvailable))
+    {
+        (
+            D::Forbidden,
+            "correlated site loss requires offsite durability and an independent key wrapper",
+        )
+    } else {
+        (
+            D::EligibleForExactGuards,
+            "policy eligibility does not imply validity, semantics, freshness, authority, scrub, or drill success",
+        )
+    };
+
+    SnapshotRecoveryCrossProductCell {
+        failure,
+        durability,
+        key_availability,
+        replica_rank,
+        filesystem_capability,
+        phase,
+        operator_acknowledged,
+        disposition,
+        terminal_nonclaim,
+    }
+}
+
 /// One row in the normative failure matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SnapshotRecoveryFailureContract {
@@ -920,6 +1131,7 @@ const EVIDENCE_CLIENT: &[&str] = &[
     "client_state_disposition",
 ];
 
+#[allow(clippy::too_many_arguments)]
 const fn failure_contract(
     failure: SnapshotRecoveryFailureClass,
     recoverable_point: &'static str,
@@ -948,41 +1160,372 @@ const fn failure_contract(
 
 /// Return the exhaustive normative row for one failure class.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub const fn snapshot_recovery_failure_contract(
     failure: SnapshotRecoveryFailureClass,
 ) -> SnapshotRecoveryFailureContract {
     use SnapshotRecoveryFailureClass as F;
     match failure {
-        F::GracefulMuxRestart => failure_contract(failure, "newest verified local root plus guardian replay suffix", "local publication RPO", "interactive-safe then complete RTO", "automatic after exact preflight", "activate only after singular writer authority", false, EVIDENCE_GUARDIAN, "fallback to predecessor or unavailable", "a graceful restart is not proof of crash or power-loss recovery"),
-        F::MuxCrash => failure_contract(failure, "newest verified root plus guardian durable replay prefix", "local publication RPO", "interactive-safe then complete RTO", "automatic read-only plan; guarded activation", "no mutation before lease and replay reconciliation", false, EVIDENCE_GUARDIAN, "quarantine ambiguous panes", "SIGKILL proves only mux-process loss, not host power loss"),
-        F::GuardianCrash => failure_contract(failure, "newest verified serialized terminal and topology state", "local publication RPO", "complete reconstruction RTO", "automatic verification only", "replacement requires policy approval", true, EVIDENCE_LOCAL_ROOT, "live reattachment unavailable", "guardian loss does not preserve guardian-owned PTYs or child execution"),
-        F::ClientCrash => failure_contract(failure, "current live mux truth", "not applicable to mux state", "client reconnect RTO", "automatic after mux identity validation", "client view state may apply only after exact pane validation", false, EVIDENCE_CLIENT, "reset client state and reconnect", "client state is not mux state or pending input authority"),
-        F::FullHostPowerLoss => failure_contract(failure, "newest power-loss-verified serialized generation", "local or replica RPO by surviving receipt", "complete reconstruction RTO", "automatic verification; policy-gated activation", "never claim live process reattachment", true, EVIDENCE_LOCAL_ROOT, "fallback or unavailable", "powered-off processes do not execute and process memory is not serialized"),
-        F::FilesystemWritebackLoss => failure_contract(failure, "newest generation whose file, root, parent, and device flush contract verifies", "local publication RPO", "complete reconstruction RTO", "automatic predecessor fallback", "mutate only after selected root verifies", false, EVIDENCE_LOCAL_ROOT, "quarantine torn suffix", "rename or fsync alone is not universal power-loss proof"),
-        F::TornOrCorruptArtifact => failure_contract(failure, "newest independently verified or repairable generation", "local or replica RPO", "repair plus complete RTO", "bounded repair then reverify", "repaired bytes remain candidates", false, EVIDENCE_SCRUB, "quarantine on insufficient rank or authentication failure", "RaptorQ rank does not imply integrity, authenticity, or authority"),
-        F::DiskFull => failure_contract(failure, "last fully published predecessor", "last successful local publication", "operator remediation plus recovery RTO", "skip overlapping publication and preserve predecessors", "no retention mutation without capacity authority", true, EVIDENCE_LOCAL_ROOT, "degraded with explicit stale RPO", "failed publication never refreshes RPO"),
-        F::InodeFull => failure_contract(failure, "last fully published predecessor", "last successful local publication", "operator remediation plus recovery RTO", "skip publication and preserve predecessors", "no partial generation publication", true, EVIDENCE_LOCAL_ROOT, "degraded with explicit stale RPO", "free bytes do not prove inode capacity"),
-        F::RemoteDomainOutage => failure_contract(failure, "verified local root and already durable remote receipts", "separate local and replica RPO", "local recovery RTO", "continue bounded local capture; defer replication", "no remote authority invention", false, EVIDENCE_REPLICA, "replication degraded", "local success is not replicated durability"),
-        F::BuildOrCodecChange => failure_contract(failure, "newest migration-compatible verified root", "selected root RPO", "migration plus recovery RTO", "automatic read-only compatibility plan", "activation requires exact migration receipt", true, EVIDENCE_LOCAL_ROOT, "quarantine incompatible objects", "parse success is not semantic compatibility"),
-        F::KeyLoss => failure_contract(failure, "generation decryptable through an independent wrapper", "surviving-wrapper RPO", "key recovery plus complete RTO", "automatic discovery only", "no plaintext guessing or unauthenticated import", true, EVIDENCE_REPLICA, "encrypted state unavailable", "repair symbols cannot replace a lost decryption key"),
-        F::OperatorSelectedRollback => failure_contract(failure, "exact acknowledged older verified root", "operator-selected historical point", "complete reconstruction RTO", "never automatic", "activate only the pinned root after freshness warning", true, EVIDENCE_FRESHNESS, "remain on current root or unavailable", "an acknowledged rollback is not latest-state recovery"),
-        F::LocalMediaLoss => failure_contract(failure, "newest independently replicated verified generation", "replica RPO", "replica download plus recovery RTO", "automatic read-only discovery", "activation requires independent key and freshness", true, EVIDENCE_REPLICA, "unavailable without replica", "same-device repair symbols do not survive device loss"),
-        F::CompleteHostLoss => failure_contract(failure, "newest independent-domain generation and key wrapper", "replica or offsite RPO", "clean-host RTO", "bootstrap discovery then read-only plan", "rotate lost-host credentials before publication", true, EVIDENCE_REPLICA, "unavailable without bootstrap, replica, and wrapper", "host loss cannot preserve local processes, media, credentials, or cache"),
-        F::LocalCredentialStoreLoss => failure_contract(failure, "generation unlocked by an independent recovery wrapper", "surviving-wrapper RPO", "credential recovery plus complete RTO", "approved wrapper acquisition", "rotate lost credentials before write authority", true, EVIDENCE_REPLICA, "encrypted state unavailable", "artifact possession is not decryption or mutation authority"),
-        F::ReplicaDomainLoss => failure_contract(failure, "newest verified surviving local or independent replica root", "surviving-domain RPO", "re-replication RTO", "continue local capture and rebuild redundancy", "never delete sole surviving root", false, EVIDENCE_REPLICA, "durability grade downgraded", "one replica receipt is not offsite durability"),
-        F::CorrelatedSiteLoss => failure_contract(failure, "newest offsite-verified generation and wrapper", "offsite RPO", "clean-site RTO", "approved offsite bootstrap", "new credentials and authority required", true, EVIDENCE_REPLICA, "unavailable without independent site", "local plus same-site replicas are one failure domain"),
-        F::ValidButStaleReplica => failure_contract(failure, "newest root confirmed by independent witness", "witness-confirmed RPO", "freshness reconciliation RTO", "verification and comparison only", "no automatic activation", true, EVIDENCE_FRESHNESS, "quarantine stale root", "cryptographic validity does not prove freshness"),
-        F::OmittedLatestRoot => failure_contract(failure, "newest independently witnessed root", "witness-confirmed RPO", "freshness reconciliation RTO", "query independent witnesses", "no automatic fallback presented as latest", true, EVIDENCE_FRESHNESS, "unknown freshness", "a store listing is not proof that no newer root exists"),
-        F::ForkOrSplitView => failure_contract(failure, "operator-selected branch after witness reconciliation", "branch-specific RPO", "conflict-resolution RTO", "read-only branch comparison", "automatic recovery forbidden", true, EVIDENCE_FRESHNESS, "quarantine all conflicting heads", "individually valid branches do not establish one authority"),
-        F::NoFreshnessWitness => failure_contract(failure, "verified root with unknown freshness", "unknown freshness; artifact age only", "operator-decision RTO", "verification only", "automatic activation forbidden", true, EVIDENCE_FRESHNESS, "candidate or unavailable", "validity and timestamp do not prove latestness"),
-        F::NoBootstrapRoute => failure_contract(failure, "locally discoverable state only", "surviving local RPO", "operator provisioning RTO", "local verification only", "no remote authority discovery by guessing", true, EVIDENCE_REPLICA, "clean-host recovery unavailable", "a replica cannot help a fresh host that cannot discover or authenticate it"),
-        F::CleanHostRecovery => failure_contract(failure, "newest independently discovered verified root and wrapper", "replica or offsite RPO", "interactive-safe then complete clean-host RTO", "approved bootstrap then read-only plan", "rotate credentials before durable publication", true, EVIDENCE_REPLICA, "unavailable on any missing authority", "copied local cache is not a clean-host drill"),
-        F::ShallowScrubOverdue => failure_contract(failure, "last verified root with overdue coverage", "last publication RPO plus coverage age", "scrub catch-up RTO", "bounded priority scrub", "do not upgrade durability grade", false, EVIDENCE_SCRUB, "degraded coverage", "recent publication does not imply recent verification"),
-        F::DeepScrubOverdue => failure_contract(failure, "last verified root with overdue deep coverage", "last publication RPO plus coverage age", "deep-scrub catch-up RTO", "bounded scheduled deep scrub", "do not reclaim unverified dependencies", false, EVIDENCE_SCRUB, "degraded coverage", "shallow metadata checks do not prove object decodability"),
-        F::ScrubFailure => failure_contract(failure, "last independently verified unaffected root", "unaffected-root RPO", "repair or re-replication RTO", "quarantine then create-new heal", "never overwrite the damaged object in place", false, EVIDENCE_SCRUB, "quarantine on failed heal", "detection is not successful repair"),
-        F::CorruptRepairSource => failure_contract(failure, "generation recoverable from independently authenticated symbols", "surviving-source RPO", "repair plus reverify RTO", "exclude corrupt source and recompute rank", "never trust decoder output before authentication", false, EVIDENCE_SCRUB, "insufficient-rank quarantine", "a decoder result is not a verified snapshot"),
-        F::ClientViewStateLoss => failure_contract(failure, "verified mux truth with safe client reset", "mux RPO; client state unavailable", "mux recovery plus client reset RTO", "automatic safe reset", "discard transient input, IME, clipboard, credentials, and handles", false, EVIDENCE_CLIENT, "server usable with reset client", "server recovery does not imply client-view preservation"),
-        F::ClientViewStateConflict => failure_contract(failure, "verified mux truth with conflicting client envelope quarantined", "mux RPO; client state conflicted", "mux recovery plus operator/client reset RTO", "automatic server recovery; client reset", "never apply conflicting selection, zoom, or viewport state", false, EVIDENCE_CLIENT, "server usable with reset client", "client envelope validity does not override root, domain, or pane identity"),
+        F::GracefulMuxRestart => failure_contract(
+            failure,
+            "newest verified local root plus guardian replay suffix",
+            "local publication RPO",
+            "interactive-safe then complete RTO",
+            "automatic after exact preflight",
+            "activate only after singular writer authority",
+            false,
+            EVIDENCE_GUARDIAN,
+            "fallback to predecessor or unavailable",
+            "a graceful restart is not proof of crash or power-loss recovery",
+        ),
+        F::MuxCrash => failure_contract(
+            failure,
+            "newest verified root plus guardian durable replay prefix",
+            "local publication RPO",
+            "interactive-safe then complete RTO",
+            "automatic read-only plan; guarded activation",
+            "no mutation before lease and replay reconciliation",
+            false,
+            EVIDENCE_GUARDIAN,
+            "quarantine ambiguous panes",
+            "SIGKILL proves only mux-process loss, not host power loss",
+        ),
+        F::GuardianCrash => failure_contract(
+            failure,
+            "newest verified serialized terminal and topology state",
+            "local publication RPO",
+            "complete reconstruction RTO",
+            "automatic verification only",
+            "replacement requires policy approval",
+            true,
+            EVIDENCE_LOCAL_ROOT,
+            "live reattachment unavailable",
+            "guardian loss does not preserve guardian-owned PTYs or child execution",
+        ),
+        F::ClientCrash => failure_contract(
+            failure,
+            "current live mux truth",
+            "not applicable to mux state",
+            "client reconnect RTO",
+            "automatic after mux identity validation",
+            "client view state may apply only after exact pane validation",
+            false,
+            EVIDENCE_CLIENT,
+            "reset client state and reconnect",
+            "client state is not mux state or pending input authority",
+        ),
+        F::FullHostPowerLoss => failure_contract(
+            failure,
+            "newest power-loss-verified serialized generation",
+            "local or replica RPO by surviving receipt",
+            "complete reconstruction RTO",
+            "automatic verification; policy-gated activation",
+            "never claim live process reattachment",
+            true,
+            EVIDENCE_LOCAL_ROOT,
+            "fallback or unavailable",
+            "powered-off processes do not execute and process memory is not serialized",
+        ),
+        F::FilesystemWritebackLoss => failure_contract(
+            failure,
+            "newest generation whose file, root, parent, and device flush contract verifies",
+            "local publication RPO",
+            "complete reconstruction RTO",
+            "automatic predecessor fallback",
+            "mutate only after selected root verifies",
+            false,
+            EVIDENCE_LOCAL_ROOT,
+            "quarantine torn suffix",
+            "rename or fsync alone is not universal power-loss proof",
+        ),
+        F::TornOrCorruptArtifact => failure_contract(
+            failure,
+            "newest independently verified or repairable generation",
+            "local or replica RPO",
+            "repair plus complete RTO",
+            "bounded repair then reverify",
+            "repaired bytes remain candidates",
+            false,
+            EVIDENCE_SCRUB,
+            "quarantine on insufficient rank or authentication failure",
+            "RaptorQ rank does not imply integrity, authenticity, or authority",
+        ),
+        F::DiskFull => failure_contract(
+            failure,
+            "last fully published predecessor",
+            "last successful local publication",
+            "operator remediation plus recovery RTO",
+            "skip overlapping publication and preserve predecessors",
+            "no retention mutation without capacity authority",
+            true,
+            EVIDENCE_LOCAL_ROOT,
+            "degraded with explicit stale RPO",
+            "failed publication never refreshes RPO",
+        ),
+        F::InodeFull => failure_contract(
+            failure,
+            "last fully published predecessor",
+            "last successful local publication",
+            "operator remediation plus recovery RTO",
+            "skip publication and preserve predecessors",
+            "no partial generation publication",
+            true,
+            EVIDENCE_LOCAL_ROOT,
+            "degraded with explicit stale RPO",
+            "free bytes do not prove inode capacity",
+        ),
+        F::RemoteDomainOutage => failure_contract(
+            failure,
+            "verified local root and already durable remote receipts",
+            "separate local and replica RPO",
+            "local recovery RTO",
+            "continue bounded local capture; defer replication",
+            "no remote authority invention",
+            false,
+            EVIDENCE_REPLICA,
+            "replication degraded",
+            "local success is not replicated durability",
+        ),
+        F::BuildOrCodecChange => failure_contract(
+            failure,
+            "newest migration-compatible verified root",
+            "selected root RPO",
+            "migration plus recovery RTO",
+            "automatic read-only compatibility plan",
+            "activation requires exact migration receipt",
+            true,
+            EVIDENCE_LOCAL_ROOT,
+            "quarantine incompatible objects",
+            "parse success is not semantic compatibility",
+        ),
+        F::KeyLoss => failure_contract(
+            failure,
+            "generation decryptable through an independent wrapper",
+            "surviving-wrapper RPO",
+            "key recovery plus complete RTO",
+            "automatic discovery only",
+            "no plaintext guessing or unauthenticated import",
+            true,
+            EVIDENCE_REPLICA,
+            "encrypted state unavailable",
+            "repair symbols cannot replace a lost decryption key",
+        ),
+        F::OperatorSelectedRollback => failure_contract(
+            failure,
+            "exact acknowledged older verified root",
+            "operator-selected historical point",
+            "complete reconstruction RTO",
+            "never automatic",
+            "activate only the pinned root after freshness warning",
+            true,
+            EVIDENCE_FRESHNESS,
+            "remain on current root or unavailable",
+            "an acknowledged rollback is not latest-state recovery",
+        ),
+        F::LocalMediaLoss => failure_contract(
+            failure,
+            "newest independently replicated verified generation",
+            "replica RPO",
+            "replica download plus recovery RTO",
+            "automatic read-only discovery",
+            "activation requires independent key and freshness",
+            true,
+            EVIDENCE_REPLICA,
+            "unavailable without replica",
+            "same-device repair symbols do not survive device loss",
+        ),
+        F::CompleteHostLoss => failure_contract(
+            failure,
+            "newest independent-domain generation and key wrapper",
+            "replica or offsite RPO",
+            "clean-host RTO",
+            "bootstrap discovery then read-only plan",
+            "rotate lost-host credentials before publication",
+            true,
+            EVIDENCE_REPLICA,
+            "unavailable without bootstrap, replica, and wrapper",
+            "host loss cannot preserve local processes, media, credentials, or cache",
+        ),
+        F::LocalCredentialStoreLoss => failure_contract(
+            failure,
+            "generation unlocked by an independent recovery wrapper",
+            "surviving-wrapper RPO",
+            "credential recovery plus complete RTO",
+            "approved wrapper acquisition",
+            "rotate lost credentials before write authority",
+            true,
+            EVIDENCE_REPLICA,
+            "encrypted state unavailable",
+            "artifact possession is not decryption or mutation authority",
+        ),
+        F::ReplicaDomainLoss => failure_contract(
+            failure,
+            "newest verified surviving local or independent replica root",
+            "surviving-domain RPO",
+            "re-replication RTO",
+            "continue local capture and rebuild redundancy",
+            "never delete sole surviving root",
+            false,
+            EVIDENCE_REPLICA,
+            "durability grade downgraded",
+            "one replica receipt is not offsite durability",
+        ),
+        F::CorrelatedSiteLoss => failure_contract(
+            failure,
+            "newest offsite-verified generation and wrapper",
+            "offsite RPO",
+            "clean-site RTO",
+            "approved offsite bootstrap",
+            "new credentials and authority required",
+            true,
+            EVIDENCE_REPLICA,
+            "unavailable without independent site",
+            "local plus same-site replicas are one failure domain",
+        ),
+        F::ValidButStaleReplica => failure_contract(
+            failure,
+            "newest root confirmed by independent witness",
+            "witness-confirmed RPO",
+            "freshness reconciliation RTO",
+            "verification and comparison only",
+            "no automatic activation",
+            true,
+            EVIDENCE_FRESHNESS,
+            "quarantine stale root",
+            "cryptographic validity does not prove freshness",
+        ),
+        F::OmittedLatestRoot => failure_contract(
+            failure,
+            "newest independently witnessed root",
+            "witness-confirmed RPO",
+            "freshness reconciliation RTO",
+            "query independent witnesses",
+            "no automatic fallback presented as latest",
+            true,
+            EVIDENCE_FRESHNESS,
+            "unknown freshness",
+            "a store listing is not proof that no newer root exists",
+        ),
+        F::ForkOrSplitView => failure_contract(
+            failure,
+            "operator-selected branch after witness reconciliation",
+            "branch-specific RPO",
+            "conflict-resolution RTO",
+            "read-only branch comparison",
+            "automatic recovery forbidden",
+            true,
+            EVIDENCE_FRESHNESS,
+            "quarantine all conflicting heads",
+            "individually valid branches do not establish one authority",
+        ),
+        F::NoFreshnessWitness => failure_contract(
+            failure,
+            "verified root with unknown freshness",
+            "unknown freshness; artifact age only",
+            "operator-decision RTO",
+            "verification only",
+            "automatic activation forbidden",
+            true,
+            EVIDENCE_FRESHNESS,
+            "candidate or unavailable",
+            "validity and timestamp do not prove latestness",
+        ),
+        F::NoBootstrapRoute => failure_contract(
+            failure,
+            "locally discoverable state only",
+            "surviving local RPO",
+            "operator provisioning RTO",
+            "local verification only",
+            "no remote authority discovery by guessing",
+            true,
+            EVIDENCE_REPLICA,
+            "clean-host recovery unavailable",
+            "a replica cannot help a fresh host that cannot discover or authenticate it",
+        ),
+        F::CleanHostRecovery => failure_contract(
+            failure,
+            "newest independently discovered verified root and wrapper",
+            "replica or offsite RPO",
+            "interactive-safe then complete clean-host RTO",
+            "approved bootstrap then read-only plan",
+            "rotate credentials before durable publication",
+            true,
+            EVIDENCE_REPLICA,
+            "unavailable on any missing authority",
+            "copied local cache is not a clean-host drill",
+        ),
+        F::ShallowScrubOverdue => failure_contract(
+            failure,
+            "last verified root with overdue coverage",
+            "last publication RPO plus coverage age",
+            "scrub catch-up RTO",
+            "bounded priority scrub",
+            "do not upgrade durability grade",
+            false,
+            EVIDENCE_SCRUB,
+            "degraded coverage",
+            "recent publication does not imply recent verification",
+        ),
+        F::DeepScrubOverdue => failure_contract(
+            failure,
+            "last verified root with overdue deep coverage",
+            "last publication RPO plus coverage age",
+            "deep-scrub catch-up RTO",
+            "bounded scheduled deep scrub",
+            "do not reclaim unverified dependencies",
+            false,
+            EVIDENCE_SCRUB,
+            "degraded coverage",
+            "shallow metadata checks do not prove object decodability",
+        ),
+        F::ScrubFailure => failure_contract(
+            failure,
+            "last independently verified unaffected root",
+            "unaffected-root RPO",
+            "repair or re-replication RTO",
+            "quarantine then create-new heal",
+            "never overwrite the damaged object in place",
+            false,
+            EVIDENCE_SCRUB,
+            "quarantine on failed heal",
+            "detection is not successful repair",
+        ),
+        F::CorruptRepairSource => failure_contract(
+            failure,
+            "generation recoverable from independently authenticated symbols",
+            "surviving-source RPO",
+            "repair plus reverify RTO",
+            "exclude corrupt source and recompute rank",
+            "never trust decoder output before authentication",
+            false,
+            EVIDENCE_SCRUB,
+            "insufficient-rank quarantine",
+            "a decoder result is not a verified snapshot",
+        ),
+        F::ClientViewStateLoss => failure_contract(
+            failure,
+            "verified mux truth with safe client reset",
+            "mux RPO; client state unavailable",
+            "mux recovery plus client reset RTO",
+            "automatic safe reset",
+            "discard transient input, IME, clipboard, credentials, and handles",
+            false,
+            EVIDENCE_CLIENT,
+            "server usable with reset client",
+            "server recovery does not imply client-view preservation",
+        ),
+        F::ClientViewStateConflict => failure_contract(
+            failure,
+            "verified mux truth with conflicting client envelope quarantined",
+            "mux RPO; client state conflicted",
+            "mux recovery plus operator/client reset RTO",
+            "automatic server recovery; client reset",
+            "never apply conflicting selection, zoom, or viewport state",
+            false,
+            EVIDENCE_CLIENT,
+            "server usable with reset client",
+            "client envelope validity does not override root, domain, or pane identity",
+        ),
     }
 }
 
@@ -998,7 +1541,10 @@ pub const fn snapshot_recovery_contract_cell(
 
     let (availability, nonclaim) = match capability {
         C::GuardianLiveProcessReattachment => match failure {
-            F::GuardianCrash | F::FullHostPowerLoss | F::CompleteHostLoss | F::CorrelatedSiteLoss => (
+            F::GuardianCrash
+            | F::FullHostPowerLoss
+            | F::CompleteHostLoss
+            | F::CorrelatedSiteLoss => (
                 A::Forbidden,
                 "live process execution cannot be reconstructed from serialized bytes",
             ),
@@ -1008,7 +1554,11 @@ pub const fn snapshot_recovery_contract_cell(
             ),
         },
         C::ExactTerminalParserRenderReconstruction => match failure {
-            F::KeyLoss | F::LocalCredentialStoreLoss | F::LocalMediaLoss | F::CompleteHostLoss | F::CorrelatedSiteLoss => (
+            F::KeyLoss
+            | F::LocalCredentialStoreLoss
+            | F::LocalMediaLoss
+            | F::CompleteHostLoss
+            | F::CorrelatedSiteLoss => (
                 A::RequiresIndependentDurability,
                 "reconstruction requires a decryptable independently retained semantically complete image",
             ),
@@ -1018,7 +1568,11 @@ pub const fn snapshot_recovery_contract_cell(
             ),
         },
         C::TopologyLayoutRecreation => match failure {
-            F::KeyLoss | F::LocalCredentialStoreLoss | F::LocalMediaLoss | F::CompleteHostLoss | F::CorrelatedSiteLoss => (
+            F::KeyLoss
+            | F::LocalCredentialStoreLoss
+            | F::LocalMediaLoss
+            | F::CompleteHostLoss
+            | F::CorrelatedSiteLoss => (
                 A::RequiresIndependentDurability,
                 "topology recreation requires an independently retained authoritative topology object",
             ),
@@ -1073,6 +1627,18 @@ pub const SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST: &[SnapshotRecoveryContractP
         platform: "all",
         required_artifacts: "source identity plus nonzero exact test selection",
         causal_fault_or_mutation: "remove one failure/capability row or clear one nonclaim",
+    },
+    SnapshotRecoveryContractProofEntry {
+        invariant_id: "snapshot.contract.independent_dimension_cross_product",
+        owner_bead: SNAPSHOT_RECOVERY_CONTRACT_OWNER,
+        fixture_or_oracle: "failure x durability x key x replica x filesystem x phase x acknowledgement",
+        assertion: "every fixture is total and no receipt fact is inferred from another",
+        package_or_script: "frankenterm-core",
+        exact_filter_or_scenario: "snapshot_recovery_cross_product_dimensions_are_independent",
+        test_layer: "integration and mutation",
+        platform: "all",
+        required_artifacts: "serialized fixture cells and mutation diagnostics",
+        causal_fault_or_mutation: "mutate each independent dimension without changing its peers",
     },
     SnapshotRecoveryContractProofEntry {
         invariant_id: "snapshot.contract.independent_verdicts",
@@ -11428,325 +11994,6 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
-
-    fn complete_recovery_evidence() -> SnapshotRecoveryEvidence {
-        SnapshotRecoveryEvidence {
-            artifact_kind: SnapshotRecoveryArtifactKind::WholeMuxRecoveryImage,
-            artifact_validity: SnapshotRecoveryVerdict::Verified,
-            repair_status: SnapshotRecoveryRepairStatus::NotRepaired,
-            semantics: SnapshotRecoverySemantics::WholeMuxComplete,
-            compatibility: SnapshotRecoveryVerdict::Verified,
-            topology_authority: SnapshotRecoveryVerdict::Verified,
-            guardian_census: SnapshotRecoveryVerdict::Verified,
-            lease_replay_input_authority: SnapshotRecoveryVerdict::Verified,
-            process_replacement_approval: SnapshotRecoveryVerdict::Verified,
-            durability: SnapshotRecoveryDurabilityGrade::OffsiteVerified,
-            freshness: SnapshotRecoveryFreshness::Verified,
-            scrub_coverage: SnapshotRecoveryScrubCoverage::Current,
-            drill_currency: SnapshotRecoveryDrillCurrency::Current,
-            client_state: SnapshotRecoveryClientStateDisposition::PreservedAndVerified,
-        }
-    }
-
-    #[test]
-    fn snapshot_recovery_policy_keeps_unproven_objectives_unset() {
-        let policy = SnapshotRecoveryPolicy::default().validate().unwrap();
-        assert_eq!(
-            policy.periodic_interval_secs,
-            SnapshotConfig::default().interval_seconds
-        );
-        assert_eq!(policy.target_local_rpo_secs, policy.periodic_interval_secs);
-        assert_eq!(policy.target_replica_rpo_secs, None);
-        assert_eq!(policy.max_full_anchor_age_secs, None);
-        assert_eq!(policy.target_interactive_safe_rto_secs, None);
-        assert_eq!(policy.target_complete_rto_secs, None);
-        assert_eq!(policy.max_freshness_witness_age_secs, None);
-        assert_eq!(policy.max_shallow_scrub_age_secs, None);
-        assert_eq!(policy.max_deep_scrub_age_secs, None);
-        assert_eq!(policy.max_disaster_drill_age_secs, None);
-
-        let mut invalid = policy;
-        invalid.target_local_rpo_secs = invalid.periodic_interval_secs - 1;
-        assert_eq!(
-            invalid.validate(),
-            Err(SnapshotRecoveryPolicyError::LocalRpoBelowInterval)
-        );
-        invalid = policy;
-        invalid.target_replica_rpo_secs = Some(invalid.target_local_rpo_secs - 1);
-        assert_eq!(
-            invalid.validate(),
-            Err(SnapshotRecoveryPolicyError::ReplicaRpoBelowLocalRpo)
-        );
-        invalid = policy;
-        invalid.target_interactive_safe_rto_secs = Some(60);
-        invalid.target_complete_rto_secs = Some(59);
-        assert_eq!(
-            invalid.validate(),
-            Err(SnapshotRecoveryPolicyError::CompleteRtoBelowInteractiveRto)
-        );
-    }
-
-    #[test]
-    fn snapshot_recovery_contract_matrix_is_total_and_nonclaiming() {
-        let mut cells = HashSet::new();
-        for failure in SnapshotRecoveryFailureClass::ALL {
-            let row = snapshot_recovery_failure_contract(failure);
-            assert_eq!(row.failure, failure);
-            assert!(!row.recoverable_point.is_empty());
-            assert!(!row.rpo_scope.is_empty());
-            assert!(!row.rto_scope.is_empty());
-            assert!(!row.automation.is_empty());
-            assert!(!row.mutation.is_empty());
-            assert!(!row.required_evidence.is_empty());
-            assert!(!row.terminal_outcome.is_empty());
-            assert!(!row.nonclaim.is_empty());
-            serde_json::to_value(row).expect("failure row must remain serializable");
-
-            for capability in SnapshotRecoveryCapability::ALL {
-                let cell = snapshot_recovery_contract_cell(failure, capability);
-                assert_eq!(cell.failure, failure);
-                assert_eq!(cell.capability, capability);
-                assert!(!cell.nonclaim.is_empty());
-                assert!(cells.insert((failure, capability)));
-                serde_json::to_value(cell).expect("contract cell must remain serializable");
-            }
-        }
-        assert_eq!(
-            cells.len(),
-            SnapshotRecoveryFailureClass::ALL.len() * SnapshotRecoveryCapability::ALL.len()
-        );
-
-        let mux_crash = snapshot_recovery_failure_contract(
-            SnapshotRecoveryFailureClass::MuxCrash,
-        );
-        let host_power_loss = snapshot_recovery_failure_contract(
-            SnapshotRecoveryFailureClass::FullHostPowerLoss,
-        );
-        assert_ne!(mux_crash.required_evidence, host_power_loss.required_evidence);
-        assert!(mux_crash.nonclaim.contains("not host power loss"));
-        assert!(host_power_loss.nonclaim.contains("do not execute"));
-        assert_eq!(
-            snapshot_recovery_contract_cell(
-                SnapshotRecoveryFailureClass::FullHostPowerLoss,
-                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
-            )
-            .availability,
-            SnapshotRecoveryCapabilityAvailability::Forbidden
-        );
-    }
-
-    #[test]
-    fn snapshot_recovery_forensic_artifacts_cannot_be_promoted() {
-        for evidence in [
-            SnapshotRecoveryEvidence::verified_mux_forensic_dump(false),
-            SnapshotRecoveryEvidence::verified_mux_forensic_dump(true),
-            SnapshotRecoveryEvidence::verified_checkpoint_scrollback_export(false),
-            SnapshotRecoveryEvidence::verified_checkpoint_scrollback_export(true),
-        ] {
-            let receipt = evidence
-                .validate_claim(
-                    SnapshotRecoveryCapability::ForensicContentExport,
-                    SnapshotRecoveryReadiness::Candidate,
-                )
-                .unwrap();
-            assert_eq!(
-                receipt.capability(),
-                SnapshotRecoveryCapability::ForensicContentExport
-            );
-            assert_eq!(receipt.readiness(), SnapshotRecoveryReadiness::Candidate);
-            assert!(!receipt.mutation_permitted());
-
-            for capability in [
-                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-                SnapshotRecoveryCapability::TopologyLayoutRecreation,
-                SnapshotRecoveryCapability::PolicyGatedProcessReplacement,
-            ] {
-                assert_eq!(
-                    evidence.validate_claim(capability, SnapshotRecoveryReadiness::Candidate),
-                    Err(SnapshotRecoveryClaimError::ForensicPromotionForbidden)
-                );
-            }
-            for readiness in [
-                SnapshotRecoveryReadiness::InteractiveSafe,
-                SnapshotRecoveryReadiness::Complete,
-            ] {
-                assert_eq!(
-                    evidence.validate_claim(
-                        SnapshotRecoveryCapability::ForensicContentExport,
-                        readiness,
-                    ),
-                    Err(SnapshotRecoveryClaimError::ForensicPromotionForbidden)
-                );
-            }
-        }
-
-        let mut repaired = SnapshotRecoveryEvidence::verified_mux_forensic_dump(true);
-        repaired.repair_status = SnapshotRecoveryRepairStatus::RepairedUnverified;
-        assert_eq!(
-            repaired.validate_claim(
-                SnapshotRecoveryCapability::ForensicContentExport,
-                SnapshotRecoveryReadiness::Candidate,
-            ),
-            Err(SnapshotRecoveryClaimError::RepairNotReverified)
-        );
-    }
-
-    #[test]
-    fn snapshot_recovery_claim_guard_rejects_each_missing_independent_fact() {
-        let baseline = complete_recovery_evidence();
-        let receipt = baseline
-            .validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            )
-            .unwrap();
-        assert_eq!(receipt.readiness(), SnapshotRecoveryReadiness::Complete);
-        assert!(receipt.mutation_permitted());
-
-        let mut changed = baseline;
-        changed.artifact_validity = SnapshotRecoveryVerdict::Unknown;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::ArtifactNotVerified)
-        );
-        changed = baseline;
-        changed.repair_status = SnapshotRecoveryRepairStatus::RepairedUnverified;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::RepairNotReverified)
-        );
-        changed = baseline;
-        changed.compatibility = SnapshotRecoveryVerdict::Unknown;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::CompatibilityNotVerified)
-        );
-        changed = baseline;
-        changed.semantics = SnapshotRecoverySemantics::TerminalStateComplete;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::WholeMuxSemanticsIncomplete)
-        );
-        changed = baseline;
-        changed.durability = SnapshotRecoveryDurabilityGrade::Unverified;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::DurabilityNotVerified)
-        );
-        for freshness in [
-            SnapshotRecoveryFreshness::Unknown,
-            SnapshotRecoveryFreshness::Stale,
-            SnapshotRecoveryFreshness::Conflict,
-        ] {
-            changed = baseline;
-            changed.freshness = freshness;
-            assert_eq!(
-                changed.validate_release_claim(
-                    SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-                ),
-                Err(SnapshotRecoveryClaimError::FreshnessNotVerified)
-            );
-        }
-        changed = baseline;
-        changed.topology_authority = SnapshotRecoveryVerdict::Unknown;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::WholeMuxSemanticsIncomplete)
-        );
-        changed = baseline;
-        changed.scrub_coverage = SnapshotRecoveryScrubCoverage::Overdue;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::ScrubCoverageNotCurrent)
-        );
-        changed = baseline;
-        changed.drill_currency = SnapshotRecoveryDrillCurrency::Overdue;
-        assert_eq!(
-            changed.validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            ),
-            Err(SnapshotRecoveryClaimError::DisasterDrillNotCurrent)
-        );
-
-        changed = baseline;
-        changed.guardian_census = SnapshotRecoveryVerdict::Unknown;
-        assert_eq!(
-            changed.validate_claim(
-                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
-                SnapshotRecoveryReadiness::InteractiveSafe,
-            ),
-            Err(SnapshotRecoveryClaimError::GuardianCensusNotVerified)
-        );
-        changed = baseline;
-        changed.lease_replay_input_authority = SnapshotRecoveryVerdict::Unknown;
-        assert_eq!(
-            changed.validate_claim(
-                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
-                SnapshotRecoveryReadiness::InteractiveSafe,
-            ),
-            Err(SnapshotRecoveryClaimError::MutationAuthorityNotVerified)
-        );
-        changed = baseline;
-        changed.process_replacement_approval = SnapshotRecoveryVerdict::Unknown;
-        assert_eq!(
-            changed.validate_claim(
-                SnapshotRecoveryCapability::PolicyGatedProcessReplacement,
-                SnapshotRecoveryReadiness::Complete,
-            ),
-            Err(SnapshotRecoveryClaimError::ProcessReplacementNotApproved)
-        );
-
-        changed = baseline;
-        changed.client_state = SnapshotRecoveryClientStateDisposition::Conflict;
-        let serialized = serde_json::to_value(changed).unwrap();
-        assert_eq!(serialized["client_state"], "conflict");
-        assert!(changed
-            .validate_release_claim(
-                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
-            )
-            .is_ok());
-        assert_eq!(changed.client_state, SnapshotRecoveryClientStateDisposition::Conflict);
-    }
-
-    #[test]
-    fn snapshot_recovery_contract_proof_manifest_is_self_consistent() {
-        let mut invariant_ids = HashSet::new();
-        let mut filters = HashSet::new();
-        for entry in SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST {
-            assert_eq!(entry.owner_bead, SNAPSHOT_RECOVERY_CONTRACT_OWNER);
-            assert!(invariant_ids.insert(entry.invariant_id));
-            assert!(filters.insert(entry.exact_filter_or_scenario));
-            for field in [
-                entry.fixture_or_oracle,
-                entry.assertion,
-                entry.package_or_script,
-                entry.exact_filter_or_scenario,
-                entry.test_layer,
-                entry.platform,
-                entry.required_artifacts,
-                entry.causal_fault_or_mutation,
-            ] {
-                assert!(!field.is_empty());
-            }
-            serde_json::to_value(entry).expect("proof entry must remain serializable");
-        }
-        assert_eq!(SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST.len(), 5);
-        assert!(filters.contains("snapshot_contract_clean_host_progressive_recovery"));
-    }
 
     type TestPaneProviderFuture = std::pin::Pin<
         Box<

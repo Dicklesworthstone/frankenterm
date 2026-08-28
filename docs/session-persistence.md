@@ -976,7 +976,23 @@ recovery does not mean client state was preserved.
 | Exact terminal/parser/render reconstruction | Verified compatible image with complete terminal semantics | Parser/render state may be installed only from exact authenticated objects | Forensic text, scrollback, and topology metadata are not parser/render state |
 | Topology/layout recreation | Verified compatible whole-mux semantics and authoritative ordered topology | Publish only after exact domain/window/tab/pane identities reconcile | Best-effort pane projections and local numeric pane IDs are not topology authority |
 | Policy-gated process replacement | Complete terminal/topology plan plus explicit replacement approval | May launch new processes through the policy/effect ledger | Replacement is not process continuity and does not recreate process memory or external resources |
-| Forensic content export | Independently verified dump or checkpoint/scrollback artifact | None; candidate/read-only only | A dump never becomes InteractiveSafe, Complete, executable, or mux-activating |
+| Forensic content export | Independently verified dump, checkpoint/scrollback artifact, or terminal-complete/whole-mux recovery image | None; candidate/read-only only | Export authority never becomes InteractiveSafe, Complete, executable, or mux-activating; a whole-mux image retains offline export without lending its executable authority to the export |
+
+The executable fixture also spans the complete product of all 30 failure
+classes, four durability grades, four key dispositions, four surviving replica
+ranks, four destination-filesystem capability grades, three recovery phases,
+and both operator-acknowledgement states (46,080 cells). These dimensions are
+echoed separately in every fixture and never inferred from one another. A
+`Candidate` result is read-only. `InteractiveSafe` or `Complete` is forbidden
+when the receipt grade contradicts the surviving replica rank, key authority is
+missing or conflicted, the destination lacks a proven power-loss-safe
+publication contract, durability is unverified, or a required acknowledgement
+is absent. Local-media/host/credential loss additionally requires an
+independent replica and key wrapper; correlated site loss requires an
+offsite-verified receipt, offsite rank, and independent wrapper. An eligible
+cell merely advances to the exact validity, semantics, compatibility,
+freshness, topology, lease/replay/input, scrub, and drill guards. It is not a
+recovery receipt.
 
 #### Failure, RPO, RTO, automation, and nonclaim matrix
 
@@ -1030,7 +1046,8 @@ Evidence abbreviations are complete authority sets, not informal hints:
 
 The executable proof registration is
 `SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST`. It binds the complete 30-by-5
-matrix, independent-verdict mutations, forensic non-promotion, the
+failure/capability matrix, the 46,080-cell independent-dimension fixture,
+independent-verdict mutations, forensic non-promotion, the
 SIGKILL-versus-host-power-loss negative control, and the downstream clean-host
 progressive-recovery scenario owned by
 `ft-interactive-swarm-product-convergence-7xqz4.8.14.4.3`. The downstream map
