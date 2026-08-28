@@ -77392,6 +77392,26 @@ struct MuxDumpVerificationReceipt {
     compatible_client: Option<VerifiedCompatibleClientDumpContract>,
 }
 
+fn validate_verified_mux_dump_recovery_claim(capture_complete: bool) -> anyhow::Result<()> {
+    use frankenterm_core::snapshot_engine::{
+        SnapshotRecoveryCapability, SnapshotRecoveryEvidence, SnapshotRecoveryReadiness,
+    };
+
+    let receipt = SnapshotRecoveryEvidence::verified_mux_forensic_dump(capture_complete)
+        .validate_claim(
+            SnapshotRecoveryCapability::ForensicContentExport,
+            SnapshotRecoveryReadiness::Candidate,
+        )
+        .map_err(|error| anyhow::anyhow!("Mux dump recovery claim contract rejected: {error}"))?;
+    anyhow::ensure!(
+        receipt.capability() == SnapshotRecoveryCapability::ForensicContentExport
+            && receipt.readiness() == SnapshotRecoveryReadiness::Candidate
+            && !receipt.mutation_permitted(),
+        "Mux dump recovery claim contract returned an unsafe receipt"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerifiedCompatibleClientSourceMetadata {
     client_sha256: String,
@@ -81705,6 +81725,7 @@ fn verify_mux_dump_v2_payload(
         "Mux dump v2 topology checksum does not bind its content targets and projections"
     );
 
+    validate_verified_mux_dump_recovery_claim(true)?;
     Ok(MuxDumpVerificationReceipt {
         schema: schema.to_string(),
         payload_sha256,
@@ -82721,6 +82742,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     {
         anyhow::bail!("Mux dump v1 must not claim unavailable authoritative topology identity");
     }
+    validate_verified_mux_dump_recovery_claim(capture_complete)?;
     Ok(MuxDumpVerificationReceipt {
         schema: schema.to_string(),
         payload_sha256: actual_payload_sha256,

@@ -903,6 +903,140 @@ upgrade cannot fork or discard pane state. Until then an upgrade command must
 fail closed when a mux owns live PTYs; it may offer a verified content dump and
 a disruptive restart, but it must never label that path lossless.
 
+### Normative whole-mux recovery claim contract
+
+This section is the product-language authority for
+`ft-interactive-swarm-product-convergence-7xqz4.8.14.1.1`. It defines what a
+future whole-mux recovery image may claim; it does **not** say that production
+capture, repair, restore, reconnect, or upgrade currently implements those
+claims. The executable counterpart is
+`snapshot_engine::SnapshotRecoveryEvidence::validate_claim`. Both the live mux
+dump verifier and the checkpoint/scrollback verifier consume that guard today,
+so neither forensic format can accidentally graduate into executable recovery.
+
+The initial default policy is deliberately local-only. Its periodic interval
+and target local RPO are both the configured snapshot interval (300 seconds by
+default). Replica RPO, maximum full-anchor age, InteractiveSafe RTO, Complete
+RTO, freshness-witness age, shallow/deep scrub age, and disaster-drill age are
+unset. An unset objective is visible as `None`; it is never interpreted as
+zero, unlimited, achieved, or not applicable. Later runtime/configuration work
+must set each objective explicitly and retain measurements before user-facing
+claims use it.
+
+#### Frozen vocabulary
+
+- **snapshot**: one causally coherent logical mux generation whose canonical
+  root binds its immutable objects and authorities. A snapshot is not
+  necessarily published, durable, fresh, compatible, or executable.
+- **checkpoint**: one pane or subsystem contribution at an exact parser,
+  output, topology, or authority watermark. A checkpoint alone is not a
+  whole-mux snapshot.
+- **dump**: a bounded read-only forensic export. It can contain text and
+  metadata but has no mux mutation authority.
+- **candidate**: bytes that passed the checks recorded in their evidence
+  profile. Repair output remains a candidate until independently reverified.
+- **restore**: reconstruct terminal semantics and/or topology from an exact
+  verified image. Restore does not imply preservation of a prior process.
+- **reattach**: bind a successor mux to a still-running guardian-owned PTY and
+  child only after authenticated census, lease, replay, and input-effect
+  reconciliation.
+- **resume**: a user-visible umbrella term that must name its actual outcome:
+  reattach, reconstruct, recreate, replace, or export. It is not a capability.
+- **repair**: reconstruct missing/corrupt representation symbols. Repair never
+  substitutes for digest, AEAD, manifest, compatibility, freshness, lease, or
+  semantic verification.
+- **fallback**: select a fully verified predecessor after the preferred root
+  fails. Fallback reports the older recovery point and never refreshes RPO.
+- **executable recovery image**: a verified whole-mux image that has passed
+  compatibility, semantic, topology, guardian/lease/replay/input (when
+  reattaching), durability, and freshness gates needed for the requested
+  mutation. A dump, checkpoint export, or repaired-but-unverified image is not
+  executable.
+- **InteractiveSafe**: one named priority pane has singular writer/input
+  authority and is safe for interaction. It does not mean the whole mux or
+  cold history is complete.
+- **Complete**: every required object and whole-mux semantic/topology invariant
+  is verified. Client view-state disposition, scrub age, drill age, durability
+  grade, and freshness remain separately reported facts even at Complete.
+
+#### Independent verdicts and capability levels
+
+Every receipt exposes cryptographic validity, semantic completeness,
+compatibility, durability grade (`Unverified`, `LocalVerified`,
+`ReplicatedVerified`, or `OffsiteVerified`), freshness, scrub coverage, drill
+currency, and client-state disposition independently. No verdict can be
+inferred from another. In particular, valid does not mean fresh; repairable
+does not mean repaired or verified; local RaptorQ does not mean device-loss
+durability; a current scrub does not mean a current disaster drill; and server
+recovery does not mean client state was preserved.
+
+| Capability | Minimum authority | Permitted mutation | Mandatory nonclaim |
+|---|---|---|---|
+| Guardian live-process reattachment | Live authenticated guardian census plus exact lease generation, replay watermark, input-effect disposition, compatible root, and freshness | Successor may acquire singular writer authority only after every guard | Serialized bytes cannot resurrect a dead guardian, PTY, process, memory, socket, or external resource |
+| Exact terminal/parser/render reconstruction | Verified compatible image with complete terminal semantics | Parser/render state may be installed only from exact authenticated objects | Forensic text, scrollback, and topology metadata are not parser/render state |
+| Topology/layout recreation | Verified compatible whole-mux semantics and authoritative ordered topology | Publish only after exact domain/window/tab/pane identities reconcile | Best-effort pane projections and local numeric pane IDs are not topology authority |
+| Policy-gated process replacement | Complete terminal/topology plan plus explicit replacement approval | May launch new processes through the policy/effect ledger | Replacement is not process continuity and does not recreate process memory or external resources |
+| Forensic content export | Independently verified dump or checkpoint/scrollback artifact | None; candidate/read-only only | A dump never becomes InteractiveSafe, Complete, executable, or mux-activating |
+
+#### Failure, RPO, RTO, automation, and nonclaim matrix
+
+Evidence abbreviations are complete authority sets, not informal hints:
+
+- **L**: cryptographic validity, semantic completeness, and the platform file,
+  root, parent, and device durability receipt.
+- **G**: authenticated guardian census, lease generation, replay watermark, and
+  input-effect disposition.
+- **R**: independent replica receipt, independently recoverable key wrapper,
+  and freshness witness.
+- **F**: independent freshness witness, root-chain continuity, and the exact
+  operator-selected root when applicable.
+- **S**: scrub coverage receipt, source-symbol identity, and post-repair
+  independent reverification.
+- **C**: exact mux-root, domain, and pane identities plus explicit client-state
+  preserve/reset/lost/conflict disposition.
+
+| Failure/scenario | Maximum recoverable point and RPO | RTO | Automation, mutation, acknowledgement | Evidence; terminal outcome; explicit nonclaim |
+|---|---|---|---|---|
+| Graceful mux restart | Newest verified local root plus guardian suffix; local publication RPO | InteractiveSafe, then Complete | Automatic exact preflight; activate only after singular writer; no acknowledgement | G; predecessor/unavailable; graceful restart is not crash or power-loss proof |
+| Mux crash | Newest verified root plus guardian durable replay prefix; local RPO | InteractiveSafe, then Complete | Read-only plan automatic, activation guarded; no acknowledgement | G; quarantine ambiguity; SIGKILL is not host-power-loss evidence |
+| Guardian crash | Newest verified serialized terminal/topology state; local RPO | Complete reconstruction | Verification automatic; replacement needs acknowledgement | L; live reattachment unavailable; guardian loss does not preserve guardian-owned PTYs or child execution |
+| Client crash | Current live mux truth; mux RPO unaffected | Client reconnect | Automatic after mux identity validation; view state applies only after pane validation | C; reset/reconnect; client state is not mux state or pending input authority |
+| Full host power loss | Newest power-loss-verified local/replica generation; surviving-grade RPO | Complete reconstruction | Verification automatic, activation policy-gated and acknowledged | L; fallback/unavailable; powered-off processes do not execute and process memory is not serialized |
+| Filesystem writeback loss | Newest generation with complete platform flush contract; local RPO | Complete reconstruction | Automatic predecessor fallback; select before mutation | L; torn suffix quarantine; rename or one fsync is not universal power-loss proof |
+| Torn/corrupt artifact | Newest independently verified or rank-repairable generation; local/replica RPO | Repair plus Complete | Bounded repair then independent reverify; no acknowledgement for safe fallback | S; insufficient-rank/authentication quarantine; decoder success is not integrity or authority |
+| Disk full | Last fully published predecessor; last-successful local RPO | Remediation plus recovery | Skip publication, preserve roots; retention mutation acknowledged | L; explicit stale-RPO degradation; failed/deduplicated publication never refreshes RPO |
+| Inode full | Last fully published predecessor; last-successful local RPO | Remediation plus recovery | Skip partial generation; remediation acknowledged | L; explicit stale-RPO degradation; free bytes do not prove inode capacity |
+| Remote-domain outage | Verified local root and existing remote receipts; local and replica RPO separate | Local recovery | Continue bounded local capture, defer replication; no acknowledgement | R; replication degraded; local success is not replicated durability |
+| Build/codec change | Newest migration-compatible verified root; selected-root RPO | Migration plus recovery | Read-only compatibility plan; activation requires acknowledged migration receipt | L; incompatible quarantine; parse success is not semantic compatibility |
+| Key loss | Generation decryptable through independent wrapper; wrapper-survival RPO | Key recovery plus Complete | Discovery only until approved wrapper acquisition | R; unavailable without key; repair symbols cannot replace a decryption key |
+| Operator-selected rollback | Exact acknowledged older verified root; historical selected point | Complete reconstruction | Never automatic; pinned-root activation acknowledged | F; remain current/unavailable; rollback is not latest-state recovery |
+| Local-media loss | Newest independent replica; replica RPO | Download plus recovery | Read-only discovery; activation acknowledged after key/freshness | R; unavailable without replica; same-device repair symbols do not survive device loss |
+| Complete-host loss | Newest independent-domain generation and wrapper; replica/offsite RPO | Clean-host recovery | Approved bootstrap; rotate lost credentials before publication | R; unavailable if bootstrap/replica/wrapper missing; local processes, media, credentials, and caches are gone |
+| Local credential-store loss | Generation unlocked by independent wrapper; wrapper-survival RPO | Credential recovery plus Complete | Approved wrapper acquisition and credential rotation | R; encrypted state unavailable; artifact possession is not decrypt or mutation authority |
+| Replica-domain loss | Newest surviving local/independent root; surviving-domain RPO | Re-replication | Continue local capture and rebuild redundancy; no acknowledgement | R; durability grade downgraded; one replica is not offsite durability |
+| Correlated site loss | Newest offsite root and wrapper; offsite RPO | Clean-site recovery | Approved offsite bootstrap and new authority | R; unavailable without independent site; same-site copies share one failure domain |
+| Valid-but-stale replica | Newest independently witnessed root; witness-confirmed RPO | Freshness reconciliation | Compare only; automatic activation forbidden and acknowledgement required | F; stale-root quarantine; validity does not prove freshness |
+| Omitted latest root | Newest independently witnessed root; witness-confirmed RPO | Freshness reconciliation | Query witnesses; acknowledged fallback only | F; freshness unknown; store listing does not prove no newer root exists |
+| Fork/split view | Operator-selected reconciled branch; branch-specific RPO | Conflict resolution | Read-only branch comparison; automatic recovery forbidden | F; quarantine conflicting heads; valid branches do not establish one authority |
+| No freshness witness | Verified root with unknown freshness; artifact age only | Operator decision | Verification only; activation acknowledged | F; candidate/unavailable; timestamp and validity do not prove latestness |
+| No bootstrap route | Locally discoverable state only; local RPO | Operator provisioning | Local verification only; no guessed remote discovery | R; clean-host recovery unavailable; undiscoverable replicas cannot recover a fresh host |
+| Clean-host recovery | Newest independently discovered root and wrapper; replica/offsite RPO | InteractiveSafe, then Complete | Approved bootstrap, read-only plan, credential rotation | R; unavailable on any missing authority; copied cache is not a clean-host drill |
+| Shallow scrub overdue | Last verified root plus explicit coverage age; publication RPO unchanged | Scrub catch-up | Bounded priority scrub; no durability promotion | S; degraded coverage; recent publication is not recent verification |
+| Deep scrub overdue | Last verified root plus deep-coverage age; publication RPO unchanged | Deep-scrub catch-up | Bounded scheduled scrub; no dependency reclamation | S; degraded coverage; shallow metadata checks do not prove object decodability |
+| Scrub failure | Last unaffected verified root; unaffected-root RPO | Repair/re-replication | Quarantine then create-new heal; never overwrite in place | S; failed-heal quarantine; detection is not repair |
+| Corrupt repair source | Root recoverable from independent authenticated symbols; surviving-source RPO | Repair plus reverify | Exclude source and recompute rank; no pre-authentication trust | S; insufficient-rank quarantine; decoder output is not a verified snapshot |
+| Client view-state loss | Verified mux truth; mux RPO, client state unavailable | Mux recovery plus reset | Safe reset automatic; discard transient input/IME/clipboard/credentials/handles | C; usable server with reset client; server recovery is not view-state preservation |
+| Client view-state conflict | Verified mux truth; mux RPO, client state conflicted | Mux recovery plus reset | Server recovery automatic; conflicting envelope never applies | C; usable server with reset client; client envelope cannot override root/domain/pane identity |
+
+The executable proof registration is
+`SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST`. It binds the complete 30-by-5
+matrix, independent-verdict mutations, forensic non-promotion, the
+SIGKILL-versus-host-power-loss negative control, and the downstream clean-host
+progressive-recovery scenario owned by
+`ft-interactive-swarm-product-convergence-7xqz4.8.14.4.3`. The downstream map
+is a required future consumer, not evidence that the e2e journey already
+exists or passes.
+
 ### Live mux content dump
 
 `ft session dump` provides a separate, read-only pre-upgrade and forensic

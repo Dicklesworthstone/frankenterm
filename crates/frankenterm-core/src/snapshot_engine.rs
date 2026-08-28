@@ -293,6 +293,837 @@ impl SnapshotTrigger {
     }
 }
 
+// =============================================================================
+// Whole-mux recovery claim contract
+// =============================================================================
+
+/// Bead that owns the first version of the whole-mux recovery claim contract.
+pub const SNAPSHOT_RECOVERY_CONTRACT_OWNER: &str =
+    "ft-interactive-swarm-product-convergence-7xqz4.8.14.1.1";
+
+/// Policy targets for periodic recovery publication.
+///
+/// These are requested objectives, never evidence that a runtime achieved
+/// them. Replica, anchor, freshness, scrub, and RTO targets remain unset until
+/// the corresponding runtime/configuration beads install an authority for
+/// them. That distinction prevents a default value from becoming a product
+/// claim merely because it was serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRecoveryPolicy {
+    /// Requested interval between local whole-mux capture attempts.
+    pub periodic_interval_secs: u64,
+    /// Requested maximum age of the newest locally verified generation.
+    pub target_local_rpo_secs: u64,
+    /// Requested maximum age of the newest independently replicated generation.
+    pub target_replica_rpo_secs: Option<u64>,
+    /// Requested maximum age of a full anchor generation.
+    pub max_full_anchor_age_secs: Option<u64>,
+    /// Requested time to make one priority pane safely interactive.
+    pub target_interactive_safe_rto_secs: Option<u64>,
+    /// Requested time to finish all required whole-mux hydration.
+    pub target_complete_rto_secs: Option<u64>,
+    /// Requested maximum age of authoritative freshness-witness evidence.
+    pub max_freshness_witness_age_secs: Option<u64>,
+    /// Requested maximum age of a successful shallow scrub.
+    pub max_shallow_scrub_age_secs: Option<u64>,
+    /// Requested maximum age of a successful deep scrub.
+    pub max_deep_scrub_age_secs: Option<u64>,
+    /// Requested maximum age of a successful clean-host disaster drill.
+    pub max_disaster_drill_age_secs: Option<u64>,
+}
+
+impl SnapshotRecoveryPolicy {
+    /// Conservative local-only policy derived from the existing periodic
+    /// snapshot interval. It makes no replica, RTO, freshness, scrub, or drill
+    /// promise until those values are explicitly configured.
+    #[must_use]
+    pub const fn local_only(periodic_interval_secs: u64) -> Self {
+        Self {
+            periodic_interval_secs,
+            target_local_rpo_secs: periodic_interval_secs,
+            target_replica_rpo_secs: None,
+            max_full_anchor_age_secs: None,
+            target_interactive_safe_rto_secs: None,
+            target_complete_rto_secs: None,
+            max_freshness_witness_age_secs: None,
+            max_shallow_scrub_age_secs: None,
+            max_deep_scrub_age_secs: None,
+            max_disaster_drill_age_secs: None,
+        }
+    }
+
+    /// Validate ordering and nonzero constraints without promoting an unset
+    /// objective into an achieved fact.
+    pub fn validate(self) -> Result<Self, SnapshotRecoveryPolicyError> {
+        if self.periodic_interval_secs == 0 || self.target_local_rpo_secs == 0 {
+            return Err(SnapshotRecoveryPolicyError::ZeroLocalObjective);
+        }
+        if self.target_local_rpo_secs < self.periodic_interval_secs {
+            return Err(SnapshotRecoveryPolicyError::LocalRpoBelowInterval);
+        }
+        if self
+            .target_replica_rpo_secs
+            .is_some_and(|replica| replica < self.target_local_rpo_secs)
+        {
+            return Err(SnapshotRecoveryPolicyError::ReplicaRpoBelowLocalRpo);
+        }
+        if self
+            .target_complete_rto_secs
+            .zip(self.target_interactive_safe_rto_secs)
+            .is_some_and(|(complete, interactive)| complete < interactive)
+        {
+            return Err(SnapshotRecoveryPolicyError::CompleteRtoBelowInteractiveRto);
+        }
+        for value in [
+            self.target_replica_rpo_secs,
+            self.max_full_anchor_age_secs,
+            self.target_interactive_safe_rto_secs,
+            self.target_complete_rto_secs,
+            self.max_freshness_witness_age_secs,
+            self.max_shallow_scrub_age_secs,
+            self.max_deep_scrub_age_secs,
+            self.max_disaster_drill_age_secs,
+        ] {
+            if value == Some(0) {
+                return Err(SnapshotRecoveryPolicyError::ZeroOptionalObjective);
+            }
+        }
+        Ok(self)
+    }
+}
+
+impl Default for SnapshotRecoveryPolicy {
+    fn default() -> Self {
+        Self::local_only(SnapshotConfig::default().interval_seconds)
+    }
+}
+
+/// Invalid recovery-objective policy. Variants are deliberately content-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SnapshotRecoveryPolicyError {
+    #[error("local recovery interval and RPO must be nonzero")]
+    ZeroLocalObjective,
+    #[error("local RPO cannot be lower than the periodic capture interval")]
+    LocalRpoBelowInterval,
+    #[error("replica RPO cannot be lower than local RPO")]
+    ReplicaRpoBelowLocalRpo,
+    #[error("complete RTO cannot be lower than interactive-safe RTO")]
+    CompleteRtoBelowInteractiveRto,
+    #[error("an explicitly configured recovery objective cannot be zero")]
+    ZeroOptionalObjective,
+}
+
+/// Failure and disaster classes covered by the normative recovery matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryFailureClass {
+    GracefulMuxRestart,
+    MuxCrash,
+    GuardianCrash,
+    ClientCrash,
+    FullHostPowerLoss,
+    FilesystemWritebackLoss,
+    TornOrCorruptArtifact,
+    DiskFull,
+    InodeFull,
+    RemoteDomainOutage,
+    BuildOrCodecChange,
+    KeyLoss,
+    OperatorSelectedRollback,
+    LocalMediaLoss,
+    CompleteHostLoss,
+    LocalCredentialStoreLoss,
+    ReplicaDomainLoss,
+    CorrelatedSiteLoss,
+    ValidButStaleReplica,
+    OmittedLatestRoot,
+    ForkOrSplitView,
+    NoFreshnessWitness,
+    NoBootstrapRoute,
+    CleanHostRecovery,
+    ShallowScrubOverdue,
+    DeepScrubOverdue,
+    ScrubFailure,
+    CorruptRepairSource,
+    ClientViewStateLoss,
+    ClientViewStateConflict,
+}
+
+impl SnapshotRecoveryFailureClass {
+    /// Stable exhaustive order used by contract and proof-manifest tests.
+    pub const ALL: [Self; 30] = [
+        Self::GracefulMuxRestart,
+        Self::MuxCrash,
+        Self::GuardianCrash,
+        Self::ClientCrash,
+        Self::FullHostPowerLoss,
+        Self::FilesystemWritebackLoss,
+        Self::TornOrCorruptArtifact,
+        Self::DiskFull,
+        Self::InodeFull,
+        Self::RemoteDomainOutage,
+        Self::BuildOrCodecChange,
+        Self::KeyLoss,
+        Self::OperatorSelectedRollback,
+        Self::LocalMediaLoss,
+        Self::CompleteHostLoss,
+        Self::LocalCredentialStoreLoss,
+        Self::ReplicaDomainLoss,
+        Self::CorrelatedSiteLoss,
+        Self::ValidButStaleReplica,
+        Self::OmittedLatestRoot,
+        Self::ForkOrSplitView,
+        Self::NoFreshnessWitness,
+        Self::NoBootstrapRoute,
+        Self::CleanHostRecovery,
+        Self::ShallowScrubOverdue,
+        Self::DeepScrubOverdue,
+        Self::ScrubFailure,
+        Self::CorruptRepairSource,
+        Self::ClientViewStateLoss,
+        Self::ClientViewStateConflict,
+    ];
+}
+
+/// Five capabilities that must never be conflated by a recovery surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryCapability {
+    GuardianLiveProcessReattachment,
+    ExactTerminalParserRenderReconstruction,
+    TopologyLayoutRecreation,
+    PolicyGatedProcessReplacement,
+    ForensicContentExport,
+}
+
+impl SnapshotRecoveryCapability {
+    /// Stable exhaustive order used by cross-product tests.
+    pub const ALL: [Self; 5] = [
+        Self::GuardianLiveProcessReattachment,
+        Self::ExactTerminalParserRenderReconstruction,
+        Self::TopologyLayoutRecreation,
+        Self::PolicyGatedProcessReplacement,
+        Self::ForensicContentExport,
+    ];
+}
+
+/// Recovery phase whose name may be exposed to a user or API consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryReadiness {
+    /// Verified bytes that have not acquired mutation authority.
+    Candidate,
+    /// One priority pane has singular writer/input authority and can be used.
+    InteractiveSafe,
+    /// Every required whole-mux object and semantic invariant is present.
+    Complete,
+}
+
+/// Receipt-backed durability grade. `Unverified` is a first-class result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryDurabilityGrade {
+    Unverified,
+    LocalVerified,
+    ReplicatedVerified,
+    OffsiteVerified,
+}
+
+/// Independent verdict used for validity and authority checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryVerdict {
+    Unknown,
+    Verified,
+    Rejected,
+    Conflict,
+}
+
+/// Semantic content proven by the selected artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoverySemantics {
+    ForensicPartial,
+    ForensicComplete,
+    TerminalStateComplete,
+    WholeMuxComplete,
+}
+
+/// Whether RaptorQ or another repair operation contributed bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryRepairStatus {
+    NotRepaired,
+    RepairedUnverified,
+    RepairedAndReverified,
+}
+
+/// Artifact family supplying the evidence profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryArtifactKind {
+    LiveMuxForensicDump,
+    CheckpointScrollbackExport,
+    WholeMuxRecoveryImage,
+}
+
+/// Freshness is independent from validity and durability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryFreshness {
+    Unknown,
+    Verified,
+    Stale,
+    Conflict,
+}
+
+/// Scrub coverage is independent from current artifact validity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryScrubCoverage {
+    Unknown,
+    Current,
+    Overdue,
+    Failed,
+}
+
+/// Disaster-drill currency is independent from a single successful restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryDrillCurrency {
+    Unknown,
+    Current,
+    Overdue,
+    Failed,
+}
+
+/// Per-client view-state disposition, separate from authoritative mux truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryClientStateDisposition {
+    Unknown,
+    PreservedAndVerified,
+    SafelyReset,
+    Lost,
+    Conflict,
+}
+
+/// Complete evidence profile consumed by capability and readiness guards.
+///
+/// Keeping each verdict as a separate field is intentional. Constructors and
+/// validators must not infer freshness from validity, durability from repair,
+/// whole-mux semantics from a forensic export, or client-state preservation
+/// from server recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRecoveryEvidence {
+    pub artifact_kind: SnapshotRecoveryArtifactKind,
+    pub artifact_validity: SnapshotRecoveryVerdict,
+    pub repair_status: SnapshotRecoveryRepairStatus,
+    pub semantics: SnapshotRecoverySemantics,
+    pub compatibility: SnapshotRecoveryVerdict,
+    pub topology_authority: SnapshotRecoveryVerdict,
+    pub guardian_census: SnapshotRecoveryVerdict,
+    pub lease_replay_input_authority: SnapshotRecoveryVerdict,
+    pub process_replacement_approval: SnapshotRecoveryVerdict,
+    pub durability: SnapshotRecoveryDurabilityGrade,
+    pub freshness: SnapshotRecoveryFreshness,
+    pub scrub_coverage: SnapshotRecoveryScrubCoverage,
+    pub drill_currency: SnapshotRecoveryDrillCurrency,
+    pub client_state: SnapshotRecoveryClientStateDisposition,
+}
+
+impl SnapshotRecoveryEvidence {
+    /// Evidence profile for an independently verified live mux content dump.
+    #[must_use]
+    pub const fn verified_mux_forensic_dump(complete: bool) -> Self {
+        Self::verified_forensic(
+            SnapshotRecoveryArtifactKind::LiveMuxForensicDump,
+            complete,
+        )
+    }
+
+    /// Evidence profile for an independently verified checkpoint/scrollback export.
+    #[must_use]
+    pub const fn verified_checkpoint_scrollback_export(complete: bool) -> Self {
+        Self::verified_forensic(
+            SnapshotRecoveryArtifactKind::CheckpointScrollbackExport,
+            complete,
+        )
+    }
+
+    const fn verified_forensic(kind: SnapshotRecoveryArtifactKind, complete: bool) -> Self {
+        Self {
+            artifact_kind: kind,
+            artifact_validity: SnapshotRecoveryVerdict::Verified,
+            repair_status: SnapshotRecoveryRepairStatus::NotRepaired,
+            semantics: if complete {
+                SnapshotRecoverySemantics::ForensicComplete
+            } else {
+                SnapshotRecoverySemantics::ForensicPartial
+            },
+            compatibility: SnapshotRecoveryVerdict::Unknown,
+            topology_authority: SnapshotRecoveryVerdict::Unknown,
+            guardian_census: SnapshotRecoveryVerdict::Unknown,
+            lease_replay_input_authority: SnapshotRecoveryVerdict::Unknown,
+            process_replacement_approval: SnapshotRecoveryVerdict::Unknown,
+            durability: SnapshotRecoveryDurabilityGrade::Unverified,
+            freshness: SnapshotRecoveryFreshness::Unknown,
+            scrub_coverage: SnapshotRecoveryScrubCoverage::Unknown,
+            drill_currency: SnapshotRecoveryDrillCurrency::Unknown,
+            client_state: SnapshotRecoveryClientStateDisposition::Unknown,
+        }
+    }
+
+    /// Validate one bounded capability/readiness claim.
+    pub fn validate_claim(
+        self,
+        capability: SnapshotRecoveryCapability,
+        readiness: SnapshotRecoveryReadiness,
+    ) -> Result<SnapshotRecoveryClaimReceipt, SnapshotRecoveryClaimError> {
+        if self.artifact_validity != SnapshotRecoveryVerdict::Verified {
+            return Err(SnapshotRecoveryClaimError::ArtifactNotVerified);
+        }
+        if self.repair_status == SnapshotRecoveryRepairStatus::RepairedUnverified {
+            return Err(SnapshotRecoveryClaimError::RepairNotReverified);
+        }
+
+        if capability == SnapshotRecoveryCapability::ForensicContentExport {
+            if self.artifact_kind == SnapshotRecoveryArtifactKind::WholeMuxRecoveryImage
+                || !matches!(
+                    self.semantics,
+                    SnapshotRecoverySemantics::ForensicPartial
+                        | SnapshotRecoverySemantics::ForensicComplete
+                )
+            {
+                return Err(SnapshotRecoveryClaimError::ArtifactCapabilityMismatch);
+            }
+            if readiness != SnapshotRecoveryReadiness::Candidate {
+                return Err(SnapshotRecoveryClaimError::ForensicPromotionForbidden);
+            }
+            return Ok(SnapshotRecoveryClaimReceipt {
+                capability,
+                readiness,
+                mutation_permitted: false,
+            });
+        }
+
+        if self.artifact_kind != SnapshotRecoveryArtifactKind::WholeMuxRecoveryImage {
+            return Err(SnapshotRecoveryClaimError::ForensicPromotionForbidden);
+        }
+        if self.compatibility != SnapshotRecoveryVerdict::Verified {
+            return Err(SnapshotRecoveryClaimError::CompatibilityNotVerified);
+        }
+
+        match capability {
+            SnapshotRecoveryCapability::GuardianLiveProcessReattachment => {
+                if self.guardian_census != SnapshotRecoveryVerdict::Verified {
+                    return Err(SnapshotRecoveryClaimError::GuardianCensusNotVerified);
+                }
+                if self.lease_replay_input_authority != SnapshotRecoveryVerdict::Verified {
+                    return Err(SnapshotRecoveryClaimError::MutationAuthorityNotVerified);
+                }
+            }
+            SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction => {
+                if !matches!(
+                    self.semantics,
+                    SnapshotRecoverySemantics::TerminalStateComplete
+                        | SnapshotRecoverySemantics::WholeMuxComplete
+                ) {
+                    return Err(SnapshotRecoveryClaimError::TerminalSemanticsIncomplete);
+                }
+            }
+            SnapshotRecoveryCapability::TopologyLayoutRecreation => {
+                if self.semantics != SnapshotRecoverySemantics::WholeMuxComplete
+                    || self.topology_authority != SnapshotRecoveryVerdict::Verified
+                {
+                    return Err(SnapshotRecoveryClaimError::TopologyAuthorityNotVerified);
+                }
+            }
+            SnapshotRecoveryCapability::PolicyGatedProcessReplacement => {
+                if self.semantics != SnapshotRecoverySemantics::WholeMuxComplete
+                    || self.topology_authority != SnapshotRecoveryVerdict::Verified
+                {
+                    return Err(SnapshotRecoveryClaimError::TopologyAuthorityNotVerified);
+                }
+                if self.process_replacement_approval != SnapshotRecoveryVerdict::Verified {
+                    return Err(SnapshotRecoveryClaimError::ProcessReplacementNotApproved);
+                }
+            }
+            SnapshotRecoveryCapability::ForensicContentExport => unreachable!(),
+        }
+
+        if readiness != SnapshotRecoveryReadiness::Candidate {
+            if self.durability < SnapshotRecoveryDurabilityGrade::LocalVerified {
+                return Err(SnapshotRecoveryClaimError::DurabilityNotVerified);
+            }
+            if self.freshness != SnapshotRecoveryFreshness::Verified {
+                return Err(SnapshotRecoveryClaimError::FreshnessNotVerified);
+            }
+        }
+        if readiness == SnapshotRecoveryReadiness::Complete
+            && (self.semantics != SnapshotRecoverySemantics::WholeMuxComplete
+                || self.topology_authority != SnapshotRecoveryVerdict::Verified)
+        {
+            return Err(SnapshotRecoveryClaimError::WholeMuxSemanticsIncomplete);
+        }
+
+        Ok(SnapshotRecoveryClaimReceipt {
+            capability,
+            readiness,
+            mutation_permitted: readiness != SnapshotRecoveryReadiness::Candidate,
+        })
+    }
+
+    /// Stronger release-language gate. Scrub and drill currency stay separate
+    /// facts, but both must be current before a release may claim this complete
+    /// recovery capability.
+    pub fn validate_release_claim(
+        self,
+        capability: SnapshotRecoveryCapability,
+    ) -> Result<SnapshotRecoveryClaimReceipt, SnapshotRecoveryClaimError> {
+        let receipt = self.validate_claim(capability, SnapshotRecoveryReadiness::Complete)?;
+        if self.scrub_coverage != SnapshotRecoveryScrubCoverage::Current {
+            return Err(SnapshotRecoveryClaimError::ScrubCoverageNotCurrent);
+        }
+        if self.drill_currency != SnapshotRecoveryDrillCurrency::Current {
+            return Err(SnapshotRecoveryClaimError::DisasterDrillNotCurrent);
+        }
+        Ok(receipt)
+    }
+}
+
+/// Nonconstructive claim receipt: only the guard can establish it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotRecoveryClaimReceipt {
+    capability: SnapshotRecoveryCapability,
+    readiness: SnapshotRecoveryReadiness,
+    mutation_permitted: bool,
+}
+
+impl SnapshotRecoveryClaimReceipt {
+    #[must_use]
+    pub const fn capability(self) -> SnapshotRecoveryCapability {
+        self.capability
+    }
+
+    #[must_use]
+    pub const fn readiness(self) -> SnapshotRecoveryReadiness {
+        self.readiness
+    }
+
+    #[must_use]
+    pub const fn mutation_permitted(self) -> bool {
+        self.mutation_permitted
+    }
+}
+
+/// Finite, content-free reason why a recovery claim was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SnapshotRecoveryClaimError {
+    #[error("artifact validity is not verified")]
+    ArtifactNotVerified,
+    #[error("repaired bytes have not been independently reverified")]
+    RepairNotReverified,
+    #[error("artifact semantics do not match the requested capability")]
+    ArtifactCapabilityMismatch,
+    #[error("a forensic artifact cannot be promoted to executable recovery")]
+    ForensicPromotionForbidden,
+    #[error("build and codec compatibility are not verified")]
+    CompatibilityNotVerified,
+    #[error("guardian census authority is not verified")]
+    GuardianCensusNotVerified,
+    #[error("lease, replay, and input authority are not verified")]
+    MutationAuthorityNotVerified,
+    #[error("terminal parser and render semantics are incomplete")]
+    TerminalSemanticsIncomplete,
+    #[error("topology authority is not verified")]
+    TopologyAuthorityNotVerified,
+    #[error("process replacement is not policy-approved")]
+    ProcessReplacementNotApproved,
+    #[error("durability grade is not locally verified")]
+    DurabilityNotVerified,
+    #[error("freshness is not verified or is in conflict")]
+    FreshnessNotVerified,
+    #[error("whole-mux semantics are incomplete")]
+    WholeMuxSemanticsIncomplete,
+    #[error("scrub coverage is not current")]
+    ScrubCoverageNotCurrent,
+    #[error("disaster drill is not current")]
+    DisasterDrillNotCurrent,
+}
+
+/// Whether a failure/capability cell can ever graduate after exact checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecoveryCapabilityAvailability {
+    CandidateAfterExactGuards,
+    RequiresIndependentDurability,
+    RequiresExternalProcessDurability,
+    Forbidden,
+}
+
+/// One row in the normative failure matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotRecoveryFailureContract {
+    pub failure: SnapshotRecoveryFailureClass,
+    pub recoverable_point: &'static str,
+    pub rpo_scope: &'static str,
+    pub rto_scope: &'static str,
+    pub automation: &'static str,
+    pub mutation: &'static str,
+    pub operator_acknowledgement: bool,
+    pub required_evidence: &'static [&'static str],
+    pub terminal_outcome: &'static str,
+    pub nonclaim: &'static str,
+}
+
+/// Cross-product cell joining one failure row to one distinct capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotRecoveryContractCell {
+    pub failure: SnapshotRecoveryFailureClass,
+    pub capability: SnapshotRecoveryCapability,
+    pub availability: SnapshotRecoveryCapabilityAvailability,
+    pub nonclaim: &'static str,
+}
+
+const EVIDENCE_LOCAL_ROOT: &[&str] = &[
+    "cryptographic_validity",
+    "semantic_completeness",
+    "platform_durability_receipt",
+];
+const EVIDENCE_GUARDIAN: &[&str] = &[
+    "authenticated_guardian_census",
+    "lease_generation",
+    "replay_watermark",
+    "input_effect_disposition",
+];
+const EVIDENCE_REPLICA: &[&str] = &[
+    "independent_replica_receipt",
+    "recovery_key_wrapper",
+    "freshness_witness",
+];
+const EVIDENCE_FRESHNESS: &[&str] = &[
+    "independent_freshness_witness",
+    "root_chain_continuity",
+    "operator_selected_root",
+];
+const EVIDENCE_SCRUB: &[&str] = &[
+    "scrub_coverage_receipt",
+    "source_symbol_identity",
+    "post_repair_reverification",
+];
+const EVIDENCE_CLIENT: &[&str] = &[
+    "exact_mux_root_identity",
+    "domain_and_pane_identity",
+    "client_state_disposition",
+];
+
+const fn failure_contract(
+    failure: SnapshotRecoveryFailureClass,
+    recoverable_point: &'static str,
+    rpo_scope: &'static str,
+    rto_scope: &'static str,
+    automation: &'static str,
+    mutation: &'static str,
+    operator_acknowledgement: bool,
+    required_evidence: &'static [&'static str],
+    terminal_outcome: &'static str,
+    nonclaim: &'static str,
+) -> SnapshotRecoveryFailureContract {
+    SnapshotRecoveryFailureContract {
+        failure,
+        recoverable_point,
+        rpo_scope,
+        rto_scope,
+        automation,
+        mutation,
+        operator_acknowledgement,
+        required_evidence,
+        terminal_outcome,
+        nonclaim,
+    }
+}
+
+/// Return the exhaustive normative row for one failure class.
+#[must_use]
+pub const fn snapshot_recovery_failure_contract(
+    failure: SnapshotRecoveryFailureClass,
+) -> SnapshotRecoveryFailureContract {
+    use SnapshotRecoveryFailureClass as F;
+    match failure {
+        F::GracefulMuxRestart => failure_contract(failure, "newest verified local root plus guardian replay suffix", "local publication RPO", "interactive-safe then complete RTO", "automatic after exact preflight", "activate only after singular writer authority", false, EVIDENCE_GUARDIAN, "fallback to predecessor or unavailable", "a graceful restart is not proof of crash or power-loss recovery"),
+        F::MuxCrash => failure_contract(failure, "newest verified root plus guardian durable replay prefix", "local publication RPO", "interactive-safe then complete RTO", "automatic read-only plan; guarded activation", "no mutation before lease and replay reconciliation", false, EVIDENCE_GUARDIAN, "quarantine ambiguous panes", "SIGKILL proves only mux-process loss, not host power loss"),
+        F::GuardianCrash => failure_contract(failure, "newest verified serialized terminal and topology state", "local publication RPO", "complete reconstruction RTO", "automatic verification only", "replacement requires policy approval", true, EVIDENCE_LOCAL_ROOT, "live reattachment unavailable", "guardian loss does not preserve guardian-owned PTYs or child execution"),
+        F::ClientCrash => failure_contract(failure, "current live mux truth", "not applicable to mux state", "client reconnect RTO", "automatic after mux identity validation", "client view state may apply only after exact pane validation", false, EVIDENCE_CLIENT, "reset client state and reconnect", "client state is not mux state or pending input authority"),
+        F::FullHostPowerLoss => failure_contract(failure, "newest power-loss-verified serialized generation", "local or replica RPO by surviving receipt", "complete reconstruction RTO", "automatic verification; policy-gated activation", "never claim live process reattachment", true, EVIDENCE_LOCAL_ROOT, "fallback or unavailable", "powered-off processes do not execute and process memory is not serialized"),
+        F::FilesystemWritebackLoss => failure_contract(failure, "newest generation whose file, root, parent, and device flush contract verifies", "local publication RPO", "complete reconstruction RTO", "automatic predecessor fallback", "mutate only after selected root verifies", false, EVIDENCE_LOCAL_ROOT, "quarantine torn suffix", "rename or fsync alone is not universal power-loss proof"),
+        F::TornOrCorruptArtifact => failure_contract(failure, "newest independently verified or repairable generation", "local or replica RPO", "repair plus complete RTO", "bounded repair then reverify", "repaired bytes remain candidates", false, EVIDENCE_SCRUB, "quarantine on insufficient rank or authentication failure", "RaptorQ rank does not imply integrity, authenticity, or authority"),
+        F::DiskFull => failure_contract(failure, "last fully published predecessor", "last successful local publication", "operator remediation plus recovery RTO", "skip overlapping publication and preserve predecessors", "no retention mutation without capacity authority", true, EVIDENCE_LOCAL_ROOT, "degraded with explicit stale RPO", "failed publication never refreshes RPO"),
+        F::InodeFull => failure_contract(failure, "last fully published predecessor", "last successful local publication", "operator remediation plus recovery RTO", "skip publication and preserve predecessors", "no partial generation publication", true, EVIDENCE_LOCAL_ROOT, "degraded with explicit stale RPO", "free bytes do not prove inode capacity"),
+        F::RemoteDomainOutage => failure_contract(failure, "verified local root and already durable remote receipts", "separate local and replica RPO", "local recovery RTO", "continue bounded local capture; defer replication", "no remote authority invention", false, EVIDENCE_REPLICA, "replication degraded", "local success is not replicated durability"),
+        F::BuildOrCodecChange => failure_contract(failure, "newest migration-compatible verified root", "selected root RPO", "migration plus recovery RTO", "automatic read-only compatibility plan", "activation requires exact migration receipt", true, EVIDENCE_LOCAL_ROOT, "quarantine incompatible objects", "parse success is not semantic compatibility"),
+        F::KeyLoss => failure_contract(failure, "generation decryptable through an independent wrapper", "surviving-wrapper RPO", "key recovery plus complete RTO", "automatic discovery only", "no plaintext guessing or unauthenticated import", true, EVIDENCE_REPLICA, "encrypted state unavailable", "repair symbols cannot replace a lost decryption key"),
+        F::OperatorSelectedRollback => failure_contract(failure, "exact acknowledged older verified root", "operator-selected historical point", "complete reconstruction RTO", "never automatic", "activate only the pinned root after freshness warning", true, EVIDENCE_FRESHNESS, "remain on current root or unavailable", "an acknowledged rollback is not latest-state recovery"),
+        F::LocalMediaLoss => failure_contract(failure, "newest independently replicated verified generation", "replica RPO", "replica download plus recovery RTO", "automatic read-only discovery", "activation requires independent key and freshness", true, EVIDENCE_REPLICA, "unavailable without replica", "same-device repair symbols do not survive device loss"),
+        F::CompleteHostLoss => failure_contract(failure, "newest independent-domain generation and key wrapper", "replica or offsite RPO", "clean-host RTO", "bootstrap discovery then read-only plan", "rotate lost-host credentials before publication", true, EVIDENCE_REPLICA, "unavailable without bootstrap, replica, and wrapper", "host loss cannot preserve local processes, media, credentials, or cache"),
+        F::LocalCredentialStoreLoss => failure_contract(failure, "generation unlocked by an independent recovery wrapper", "surviving-wrapper RPO", "credential recovery plus complete RTO", "approved wrapper acquisition", "rotate lost credentials before write authority", true, EVIDENCE_REPLICA, "encrypted state unavailable", "artifact possession is not decryption or mutation authority"),
+        F::ReplicaDomainLoss => failure_contract(failure, "newest verified surviving local or independent replica root", "surviving-domain RPO", "re-replication RTO", "continue local capture and rebuild redundancy", "never delete sole surviving root", false, EVIDENCE_REPLICA, "durability grade downgraded", "one replica receipt is not offsite durability"),
+        F::CorrelatedSiteLoss => failure_contract(failure, "newest offsite-verified generation and wrapper", "offsite RPO", "clean-site RTO", "approved offsite bootstrap", "new credentials and authority required", true, EVIDENCE_REPLICA, "unavailable without independent site", "local plus same-site replicas are one failure domain"),
+        F::ValidButStaleReplica => failure_contract(failure, "newest root confirmed by independent witness", "witness-confirmed RPO", "freshness reconciliation RTO", "verification and comparison only", "no automatic activation", true, EVIDENCE_FRESHNESS, "quarantine stale root", "cryptographic validity does not prove freshness"),
+        F::OmittedLatestRoot => failure_contract(failure, "newest independently witnessed root", "witness-confirmed RPO", "freshness reconciliation RTO", "query independent witnesses", "no automatic fallback presented as latest", true, EVIDENCE_FRESHNESS, "unknown freshness", "a store listing is not proof that no newer root exists"),
+        F::ForkOrSplitView => failure_contract(failure, "operator-selected branch after witness reconciliation", "branch-specific RPO", "conflict-resolution RTO", "read-only branch comparison", "automatic recovery forbidden", true, EVIDENCE_FRESHNESS, "quarantine all conflicting heads", "individually valid branches do not establish one authority"),
+        F::NoFreshnessWitness => failure_contract(failure, "verified root with unknown freshness", "unknown freshness; artifact age only", "operator-decision RTO", "verification only", "automatic activation forbidden", true, EVIDENCE_FRESHNESS, "candidate or unavailable", "validity and timestamp do not prove latestness"),
+        F::NoBootstrapRoute => failure_contract(failure, "locally discoverable state only", "surviving local RPO", "operator provisioning RTO", "local verification only", "no remote authority discovery by guessing", true, EVIDENCE_REPLICA, "clean-host recovery unavailable", "a replica cannot help a fresh host that cannot discover or authenticate it"),
+        F::CleanHostRecovery => failure_contract(failure, "newest independently discovered verified root and wrapper", "replica or offsite RPO", "interactive-safe then complete clean-host RTO", "approved bootstrap then read-only plan", "rotate credentials before durable publication", true, EVIDENCE_REPLICA, "unavailable on any missing authority", "copied local cache is not a clean-host drill"),
+        F::ShallowScrubOverdue => failure_contract(failure, "last verified root with overdue coverage", "last publication RPO plus coverage age", "scrub catch-up RTO", "bounded priority scrub", "do not upgrade durability grade", false, EVIDENCE_SCRUB, "degraded coverage", "recent publication does not imply recent verification"),
+        F::DeepScrubOverdue => failure_contract(failure, "last verified root with overdue deep coverage", "last publication RPO plus coverage age", "deep-scrub catch-up RTO", "bounded scheduled deep scrub", "do not reclaim unverified dependencies", false, EVIDENCE_SCRUB, "degraded coverage", "shallow metadata checks do not prove object decodability"),
+        F::ScrubFailure => failure_contract(failure, "last independently verified unaffected root", "unaffected-root RPO", "repair or re-replication RTO", "quarantine then create-new heal", "never overwrite the damaged object in place", false, EVIDENCE_SCRUB, "quarantine on failed heal", "detection is not successful repair"),
+        F::CorruptRepairSource => failure_contract(failure, "generation recoverable from independently authenticated symbols", "surviving-source RPO", "repair plus reverify RTO", "exclude corrupt source and recompute rank", "never trust decoder output before authentication", false, EVIDENCE_SCRUB, "insufficient-rank quarantine", "a decoder result is not a verified snapshot"),
+        F::ClientViewStateLoss => failure_contract(failure, "verified mux truth with safe client reset", "mux RPO; client state unavailable", "mux recovery plus client reset RTO", "automatic safe reset", "discard transient input, IME, clipboard, credentials, and handles", false, EVIDENCE_CLIENT, "server usable with reset client", "server recovery does not imply client-view preservation"),
+        F::ClientViewStateConflict => failure_contract(failure, "verified mux truth with conflicting client envelope quarantined", "mux RPO; client state conflicted", "mux recovery plus operator/client reset RTO", "automatic server recovery; client reset", "never apply conflicting selection, zoom, or viewport state", false, EVIDENCE_CLIENT, "server usable with reset client", "client envelope validity does not override root, domain, or pane identity"),
+    }
+}
+
+/// Return one cell from the exhaustive failure/capability cross-product.
+#[must_use]
+pub const fn snapshot_recovery_contract_cell(
+    failure: SnapshotRecoveryFailureClass,
+    capability: SnapshotRecoveryCapability,
+) -> SnapshotRecoveryContractCell {
+    use SnapshotRecoveryCapability as C;
+    use SnapshotRecoveryCapabilityAvailability as A;
+    use SnapshotRecoveryFailureClass as F;
+
+    let (availability, nonclaim) = match capability {
+        C::GuardianLiveProcessReattachment => match failure {
+            F::GuardianCrash | F::FullHostPowerLoss | F::CompleteHostLoss | F::CorrelatedSiteLoss => (
+                A::Forbidden,
+                "live process execution cannot be reconstructed from serialized bytes",
+            ),
+            _ => (
+                A::CandidateAfterExactGuards,
+                "reattachment requires a live authenticated guardian plus exact lease, replay, and input authority",
+            ),
+        },
+        C::ExactTerminalParserRenderReconstruction => match failure {
+            F::KeyLoss | F::LocalCredentialStoreLoss | F::LocalMediaLoss | F::CompleteHostLoss | F::CorrelatedSiteLoss => (
+                A::RequiresIndependentDurability,
+                "reconstruction requires a decryptable independently retained semantically complete image",
+            ),
+            _ => (
+                A::CandidateAfterExactGuards,
+                "forensic text or topology metadata is not terminal parser/render state",
+            ),
+        },
+        C::TopologyLayoutRecreation => match failure {
+            F::KeyLoss | F::LocalCredentialStoreLoss | F::LocalMediaLoss | F::CompleteHostLoss | F::CorrelatedSiteLoss => (
+                A::RequiresIndependentDurability,
+                "topology recreation requires an independently retained authoritative topology object",
+            ),
+            _ => (
+                A::CandidateAfterExactGuards,
+                "pane labels and best-effort projections are not authoritative topology",
+            ),
+        },
+        C::PolicyGatedProcessReplacement => (
+            A::CandidateAfterExactGuards,
+            "replacement creates new processes and never claims continuity of process memory or external resources",
+        ),
+        C::ForensicContentExport => (
+            A::CandidateAfterExactGuards,
+            "forensic content is read-only evidence and never executable recovery authority",
+        ),
+    };
+    SnapshotRecoveryContractCell {
+        failure,
+        capability,
+        availability,
+        nonclaim,
+    }
+}
+
+/// One machine-validated proof-manifest entry for this contract bead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotRecoveryContractProofEntry {
+    pub invariant_id: &'static str,
+    pub owner_bead: &'static str,
+    pub fixture_or_oracle: &'static str,
+    pub assertion: &'static str,
+    pub package_or_script: &'static str,
+    pub exact_filter_or_scenario: &'static str,
+    pub test_layer: &'static str,
+    pub platform: &'static str,
+    pub required_artifacts: &'static str,
+    pub causal_fault_or_mutation: &'static str,
+}
+
+/// Executable registration for local invariants and the downstream real e2e
+/// consumer owned by the disaster-journey bead.
+pub const SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST: &[SnapshotRecoveryContractProofEntry] = &[
+    SnapshotRecoveryContractProofEntry {
+        invariant_id: "snapshot.contract.failure_capability_cross_product",
+        owner_bead: SNAPSHOT_RECOVERY_CONTRACT_OWNER,
+        fixture_or_oracle: "SnapshotRecoveryFailureClass::ALL x SnapshotRecoveryCapability::ALL",
+        assertion: "every cell is total and carries a nonclaim",
+        package_or_script: "frankenterm-core",
+        exact_filter_or_scenario: "snapshot_recovery_contract_matrix_is_total_and_nonclaiming",
+        test_layer: "unit",
+        platform: "all",
+        required_artifacts: "source identity plus nonzero exact test selection",
+        causal_fault_or_mutation: "remove one failure/capability row or clear one nonclaim",
+    },
+    SnapshotRecoveryContractProofEntry {
+        invariant_id: "snapshot.contract.independent_verdicts",
+        owner_bead: SNAPSHOT_RECOVERY_CONTRACT_OWNER,
+        fixture_or_oracle: "fully verified whole-mux evidence profile",
+        assertion: "validity, semantics, durability, freshness, scrub, drill, and client disposition do not imply one another",
+        package_or_script: "frankenterm-core",
+        exact_filter_or_scenario: "snapshot_recovery_claim_guard_rejects_each_missing_independent_fact",
+        test_layer: "mutation",
+        platform: "all",
+        required_artifacts: "bounded content-free assertion log",
+        causal_fault_or_mutation: "replace exactly one independent verdict with unknown, stale, overdue, failed, or conflict",
+    },
+    SnapshotRecoveryContractProofEntry {
+        invariant_id: "snapshot.contract.forensic_nonpromotion",
+        owner_bead: SNAPSHOT_RECOVERY_CONTRACT_OWNER,
+        fixture_or_oracle: "verified mux dump and checkpoint-scrollback export",
+        assertion: "forensic export is candidate-only and never mutation-capable",
+        package_or_script: "frankenterm-core and frankenterm",
+        exact_filter_or_scenario: "snapshot_recovery_forensic_artifacts_cannot_be_promoted",
+        test_layer: "integration",
+        platform: "all",
+        required_artifacts: "independent verifier receipt",
+        causal_fault_or_mutation: "request executable capability or interactive-safe/complete readiness",
+    },
+    SnapshotRecoveryContractProofEntry {
+        invariant_id: "snapshot.contract.power_loss_nonclaim",
+        owner_bead: SNAPSHOT_RECOVERY_CONTRACT_OWNER,
+        fixture_or_oracle: "mux SIGKILL and isolated-host power-cut scenarios",
+        assertion: "process crash evidence cannot satisfy host-power-loss evidence",
+        package_or_script: "tests/e2e snapshot disaster harness",
+        exact_filter_or_scenario: "snapshot_contract_host_power_loss_nonclaim",
+        test_layer: "e2e",
+        platform: "linux-and-macos",
+        required_artifacts: "source, binary, filesystem capability, fault, root, and replay identities",
+        causal_fault_or_mutation: "label SIGKILL-only evidence as host power loss",
+    },
+    SnapshotRecoveryContractProofEntry {
+        invariant_id: "snapshot.contract.clean_host_progressive_recovery",
+        owner_bead: SNAPSHOT_RECOVERY_CONTRACT_OWNER,
+        fixture_or_oracle: "ft-interactive-swarm-product-convergence-7xqz4.8.14.4.3",
+        assertion: "clean host reaches interactive-safe before complete without authority invention",
+        package_or_script: "tests/e2e snapshot disaster harness",
+        exact_filter_or_scenario: "snapshot_contract_clean_host_progressive_recovery",
+        test_layer: "e2e",
+        platform: "linux-and-macos",
+        required_artifacts: "bootstrap, key-wrapper, replica, freshness, lease, replay, topology, and client-disposition receipts",
+        causal_fault_or_mutation: "remove one authority, inject stale/split view, or promote interactive-safe to complete",
+    },
+];
+
 /// Result of a successful snapshot capture.
 #[derive(Clone)]
 pub struct SnapshotResult {
@@ -8910,6 +9741,18 @@ fn validate_checkpoint_scrollback_payload(
             "payload summary or total resource accounting is invalid".to_string(),
         ));
     }
+    SnapshotRecoveryEvidence::verified_checkpoint_scrollback_export(
+        complete_pane_count == pane_count,
+    )
+    .validate_claim(
+        SnapshotRecoveryCapability::ForensicContentExport,
+        SnapshotRecoveryReadiness::Candidate,
+    )
+    .map_err(|error| {
+        CheckpointScrollbackArtifactError::InvalidArtifact(format!(
+            "checkpoint artifact recovery claim contract rejected: {error}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -10585,6 +11428,325 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
+
+    fn complete_recovery_evidence() -> SnapshotRecoveryEvidence {
+        SnapshotRecoveryEvidence {
+            artifact_kind: SnapshotRecoveryArtifactKind::WholeMuxRecoveryImage,
+            artifact_validity: SnapshotRecoveryVerdict::Verified,
+            repair_status: SnapshotRecoveryRepairStatus::NotRepaired,
+            semantics: SnapshotRecoverySemantics::WholeMuxComplete,
+            compatibility: SnapshotRecoveryVerdict::Verified,
+            topology_authority: SnapshotRecoveryVerdict::Verified,
+            guardian_census: SnapshotRecoveryVerdict::Verified,
+            lease_replay_input_authority: SnapshotRecoveryVerdict::Verified,
+            process_replacement_approval: SnapshotRecoveryVerdict::Verified,
+            durability: SnapshotRecoveryDurabilityGrade::OffsiteVerified,
+            freshness: SnapshotRecoveryFreshness::Verified,
+            scrub_coverage: SnapshotRecoveryScrubCoverage::Current,
+            drill_currency: SnapshotRecoveryDrillCurrency::Current,
+            client_state: SnapshotRecoveryClientStateDisposition::PreservedAndVerified,
+        }
+    }
+
+    #[test]
+    fn snapshot_recovery_policy_keeps_unproven_objectives_unset() {
+        let policy = SnapshotRecoveryPolicy::default().validate().unwrap();
+        assert_eq!(
+            policy.periodic_interval_secs,
+            SnapshotConfig::default().interval_seconds
+        );
+        assert_eq!(policy.target_local_rpo_secs, policy.periodic_interval_secs);
+        assert_eq!(policy.target_replica_rpo_secs, None);
+        assert_eq!(policy.max_full_anchor_age_secs, None);
+        assert_eq!(policy.target_interactive_safe_rto_secs, None);
+        assert_eq!(policy.target_complete_rto_secs, None);
+        assert_eq!(policy.max_freshness_witness_age_secs, None);
+        assert_eq!(policy.max_shallow_scrub_age_secs, None);
+        assert_eq!(policy.max_deep_scrub_age_secs, None);
+        assert_eq!(policy.max_disaster_drill_age_secs, None);
+
+        let mut invalid = policy;
+        invalid.target_local_rpo_secs = invalid.periodic_interval_secs - 1;
+        assert_eq!(
+            invalid.validate(),
+            Err(SnapshotRecoveryPolicyError::LocalRpoBelowInterval)
+        );
+        invalid = policy;
+        invalid.target_replica_rpo_secs = Some(invalid.target_local_rpo_secs - 1);
+        assert_eq!(
+            invalid.validate(),
+            Err(SnapshotRecoveryPolicyError::ReplicaRpoBelowLocalRpo)
+        );
+        invalid = policy;
+        invalid.target_interactive_safe_rto_secs = Some(60);
+        invalid.target_complete_rto_secs = Some(59);
+        assert_eq!(
+            invalid.validate(),
+            Err(SnapshotRecoveryPolicyError::CompleteRtoBelowInteractiveRto)
+        );
+    }
+
+    #[test]
+    fn snapshot_recovery_contract_matrix_is_total_and_nonclaiming() {
+        let mut cells = HashSet::new();
+        for failure in SnapshotRecoveryFailureClass::ALL {
+            let row = snapshot_recovery_failure_contract(failure);
+            assert_eq!(row.failure, failure);
+            assert!(!row.recoverable_point.is_empty());
+            assert!(!row.rpo_scope.is_empty());
+            assert!(!row.rto_scope.is_empty());
+            assert!(!row.automation.is_empty());
+            assert!(!row.mutation.is_empty());
+            assert!(!row.required_evidence.is_empty());
+            assert!(!row.terminal_outcome.is_empty());
+            assert!(!row.nonclaim.is_empty());
+            serde_json::to_value(row).expect("failure row must remain serializable");
+
+            for capability in SnapshotRecoveryCapability::ALL {
+                let cell = snapshot_recovery_contract_cell(failure, capability);
+                assert_eq!(cell.failure, failure);
+                assert_eq!(cell.capability, capability);
+                assert!(!cell.nonclaim.is_empty());
+                assert!(cells.insert((failure, capability)));
+                serde_json::to_value(cell).expect("contract cell must remain serializable");
+            }
+        }
+        assert_eq!(
+            cells.len(),
+            SnapshotRecoveryFailureClass::ALL.len() * SnapshotRecoveryCapability::ALL.len()
+        );
+
+        let mux_crash = snapshot_recovery_failure_contract(
+            SnapshotRecoveryFailureClass::MuxCrash,
+        );
+        let host_power_loss = snapshot_recovery_failure_contract(
+            SnapshotRecoveryFailureClass::FullHostPowerLoss,
+        );
+        assert_ne!(mux_crash.required_evidence, host_power_loss.required_evidence);
+        assert!(mux_crash.nonclaim.contains("not host power loss"));
+        assert!(host_power_loss.nonclaim.contains("do not execute"));
+        assert_eq!(
+            snapshot_recovery_contract_cell(
+                SnapshotRecoveryFailureClass::FullHostPowerLoss,
+                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
+            )
+            .availability,
+            SnapshotRecoveryCapabilityAvailability::Forbidden
+        );
+    }
+
+    #[test]
+    fn snapshot_recovery_forensic_artifacts_cannot_be_promoted() {
+        for evidence in [
+            SnapshotRecoveryEvidence::verified_mux_forensic_dump(false),
+            SnapshotRecoveryEvidence::verified_mux_forensic_dump(true),
+            SnapshotRecoveryEvidence::verified_checkpoint_scrollback_export(false),
+            SnapshotRecoveryEvidence::verified_checkpoint_scrollback_export(true),
+        ] {
+            let receipt = evidence
+                .validate_claim(
+                    SnapshotRecoveryCapability::ForensicContentExport,
+                    SnapshotRecoveryReadiness::Candidate,
+                )
+                .unwrap();
+            assert_eq!(
+                receipt.capability(),
+                SnapshotRecoveryCapability::ForensicContentExport
+            );
+            assert_eq!(receipt.readiness(), SnapshotRecoveryReadiness::Candidate);
+            assert!(!receipt.mutation_permitted());
+
+            for capability in [
+                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+                SnapshotRecoveryCapability::TopologyLayoutRecreation,
+                SnapshotRecoveryCapability::PolicyGatedProcessReplacement,
+            ] {
+                assert_eq!(
+                    evidence.validate_claim(capability, SnapshotRecoveryReadiness::Candidate),
+                    Err(SnapshotRecoveryClaimError::ForensicPromotionForbidden)
+                );
+            }
+            for readiness in [
+                SnapshotRecoveryReadiness::InteractiveSafe,
+                SnapshotRecoveryReadiness::Complete,
+            ] {
+                assert_eq!(
+                    evidence.validate_claim(
+                        SnapshotRecoveryCapability::ForensicContentExport,
+                        readiness,
+                    ),
+                    Err(SnapshotRecoveryClaimError::ForensicPromotionForbidden)
+                );
+            }
+        }
+
+        let mut repaired = SnapshotRecoveryEvidence::verified_mux_forensic_dump(true);
+        repaired.repair_status = SnapshotRecoveryRepairStatus::RepairedUnverified;
+        assert_eq!(
+            repaired.validate_claim(
+                SnapshotRecoveryCapability::ForensicContentExport,
+                SnapshotRecoveryReadiness::Candidate,
+            ),
+            Err(SnapshotRecoveryClaimError::RepairNotReverified)
+        );
+    }
+
+    #[test]
+    fn snapshot_recovery_claim_guard_rejects_each_missing_independent_fact() {
+        let baseline = complete_recovery_evidence();
+        let receipt = baseline
+            .validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            )
+            .unwrap();
+        assert_eq!(receipt.readiness(), SnapshotRecoveryReadiness::Complete);
+        assert!(receipt.mutation_permitted());
+
+        let mut changed = baseline;
+        changed.artifact_validity = SnapshotRecoveryVerdict::Unknown;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::ArtifactNotVerified)
+        );
+        changed = baseline;
+        changed.repair_status = SnapshotRecoveryRepairStatus::RepairedUnverified;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::RepairNotReverified)
+        );
+        changed = baseline;
+        changed.compatibility = SnapshotRecoveryVerdict::Unknown;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::CompatibilityNotVerified)
+        );
+        changed = baseline;
+        changed.semantics = SnapshotRecoverySemantics::TerminalStateComplete;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::WholeMuxSemanticsIncomplete)
+        );
+        changed = baseline;
+        changed.durability = SnapshotRecoveryDurabilityGrade::Unverified;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::DurabilityNotVerified)
+        );
+        for freshness in [
+            SnapshotRecoveryFreshness::Unknown,
+            SnapshotRecoveryFreshness::Stale,
+            SnapshotRecoveryFreshness::Conflict,
+        ] {
+            changed = baseline;
+            changed.freshness = freshness;
+            assert_eq!(
+                changed.validate_release_claim(
+                    SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+                ),
+                Err(SnapshotRecoveryClaimError::FreshnessNotVerified)
+            );
+        }
+        changed = baseline;
+        changed.topology_authority = SnapshotRecoveryVerdict::Unknown;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::WholeMuxSemanticsIncomplete)
+        );
+        changed = baseline;
+        changed.scrub_coverage = SnapshotRecoveryScrubCoverage::Overdue;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::ScrubCoverageNotCurrent)
+        );
+        changed = baseline;
+        changed.drill_currency = SnapshotRecoveryDrillCurrency::Overdue;
+        assert_eq!(
+            changed.validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            ),
+            Err(SnapshotRecoveryClaimError::DisasterDrillNotCurrent)
+        );
+
+        changed = baseline;
+        changed.guardian_census = SnapshotRecoveryVerdict::Unknown;
+        assert_eq!(
+            changed.validate_claim(
+                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
+                SnapshotRecoveryReadiness::InteractiveSafe,
+            ),
+            Err(SnapshotRecoveryClaimError::GuardianCensusNotVerified)
+        );
+        changed = baseline;
+        changed.lease_replay_input_authority = SnapshotRecoveryVerdict::Unknown;
+        assert_eq!(
+            changed.validate_claim(
+                SnapshotRecoveryCapability::GuardianLiveProcessReattachment,
+                SnapshotRecoveryReadiness::InteractiveSafe,
+            ),
+            Err(SnapshotRecoveryClaimError::MutationAuthorityNotVerified)
+        );
+        changed = baseline;
+        changed.process_replacement_approval = SnapshotRecoveryVerdict::Unknown;
+        assert_eq!(
+            changed.validate_claim(
+                SnapshotRecoveryCapability::PolicyGatedProcessReplacement,
+                SnapshotRecoveryReadiness::Complete,
+            ),
+            Err(SnapshotRecoveryClaimError::ProcessReplacementNotApproved)
+        );
+
+        changed = baseline;
+        changed.client_state = SnapshotRecoveryClientStateDisposition::Conflict;
+        let serialized = serde_json::to_value(changed).unwrap();
+        assert_eq!(serialized["client_state"], "conflict");
+        assert!(changed
+            .validate_release_claim(
+                SnapshotRecoveryCapability::ExactTerminalParserRenderReconstruction,
+            )
+            .is_ok());
+        assert_eq!(changed.client_state, SnapshotRecoveryClientStateDisposition::Conflict);
+    }
+
+    #[test]
+    fn snapshot_recovery_contract_proof_manifest_is_self_consistent() {
+        let mut invariant_ids = HashSet::new();
+        let mut filters = HashSet::new();
+        for entry in SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST {
+            assert_eq!(entry.owner_bead, SNAPSHOT_RECOVERY_CONTRACT_OWNER);
+            assert!(invariant_ids.insert(entry.invariant_id));
+            assert!(filters.insert(entry.exact_filter_or_scenario));
+            for field in [
+                entry.fixture_or_oracle,
+                entry.assertion,
+                entry.package_or_script,
+                entry.exact_filter_or_scenario,
+                entry.test_layer,
+                entry.platform,
+                entry.required_artifacts,
+                entry.causal_fault_or_mutation,
+            ] {
+                assert!(!field.is_empty());
+            }
+            serde_json::to_value(entry).expect("proof entry must remain serializable");
+        }
+        assert_eq!(SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST.len(), 5);
+        assert!(filters.contains("snapshot_contract_clean_host_progressive_recovery"));
+    }
 
     type TestPaneProviderFuture = std::pin::Pin<
         Box<
