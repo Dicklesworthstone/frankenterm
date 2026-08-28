@@ -517,6 +517,10 @@ proptest! {
         ttl in 1000u64..10_000_000,
         integrity in proptest::bool::ANY,
         max_ledgers in 1usize..1000,
+        max_spool_files in 1usize..10_000,
+        max_spool_total_bytes in 1u64..(1024 * 1024 * 1024),
+        max_spool_records in 1usize..1_000_000,
+        max_ledger_bytes in 1u64..(64 * 1024 * 1024),
     ) {
         let policy = IdempotencyPolicy {
             dedup_capacity: capacity,
@@ -524,6 +528,10 @@ proptest! {
             dedup_ttl_ms: ttl,
             require_chain_integrity: integrity,
             max_active_ledgers: max_ledgers,
+            max_spool_files,
+            max_spool_total_bytes,
+            max_spool_records,
+            max_ledger_bytes,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: IdempotencyPolicy = serde_json::from_str(&json).unwrap();
@@ -532,6 +540,10 @@ proptest! {
         prop_assert_eq!(back.dedup_ttl_ms, ttl);
         prop_assert_eq!(back.require_chain_integrity, integrity);
         prop_assert_eq!(back.max_active_ledgers, max_ledgers);
+        prop_assert_eq!(back.max_spool_files, max_spool_files);
+        prop_assert_eq!(back.max_spool_total_bytes, max_spool_total_bytes);
+        prop_assert_eq!(back.max_spool_records, max_spool_records);
+        prop_assert_eq!(back.max_ledger_bytes, max_ledger_bytes);
     }
 }
 
