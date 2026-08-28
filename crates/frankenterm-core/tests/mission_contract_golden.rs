@@ -744,7 +744,7 @@ fn contract_clear_override_returns_true_for_existing() {
     ))
     .unwrap();
     assert!(ml.clear_override("to-clear", 2000));
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
 }
 
 #[test]

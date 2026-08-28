@@ -193,7 +193,7 @@ fn inject_no_scrollbacks() {
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failure_count(), 0);
         assert_eq!(report.skipped_count(), 0);
-        assert_eq!(report.skipped_sample(), []);
+        assert!(report.skipped_sample().is_empty());
     });
 }
 

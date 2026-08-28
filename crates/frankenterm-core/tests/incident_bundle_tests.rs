@@ -1330,7 +1330,7 @@ fn collect_incident_bundle_process_sampler_writes_bounded_snapshot() {
         serde_json::from_str(&fs::read_to_string(sample_path).unwrap()).unwrap();
     assert_eq!(sample["collector"], "ps");
     let processes = sample["processes"].as_array().unwrap();
-    assert_ne!(processes.as_slice(), []);
+    assert!(!processes.is_empty());
     assert!(
         processes
             .iter()

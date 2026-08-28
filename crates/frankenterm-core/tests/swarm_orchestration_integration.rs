@@ -513,7 +513,7 @@ fn e2e_scheduler_evaluates_queue_state() {
             assert_ne!(reason, "");
         }
         SchedulerDecision::AssignWork { assignments } => {
-            assert_ne!(assignments.as_slice(), []);
+            assert!(!assignments.is_empty());
         }
         SchedulerDecision::ScaleUp {
             additional_agents, ..
@@ -521,7 +521,7 @@ fn e2e_scheduler_evaluates_queue_state() {
             assert!(*additional_agents >= 1);
         }
         SchedulerDecision::Rebalance { moves } => {
-            assert_ne!(moves.as_slice(), []);
+            assert!(!moves.is_empty());
         }
         _ => {} // Other decisions are also valid
     }

@@ -603,7 +603,7 @@ fn budget_override_history_bounded() {
     }
 
     // Active overrides should be zero (all cleared)
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
 }
 
 #[test]

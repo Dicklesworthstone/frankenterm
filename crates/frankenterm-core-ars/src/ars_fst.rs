@@ -1102,7 +1102,7 @@ mod tests {
         let err = builder.add_literal("overflow", "c", 0).unwrap_err();
 
         assert_eq!(err, FstError::ReflexIdExhausted);
-        assert_eq!(builder.entries(), []);
+        assert!(builder.entries().is_empty());
     }
 
     #[test]

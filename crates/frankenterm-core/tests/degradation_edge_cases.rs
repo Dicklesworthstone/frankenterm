@@ -170,7 +170,7 @@ fn pattern_engine_recovery_clears_patterns_but_not_workflows() {
 
     dm.recover(Subsystem::PatternEngine);
     // Patterns cleared, workflows still paused.
-    assert_eq!(dm.disabled_patterns(), []);
+    assert!(dm.disabled_patterns().is_empty());
     assert_eq!(dm.paused_workflows().len(), 1);
     assert!(dm.is_workflow_paused("wf-1"));
 }
@@ -185,7 +185,7 @@ fn workflow_engine_recovery_clears_workflows_but_not_patterns() {
 
     dm.recover(Subsystem::WorkflowEngine);
     // Workflows cleared, patterns still disabled.
-    assert_eq!(dm.paused_workflows(), []);
+    assert!(dm.paused_workflows().is_empty());
     assert_eq!(dm.disabled_patterns().len(), 1);
     assert!(dm.is_pattern_disabled("rule-1"));
 }
@@ -303,7 +303,7 @@ fn resume_all_workflows_one_by_one() {
     for i in 0..5 {
         dm.resume_workflow(&format!("wf-{i}"));
     }
-    assert_eq!(dm.paused_workflows(), []);
+    assert!(dm.paused_workflows().is_empty());
 }
 
 // ===========================================================================

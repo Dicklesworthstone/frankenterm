@@ -418,7 +418,7 @@ fn json_format_policy_evaluation_structure() {
 
     let policy = &parsed["policy_evaluation"];
     let checks = policy["checks"].as_array().unwrap();
-    assert_ne!(checks.as_slice(), []);
+    assert!(!checks.is_empty());
 
     for check in checks {
         assert!(check["name"].is_string());

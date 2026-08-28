@@ -2555,7 +2555,7 @@ mod tests {
                 err,
                 IndexerError::IndexWrite(IndexWriteError::Transient { .. })
             ));
-            assert_eq!(indexer.writer().written_docs(), []);
+            assert!(indexer.writer().written_docs().is_empty());
             assert_eq!(indexer.writer().commits, 0);
         });
     }

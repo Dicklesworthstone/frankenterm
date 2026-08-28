@@ -8480,7 +8480,7 @@ mod tests {
             wezterm_term::config::ScrollbackSnapshotFidelity::ExactSemantic
         );
         assert_eq!(snapshot.generation(), empty.generation());
-        assert_eq!(snapshot.rows(), []);
+        assert!(snapshot.rows().is_empty());
 
         let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
             .simple()
@@ -11279,7 +11279,7 @@ mod tests {
         let empty = sink
             .snapshot_scrollback(6, limits)
             .expect("snapshot committed empty generation");
-        assert_eq!(empty.rows(), []);
+        assert!(empty.rows().is_empty());
         assert_eq!(empty.oldest_stable_row(), None);
         assert_eq!(
             empty.fidelity(),

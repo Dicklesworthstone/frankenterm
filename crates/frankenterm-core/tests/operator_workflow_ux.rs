@@ -313,7 +313,7 @@ fn override_full_lifecycle_activate_evaluate_clear() {
 
     // Step 3: Clear override
     assert!(ml.clear_override("pin-1", 2000));
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
 
     // Step 4: Evaluate again — normal behavior resumes
     let decision2 = ml.evaluate(3000, MissionTrigger::CadenceTick, &issues, &agents, &c);
@@ -370,7 +370,7 @@ fn override_expired_auto_evicted_on_evaluate() {
     assert_eq!(ml.active_overrides().len(), 1);
 
     ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
 }
 
 #[test]

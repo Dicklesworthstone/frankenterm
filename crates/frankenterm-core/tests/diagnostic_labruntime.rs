@@ -360,7 +360,7 @@ fn bundle_includes_reservation_snapshot() {
             std::fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
         let history: serde_json::Value = serde_json::from_str(&hist_content).unwrap();
         let hist_arr = history.as_array().unwrap();
-        assert_ne!(hist_arr.as_slice(), []);
+        assert!(!hist_arr.is_empty());
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

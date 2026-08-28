@@ -325,7 +325,7 @@ fn override_full_lifecycle_apply_inspect_clear() {
     let mut ml = MissionLoop::new(MissionLoopConfig::default());
 
     // Step 1: No overrides initially
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
 
     // Step 2: Apply pin override
     ml.apply_override(ovr(
@@ -344,7 +344,7 @@ fn override_full_lifecycle_apply_inspect_clear() {
     // Step 4: Clear
     let cleared = ml.clear_override("pin-b1", 5000);
     assert!(cleared);
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
 
     // Step 5: Clear non-existent returns false
     assert!(!ml.clear_override("nonexistent", 6000));
@@ -400,7 +400,7 @@ fn override_ttl_auto_eviction() {
 
     // After expiry — override evicted, bead assignable
     let d2 = ml.evaluate(35_000, MissionTrigger::CadenceTick, &issues, &agents, &c);
-    assert_eq!(ml.active_overrides(), []);
+    assert!(ml.active_overrides().is_empty());
     assert!(!d2.assignment_set.assignments.is_empty());
 }
 

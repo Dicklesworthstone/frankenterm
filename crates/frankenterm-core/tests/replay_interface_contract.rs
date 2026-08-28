@@ -751,7 +751,7 @@ fn ic37_smoke_empty_artifact_list() {
 
     let json = serde_json::to_value(&data).unwrap();
     assert_eq!(json["count"], 0);
-    assert_eq!(json["artifacts"].as_array().unwrap().as_slice(), []);
+    assert!(json["artifacts"].as_array().unwrap().is_empty());
 
     // Wrapping in dispatch
     let dispatch = DispatchResult::ok(json);

@@ -20230,7 +20230,7 @@ mod tests {
             .expect("read empty immutable recovery Census");
         assert!(!census.snapshot_id().is_nil());
         assert_eq!(census.total_entries(), 0);
-        assert_eq!(census.entries(), []);
+        assert!(census.entries().is_empty());
         assert_eq!(census.next_cursor(), None);
 
         let rejected_spawn = BrokerControlRequestV1::new(
