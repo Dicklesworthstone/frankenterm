@@ -357,7 +357,7 @@ mod tests {
         let sa = SuffixArray::new(b"");
         assert!(sa.is_empty());
         assert_eq!(sa.len(), 0);
-        assert_eq!(sa.search(b"anything"), [] as [usize; 0]);
+        assert!(sa.search(b"anything").is_empty());
         assert_eq!(sa.count(b"anything"), 0);
     }
 
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn search_not_found() {
         let sa = SuffixArray::from_str("hello world");
-        assert_eq!(sa.search_str("xyz"), [] as [usize; 0]);
+        assert!(sa.search_str("xyz").is_empty());
         assert_eq!(sa.count_str("xyz"), 0);
     }
 
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(sa.search_str("the"), vec![0, 31]);
         assert_eq!(sa.count_str("the"), 2);
         assert_eq!(sa.search_str("fox"), vec![16]);
-        assert_eq!(sa.search_str("cat"), [] as [usize; 0]);
+        assert!(sa.search_str("cat").is_empty());
     }
 
     #[test]
@@ -538,14 +538,14 @@ mod tests {
     #[test]
     fn search_empty_pattern() {
         let sa = SuffixArray::from_str("hello");
-        assert_eq!(sa.search(b""), [] as [usize; 0]);
+        assert!(sa.search(b"").is_empty());
         assert_eq!(sa.count(b""), 0);
     }
 
     #[test]
     fn search_on_empty_text() {
         let sa = SuffixArray::new(b"");
-        assert_eq!(sa.search(b"a"), [] as [usize; 0]);
+        assert!(sa.search(b"a").is_empty());
         assert_eq!(sa.count(b"a"), 0);
     }
 
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn search_pattern_longer_than_text() {
         let sa = SuffixArray::from_str("hi");
-        assert_eq!(sa.search_str("hello"), [] as [usize; 0]);
+        assert!(sa.search_str("hello").is_empty());
     }
 
     #[test]
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn longest_repeated_substring_str_empty() {
         let sa = SuffixArray::new(b"");
-        assert_eq!(sa.longest_repeated_substring_str(), []);
+        assert!(sa.longest_repeated_substring_str().is_empty());
     }
 
     #[test]

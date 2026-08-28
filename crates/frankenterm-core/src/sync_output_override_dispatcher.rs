@@ -385,7 +385,7 @@ mod tests {
     fn drain_empty_queue_returns_empty_vec() {
         let mut d = OverrideDispatcher::new();
         let drained = d.drain_coalesced_at_esu();
-        assert_eq!(drained, [] as [sync_output_override_dispatcher::CoalescedEntry; 0]);
+        assert!(drained.is_empty());
     }
 
     #[test]

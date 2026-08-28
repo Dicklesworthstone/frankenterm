@@ -1920,7 +1920,7 @@ mod tests {
         assert_eq!(sb.warm_page_count(), 0);
         assert_eq!(sb.cold_line_count(), 0);
         assert_eq!(sb.total_line_count(), 0);
-        assert_eq!(sb.tail(10), [] as [&str; 0]);
+        assert!(sb.tail(10).is_empty());
     }
 
     #[test]
@@ -2375,7 +2375,7 @@ mod tests {
         let empty: Vec<String> = vec![];
         let bytes = lines_to_bytes(&empty);
         let back = bytes_to_lines(&bytes);
-        assert_eq!(back, [] as [std::string::String; 0]);
+        assert!(back.is_empty());
     }
 
     #[test]

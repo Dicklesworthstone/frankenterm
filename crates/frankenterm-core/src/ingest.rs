@@ -5586,7 +5586,7 @@ mod tests {
         assert!(diff.new_panes.contains(&1));
         assert!(diff.new_panes.contains(&2));
         assert_eq!(diff.closed_panes, [] as [u64; 0]);
-        assert_eq!(diff.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
+        assert!(diff.metadata_changes.is_empty());
         assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
 
         // Registry now tracks both panes
@@ -5701,7 +5701,7 @@ mod tests {
 
         let stable_diff = registry.discovery_tick(vec![replacement]);
         assert_eq!(stable_diff.lifecycle_replacements, [] as [u64; 0]);
-        assert_eq!(stable_diff.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
+        assert!(stable_diff.metadata_changes.is_empty());
         assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
     }
 
@@ -5791,7 +5791,7 @@ mod tests {
         let repeated = registry.discovery_tick(vec![proven.clone(), proven]);
         assert_eq!(repeated.ambiguous_lifecycle_panes, vec![pane_id]);
         assert_eq!(repeated.lifecycle_replacements, [] as [u64; 0]);
-        assert_eq!(repeated.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
+        assert!(repeated.metadata_changes.is_empty());
         assert_eq!(
             registry
                 .get_entry(pane_id)
@@ -5836,7 +5836,7 @@ mod tests {
         let metadata_diff =
             metadata_registry.discovery_tick(vec![make_pane(11, "editor", Some("/tmp"))]);
         assert_eq!(metadata_diff.revision_exhausted_panes, vec![11]);
-        assert_eq!(metadata_diff.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
+        assert!(metadata_diff.metadata_changes.is_empty());
         assert!(!metadata_registry.get_entry(11).unwrap().should_observe());
         let metadata_repeat = metadata_registry.discovery_tick(vec![make_pane(
             11,
@@ -5873,7 +5873,7 @@ mod tests {
             exhausted.revision_exhausted_panes,
             (0..600_u64).collect::<Vec<_>>()
         );
-        assert_eq!(exhausted.metadata_changes, [] as [ingest::PaneMetadataChange; 0]);
+        assert!(exhausted.metadata_changes.is_empty());
 
         let repeated = registry.discovery_tick(changed);
         assert!(
@@ -6717,19 +6717,19 @@ mod tests {
     fn osc133_parse_ignores_malformed() {
         // Unknown marker type
         let markers = parse_osc133_markers("\x1b]133;X\x07");
-        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
+        assert!(markers.is_empty());
 
         // Missing terminator (text ends before terminator)
         let markers = parse_osc133_markers("\x1b]133;A");
-        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
+        assert!(markers.is_empty());
 
         // Wrong OSC number
         let markers = parse_osc133_markers("\x1b]7;A\x07");
-        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
+        assert!(markers.is_empty());
 
         // Not an OSC sequence
         let markers = parse_osc133_markers("[133;A");
-        assert_eq!(markers, [] as [ingest::Osc133Marker; 0]);
+        assert!(markers.is_empty());
     }
 
     #[test]
@@ -8072,7 +8072,7 @@ mod tests {
             overflow: false,
         });
 
-        assert_eq!(segments, [] as [ingest::CapturedSegment; 0]);
+        assert!(segments.is_empty());
         assert_eq!(ingester.active_panes(), 0);
         assert_eq!(ingester.total_segments(), 0);
         assert_eq!(ingester.total_gaps(), 0);
@@ -8299,7 +8299,7 @@ mod tests {
     fn ingester_pane_closed_unknown_pane_is_noop() {
         let mut ingester = StreamIngester::new();
         let segs = ingester.process(StreamEvent::PaneClosed { pane_id: 999 });
-        assert_eq!(segs, [] as [ingest::CapturedSegment; 0]);
+        assert!(segs.is_empty());
     }
 
     // --- Disconnected ---

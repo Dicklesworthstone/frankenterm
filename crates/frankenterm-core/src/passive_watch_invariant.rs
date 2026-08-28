@@ -665,7 +665,7 @@ mod tests {
             mutating_violations: 0,
             corpus_kind: None,
         };
-        assert_eq!(check_invariants(&obs), [] as [passive_watch_invariant::PassiveWatchInvariant; 0]);
+        assert!(check_invariants(&obs).is_empty());
         assert!(obs.is_safe());
     }
 

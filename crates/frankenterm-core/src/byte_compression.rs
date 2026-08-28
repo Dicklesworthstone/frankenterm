@@ -748,7 +748,7 @@ mod tests {
         let seeds = terminal_dictionary_seeds();
         assert!(seeds.len() > 10);
         for seed in &seeds {
-            assert_ne!(seed.as_slice(), []);
+            assert!(!seed.is_empty());
         }
     }
 

@@ -241,7 +241,7 @@ mod tests {
         assert!(b.is_empty());
         // peek_bytes returns empty even if Vec has reserved
         // capacity.
-        assert_eq!(b.peek_bytes(), []);
+        assert!(b.peek_bytes().is_empty());
     }
 
     // ----------------------------------------------------------------
@@ -405,7 +405,7 @@ mod tests {
     fn drain_for_publish_empty_returns_empty_vec() {
         let mut b = BsuRingBuffer::new(cfg(1000));
         let drained = b.drain_for_publish();
-        assert_eq!(drained, [] as [u8; 0]);
+        assert!(drained.is_empty());
     }
 
     #[test]

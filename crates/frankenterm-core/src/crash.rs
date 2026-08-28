@@ -11751,7 +11751,7 @@ mod tests {
         assert_eq!(cp.version, CHECKPOINT_FORMAT_VERSION);
         assert_eq!(cp.created_at, 1000);
         assert_eq!(cp.wa_version, crate::VERSION);
-        assert_eq!(cp.panes, [] as [crash::PaneCaptureState; 0]);
+        assert!(cp.panes.is_empty());
     }
 
     #[test]

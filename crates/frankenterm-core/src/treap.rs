@@ -653,13 +653,13 @@ mod tests {
     #[test]
     fn to_sorted_vec_empty() {
         let treap: Treap<i32, ()> = Treap::new();
-        assert_eq!(treap.to_sorted_vec(), [] as [(&i32, &()); 0]);
+        assert!(treap.to_sorted_vec().is_empty());
     }
 
     #[test]
     fn keys_empty() {
         let treap: Treap<i32, ()> = Treap::new();
-        assert_eq!(treap.keys(), [] as [&i32; 0]);
+        assert!(treap.keys().is_empty());
     }
 
     #[test]

@@ -365,7 +365,7 @@ mod import_guardrail_tests {
 
     #[test]
     fn forbidden_patterns_are_non_empty() {
-        assert_ne!(FORBIDDEN_PATTERNS, []);
+        assert!(!FORBIDDEN_PATTERNS.is_empty());
     }
 
     #[test]

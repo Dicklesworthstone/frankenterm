@@ -2101,7 +2101,7 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        assert_eq!(registry.dispatch(HookPhase::PreStep, &ctx), [] as [(std::string::String, swarm_pipeline::HookOutcome); 0]);
+        assert!(registry.dispatch(HookPhase::PreStep, &ctx).is_empty());
     }
 
     #[test]
@@ -2349,7 +2349,7 @@ mod tests {
         let mut executor = PipelineExecutor::new();
         let result = executor.execute(&p, 1000).unwrap();
         assert!(matches!(result.status, PipelineStatus::Failed { .. }));
-        assert_eq!(result.compensations_executed, [] as [std::string::String; 0]);
+        assert!(result.compensations_executed.is_empty());
     }
 
     #[test]

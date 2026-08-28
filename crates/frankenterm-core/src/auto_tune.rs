@@ -4093,7 +4093,7 @@ mod tests {
             candidate.reason_code,
             "auto_tune.candidate.runtime.output_coalesce_window_ms"
         );
-        assert_eq!(decision.skip_reasons, [] as [auto_tune::CandidateSkipReason; 0]);
+        assert!(decision.skip_reasons.is_empty());
     }
 
     #[test]

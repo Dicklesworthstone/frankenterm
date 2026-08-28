@@ -2748,7 +2748,7 @@ mod tests {
     #[test]
     fn build_offsets_empty() {
         let offsets = build_offsets_from_lengths(&[]);
-        assert_eq!(offsets, [] as [storage::mmap_store::LineOffset; 0]);
+        assert!(offsets.is_empty());
     }
 
     #[test]
@@ -3972,7 +3972,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
 
         let (offsets, len) = PaneFile::scan_offsets(&path).unwrap();
-        assert_eq!(offsets, [] as [storage::mmap_store::LineOffset; 0]);
+        assert!(offsets.is_empty());
         assert_eq!(len, 0);
     }
 

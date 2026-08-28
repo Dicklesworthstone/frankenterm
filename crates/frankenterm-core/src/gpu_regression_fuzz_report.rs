@@ -1156,7 +1156,7 @@ mod tests {
 
         assert!(comparison.passed(), "{comparison:?}");
         assert_eq!(comparison.framework, "NSAccessibility");
-        assert_eq!(comparison.violations, [] as [gpu_regression_fuzz_report::ScreenReaderContractViolation; 0]);
+        assert!(comparison.violations.is_empty());
     }
 
     #[test]
@@ -1196,7 +1196,7 @@ mod tests {
 
         assert!(comparison.skipped(), "{comparison:?}");
         assert_eq!(comparison.framework, "UIAutomation");
-        assert_eq!(comparison.violations, [] as [gpu_regression_fuzz_report::ScreenReaderContractViolation; 0]);
+        assert!(comparison.violations.is_empty());
     }
 
     #[test]

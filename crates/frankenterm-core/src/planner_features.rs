@@ -2360,7 +2360,7 @@ mod tests {
         let ctx = PlannerExtractionContext::default();
         let config = PlannerExtractionConfig::default();
         let result = extract_planner_features(&report, &agents, &ctx, &config);
-        assert_eq!(result.features, [] as [planner_features::PlannerFeatureVector; 0]);
+        assert!(result.features.is_empty());
         assert_eq!(result.ranked_ids, [] as [std::string::String; 0]);
     }
 

@@ -893,7 +893,7 @@ mod tests {
     fn empty_candidates_returns_empty_plan() {
         let mut planner = LoadShedPlanner::new(LoadShedConfig::conservative());
         let decisions = planner.plan(&[], &full_pressure());
-        assert_eq!(decisions, [] as [(u64, mission_load_shed_planner::LoadShedDecision, mission_load_shed_planner::LoadShedDecisionEvidence); 0]);
+        assert!(decisions.is_empty());
     }
 
     /// Hysteresis state snapshot reflects accumulated pressure

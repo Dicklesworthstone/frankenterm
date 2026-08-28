@@ -1358,7 +1358,7 @@ mod tests {
         let ns = TenantNamespace::new("org").unwrap();
 
         reg.check_and_audit(&ns, &ns, NamespacedResourceKind::Pane, "1", 1_000);
-        assert_eq!(reg.audit_log(), []);
+        assert!(reg.audit_log().is_empty());
     }
 
     #[test]

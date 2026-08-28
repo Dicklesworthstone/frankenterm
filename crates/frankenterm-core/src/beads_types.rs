@@ -869,7 +869,7 @@ mod tests {
         let report = resolve_bead_readiness(&[]);
         assert!(report.candidates.is_empty());
         assert_eq!(report.ready_ids, [] as [std::string::String; 0]);
-        assert_eq!(report.degraded_reason_codes, [] as [beads_types::BeadResolverReasonCode; 0]);
+        assert!(report.degraded_reason_codes.is_empty());
         assert_eq!(report.ready_count(), 0);
     }
 

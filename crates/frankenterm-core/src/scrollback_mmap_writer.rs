@@ -4175,7 +4175,7 @@ mod tests {
         drop(writer);
 
         let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
-        assert_eq!(snapshot.records, [] as [(scrollback_mmap_format::RecordKind, std::vec::Vec<u8>); 0]);
+        assert!(snapshot.records.is_empty());
         assert_eq!(snapshot.completeness, LinearRecordCompleteness::Complete);
     }
 

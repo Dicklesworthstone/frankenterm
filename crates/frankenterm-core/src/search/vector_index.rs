@@ -451,7 +451,7 @@ mod tests {
         let idx = make_index(&vecs);
         // query has wrong dimension
         let results = idx.search(&[1.0, 0.0, 0.0], 5);
-        assert_eq!(results, [] as [(u64, f32); 0]);
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
         let vecs = vec![(1u64, vec![1.0, 0.0])];
         let idx = make_index(&vecs);
         let results = idx.search(&[1.0, 0.0], 0);
-        assert_eq!(results, [] as [(u64, f32); 0]);
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -783,6 +783,6 @@ mod tests {
         let idx = FtviIndex::from_bytes(&data).unwrap();
         assert_eq!(idx.len(), 3);
         assert_eq!(idx.dimension(), 0);
-        assert_eq!(idx.vector_at(0), []);
+        assert!(idx.vector_at(0).is_empty());
     }
 }

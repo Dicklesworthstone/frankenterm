@@ -571,7 +571,7 @@ mod tests {
 
         // Query a specific region
         let results = tree.query(&Rect::new(10.0, 0.0, 20.0, 3.0));
-        assert_ne!(results, [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(!results.is_empty());
     }
 
     #[test]
@@ -643,7 +643,7 @@ mod tests {
     fn query_empty() {
         let tree: RTree<i32> = RTree::new();
         let results = tree.query(&Rect::new(0.0, 0.0, 10.0, 10.0));
-        assert_eq!(results, [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(results.is_empty());
     }
 
     // ── Expanded test coverage ──────────────────────────────────────
@@ -755,7 +755,7 @@ mod tests {
     fn point_query_empty_tree() {
         let tree: RTree<i32> = RTree::new();
         let results = tree.query_point(5.0, 5.0);
-        assert_eq!(results, [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -765,7 +765,7 @@ mod tests {
         tree.insert(Rect::new(10.0, 10.0, 15.0, 15.0), 2);
 
         let results = tree.query_point(7.0, 7.0);
-        assert_eq!(results, [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -804,7 +804,7 @@ mod tests {
 
         // Query a region that should contain specific entries
         let results = tree.query(&Rect::new(0.0, 0.0, 15.0, 5.0));
-        assert_ne!(results, [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(!results.is_empty());
     }
 
     #[test]
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn entries_empty_tree() {
         let tree: RTree<i32> = RTree::new();
-        assert_eq!(tree.entries(), [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(tree.entries().is_empty());
     }
 
     #[test]
@@ -963,7 +963,7 @@ mod tests {
         tree.insert(Rect::new(10.0, 10.0, 15.0, 15.0), 2);
 
         let results = tree.query(&Rect::new(6.0, 6.0, 9.0, 9.0));
-        assert_eq!(results, [] as [(&r_tree::Rect, &i32); 0]);
+        assert!(results.is_empty());
     }
 
     #[test]

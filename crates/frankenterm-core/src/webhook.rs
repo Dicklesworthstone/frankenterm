@@ -1085,7 +1085,7 @@ mod tests {
         assert!(json["text"].as_str().unwrap().contains("FrankenTerm:"));
         assert!(json["text"].as_str().unwrap().contains("suppressed"));
         assert!(json["blocks"].is_array());
-        assert_ne!(json["blocks"].as_array().unwrap().as_slice(), []);
+        assert!(!json["blocks"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1773,7 +1773,7 @@ url = "http://localhost:8080/hook"
 "#;
         let ep: WebhookEndpointConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(ep.template, WebhookTemplate::Generic);
-        assert_eq!(ep.events, [] as [std::string::String; 0]);
+        assert!(ep.events.is_empty());
         assert!(ep.headers.is_empty());
         assert!(ep.enabled);
     }

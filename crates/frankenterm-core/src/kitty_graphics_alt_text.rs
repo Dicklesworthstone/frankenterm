@@ -915,7 +915,7 @@ mod tests {
         // Pin accessors.
         assert_eq!(att.version(), "1.0.0");
         assert_eq!(att.fixtures_passed().len(), 3);
-        assert_eq!(att.fixtures_failed(), []);
+        assert!(att.fixtures_failed().is_empty());
         assert!(att.alt_text_a11y_test_passed());
         assert!(att.cap_rejection_test_passed());
         assert_eq!(att.rollout_phase(), RolloutPhase::OptIn);

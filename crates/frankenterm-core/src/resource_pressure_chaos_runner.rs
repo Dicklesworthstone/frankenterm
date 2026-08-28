@@ -557,10 +557,11 @@ mod tests {
         );
         assert!(report.high_scale_proven);
         assert!(report.coverage_assessment.parent_completion_ready);
-        assert_eq!(
+        assert!(
             report
                 .coverage_assessment
-                .blocking_pressure_classes, [] as [resource_pressure_chaos::ResourcePressureClass; 0]
+                .blocking_pressure_classes
+                .is_empty()
         );
     }
 

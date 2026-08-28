@@ -1878,7 +1878,7 @@ mod pure_tests {
         assert_eq!(snap.native_output_input_events, 0);
         assert_eq!(snap.native_output_batches_emitted, 0);
         assert!(snap.event_bus.is_none());
-        assert_eq!(snap.cost_attribution_estimates, [] as [cost_tracker::CostAttributionEstimateSummary; 0]);
+        assert!(snap.cost_attribution_estimates.is_empty());
     }
 
     #[test]

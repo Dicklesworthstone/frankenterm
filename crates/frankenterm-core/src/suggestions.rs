@@ -1965,7 +1965,7 @@ mod tests {
         let enhanced = enhance_pane_not_found(remediation, 4, &ctx);
 
         // Should have alternatives for "did you mean" and "available panes"
-        assert_ne!(enhanced.alternatives, [] as [std::string::String; 0]);
+        assert!(!enhanced.alternatives.is_empty());
 
         let alts_text = enhanced.alternatives.join(" ");
         assert!(alts_text.contains("Did you mean"));
@@ -1981,7 +1981,7 @@ mod tests {
         let remediation = Remediation::new("Workflow not found");
         let enhanced = enhance_workflow_not_found(remediation, "handle_compactin", &ctx);
 
-        assert_ne!(enhanced.alternatives, [] as [std::string::String; 0]);
+        assert!(!enhanced.alternatives.is_empty());
         let alts_text = enhanced.alternatives.join(" ");
         assert!(alts_text.contains("handle_compaction"));
     }
@@ -1995,7 +1995,7 @@ mod tests {
         let remediation = Remediation::new("Rule not found");
         let enhanced = enhance_rule_not_found(remediation, "codex.usage.reched", &ctx);
 
-        assert_ne!(enhanced.alternatives, [] as [std::string::String; 0]);
+        assert!(!enhanced.alternatives.is_empty());
         let alts_text = enhanced.alternatives.join(" ");
         assert!(alts_text.contains("codex.usage.reached"));
     }
@@ -2009,7 +2009,7 @@ mod tests {
         // Should have a platform-specific install command (on Linux/macOS)
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            assert_ne!(enhanced.commands, [] as [error::RemediationCommand; 0]);
+            assert!(!enhanced.commands.is_empty());
             let cmd = &enhanced.commands[0];
             assert!(cmd.command.contains("wezterm"));
             assert!(cmd.platform.is_some());

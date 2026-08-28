@@ -1018,7 +1018,7 @@ mod tests {
         let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
         assert!(report.overall_compliant);
         assert!((report.compliance_rate - 1.0).abs() < f64::EPSILON);
-        assert_eq!(report.uncovered_contracts, [] as [std::string::String; 0]);
+        assert!(report.uncovered_contracts.is_empty());
         assert!(report.failing_contracts().is_empty());
         assert_eq!(report.surface_status.keep_count, keep_count);
         assert_eq!(report.surface_status.replace_count, replace_count);
@@ -1070,7 +1070,7 @@ mod tests {
         }
         report.finalize();
 
-        assert_ne!(report.uncovered_contracts, [] as [std::string::String; 0]);
+        assert!(!report.uncovered_contracts.is_empty());
         // Should not be overall compliant because uncovered contracts have
         // zero evidence (compliant=false).
         assert!(!report.overall_compliant);

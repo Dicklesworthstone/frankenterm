@@ -1620,7 +1620,7 @@ mod tests {
         );
         assert_eq!(fleet.launch_plan.program_weight("shell"), 3);
         assert_eq!(fleet.launch_plan.program_weight("codex-cli"), 1);
-        assert_eq!(fleet.launch_plan.invariant_violations(), [] as [session_profiles::FleetLaunchInvariantViolation; 0]);
+        assert!(fleet.launch_plan.invariant_violations().is_empty());
     }
 
     #[test]
@@ -1759,7 +1759,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta", "zeta"]
         );
-        assert_eq!(fleet.launch_plan.invariant_violations(), [] as [session_profiles::FleetLaunchInvariantViolation; 0]);
+        assert!(fleet.launch_plan.invariant_violations().is_empty());
     }
 
     #[test]
@@ -1834,7 +1834,7 @@ mod tests {
     fn validate_ok() {
         let mut reg = ProfileRegistry::new();
         reg.register_defaults();
-        assert_eq!(reg.validate(), [] as [session_profiles::ProfileValidationError; 0]);
+        assert!(reg.validate().is_empty());
     }
 
     #[test]
@@ -2064,7 +2064,7 @@ mod tests {
         let json = r#"{"command":"echo"}"#;
         let cmd: SpawnCommand = serde_json::from_str(json).unwrap();
         assert!(cmd.use_shell);
-        assert_eq!(cmd.args, [] as [std::string::String; 0]);
+        assert!(cmd.args.is_empty());
     }
 
     // -------------------------------------------------------------------------

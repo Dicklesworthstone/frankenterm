@@ -1126,7 +1126,7 @@ mod tests {
         let decision = ctrl.evaluate_health(1, 1000, &diff, &metrics);
 
         assert!(decision.health_check.healthy);
-        assert_eq!(decision.health_check.failure_reasons, [] as [canary_rollout_controller::HealthFailureReason; 0]);
+        assert!(decision.health_check.failure_reasons.is_empty());
     }
 
     #[test]

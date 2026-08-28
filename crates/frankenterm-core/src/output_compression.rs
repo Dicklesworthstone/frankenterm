@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn compress_empty_input() {
         let compressed = compress("", &CompressionConfig::default());
-        assert_eq!(compressed.templates, [] as [output_compression::OutputTemplate; 0]);
+        assert!(compressed.templates.is_empty());
         assert!(compressed.entries.is_empty());
     }
 

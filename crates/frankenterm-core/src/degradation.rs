@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(dm.disabled_patterns().len(), 1);
 
         dm.recover(Subsystem::PatternEngine);
-        assert_eq!(dm.disabled_patterns(), []);
+        assert!(dm.disabled_patterns().is_empty());
     }
 
     #[test]
@@ -1208,7 +1208,7 @@ mod tests {
 
         dm.resume_workflow("wf-123");
         assert!(!dm.is_workflow_paused("wf-123"));
-        assert_eq!(dm.paused_workflows(), []);
+        assert!(dm.paused_workflows().is_empty());
     }
 
     #[test]
@@ -2013,7 +2013,7 @@ mod tests {
 
         // Recover only PatternEngine
         dm.recover(Subsystem::PatternEngine);
-        assert_eq!(dm.disabled_patterns(), []);
+        assert!(dm.disabled_patterns().is_empty());
         // Workflows should still be paused
         assert_eq!(dm.paused_workflows().len(), 2);
         assert!(dm.is_workflow_paused("wf-100"));
@@ -2021,7 +2021,7 @@ mod tests {
 
         // Now recover WorkflowEngine too
         dm.recover(Subsystem::WorkflowEngine);
-        assert_eq!(dm.paused_workflows(), []);
+        assert!(dm.paused_workflows().is_empty());
         assert_eq!(dm.overall_status(), OverallStatus::Healthy);
     }
 
@@ -2907,7 +2907,7 @@ mod tests {
     fn resume_nonexistent_workflow_is_noop() {
         let mut dm = DegradationManager::new();
         dm.resume_workflow("does-not-exist");
-        assert_eq!(dm.paused_workflows(), []);
+        assert!(dm.paused_workflows().is_empty());
     }
 
     #[test]
@@ -3082,8 +3082,8 @@ mod tests {
         let dm = DegradationManager::default();
         assert_eq!(dm.queued_write_count(), 0);
         assert_eq!(dm.queued_write_bytes(), 0);
-        assert_eq!(dm.disabled_patterns(), []);
-        assert_eq!(dm.paused_workflows(), []);
+        assert!(dm.disabled_patterns().is_empty());
+        assert!(dm.paused_workflows().is_empty());
         assert!(dm.snapshots().is_empty());
     }
 

@@ -971,7 +971,7 @@ mod tests {
         let table = Table::new(vec![Column::new("A")]).with_format(OutputFormat::Json);
         let output = table.render();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed, [] as [serde_json::Value; 0]);
+        assert!(parsed.is_empty());
     }
 
     #[test]

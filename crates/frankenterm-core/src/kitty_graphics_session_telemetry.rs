@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(agg.summary().total_rejected, 1);
         // A second flush returns empty.
         let drained2 = agg.flush_log_rows();
-        assert_eq!(drained2, [] as [kitty_graphics_compositor::StructuredLogRow; 0]);
+        assert!(drained2.is_empty());
     }
 
     #[test]

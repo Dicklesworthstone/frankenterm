@@ -1140,7 +1140,7 @@ mod tests {
         let mut log = TransitionLog::new();
         log.record(1, StateLabel::Creating, StateLabel::Active, 100);
         let filtered = log.records_for_pane(999);
-        assert_eq!(filtered, [] as [&pane_typestate::TransitionRecord; 0]);
+        assert!(filtered.is_empty());
         assert_eq!(log.count_for_pane(999), 0);
     }
 

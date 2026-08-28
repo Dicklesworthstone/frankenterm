@@ -421,7 +421,9 @@ mod tests {
         let p2 = point(4, 128, 800, 1500, 3000, 200, 2500, 800);
         let report = plan(&[p1, p2]);
         match report {
-            PlannerReport::DataNeeded { reasons } => assert_ne!(reasons, [] as [std::string::String; 0]),
+            PlannerReport::DataNeeded { reasons } => {
+                assert_ne!(reasons, [] as [std::string::String; 0])
+            }
             other @ PlannerReport::Frontier { .. } => {
                 panic!("expected DataNeeded, got {other:?}")
             }
@@ -442,7 +444,7 @@ mod tests {
                 dominated,
             } => {
                 assert_eq!(frontier.len(), 3);
-                assert_eq!(dominated, [] as [pareto_frontier_planner::DominatedExplanation; 0]);
+                assert!(dominated.is_empty());
             }
             other @ PlannerReport::DataNeeded { .. } => {
                 panic!("expected Frontier, got {other:?}")

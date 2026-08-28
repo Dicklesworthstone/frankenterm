@@ -625,7 +625,7 @@ mod tests {
     fn diff_identical_grids_returns_empty() {
         let g = vec![cell(0, 0, 1), cell(0, 1, 2)];
         let diffs = diff_grids(&g, &g).unwrap();
-        assert_eq!(diffs, [] as [cell_consistency_crc::CellDiff; 0]);
+        assert!(diffs.is_empty());
     }
 
     #[test]

@@ -1226,7 +1226,7 @@ mod tests {
 
         assert_eq!(diff.recommendations_count, 2);
         assert_eq!(diff.emissions_count, 2);
-        assert_eq!(diff.missing_executions, [] as [(std::string::String, std::string::String); 0]);
+        assert!(diff.missing_executions.is_empty());
         assert!(diff.unexpected_executions.is_empty());
         assert!(diff.agent_divergences.is_empty());
         assert!((diff.dispatch_rate - 1.0).abs() < f64::EPSILON);

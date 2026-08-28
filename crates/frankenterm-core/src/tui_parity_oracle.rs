@@ -1129,7 +1129,7 @@ mod tests {
         let b = RenderFrame::blank(8, 10);
         let d = compute_diff(&a, &b);
         assert!(d.dimension_mismatch);
-        assert_eq!(d.cells, [] as [tui_parity_oracle::CellDiff; 0]);
+        assert!(d.cells.is_empty());
         assert!(d.render_summary(10).contains("dimension mismatch"));
     }
 

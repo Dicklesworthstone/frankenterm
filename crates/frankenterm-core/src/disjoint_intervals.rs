@@ -536,7 +536,7 @@ mod tests {
         let mut di = DisjointIntervals::new();
         di.insert(0, 10);
         let gaps = di.gaps(0, 10);
-        assert_eq!(gaps, [] as [disjoint_intervals::Interval; 0]);
+        assert!(gaps.is_empty());
     }
 
     #[test]
@@ -770,7 +770,7 @@ mod tests {
         let mut di = DisjointIntervals::new();
         di.insert(0, 10);
         let gaps = di.gaps(10, 5); // lo >= hi
-        assert_eq!(gaps, [] as [disjoint_intervals::Interval; 0]);
+        assert!(gaps.is_empty());
     }
 
     #[test]
@@ -778,7 +778,7 @@ mod tests {
         let mut di = DisjointIntervals::new();
         di.insert(0, 20); // extends beyond [5, 15)
         let gaps = di.gaps(5, 15);
-        assert_eq!(gaps, [] as [disjoint_intervals::Interval; 0]);
+        assert!(gaps.is_empty());
     }
 
     #[test]

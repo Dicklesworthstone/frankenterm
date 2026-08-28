@@ -520,7 +520,7 @@ mod tests {
         let cr = run(SteerPlanScenario::CleanReady);
         assert_eq!(cr.plan_status, MissionObjectivePlanStatus::Actionable);
         assert_eq!(cr.receipt.envelope_verdict, "envelope.admit");
-        assert_eq!(cr.receipt.required_approvals, [] as [std::string::String; 0]);
+        assert!(cr.receipt.required_approvals.is_empty());
         assert_eq!(cr.receipt.rehearsal_score, Some(1000));
         assert!(cr.policy_decision.is_allowed());
         assert_eq!(cr.rehearsal_score.aggregate_verdict, RehearsalVerdict::Pass);

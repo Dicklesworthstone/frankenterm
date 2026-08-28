@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn initial_state_is_safe() {
         let s = KillSwitchModelState::initial(3);
-        assert_eq!(check_safety(&s), [] as [tx_killswitch_model::SafetyInvariant; 0]);
+        assert!(check_safety(&s).is_empty());
         assert_eq!(s.tx_state, MissionTxState::Draft);
         assert_eq!(s.kill_switch, MissionKillSwitchLevel::Off);
     }
@@ -462,7 +462,7 @@ mod tests {
         s = apply(&s, KillSwitchAction::CommitStep { step_id: 1 });
         s = apply(&s, KillSwitchAction::FinishCommit);
         assert_eq!(s.tx_state, MissionTxState::Committed);
-        assert_eq!(check_safety(&s), [] as [tx_killswitch_model::SafetyInvariant; 0]);
+        assert!(check_safety(&s).is_empty());
         assert!(is_drained(&s));
     }
 

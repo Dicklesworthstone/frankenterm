@@ -2660,8 +2660,8 @@ mod tests {
             score.receipt.aggregate_verdict,
             RehearsalVerdict::MissingEvidence
         );
-        assert_eq!(score.evaluation_log, [] as [rehearsal_score::RehearsalCriterionEvaluationLog; 0]);
-        assert_ne!(explain.evaluation_log, [] as [rehearsal_score::RehearsalCriterionEvaluationLog; 0]);
+        assert!(score.evaluation_log.is_empty());
+        assert!(!explain.evaluation_log.is_empty());
         assert_eq!(explain.evaluation_log.len(), explain.receipt.criteria.len());
         assert!(!score.raw_pane_content_stored);
         assert!(!score.live_mutation_allowed);

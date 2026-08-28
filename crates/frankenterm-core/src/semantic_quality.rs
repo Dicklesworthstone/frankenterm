@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn ranked_ids_empty_input() {
         let ids = ranked_ids(&[], 5);
-        assert_eq!(ids, [] as [u64; 0]);
+        assert!(ids.is_empty());
     }
 
     #[test]
@@ -734,7 +734,7 @@ mod tests {
         for q in &queries {
             assert_ne!(q.name, "");
             assert!(q.top_k > 0);
-            assert_ne!(q.relevant_ids, [] as [u64; 0]);
+            assert!(!q.relevant_ids.is_empty());
         }
     }
 

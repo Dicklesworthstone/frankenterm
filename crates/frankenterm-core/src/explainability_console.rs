@@ -2129,7 +2129,7 @@ mod tests {
 
         let descendants = ledger.descendants("pane:1:event", 16);
         assert_eq!(descendants.nodes.len(), 7);
-        assert_eq!(descendants.gaps, [] as [explainability_console::CausalUncertaintyGap; 0]);
+        assert!(descendants.gaps.is_empty());
 
         let ancestors = ledger.ancestors("pane:2:recovered", 16);
         let ancestor_ids: Vec<&str> = ancestors

@@ -1442,7 +1442,7 @@ mod tests {
         // Empty boundary is always satisfied
         assert!(b.is_satisfied(&chain));
         assert_eq!(b.pending_subsystems(&chain), [] as [&str; 0]);
-        assert_eq!(b.required(), []);
+        assert!(b.required().is_empty());
     }
 
     #[test]

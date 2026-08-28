@@ -716,7 +716,7 @@ mod tests {
     fn steal_batch_empty_deque() {
         let (_worker, stealer) = new_deque::<i32>(16);
         let batch = stealer.steal_batch(5);
-        assert_eq!(batch, [] as [i32; 0]);
+        assert!(batch.is_empty());
     }
 
     #[test]
@@ -725,7 +725,7 @@ mod tests {
         worker.push(1);
         worker.push(2);
         let batch = stealer.steal_batch(0);
-        assert_eq!(batch, [] as [i32; 0]);
+        assert!(batch.is_empty());
         assert_eq!(worker.len(), 2); // nothing stolen
     }
 

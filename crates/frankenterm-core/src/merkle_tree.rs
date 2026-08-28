@@ -887,7 +887,7 @@ mod tests {
         let t = MerkleTree::from_entries(vec![(b"only".to_vec(), b"val".to_vec())]);
         let proof = t.proof(b"only").unwrap();
         assert!(proof.verify(&t.root_hash()));
-        assert_eq!(proof.path, [] as [merkle_tree::ProofStep; 0]); // single leaf, no siblings
+        assert!(proof.path.is_empty()); // single leaf, no siblings
     }
 
     #[test]

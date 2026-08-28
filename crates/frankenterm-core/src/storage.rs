@@ -13965,7 +13965,7 @@ mod writer_epoch_transaction_tests {
             || Ok(()),
         );
         assert_epoch_poisoned(&preflight_mismatch);
-        assert_eq!(backend.calls(), [] as [std::string::String; 0]);
+        assert!(backend.calls().is_empty());
         assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
         assert!(take_writer_backend_epoch_poisoned_signal());
 
@@ -37069,7 +37069,7 @@ fn storage_tick149_search_semantic_cluster_roundtrip() {
             .get_unembedded_segments_with_cx(&cx, "embedder-tick149", 10)
             .await
             .unwrap();
-        assert_eq!(unembedded_same, [] as [i64; 0]);
+        assert!(unembedded_same.is_empty());
         let unembedded_other = storage
             .get_unembedded_segments_with_cx(&cx, "embedder-other", 10)
             .await

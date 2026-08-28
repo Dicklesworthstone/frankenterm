@@ -2386,7 +2386,7 @@ mod tests {
         let d = QuiescenceDetector::new(Duration::from_millis(50));
         let snap = d.snapshot();
         assert_eq!(snap.total_pending, 0);
-        assert_eq!(snap.gauges, [] as [(std::string::String, usize); 0]);
+        assert!(snap.gauges.is_empty());
         assert!(snap.last_activity.is_none());
         assert_eq!(snap.quiet_window, Duration::from_millis(50));
     }

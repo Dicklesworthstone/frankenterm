@@ -1570,7 +1570,7 @@ mod tests {
                 fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
             let history: serde_json::Value = serde_json::from_str(&hist_content).unwrap();
             let hist_arr = history.as_array().unwrap();
-            assert_ne!(hist_arr.as_slice(), []);
+            assert!(!hist_arr.is_empty());
 
             storage.shutdown().await.unwrap();
             let _ = fs::remove_file(&tmp);
@@ -2813,7 +2813,7 @@ mod tests {
         let json = serde_json::to_string(&wf).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed["step_count"], 0);
-        assert_eq!(parsed["steps"].as_array().unwrap().as_slice(), []);
+        assert!(parsed["steps"].as_array().unwrap().is_empty());
         assert!(parsed["completed_at"].is_null());
     }
 
@@ -2854,7 +2854,7 @@ mod tests {
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
-        assert_eq!(parsed["files"].as_array().unwrap().as_slice(), []);
+        assert!(parsed["files"].as_array().unwrap().is_empty());
         assert_eq!(parsed["file_count"], 0);
         assert!(!parsed["redacted"].as_bool().unwrap());
     }

@@ -1481,7 +1481,7 @@ mod tests {
         let hits = store
             .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
             .unwrap();
-        assert_eq!(hits, [] as [search::chunk_vector_store::ChunkVectorHit; 0]);
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -1559,7 +1559,7 @@ mod tests {
         let hits = store
             .semantic_search("prof-1", "gen-1", &make_normalized_vec(8), 10)
             .unwrap();
-        assert_eq!(hits, [] as [search::chunk_vector_store::ChunkVectorHit; 0]);
+        assert!(hits.is_empty());
     }
 
     // ── Store: drift_report tests ─────────────────────────────────────────
@@ -1686,10 +1686,11 @@ mod tests {
         }
 
         let reopened = ChunkVectorStore::open(&path).unwrap();
-        assert_eq!(
+        assert!(
             reopened
                 .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
-                .unwrap(), [] as [search::chunk_vector_store::ChunkVectorHit; 0]
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(
             reopened
@@ -1730,10 +1731,11 @@ mod tests {
         }
 
         let reopened = ChunkVectorStore::open(&path).unwrap();
-        assert_eq!(
+        assert!(
             reopened
                 .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
-                .unwrap(), [] as [search::chunk_vector_store::ChunkVectorHit; 0]
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(
             reopened

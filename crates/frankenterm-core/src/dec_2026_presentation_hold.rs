@@ -609,8 +609,8 @@ mod tests {
         let prior = s.clone();
         let outcome = apply_event(&mut s, PresentationHoldEvent::FrameReady);
         assert_eq!(outcome, PresentationHoldOutcome::Present);
-        assert_eq!(
-            check_invariants(&prior, &s, PresentationHoldEvent::FrameReady, outcome), [] as [dec_2026_presentation_hold::PresentationHoldViolation; 0]
+        assert!(
+            check_invariants(&prior, &s, PresentationHoldEvent::FrameReady, outcome).is_empty()
         );
     }
 
@@ -622,8 +622,8 @@ mod tests {
         let outcome = apply_event(&mut s, PresentationHoldEvent::FrameReady);
         assert_eq!(outcome, PresentationHoldOutcome::Hold);
         assert_eq!(s.frames_held_total, 1);
-        assert_eq!(
-            check_invariants(&prior, &s, PresentationHoldEvent::FrameReady, outcome), [] as [dec_2026_presentation_hold::PresentationHoldViolation; 0]
+        assert!(
+            check_invariants(&prior, &s, PresentationHoldEvent::FrameReady, outcome).is_empty()
         );
     }
 
@@ -640,7 +640,7 @@ mod tests {
         assert!(!s.synchronized_output_active);
         assert!(s.held_dirty_lines.is_empty());
         assert_eq!(s.frames_flushed_total, 1);
-        assert_eq!(check_invariants(&prior, &s, PresentationHoldEvent::Esu, outcome), [] as [dec_2026_presentation_hold::PresentationHoldViolation; 0]);
+        assert!(check_invariants(&prior, &s, PresentationHoldEvent::Esu, outcome).is_empty());
     }
 
     #[test]
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(outcome, PresentationHoldOutcome::NoOp);
         assert_eq!(s.frames_flushed_total, 0);
         assert!(!s.synchronized_output_active);
-        assert_eq!(check_invariants(&prior, &s, PresentationHoldEvent::Esu, outcome), [] as [dec_2026_presentation_hold::PresentationHoldViolation; 0]);
+        assert!(check_invariants(&prior, &s, PresentationHoldEvent::Esu, outcome).is_empty());
     }
 
     #[test]
@@ -741,7 +741,7 @@ mod tests {
         ));
         assert!(!s.synchronized_output_active);
         assert!(s.held_dirty_lines.is_empty());
-        assert_eq!(check_invariants(&prior, &s, PresentationHoldEvent::Reset, outcome), [] as [dec_2026_presentation_hold::PresentationHoldViolation; 0]);
+        assert!(check_invariants(&prior, &s, PresentationHoldEvent::Reset, outcome).is_empty());
     }
 
     #[test]

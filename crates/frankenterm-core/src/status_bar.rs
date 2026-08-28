@@ -750,7 +750,7 @@ mod tests {
         let specs = vec![spec("a", TileAlignment::Left, 1, 5, 5)];
         let renders = vec![rendered("a", 10)]; // > max_width
         let bar = layout_status_bar(&specs, &renders, 80);
-        assert_eq!(bar.placements, [] as [status_bar::TilePlacement; 0]);
+        assert!(bar.placements.is_empty());
         assert_eq!(bar.dropped.len(), 1);
         assert_eq!(bar.dropped[0].tile_id, "a");
         assert_eq!(bar.dropped[0].reason, DropReason::OverflowsMaxWidth);
@@ -761,7 +761,7 @@ mod tests {
         let specs = vec![spec("a", TileAlignment::Left, 5, 10, 5)];
         let renders = vec![rendered("a", 1)]; // < min_width
         let bar = layout_status_bar(&specs, &renders, 80);
-        assert_eq!(bar.placements, [] as [status_bar::TilePlacement; 0]);
+        assert!(bar.placements.is_empty());
         assert_eq!(bar.dropped[0].reason, DropReason::UnderflowsMinWidth);
     }
 
@@ -770,9 +770,9 @@ mod tests {
         let specs = vec![spec("a", TileAlignment::Left, 1, 10, 5)];
         // No rendered tile (refresh hint hasn't fired yet).
         let bar = layout_status_bar(&specs, &[], 80);
-        assert_eq!(bar.placements, [] as [status_bar::TilePlacement; 0]);
+        assert!(bar.placements.is_empty());
         // Not dropped — just absent.
-        assert_eq!(bar.dropped, [] as [status_bar::DroppedTile; 0]);
+        assert!(bar.dropped.is_empty());
     }
 
     // ----------------------------------------------------------------
@@ -884,7 +884,7 @@ mod tests {
         ];
         let bar = layout_status_bar(&specs, &renders, 80);
         assert_eq!(bar.placements.len(), 8);
-        assert_eq!(bar.dropped, [] as [status_bar::DroppedTile; 0]);
+        assert!(bar.dropped.is_empty());
         // Smoke test: clock is the rightmost tile.
         let placements_sorted = &bar.placements;
         let rightmost = placements_sorted.last().unwrap();

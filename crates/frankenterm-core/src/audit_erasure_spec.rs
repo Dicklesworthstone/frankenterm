@@ -1026,7 +1026,7 @@ mod tests {
         for (i, s) in shards.iter().enumerate() {
             assert_eq!(s.shard_index() as usize, i);
             assert_eq!(s.is_parity(), i >= cfg.k() as usize);
-            assert_ne!(s.bytes(), []);
+            assert!(!s.bytes().is_empty());
         }
     }
 

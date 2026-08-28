@@ -672,7 +672,7 @@ mod tests {
         let artifacts = full_artifacts();
         let report = VerificationReport::verify(&manifest, &artifacts);
         assert_eq!(report.verdict, VerificationVerdict::Complete);
-        assert_eq!(report.mandatory_missing, [] as [migration_artifact_contracts::ArtifactType; 0]);
+        assert!(report.mandatory_missing.is_empty());
     }
 
     #[test]
@@ -687,7 +687,7 @@ mod tests {
         }];
         let report = VerificationReport::verify(&manifest, &artifacts);
         assert_eq!(report.verdict, VerificationVerdict::Incomplete);
-        assert_ne!(report.mandatory_missing, [] as [migration_artifact_contracts::ArtifactType; 0]);
+        assert!(!report.mandatory_missing.is_empty());
     }
 
     #[test]

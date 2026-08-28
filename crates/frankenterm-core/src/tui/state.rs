@@ -888,7 +888,7 @@ mod tests {
     fn reduce_submit_empty_search_is_noop() {
         let mut state = UiState::default();
         let effects = reduce(&mut state, UiAction::SubmitSearch);
-        assert_eq!(effects, [] as [tui::state::Effect; 0]);
+        assert!(effects.is_empty());
     }
 
     #[test]

@@ -2655,7 +2655,7 @@ mod tests {
             }
         ));
         let frame = scheduler.schedule_frame();
-        assert_eq!(frame.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(frame.scheduled.is_empty());
         assert_eq!(scheduler.metrics().suppressed_by_gate, 1);
         assert_eq!(scheduler.metrics().suppressed_frames, 1);
 
@@ -2697,7 +2697,7 @@ mod tests {
 
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 4, 100));
         let frame = scheduler.schedule_frame_with_input_backlog(4, 3);
-        assert_eq!(frame.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(frame.scheduled.is_empty());
         assert_eq!(frame.frame_budget_units, 4);
         assert_eq!(frame.effective_resize_budget_units, 2);
         assert_eq!(frame.input_reserved_units, 2);
@@ -2743,7 +2743,7 @@ mod tests {
 
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 2, 100));
         let frame = scheduler.schedule_frame_with_input_backlog(2, 1);
-        assert_eq!(frame.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(frame.scheduled.is_empty());
         assert_eq!(frame.effective_resize_budget_units, 1);
         assert_eq!(frame.input_reserved_units, 1);
         assert_eq!(scheduler.metrics().input_guardrail_deferrals, 1);
@@ -3186,7 +3186,7 @@ mod tests {
     #[test]
     fn schedule_frame_result_default_is_empty() {
         let r = super::ScheduleFrameResult::default();
-        assert_eq!(r.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(r.scheduled.is_empty());
         assert_eq!(r.budget_spent_units, 0);
         assert_eq!(r.pending_after, 0);
     }
@@ -3199,7 +3199,7 @@ mod tests {
     fn schedule_frame_with_no_pending_work() {
         let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
         let frame = scheduler.schedule_frame();
-        assert_eq!(frame.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(frame.scheduled.is_empty());
         assert_eq!(frame.budget_spent_units, 0);
         assert_eq!(frame.pending_after, 0);
         assert_eq!(scheduler.metrics().frames, 1);
@@ -3249,7 +3249,7 @@ mod tests {
 
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Interactive, 5, 100));
         let frame = scheduler.schedule_frame();
-        assert_eq!(frame.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(frame.scheduled.is_empty());
         assert_eq!(frame.pending_after, 1);
     }
 
@@ -3448,7 +3448,7 @@ mod tests {
         let debug = scheduler.debug_snapshot(64);
         // Transaction age is 5200-5100=100ms, threshold is 2000ms
         let stalled = debug.stalled_transactions(5_200, 2_000);
-        assert_eq!(stalled, [] as [resize_scheduler::ResizeStalledTransaction; 0]);
+        assert!(stalled.is_empty());
     }
 
     #[test]
@@ -3767,9 +3767,9 @@ mod tests {
     fn lifecycle_events_empty_returns_empty_vec() {
         let scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
         let events = scheduler.lifecycle_events(0);
-        assert_eq!(events, [] as [resize_scheduler::ResizeTransactionLifecycleEvent; 0]);
+        assert!(events.is_empty());
         let events_limited = scheduler.lifecycle_events(10);
-        assert_eq!(events_limited, [] as [resize_scheduler::ResizeTransactionLifecycleEvent; 0]);
+        assert!(events_limited.is_empty());
     }
 
     #[test]
@@ -3800,7 +3800,7 @@ mod tests {
         scheduler.set_emergency_disable(true);
 
         let frame = scheduler.schedule_frame();
-        assert_eq!(frame.scheduled, [] as [resize_scheduler::ScheduledResizeWork; 0]);
+        assert!(frame.scheduled.is_empty());
         assert_eq!(frame.pending_after, 2);
         assert_eq!(scheduler.metrics().suppressed_frames, 1);
     }

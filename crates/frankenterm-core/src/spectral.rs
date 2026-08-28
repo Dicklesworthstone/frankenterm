@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn fft_empty() {
-        assert_eq!(power_spectral_density(&[]), [] as [f64; 0]);
+        assert!(power_spectral_density(&[]).is_empty());
     }
 
     #[test]
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn hann_empty() {
-        assert_eq!(hann_window(&[]), [] as [f64; 0]);
+        assert!(hann_window(&[]).is_empty());
     }
 
     #[test]

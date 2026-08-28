@@ -1632,7 +1632,7 @@ mod tests {
     fn remediation_new_has_empty_fields() {
         let r = Remediation::new("Fix the thing");
         assert_eq!(r.summary, "Fix the thing");
-        assert_eq!(r.commands, [] as [error::RemediationCommand; 0]);
+        assert!(r.commands.is_empty());
         assert_eq!(r.alternatives, [] as [std::string::String; 0]);
         assert!(r.learn_more.is_none());
     }
@@ -1902,7 +1902,7 @@ mod tests {
     fn workflow_pane_locked_remediation() {
         let r = WorkflowError::PaneLocked.remediation();
         assert_ne!(r.summary, "");
-        assert_ne!(r.commands, [] as [error::RemediationCommand; 0]);
+        assert!(!r.commands.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2238,21 +2238,21 @@ mod tests {
         }
         .remediation();
         assert_ne!(r.summary, "");
-        assert_ne!(r.commands, [] as [error::RemediationCommand; 0]);
+        assert!(!r.commands.is_empty());
     }
 
     #[test]
     fn pattern_match_timeout_remediation() {
         let r = PatternError::MatchTimeout.remediation();
         assert_ne!(r.summary, "");
-        assert_ne!(r.commands, [] as [error::RemediationCommand; 0]);
+        assert!(!r.commands.is_empty());
     }
 
     #[test]
     fn config_validation_error_remediation() {
         let r = ConfigError::ValidationError("bad field".to_string()).remediation();
         assert_ne!(r.summary, "");
-        assert_ne!(r.commands, [] as [error::RemediationCommand; 0]);
+        assert!(!r.commands.is_empty());
 
         let r = ConfigError::RecorderBackendSelection(
             crate::recorder_storage::select_recorder_backend(
@@ -2262,7 +2262,7 @@ mod tests {
         )
         .remediation();
         assert_ne!(r.summary, "");
-        assert_ne!(r.commands, [] as [error::RemediationCommand; 0]);
+        assert!(!r.commands.is_empty());
         let rendered = r.render_plain();
         assert!(rendered.contains("frankensqlite"));
         assert!(rendered.contains("rusqlite"));

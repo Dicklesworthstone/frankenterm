@@ -689,8 +689,8 @@ mod tests {
     #[test]
     fn range_frequencies_empty_range() {
         let wt = WaveletTree::new(b"abc");
-        assert_eq!(wt.range_frequencies(3, 3), [] as [(u8, usize); 0]);
-        assert_eq!(wt.range_frequencies(5, 2), [] as [(u8, usize); 0]);
+        assert!(wt.range_frequencies(3, 3).is_empty());
+        assert!(wt.range_frequencies(5, 2).is_empty());
     }
 
     #[test]

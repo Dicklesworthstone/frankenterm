@@ -2148,7 +2148,7 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(q.len(), 0);
         assert_eq!(q.pending_bytes(), 0);
-        assert_eq!(q.pending(), []);
+        assert!(q.pending().is_empty());
     }
 
     #[test]
@@ -3186,7 +3186,7 @@ mod tests {
         let handoffs = vec![demote(1, 100), demote(2, 200), demote(3, 300)];
         let (admitted, deferred) = d.partition(&handoffs, 1_000_000);
         assert_eq!(admitted.len(), 3);
-        assert_eq!(deferred, [] as [atlas_tiered_swap::DiskTierHandoff; 0]);
+        assert!(deferred.is_empty());
     }
 
     #[test]

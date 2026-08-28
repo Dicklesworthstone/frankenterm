@@ -13411,8 +13411,8 @@ mod tests {
         changed.is_zoomed = true;
         let diff = registry.discovery_tick(vec![changed]);
         assert_eq!(diff.metadata_changes.len(), 1);
-        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
-        assert_eq!(diff.re_observed_panes, [] as [u64; 0]);
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert!(diff.re_observed_panes.is_empty());
 
         let second_view =
             capture_publication_view(&registry, &revisions, &storage_resyncs, &HashSet::new());
@@ -13465,7 +13465,7 @@ mod tests {
         let replacement = registry.discovery_tick(vec![successor.clone()]);
         assert_eq!(replacement.lifecycle_replacements, vec![pane_id]);
         let stable = registry.discovery_tick(vec![successor]);
-        assert_eq!(stable.lifecycle_replacements, [] as [u64; 0]);
+        assert!(stable.lifecycle_replacements.is_empty());
 
         let metrics = RuntimeMetrics::default();
         record_discovery_lifecycle_health(&metrics, replacement.lifecycle_replacements.len(), 100);
@@ -13547,8 +13547,8 @@ mod tests {
                 diff.metadata_changes.len(),
                 usize::try_from(pane_count).unwrap()
             );
-            assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
-            assert_eq!(diff.re_observed_panes, [] as [u64; 0]);
+            assert!(diff.lifecycle_replacements.is_empty());
+            assert!(diff.re_observed_panes.is_empty());
 
             let second_view =
                 capture_publication_view(&registry, &revisions, &HashMap::new(), &HashSet::new());
@@ -13631,7 +13631,7 @@ mod tests {
         );
         let (confirmed_terminal, forced_transitions) =
             classify_unresolved_barrier_predecessors(&unresolved, &registry);
-        assert_eq!(confirmed_terminal, [] as [u64; 0]);
+        assert!(confirmed_terminal.is_empty());
         assert_eq!(forced_transitions, vec![pane_id]);
 
         let mut last_revision = predecessor_revision.get();
@@ -13665,7 +13665,7 @@ mod tests {
         let (confirmed_terminal, forced_transitions) =
             classify_unresolved_barrier_predecessors(&terminal_unresolved, &registry);
         assert_eq!(confirmed_terminal, vec![pane_id]);
-        assert_eq!(forced_transitions, [] as [u64; 0]);
+        assert!(forced_transitions.is_empty());
     }
 
     #[test]
@@ -13697,7 +13697,7 @@ mod tests {
         let mut suspended = HashMap::new();
 
         let diff = registry.discovery_tick(vec![make_pane(pane_id, "ignore-now")]);
-        assert_eq!(diff.lifecycle_replacements, [] as [u64; 0]);
+        assert!(diff.lifecycle_replacements.is_empty());
         assert_eq!(diff.metadata_changes.len(), 1);
         assert!(!registry_observes_pane(&registry, pane_id));
         let resumed =
@@ -13731,7 +13731,7 @@ mod tests {
 
         let resumed_diff = registry.discovery_tick(vec![make_pane(pane_id, "observed-again")]);
         assert_eq!(resumed_diff.re_observed_panes, vec![pane_id]);
-        assert_eq!(resumed_diff.lifecycle_replacements, [] as [u64; 0]);
+        assert!(resumed_diff.lifecycle_replacements.is_empty());
         let durable_anchor_predecessors = update_suspended_capture_continuity(
             &registry,
             &resumed_diff,
@@ -15781,11 +15781,12 @@ mod tests {
                     .expect("restart drains primary-only commit"),
                     1
                 );
-                assert_eq!(
+                assert!(
                     primary
                         .pending_recorder_deliveries_with_cx(&cx)
                         .await
-                        .expect("ledger empty after ack"), [] as [storage::PendingRecorderDelivery; 0]
+                        .expect("ledger empty after ack")
+                        .is_empty()
                 );
                 assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
                 assert_eq!(
@@ -15891,11 +15892,12 @@ mod tests {
                     .expect("restart resolves ambiguous append and acks ledger"),
                     1
                 );
-                assert_eq!(
+                assert!(
                     primary
                         .pending_recorder_deliveries_with_cx(&cx)
                         .await
-                        .expect("ledger empty after restart ack"), [] as [storage::PendingRecorderDelivery; 0]
+                        .expect("ledger empty after restart ack")
+                        .is_empty()
                 );
                 assert_eq!(
                     recorder_delivery_latest_ordinal(&recorder).await,
@@ -16006,11 +16008,12 @@ mod tests {
                     .expect("drain split-secret deliveries"),
                     2
                 );
-                assert_eq!(
+                assert!(
                     primary
                         .pending_recorder_deliveries_with_cx(&cx)
                         .await
-                        .expect("ledger empty after split-secret delivery"), [] as [storage::PendingRecorderDelivery; 0]
+                        .expect("ledger empty after split-secret delivery")
+                        .is_empty()
                 );
 
                 let recorder_events =
@@ -17896,7 +17899,7 @@ mod tests {
             inventory.watchdog.overall,
             Some(crate::watchdog::HealthStatus::Healthy)
         );
-        assert_eq!(inventory.watchdog.unhealthy_components, [] as [crash::LeakRiskWatchdogComponentSnapshot; 0]);
+        assert!(inventory.watchdog.unhealthy_components.is_empty());
 
         let telemetry = inventory
             .watchdog
@@ -19559,7 +19562,7 @@ mod tests {
 
         let snapshot = fetch.health_snapshot(&[11]);
         assert_eq!(snapshot.observed_pane_ids, vec![11]);
-        assert_eq!(snapshot.sampled_pane_ids, [] as [u64; 0]);
+        assert!(snapshot.sampled_pane_ids.is_empty());
         assert!(snapshot.telemetry_blind);
         assert_eq!(snapshot.tiering_enabled_panes, 0);
         assert_eq!(snapshot.configured_hot_lines_min, None);
@@ -21224,7 +21227,7 @@ mod tests {
     #[test]
     fn runtime_config_default_no_vendored_mux_socket_paths() {
         let config = RuntimeConfig::default();
-        assert_eq!(config.vendored_mux_socket_paths, [] as [std::path::PathBuf; 0]);
+        assert!(config.vendored_mux_socket_paths.is_empty());
     }
 
     #[test]

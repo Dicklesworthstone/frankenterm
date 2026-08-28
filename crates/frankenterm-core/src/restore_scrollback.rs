@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(r.failure_count(), 0);
         assert_eq!(r.total_bytes(), 0);
         assert_eq!(r.skipped_count(), 0);
-        assert_eq!(r.skipped_sample(), []);
+        assert!(r.skipped_sample().is_empty());
     }
 
     #[test]
@@ -1012,7 +1012,7 @@ mod tests {
             assert_eq!(report.success_count(), 0);
             assert_eq!(report.failure_count(), 0);
             assert_eq!(report.skipped_count(), 0);
-            assert_eq!(report.skipped_sample(), []);
+            assert!(report.skipped_sample().is_empty());
         });
     }
 

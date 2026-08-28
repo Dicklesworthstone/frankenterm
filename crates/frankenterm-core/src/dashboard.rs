@@ -740,7 +740,7 @@ mod tests {
         let state = mgr.snapshot();
         assert_eq!(state.overall_health, SystemHealthTier::Green);
         assert_eq!(state.costs.pane_count, 0);
-        assert_eq!(state.costs.attribution_estimates, [] as [cost_tracker::CostAttributionEstimateSummary; 0]);
+        assert!(state.costs.attribution_estimates.is_empty());
         assert_eq!(state.rate_limits.limited_provider_count, 0);
         assert_eq!(state.backpressure.paused_pane_count, 0);
         assert_eq!(state.quota.evaluations, 0);
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(state.costs.total_tokens, 70_000);
         assert_eq!(state.costs.alerts.len(), 1);
         assert_eq!(state.costs.alerts[0].severity, "warning");
-        assert_eq!(state.costs.attribution_estimates, [] as [cost_tracker::CostAttributionEstimateSummary; 0]);
+        assert!(state.costs.attribution_estimates.is_empty());
 
         // Rate limit panel
         assert_eq!(state.rate_limits.providers.len(), 2);

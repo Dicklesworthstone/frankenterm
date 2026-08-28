@@ -4061,7 +4061,7 @@ mod tests {
 
         // Third call: budget exhausted.
         let selected3 = sched.select_panes(&[(5, 10)], 5);
-        assert_eq!(selected3, [] as [u64; 0]);
+        assert!(selected3.is_empty());
     }
 
     #[test]
@@ -4156,7 +4156,7 @@ mod tests {
         let mut sched = CaptureScheduler::new(budget);
 
         let selected = sched.select_panes(&[], 10);
-        assert_eq!(selected, [] as [u64; 0]);
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -5156,7 +5156,7 @@ mod tests {
 
         let panes = vec![(1, 10), (2, 50)];
         let selected = sched.select_panes(&panes, 0);
-        assert_eq!(selected, [] as [u64; 0]);
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -5485,7 +5485,7 @@ mod tests {
             dirty_row_count: 11,
         });
 
-        assert_eq!(segments, [] as [ingest::CapturedSegment; 0]);
+        assert!(segments.is_empty());
         assert_eq!(bridge.events_processed(), 1);
         assert_eq!(bridge.dirty_range_total(), 3);
         assert_eq!(bridge.dirty_row_total(), 11);

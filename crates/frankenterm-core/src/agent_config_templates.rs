@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn templates_for_detected_empty() {
         let ts = generate_templates_for_detected(&[]);
-        assert_eq!(ts, [] as [agent_config_templates::AgentConfigTemplate; 0]);
+        assert!(ts.is_empty());
     }
 
     #[test]

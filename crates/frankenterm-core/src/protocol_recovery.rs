@@ -2997,7 +2997,7 @@ mod tests {
 
             assert!(matches!(o.result, Ok(7)), "happy path must succeed");
             assert_eq!(o.attempts, 1);
-            assert_eq!(o.error_kinds, [] as [protocol_recovery::ProtocolErrorKind; 0]);
+            assert!(o.error_kinds.is_empty());
             assert_eq!(e.stats().first_try_successes, 1);
         });
     }

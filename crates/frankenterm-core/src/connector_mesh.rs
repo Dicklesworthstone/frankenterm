@@ -777,7 +777,7 @@ mod tests {
         mesh.register_host(make_host("h1", "z1")).unwrap();
         let removed = mesh.deregister_host("h1").unwrap();
         assert_eq!(removed.host_id, "h1");
-        assert_eq!(mesh.hosts(), [] as [&connector_mesh::MeshHost; 0]);
+        assert!(mesh.hosts().is_empty());
     }
 
     #[test]
@@ -799,7 +799,7 @@ mod tests {
 
         assert_eq!(mesh.hosts_in_zone("z1").len(), 2);
         assert_eq!(mesh.hosts_in_zone("z2").len(), 1);
-        assert_eq!(mesh.hosts_in_zone("z3"), [] as [&connector_mesh::MeshHost; 0]);
+        assert!(mesh.hosts_in_zone("z3").is_empty());
     }
 
     // ========================================================================
@@ -859,7 +859,7 @@ mod tests {
         mesh.register_host(make_host("h1", "z1")).unwrap();
         mesh.record_heartbeat("h1", 5000).unwrap();
         let timed_out = mesh.check_heartbeat_timeouts(6000);
-        assert_eq!(timed_out, [] as [std::string::String; 0]);
+        assert!(timed_out.is_empty());
     }
 
     #[test]
@@ -869,7 +869,7 @@ mod tests {
         mesh.register_host(make_host("h1", "z1")).unwrap();
         mesh.update_health("h1", HostHealth::Draining).unwrap();
         let timed_out = mesh.check_heartbeat_timeouts(999_999);
-        assert_eq!(timed_out, [] as [std::string::String; 0]);
+        assert!(timed_out.is_empty());
     }
 
     // ========================================================================

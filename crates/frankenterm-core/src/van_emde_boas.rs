@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn iter_empty() {
         let veb = VanEmdeBoas::new(256);
-        assert_eq!(veb.iter(), [] as [u32; 0]);
+        assert!(veb.iter().is_empty());
     }
 
     #[test]

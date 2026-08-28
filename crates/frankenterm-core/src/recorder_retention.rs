@@ -401,7 +401,7 @@ mod tests {
         assert!(!SegmentPhase::Active.can_transition_to(SegmentPhase::Purged));
         assert!(SegmentPhase::Sealed.can_transition_to(SegmentPhase::Archived));
         assert!(SegmentPhase::Archived.can_transition_to(SegmentPhase::Purged));
-        assert_eq!(SegmentPhase::Purged.valid_transitions(), []);
+        assert!(SegmentPhase::Purged.valid_transitions().is_empty());
     }
 
     #[test]
@@ -1071,7 +1071,7 @@ mod tests {
             SegmentPhase::Archived.valid_transitions(),
             &[SegmentPhase::Purged]
         );
-        assert_eq!(SegmentPhase::Purged.valid_transitions(), []);
+        assert!(SegmentPhase::Purged.valid_transitions().is_empty());
     }
 
     #[test]
@@ -1116,7 +1116,10 @@ mod tests {
         assert_eq!(r.archived, [] as [std::string::String; 0]);
         assert_eq!(r.purge_candidates, [] as [std::string::String; 0]);
         assert_eq!(r.purged, [] as [std::string::String; 0]);
-        assert_eq!(r.held, [] as [(std::string::String, std::string::String); 0]);
+        assert_eq!(
+            r.held,
+            [] as [(std::string::String, std::string::String); 0]
+        );
         let _ = format!("{:?}", r);
     }
 

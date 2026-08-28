@@ -1641,8 +1641,8 @@ mod tests {
             artifact_paths: Vec::new(),
         });
 
-        assert_eq!(report.recommendations, [] as [context_horizon::ContextHorizonRecommendation; 0]);
-        assert_eq!(advise_context_horizon(&report), [] as [context_horizon::ContextHorizonAdvisorRecord; 0]);
+        assert!(report.recommendations.is_empty());
+        assert!(advise_context_horizon(&report).is_empty());
         assert_eq!(report.fleet_summary.top_operator_move, "none");
     }
 

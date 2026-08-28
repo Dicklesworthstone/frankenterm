@@ -3962,7 +3962,7 @@ events: []
             executed_resize_events: 0,
             events: vec![],
         };
-        assert_eq!(timeline.flame_samples(), [] as [simulation::ResizeTimelineFlameSample; 0]);
+        assert!(timeline.flame_samples().is_empty());
     }
 
     #[test]
@@ -4580,7 +4580,7 @@ events:
                 .unwrap();
             assert_eq!(count, 2);
             assert_eq!(timeline.executed_resize_events, 0);
-            assert_eq!(timeline.events, [] as [simulation::ResizeTimelineEvent; 0]);
+            assert!(timeline.events.is_empty());
         });
     }
 

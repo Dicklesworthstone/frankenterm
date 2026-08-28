@@ -651,7 +651,7 @@ mod tests {
     fn skip_list_iter_empty() {
         let list: SkipList<i32, i32> = SkipList::new(42);
         let items: Vec<_> = list.iter().collect();
-        assert_eq!(items, [] as [(&i32, &i32); 0]);
+        assert!(items.is_empty());
     }
 
     #[test]
@@ -660,7 +660,7 @@ mod tests {
         list.insert(10, "ten");
         list.insert(20, "twenty");
         let result = list.range(&100, &200);
-        assert_eq!(result, [] as [(&i32, &&str); 0]);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -813,7 +813,7 @@ mod tests {
             list.insert(i, i);
         }
         let result = list.range(&8, &3);
-        assert_eq!(result, [] as [(&i32, &i32); 0]);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -832,7 +832,7 @@ mod tests {
         list.insert(10, "a");
         list.insert(50, "b");
         let result = list.range(&20, &40);
-        assert_eq!(result, [] as [(&i32, &&str); 0]);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -849,7 +849,7 @@ mod tests {
     fn range_on_empty_list() {
         let list: SkipList<i32, i32> = SkipList::new(42);
         let result = list.range(&0, &100);
-        assert_eq!(result, [] as [(&i32, &i32); 0]);
+        assert!(result.is_empty());
     }
 
     #[test]

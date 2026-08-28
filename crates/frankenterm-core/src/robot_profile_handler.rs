@@ -1465,7 +1465,7 @@ mod tests {
         let conn = fresh_conn();
         let v = handle_profile_command("list", &json!({}), &conn).expect("ok");
         let arr = v.get("profiles").and_then(Value::as_array).expect("arr");
-        assert_eq!(arr.as_slice(), []);
+        assert!(arr.is_empty());
     }
 
     #[test]
@@ -1543,7 +1543,7 @@ mod tests {
         let v = handle_profile_command("validate", &json!({ "name": "good" }), &conn).expect("ok");
         assert_eq!(v.get("valid").and_then(Value::as_bool), Some(true));
         let issues = v.get("issues").and_then(Value::as_array).unwrap();
-        assert_eq!(issues.as_slice(), []);
+        assert!(issues.is_empty());
     }
 
     #[test]
@@ -1658,7 +1658,7 @@ mod tests {
 
         assert_eq!(err.error_code(), "robot.profile.bad_params");
         assert!(err.to_string().contains("`dry_run` must be a boolean"));
-        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
+        assert!(executor.spawned.is_empty());
     }
 
     #[test]
@@ -1684,7 +1684,7 @@ mod tests {
             err.to_string()
                 .contains(&format!("`count` must be <= {PROFILE_APPLY_COUNT_MAX}"))
         );
-        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
+        assert!(executor.spawned.is_empty());
     }
 
     #[test]
@@ -1708,7 +1708,7 @@ mod tests {
             err.to_string()
                 .contains(&format!("maximum is {ENV_MAX_COUNT}"))
         );
-        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
+        assert!(executor.spawned.is_empty());
     }
 
     #[test]
@@ -1737,7 +1737,7 @@ mod tests {
             err.to_string()
                 .contains(&format!("maximum is {ENV_VALUE_MAX_LEN}"))
         );
-        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
+        assert!(executor.spawned.is_empty());
     }
 
     #[test]
@@ -1797,7 +1797,7 @@ mod tests {
             replay.get("idempotent_replay").and_then(Value::as_bool),
             Some(true)
         );
-        assert_eq!(replay_executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
+        assert!(replay_executor.spawned.is_empty());
     }
 
     #[test]
@@ -1819,7 +1819,7 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ProfileHandlerError::PolicyDenied { .. }));
-        assert_eq!(executor.spawned, [] as [robot_profile_handler::ProfileApplySpawnSpec; 0]);
+        assert!(executor.spawned.is_empty());
     }
 
     #[test]

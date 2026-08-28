@@ -1791,7 +1791,7 @@ mod tests {
 
     #[test]
     fn test_chunk_scrollback_empty() {
-        assert_eq!(chunk_scrollback_lines(&[], 5000), [] as [search::indexing::IndexableDocument; 0]);
+        assert!(chunk_scrollback_lines(&[], 5000).is_empty());
     }
 
     #[test]
@@ -1830,7 +1830,7 @@ mod tests {
     #[test]
     fn test_extract_command_blocks_empty() {
         let config = CommandBlockExtractionConfig::default();
-        assert_eq!(extract_command_output_blocks(&[], &config), [] as [search::indexing::IndexableDocument; 0]);
+        assert!(extract_command_output_blocks(&[], &config).is_empty());
     }
 
     #[test]
@@ -1868,7 +1868,7 @@ mod tests {
     fn test_extract_artifacts_code_block() {
         let text = "Some text\n```\nfn main() {}\n```\nMore text";
         let artifacts = extract_agent_artifacts(text, 1000, Some(1), None);
-        assert_ne!(artifacts, [] as [search::indexing::IndexableDocument; 0]);
+        assert!(!artifacts.is_empty());
         let code_block = artifacts.iter().find(|a| {
             a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("code_block")
         });
@@ -1879,7 +1879,7 @@ mod tests {
     fn test_extract_artifacts_error_line() {
         let text = "error: cannot find module `foo`";
         let artifacts = extract_agent_artifacts(text, 1000, None, None);
-        assert_ne!(artifacts, [] as [search::indexing::IndexableDocument; 0]);
+        assert!(!artifacts.is_empty());
         let err = artifacts
             .iter()
             .find(|a| a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("error"));
@@ -1890,7 +1890,7 @@ mod tests {
     fn test_extract_artifacts_tool_trace() {
         let text = "tool call: read_file(\"/foo/bar.rs\")";
         let artifacts = extract_agent_artifacts(text, 1000, None, None);
-        assert_ne!(artifacts, [] as [search::indexing::IndexableDocument; 0]);
+        assert!(!artifacts.is_empty());
         let tool = artifacts
             .iter()
             .find(|a| a.metadata.get("artifact_kind").and_then(|v| v.as_str()) == Some("tool"));
@@ -1900,7 +1900,7 @@ mod tests {
     #[test]
     fn test_extract_artifacts_empty_text() {
         let artifacts = extract_agent_artifacts("", 1000, None, None);
-        assert_eq!(artifacts, [] as [search::indexing::IndexableDocument; 0]);
+        assert!(artifacts.is_empty());
     }
 
     #[test]
@@ -1928,7 +1928,7 @@ mod tests {
             .expect("ingest");
 
         let hits = index.search("", 10, 1020);
-        assert_eq!(hits, [] as [search::indexing::IndexedDocument; 0]);
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -1944,7 +1944,7 @@ mod tests {
             .expect("ingest");
 
         let hits = index.search("findable", 0, 1020);
-        assert_eq!(hits, [] as [search::indexing::IndexedDocument; 0]);
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -2061,7 +2061,7 @@ mod tests {
         assert_eq!(index.documents().len(), 2);
         // Old content should be gone
         let hits = index.search("old content", 10, 2300);
-        assert_eq!(hits, [] as [search::indexing::IndexedDocument; 0]);
+        assert!(hits.is_empty());
     }
 
     #[test]

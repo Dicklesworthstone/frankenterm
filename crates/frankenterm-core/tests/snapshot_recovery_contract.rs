@@ -1,5 +1,8 @@
+#![allow(clippy::too_many_lines)]
+
+use frankenterm_core::config::SnapshotConfig;
 use frankenterm_core::snapshot_engine::{
-    SNAPSHOT_RECOVERY_CONTRACT_OWNER, SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST, SnapshotConfig,
+    SNAPSHOT_RECOVERY_CONTRACT_OWNER, SNAPSHOT_RECOVERY_CONTRACT_PROOF_MANIFEST,
     SnapshotRecoveryArtifactKind, SnapshotRecoveryCapability,
     SnapshotRecoveryCapabilityAvailability, SnapshotRecoveryClaimError,
     SnapshotRecoveryClientStateDisposition, SnapshotRecoveryCrossProductDisposition,

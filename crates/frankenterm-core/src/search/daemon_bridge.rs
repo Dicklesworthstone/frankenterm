@@ -1127,7 +1127,7 @@ mod tests {
     #[test]
     fn vectors_to_results_empty() {
         let results = vectors_to_results(&[], &[], "m", 0);
-        assert_eq!(results, [] as [search::daemon_bridge::SingleEmbedResult; 0]);
+        assert!(results.is_empty());
     }
 
     #[test]

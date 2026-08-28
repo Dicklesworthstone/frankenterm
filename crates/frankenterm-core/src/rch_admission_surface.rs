@@ -362,7 +362,7 @@ mod tests {
             report_with(RchAdmissionProofStatus::Runnable, Vec::new()),
         );
         assert!(!surface.proof_blocked);
-        assert_eq!(surface.reasons, [] as [rch_admission_surface::RchAdmissionSurfaceReason; 0]);
+        assert!(surface.reasons.is_empty());
         let text = surface.doctor_lines().join("\n");
         assert!(text.contains("runnable"), "{text}");
         assert!(

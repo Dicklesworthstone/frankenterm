@@ -1274,7 +1274,7 @@ mod tests {
         let err = CassError::NotInstalled;
         let rem = err.remediation();
         assert_ne!(rem.summary, "");
-        assert_ne!(rem.commands, [] as [error::RemediationCommand; 0]);
+        assert!(!rem.commands.is_empty());
     }
 
     #[test]

@@ -965,8 +965,8 @@ mod tests {
         let plan = compile_tx_plan("p1", &[], &CompilerConfig::default());
         assert_eq!(plan.plan_id, "p1");
         assert!(plan.steps.is_empty());
-        assert_eq!(plan.execution_order, [] as [std::string::String; 0]);
-        assert_eq!(plan.parallel_levels, [] as [std::vec::Vec<std::string::String>; 0]);
+        assert!(plan.execution_order.is_empty());
+        assert!(plan.parallel_levels.is_empty());
         assert_eq!(plan.risk_summary.total_steps, 0);
     }
 

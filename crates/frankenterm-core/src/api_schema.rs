@@ -1602,7 +1602,7 @@ mod tests {
         let d = SchemaDiffResult::default();
         assert_eq!(d.from_version, "");
         assert_eq!(d.to_version, "");
-        assert_eq!(d.changes, [] as [api_schema::SchemaChange; 0]);
+        assert!(d.changes.is_empty());
         assert!(!d.has_breaking_changes());
     }
 

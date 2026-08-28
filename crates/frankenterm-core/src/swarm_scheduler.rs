@@ -3836,7 +3836,7 @@ mod tests {
         assert_eq!(snapshot.overall_state, HerdWaveOverallState::Normal);
         assert_eq!(snapshot.admission_action, Some(AdmissionAction::Admit));
         assert!(!snapshot.raw_pane_content_stored);
-        assert_eq!(snapshot.unavailable_sources, [] as [swarm_scheduler::HerdWaveUnavailableSource; 0]);
+        assert!(snapshot.unavailable_sources.is_empty());
 
         let json = serde_json::to_value(&snapshot).expect("serialize herd-wave snapshot");
         assert_eq!(json["contract_id"], HERD_WAVE_CONTRACT_ID);
@@ -4214,7 +4214,7 @@ mod tests {
         let plan = herd_wave_dry_run_fixture(&signals, &background_admission_request());
 
         assert!(!plan.summary.detected);
-        assert_eq!(plan.calendar, [] as [swarm_scheduler::HerdWaveDryRunCalendarEntry; 0]);
+        assert!(plan.calendar.is_empty());
         assert_eq!(plan.admission_action, Some(AdmissionAction::Admit));
         assert!(
             plan.operator_next_actions
@@ -4479,7 +4479,7 @@ mod tests {
         let decision = scheduler.evaluate(&mut queue, 2000);
         match decision {
             SchedulerDecision::AssignWork { assignments } => {
-                assert_ne!(assignments, [] as [swarm_scheduler::WorkAssignment; 0]);
+                assert!(!assignments.is_empty());
                 assert_eq!(assignments[0].agent_id, agent);
             }
             other => panic!("expected AssignWork, got {other:?}"),
@@ -4652,7 +4652,7 @@ mod tests {
         assert!(result.is_some());
         match result.unwrap() {
             SchedulerDecision::ScaleDown { remove_agents, .. } => {
-                assert_ne!(remove_agents, [] as [std::string::String; 0]);
+                assert!(!remove_agents.is_empty());
                 // Should not remove a1 (has active work)
                 assert!(!remove_agents.contains(&"a1".to_string()));
             }
@@ -4777,7 +4777,7 @@ mod tests {
         assert!(result.is_some());
         match result.unwrap() {
             SchedulerDecision::Rebalance { moves } => {
-                assert_ne!(moves, [] as [swarm_scheduler::RebalanceMove; 0]);
+                assert!(!moves.is_empty());
                 assert_eq!(moves[0].from_agent, "a1");
                 assert_eq!(moves[0].to_agent, "a2");
             }
@@ -4995,7 +4995,7 @@ mod tests {
         let d1 = scheduler.evaluate(&mut queue, 1000);
         match &d1 {
             SchedulerDecision::AssignWork { assignments } => {
-                assert_ne!(assignments.as_slice(), []);
+                assert!(!assignments.is_empty());
             }
             other => panic!("expected AssignWork, got {other:?}"),
         }

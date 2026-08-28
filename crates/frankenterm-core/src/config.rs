@@ -413,7 +413,7 @@ mod smart_selection_tests {
     #[test]
     fn empty_config_validates_clean() {
         let cfg = SmartSelectionConfig::default();
-        assert_eq!(cfg.validate(), [] as [config::SmartSelectionPatternError; 0]);
+        assert!(cfg.validate().is_empty());
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod smart_selection_tests {
         let cfg = SmartSelectionConfig {
             patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
         };
-        assert_eq!(cfg.validate(), [] as [config::SmartSelectionPatternError; 0]);
+        assert!(cfg.validate().is_empty());
     }
 
     #[test]
@@ -500,7 +500,7 @@ mod smart_selection_tests {
         let cfg = SmartSelectionConfig {
             patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
         };
-        assert_eq!(cfg.validate(), [] as [config::SmartSelectionPatternError; 0]);
+        assert!(cfg.validate().is_empty());
         let compiled = cfg.compile().expect("validated patterns compile");
         assert_eq!(compiled.len(), 1);
         assert_eq!(compiled[0].name, "issue-ref");
@@ -7849,8 +7849,8 @@ max_sender_id_len = 0
     #[test]
     fn pane_filter_default_allows_all() {
         let filter = PaneFilterConfig::default();
-        assert_eq!(filter.include, [] as [config::PaneFilterRule; 0]);
-        assert_eq!(filter.exclude, [] as [config::PaneFilterRule; 0]);
+        assert!(filter.include.is_empty());
+        assert!(filter.exclude.is_empty());
         assert!(!filter.has_rules());
 
         // With no rules, all panes should be observed
@@ -9314,7 +9314,7 @@ retention_days = 45
 retention_tiers = []
 ";
         let config = Config::from_toml(toml_str).expect("parse");
-        assert_eq!(config.storage.retention_tiers, [] as [config::RetentionTier; 0]);
+        assert!(config.storage.retention_tiers.is_empty());
         assert_eq!(
             config
                 .storage

@@ -3567,7 +3567,7 @@ mod tests {
         assert_eq!(export.session.session_id, "sess-1");
         assert_eq!(export.pane_ids, vec![1, 2]);
         assert_eq!(export.events_processed, 1);
-        assert_eq!(export.warnings, [] as [std::string::String; 0]);
+        assert!(export.warnings.is_empty());
     }
 
     #[test]

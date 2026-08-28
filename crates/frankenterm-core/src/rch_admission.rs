@@ -2640,8 +2640,8 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
-        assert_eq!(report.reason_codes, [] as [rch_admission::RchAdmissionReasonCode; 0]);
-        assert_eq!(report.recommendations, [] as [rch_admission::RchAdmissionRecommendation; 0]);
+        assert!(report.reason_codes.is_empty());
+        assert!(report.recommendations.is_empty());
         assert_eq!(report.cargo_jobs, Some(1));
         assert_eq!(report.estimated_slots, Some(1));
     }
@@ -2815,7 +2815,7 @@ mod tests {
             preflight.proof_command.proof_scope,
             Some(ProofScope::Package { ref package }) if package == "frankenterm-core"
         ));
-        assert_eq!(preflight.proof_command.risks, [] as [rch_admission::RchAdmissionProofCommandRisk; 0]);
+        assert!(preflight.proof_command.risks.is_empty());
         assert!(preflight.summary.contains("admitted: 1 worker"));
         assert!(preflight.summary.contains("package-scoped"));
     }
@@ -3003,7 +3003,7 @@ mod tests {
         assert_eq!(dirty[1].category, "untracked");
         assert_eq!(dirty[2].category, "deleted");
         assert_eq!(dirty[3].category, "added");
-        assert_eq!(parse_git_porcelain_dirty(""), [] as [rch_admission::RchAdmissionGitDirtyPath; 0]);
+        assert!(parse_git_porcelain_dirty("").is_empty());
     }
 
     #[test]
@@ -3035,7 +3035,7 @@ mod tests {
             rejections[0].reason_code,
             RchAdmissionReasonCode::NoAdmissibleWorkers
         );
-        assert_eq!(parse_rch_status_worker_rejections("{}"), [] as [rch_admission::RchAdmissionWorkerRejection; 0]);
+        assert!(parse_rch_status_worker_rejections("{}").is_empty());
     }
 
     #[test]

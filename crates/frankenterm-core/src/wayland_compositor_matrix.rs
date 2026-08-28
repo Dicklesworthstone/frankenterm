@@ -476,7 +476,7 @@ mod tests {
             ));
         }
         assert!(m.all_tier1_passed());
-        assert_eq!(m.missing_tier1(), [] as [wayland_compositor_matrix::CompositorIdentity; 0]);
+        assert!(m.missing_tier1().is_empty());
     }
 
     #[test]

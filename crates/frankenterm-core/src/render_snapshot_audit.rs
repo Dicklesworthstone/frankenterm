@@ -592,7 +592,7 @@ mod tests {
         reg.register(input_site("ingest_pty"));
         reg.mark_instrumented("draw_frame");
         let violations = reg.audit();
-        assert_eq!(violations, [] as [render_snapshot_audit::AuditViolation; 0]);
+        assert!(violations.is_empty());
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
             }
         }
         let violations = reg.audit();
-        assert_eq!(violations, [] as [render_snapshot_audit::AuditViolation; 0]);
+        assert!(violations.is_empty());
 
         let inputs = MigrationReadinessInputs {
             registry_audit_violations: violations.len() as u32,

@@ -4401,7 +4401,7 @@ mod tests {
             }],
         };
         assert!(report.unhealthy_shards().is_empty());
-        assert_eq!(report.watchdog_warnings(), [] as [std::string::String; 0]);
+        assert!(report.watchdog_warnings().is_empty());
     }
 
     #[test]

@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn script_empty() {
         let ops = edit_script(b"", b"");
-        assert_eq!(ops, [] as [edit_distance::EditOp; 0]);
+        assert!(ops.is_empty());
     }
 
     #[test]

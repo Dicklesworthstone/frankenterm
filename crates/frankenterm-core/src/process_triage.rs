@@ -1169,8 +1169,8 @@ mod tests {
             review_count: 0,
             protected_count: 0,
         };
-        assert_eq!(plan.auto_safe_entries(), [] as [&process_triage::ClassifiedProcess; 0]);
-        assert_eq!(plan.review_entries(), [] as [&process_triage::ClassifiedProcess; 0]);
+        assert!(plan.auto_safe_entries().is_empty());
+        assert!(plan.review_entries().is_empty());
     }
 
     #[test]

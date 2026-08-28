@@ -4877,7 +4877,7 @@ recorder_backend = "frankensqlite"
                 .unwrap();
 
             let lag = storage.lag_metrics().await.unwrap();
-            assert_eq!(lag.consumers, [] as [recorder_storage::RecorderConsumerLag; 0]);
+            assert!(lag.consumers.is_empty());
             assert!(lag.latest_offset.is_some());
         });
     }
@@ -5179,7 +5179,7 @@ recorder_backend = "frankensqlite"
 
             let lag = storage.lag_metrics().await.unwrap();
             assert!(lag.latest_offset.is_none());
-            assert_eq!(lag.consumers, [] as [recorder_storage::RecorderConsumerLag; 0]);
+            assert!(lag.consumers.is_empty());
         });
     }
 

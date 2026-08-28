@@ -2814,7 +2814,7 @@ mod tests {
             report.handoff_state,
             MissionTwinOwnershipHandoffState::SafeToOpen
         );
-        assert_eq!(report.dirty_overlaps, [] as [mission_twin_replay::MissionTwinOwnershipPathOverlap; 0]);
+        assert!(report.dirty_overlaps.is_empty());
         assert!(
             report
                 .reason_codes

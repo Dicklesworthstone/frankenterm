@@ -1192,7 +1192,7 @@ mod tests {
     fn merge_empty_streams() {
         let streams: Vec<Vec<ReplayOrder>> = vec![vec![], vec![]];
         let merged = merge_replay_streams(streams, |o| *o);
-        assert_eq!(merged, [] as [sequence_model::ReplayOrder; 0]);
+        assert!(merged.is_empty());
     }
 
     #[test]
@@ -1446,7 +1446,7 @@ mod tests {
             ReplayOrder::new(2, 0, 1),
             ReplayOrder::new(3, 1, 1),
         ];
-        assert_eq!(validate_replay_order(&orders), [] as [sequence_model::ReplayOrderViolation; 0]);
+        assert!(validate_replay_order(&orders).is_empty());
     }
 
     #[test]
@@ -1493,8 +1493,8 @@ mod tests {
 
     #[test]
     fn empty_and_single_are_valid() {
-        assert_eq!(validate_replay_order(&[]), [] as [sequence_model::ReplayOrderViolation; 0]);
-        assert_eq!(validate_replay_order(&[ReplayOrder::new(0, 0, 0)]), [] as [sequence_model::ReplayOrderViolation; 0]);
+        assert!(validate_replay_order(&[]).is_empty());
+        assert!(validate_replay_order(&[ReplayOrder::new(0, 0, 0)]).is_empty());
     }
 
     // -- Integration: assigner → replay order → validation --
@@ -1568,7 +1568,7 @@ mod tests {
         // Validate
         assert_eq!(merged.len(), 10);
         let violations = validate_replay_order(&merged);
-        assert_eq!(violations, [] as [sequence_model::ReplayOrderViolation; 0]);
+        assert!(violations.is_empty());
 
         // Verify determinism: merge again in different order
         let assigner2 = SequenceAssigner::new();

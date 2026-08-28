@@ -663,7 +663,7 @@ mod tests {
         let now_ms = 1_700_000_000_000_i64;
         let decision = scheduler.evaluate(now_ms, 0, &hazard_rates);
 
-        assert_ne!(decision.windows, [] as [restart_scheduler::ScoredWindow; 0]);
+        assert!(!decision.windows.is_empty());
         assert!(decision.recommendation.is_some());
         assert!(decision.would_trigger);
 
@@ -904,7 +904,7 @@ mod tests {
     fn empty_hazard_rates() {
         let scheduler = RestartScheduler::default();
         let decision = scheduler.evaluate(1_700_000_000_000, 0, &[]);
-        assert_eq!(decision.windows, [] as [restart_scheduler::ScoredWindow; 0]);
+        assert!(decision.windows.is_empty());
         assert!(decision.recommendation.is_none());
         assert!(!decision.would_trigger);
     }

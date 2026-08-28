@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(m.id, "p");
         assert_eq!(m.version, "1.0");
         assert_eq!(m.signature_class, PluginSignatureClass::Unsigned);
-        assert_eq!(m.capabilities, [] as [plugin_capabilities::PluginCapability; 0]);
+        assert!(m.capabilities.is_empty());
     }
 
     #[test]

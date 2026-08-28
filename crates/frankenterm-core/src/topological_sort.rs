@@ -659,7 +659,7 @@ mod tests {
     fn scc_empty() {
         let g = DiGraph::new(0);
         let sccs = tarjan_scc(&g);
-        assert_eq!(sccs, [] as [std::vec::Vec<usize>; 0]);
+        assert!(sccs.is_empty());
     }
 
     // -- find_cycle --

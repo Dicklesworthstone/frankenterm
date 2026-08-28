@@ -2481,7 +2481,7 @@ mod tests {
         assert!(plan.is_some());
         let plan = plan.unwrap();
         assert_eq!(plan.trigger_tier, FleetPressureTier::Elevated);
-        assert_ne!(plan.targets, [] as [fleet_memory_controller::EvictionTarget; 0]);
+        assert!(!plan.targets.is_empty());
     }
 
     #[test]
@@ -2657,7 +2657,7 @@ mod tests {
         let total_warm: usize = panes.iter().map(|p| p.warm_bytes).sum();
         assert_eq!(plan.fleet_warm_bytes_before, total_warm);
         assert!(plan.fleet_warm_bytes_target < total_warm);
-        assert_ne!(plan.targets, [] as [fleet_memory_controller::EvictionTarget; 0]);
+        assert!(!plan.targets.is_empty());
     }
 
     // ── br-ft-diccw: FleetMemoryConfig hysteresis-threshold validation ──

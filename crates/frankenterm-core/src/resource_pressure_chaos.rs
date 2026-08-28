@@ -2702,7 +2702,7 @@ mod tests {
         let all_passed = matrix.rows.iter().map(pass_for_row).collect::<Vec<_>>();
         let complete = matrix.assess_parent_completion(&all_passed);
         assert!(complete.parent_completion_ready, "{complete:?}");
-        assert_eq!(complete.blocking_pressure_classes, [] as [resource_pressure_chaos::ResourcePressureClass; 0]);
+        assert!(complete.blocking_pressure_classes.is_empty());
     }
 
     #[test]

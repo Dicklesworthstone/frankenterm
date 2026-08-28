@@ -1492,7 +1492,7 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(profiles.len(), 1);
-        assert_eq!(layouts, [] as [ntm_importer::TranslatedLayoutTemplate; 0]);
+        assert!(layouts.is_empty());
         let warning = result
             .findings
             .iter()
@@ -1875,7 +1875,7 @@ mod tests {
         let (_translated, result) = NtmImporter::translate_config(&config);
 
         assert!(result.success);
-        assert_eq!(result.findings, [] as [ntm_importer::ImportFinding; 0]);
+        assert!(result.findings.is_empty());
     }
 
     // -------------------------------------------------------------------------

@@ -1435,7 +1435,7 @@ mod tests {
             error,
             Some(ProofIntentReceiptError::AttemptNotCloseoutEligible { .. })
         ));
-        assert_eq!(entry.attached_receipts, [] as [proof_intent::ProofIntentAttachedReceipt; 0]);
+        assert!(entry.attached_receipts.is_empty());
 
         let report = build_proof_intent_release_readiness_report(
             std::slice::from_ref(&entry),

@@ -927,7 +927,7 @@ steps:
     #[test]
     fn workflow_default_trigger_event_types_empty() {
         let wf = MockWorkflow::default();
-        assert_eq!(wf.trigger_event_types(), []);
+        assert!(wf.trigger_event_types().is_empty());
     }
 
     #[test]
@@ -943,7 +943,7 @@ steps:
     #[test]
     fn workflow_default_trigger_rule_ids_empty() {
         let wf = MockWorkflow::default();
-        assert_eq!(wf.trigger_rule_ids(), []);
+        assert!(wf.trigger_rule_ids().is_empty());
     }
 
     #[test]
@@ -958,7 +958,7 @@ steps:
     #[test]
     fn workflow_default_supported_agent_types_empty() {
         let wf = MockWorkflow::default();
-        assert_eq!(wf.supported_agent_types(), []);
+        assert!(wf.supported_agent_types().is_empty());
     }
 
     #[test]
@@ -1033,7 +1033,7 @@ steps:
     #[test]
     fn workflow_default_no_dependencies() {
         let wf = MockWorkflow::default();
-        assert_eq!(wf.dependencies(), []);
+        assert!(wf.dependencies().is_empty());
     }
 
     #[test]
@@ -1148,15 +1148,15 @@ steps:
         assert_eq!(info.name, "mock_workflow");
         assert_eq!(info.description, "A mock workflow for testing");
         assert!(info.enabled);
-        assert_eq!(info.trigger_event_types, [] as [std::string::String; 0]);
-        assert_eq!(info.trigger_rule_ids, [] as [std::string::String; 0]);
-        assert_eq!(info.agent_types, [] as [std::string::String; 0]);
+        assert!(info.trigger_event_types.is_empty());
+        assert!(info.trigger_rule_ids.is_empty());
+        assert!(info.agent_types.is_empty());
         assert_eq!(info.step_count, 3);
         assert!(info.requires_pane);
         assert!(!info.requires_approval);
         assert!(info.can_abort);
         assert!(!info.destructive);
-        assert_eq!(info.dependencies, [] as [std::string::String; 0]);
+        assert!(info.dependencies.is_empty());
     }
 
     #[test]

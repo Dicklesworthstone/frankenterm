@@ -6496,7 +6496,7 @@ rules:
         assert!(report.signature_checked);
         assert_eq!(report.fixture_hashes_checked, 1);
         assert!(report.regex_budget_checked);
-        assert_eq!(report.issues, [] as [patterns::PatternPackVerificationIssue; 0]);
+        assert!(report.issues.is_empty());
     }
 
     #[test]
@@ -8607,7 +8607,7 @@ rules:
         // "hellohello". This yields two anchor hits: one inside the overlap window
         // (blocked by the overlap gate) and one outside the window (blocked by the
         // dedupe gate). Both are reported as non-matching traces.
-        assert_ne!(traces2, [] as [patterns::MatchTrace; 0]);
+        assert!(!traces2.is_empty());
         assert!(traces2.iter().all(|t| !t.eligible));
 
         let dedupe_trace = traces2
@@ -9991,7 +9991,7 @@ description = "Project lint warning"
         let (detections, traces) =
             engine.detect_with_context_and_trace(&text, &mut traced_ctx, &TraceOptions::default());
         assert!(detections.is_empty());
-        assert_eq!(traces, [] as [patterns::MatchTrace; 0]);
+        assert!(traces.is_empty());
         assert!(traced_ctx.tail_buffer.len() <= DetectionContext::MAX_TAIL_SIZE);
     }
 
@@ -10209,7 +10209,7 @@ description = "Project lint warning"
         let opts = TraceOptions::default();
         let (d, t) = engine.detect_with_context_and_trace("", &mut ctx, &opts);
         assert!(d.is_empty());
-        assert_eq!(t, [] as [patterns::MatchTrace; 0]);
+        assert!(t.is_empty());
     }
 
     // --- Detection::dedup_key with non-object extracted ---
@@ -11215,7 +11215,7 @@ rules:
             PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY as u32
         );
         assert_eq!(snap.top_rule_hits.total_inserts, 0);
-        assert_eq!(snap.top_rule_hits.top_items, [] as [misra_gries_top_k::MonitoredItem<std::string::String>; 0]);
+        assert!(snap.top_rule_hits.top_items.is_empty());
     }
 
     #[test]
@@ -11247,7 +11247,7 @@ rules:
         let (detections, traces) = engine.detect_with_context_and_trace("", &mut ctx, &opts);
 
         assert!(detections.is_empty());
-        assert_eq!(traces, [] as [patterns::MatchTrace; 0]);
+        assert!(traces.is_empty());
         let snap = engine.telemetry().snapshot();
         assert_eq!(snap.scans_total, 1);
     }

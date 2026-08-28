@@ -896,7 +896,7 @@ mod tests {
             recorded_at_ms: 1,
         });
 
-        assert_eq!(tracker.attribution_estimates(), [] as [cost_tracker::CostAttributionEstimateSummary; 0]);
+        assert!(tracker.attribution_estimates().is_empty());
         assert_eq!(tracker.telemetry().invalid_usages_rejected, 3);
     }
 

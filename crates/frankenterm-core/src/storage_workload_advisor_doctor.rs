@@ -271,7 +271,7 @@ mod tests {
         let rendering = WorkloadAdvisorDoctor::new().render(&report);
         match rendering {
             AdvisorReportRendering::DataNeeded { reasons } => {
-                assert_ne!(reasons, [] as [std::string::String; 0]);
+                assert!(!reasons.is_empty());
             }
             AdvisorReportRendering::Recommendation { .. } => {
                 panic!("expected DataNeeded variant")

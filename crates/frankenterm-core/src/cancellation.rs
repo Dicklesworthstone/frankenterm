@@ -1964,7 +1964,7 @@ mod tests {
                 2000,
             )
             .unwrap();
-        assert_eq!(cascaded, [] as [scope_tree::ScopeId; 0]); // Workers don't cascade
+        assert!(cascaded.is_empty()); // Workers don't cascade
 
         assert_eq!(
             tree.get(&well_known::capture_worker(0)).unwrap().state,
