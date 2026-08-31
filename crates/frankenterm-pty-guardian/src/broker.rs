@@ -11215,8 +11215,10 @@ impl BrokerPaneLeaseWalCatalogV1 {
         }
 
         for journal in recovered.iter() {
-            let status = journal.status();
-            if status.head_reconciliation_required || !status.append_authority_withheld {
+            let recovered_journal_status = journal.status();
+            if recovered_journal_status.head_reconciliation_required
+                || !recovered_journal_status.append_authority_withheld
+            {
                 return Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable);
             }
             let journal_id = journal.identity.spawn.journal_id();
