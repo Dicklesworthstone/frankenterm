@@ -582,8 +582,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("metrics.rs", "start"),
     ("metrics.rs", "wait"),
     ("native_events.rs", "bind"),
-    ("native_events.rs", "connect"),
-    ("native_events.rs", "accept"),
     ("native_events.rs", "run"),
     ("notifications.rs", "handle_detection"),
     ("orphan_reaper.rs", "reap_orphans"),
@@ -651,8 +649,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
 # not make the ratchet appear to have gained or lost a covered public API.
 REQUIRED_AMBIENT_CX_WRAPPERS: set[tuple[str, str]] = {
     ("native_events.rs", "bind"),
-    ("native_events.rs", "connect"),
-    ("native_events.rs", "accept"),
     ("native_events.rs", "run"),
 }
 
