@@ -119,9 +119,10 @@ catch common omissions.
   authoritative, but a local
   `python3 scripts/check_runtime_proof_coverage.py --summary`
   spot-check confirms 0 uncovered before tagging.
-- **Smoke-test the installer.** `bash install.sh --dry-run`
-  against `vX.Y.0` (the tagged version) to catch `curl|bash` shape
-  drift before users do.
+- **Smoke-test the installer entrypoint without mutating the host.** Run
+  `bash -n install.sh` and `bash install.sh --help >/dev/null` against the
+  exact release source to catch shell-syntax and argument-parser drift before
+  users do. The installer does not provide a `--dry-run` option.
 - **Test the e2e workflow trigger through RCH.**
   ```bash
   RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-e2e-workflow \

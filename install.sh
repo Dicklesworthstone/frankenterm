@@ -121,13 +121,19 @@ LOCK_HOLDER_PID=""
 LOCK_CONTROL_FIFO=""
 LOCK_READY_FILE=""
 cleanup() {
-  [ -n "$TMP" ] && rm -rf "$TMP"
+  if [ -n "$TMP" ]; then
+    rm -rf "$TMP"
+  fi
   if [ "$LOCKED" -eq 1 ]; then
     exec 9>&- 2>/dev/null || true
     [ -n "$LOCK_HOLDER_PID" ] && wait "$LOCK_HOLDER_PID" 2>/dev/null || true
   fi
-  [ -n "$LOCK_CONTROL_FIFO" ] && rm -f "$LOCK_CONTROL_FIFO"
-  [ -n "$LOCK_READY_FILE" ] && rm -f "$LOCK_READY_FILE"
+  if [ -n "$LOCK_CONTROL_FIFO" ]; then
+    rm -f "$LOCK_CONTROL_FIFO"
+  fi
+  if [ -n "$LOCK_READY_FILE" ]; then
+    rm -f "$LOCK_READY_FILE"
+  fi
 }
 trap cleanup EXIT
 
