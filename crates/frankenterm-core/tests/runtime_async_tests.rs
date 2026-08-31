@@ -1,13 +1,13 @@
 // ft-nm5nc: this entire file tested the legacy "tokio path" of the
 // dual-runtime compatibility layer. ft-xbnl0.2.5 made asupersync the
 // sole async runtime (the dual-runtime tokio fallback was removed),
-// and ft-g43fq renamed runtime_compat → runtime_async to reflect that
+// and ft-g43fq renamed the canonical module to runtime_async to reflect that
 // reality. Every test below was written against tokio-shape APIs
 // (e.g. `tx.reserve()` without a `&cx`) that no longer exist on the
 // canonical surface — they would fail to compile against today's
 // asupersync wrappers. Disabled wholesale via cfg(any()) rather than
 // deleted (AGENTS.md RULE 1); content preserved for audit. The
-// asupersync-side equivalents are covered by proptest_runtime_compat,
+// asupersync-side equivalents are covered by the runtime property suite,
 // runtime_async_smoke, pool_labruntime, lab_smoke, and the surrounding
 // *_labruntime suite.
 #![cfg(any())]

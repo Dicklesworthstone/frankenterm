@@ -823,9 +823,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Runtime migration matrix: default workspace builds already include
-  # asupersync-runtime, so exercise frankenterm-core in both runtime modes
-  # explicitly to keep the tokio-compat fallback path from silently rotting.
+  # Runtime-surface matrix: default workspace builds already include
+  # asupersync-runtime, so exercise frankenterm-core both with no default
+  # feature selectors and with the canonical runtime selector enabled. The
+  # minimal lane is not a second runtime implementation or compatibility path.
   runtime-matrix:
     name: Runtime (${{ matrix.runtime }})
     runs-on: ubuntu-latest
@@ -834,7 +835,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runtime: tokio-compat
+          - runtime: minimal-no-default-features
             check_args: -p frankenterm-core --all-targets --no-default-features
             test_args: -p frankenterm-core --lib --no-default-features
           - runtime: asupersync-runtime
