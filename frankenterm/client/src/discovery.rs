@@ -3,6 +3,34 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use wezterm_uds::UnixStream;
 
+/// Canonical filename prefix for per-process FrankenTerm GUI mux sockets.
+pub const GUI_SOCKET_PREFIX: &str = "frankenterm-gui-sock-";
+
+/// Return the canonical runtime path for a FrankenTerm GUI mux socket.
+#[must_use]
+pub fn gui_socket_path_for_pid(pid: u32) -> PathBuf {
+    config::RUNTIME_DIR.join(format!("{GUI_SOCKET_PREFIX}{pid}"))
+}
+
+fn is_gui_socket_name(name: &str) -> bool {
+    name.strip_prefix(GUI_SOCKET_PREFIX)
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+#[cfg(unix)]
+fn is_socket_entry(entry: &std::fs::DirEntry) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    entry
+        .file_type()
+        .is_ok_and(|file_type| file_type.is_socket())
+}
+
+#[cfg(not(unix))]
+fn is_socket_entry(_entry: &std::fs::DirEntry) -> bool {
+    true
+}
+
 /// There's a lot more code in this windows module than I thought I would need
 /// to write.  Ostensibly, we could get away with making a symlink by taking
 /// the SessionName environment variable, combining it with the class name
@@ -336,9 +364,9 @@ pub fn resolve_gui_sock_path(class_name: &str) -> anyhow::Result<PathBuf> {
     NameHolder::resolve(class_name)
 }
 
-/// This function returns a list of the gui-sock- paths in
-/// the runtime dir.  These represent the locally running
-/// instances of wezterm-gui.
+/// This function returns a list of the `frankenterm-gui-sock-<pid>` paths in
+/// the runtime dir. These represent the locally running FrankenTerm GUI
+/// instances.
 /// The list is pruned of any entries that are not live
 /// and then sorted with the eldest instance first.
 pub fn discover_gui_socks() -> Vec<PathBuf> {
@@ -371,7 +399,7 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
     if let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) {
         for entry in dir.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("gui-sock-") {
+                if is_gui_socket_name(name) && is_socket_entry(&entry) {
                     let path = entry.path();
                     if let Ok(meta) = entry.metadata() {
                         let age = meta_age(&meta);
@@ -393,4 +421,26 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 
 fn is_sock_dead(sock: &std::path::Path) -> bool {
     UnixStream::connect(sock).is_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_gui_socket_path_uses_frankenterm_prefix() {
+        let path = gui_socket_path_for_pid(42);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("frankenterm-gui-sock-42")
+        );
+    }
+
+    #[test]
+    fn gui_socket_name_requires_canonical_numeric_pid() {
+        assert!(is_gui_socket_name("frankenterm-gui-sock-42"));
+        assert!(!is_gui_socket_name("gui-sock-42"));
+        assert!(!is_gui_socket_name("frankenterm-gui-sock-"));
+        assert!(!is_gui_socket_name("frankenterm-gui-sock-not-a-pid"));
+    }
 }

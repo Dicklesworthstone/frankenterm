@@ -3098,7 +3098,7 @@ async fn async_run_terminal_gui(
     should_publish: bool,
 ) -> anyhow::Result<TerminalGuiStartupOutcome> {
     let pid = std::process::id();
-    let unix_socket_path = config::RUNTIME_DIR.join(format!("frankenterm-gui-sock-{}", pid));
+    let unix_socket_path = frankenterm_client::discovery::gui_socket_path_for_pid(pid);
     #[allow(unused_unsafe)]
     unsafe {
         std::env::set_var("FRANKENTERM_UNIX_SOCKET", unix_socket_path.clone());

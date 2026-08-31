@@ -205,10 +205,11 @@ fn update_checker() {
 
     std::thread::sleep(if force_ui { initial_interval } else { delay });
 
-    let my_sock = config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
+    let my_sock =
+        frankenterm_client::discovery::gui_socket_path_for_pid(std::process::id());
 
     loop {
-        // Figure out which other wezterm-guis are running.
+        // Figure out which other FrankenTerm GUIs are running.
         // We have a little "consensus protocol" to decide which
         // of us will show the toast notification or show the update
         // window: the one of us that sorts first in the list will
