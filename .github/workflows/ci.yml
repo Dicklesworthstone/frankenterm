@@ -1416,7 +1416,10 @@ jobs:
     name: Build (${{ matrix.target }})
     needs: [lint, test, feature-matrix, runtime-matrix, ftui-tests]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # A cold arm64 macOS application-family build has repeatedly exceeded
+    # 30 minutes.  Match the release lane's measured upper bound so CI can
+    # actually produce a native candidate instead of timing out near link.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -1439,6 +1442,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
+
+      - name: Freeze atomic Unix component identity
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_revision="$(git rev-parse HEAD)"
+          version="$(awk '
+            /^\[workspace.package\]$/ { in_workspace_package = 1; next }
+            in_workspace_package && /^version = / {
+              gsub(/^version = "/, "")
+              gsub(/".*/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          case "${{ matrix.target }}" in
+            *-apple-darwin)
+              feature_contract="application-family-gui-ft-mux-server-pty-guardian-default-features-v1"
+              ;;
+            *)
+              feature_contract="process-family-ft-mux-server-pty-guardian-default-features-v1"
+              ;;
+          esac
+          build_id="$(bash scripts/atomic-component-manifest.sh derive-build-id \
+            --source-revision "$source_revision" \
+            --version "$version" \
+            --target "${{ matrix.target }}" \
+            --profile release-interactive \
+            --feature-contract "$feature_contract")"
+          {
+            echo "FT_ATOMIC_BUILD_IDENTITY=$build_id"
+            echo "FT_ATOMIC_SOURCE_REVISION=$source_revision"
+            echo "FT_ATOMIC_BUILD_VERSION=$version"
+            echo "FT_ATOMIC_BUILD_TARGET=${{ matrix.target }}"
+            echo "FT_ATOMIC_BUILD_PROFILE=release-interactive"
+            echo "FT_ATOMIC_FEATURE_CONTRACT=$feature_contract"
+          } >> "$GITHUB_ENV"
 
       - name: Install Linux workspace build dependencies
         if: runner.os == 'Linux'
@@ -1466,8 +1507,19 @@ jobs:
           echo "Provisioned OpenSSL at $OPENSSL_ROOT"
           ls -la "$OPENSSL_ROOT/lib"
 
-      - name: Build shipped binary
-        run: cargo build --locked --profile release-interactive --target ${{ matrix.target }}
+      - name: Build shipped process family
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == *-apple-darwin ]]; then
+            cargo build --locked --profile release-interactive --target "${{ matrix.target }}" \
+              --bin frankenterm-gui \
+              --bin frankenterm-mux-server \
+              --bin frankenterm-pty-guardian \
+              --bin ft
+          else
+            cargo build --locked --profile release-interactive --target "${{ matrix.target }}"
+          fi
 
       - name: Verify shipped panic contract as built subprocesses
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -1492,6 +1544,9 @@ jobs:
           path: |
             target/${{ matrix.target }}/release-interactive/ft
             target/${{ matrix.target }}/release-interactive/ft.exe
+            target/${{ matrix.target }}/release-interactive/frankenterm-gui
+            target/${{ matrix.target }}/release-interactive/frankenterm-mux-server
+            target/${{ matrix.target }}/release-interactive/frankenterm-pty-guardian
           if-no-files-found: ignore
 
   # Assert that the shipped release binary's `ft --version` and
