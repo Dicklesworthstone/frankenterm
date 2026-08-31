@@ -64,8 +64,15 @@ jobs:
         run: |
           case "$(uname -s)" in
             Darwin)
-              echo "CC=$(xcrun --find clang)" >> "$GITHUB_ENV"
-              echo "CXX=$(xcrun --find clang++)" >> "$GITHUB_ENV"
+              sdkroot="$(xcrun --sdk macosx --show-sdk-path)"
+              if [[ ! -f "${sdkroot}/usr/include/math.h" ]]; then
+                echo "macOS SDK is missing required C headers: ${sdkroot}/usr/include/math.h" >&2
+                exit 1
+              fi
+              echo "CC=$(xcrun --sdk macosx --find clang)" >> "$GITHUB_ENV"
+              echo "CXX=$(xcrun --sdk macosx --find clang++)" >> "$GITHUB_ENV"
+              echo "SDKROOT=${sdkroot}" >> "$GITHUB_ENV"
+              echo "CPATH=${sdkroot}/usr/include${CPATH:+:${CPATH}}" >> "$GITHUB_ENV"
               ;;
             Linux)
               sudo apt-get update -qq
