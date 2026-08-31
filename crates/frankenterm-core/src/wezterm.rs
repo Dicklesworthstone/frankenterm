@@ -5233,6 +5233,23 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             resume_hint: tail.contains("codex resume"),
         };
 
+        if last_markers.complete() {
+            let elapsed_ms = elapsed_ms(cx, start);
+            tracing::info!(
+                pane_id,
+                elapsed_ms,
+                polls,
+                "codex_summary_wait_with_cx matched"
+            );
+            return Ok(CodexSummaryWaitResult {
+                matched: true,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
         let now = crate::runtime_async::timer_now_with_cx(cx);
         if wait_timed_out(deadline, now) {
             let elapsed_ms = elapsed_ms(cx, start);
@@ -5244,23 +5261,6 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             );
             return Ok(CodexSummaryWaitResult {
                 matched: false,
-                elapsed_ms,
-                polls,
-                last_tail_hash,
-                last_markers,
-            });
-        }
-
-        if last_markers.complete() {
-            let elapsed_ms = elapsed_ms(cx, start);
-            tracing::info!(
-                pane_id,
-                elapsed_ms,
-                polls,
-                "codex_summary_wait_with_cx matched"
-            );
-            return Ok(CodexSummaryWaitResult {
-                matched: true,
                 elapsed_ms,
                 polls,
                 last_tail_hash,

@@ -4979,13 +4979,10 @@ mod tests {
         });
     }
 
-    async fn seed_limited_pane(
+    async fn seed_test_pane(
         storage: &crate::storage::StorageHandle,
         pane_id: u64,
-        reset_at: Option<i64>,
-        reset_source: &str,
         last_seen_at: i64,
-        conservative_ttl_ms: i64,
     ) {
         storage
             .upsert_pane(crate::storage::PaneRecord {
@@ -5005,6 +5002,17 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    async fn seed_limited_pane(
+        storage: &crate::storage::StorageHandle,
+        pane_id: u64,
+        reset_at: Option<i64>,
+        reset_source: &str,
+        last_seen_at: i64,
+        conservative_ttl_ms: i64,
+    ) {
+        seed_test_pane(storage, pane_id, last_seen_at).await;
         storage
             .upsert_limit_window(crate::storage::LimitWindowRecord {
                 id: 0,
@@ -5252,7 +5260,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_progress_persistence_failure_stops_before_later_steps() {
+    fn workflow_missing_record_stops_before_any_steps() {
         run_async_test(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let db_path = temp_dir
@@ -5302,8 +5310,8 @@ mod tests {
             }
             assert_eq!(
                 calls.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "runner must stop before executing later steps after progress persistence fails"
+                0,
+                "runner must not execute side effects before its durable start audit exists"
             );
 
             storage.shutdown().await.unwrap();
@@ -5442,6 +5450,7 @@ mod tests {
             );
             let execution_id = "jump-cycle-terminal-state";
             let cx = crate::cx::for_testing();
+            seed_test_pane(&storage, 77, now_ms()).await;
             let outcome = runner
                 .run_workflow_manual_with_cx(
                     &cx,

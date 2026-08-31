@@ -9845,7 +9845,7 @@ Try again at 3:00 PM UTC.
                 .expect("device-auth test module");
             let tail = &source[start..];
             let end = tail
-                .find("\n    // ========================================================================\n    // Session Resume Step Tests")
+                .find("\n    mod resume_session_step_tests {")
                 .expect("device-auth test module boundary");
             let body = &tail[..end];
             assert!(!body.contains(concat!("execute_device_auth_", "step(")));
