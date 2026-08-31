@@ -25,7 +25,11 @@ const MANIFEST_PRODUCER_FALLBACK_ISSUES_JSONL: &str = r#"{"id":"ft-0elb9","statu
 {"id":"ft-e87u6.12","status":"closed","dependencies":[]}
 {"id":"ft-e87u6.9","status":"closed","dependencies":[]}
 {"id":"ft-gtcm9.5","status":"closed","dependencies":[]}
-{"id":"ft-7h5da.13.7","status":"closed","dependencies":[]}
+{"id":"ft-7h5da.1.5","status":"blocked","dependencies":[{"issue_id":"ft-7h5da.1.5","depends_on_id":"ft-e87u6","type":"blocks"}]}
+{"id":"ft-7h5da.5.5","status":"closed","dependencies":[]}
+{"id":"ft-7h5da.10.2","status":"blocked","dependencies":[{"issue_id":"ft-7h5da.10.2","depends_on_id":"ft-e87u6","type":"blocks"}]}
+{"id":"ft-7h5da.13.7","status":"blocked","dependencies":[{"issue_id":"ft-7h5da.13.7","depends_on_id":"ft-e87u6","type":"blocks"}]}
+{"id":"ft-booek.7","status":"blocked","dependencies":[{"issue_id":"ft-booek.7","depends_on_id":"ft-e87u6","type":"blocks"}]}
 {"id":"ft-i2eni.1","status":"closed","dependencies":[]}
 {"id":"ft-i2eni.6","status":"closed","dependencies":[]}
 {"id":"ft-oohsx.5","status":"closed","dependencies":[]}

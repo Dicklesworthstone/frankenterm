@@ -43,11 +43,12 @@
     },
     {
       "category": "perf/lindley-bounds",
-      "path": "docs/attestations/perf/lindley-bounds.json",
+      "path": null,
       "media_type": "application/json",
-      "produced_by_bead": "ft-7h5da.10.2",
+      "deferred_to_bead": "ft-7h5da.10.2",
+      "deferred_reason": "The W9.2 producer is blocked and has not closed its target-class re-derivation contract. The retained JSON is not current release evidence and must remain outside the bundle until that Bead closes.",
       "proof_categories": [8],
-      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Original substrate via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69); ft-7h5da.10.2 refreshes the published capture slice against the W9.1 append_segment group-commit storage service curve."
+      "description": "Deferred Lindley/min-plus algebra re-derivation for the W9.1 append_segment group-commit storage service curve. The older retained artifact remains on disk for diagnosis but is not bundled as current proof."
     },
     {
       "category": "tui/render-parity",
@@ -99,11 +100,12 @@
     },
     {
       "category": "security/redaction-hygiene",
-      "path": "docs/security/redaction-hygiene.json",
+      "path": null,
       "media_type": "application/json",
-      "produced_by_bead": "ft-7h5da.1.5",
+      "deferred_to_bead": "ft-7h5da.1.5",
+      "deferred_reason": "The W0.5 producer is blocked and has not closed the catalog-version stamping and backfill-receipt contract. The retained JSON cannot be promoted to release evidence while that work remains blocked.",
       "proof_categories": [7, 9],
-      "description": "Temporal redaction hygiene (G10.5): catalog-versioned segment stamping (output_segments.redaction_catalog_version, schema v29) + catalog-aware backfill receipts (maintenance_log event_type='redaction_backfill')."
+      "description": "Deferred temporal-redaction hygiene proof for catalog-versioned segment stamping and catalog-aware backfill receipts. The retained artifact remains diagnostic-only until the producer closes."
     },
     {
       "category": "security/distributed-threat-model",
@@ -163,11 +165,12 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": "docs/attestations/proofs/operating-envelope.json",
+      "path": null,
       "media_type": "application/json",
-      "produced_by_bead": "ft-booek.7",
+      "deferred_to_bead": "ft-booek.7",
+      "deferred_reason": "The operating-envelope convergence producer is blocked and still records target-class capacity as not proven. Its retained no-verdict artifact must not be hashed into a release bundle as completed producer evidence.",
       "proof_categories": [4, 5],
-      "description": "Operating-envelope convergence/no-verdict artifact for the ft.operating_envelope.v1 fail-closed admission contract, retained fixture/proof-calendar corpus, operator runbook, and release-attestation posture. Uses the existing robot-contracts release category because this is a schema-backed read-only planning contract; it records that target-class capacity remains blocked while resource-cockpit target-class evidence is skipped_not_proven."
+      "description": "Deferred operating-envelope convergence proof for the ft.operating_envelope.v1 fail-closed admission contract. The retained no-verdict artifact remains diagnostic-only while target-class capacity is unproven."
     },
     {
       "category": "proofs/robot-contracts",
@@ -211,11 +214,12 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": "docs/attestations/proofs/robot-contract-doctor.json",
+      "path": null,
       "media_type": "application/json",
-      "produced_by_bead": "ft-7h5da.13.7",
+      "deferred_to_bead": "ft-7h5da.13.7",
+      "deferred_reason": "The unified Contract Doctor producer is blocked and has not completed its six-dimension verdict and cross-surface proof contract. The retained artifact is excluded from release evidence until the producer closes.",
       "proof_categories": [4],
-      "description": "Unified Robot/MCP Contract Doctor verdict for the ft.robot_contract_doctor.v1 release contract. The artifact ties ApiSurface::ALL, the API-surface ledger, the six-dimension Contract Doctor matrix, MCP dispatch registry checks, tracked gap beads, CI workflow wiring, and the narrow RCH cargo proof into the proofs/robot-contracts category without promoting tracked exceptions to green claims."
+      "description": "Deferred unified Robot/MCP Contract Doctor verdict for the ft.robot_contract_doctor.v1 release contract. The retained artifact remains diagnostic-only until its producer closes."
     },
     {
       "category": "proofs/rehearsal-score",

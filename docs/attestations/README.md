@@ -27,7 +27,7 @@ The producing-bead column is the source of truth for which work item gates the a
 |----------|----------------|---------------------|
 | `perf/headline-claims` | `ft-syqcz.3` | G3 |
 | `perf/competitor-matrix` | `ft-e87u6.9` | G3 |
-| `perf/lindley-bounds` | `ft-7h5da.10.2` | G3 |
+| `perf/lindley-bounds` | `ft-7h5da.10.2` (blocked; manifest slot deferred) | G3 |
 | `tui/render-parity` | `ft-35yac.1.2` (GPU visual adjunct) + `ft-35yac.2` (full ratatui<->ftui report) | G5 |
 | `security/passive-watch` | `ft-x0666.1` | G9 |
 | `security/redactor-coverage` | `ft-x0666.2` | G10 |
@@ -65,6 +65,12 @@ degraded, skipped, local-fallback, Agent Mail outage, dirty-overlap, and
 fixture-only states. A release claim may cite a concrete receipt only for the
 criteria whose evidence is proven; blocked, skipped, degraded, simulated, or
 fixture-only rows stay visible as non-production proof states.
+
+The optional `security/redaction-hygiene`, operating-envelope, and unified
+Contract Doctor slots are currently explicit deferrals to `ft-7h5da.1.5`,
+`ft-booek.7`, and `ft-7h5da.13.7`. Their retained JSON files are diagnostic
+inputs, not release-bundle evidence, until those producer Beads close. Strict
+deferred verification therefore remains intentionally red.
 
 `proofs/robot-contracts` also hashes
 `docs/attestations/proofs/flight-recorder-incident-replay.json`, the
