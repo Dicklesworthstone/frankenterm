@@ -620,13 +620,14 @@ impl GuardianCensusCoordinator {
 
     fn cancel_retirement_reservation(&self, identity: GuardianPaneLeaseIdentity) {
         let mut state = self.state.lock();
-        let removable = state.retirement_slots.get(&identity.pane_id()).is_some_and(
-            |slot| {
+        let removable = state
+            .retirement_slots
+            .get(&identity.pane_id())
+            .is_some_and(|slot| {
                 slot.identity == identity
                     && slot.authority.lock().is_none()
                     && !slot.retry_in_flight
-            },
-        );
+            });
         if removable {
             state.retirement_slots.remove(&identity.pane_id());
         }
@@ -739,8 +740,8 @@ impl GuardianCensusCoordinator {
                     return Err(error);
                 }
                 slot.retry_attempts = slot.retry_attempts.saturating_add(1);
-                slot.retry_not_before = Instant::now()
-                    + guardian_retirement_retry_delay(slot.retry_attempts);
+                slot.retry_not_before =
+                    Instant::now() + guardian_retirement_retry_delay(slot.retry_attempts);
                 slot.order = order;
                 metrics::counter!(
                     "mux.guardian_proxy.retained_retirement_retry_total",

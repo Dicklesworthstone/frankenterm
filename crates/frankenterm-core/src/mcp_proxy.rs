@@ -1451,7 +1451,10 @@ mod tests {
         let filtered =
             locked_filter_remote_tools(&settings, vec![missing_annotations, malformed_annotations]);
 
-        assert_eq!(filtered, [] as [frankenterm_core_mcp::McpClientToolDefinition; 0]);
+        assert_eq!(
+            filtered,
+            [] as [frankenterm_core_mcp::McpClientToolDefinition; 0]
+        );
     }
 
     /// br-ft-153dy: filtering one destructive tool bumps the
@@ -1783,7 +1786,10 @@ mod tests {
     fn filter_remote_tools_empty_input() {
         let settings = McpClientConfig::default();
         let filtered = locked_filter_remote_tools(&settings, Vec::new());
-        assert_eq!(filtered, [] as [frankenterm_core_mcp::McpClientToolDefinition; 0]);
+        assert_eq!(
+            filtered,
+            [] as [frankenterm_core_mcp::McpClientToolDefinition; 0]
+        );
     }
 
     // ========================================================================

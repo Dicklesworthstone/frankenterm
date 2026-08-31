@@ -1,8 +1,8 @@
 use crate::client::{RpcConsumerKind, RpcGenerationScope};
 use crate::domain::ClientInner;
 use codec::*;
-use config::{ConfigHandle, configuration};
-use futures::future::{Either, select};
+use config::{configuration, ConfigHandle};
+use futures::future::{select, Either};
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use lru::LruCache;
@@ -21,11 +21,11 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
-use termwiz::cell::{Cell, CellAttributes, Underline, grapheme_column_width};
+use termwiz::cell::{grapheme_column_width, Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
 use termwiz::hyperlink::Rule;
 use termwiz::image::{ImageCell, ImageData, ImageDataValidationError, ImageDataValidationLimits};
-use termwiz::surface::{SEQ_ZERO, SequenceNo};
+use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
@@ -3427,39 +3427,39 @@ impl RenderableState {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedImageFailure, FetchToken, IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES, ImageLru,
-        LineEntry, MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES,
-        MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION, MAX_ORDINARY_IMAGE_BATCH_BYTES,
-        MAX_PENDING_PREDICTIONS, OrdinaryImageBatchAdmission, PREDICT_CONFIDENT_SCORE, Prediction,
-        PredictionReconciliation, ValidatedImageData, apply_prediction_reconciliation_to_score,
-        base_poll_interval, cache_and_admit_ordinary_image, expire_predictions,
-        get_cached_validated_image, initial_last_poll, mark_predictions_dispatched,
-        paste_fits_prediction_budget, push_bounded_prediction, push_image_locator,
-        rebuild_cache_as_stale, reconcile_predictions_after_cached_terminal_change,
+        apply_prediction_reconciliation_to_score, base_poll_interval,
+        cache_and_admit_ordinary_image, expire_predictions, get_cached_validated_image,
+        initial_last_poll, mark_predictions_dispatched, paste_fits_prediction_budget,
+        push_bounded_prediction, push_image_locator, rebuild_cache_as_stale,
+        reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
         reset_prediction_state, rows_requiring_image_retry, should_apply_unilateral_delta,
-        try_release_atomic, try_reserve_bounded_atomic,
+        try_release_atomic, try_reserve_bounded_atomic, CachedImageFailure, FetchToken, ImageLru,
+        LineEntry, OrdinaryImageBatchAdmission, Prediction, PredictionReconciliation,
+        ValidatedImageData, IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
+        MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES, MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION,
+        MAX_ORDINARY_IMAGE_BATCH_BYTES, MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
     };
     use crate::client::Client;
     use crate::client::TEST_RENDER_CONNECTION_IDENTITY;
     use crate::domain::{ClientDomainConfig, ClientInner};
     use crate::pane::ClientPane;
     use codec::{
-        GetImageCell, InputSerial, MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
-        MAX_IMAGE_HYDRATION_DECODED_BYTES, RenderConnectionIdentity, TopologyStreamId,
+        GetImageCell, InputSerial, RenderConnectionIdentity, TopologyStreamId,
+        MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES, MAX_IMAGE_HYDRATION_DECODED_BYTES,
     };
     use config::UnixDomain;
     use lru::LruCache;
     use mux::MuxSessionIncarnation;
     use std::collections::{HashMap, HashSet};
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use termwiz::cell::{Cell, CellAttributes};
     use termwiz::hyperlink::Rule;
     use termwiz::image::{ImageData, ImageDataType};
-    use termwiz::surface::{SEQ_ZERO, SequenceNo};
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
     use wezterm_term::{KeyCode, KeyModifiers};
 
@@ -4414,21 +4414,15 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.retained_bytes(), 32);
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &first_hash)
-                .is_none()
-        );
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &second_hash)
-                .is_some()
-        );
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &third_hash)
-                .is_some()
-        );
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &first_hash)
+            .is_none());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &second_hash)
+            .is_some());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &third_hash)
+            .is_some());
     }
 
     #[test]
@@ -4442,11 +4436,9 @@ mod tests {
 
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.retained_bytes(), 0);
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
-                .is_none()
-        );
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
+            .is_none());
     }
 
     #[test]
@@ -4463,11 +4455,9 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.retained_bytes(), 16);
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
-                .is_some()
-        );
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
+            .is_some());
     }
 
     #[test]
@@ -4522,16 +4512,12 @@ mod tests {
 
         cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, image);
 
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
-                .is_some()
-        );
-        assert!(
-            cache
-                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id + 1, &hash)
-                .is_none()
-        );
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
+            .is_some());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id + 1, &hash)
+            .is_none());
         assert!(cache.get(other_connection, pane_id, &hash).is_none());
     }
 
@@ -4602,16 +4588,14 @@ mod tests {
             cache.get_failure(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &revision, now,),
             Some(CachedImageFailure::Permanent)
         );
-        assert!(
-            cache
-                .get_failure(
-                    TEST_RENDER_CONNECTION_IDENTITY,
-                    pane_id,
-                    &other_revision,
-                    now,
-                )
-                .is_none()
-        );
+        assert!(cache
+            .get_failure(
+                TEST_RENDER_CONNECTION_IDENTITY,
+                pane_id,
+                &other_revision,
+                now,
+            )
+            .is_none());
 
         cache.record_failure(
             TEST_RENDER_CONNECTION_IDENTITY,

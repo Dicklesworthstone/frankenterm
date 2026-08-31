@@ -1,13 +1,13 @@
 use crate::client::{
-    ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope, admit_interactive_rpc_now,
+    admit_interactive_rpc_now, ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope,
 };
-use crate::domain::{ClientInner, lock_or_recover};
+use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
-    RenderableInner, RenderablePaneBinding, RenderableState, hydrate_lines,
-    hydrate_render_application_lines,
+    hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
+    RenderableState,
 };
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use codec::*;
 use config::configuration;
@@ -4151,14 +4151,14 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MuxTestScope;
-    use crate::client::{Client, TEST_RENDER_CONNECTION_IDENTITY, TestRpcPeer};
+    use crate::client::{Client, TestRpcPeer, TEST_RENDER_CONNECTION_IDENTITY};
     use crate::domain::ClientDomainConfig;
+    use crate::MuxTestScope;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::{Mux, MuxNotification};
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
     use termwiz::cell::{CellAttributes, SemanticType};
 
     const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
@@ -4529,11 +4529,9 @@ mod tests {
             ReliableInputWireAttempt::Unsampled(_)
         ));
         assert_eq!(consumed, Some(context));
-        assert!(
-            inner
-                .reliable_input_queue
-                .restore_front_trace_context(&expected, consumed)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .restore_front_trace_context(&expected, consumed));
 
         let (v62_attempt, consumed_again) = inner
             .reliable_input_queue
@@ -4671,11 +4669,9 @@ mod tests {
             second_wire.request.input_serial,
             second_request.input_serial
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&second, "applied")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&second, "applied"));
         assert!(inner.reliable_input_queue.state.lock().pending.is_empty());
         assert!(peer.is_empty());
     }
@@ -4726,11 +4722,9 @@ mod tests {
             panic!("base reliable-key control must use PDU96");
         };
         assert_eq!(original.pane_registration, Some(pane_registration));
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_key_ambiguity(&entry, true)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_key_ambiguity(&entry, true));
         assert!(matches!(
             inner.reliable_input_queue.claim_front_wire_attempt(
                 &entry,
@@ -4740,11 +4734,9 @@ mod tests {
             Err(ReliableKeyClaimError::ServerRestartAfterAmbiguousAttempt)
         ));
 
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_key_ambiguity(&entry, false)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_key_ambiguity(&entry, false));
         let (safe_successor_probe, _) = inner
             .reliable_input_queue
             .claim_front_wire_attempt(
@@ -4908,17 +4900,12 @@ mod tests {
                 Some(CODEC_VERSION_MIN_SUPPORTED)
             );
             assert!(!effect_may_have_reached);
-            assert!(
-                inner
-                    .reliable_input_queue
-                    .complete_front(&queued, "test_complete")
-            );
+            assert!(inner
+                .reliable_input_queue
+                .complete_front(&queued, "test_complete"));
 
-            peer.replace_ready_generation(
-                &inner.client,
-                LEGACY46_CODEC_VERSION,
-            )
-            .expect("restore exact legacy key generation for the next control");
+            peer.replace_ready_generation(&inner.client, LEGACY46_CODEC_VERSION)
+                .expect("restore exact legacy key generation for the next control");
         }
     }
 
@@ -4962,10 +4949,7 @@ mod tests {
             let entry = inner.reliable_input_queue.state.lock().pending[0].clone();
             inner
                 .reliable_input_queue
-                .arm_after_claim_generation_barrier(
-                    peer.clone(),
-                    LEGACY46_CODEC_VERSION,
-                );
+                .arm_after_claim_generation_barrier(peer.clone(), LEGACY46_CODEC_VERSION);
             let raced = promise::spawn::block_on(ReliableInputQueue::attempt(
                 &inner.reliable_input_queue,
                 &inner,
@@ -4997,11 +4981,9 @@ mod tests {
                     LegacyKeyWireAttempt::KeyUp(_)
                 )
             ));
-            assert!(
-                inner
-                    .reliable_input_queue
-                    .complete_front(&entry, "test_complete")
-            );
+            assert!(inner
+                .reliable_input_queue
+                .complete_front(&entry, "test_complete"));
 
             peer.replace_ready_generation(
                 &inner.client,
@@ -5058,18 +5040,13 @@ mod tests {
             prior_effect_attempt.request.pane_registration,
             Some(pane_registration)
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_key_ambiguity(&entry, true)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_key_ambiguity(&entry, true));
 
         inner
             .reliable_input_queue
-            .arm_after_claim_generation_barrier(
-                peer.clone(),
-                LEGACY46_CODEC_VERSION,
-            );
+            .arm_after_claim_generation_barrier(peer.clone(), LEGACY46_CODEC_VERSION);
         let raced = promise::spawn::block_on(ReliableInputQueue::attempt(
             &inner.reliable_input_queue,
             &inner,
@@ -5097,11 +5074,9 @@ mod tests {
         // transport, neither a same-generation retry nor a successor may
         // replay it: the former remains ambiguous and the latter has lost the
         // only physical-connection fence available to codec 46.
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_key_ambiguity(&entry, false)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_key_ambiguity(&entry, false));
         {
             let mut state = inner.reliable_input_queue.state.lock();
             let QueuedReliableInputPayload::Key {
@@ -5117,11 +5092,9 @@ mod tests {
             .reliable_input_queue
             .claim_front_legacy_key_attempt(&entry, legacy_generation)
             .expect("first legacy attempt is admitted on its exact transport");
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_key_ambiguity(&entry, true)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_key_ambiguity(&entry, true));
         assert!(matches!(
             inner
                 .reliable_input_queue
@@ -5523,12 +5496,10 @@ mod tests {
             )
             .expect("first write attempt records its exact server incarnation");
         assert_eq!(first_wire.pane_registration, Some(pane_registration));
-        assert!(
-            !inner
-                .reliable_input_queue
-                .apply_front_pane_write_prefix(&first, 2)
-                .expect("two-byte applied prefix is authoritative")
-        );
+        assert!(!inner
+            .reliable_input_queue
+            .apply_front_pane_write_prefix(&first, 2)
+            .expect("two-byte applied prefix is authoritative"));
 
         let state = inner.reliable_input_queue.state.lock();
         assert_eq!(state.pending.len(), 3);
@@ -5740,11 +5711,9 @@ mod tests {
                 TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
             )
             .expect("initial session claims the request");
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_pane_write_ambiguity(&entry, true)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_pane_write_ambiguity(&entry, true));
         let same_server_route = inner
             .reliable_input_queue
             .claim_front_pane_write_attempt(
@@ -5761,11 +5730,9 @@ mod tests {
             Err(ReliablePaneWriteClaimError::ServerRestartAfterAmbiguousAttempt)
         ));
 
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_pane_write_ambiguity(&entry, false)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_pane_write_ambiguity(&entry, false));
         let proven_safe = inner
             .reliable_input_queue
             .claim_front_pane_write_attempt(
@@ -5818,11 +5785,9 @@ mod tests {
                 data: b"legacy".to_vec(),
             })
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&entry, "legacy_applied")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&entry, "legacy_applied"));
         assert_eq!(
             std::io::Write::write(&mut *pane.writer.lock(), b"ambiguous")
                 .expect("second codec-46 write transfers FIFO ownership"),
@@ -5840,11 +5805,9 @@ mod tests {
             .expect("one exact legacy transport may claim the write");
         assert_eq!(request.pane_id, 144);
         assert_eq!(request.data, b"ambiguous");
-        assert!(
-            inner
-                .reliable_input_queue
-                .set_front_pane_write_ambiguity(&entry, true)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .set_front_pane_write_ambiguity(&entry, true));
         assert!(matches!(
             inner
                 .reliable_input_queue
@@ -5971,11 +5934,9 @@ mod tests {
             inner.reliable_input_queue.state.try_lock().is_some(),
             "off-thread flush must wait without retaining the reliable-input queue mutex"
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&entry, "test_applied")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&entry, "test_applied"));
         result_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("settled flush must wake")
@@ -6177,11 +6138,9 @@ mod tests {
         let wire = wire.expect("the exact successor generation receives the retained bytes");
         assert_eq!(wire.request.data, b"upgrade");
         assert_eq!(wire.request.pane_id, 137);
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&entry, "applied_prefix")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&entry, "applied_prefix"));
         assert_eq!(delivery.pending_chunks(), 0);
         assert_eq!(delivery.sticky_failure(), None);
     }
@@ -6265,11 +6224,9 @@ mod tests {
                 .data,
             b"retained"
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&entry, "applied_prefix")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&entry, "applied_prefix"));
         assert_eq!(delivery.pending_chunks(), 0);
         assert_eq!(delivery.sticky_failure(), None);
     }
@@ -6465,11 +6422,9 @@ mod tests {
             state.worker_running = true;
         }
 
-        assert!(
-            inner
-                .reliable_input_queue
-                .retire_front_pane_authority(&first, "pane_registration_mismatch")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .retire_front_pane_authority(&first, "pane_registration_mismatch"));
         assert_eq!(*first_authority_cache.lock(), None);
         assert_eq!(
             cached_pane_registration(&second_authority_cache),

@@ -9295,7 +9295,10 @@ mod tests {
                 );
             }
             assert!(oracle_report.oracle_report.all_passed());
-            assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
+            assert_eq!(
+                oracle_report.invariant_violations,
+                [] as [std::string::String; 0]
+            );
         }
     }
 
@@ -9374,7 +9377,10 @@ mod tests {
         assert_eq!(service.snapshot().wake_completions, 1);
         assert_eq!(service.snapshot().max_wake_latency_ns, 0);
         assert!(oracle_report.oracle_report.all_passed());
-        assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
+        assert_eq!(
+            oracle_report.invariant_violations,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -9427,7 +9433,10 @@ mod tests {
         assert_eq!(metrics.budget_exhaustions, 0);
         assert_eq!(metrics.context_failures, 0);
         assert!(oracle_report.oracle_report.all_passed());
-        assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
+        assert_eq!(
+            oracle_report.invariant_violations,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -9666,7 +9675,10 @@ mod tests {
         assert_eq!(runtime.pending_timer_count(), 0);
         assert!(virtual_report.auto_advances >= 1);
         assert!(oracle_report.oracle_report.all_passed());
-        assert_eq!(oracle_report.invariant_violations, [] as [std::string::String; 0]);
+        assert_eq!(
+            oracle_report.invariant_violations,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

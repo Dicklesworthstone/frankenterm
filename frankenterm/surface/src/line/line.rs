@@ -7,7 +7,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
-use crate::{Change, SEQ_ZERO, SequenceNo};
+use crate::{Change, SequenceNo, SEQ_ZERO};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};

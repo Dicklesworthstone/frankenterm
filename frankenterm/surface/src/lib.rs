@@ -1324,7 +1324,7 @@ mod test {
     #[cfg(feature = "use_image")]
     use frankenterm_cell::image::ImageData;
     use frankenterm_cell::{AttributeChange, Intensity};
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     // The \x20's look a little awkward, but we can't use a plain
     // space in the first chararcter of a multi-line continuation;
@@ -3076,11 +3076,9 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::Title("myterm".to_string()));
         let (_seq, changes) = s.get_changes(0);
-        assert!(
-            changes
-                .iter()
-                .any(|c| matches!(c, Change::Title(t) if t == "myterm"))
-        );
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::Title(t) if t == "myterm")));
     }
 
     // === repaint includes cursor shape ===
@@ -3090,11 +3088,9 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::CursorShape(CursorShape::SteadyUnderline));
         let (_seq, changes) = s.get_changes(0);
-        assert!(
-            changes
-                .iter()
-                .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline)))
-        );
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline))));
     }
 
     // === hidden cursor not shown in repaint ===

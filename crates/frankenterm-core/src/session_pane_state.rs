@@ -1016,10 +1016,8 @@ mod tests {
         assert!(truncated);
         assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
         assert_eq!(
-            PaneStateSnapshot::from_json(&json)
-                .unwrap()
-                .terminal
-                .title, ""
+            PaneStateSnapshot::from_json(&json).unwrap().terminal.title,
+            ""
         );
     }
 

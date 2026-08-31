@@ -6714,7 +6714,10 @@ mod tests {
                 .expect("cached render snapshot should be reused");
             assert_eq!(second.seqno, 14);
             assert_eq!(second.dirty_lines, [] as [std::ops::Range<isize>; 0]);
-            assert_eq!(second.bonus_lines.extract_data().0, [] as [(isize, frankenterm_term::Line); 0]);
+            assert_eq!(
+                second.bonus_lines.extract_data().0,
+                [] as [(isize, frankenterm_term::Line); 0]
+            );
             assert_eq!(second.title, "cached-pane");
             assert_eq!(second.dimensions.cols, 120);
 

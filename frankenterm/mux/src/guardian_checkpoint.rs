@@ -23,15 +23,15 @@ use crate::{
     PaneRegistrationOperationLease,
 };
 use frankenterm_term::{
-    RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointError,
-    RecoveryTerminalCheckpointV2,
     terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2},
+    RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2,
+    RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID,
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
 use std::sync::{Arc, Weak};
 use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;
-use termwiz::escape::{Action, parser::RecoveryGroundBoundary};
+use termwiz::escape::{parser::RecoveryGroundBoundary, Action};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -6412,9 +6412,8 @@ mod tests {
         assert_eq!(inventory.structs, expected_structs);
         assert_eq!(
             inventory.stage_bodies,
-            vec![
-                syn::parse_str::<syn::ItemEnum>(
-                    r#"
+            vec![syn::parse_str::<syn::ItemEnum>(
+                r#"
                     enum GuardianCheckpointStageBodyV1 {
                         Begin,
                         Chunk(GuardianCheckpointStageChunkDeliveryV1),
@@ -6423,9 +6422,8 @@ mod tests {
                         Ack { completion_id: Uuid },
                     }
                 "#,
-                )
-                .expect("parse frozen checkpoint Stage body enum")
-            ]
+            )
+            .expect("parse frozen checkpoint Stage body enum")]
         );
 
         inventory.derives.sort();
@@ -7176,11 +7174,9 @@ mod tests {
         .expect("parse production-only manual Clone mutation");
         let mut production_clone_inventory = ProtocolDeliveryAstInventory::default();
         production_clone_inventory.visit_file(&production_clone_mutation);
-        assert!(
-            production_clone_inventory
-                .impls
-                .contains(&"GuardianCheckpointStageChunkDeliveryV1:Clone".to_owned())
-        );
+        assert!(production_clone_inventory
+            .impls
+            .contains(&"GuardianCheckpointStageChunkDeliveryV1:Clone".to_owned()));
         assert_eq!(production_clone_inventory.clone_like_factories.len(), 1);
         assert_eq!(production_clone_inventory.conditional_surfaces.len(), 1);
 

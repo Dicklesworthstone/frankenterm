@@ -109273,9 +109273,8 @@ log_level = "debug"
             })
             .expect_err("selector collision must fail without overwrite");
         assert!(
-            collision_error
-                .to_string()
-                .contains("refusing to overwrite")
+            format!("{collision_error:#}").contains("refusing to overwrite"),
+            "the full error chain must retain the fail-closed collision diagnosis: {collision_error:#}"
         );
         assert_eq!(
             std::fs::read_link(root.join(&colliding_selector)).unwrap(),

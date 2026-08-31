@@ -1,10 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use crate::SEQ_ZERO;
 use crate::hyperlink::{Hyperlink, Rule};
 use crate::line::clusterline::ClusteredLine;
 use crate::line::storage::CellStorage;
+use crate::SEQ_ZERO;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -176,11 +176,10 @@ fn implicit_hyperlink_scan_splits_at_zero_width_cells() {
     line.scan_and_create_hyperlinks(&rules);
 
     assert!(!line.has_hyperlink());
-    assert!(
-        line.coerce_vec_storage()
-            .iter()
-            .all(|cell| cell.attrs().hyperlink().is_none())
-    );
+    assert!(line
+        .coerce_vec_storage()
+        .iter()
+        .all(|cell| cell.attrs().hyperlink().is_none()));
 }
 
 #[test]

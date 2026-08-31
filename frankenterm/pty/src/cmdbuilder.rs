@@ -60,7 +60,7 @@ fn passwd_field_to_string(field: *const libc::c_char, field_name: &str) -> anyho
 
 #[cfg(unix)]
 fn get_shell() -> String {
-    use nix::unistd::{AccessFlags, access};
+    use nix::unistd::{access, AccessFlags};
 
     let ent = unsafe { libc::getpwuid(libc::getuid()) };
     if !ent.is_null() {
@@ -153,7 +153,7 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
     {
         use std::os::windows::ffi::OsStringExt;
         use winapi::um::processenv::ExpandEnvironmentStringsW;
-        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RegType};
+        use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
         use winreg::types::FromRegValue;
         use winreg::{RegKey, RegValue};
 
@@ -407,7 +407,7 @@ mod os_string_serde {
 
 #[cfg(feature = "serde_support")]
 mod os_string_vec_serde {
-    use super::{OsString, os_string_serde};
+    use super::{os_string_serde, OsString};
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -433,7 +433,7 @@ mod os_string_vec_serde {
 
 #[cfg(feature = "serde_support")]
 mod option_os_string_serde {
-    use super::{OsString, os_string_serde};
+    use super::{os_string_serde, OsString};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub(super) fn serialize<S>(value: &Option<OsString>, serializer: S) -> Result<S::Ok, S::Error>
@@ -470,10 +470,10 @@ mod env_map_serde {
     //! `(OsString, EnvEntry)` pairs rather than a map. Each `OsString` is
     //! encoded through the local platform-tagged adapter, so every pair
     //! roundtrips losslessly regardless of UTF-8 validity.
-    use super::{BTreeMap, EnvEntry, OsString, os_string_serde};
-    use serde::Serialize;
+    use super::{os_string_serde, BTreeMap, EnvEntry, OsString};
     use serde::de::{Deserialize, Deserializer, Error as DeError, SeqAccess, Visitor};
     use serde::ser::{SerializeSeq, SerializeTuple, Serializer};
+    use serde::Serialize;
     use std::fmt;
 
     struct EnvPairRef<'a> {
@@ -797,7 +797,7 @@ impl CommandBuilder {
     }
 
     fn search_path(&self, exe: &OsStr, cwd: &OsStr) -> anyhow::Result<OsString> {
-        use nix::unistd::{AccessFlags, access};
+        use nix::unistd::{access, AccessFlags};
 
         let exe_path: &Path = exe.as_ref();
         if exe_path.is_relative() {
@@ -940,7 +940,7 @@ impl CommandBuilder {
     /// We take the contents of the $SHELL env var first, then
     /// fall back to looking it up from the password database.
     pub fn get_shell(&self) -> String {
-        use nix::unistd::{AccessFlags, access};
+        use nix::unistd::{access, AccessFlags};
 
         if let Some(shell) = self.get_env("SHELL").and_then(OsStr::to_str) {
             match access(shell, AccessFlags::X_OK) {
@@ -990,7 +990,7 @@ impl PreparedCommand {
     /// umask is restored before the error is returned so diagnostic or test
     /// callers cannot leak a modified process-wide setting.
     pub fn exec_in_isolated_process(mut self) -> std::io::Error {
-        use nix::sys::stat::{Mode, umask};
+        use nix::sys::stat::{umask, Mode};
         use std::os::unix::process::CommandExt as _;
 
         let previous_umask = self
@@ -1469,10 +1469,9 @@ mod tests {
         cmd.env("CUSTOM_KEY", "custom_value");
         let full: Vec<_> = cmd.iter_full_env_as_str().collect();
         // Should include base env vars (like PATH) plus our custom one
-        assert!(
-            full.iter()
-                .any(|(k, v)| *k == "CUSTOM_KEY" && *v == "custom_value")
-        );
+        assert!(full
+            .iter()
+            .any(|(k, v)| *k == "CUSTOM_KEY" && *v == "custom_value"));
         // Should have more than just our one custom var
         assert!(full.len() > 1);
     }

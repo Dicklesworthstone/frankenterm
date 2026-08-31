@@ -2395,7 +2395,10 @@ mod tests {
         let req = RecorderQueryRequest::default();
         assert!(req.time_range.is_none());
         assert_eq!(req.pane_ids, [] as [u64; 0]);
-        assert_eq!(req.sources, [] as [frankenterm_core_replay_types::recorder_metadata::RecorderEventSource; 0]);
+        assert_eq!(
+            req.sources,
+            [] as [frankenterm_core_replay_types::recorder_metadata::RecorderEventSource; 0]
+        );
         assert!(req.text_pattern.is_none());
         assert_eq!(req.limit, 100);
         assert_eq!(req.offset, 0);
@@ -2684,7 +2687,10 @@ mod tests {
         let cloned = filter.clone();
         assert!(cloned.time_range.is_none());
         assert_eq!(cloned.pane_ids, [] as [u64; 0]);
-        assert_eq!(cloned.sources, [] as [frankenterm_core_replay_types::recorder_metadata::RecorderEventSource; 0]);
+        assert_eq!(
+            cloned.sources,
+            [] as [frankenterm_core_replay_types::recorder_metadata::RecorderEventSource; 0]
+        );
         assert!(cloned.text_pattern.is_none());
     }
 

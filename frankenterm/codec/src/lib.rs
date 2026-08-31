@@ -4901,10 +4901,11 @@ impl MuxWireDecodedPayload {
     #[must_use]
     pub fn ident(&self) -> u64 {
         match self {
-            Self::Pdu(pdu) => pdu
-                .wire_spec()
-                .expect("decoded PDUs always have an assigned wire schema")
-                .ident,
+            Self::Pdu(pdu) => {
+                pdu.wire_spec()
+                    .expect("decoded PDUs always have an assigned wire schema")
+                    .ident
+            }
             Self::Legacy46ListPanesResponse(_) => ListPanesResponse::IDENT,
             Self::Legacy46SendPaste(_) => SendPaste::IDENT,
             Self::Legacy46Rejection(_) => ErrorResponse::IDENT,

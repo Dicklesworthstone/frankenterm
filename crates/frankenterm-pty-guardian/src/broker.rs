@@ -11195,11 +11195,12 @@ impl BrokerPaneLeaseWalCatalogV1 {
                 BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64,
                 BROKER_LEASE_HEAD_MAX_PHYSICAL_BYTES,
             )?;
-            let authority = BrokerPaneLeaseWalFilesystemRevalidationV1::from_revalidated_filesystem(
-                &journal.identity,
-                wal_identity.bytes,
-                head_identity.bytes,
-            )?;
+            let authority =
+                BrokerPaneLeaseWalFilesystemRevalidationV1::from_revalidated_filesystem(
+                    &journal.identity,
+                    wal_identity.bytes,
+                    head_identity.bytes,
+                )?;
             activations.push(journal.preflight_recovered_head_activation(
                 authority,
                 BrokerPaneLeaseWalRecoveredAuthorityV1::RetainWithheld,
@@ -23576,9 +23577,8 @@ mod tests {
             .expect("derive lease token-fence lease-WAL authority");
         let identity = lease_catalog_identity(&spawn_authenticator, 0x68);
         let predecessor = lease_catalog_initial_attachment(identity.spawn, 0x68);
-        let head_path = lease_catalog_path.join(broker_lease_catalog_head_name(
-            identity.spawn.journal_id(),
-        ));
+        let head_path =
+            lease_catalog_path.join(broker_lease_catalog_head_name(identity.spawn.journal_id()));
 
         let catalog = BrokerPaneLeaseWalCatalogV1::open(lease_catalog_path.clone())
             .expect("open lease token-fence catalog");
@@ -23587,11 +23587,7 @@ mod tests {
             .expect("create lease token-fence WAL-ahead journal");
         journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
         assert!(matches!(
-            journal.fence_predecessor_and_sync(
-                predecessor,
-                2,
-                identity.initial_recovery_verifier,
-            ),
+            journal.fence_predecessor_and_sync(predecessor, 2, identity.initial_recovery_verifier,),
             Err(BrokerPaneLeaseWalErrorV1::Io(_))
         ));
         drop(journal);
@@ -23610,8 +23606,7 @@ mod tests {
             "guardian-retained-lease-token-fence-{}.token",
             Uuid::new_v4()
         ));
-        fs::rename(&token_path, &retained_token)
-            .expect("retain original lease token-fence inode");
+        fs::rename(&token_path, &retained_token).expect("retain original lease token-fence inode");
         create_private_broker_token_with_bytes(&token_path, &original_token);
         assert!(matches!(
             reconcile_broker_lease_catalog_under_token_authority(
@@ -26248,9 +26243,9 @@ mod tests {
         let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe8);
         let identity = lease_catalog_identity(&spawn_authenticator, 0x4c);
         let predecessor = lease_catalog_initial_attachment(identity.spawn, 0x4c);
-        let head_path = temp.path().join(broker_lease_catalog_head_name(
-            identity.spawn.journal_id(),
-        ));
+        let head_path = temp
+            .path()
+            .join(broker_lease_catalog_head_name(identity.spawn.journal_id()));
         let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
             .expect("open restart-reconciliation lease catalog");
         let mut journal = catalog
@@ -26258,11 +26253,7 @@ mod tests {
             .expect("create restart-reconciliation lease journal");
         journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
         assert!(matches!(
-            journal.fence_predecessor_and_sync(
-                predecessor,
-                2,
-                identity.initial_recovery_verifier,
-            ),
+            journal.fence_predecessor_and_sync(predecessor, 2, identity.initial_recovery_verifier,),
             Err(BrokerPaneLeaseWalErrorV1::Io(_))
         ));
         drop(journal);
@@ -26295,11 +26286,7 @@ mod tests {
             "restart reconciliation did not append the authenticated head anchor"
         );
         let recovered_fence = journal
-            .fence_predecessor_and_sync(
-                predecessor,
-                2,
-                identity.initial_recovery_verifier,
-            )
+            .fence_predecessor_and_sync(predecessor, 2, identity.initial_recovery_verifier)
             .expect("recover the exact already-durable predecessor fence");
         assert_eq!(
             recovered_fence.phase,
@@ -26354,9 +26341,9 @@ mod tests {
         let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe9);
         let identity = lease_catalog_identity(&spawn_authenticator, 0x4d);
         let predecessor = lease_catalog_initial_attachment(identity.spawn, 0x4d);
-        let head_path = temp.path().join(broker_lease_catalog_head_name(
-            identity.spawn.journal_id(),
-        ));
+        let head_path = temp
+            .path()
+            .join(broker_lease_catalog_head_name(identity.spawn.journal_id()));
         let catalog = BrokerPaneLeaseWalCatalogV1::open(temp.path().to_path_buf())
             .expect("open partial-head restart lease catalog");
         let mut journal = catalog
@@ -26364,11 +26351,7 @@ mod tests {
             .expect("create partial-head restart lease journal");
         journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
         assert!(matches!(
-            journal.fence_predecessor_and_sync(
-                predecessor,
-                2,
-                identity.initial_recovery_verifier,
-            ),
+            journal.fence_predecessor_and_sync(predecessor, 2, identity.initial_recovery_verifier,),
             Err(BrokerPaneLeaseWalErrorV1::Io(_))
         ));
         drop(journal);
@@ -26379,8 +26362,7 @@ mod tests {
         let mut first_recovery = catalog
             .scan_all_for_admission(&lease_authenticator)
             .expect("scan WAL-ahead lease before partial recovered-head write");
-        first_recovery[0]
-            .inject_fault(BrokerPaneLeaseWalInjectedFaultV1::DuringRecoveredHeadWrite);
+        first_recovery[0].inject_fault(BrokerPaneLeaseWalInjectedFaultV1::DuringRecoveredHeadWrite);
         assert!(matches!(
             catalog.reconcile_recovered_read_only(&mut first_recovery),
             Err(BrokerPaneLeaseWalErrorV1::Io(_))

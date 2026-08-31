@@ -19,11 +19,11 @@
 
 use base64::Engine as _;
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
     aead::{
-        Aead, KeyInit, Payload,
         rand_core::{OsRng, RngCore as _},
+        Aead, KeyInit, Payload,
     },
+    XChaCha20Poly1305, XNonce,
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::{TryFrom, TryInto};
@@ -2191,7 +2191,9 @@ pub enum GuardianOutputJournalError {
     NewSegmentCreationUnsupported,
     #[error("new guardian output journal parent directory is not private current-user authority")]
     InsecureNewSegmentParent,
-    #[error("new guardian output journal file identity, ownership, mode, or link count is invalid")]
+    #[error(
+        "new guardian output journal file identity, ownership, mode, or link count is invalid"
+    )]
     InsecureNewSegmentIdentity,
     #[error("new guardian output journal parent or child identity changed before activation")]
     NewSegmentPublicationIdentityChanged,
@@ -2225,7 +2227,9 @@ pub enum GuardianOutputJournalError {
     RecordLimit { maximum: u64 },
     #[error("guardian output journal record at byte {offset} has invalid magic")]
     InvalidRecordMagic { offset: u64 },
-    #[error("guardian output journal record at byte {offset} has invalid header length {observed}")]
+    #[error(
+        "guardian output journal record at byte {offset} has invalid header length {observed}"
+    )]
     InvalidRecordHeaderLength { offset: u64, observed: u32 },
     #[error("guardian output journal record at byte {offset} has nonzero reserved bytes")]
     NonCanonicalRecordHeader { offset: u64 },
@@ -2253,7 +2257,9 @@ pub enum GuardianOutputJournalError {
     RecordDigestMismatch { sequence: u64 },
     #[error("guardian output journal sequence space is exhausted")]
     SequenceExhausted,
-    #[error("new guardian output segment is not active until its parent directory is synchronized")]
+    #[error(
+        "new guardian output segment is not active until its parent directory is synchronized"
+    )]
     DirectoryEntryNotDurable,
     #[error("guardian output journal has an incomplete tail and must be sealed")]
     IncompleteTail,
@@ -4541,11 +4547,9 @@ mod tests {
     fn raw_terminal_plaintext_never_appears_in_segment_bytes() {
         let plaintext = b"FT-UNIQUE-RAW-TERMINAL-SECRET-7f10c9";
         let bytes = journal_bytes(&[plaintext]);
-        assert!(
-            !bytes
-                .windows(plaintext.len())
-                .any(|window| window == plaintext)
-        );
+        assert!(!bytes
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
     }
 
     #[test]
@@ -4723,11 +4727,9 @@ mod tests {
                 actual: 0,
             }
         ));
-        assert!(
-            std::fs::read(&path)
-                .expect("read preserved empty evidence")
-                .is_empty()
-        );
+        assert!(std::fs::read(&path)
+            .expect("read preserved empty evidence")
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -4775,11 +4777,9 @@ mod tests {
             append_error,
             GuardianOutputJournalError::AppendDescriptorNotReadWrite
         ));
-        assert!(
-            std::fs::read(&path)
-                .expect("read descriptor-mode evidence")
-                .is_empty()
-        );
+        assert!(std::fs::read(&path)
+            .expect("read descriptor-mode evidence")
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -4953,11 +4953,9 @@ mod tests {
             GuardianOutputJournalError::Io(ref source)
                 if source.kind() == std::io::ErrorKind::AlreadyExists
         ));
-        assert!(
-            std::fs::read(&empty_path)
-                .expect("read retained empty evidence")
-                .is_empty()
-        );
+        assert!(std::fs::read(&empty_path)
+            .expect("read retained empty evidence")
+            .is_empty());
 
         let path = directory.path().join("preexisting-nonempty.ftgout");
         let retained = b"retained preexisting evidence";
@@ -5110,10 +5108,8 @@ mod tests {
         assert_eq!(metadata.len(), FILE_HEADER_BYTES_U64);
         let descriptor_flags = nix::fcntl::fcntl(&journal.file, nix::fcntl::F_GETFD)
             .expect("inspect invariant-bound descriptor flags");
-        assert!(
-            nix::fcntl::FdFlag::from_bits_truncate(descriptor_flags)
-                .contains(nix::fcntl::FdFlag::FD_CLOEXEC)
-        );
+        assert!(nix::fcntl::FdFlag::from_bits_truncate(descriptor_flags)
+            .contains(nix::fcntl::FdFlag::FD_CLOEXEC));
         journal
             .sync_parent_directory_and_activate()
             .expect("activate invariant-bound journal");
@@ -5347,12 +5343,10 @@ mod tests {
                 .receipt(),
             receipt
         );
-        assert!(
-            cursor
-                .next_record()
-                .expect("cursor excludes incomplete tail")
-                .is_none()
-        );
+        assert!(cursor
+            .next_record()
+            .expect("cursor excludes incomplete tail")
+            .is_none());
         assert_eq!(
             std::fs::read(&path).expect("re-read preserved torn-tail evidence"),
             exact_evidence
@@ -5416,11 +5410,9 @@ mod tests {
                 actual: 0,
             }
         ));
-        assert!(
-            std::fs::read(&path)
-                .expect("read crash-truncated evidence after append reopen")
-                .is_empty()
-        );
+        assert!(std::fs::read(&path)
+            .expect("read crash-truncated evidence after append reopen")
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -5586,20 +5578,16 @@ mod tests {
         assert_eq!(cursor.verified_record_count(), 3);
         drop(third);
 
-        assert!(
-            cursor
-                .next_record()
-                .expect("finish exact cursor authority")
-                .is_none()
-        );
+        assert!(cursor
+            .next_record()
+            .expect("finish exact cursor authority")
+            .is_none());
         assert!(cursor.is_exhausted());
         assert_eq!(cursor.verified_record_count(), 3);
-        assert!(
-            cursor
-                .next_record()
-                .expect("repeated EOF is stable")
-                .is_none()
-        );
+        assert!(cursor
+            .next_record()
+            .expect("repeated EOF is stable")
+            .is_none());
         assert_eq!(cursor.verified_record_count(), 3);
 
         let mut explicit_replay = journal
@@ -5643,12 +5631,10 @@ mod tests {
                 .receipt(),
             receipts[1]
         );
-        assert!(
-            cursor
-                .next_record()
-                .expect("frozen cursor ignores later append")
-                .is_none()
-        );
+        assert!(cursor
+            .next_record()
+            .expect("frozen cursor ignores later append")
+            .is_none());
         assert_eq!(cursor.verified_record_count(), 2);
 
         let mut later_cursor = journal
@@ -5945,11 +5931,9 @@ mod tests {
         assert!(page.records()[0].receipt().matches_payload(payloads[1]));
         let mut same_length_wrong_payload = payloads[1].to_vec();
         same_length_wrong_payload[0] ^= 0x01;
-        assert!(
-            !page.records()[0]
-                .receipt()
-                .matches_payload(&same_length_wrong_payload)
-        );
+        assert!(!page.records()[0]
+            .receipt()
+            .matches_payload(&same_length_wrong_payload));
         assert_eq!(page.next_recovery_sequence(), Some(3));
         assert_eq!(page.committed_next_sequence(), Some(4));
         assert_eq!(page.committed_log_bytes(), third.committed_log_bytes());
@@ -6187,18 +6171,14 @@ mod tests {
             .expect("maximal cursor record exists");
         assert_eq!(cursor_terminal.receipt(), terminal);
         assert_eq!(cursor_terminal.plaintext(), b"terminal");
-        assert!(
-            cursor
-                .next_record()
-                .expect("maximal cursor reaches a terminal EOF")
-                .is_none()
-        );
-        assert!(
-            cursor
-                .next_record()
-                .expect("maximal cursor cannot wrap after EOF")
-                .is_none()
-        );
+        assert!(cursor
+            .next_record()
+            .expect("maximal cursor reaches a terminal EOF")
+            .is_none());
+        assert!(cursor
+            .next_record()
+            .expect("maximal cursor cannot wrap after EOF")
+            .is_none());
         assert_eq!(cursor.verified_record_count(), 1);
     }
 
@@ -6446,12 +6426,10 @@ mod tests {
                 .receipt(),
             receipt
         );
-        assert!(
-            cursor
-                .next_record()
-                .expect("cursor excludes the uncommitted torn tail")
-                .is_none()
-        );
+        assert!(cursor
+            .next_record()
+            .expect("cursor excludes the uncommitted torn tail")
+            .is_none());
         assert!(matches!(
             cursor.tail(),
             GuardianOutputJournalTail::Incomplete {

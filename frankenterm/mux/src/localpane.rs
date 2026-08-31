@@ -3,12 +3,12 @@ use crate::guardian_checkpoint::{
     LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
 };
 use crate::guardian_protocol::GuardianCheckpointReceipt;
+#[cfg(test)]
+use crate::pane::GuardianLiveOutputDelivery;
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, GuardianLiveCheckpointPublisher,
     GuardianLiveOutputReader, LogicalLine, Pane, PaneId, Pattern, SearchResult, WithPaneLines,
 };
-#[cfg(test)]
-use crate::pane::GuardianLiveOutputDelivery;
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
 use crate::{Domain, PaneRegistrationHandle, PaneRegistrationSlot};

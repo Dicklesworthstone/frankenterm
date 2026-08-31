@@ -7557,7 +7557,10 @@ mod tests {
         assert_eq!(data.leak_risk.pane_arena_peak_bytes, 2 * 1024 * 1024);
         assert_eq!(data.leak_risk.storage_lock_contention_events, 5);
         assert!(!data.leak_risk.watchdog_unhealthy);
-        assert_eq!(data.leak_risk.unhealthy_components, [] as [std::string::String; 0]);
+        assert_eq!(
+            data.leak_risk.unhealthy_components,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
