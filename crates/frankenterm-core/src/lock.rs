@@ -370,13 +370,17 @@ fn read_lock_sidecar_bytes_in_directory_admitted_with_hook(
         .map_err(|error| stable_io_failure("handle_after_read", &error))?;
     admit_named_sidecar(&handle_after, max_bytes, "handle_after_read")?;
     require_same_metadata_identity(&handle_before, &handle_after, "read_identity")?;
-    require_same_metadata_observation(&handle_before, &handle_after, "read_identity")?;
 
     let named_after = directory
         .symlink_metadata(name)
         .map_err(|error| stable_io_failure("path_after_read", &error))?;
     admit_named_sidecar(&named_after, max_bytes, "path_after_read")?;
     require_same_metadata_identity(&handle_after, &named_after, "path_after_read")?;
+    // Namespace replacement changes ctime on some Unix filesystems. Check the
+    // retained handle against the current name before comparing observations
+    // so a deliberate replacement is classified as a namespace identity
+    // change rather than an incidental timestamp mutation of the old inode.
+    require_same_metadata_observation(&handle_before, &handle_after, "read_identity")?;
     require_same_metadata_observation(&handle_after, &named_after, "path_after_read")?;
     if require_holder_binding {
         require_external_advisory_lock(&file, "holder_binding_after_read")?;

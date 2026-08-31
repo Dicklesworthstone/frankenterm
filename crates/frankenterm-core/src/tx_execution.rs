@@ -4139,11 +4139,22 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     return Err(deferred);
                 }
 
+                // A hard stop must block every unresolved forward step, but it
+                // must not strand an external effect whose durable success was
+                // recovered from an earlier process. This exception grants no
+                // commit authority: it applies only to the synthesized
+                // recovery report and still evaluates the compensation
+                // action's policy, approval, reservation, and liveness gates.
+                let compensation_kill_switch = if recovery_requires_compensation {
+                    MissionKillSwitchLevel::Off
+                } else {
+                    effective_kill_switch
+                };
                 let compensation_permit = self.validate_compensation_dispatch(
                     contract,
                     &gate_report,
                     &execution_id,
-                    effective_kill_switch,
+                    compensation_kill_switch,
                     now_ms,
                 )?;
 
@@ -6775,7 +6786,8 @@ mod tests {
     use crate::plan::{
         MissionActorRole, MissionEconomicBreakerDecision, MissionTokenBudget,
         MissionTokenUsageSample, MissionTxContract, MissionTxState, StepAction, TxCompensation,
-        TxId, TxIntent, TxOutcome, TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
+        TxId, TxIntent, TxOutcome, TxPlan as ContractTxPlan, TxPlanId, TxPrecondition, TxStep,
+        TxStepId,
     };
     use crate::tx_idempotency::{IdempotencyKey, IdempotencyPolicy, IdempotencyStore, StepOutcome};
     use crate::tx_plan_compiler::StepRisk;
@@ -12975,7 +12987,7 @@ mod tests {
             .execute_with_store(&mut contract, &mut store, 6_000)
             .map_err(|err| err.to_string())?;
 
-        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.final_state, MissionTxState::RolledBack);
         assert_eq!(result.outcome, TxOutcome::Compensated);
         assert_eq!(
             *dispatched_compensations.borrow(),
@@ -13054,7 +13066,7 @@ mod tests {
             .execute_with_store(&mut contract, &mut store, 6_000)
             .map_err(|err| err.to_string())?;
 
-        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.final_state, MissionTxState::RolledBack);
         assert_eq!(result.outcome, TxOutcome::Compensated);
         assert_eq!(
             *dispatched_compensations.borrow(),
@@ -13083,6 +13095,10 @@ mod tests {
     fn mixed_recovery_reconstructs_proven_receipts_under_failed_precondition() -> Result<(), String>
     {
         let mut contract = make_test_contract(2);
+        contract
+            .plan
+            .preconditions
+            .push(TxPrecondition::PromptActive { pane_id: 1 });
         let (_store_dir, mut store) = durable_store();
         let compiled_plan = compiled_plan_from_contract(&contract);
         store
@@ -13115,7 +13131,7 @@ mod tests {
             .execute_with_store(&mut contract, &mut store, 6_000)
             .map_err(|err| err.to_string())?;
 
-        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.final_state, MissionTxState::RolledBack);
         assert_eq!(result.outcome, TxOutcome::Compensated);
         assert_eq!(
             *dispatched_compensations.borrow(),

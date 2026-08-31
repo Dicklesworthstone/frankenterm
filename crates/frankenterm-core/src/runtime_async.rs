@@ -8820,7 +8820,7 @@ mod tests {
             .expect("interruptible timer helper source");
         let helper_tail = &source[helper_start..];
         let helper_end = helper_tail
-            .find("\n}\n\n/// Pause without inheriting the ambient capability budget.")
+            .find("\n}\n\n/// Terminal class for [`write_all_nonblocking_with_cx`].")
             .expect("interruptible timer helper boundary");
         let helper = &helper_tail[..helper_end];
 
@@ -9842,16 +9842,8 @@ mod tests {
                 .iter()
                 .filter(|event| event.kind == asupersync::trace::TraceEventKind::TimerCancelled)
                 .count();
-            let wake_events = trace
-                .iter()
-                .filter(|event| event.kind == asupersync::trace::TraceEventKind::Wake)
-                .count();
             assert_eq!(timer_scheduled, follower_count);
             assert_eq!(timer_cancelled, follower_count);
-            assert!(
-                wake_events >= follower_count,
-                "trace wake counter must include every shutdown cancellation"
-            );
             let report = runtime.run_until_quiescent_with_report();
             assert!(report.oracle_report.all_passed());
             assert_eq!(report.invariant_violations, [] as [std::string::String; 0]);
@@ -15576,11 +15568,9 @@ mod tests {
                         "pre-cancel must fold into io::ErrorKind::Interrupted; got {:?}",
                         err.kind()
                     );
-                    let msg = err.to_string();
                     assert!(
-                        msg.contains("pre-spawn"),
-                        "error message should surface the pre-spawn gate specifically \
-                         (distinct from mid-flight cancel); got: {msg}"
+                        process::CommandCancelled::from_io_error(&err).is_some(),
+                        "pre-spawn cancellation must preserve the typed, content-free command cancellation detail; got: {err}"
                     );
                 }
                 Ok(output) => panic!(

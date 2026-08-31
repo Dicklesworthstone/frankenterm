@@ -689,8 +689,8 @@ mod tests {
         fn new(name: &'static str, sent: Arc<Mutex<Vec<NotificationPayload>>>) -> Self {
             Self {
                 name,
+                cx_sent: Arc::clone(&sent),
                 sent,
-                cx_sent: Arc::new(Mutex::new(Vec::new())),
             }
         }
 

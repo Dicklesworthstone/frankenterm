@@ -11034,7 +11034,7 @@ fn mcp_tx_rollback_proof_error(
     match kind {
         crate::tx_execution::RollbackProofKind::Missing => (
             MCP_ERR_WORKFLOW,
-            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future new transactions, execute commits through MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts.",
+            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future transactions, use MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts.",
         ),
         crate::tx_execution::RollbackProofKind::Conflict => (
             MCP_ERR_WORKFLOW,
@@ -22829,7 +22829,7 @@ mod tests {
         );
         assert_eq!(
             envelope["hint"],
-            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future new transactions, execute commits through MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts."
+            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future transactions, use MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts."
         );
         assert_eq!(
             std::fs::read(&contract_path).expect("reread forged contract"),

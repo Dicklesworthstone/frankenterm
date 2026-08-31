@@ -2928,6 +2928,16 @@ impl WeztermClient {
     ) -> CliMutationCircuitEvidence {
         match result {
             Ok(_) => CliMutationCircuitEvidence::SuccessfulResponse,
+            Err(crate::Error::Wezterm(WeztermError::MuxRejection(rejection)))
+                if matches!(
+                    rejection.code,
+                    MuxRejectionCode::BackendFailure
+                        | MuxRejectionCode::IndeterminateMutation
+                        | MuxRejectionCode::UnknownFuture
+                ) =>
+            {
+                CliMutationCircuitEvidence::BackendFailure
+            }
             Err(crate::Error::Wezterm(WeztermError::MuxRejection(_))) => {
                 CliMutationCircuitEvidence::SuccessfulResponse
             }
@@ -3262,15 +3272,25 @@ impl WeztermClient {
     ) -> WeztermError {
         use crate::runtime_async::process::{CommandOutputLimitExceeded, CommandOutputStream};
 
-        if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(error)
-            && exceeded.stream() == CommandOutputStream::Stdout
-            && let Some(command) = contract.output_too_large_command
-        {
-            return WeztermError::OutputTooLarge {
-                command: command.to_string(),
-                len: exceeded.observed(),
-                cap: exceeded.limit(),
+        if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(error) {
+            if exceeded.stream() == CommandOutputStream::Stdout
+                && let Some(command) = contract.output_too_large_command
+            {
+                return WeztermError::OutputTooLarge {
+                    command: command.to_string(),
+                    len: exceeded.observed(),
+                    cap: exceeded.limit(),
+                };
+            }
+            let stream = match exceeded.stream() {
+                CommandOutputStream::Stdout => "stdout",
+                CommandOutputStream::Stderr => "stderr",
             };
+            return WeztermError::CommandFailed(format!(
+                "{stream} capture limit exceeded (observed={} bytes, cap={})",
+                exceeded.observed(),
+                exceeded.limit()
+            ));
         }
         Self::categorize_io_error(error)
     }
@@ -3429,7 +3449,7 @@ impl WeztermClient {
             Some("GetLines") => MuxOperation::ReadPaneText,
             Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
-            Some("WriteToPane" | "SendPaste") => MuxOperation::SendText,
+            Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1") => MuxOperation::SendText,
             Some("Resize") => MuxOperation::ResizePane,
             Some("AdjustPaneSize") => MuxOperation::AdjustPaneSize,
             Some("CreateFloatingPane") => MuxOperation::CreateFloatingPane,
@@ -5356,6 +5376,15 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
 
+    fn isolated_cli_client() -> WeztermClient {
+        WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::default())
+    }
+
+    fn isolated_cli_client_with_socket(socket_path: impl Into<String>) -> WeztermClient {
+        WeztermClient::with_socket(socket_path)
+            .with_circuit_breaker_config(CircuitBreakerConfig::default())
+    }
+
     #[test]
     fn split_percent_preserves_full_non_degenerate_range() {
         assert_eq!(normalize_split_percent(0), 1);
@@ -5830,7 +5859,7 @@ mod tests {
                 !bogus.exists(),
                 "precondition: test socket path must not exist"
             );
-            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let client = isolated_cli_client_with_socket(bogus.to_string_lossy().into_owned());
 
             let cx = crate::cx::for_request();
             let err = client
@@ -5868,7 +5897,7 @@ mod tests {
                 !bogus.exists(),
                 "precondition: test socket path must not exist"
             );
-            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let client = isolated_cli_client_with_socket(bogus.to_string_lossy().into_owned());
 
             let cx = crate::cx::for_request();
             let err = client
@@ -5908,7 +5937,7 @@ mod tests {
                 !bogus.exists(),
                 "precondition: test socket path must not exist"
             );
-            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let client = isolated_cli_client_with_socket(bogus.to_string_lossy().into_owned());
             let cx = crate::cx::for_request();
 
             // Zoom path (no --unzoom arg).
@@ -6155,7 +6184,7 @@ mod tests {
                 !bogus.exists(),
                 "precondition: test socket path must not exist"
             );
-            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let client = isolated_cli_client_with_socket(bogus.to_string_lossy().into_owned());
 
             let cx = crate::cx::for_request();
             let err = client
@@ -6196,7 +6225,7 @@ mod tests {
                 !bogus.exists(),
                 "precondition: test socket path must not exist"
             );
-            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let client = isolated_cli_client_with_socket(bogus.to_string_lossy().into_owned());
             let cx = crate::cx::for_request();
 
             // new_window = true branch (adds --new-window).
@@ -6285,7 +6314,7 @@ mod tests {
             );
 
             // Arc<dyn WeztermInterface> wrapper.
-            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+            let arc: Arc<dyn WeztermInterface> = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let cx = crate::cx::for_request();
@@ -6303,7 +6332,7 @@ mod tests {
             // UnifiedClient wrapper (CLI-backed variant). Build via
             // `from_handle` so the inner WeztermClient uses the bogus
             // socket path.
-            let inner_handle: WeztermHandle = Arc::new(WeztermClient::with_socket(
+            let inner_handle: WeztermHandle = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let unified = UnifiedClient::from_handle(
@@ -6347,7 +6376,7 @@ mod tests {
                 "precondition: test socket path must not exist"
             );
 
-            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+            let arc: Arc<dyn WeztermInterface> = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let cx = crate::cx::for_request();
@@ -6362,7 +6391,7 @@ mod tests {
                 other => panic!("Arc<dyn> expected SocketNotFound (kill), got {other:?}"),
             }
 
-            let inner_handle: WeztermHandle = Arc::new(WeztermClient::with_socket(
+            let inner_handle: WeztermHandle = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let unified = UnifiedClient::from_handle(
@@ -6405,7 +6434,7 @@ mod tests {
                 "precondition: test socket path must not exist"
             );
 
-            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+            let arc: Arc<dyn WeztermInterface> = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let cx = crate::cx::for_request();
@@ -6435,7 +6464,7 @@ mod tests {
             }
 
             // UnifiedClient zoom=true
-            let inner_handle: WeztermHandle = Arc::new(WeztermClient::with_socket(
+            let inner_handle: WeztermHandle = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let unified = UnifiedClient::from_handle(
@@ -6480,7 +6509,7 @@ mod tests {
                 "precondition: test socket path must not exist"
             );
 
-            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+            let arc: Arc<dyn WeztermInterface> = Arc::new(isolated_cli_client_with_socket(
                 bogus.to_string_lossy().into_owned(),
             ));
             let cx = crate::cx::for_request();
@@ -6553,7 +6582,7 @@ mod tests {
                 !bogus.exists(),
                 "precondition: test socket path must not exist"
             );
-            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let client = isolated_cli_client_with_socket(bogus.to_string_lossy().into_owned());
             let cx = crate::cx::for_request();
 
             // Exercise Left direction with no cwd/percent.
@@ -8061,7 +8090,7 @@ mod tests {
 
     #[test]
     fn malformed_successful_spawn_receipt_is_indeterminate() {
-        let client = WeztermClient::new();
+        let client = isolated_cli_client();
         let error = client
             .settle_cli_pane_id_mutation(
                 "spawn_targeted",
@@ -8191,11 +8220,11 @@ mod tests {
             WeztermClient::completed_cli_mutation_circuit_evidence(&authoritative_failure);
         assert_eq!(evidence, CliMutationCircuitEvidence::BackendFailure);
 
-        let backend_client = WeztermClient::new();
+        let backend_client = isolated_cli_client();
         backend_client.circuit_record_mutation_evidence(evidence);
         assert_eq!(backend_client.circuit_status().consecutive_failures, 1);
 
-        let caller_cancelled_client = WeztermClient::new();
+        let caller_cancelled_client = isolated_cli_client();
         caller_cancelled_client
             .circuit_record_mutation_evidence(CliMutationCircuitEvidence::Ignore);
         assert_eq!(
@@ -8242,7 +8271,7 @@ mod tests {
         let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
         let wez_err = WeztermClient::categorize_io_error(&e);
         match wez_err {
-            WeztermError::CommandFailed(msg) => assert!(msg.contains("connection refused")),
+            WeztermError::CommandFailed(msg) => assert_eq!(msg, "bridge CLI I/O failure"),
             other => panic!("expected CommandFailed, got {:?}", other),
         }
     }

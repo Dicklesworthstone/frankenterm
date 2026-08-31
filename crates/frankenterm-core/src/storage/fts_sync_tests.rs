@@ -254,7 +254,7 @@ fn full_fts_rebuild_pages_more_than_one_startup_pane_batch() {
     for pane_id in 1..=pane_count {
         let pane_id = u64::try_from(pane_id).unwrap();
         insert_test_pane(&conn, pane_id);
-        insert_test_segment(&conn, pane_id, 0, "paged-full-rebuild-token");
+        insert_test_segment(&conn, pane_id, 0, "pagedfullrebuildtoken");
     }
 
     let result = full_fts_rebuild_test(&mut conn, &FtsSyncConfig::default()).unwrap();
@@ -263,7 +263,7 @@ fn full_fts_rebuild_pages_more_than_one_startup_pane_batch() {
     assert_eq!(result.segments_indexed, u64::try_from(pane_count).unwrap());
     assert_eq!(result.panes_processed, u64::try_from(pane_count).unwrap());
     assert_eq!(
-        fts_match_count(&conn, "paged-full-rebuild-token"),
+        fts_match_count(&conn, "pagedfullrebuildtoken"),
         i64::try_from(pane_count).unwrap()
     );
 }
@@ -848,11 +848,7 @@ fn fts_sync_rejects_negative_cached_lengths_before_index_mutation() {
             message.contains("content_len") || message.contains("content length"),
             "both FTS engines must identify the corrupt cached length: {message}"
         );
-        let indexed: i64 = conn
-            .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
+        let indexed = fts_match_count(&conn, "negative");
         assert_eq!(
             indexed, 0,
             "a corrupt cached length must be detected before either engine mutates FTS"
@@ -892,11 +888,7 @@ fn fts_sync_rolls_back_postings_when_progress_checkpoint_fails() {
                 sync_fts_for_pane_backend_with_mode(backend, 1, &config, insert_select_batch)
             })
             .expect_err("injected progress failure must abort the atomic FTS unit");
-            let indexed: i64 = conn
-                .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
+            let indexed = fts_match_count(&conn, "atomic");
             assert_eq!(
                 indexed, 0,
                 "postings must roll back when their resume checkpoint does not commit"

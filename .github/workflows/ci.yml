@@ -830,7 +830,10 @@ jobs:
   runtime-matrix:
     name: Runtime (${{ matrix.runtime }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A cold runtime-surface check alone can exceed 20 minutes, and this job
+    # intentionally runs check, Clippy, and the full frankenterm-core lib suite.
+    # Keep the timeout large enough for an empty cache to reach the assertions.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -864,7 +867,11 @@ jobs:
           cargo clippy ${{ matrix.check_args }} -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/runtime-${{ matrix.runtime }}-clippy.log
 
       - name: Run focused tests
-        run: cargo test ${{ matrix.test_args }} --verbose
+        # frankenterm-core has more than 27K lib tests and many SQLite/runtime
+        # fixtures. GitHub and RCH hosts can expose very high CPU counts, so
+        # libtest's host-sized default fan-out exhausts process resources and
+        # creates scheduler timing interference that a normal Mac never sees.
+        run: cargo test ${{ matrix.test_args }} --verbose -- --test-threads=4
 
       - name: Upload runtime logs on failure
         if: failure()

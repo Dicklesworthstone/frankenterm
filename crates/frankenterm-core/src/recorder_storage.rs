@@ -4313,7 +4313,7 @@ recorder_backend = "frankensqlite"
     }
 
     #[test]
-    fn health_records_checkpoint_regression_diagnostic() {
+    fn health_ignores_checkpoint_regression_from_caller_data() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
@@ -4351,11 +4351,12 @@ recorder_backend = "frankensqlite"
                 RecorderStorageError::CheckpointRegression { .. }
             ));
 
-            let degraded = storage.health().await;
-            assert!(degraded.degraded);
-            let diagnostic = degraded.last_error.unwrap();
-            assert!(diagnostic.contains("commit_checkpoint failed"));
-            assert!(diagnostic.contains("TerminalData"));
+            let after_rejection = storage.health().await;
+            assert!(
+                !after_rejection.degraded,
+                "a rejected caller checkpoint must not claim the storage backend is degraded"
+            );
+            assert!(after_rejection.last_error.is_none());
 
             let _ = storage
                 .commit_checkpoint(RecorderCheckpoint {
@@ -4378,7 +4379,7 @@ recorder_backend = "frankensqlite"
     }
 
     #[test]
-    fn health_records_append_diagnostic_and_clears_on_success() {
+    fn health_ignores_invalid_append_request_from_caller_data() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let mut cfg = test_config(dir.path());
@@ -4396,11 +4397,12 @@ recorder_backend = "frankensqlite"
                 .unwrap_err();
             assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
 
-            let degraded = storage.health().await;
-            assert!(degraded.degraded);
-            let diagnostic = degraded.last_error.unwrap();
-            assert!(diagnostic.contains("append_batch failed"));
-            assert!(diagnostic.contains("TerminalData"));
+            let after_rejection = storage.health().await;
+            assert!(
+                !after_rejection.degraded,
+                "a rejected caller batch must not claim the storage backend is degraded"
+            );
+            assert!(after_rejection.last_error.is_none());
 
             let _ = storage
                 .append_batch(AppendRequest {

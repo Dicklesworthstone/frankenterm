@@ -127,8 +127,9 @@ fn v0_init_fault_after_repair_rolls_back_atomically() {
 
     let err = initialize_schema(&conn).expect_err("fault must propagate");
     assert!(
-        err.to_string().contains("ft-k542h fault injection"),
-        "expected fault-injection error, got: {err}"
+        err.to_string()
+            .contains("v0 init: migration mutation failed"),
+        "the public error must identify the failed migration phase without exposing its internal cause, got: {err}"
     );
 
     // Atomicity invariants: the outer transaction rolled back, so:
@@ -282,25 +283,25 @@ fn migration_plan_empty_when_at_target() {
 
 #[test]
 fn downgrade_below_forward_only_floor_fails_closed() {
-    // v34 is deliberately forward-only because downgrading it would discard
-    // authoritative deletion evidence. build_migration_plan hard-errors when
-    // any undone migration lacks down_sql, so current head can roll back the
-    // reversible v35 tail to v34 but cannot cross that floor.
+    // The newest forward-only migration defines the rollback floor from head.
+    // V45 owns pending recorder-delivery evidence, so current head cannot roll
+    // back at all. The historical v35 index-only tail remains independently
+    // reversible when planning from v35 to the v34 retention-evidence floor.
     let forward_only_floor = MIGRATIONS
         .iter()
         .filter(|migration| migration.down_sql.is_none())
         .map(|migration| migration.version)
         .max()
         .expect("the v1 baseline is forward-only");
-    assert_eq!(forward_only_floor, 34, "v34 is the current rollback floor");
+    assert_eq!(forward_only_floor, 45, "v45 is the current rollback floor");
 
-    let reversible_tail = build_migration_plan(SCHEMA_VERSION, 34)
-        .expect("the v35 index-only tail must roll back to the v34 floor");
+    let reversible_tail = build_migration_plan(35, 34)
+        .expect("the historical v35 index-only tail must remain reversible");
     assert_eq!(reversible_tail.steps.len(), 1);
     assert_eq!(reversible_tail.steps[0].migration_version, 35);
     assert_eq!(reversible_tail.steps[0].resulting_version, 34);
 
-    for target in [1, 3, 17, 32, 33] {
+    for target in [44, 34, 17, 1] {
         let err = build_migration_plan(SCHEMA_VERSION, target)
             .expect_err("downgrade from the forward-only head must fail closed");
         assert!(
@@ -1218,15 +1219,36 @@ fn each_migration_step_can_be_reapplied_without_panicking() {
     // covered separately above.
     for migration in MIGRATIONS.iter().skip(1) {
         let conn = Connection::open_in_memory().unwrap();
-        // Build the head DDL directly. Calling `initialize_schema` here would
-        // run the complete migration plan before the per-step assertion and
-        // turn any fresh-init regression into an unhelpful generic setup
-        // failure instead of identifying the first non-idempotent migration.
+        // Build the head DDL directly, then replay prerequisites in order.
+        // Calling `initialize_schema` here would run the complete migration
+        // plan before the per-step assertion and turn any fresh-init
+        // regression into an unhelpful generic setup failure. Later authority
+        // migrations (notably v44) deliberately depend on earlier versioned
+        // objects that are excluded from the base schema body.
         let (pragma_preamble, schema_body) = split_schema_sql_pragmas();
         conn.execute_batch(&pragma_preamble)
             .expect("apply schema PRAGMA preamble");
         conn.execute_batch(&schema_body)
             .expect("apply head schema body");
+
+        for prerequisite in MIGRATIONS
+            .iter()
+            .skip(1)
+            .take_while(|prerequisite| prerequisite.version < migration.version)
+        {
+            let prerequisite_step = MigrationStep {
+                migration_version: prerequisite.version,
+                resulting_version: prerequisite.version,
+                description: prerequisite.description,
+                direction: MigrationDirection::Up,
+            };
+            apply_migration_step(&conn, &prerequisite_step).unwrap_or_else(|err| {
+                panic!(
+                    "prerequisite v{} for v{} failed on head schema: {err}",
+                    prerequisite.version, migration.version
+                )
+            });
+        }
 
         let step = MigrationStep {
             migration_version: migration.version,

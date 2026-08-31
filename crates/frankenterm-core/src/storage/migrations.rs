@@ -5958,6 +5958,8 @@ fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) ->
 
     run_owned_migration_transaction_with_foreign_keys_suspended(conn, "v0 init", |transaction| {
         repair_existing_v0_tables_before_schema_sql(transaction)?;
+        let restore_suspended_recovery_authority =
+            table_exists(transaction, "session_recovery_usability")?;
         suspend_canonical_session_authority_triggers_for_v0_replay(transaction)?;
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::RepairComplete)?;
@@ -5968,7 +5970,23 @@ fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) ->
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
 
-        run_migrations_in_existing_transaction(transaction, 0)?;
+        if restore_suspended_recovery_authority {
+            // A current database whose version stamp was lost already owns the
+            // v44 tables. Migration v38 requires every checkpoint observer to
+            // be suspended during its table cutover, while the exact v40
+            // retained-size validator correctly requires all 27 triggers when
+            // the v44 tables exist. Replay through v39 first, then restore the
+            // already-owned v44 trigger authority before v40 validates the
+            // combined catalog. The ordinary v44 step remains idempotent and
+            // performs its canonical population-cursor reset later.
+            let through_v39 = build_migration_plan(0, 39)?;
+            apply_migration_plan_in_existing_transaction(transaction, &through_v39)?;
+            ensure_session_recovery_usability_schema(transaction)?;
+            let remainder = build_migration_plan(39, SCHEMA_VERSION)?;
+            apply_migration_plan_in_existing_transaction(transaction, &remainder)?;
+        } else {
+            run_migrations_in_existing_transaction(transaction, 0)?;
+        }
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::MigrationsApplied)?;
 

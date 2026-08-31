@@ -11048,6 +11048,7 @@ mod saturation_counter_tests {
             hits: u64::MAX,
             misses: u64::MAX,
             returns: 0,
+            capacity_discards: 0,
             pool_lock_poisoned: 0,
         };
 
@@ -16591,6 +16592,8 @@ mod writer_io_scheduler_tests {
     #[test]
     fn event_gap_group_commit_commit_failure_rolls_back_and_fails_all() {
         run_storage_async_test(async {
+            let _writer_authority = WriterDispatchAuthority::enter();
+            let _ = take_writer_backend_epoch_poisoned_signal();
             let backend = CommitFailBackend::new();
             backend
                 .inner
@@ -21203,9 +21206,12 @@ where
 // Pool is process-global (`OnceLock`-backed `Mutex<HashMap<...>>`) rather
 // than per-StorageHandle because the spawn_blocking closures capture
 // `db_path` by clone, not the `StorageHandle` itself. Process-global keeps
-// the migration drop-in.
+// the migration drop-in. Both the per-path and process-wide idle capacities
+// are bounded: without the global bound, churn across unique database paths
+// retains one SQLite DB/WAL/SHM descriptor set per path until process exit.
 
 const DEFAULT_READ_POOL_MAX_PER_PATH: usize = 8;
+const MAX_IDLE_READ_BACKENDS: usize = 64;
 
 static READ_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>,
@@ -21237,6 +21243,7 @@ fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Ve
 static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POOL_RETURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOL_CAPACITY_DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // br-ft-ac4j0: pool-lock poison-recovery counter.
 //
@@ -21668,6 +21675,9 @@ pub struct PoolTelemetrySnapshot {
     pub hits: u64,
     pub misses: u64,
     pub returns: u64,
+    /// Connections closed instead of retained because either the per-path or
+    /// process-wide idle capacity was already full.
+    pub capacity_discards: u64,
     /// br-ft-ac4j0: count of read-pool Mutex-poison recoveries since
     /// process load. Non-zero values mean a prior thread panicked
     /// while holding the pool lock; the storage layer recovered
@@ -21708,6 +21718,7 @@ pub fn pool_telemetry_snapshot() -> PoolTelemetrySnapshot {
         hits: POOL_HITS.load(Ordering::Relaxed),
         misses: POOL_MISSES.load(Ordering::Relaxed),
         returns: POOL_RETURNS.load(Ordering::Relaxed),
+        capacity_discards: POOL_CAPACITY_DISCARDS.load(Ordering::Relaxed),
         // br-ft-ac4j0: surface pool-lock poison recoveries.
         pool_lock_poisoned: POOL_LOCK_POISONED.load(Ordering::Relaxed),
     }
@@ -21835,6 +21846,8 @@ impl Drop for PooledReadConn {
                 drop(backend);
                 return;
             }
+            let mut returning_backend = Some(backend);
+            let mut evicted_backend = None;
             // br-ft-ac4j0: pre-fix this site silently dropped the
             // connection on poison without observability. The drop is
             // correct (rusqlite Drop closes the connection cleanly),
@@ -21844,20 +21857,60 @@ impl Drop for PooledReadConn {
             // visible via PoolTelemetrySnapshot.
             match read_pool().lock() {
                 Ok(mut pool) => {
-                    let entry = pool.entry(self.db_path.clone()).or_default();
-                    if entry.len() < self.max_pool_size {
-                        entry.push(backend);
+                    let path_has_capacity = pool
+                        .get(&self.db_path)
+                        .is_none_or(|entry| entry.len() < self.max_pool_size);
+                    let total_idle = pool
+                        .values()
+                        .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
+                    if path_has_capacity && total_idle >= MAX_IDLE_READ_BACKENDS {
+                        let evict_path = pool
+                            .iter()
+                            .find(|(path, entry)| {
+                                path.as_str() != self.db_path.as_str() && !entry.is_empty()
+                            })
+                            .map(|(path, _)| path.clone());
+                        if let Some(evict_path) = evict_path {
+                            let remove_entry = {
+                                let entry = pool
+                                    .get_mut(&evict_path)
+                                    .expect("selected read-pool entry must still exist");
+                                evicted_backend = entry.pop();
+                                entry.is_empty()
+                            };
+                            if remove_entry {
+                                pool.remove(&evict_path);
+                            }
+                            if evicted_backend.is_some() {
+                                saturating_atomic_u64_add(&POOL_CAPACITY_DISCARDS, 1);
+                            }
+                        }
+                    }
+
+                    let total_after_eviction = pool
+                        .values()
+                        .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
+                    if path_has_capacity && total_after_eviction < MAX_IDLE_READ_BACKENDS {
+                        let entry = pool.entry(self.db_path.clone()).or_default();
+                        entry.push(
+                            returning_backend
+                                .take()
+                                .expect("returning read backend must still be owned"),
+                        );
                         // br-ft-rvt1z: counted only on successful return.
                         saturating_atomic_u64_add(&POOL_RETURNS, 1);
-                        return;
+                    } else {
+                        saturating_atomic_u64_add(&POOL_CAPACITY_DISCARDS, 1);
                     }
                 }
                 Err(_) => {
                     saturating_atomic_u64_add(&POOL_LOCK_POISONED, 1);
                 }
             }
-            // Pool full (or lock poisoned) — let backend drop, which closes it.
-            drop(backend);
+            // Close evicted or unretained backends after releasing the pool
+            // mutex so SQLite teardown never serializes unrelated borrowers.
+            drop(evicted_backend);
+            drop(returning_backend);
         }
     }
 }
@@ -28460,7 +28513,8 @@ fn segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
 /// Decode the narrower FTS-catch-up row shape while charging the authoritative
 /// UTF-8 bytes that will actually be inserted into FTS. `content_len` is a
 /// cached statistics column and can be stale in legacy or externally repaired
-/// databases, so it is deliberately absent from this resource-boundary query.
+/// databases, so it is validated for a non-negative domain but never trusted
+/// as the resource charge.
 fn fts_segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
     let reader = CellRowReader::new(row);
     let pane_id = reader
@@ -28474,6 +28528,15 @@ fn fts_segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
     let content = reader
         .string(3)
         .map_err(|err| storage_backend_error("FTS segment content", err))?;
+    let cached_content_len = reader
+        .i64(4)
+        .map_err(|err| storage_backend_error("FTS segment content_len", err))?;
+    if cached_content_len < 0 {
+        return Err(StorageError::Database(format!(
+            "output_segments.content_len is negative: {cached_content_len}"
+        ))
+        .into());
+    }
     let content_len = content.len();
     Ok(Segment {
         id: reader
@@ -28484,10 +28547,10 @@ fn fts_segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
         content,
         content_len,
         content_hash: reader
-            .optional_string(4)
+            .optional_string(5)
             .map_err(|err| storage_backend_error("FTS segment content_hash", err))?,
         captured_at: reader
-            .i64(5)
+            .i64(6)
             .map_err(|err| storage_backend_error("FTS segment captured_at", err))?,
     })
 }
@@ -28622,13 +28685,13 @@ fn get_unindexed_segments_backend(
     include_from_zero: bool,
 ) -> Result<Vec<Segment>> {
     let sql = if include_from_zero {
-        "SELECT id, pane_id, seq, content, content_hash, captured_at
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
              FROM output_segments
              WHERE pane_id = ?1
              ORDER BY seq
              LIMIT ?3"
     } else {
-        "SELECT id, pane_id, seq, content, content_hash, captured_at
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
              FROM output_segments
              WHERE pane_id = ?1 AND seq > ?2
              ORDER BY seq
@@ -28705,7 +28768,7 @@ pub fn set_fts_insert_select_batch_override_for_bench(enabled: Option<bool>) {
 fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str {
     if include_from_zero {
         "WITH limited AS (
-             SELECT seq, length(CAST(content AS BLOB)) AS content_bytes,
+             SELECT seq, length(CAST(content AS BLOB)) AS content_bytes, content_len,
                     ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
                     SUM(length(CAST(content AS BLOB))) OVER (
                         ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
@@ -28724,10 +28787,11 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
              (SELECT COUNT(*) FROM limited) AS fetched_count,
              (SELECT COUNT(*) FROM selected) AS indexed_count,
              (SELECT MAX(seq) FROM selected) AS max_seq,
-             (SELECT MIN(content_bytes) FROM limited) AS min_content_bytes"
+             (SELECT MIN(content_bytes) FROM limited) AS min_content_bytes,
+             (SELECT MIN(content_len) FROM limited) AS min_cached_content_len"
     } else {
         "WITH limited AS (
-             SELECT seq, length(CAST(content AS BLOB)) AS content_bytes,
+             SELECT seq, length(CAST(content AS BLOB)) AS content_bytes, content_len,
                     ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
                     SUM(length(CAST(content AS BLOB))) OVER (
                         ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
@@ -28746,7 +28810,8 @@ fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str 
              (SELECT COUNT(*) FROM limited) AS fetched_count,
              (SELECT COUNT(*) FROM selected) AS indexed_count,
              (SELECT MAX(seq) FROM selected) AS max_seq,
-             (SELECT MIN(content_bytes) FROM limited) AS min_content_bytes"
+             (SELECT MIN(content_bytes) FROM limited) AS min_content_bytes,
+             (SELECT MIN(content_len) FROM limited) AS min_cached_content_len"
     }
 }
 
@@ -28817,9 +28882,9 @@ fn insert_fts_entries_select_batch_backend(
             StorageError::Database("set-based FTS batch summary returned no row".to_string())
         })?;
     let reader = CellRowReader::new(&summary_row);
-    if reader.column_count() != 4 {
+    if reader.column_count() != 5 {
         return Err(StorageError::Database(format!(
-            "set-based FTS batch summary returned {} columns; expected 4",
+            "set-based FTS batch summary returned {} columns; expected 5",
             reader.column_count()
         ))
         .into());
@@ -28860,6 +28925,23 @@ fn insert_fts_entries_select_batch_backend(
     {
         return Err(StorageError::Database(format!(
             "set-based FTS batch encountered negative content byte length {min_content_bytes}",
+        ))
+        .into());
+    }
+    let min_cached_content_len = reader.optional_i64(4).map_err(|err| {
+        storage_backend_error("Failed to parse set-based FTS min cached content_len", err)
+    })?;
+    if fetched_count > 0 && min_cached_content_len.is_none() {
+        return Err(StorageError::Database(
+            "set-based FTS batch fetched rows without a cached content_len".to_string(),
+        )
+        .into());
+    }
+    if let Some(min_cached_content_len) = min_cached_content_len
+        && min_cached_content_len < 0
+    {
+        return Err(StorageError::Database(format!(
+            "set-based FTS batch encountered negative content_len {min_cached_content_len}",
         ))
         .into());
     }
@@ -42587,10 +42669,11 @@ mod write_command_sender_tests {
 #[cfg(test)]
 mod pool_telemetry_tests {
     use super::{
-        POOL_HITS, POOL_LOCK_POISONED, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot,
-        PooledReadConn, StorageBackendLoan, StorageBackendProvider, StorageHandle,
-        StorageWriterOpenRequest, default_storage_backend_provider, pool_telemetry_snapshot,
-        pooled_backend, register_storage_backend_provider, reset_pool_lock_poisoned_count_for_test,
+        MAX_IDLE_READ_BACKENDS, POOL_CAPACITY_DISCARDS, POOL_HITS, POOL_LOCK_POISONED, POOL_MISSES,
+        POOL_RETURNS, PoolTelemetrySnapshot, PooledReadConn, StorageBackendLoan,
+        StorageBackendProvider, StorageHandle, StorageWriterOpenRequest,
+        default_storage_backend_provider, pool_telemetry_snapshot, pooled_backend, read_pool,
+        register_storage_backend_provider, reset_pool_lock_poisoned_count_for_test,
         run_storage_async_test, with_provider_read_backend,
     };
     use crate::storage_backend_trait::{
@@ -42616,6 +42699,7 @@ mod pool_telemetry_tests {
             hits: POOL_HITS.load(Ordering::Relaxed),
             misses: POOL_MISSES.load(Ordering::Relaxed),
             returns: POOL_RETURNS.load(Ordering::Relaxed),
+            capacity_discards: POOL_CAPACITY_DISCARDS.load(Ordering::Relaxed),
             // br-ft-ac4j0: include pool_lock_poisoned in baseline.
             pool_lock_poisoned: POOL_LOCK_POISONED.load(Ordering::Relaxed),
         }
@@ -42626,6 +42710,9 @@ mod pool_telemetry_tests {
             hits: end.hits.saturating_sub(start.hits),
             misses: end.misses.saturating_sub(start.misses),
             returns: end.returns.saturating_sub(start.returns),
+            capacity_discards: end
+                .capacity_discards
+                .saturating_sub(start.capacity_discards),
             // br-ft-ac4j0.
             pool_lock_poisoned: end
                 .pool_lock_poisoned
@@ -42648,6 +42735,7 @@ mod pool_telemetry_tests {
             hits: 0,
             misses: 0,
             returns: 0,
+            capacity_discards: 0,
             // br-ft-ac4j0.
             pool_lock_poisoned: 0,
         };
@@ -42660,10 +42748,60 @@ mod pool_telemetry_tests {
             hits: 80,
             misses: 20,
             returns: 80,
+            capacity_discards: 0,
             // br-ft-ac4j0.
             pool_lock_poisoned: 0,
         };
         assert!((s.hit_rate() - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_pool_process_wide_idle_capacity_is_bounded_across_paths() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let start = baseline();
+        let mut db_paths = Vec::with_capacity(MAX_IDLE_READ_BACKENDS + 1);
+
+        for index in 0..=MAX_IDLE_READ_BACKENDS {
+            let db_path = temp_dir.path().join(format!("global-cap-{index}.db"));
+            std::fs::File::create(&db_path).expect("seed database file");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let pooled = PooledReadConn::acquire(&db_path).expect("acquire pooled backend");
+            let is_autocommit = pooled.with_borrowed_backend(|backend| {
+                backend
+                    .with_connection(|conn| conn.is_autocommit())
+                    .expect("pooled backend autocommit probe")
+            });
+            assert!(is_autocommit);
+            db_paths.push(db_path);
+        }
+
+        let total_idle = {
+            let pool = read_pool()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pool.values()
+                .fold(0_usize, |total, entry| total.saturating_add(entry.len()))
+        };
+        let end = baseline();
+
+        assert!(
+            total_idle <= MAX_IDLE_READ_BACKENDS,
+            "process-wide idle pool exceeded its bound: {total_idle} > {MAX_IDLE_READ_BACKENDS}"
+        );
+        assert!(
+            end.capacity_discards > start.capacity_discards,
+            "cross-path churn must close excess connections instead of retaining them"
+        );
+
+        let mut pool = read_pool()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for db_path in db_paths {
+            pool.remove(&db_path);
+        }
     }
 
     /// br-ft-ac4j0: a clean acquire/release cycle does not bump
@@ -43063,8 +43201,8 @@ mod pool_telemetry_tests {
                 missing_pane_error
                     .to_string()
                     .to_ascii_lowercase()
-                    .contains("foreign key"),
-                "missing-pane append should fail through sqlite FK enforcement, got {missing_pane_error}"
+                    .contains("invalid output segment metadata or missing scrollback summary"),
+                "missing-pane append should fail through the canonical content-free integrity guard, got {missing_pane_error}"
             );
 
             storage

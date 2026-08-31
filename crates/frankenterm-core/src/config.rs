@@ -70,7 +70,7 @@ impl FleetScrollbackBudgetConfig {
                 "fleet_scrollback.per_pane_budget_bytes must be >= 1 when enabled".to_string(),
             );
         }
-        if !self.high_ratio.is_finite() || !(0.0..1.0).contains(&self.high_ratio) {
+        if !self.high_ratio.is_finite() || self.high_ratio <= 0.0 || self.high_ratio >= 1.0 {
             return Err("fleet_scrollback.high_ratio must be finite and in (0, 1)".to_string());
         }
         Ok(())
@@ -2162,17 +2162,22 @@ pub(crate) fn compile_retention_policy_tiers(
         .iter()
         .map(|tier| tier.severities.len() + tier.event_types.len())
         .sum();
-    let mut classification_sql = String::from("CASE");
     let mut bind_values = Vec::with_capacity(input_sql_bind_cost);
-    for (branch_index, tier) in canonical_tiers.iter().enumerate() {
-        classification_sql.push_str(" WHEN (");
-        append_compiled_retention_tier_predicate(&mut classification_sql, &mut bind_values, tier);
-        classification_sql.push_str(") THEN ");
-        classification_sql.push_str(&branch_index.to_string());
-    }
-    classification_sql.push_str(" ELSE ");
-    classification_sql.push_str(&canonical_tiers.len().to_string());
-    classification_sql.push_str(" END");
+    let classification_sql = if canonical_tiers.is_empty() {
+        "0".to_string()
+    } else {
+        let mut sql = String::from("CASE");
+        for (branch_index, tier) in canonical_tiers.iter().enumerate() {
+            sql.push_str(" WHEN (");
+            append_compiled_retention_tier_predicate(&mut sql, &mut bind_values, tier);
+            sql.push_str(") THEN ");
+            sql.push_str(&branch_index.to_string());
+        }
+        sql.push_str(" ELSE ");
+        sql.push_str(&canonical_tiers.len().to_string());
+        sql.push_str(" END");
+        sql
+    };
 
     let count_sql = format!(
         "SELECT COUNT(*) FROM events \
@@ -9536,6 +9541,23 @@ retention_tiers = []
             2,
             "one immutable compilation must be reusable across repeated cleanup SQL executions"
         );
+    }
+
+    #[test]
+    fn empty_retention_policy_uses_a_valid_literal_fallback_classifier() {
+        let plan = compile_retention_policy_tiers(&[]).expect("compile empty retention policy");
+
+        assert_eq!(plan.fallback_branch_index(), 0);
+        assert!(plan.bind_values().is_empty());
+        for sql in [
+            plan.count_sql(),
+            plan.candidate_sql(),
+            plan.all_branch_count_sql(),
+            plan.all_branch_candidate_sql(),
+        ] {
+            assert!(sql.contains("(0)"), "missing literal classifier: {sql}");
+            assert!(!sql.contains("CASE ELSE"), "invalid empty CASE: {sql}");
+        }
     }
 
     // =========================================================================

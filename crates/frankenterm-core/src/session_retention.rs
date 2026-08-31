@@ -1333,7 +1333,16 @@ fn delete_sessions_by_age_phase_with_observer(
     max_age_days: u64,
     observer: &impl SessionOwnerObserver,
 ) -> Result<RetentionPhaseOutcome<usize>, rusqlite::Error> {
-    let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
+    delete_sessions_by_age_phase_at_with_observer(conn, max_age_days, observer, epoch_ms())
+}
+
+fn delete_sessions_by_age_phase_at_with_observer(
+    conn: &Connection,
+    max_age_days: u64,
+    observer: &impl SessionOwnerObserver,
+    now_ms: u64,
+) -> Result<RetentionPhaseOutcome<usize>, rusqlite::Error> {
+    let cutoff_ms = now_ms.saturating_sub(max_age_days.saturating_mul(86_400_000));
     // An unrepresentable future cutoff must fail without deleting anything;
     // clamping to i64::MAX would make nearly every closed session eligible.
     let cutoff_ms = u64_to_sqlite_integer(cutoff_ms)?;
@@ -5800,29 +5809,30 @@ mod tests {
     #[test]
     fn age_cleanup_boundary_exactly_at_cutoff() {
         let conn = make_test_db();
-        let now = epoch_ms() as i64;
-        // Slightly newer than 30 days ago (+100ms) to account for time elapsed
-        // between this epoch_ms() call and the one inside delete_sessions_by_age.
-        // The query uses `created_at < cutoff`, so anything at or after the cutoff
-        // should NOT be deleted.
-        let just_inside_30_days = now - 30 * 86_400_000 + 100;
+        let now = 1_800_000_000_000_u64;
+        let exactly_at_cutoff = i64::try_from(now - 30 * 86_400_000).unwrap();
 
-        insert_session(&conn, "boundary", just_inside_30_days, true);
+        insert_session(&conn, "boundary", exactly_at_cutoff, true);
 
-        let deleted = delete_sessions_by_age(&conn, 30).unwrap();
+        let observer = SystemSessionOwnerObserver::new();
+        let deleted = delete_sessions_by_age_phase_at_with_observer(&conn, 30, &observer, now)
+            .unwrap()
+            .value;
         assert_eq!(deleted, 0);
     }
 
     #[test]
     fn age_cleanup_one_ms_past_cutoff() {
         let conn = make_test_db();
-        let now = epoch_ms() as i64;
-        // 1ms past the 30-day cutoff
-        let just_past = now - 30 * 86_400_000 - 1;
+        let now = 1_800_000_000_000_u64;
+        let just_past = i64::try_from(now - 30 * 86_400_000 - 1).unwrap();
 
         insert_session(&conn, "just-past", just_past, true);
 
-        let deleted = delete_sessions_by_age(&conn, 30).unwrap();
+        let observer = SystemSessionOwnerObserver::new();
+        let deleted = delete_sessions_by_age_phase_at_with_observer(&conn, 30, &observer, now)
+            .unwrap()
+            .value;
         assert_eq!(deleted, 1);
     }
 

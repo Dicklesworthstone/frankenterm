@@ -3654,7 +3654,10 @@ mod tests {
             Err(MmapStoreError::InvalidLineRecord)
         ));
         assert_eq!(store.line_count(1), 0);
-        assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), b"");
+        assert!(
+            !dir.path().join("1.log").exists(),
+            "validation must reject the record before creating a pane log"
+        );
     }
 
     #[test]

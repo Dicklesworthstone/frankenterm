@@ -2274,6 +2274,23 @@ pub fn write_crash_bundle(
     health: Option<&HealthSnapshot>,
     resize_forensics: Option<&crate::resize_crash_forensics::ResizeCrashContext>,
 ) -> std::io::Result<PathBuf> {
+    let environment_markers = CrashEnvironmentMarkers::capture(health);
+    write_crash_bundle_with_markers(
+        crash_dir,
+        report,
+        health,
+        resize_forensics,
+        &environment_markers,
+    )
+}
+
+fn write_crash_bundle_with_markers(
+    crash_dir: &Path,
+    report: &CrashReport,
+    health: Option<&HealthSnapshot>,
+    resize_forensics: Option<&crate::resize_crash_forensics::ResizeCrashContext>,
+    environment_markers: &CrashEnvironmentMarkers,
+) -> std::io::Result<PathBuf> {
     let redactor = Redactor::new();
 
     // Build timestamped bundle directory name
@@ -2394,7 +2411,7 @@ pub fn write_crash_bundle(
 
     // 2c. Write environment_markers.json.
     let has_environment_markers = {
-        let markers = CrashEnvironmentMarkers::capture(health).redacted(&redactor);
+        let markers = environment_markers.redacted(&redactor);
         let json = serde_json::to_string_pretty(&markers).map_err(std::io::Error::other)?;
         maybe_write_bounded("environment_markers.json", json.as_bytes())?
     };
@@ -10414,9 +10431,24 @@ mod tests {
         };
 
         let health = test_snapshot();
+        let environment_markers = CrashEnvironmentMarkers::capture(Some(&health));
 
-        let path1 = write_crash_bundle(&crash_dir1, &report, Some(&health), None).unwrap();
-        let path2 = write_crash_bundle(&crash_dir2, &report, Some(&health), None).unwrap();
+        let path1 = write_crash_bundle_with_markers(
+            &crash_dir1,
+            &report,
+            Some(&health),
+            None,
+            &environment_markers,
+        )
+        .unwrap();
+        let path2 = write_crash_bundle_with_markers(
+            &crash_dir2,
+            &report,
+            Some(&health),
+            None,
+            &environment_markers,
+        )
+        .unwrap();
 
         // Manifests should have the same structural content
         let m1: CrashManifest =

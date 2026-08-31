@@ -1992,10 +1992,14 @@ mod tests {
             .iter()
             .find(|slot| {
                 slot["category"] == "proofs/robot-contracts"
-                    && slot["path"] == "docs/attestations/proofs/robot-contract-doctor.json"
+                    && slot["deferred_to_bead"] == artifact["produced_by_bead"]
             })
-            .expect("robot-contract-doctor manifest slot exists");
-        assert_eq!(slot["produced_by_bead"], artifact["produced_by_bead"]);
+            .expect("deferred robot-contract-doctor manifest slot exists");
+        assert!(slot["path"].is_null());
+        assert_eq!(slot["deferred_to_bead"], artifact["produced_by_bead"]);
+        assert!(slot["deferred_reason"].as_str().is_some_and(|reason| {
+            reason.contains("producer is blocked") && reason.contains("excluded from release")
+        }));
         assert!(
             slot["proof_categories"]
                 .as_array()

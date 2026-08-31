@@ -3223,6 +3223,16 @@ mod tests {
         );
     }
 
+    async fn await_cx_cleanup(backend: &CreationBoundaryBackend) {
+        crate::runtime_async::timeout(Duration::from_secs(5), async {
+            while backend.cx_kills.load(Ordering::Acquire) != 1 {
+                crate::runtime_async::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independently spawned rollback must settle within five seconds");
+    }
+
     fn assert_cancelled_cx_rollback(
         caller_cx: &crate::cx::Cx,
         backend: &CreationBoundaryBackend,
@@ -4067,12 +4077,7 @@ mod tests {
             assert!(caller_cx.is_cancel_requested());
             drop(creation);
 
-            for _ in 0..32 {
-                if backend.cx_kills.load(Ordering::Acquire) == 1 {
-                    break;
-                }
-                crate::runtime_async::task::yield_now().await;
-            }
+            await_cx_cleanup(&backend).await;
             assert_cx_cleanup(&backend);
         });
     }
@@ -4089,12 +4094,7 @@ mod tests {
             );
             drop(creation);
 
-            for _ in 0..32 {
-                if backend.cx_kills.load(Ordering::Acquire) == 1 {
-                    break;
-                }
-                crate::runtime_async::task::yield_now().await;
-            }
+            await_cx_cleanup(&backend).await;
             assert_cx_cleanup(&backend);
         });
     }
@@ -4556,7 +4556,7 @@ mod tests {
             assert_eq!(failing_entry.pane_count, None);
             assert_eq!(
                 failing_entry.probe_outcome,
-                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::CommandFailed)
+                ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::TimedOut)
             );
 
             let warnings = report.watchdog_warnings();
@@ -5094,7 +5094,10 @@ mod tests {
                 None,
                 crate::Error::Storage(storage_error),
             );
-            assert_eq!(projected.to_string(), expected.to_string());
+            assert_eq!(
+                projected.to_string(),
+                crate::Error::Storage(expected).to_string()
+            );
             assert!(!projected.to_string().contains("hostile_static"));
             assert!(!crate::retry::is_retryable(&projected));
             assert_eq!(
@@ -5823,9 +5826,7 @@ mod tests {
                 .await
                 .expect_err("failing backend kill must propagate its error");
             assert!(
-                error
-                    .to_string()
-                    .contains("kill_pane failed on shard 0, pane=7 (class=command_failed)"),
+                matches!(&error, crate::Error::Wezterm(WeztermError::Timeout(5))),
                 "unexpected backend error: {error}"
             );
             assert!(

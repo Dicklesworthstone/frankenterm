@@ -2673,6 +2673,10 @@ struct SnapshotAuthorityState {
     /// registry lock is always acquired before this lock, so discovering a
     /// hard-link alias and retaining a latch cannot deadlock each other.
     registry_identities: StdMutex<Vec<String>>,
+    /// Physical filesystem paths that have been observed for this authority.
+    /// Object identities alone are not permanent: after every known pathname
+    /// disappears, the OS may reuse the inode for an unrelated database.
+    registry_paths: StdMutex<Vec<PathBuf>>,
     /// Canonical connection locator chosen by the first engine for this
     /// database object. Hard-link aliases must reuse it so SQLite WAL/journal
     /// sidecars and locks cannot split by pathname even though the inode is the
@@ -2697,8 +2701,14 @@ impl SnapshotAuthorityState {
         registry_identities: Vec<String>,
         connection_locator: Option<String>,
     ) -> Self {
+        let registry_paths = connection_locator
+            .as_deref()
+            .and_then(snapshot_authority_filesystem_path)
+            .into_iter()
+            .collect();
         Self {
             registry_identities: StdMutex::new(registry_identities),
+            registry_paths: StdMutex::new(registry_paths),
             connection_locator,
             in_progress: AtomicBool::new(false),
             reconciliation_required: AtomicBool::new(false),
@@ -2783,6 +2793,18 @@ fn retain_latched_snapshot_authority(state: &Arc<SnapshotAuthorityState>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for identity in identities.iter() {
+        if identity.starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX)
+            && !snapshot_authority_state_still_names_object(state, identity)
+        {
+            if matches!(
+                entries.get(identity),
+                Some(SnapshotAuthorityRegistryEntry::Live(existing))
+                    if existing.upgrade().is_some_and(|existing| Arc::ptr_eq(&existing, state))
+            ) {
+                entries.remove(identity);
+            }
+            continue;
+        }
         entries.insert(
             identity.clone(),
             SnapshotAuthorityRegistryEntry::Latched(Arc::clone(state)),
@@ -2813,13 +2835,7 @@ fn refresh_snapshot_authority_file_identities(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for identity in &identities {
-            let existing = match entries.get(identity) {
-                Some(SnapshotAuthorityRegistryEntry::Live(existing)) => existing.upgrade(),
-                Some(SnapshotAuthorityRegistryEntry::Latched(existing)) => {
-                    Some(Arc::clone(existing))
-                }
-                None => None,
-            };
+            let existing = resolve_snapshot_authority_registry_entry(&mut entries, identity);
             if let Some(existing) = existing
                 && !Arc::ptr_eq(&existing, state)
                 && !conflicts.iter().any(|known| Arc::ptr_eq(known, &existing))
@@ -2852,6 +2868,15 @@ fn refresh_snapshot_authority_file_identities(
         }
 
         if observed_error.is_none() {
+            if let Some(path) = snapshot_authority_filesystem_path(db_path) {
+                let mut registered_paths = state
+                    .registry_paths
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !registered_paths.contains(&path) {
+                    registered_paths.push(path);
+                }
+            }
             for identity in identities {
                 if !registered.contains(&identity) {
                     registered.push(identity.clone());
@@ -3083,6 +3108,49 @@ fn filesystem_object_snapshot_authority_identity(_path: &Path) -> Option<String>
     None
 }
 
+fn snapshot_authority_filesystem_path(db_path: &str) -> Option<PathBuf> {
+    let primary = snapshot_authority_file_identity(db_path)?;
+    if !is_filesystem_snapshot_authority_identity(&primary) {
+        return None;
+    }
+    sqlite_locator_filesystem_path(db_path).map(|path| freeze_filesystem_path(&path))
+}
+
+fn snapshot_authority_state_still_names_object(
+    state: &SnapshotAuthorityState,
+    object_identity: &str,
+) -> bool {
+    state
+        .registry_paths
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|path| {
+            filesystem_object_snapshot_authority_identity(path)
+                .is_some_and(|observed| observed == object_identity)
+        })
+}
+
+fn resolve_snapshot_authority_registry_entry(
+    entries: &mut HashMap<String, SnapshotAuthorityRegistryEntry>,
+    identity: &str,
+) -> Option<Arc<SnapshotAuthorityState>> {
+    let existing = match entries.get(identity) {
+        Some(SnapshotAuthorityRegistryEntry::Live(existing)) => existing.upgrade(),
+        Some(SnapshotAuthorityRegistryEntry::Latched(existing)) => Some(Arc::clone(existing)),
+        None => None,
+    };
+    if identity.starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX)
+        && existing
+            .as_ref()
+            .is_some_and(|state| !snapshot_authority_state_still_names_object(state, identity))
+    {
+        entries.remove(identity);
+        return None;
+    }
+    existing
+}
+
 fn snapshot_authority_file_identities(db_path: &str) -> Vec<String> {
     let Some(primary) = snapshot_authority_file_identity(db_path) else {
         return Vec::new();
@@ -3267,11 +3335,7 @@ fn shared_snapshot_authority_state(db_path: &str) -> Arc<SnapshotAuthorityState>
 
         let mut matched_states = Vec::new();
         for identity in &identities {
-            let matched = match entries.get(identity) {
-                Some(SnapshotAuthorityRegistryEntry::Live(state)) => state.upgrade(),
-                Some(SnapshotAuthorityRegistryEntry::Latched(state)) => Some(Arc::clone(state)),
-                None => None,
-            };
+            let matched = resolve_snapshot_authority_registry_entry(&mut entries, identity);
             if let Some(matched) = matched
                 && !matched_states
                     .iter()
@@ -7437,6 +7501,36 @@ fn save_checkpoint_authoritatively_sync(
     new_session: Option<&NewSessionMetadata>,
     owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> std::result::Result<CheckpointCommitReceipt, SnapshotAuthorityDbError> {
+    save_checkpoint_authoritatively_sync_with_fault(
+        db_path,
+        session_id,
+        now_ms,
+        checkpoint_type,
+        prepared,
+        new_session,
+        owner_identity,
+        SnapshotCommitFault::None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotCommitFault {
+    None,
+    #[cfg(test)]
+    IgnoreExistingSessionUpdate,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_checkpoint_authoritatively_sync_with_fault(
+    db_path: &str,
+    session_id: &str,
+    now_ms: u64,
+    checkpoint_type: &str,
+    prepared: &PreparedSnapshotPersistence,
+    new_session: Option<&NewSessionMetadata>,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
+    fault: SnapshotCommitFault,
+) -> std::result::Result<CheckpointCommitReceipt, SnapshotAuthorityDbError> {
     let now_ms = u64_to_sqlite_integer(now_ms)?;
     let conn = open_conn(db_path)?;
 
@@ -7558,33 +7652,37 @@ fn save_checkpoint_authoritatively_sync(
         } // drop stmt before commit
 
         if new_session.is_none() {
-            let updated_session = tx.execute(
-                "UPDATE mux_sessions
-                 SET last_checkpoint_at = ?1,
-                     topology_json = ?2,
-                     shutdown_clean = 0,
-                     clean_checkpoint_id = NULL,
-                     owner_heartbeat_at = ?7,
-                     recovery_acknowledged_at = NULL
-                 WHERE session_id = ?3
-                   AND (
-                       (?4 IS NULL AND owner_pid IS NULL
-                           AND owner_process_start IS NULL
-                           AND owner_heartbeat_at IS NULL)
-                       OR (host_id = ?4
-                           AND owner_pid = ?5
-                           AND owner_process_start = ?6)
-                   )",
-                rusqlite::params![
-                    now_ms,
-                    prepared.topology_json.as_str(),
-                    session_id,
-                    owner_identity.map(|identity| identity.host_id.as_str()),
-                    owner_identity.map(|identity| identity.pid),
-                    owner_identity.map(|identity| identity.process_start),
-                    owner_identity.map(|_| now_ms),
-                ],
-            )?;
+            let updated_session = match fault {
+                SnapshotCommitFault::None => tx.execute(
+                    "UPDATE mux_sessions
+                     SET last_checkpoint_at = ?1,
+                         topology_json = ?2,
+                         shutdown_clean = 0,
+                         clean_checkpoint_id = NULL,
+                         owner_heartbeat_at = ?7,
+                         recovery_acknowledged_at = NULL
+                     WHERE session_id = ?3
+                       AND (
+                           (?4 IS NULL AND owner_pid IS NULL
+                               AND owner_process_start IS NULL
+                               AND owner_heartbeat_at IS NULL)
+                           OR (host_id = ?4
+                               AND owner_pid = ?5
+                               AND owner_process_start = ?6)
+                       )",
+                    rusqlite::params![
+                        now_ms,
+                        prepared.topology_json.as_str(),
+                        session_id,
+                        owner_identity.map(|identity| identity.host_id.as_str()),
+                        owner_identity.map(|identity| identity.pid),
+                        owner_identity.map(|identity| identity.process_start),
+                        owner_identity.map(|_| now_ms),
+                    ],
+                )?,
+                #[cfg(test)]
+                SnapshotCommitFault::IgnoreExistingSessionUpdate => 0,
+            };
             require_exactly_one_changed_row(updated_session)?;
         }
 
@@ -7642,6 +7740,30 @@ fn save_checkpoint_sync(
         prepared,
         new_session,
         None,
+    )
+    .map_err(SnapshotAuthorityDbError::into_primary_source)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn save_checkpoint_sync_with_fault(
+    db_path: &str,
+    session_id: &str,
+    now_ms: u64,
+    checkpoint_type: &str,
+    prepared: &PreparedSnapshotPersistence,
+    new_session: Option<&NewSessionMetadata>,
+    fault: SnapshotCommitFault,
+) -> std::result::Result<CheckpointCommitReceipt, rusqlite::Error> {
+    save_checkpoint_authoritatively_sync_with_fault(
+        db_path,
+        session_id,
+        now_ms,
+        checkpoint_type,
+        prepared,
+        new_session,
+        None,
+        fault,
     )
     .map_err(SnapshotAuthorityDbError::into_primary_source)
 }
@@ -12117,11 +12239,7 @@ mod tests {
     fn checkpoint_deletion_rejects_oversized_durable_identity_before_delete() {
         for corrupt_field in ["session_id", "checkpoint_role", "state_hash"] {
             let (_tmp, db_path) = setup_test_db();
-            let session_id = if corrupt_field == "session_id" {
-                "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1)
-            } else {
-                "sess-bounded-delete".to_string()
-            };
+            let session_id = "sess-bounded-delete".to_string();
             create_session_sync(
                 db_path.as_str(),
                 &session_id,
@@ -12141,6 +12259,24 @@ mod tests {
             );
             let conn = Connection::open(db_path.as_str()).unwrap();
             match corrupt_field {
+                "session_id" => {
+                    conn.execute_batch(
+                        "PRAGMA foreign_keys = OFF;
+                         PRAGMA ignore_check_constraints = ON;
+                         DROP TRIGGER session_checkpoints_retained_size_au;",
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "UPDATE session_checkpoints SET session_id = ?2 WHERE id = ?1",
+                        rusqlite::params![
+                            checkpoint_id,
+                            "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1)
+                        ],
+                    )
+                    .unwrap();
+                    conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                        .unwrap();
+                }
                 "checkpoint_role" => {
                     conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
                         .unwrap();
@@ -12162,7 +12298,6 @@ mod tests {
                     )
                     .unwrap();
                 }
-                "session_id" => {}
                 _ => unreachable!("fixture field is exhaustive"),
             }
             drop(conn);
@@ -12183,10 +12318,11 @@ mod tests {
     #[test]
     fn cleanup_rejects_oversized_session_identity_before_delete() {
         let (_tmp, db_path) = setup_test_db();
+        let valid_session_id = "sess-bounded-cleanup";
         let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
         create_session_sync(
             db_path.as_str(),
-            &oversized_session_id,
+            valid_session_id,
             1_000,
             r#"{"version":"initial"}"#,
             crate::VERSION,
@@ -12194,13 +12330,34 @@ mod tests {
         .unwrap();
         insert_checkpoint_fixture(
             db_path.as_str(),
-            &oversized_session_id,
+            valid_session_id,
             2_000,
             CHECKPOINT_ROLE_SNAPSHOT,
             "snp2:fixture",
             Some(r#"{"version":"initial"}"#),
             0,
         );
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA ignore_check_constraints = ON;
+             DROP TRIGGER session_checkpoints_retained_size_au;
+             DROP TRIGGER mux_sessions_retained_size_au;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions SET session_id = ?2 WHERE session_id = ?1",
+            rusqlite::params![valid_session_id, &oversized_session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_checkpoints SET session_id = ?2 WHERE session_id = ?1",
+            rusqlite::params![valid_session_id, &oversized_session_id],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+        drop(conn);
 
         cleanup_authoritatively_sync(db_path.as_str(), 0, 365)
             .expect_err("cleanup must reject oversized affected-session identity before DML");
@@ -12859,6 +13016,33 @@ mod tests {
         ));
         assert!(primary.authority_reconciliation_is_required());
         assert!(rogue.reconciliation_is_required());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_latched_object_identity_does_not_poison_an_unrelated_database() {
+        let object_identity =
+            "sqlite-file-object-unix:18446744073709551614:18446744073709551613".to_string();
+        let state = Arc::new(SnapshotAuthorityState::new_with_registry_identities(
+            vec![object_identity.clone()],
+            Some(
+                "file:%2Fprivate%2Ftmp%2F.ft-snapshot-authority-never-created-stale-inode-test"
+                    .to_string(),
+            ),
+        ));
+        let mut registry = snapshot_authority_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.insert(
+            object_identity.clone(),
+            SnapshotAuthorityRegistryEntry::Latched(state),
+        );
+
+        assert!(
+            resolve_snapshot_authority_registry_entry(&mut registry, &object_identity).is_none(),
+            "an inode mapping must expire once no known path still names that object"
+        );
+        assert!(!registry.contains_key(&object_identity));
     }
 
     #[test]
@@ -14694,6 +14878,14 @@ mod tests {
                 scrollback_checkpoint_seq INTEGER,
                 last_output_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS pane_scrollback_summary (
+                pane_id INTEGER PRIMARY KEY,
+                retained_segment_count INTEGER NOT NULL,
+                first_seq INTEGER,
+                last_seq INTEGER,
+                first_captured_at INTEGER,
+                last_captured_at INTEGER
+            );
             CREATE INDEX IF NOT EXISTS idx_checkpoints_session
                 ON session_checkpoints(session_id, checkpoint_at);
             CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
@@ -14745,7 +14937,7 @@ mod tests {
     ) {
         let mut conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE pane_scrollback_summary (
+            "CREATE TABLE IF NOT EXISTS pane_scrollback_summary (
                  pane_id INTEGER PRIMARY KEY,
                  retained_segment_count INTEGER NOT NULL,
                  first_seq INTEGER,
@@ -14753,7 +14945,7 @@ mod tests {
                  first_captured_at INTEGER,
                  last_captured_at INTEGER
              );
-             CREATE TABLE output_segments (
+             CREATE TABLE IF NOT EXISTS output_segments (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  pane_id INTEGER NOT NULL,
                  seq INTEGER NOT NULL,
@@ -14762,7 +14954,7 @@ mod tests {
                  redaction_catalog_version TEXT,
                  UNIQUE(pane_id, seq)
              );
-             CREATE TABLE output_gaps (
+             CREATE TABLE IF NOT EXISTS output_gaps (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  pane_id INTEGER NOT NULL,
                  seq_before INTEGER NOT NULL,
@@ -14962,17 +15154,28 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    /// macOS exposes `/tmp` and `/var` through symlinks, while the artifact
-    /// authority deliberately refuses every symlinked path component. Keep
-    /// these tests under the physical checkout directory so they exercise the
-    /// same no-follow chain on Linux and macOS instead of failing at the test
-    /// harness's ambient temporary-directory alias.
+    /// Resolve the platform temporary root physically before creating the
+    /// fixture. macOS exposes `/tmp` through a symlink, while RCH may set
+    /// `TMPDIR` to a directory nested beneath a group-writable checkout. Both
+    /// are intentionally rejected by artifact authority, so neither ambient
+    /// path is a valid success fixture.
     fn checkpoint_artifact_test_directory() -> tempfile::TempDir {
-        let physical_checkout = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        tempfile::Builder::new()
+        #[cfg(unix)]
+        let physical_temp_root = std::fs::canonicalize("/tmp").unwrap();
+        #[cfg(not(unix))]
+        let physical_temp_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::Builder::new()
             .prefix(".ft-checkpoint-artifact-test-")
-            .tempdir_in(physical_checkout)
-            .unwrap()
+            .tempdir_in(physical_temp_root)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        directory
     }
 
     #[test]
@@ -15577,10 +15780,23 @@ mod tests {
                 .execute(
                     "INSERT INTO mux_pane_state
                      (checkpoint_id, pane_id, terminal_state_json)
-                     VALUES (?1, 'malformed-pane-id', '{}')",
+                     VALUES (?1, 2, '{}')",
                     [extra_pane_snapshot.checkpoint_id],
                 )
                 .unwrap();
+            let extra_pane_conn = Connection::open(extra_pane_db_path.as_str()).unwrap();
+            let row_count_error = load_checkpoint_persisted_panes_for_artifact(
+                &extra_pane_conn,
+                extra_pane_snapshot.checkpoint_id,
+                1,
+            )
+            .expect_err("the bounded pane loader must reject the extra durable row");
+            assert!(matches!(
+                row_count_error,
+                CheckpointScrollbackArtifactError::Checkpoint(ref message)
+                    if message.contains("contains 2 pane rows")
+            ));
+            drop(extra_pane_conn);
             assert!(matches!(
                 build_checkpoint_scrollback_payload(
                     extra_pane_db_path.as_str(),
@@ -15588,7 +15804,7 @@ mod tests {
                     CheckpointScrollbackArtifactLimits::default(),
                 ),
                 Err(CheckpointScrollbackArtifactError::Checkpoint(ref message))
-                    if message.contains("contains 2 pane rows")
+                    if message.contains("could not be decoded")
             ));
 
             let (_gap_db_file, gap_db_path) = setup_test_db();
@@ -16489,7 +16705,8 @@ mod tests {
                 .capture(&panes, SnapshotTrigger::Manual)
                 .await
                 .expect_err("an unrepresentable pane ID must abort the first capture");
-            assert!(matches!(&error, SnapshotError::Database(_)));
+            assert!(matches!(&error, SnapshotError::Serialization(message)
+                if message.contains("exceeds SQLite integer range")));
             assert!(!error.requires_reconciliation());
             assert!(
                 !engine
@@ -18473,28 +18690,16 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(db_path.as_str()).unwrap();
-        conn.execute_batch(
-            "DROP TRIGGER mux_sessions_retained_size_au;
-             CREATE TRIGGER mux_sessions_retained_size_au
-             BEFORE UPDATE OF last_checkpoint_at ON mux_sessions
-             WHEN OLD.session_id = 'sess-rollback'
-             BEGIN
-                 SELECT RAISE(IGNORE);
-             END;",
-        )
-        .unwrap();
-        drop(conn);
-
         let pane = PaneStateSnapshot::from_pane_info(&make_test_pane(9, 24, 80), 2000, false);
         let prepared = prepare_test_snapshot(r#"{"version":"new"}"#, &[pane]);
-        let error = save_checkpoint_sync(
+        let error = save_checkpoint_sync_with_fault(
             db_path.as_str(),
             "sess-rollback",
             2000,
             "event",
             &prepared,
             None,
+            SnapshotCommitFault::IgnoreExistingSessionUpdate,
         )
         .expect_err("an ignored authority-row update must abort the checkpoint transaction");
         assert!(matches!(error, rusqlite::Error::StatementChangedRows(0)));
@@ -19326,7 +19531,7 @@ mod tests {
             let _ = engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0
             sleep(Duration::from_millis(50)).await;
             let _ = engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0 = 4.0
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let after_below = checkpoint_count(db_path.as_str());
             assert_eq!(after_below, 1, "below threshold: no new capture");
@@ -19361,7 +19566,7 @@ mod tests {
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
             sleep(Duration::from_millis(30)).await;
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "work-completed threshold").await;
 
             let count = checkpoint_count(db_path.as_str());
             assert_eq!(count, 2, "startup + threshold capture");
@@ -19388,10 +19593,10 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "immediate hazard trigger").await;
 
             let count = checkpoint_count(db_path.as_str());
             assert_eq!(count, 2, "startup + immediate HazardThreshold");
@@ -19418,10 +19623,10 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::MemoryPressure);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "immediate memory-pressure trigger").await;
 
             let count = checkpoint_count(db_path.as_str());
             assert_eq!(count, 2, "startup + immediate MemoryPressure");
@@ -19448,14 +19653,14 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             // First batch: 3 x 2.0 = 6.0 >= 5.0 → capture + reset
             for _ in 0..3 {
                 let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
                 sleep(Duration::from_millis(30)).await;
             }
-            sleep(Duration::from_millis(150)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "first threshold").await;
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
                 2,
@@ -19475,7 +19680,7 @@ mod tests {
 
             // Third trigger crosses again: 4.0 + 2.0 = 6.0
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 3, "second threshold").await;
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
                 3,
@@ -19504,7 +19709,7 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
             shutdown_tx.send(true).unwrap();
 
             let result = timeout(Duration::from_secs(5), handle).await;
@@ -19529,13 +19734,12 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            // Wait for startup capture + scheduler loop to settle (250ms poll step)
-            sleep(Duration::from_millis(350)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            sleep(Duration::from_millis(350)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "zero-threshold work trigger").await;
             let _ = engine.emit_trigger(SnapshotTrigger::StateTransition);
-            sleep(Duration::from_millis(350)).await;
+            await_checkpoint_count(db_path.as_str(), 3, "zero-threshold state trigger").await;
 
             let count = checkpoint_count(db_path.as_str());
             assert_eq!(count, 3, "startup + 2 captures (zero threshold)");
@@ -19642,7 +19846,7 @@ mod tests {
 
             // HazardThreshold is immediate — captures + resets accumulator
             let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "immediate hazard trigger").await;
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
                 2,
@@ -19662,7 +19866,7 @@ mod tests {
 
             // One more pushes over: 4.0 + 2.0 = 6.0 >= 5.0
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 3, "post-hazard threshold").await;
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
                 3,
@@ -19816,14 +20020,14 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0
             sleep(Duration::from_millis(50)).await;
             assert_eq!(checkpoint_count(db_path.as_str()), 1, "3.0 < 5.0");
 
             let _ = engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 6.0
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "idle-window threshold").await;
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
                 2,
@@ -19857,9 +20061,9 @@ mod tests {
             await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "hazard trigger").await;
             let _ = engine.emit_trigger(SnapshotTrigger::MemoryPressure);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 3, "memory-pressure trigger").await;
 
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
@@ -19948,11 +20152,11 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             // One WorkCompleted = 6.0 >= 5.0
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            sleep(Duration::from_millis(200)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "custom work-completed threshold").await;
             assert_eq!(
                 checkpoint_count(db_path.as_str()),
                 2,
@@ -19997,7 +20201,7 @@ mod tests {
             for _ in 0..5 {
                 let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
             }
-            sleep(Duration::from_millis(300)).await;
+            await_checkpoint_count(db_path.as_str(), 2, "rapid trigger burst").await;
 
             // Should have captured at least twice (startup + when >= 5.0)
             let count = checkpoint_count(db_path.as_str());
@@ -20330,8 +20534,7 @@ mod tests {
             // Pre-cancel the Cx. Use a different pane state to make it explicit
             // that cancellation, not state equivalence, suppresses the write.
             let panes2 = vec![make_test_pane(1, 30, 100)];
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            let cx = crate::cx::Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("ft-xbnl0.2.x pre-cancel shutdown"),
@@ -20441,8 +20644,7 @@ mod tests {
             let runs_before = engine.telemetry().snapshot().cleanup_runs;
             let removed_before = engine.telemetry().snapshot().cleanup_removed;
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            let cx = crate::cx::Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("ft-xbnl0.2.x snapshot cleanup precancel"),
@@ -20541,8 +20743,7 @@ mod tests {
             let attempts_before = engine.telemetry().snapshot().captures_attempted;
             let successes_before = engine.telemetry().snapshot().captures_succeeded;
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            let cx = crate::cx::Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("ft-xbnl0.2.3 capture_with_cx precancel"),

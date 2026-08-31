@@ -2034,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_retries_transient() {
+    fn engine_retries_recoverable_read_timeout() {
         run_async_test(async {
             let cc = Arc::new(AtomicU32::new(0));
             let cc2 = cc.clone();
@@ -2062,7 +2062,7 @@ mod tests {
                 .await;
             assert_eq!(o.result.unwrap(), 99);
             assert_eq!(o.attempts, 3);
-            assert_eq!(e.stats().transient_failures, 2);
+            assert_eq!(e.stats().recoverable_failures, 2);
         });
     }
 

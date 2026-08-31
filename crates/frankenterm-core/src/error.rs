@@ -1256,7 +1256,7 @@ impl StorageError {
             ))
             .command("Diagnostics", "ft doctor")
             .alternative(
-                "Inspect the affected durable state and writer health before retrying the command.",
+                "Inspect and reconcile the affected durable state and writer health before retrying the command.",
             ),
             Self::WriterClosed => Remediation::new(
                 "The storage writer has already completed an orderly shutdown.",

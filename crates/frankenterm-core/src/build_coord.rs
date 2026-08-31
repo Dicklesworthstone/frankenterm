@@ -379,6 +379,15 @@ pub fn check_build_running(
 /// Returns the directory containing the root `Cargo.toml` (workspace root if
 /// it's a workspace, otherwise the package root).
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    find_project_root_before(start, None)
+}
+
+/// Implementation seam for filesystem-hermetic tests.
+///
+/// `stop_before` is not inspected. Production callers traverse to the
+/// filesystem root; tests use the parent of their fixture so an inherited
+/// `TMPDIR` nested inside another Cargo workspace cannot change the result.
+fn find_project_root_before(start: &Path, stop_before: Option<&Path>) -> Option<PathBuf> {
     let mut dir = if start.is_file() {
         start.parent()?.to_path_buf()
     } else {
@@ -388,6 +397,10 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     let mut candidate = None;
 
     loop {
+        if stop_before.is_some_and(|boundary| dir == boundary) {
+            break;
+        }
+
         let cargo_toml = dir.join("Cargo.toml");
         if cargo_toml.exists() {
             // Check if this is a workspace root
@@ -1124,7 +1137,7 @@ mod tests {
     #[test]
     fn find_project_root_simple() {
         let tmp = setup_project();
-        let root = find_project_root(tmp.path());
+        let root = find_project_root_before(tmp.path(), tmp.path().parent());
         assert_eq!(root, Some(tmp.path().to_path_buf()));
     }
 
@@ -1134,7 +1147,7 @@ mod tests {
         let crate_dir = tmp.path().join("crates").join("foo");
 
         // From a subcrate, should find workspace root
-        let root = find_project_root(&crate_dir);
+        let root = find_project_root_before(&crate_dir, tmp.path().parent());
         assert_eq!(root, Some(tmp.path().to_path_buf()));
     }
 
@@ -1142,7 +1155,7 @@ mod tests {
     fn find_project_root_not_cargo() {
         let tmp = TempDir::new().unwrap();
         // No Cargo.toml anywhere
-        let root = find_project_root(tmp.path());
+        let root = find_project_root_before(tmp.path(), tmp.path().parent());
         assert!(root.is_none());
     }
 
@@ -1883,7 +1896,7 @@ mod tests {
         let tmp = setup_project();
         let sub = tmp.path().join("src").join("deep");
         fs::create_dir_all(&sub).unwrap();
-        let root = find_project_root(&sub);
+        let root = find_project_root_before(&sub, tmp.path().parent());
         assert_eq!(root, Some(tmp.path().to_path_buf()));
     }
 
@@ -1891,7 +1904,7 @@ mod tests {
     fn find_project_root_from_file_path() {
         let tmp = setup_project();
         let file = tmp.path().join("Cargo.toml");
-        let root = find_project_root(&file);
+        let root = find_project_root_before(&file, tmp.path().parent());
         assert_eq!(root, Some(tmp.path().to_path_buf()));
     }
 
@@ -1900,7 +1913,7 @@ mod tests {
         let tmp = setup_workspace();
         let src_dir = tmp.path().join("crates").join("foo").join("src");
         fs::create_dir_all(&src_dir).unwrap();
-        let root = find_project_root(&src_dir);
+        let root = find_project_root_before(&src_dir, tmp.path().parent());
         assert_eq!(root, Some(tmp.path().to_path_buf()));
     }
 

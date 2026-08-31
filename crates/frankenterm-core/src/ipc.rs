@@ -4240,11 +4240,15 @@ mod tests {
         assert!(defaults.resource_bounds_are_valid());
 
         let mut tuning = crate::tuning_config::IpcTuning::default();
-        tuning.max_concurrent_connections = 2048;
+        // Keep the override distinct from the default while remaining inside
+        // the aggregate request-line buffering envelope. At 2,048, the two
+        // delimiter bytes per connection intentionally push the 128 KiB
+        // message default just over the 512 MiB process cap.
+        tuning.max_concurrent_connections = 1536;
         tuning.initial_request_timeout_ms = 750;
         tuning.io_timeout_ms = 45_000;
         let resolved = resolve_limits(Some(&tuning));
-        assert_eq!(resolved.max_concurrent_connections, 2048);
+        assert_eq!(resolved.max_concurrent_connections, 1536);
         assert_eq!(resolved.initial_request_timeout_ms, 750);
         assert_eq!(resolved.io_timeout_ms, 45_000);
         assert!(resolved.resource_bounds_are_valid());

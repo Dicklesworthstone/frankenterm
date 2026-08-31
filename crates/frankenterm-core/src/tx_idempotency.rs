@@ -860,8 +860,17 @@ impl TxExecutionLedger {
                         actual_failed.push(step_id);
                     }
                 }
-                StepOutcome::Compensated { .. } if !actual_compensated.contains(&step_id) => {
-                    actual_compensated.push(step_id);
+                StepOutcome::Compensated { .. } => {
+                    // A durable compensation receipt is itself proof that the
+                    // original step completed. Recovery ledgers may contain
+                    // only this authoritative receipt, without replaying the
+                    // earlier success record into the current generation.
+                    if !actual_completed.contains(&step_id) {
+                        actual_completed.push(step_id.clone());
+                    }
+                    if !actual_compensated.contains(&step_id) {
+                        actual_compensated.push(step_id);
+                    }
                 }
                 _ => {}
             }
@@ -915,9 +924,10 @@ impl TxExecutionLedger {
                         "RolledBack disposition requires Completed or Aborted phase; target phase is {target_phase:?}"
                     ));
                 }
-                if cert.compensated_step_ids.is_empty() {
+                if cert.failed_step_ids.is_empty() && cert.compensated_step_ids.is_empty() {
                     return Err(
-                        "RolledBack disposition requires non-empty compensated steps".to_string(),
+                        "RolledBack disposition requires failed or compensated step evidence"
+                            .to_string(),
                     );
                 }
                 if cert.completed_step_ids != cert.compensated_step_ids {
@@ -961,8 +971,13 @@ impl TxExecutionLedger {
                         actual_failed.push(step_id);
                     }
                 }
-                StepOutcome::Compensated { .. } if !actual_compensated.contains(&step_id) => {
-                    actual_compensated.push(step_id);
+                StepOutcome::Compensated { .. } => {
+                    if !actual_completed.contains(&step_id) {
+                        actual_completed.push(step_id.clone());
+                    }
+                    if !actual_compensated.contains(&step_id) {
+                        actual_compensated.push(step_id);
+                    }
                 }
                 _ => {}
             }
@@ -975,7 +990,9 @@ impl TxExecutionLedger {
             TxPhase::Completed => {
                 if actual_failed.is_empty() && actual_compensated.is_empty() {
                     TerminalDispositionKind::Committed
-                } else if !actual_compensated.is_empty() && actual_compensated == actual_completed {
+                } else if actual_compensated == actual_completed
+                    && (!actual_failed.is_empty() || !actual_compensated.is_empty())
+                {
                     TerminalDispositionKind::RolledBack
                 } else {
                     return Err(IdempotencyError::InvalidTerminalCertificate {
@@ -6271,7 +6288,7 @@ mod tests {
     // ── ResumeContext tests ──
 
     #[test]
-    fn resume_already_complete() {
+    fn resume_completed_phase_without_step_evidence_restarts_fresh() {
         let plan = make_plan(2);
         let mut ledger = TxExecutionLedger::new("exec-1", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
@@ -6279,7 +6296,7 @@ mod tests {
         ledger.transition_phase(TxPhase::Completed).unwrap();
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
-        assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
+        assert_eq!(ctx.recommendation, ResumeRecommendation::RestartFresh);
     }
 
     #[test]

@@ -3198,6 +3198,14 @@ fn publish_discovery_capture_view(
             format!("{phase}: discovery produced an invalid zero authority-view epoch"),
         ));
     };
+    if publication_tx.is_closed() {
+        return Err(runtime_backend_error(
+            "capture.discovery.publish",
+            format!(
+                "{phase}: capture publication receiver closed before epoch {epoch} could be prepared"
+            ),
+        ));
+    }
     if authority_gate_uninitialized
         || !capture_publication_identity_matches(last_view, &observed_panes)
     {
@@ -7018,7 +7026,7 @@ impl ObservationRuntime {
     fn spawn_capture_task(
         &self,
         capture_tx: mpsc::Sender<CaptureEvent>,
-        discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
+        mut discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
         capture_checkpoints: CaptureCheckpointCache,
         retirement_publisher: CaptureRetirementPublisher,
     ) -> JoinHandle<()> {
@@ -7289,7 +7297,7 @@ impl ObservationRuntime {
                     // channel retains an update sent before this task first
                     // runs and coalesces superseded ticks to their latest
                     // monotonic revision-stamped view.
-                    let publication = discovery_publication_rx.borrow_and_clone();
+                    let publication = discovery_publication_rx.borrow_and_update_clone();
                     let publication_epoch = publication.epoch;
                     #[cfg(all(feature = "vendored", unix))]
                     {
@@ -13860,14 +13868,14 @@ mod tests {
     fn discovery_publication_wakes_capture_and_coalesces_without_spin() {
         let now = Instant::now();
         let deadline = runtime_deadline_after(now, Duration::from_secs(3_600), "test sync");
-        let (tx, rx) = watch::channel(DiscoveryCapturePublication::default());
+        let (tx, mut rx) = watch::channel(DiscoveryCapturePublication::default());
 
         assert!(!capture_sync_due(now, deadline, &rx));
         tx.send(discovery_publication(1)).expect("publish epoch 1");
         tx.send(discovery_publication(2)).expect("publish epoch 2");
         tx.send(discovery_publication(3)).expect("publish epoch 3");
         assert!(capture_sync_due(now, deadline, &rx));
-        assert_eq!(rx.borrow_and_clone().epoch, 3);
+        assert_eq!(rx.borrow_and_update_clone().epoch, 3);
         assert!(
             !capture_sync_due(now, deadline, &rx),
             "consuming the latest publication must clear the wakeup"
@@ -18495,7 +18503,9 @@ mod tests {
     #[test]
     fn health_pane_snapshot_resets_activity_on_generation_change() {
         let mut registry = PaneRegistry::new();
-        registry.discovery_tick(vec![make_pane(1, "bash")]);
+        let mut initial = make_pane(1, "bash");
+        initial.domain_id = Some(1);
+        registry.discovery_tick(vec![initial]);
         registry.get_cursor_mut(1).expect("pane 1 cursor").next_seq = 4;
 
         let mut tracker = HashMap::new();
@@ -18507,7 +18517,9 @@ mod tests {
         );
         assert_eq!(first.last_activity_by_pane, vec![(1, 2_000)]);
 
-        registry.discovery_tick(vec![make_pane(1, "vim")]);
+        let mut replacement = make_pane(1, "vim");
+        replacement.domain_id = Some(2);
+        registry.discovery_tick(vec![replacement]);
         let second = build_health_pane_snapshot(
             &registry,
             &cursor_map_from_registry(&registry),

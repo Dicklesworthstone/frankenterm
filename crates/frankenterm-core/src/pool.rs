@@ -2162,8 +2162,7 @@ mod tests {
             let pool: Pool<String> = Pool::new(test_config(1));
             pool.put("idle".to_string()).await;
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
+            let cx = Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("pre-cancelled try acquire"),
@@ -2232,8 +2231,7 @@ mod tests {
         run_async_test(async {
             let pool: Pool<String> = Pool::new(test_config(1));
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
+            let cx = Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("pre-cancelled acquire"),
@@ -2365,8 +2363,7 @@ mod tests {
             // previous behavior (ambient timeout) also produced
             // Cancelled but via a different code path — this test
             // ensures we don't regress either.
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
+            let cx = Cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("cancel pre-acquire checkpoint"),
