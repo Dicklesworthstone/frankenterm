@@ -3449,7 +3449,9 @@ impl WeztermClient {
             Some("GetLines") => MuxOperation::ReadPaneText,
             Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
-            Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1") => MuxOperation::SendText,
+            Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1" | "ReliablePaneWriteV1") => {
+                MuxOperation::SendText
+            }
             Some("Resize") => MuxOperation::ResizePane,
             Some("AdjustPaneSize") => MuxOperation::AdjustPaneSize,
             Some("CreateFloatingPane") => MuxOperation::CreateFloatingPane,
