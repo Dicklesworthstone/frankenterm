@@ -74,7 +74,7 @@ fn bimodal_values(n: usize) -> Vec<f64> {
         let r = (state >> 33) as f64 / u32::MAX as f64;
         // 50% around 100, 50% around 900
         let v = if r < 0.5 {
-            100.0 + r * 40.0
+            r.mul_add(40.0, 100.0)
         } else {
             (r - 0.5).mul_add(40.0, 900.0)
         };

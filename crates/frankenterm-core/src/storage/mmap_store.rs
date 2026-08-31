@@ -3366,7 +3366,7 @@ mod tests {
         store.append_line(0, "published-predecessor").unwrap();
         let predecessor_log = std::fs::read(dir.path().join("0.log")).unwrap();
         let predecessor_sequence = std::fs::read(dir.path().join("0.seq")).unwrap();
-        let replacement_id = (1_u64 << 63) | 77;
+        let replacement_id = (1_u64 << 63) | 0x4d;
         let records = vec!["sealed-row-one".to_string(), "sealed-row-two".to_string()];
 
         let staged = store
@@ -3394,7 +3394,7 @@ mod tests {
     fn deterministic_replacement_retry_reuses_one_bounded_ledger_slot() {
         let dir = temp_dir();
         let mut store = file_only_store(dir.path());
-        let replacement_id = (1_u64 << 63) | 78;
+        let replacement_id = (1_u64 << 63) | 0x4e;
         let records = vec!["opaque-record-a".to_string(), "opaque-record-b".to_string()];
         let first = store
             .stage_versioned_pane_replacement(replacement_id, &records, 2, 1024)
@@ -3431,14 +3431,14 @@ mod tests {
         let dir = temp_dir();
         let mut store = file_only_store(dir.path());
         let empty = store
-            .stage_versioned_pane_replacement((1_u64 << 63) | 79, &[], 0, 0)
+            .stage_versioned_pane_replacement((1_u64 << 63) | 0x4f, &[], 0, 0)
             .expect("stage atomic empty replacement");
         assert_eq!(empty.record_count(), 0);
         assert_eq!(empty.record_bytes(), 0);
         assert_eq!(empty.committed_bytes(), 0);
 
         let error = store
-            .stage_versioned_pane_replacement((1_u64 << 63) | 80, &["four".to_string()], 1, 4)
+            .stage_versioned_pane_replacement((1_u64 << 63) | 0x50, &["four".to_string()], 1, 4)
             .expect_err("record delimiter participates in committed-byte bound");
         assert!(matches!(
             error,

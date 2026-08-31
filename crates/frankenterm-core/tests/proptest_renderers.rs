@@ -420,7 +420,11 @@ proptest! {
     /// Clone preserves HealthDiagnosticStatus variant.
     #[test]
     fn health_status_clone(s in arb_health_status()) {
-        let cloned = Clone::clone(&s);
+        fn clone_via_trait<T: Clone>(value: &T) -> T {
+            value.clone()
+        }
+
+        let cloned = clone_via_trait(&s);
         prop_assert_eq!(s, cloned);
     }
 }

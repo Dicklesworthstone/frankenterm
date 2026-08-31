@@ -422,7 +422,7 @@ mod tests {
         let report = plan(&[p1, p2]);
         match report {
             PlannerReport::DataNeeded { reasons } => {
-                assert_ne!(reasons, [] as [std::string::String; 0])
+                assert!(!reasons.is_empty());
             }
             other @ PlannerReport::Frontier { .. } => {
                 panic!("expected DataNeeded, got {other:?}")

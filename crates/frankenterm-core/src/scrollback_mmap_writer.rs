@@ -3836,9 +3836,9 @@ mod tests {
         symlink(&path, &symlink_path).unwrap();
         assert!(matches!(
             read_linear_records(&symlink_path, test_read_limits()),
-            Err(MmapScrollbackError::UnsafeReadSource { .. })
-                | Err(MmapScrollbackError::Open { .. })
-                | Err(MmapScrollbackError::Metadata { .. })
+            Err(MmapScrollbackError::UnsafeReadSource { .. }
+                | MmapScrollbackError::Open { .. }
+                | MmapScrollbackError::Metadata { .. })
         ));
 
         let hardlink_path = dir.join("hardlink.bin");
@@ -3894,8 +3894,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(MmapScrollbackError::UnsafeReadSource { .. })
-                | Err(MmapScrollbackError::Metadata { .. })
+            Err(MmapScrollbackError::UnsafeReadSource { .. } | MmapScrollbackError::Metadata { .. })
         ));
     }
 

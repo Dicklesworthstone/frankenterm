@@ -1521,10 +1521,10 @@ impl StorageBackend for MockBackend {
         guard.executed.push("BEGIN".to_string());
         let user_version_before = guard.user_version;
 
-        let mut tx_handle = MockTransactionHandle { state: &mut *guard };
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)));
-        drop(tx_handle);
+        let result = {
+            let mut tx_handle = MockTransactionHandle { state: &mut guard };
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx_handle)))
+        };
 
         match result {
             Ok(Ok(())) => {
