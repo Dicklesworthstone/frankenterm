@@ -16282,7 +16282,6 @@ mod tests {
         });
     }
 
-    #[cfg(any(all(feature = "vendored", unix), feature = "native-wezterm"))]
     fn test_capture_lease(global_pane_id: u64, source_kind: CaptureSourceKind) -> CaptureLease {
         let authority = CaptureAuthority::new();
         let pane = authority
