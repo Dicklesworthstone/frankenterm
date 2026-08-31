@@ -3578,7 +3578,6 @@ dependencies = [
  "memchr",
  "mux",
  "nix 0.31.3",
- "openssl-sys",
  "predicates",
  "rusqlite",
  "rustix",
