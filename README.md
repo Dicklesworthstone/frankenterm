@@ -762,13 +762,32 @@ Post-install expectations:
 - On a clean host, doctor reports the available mux-backend prerequisites. A compatibility-CLI setup requires `wezterm --version` and `wezterm cli list --format json`; a native vendored setup may use a reachable direct mux endpoint instead.
 - `.ft`, logs, and the SQLite database are created on first daemon/watch startup
 
-### From source
+### Build a checkout from source
 
 ```bash
 git clone https://github.com/Dicklesworthstone/frankenterm.git
 cd frankenterm
-cargo build --profile release-interactive
-cp target/release-interactive/ft ~/.local/bin/
+bash scripts/install-hooks.sh
+cargo build --locked --profile release-interactive \
+  -p frankenterm --bin ft \
+  -p frankenterm-mux-server --bin frankenterm-mux-server \
+  -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
+```
+
+This produces an uninstalled candidate process family under
+`target/release-interactive/`. Do **not** copy only `ft` over a live
+installation: the CLI, mux server, and PTY guardian are an atomic family with a
+shared build identity, manifest, and selector. On Apple-Silicon macOS, build the
+complete four-role app bundle (GUI plus that process family) with
+`scripts/create-macos-bundle.sh`; the script uses the repository's strict RCH
+source-fencing contract and emits `FrankenTerm.app` plus its component manifest.
+
+To install a published release from source rather than merely build a checkout,
+use the installer path so the complete family is sealed and verified:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh \
+  | bash -s -- --from-source
 ```
 
 ### With optional features
