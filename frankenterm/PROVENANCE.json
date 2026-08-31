@@ -4,17 +4,17 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
-        "fix": 1,
-        "other": 2,
+        "fix": 4,
+        "other": 5,
         "runtime-swap": 3
       },
-      "fork_side_commit_count": 7,
+      "fork_side_commit_count": 13,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-04-20T15:35:36-04:00",
-        "sha": "a580959946c26fc40083c448aac4a4a2fcf8053c",
-        "subject": "style: workspace-wide rustfmt sweep across benches + core + legacy crates"
+        "classification": "other",
+        "committed_at": "2026-07-28T10:14:22-04:00",
+        "sha": "12afdb51f775db09b07abe6b4e2c864287ab8c4e",
+        "subject": "perf(mux): bound interactive delivery and harden topology lifecycle"
       },
       "name": "async_ossl",
       "path": "frankenterm/async_ossl",
@@ -42,19 +42,19 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "fix": 3,
+        "fix": 4,
         "other": 1,
         "rename": 1,
         "security-fix": 1,
         "test": 3
       },
-      "fork_side_commit_count": 9,
+      "fork_side_commit_count": 10,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "security-fix",
-        "committed_at": "2026-03-28T01:20:58-04:00",
-        "sha": "ad4642d39a3960052e1579d60e3674bf631f8036",
-        "subject": "fix(security): eliminate 4 remotely-triggerable panic paths"
+        "classification": "fix",
+        "committed_at": "2026-08-07T09:16:59-04:00",
+        "sha": "229c714f91010da65e316ff6c505f1b000d718df",
+        "subject": "fix(mux): keep prepared tree callbacks outside tab lock"
       },
       "name": "frankenterm-bidi",
       "path": "frankenterm/bidi",
@@ -83,18 +83,19 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "fix": 6,
+        "feat": 1,
+        "fix": 9,
         "other": 1,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 14,
+      "fork_side_commit_count": 18,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-04-19T20:54:01-04:00",
-        "sha": "ca8f99fae5930065c5b55ad807ddfa5ec37e00f3",
-        "subject": "test: add blob-leases serde proptests"
+        "classification": "feat",
+        "committed_at": "2026-08-07T16:01:59-04:00",
+        "sha": "fc25ce71341fc88ed6f2b44b60d17bf14b948f0d",
+        "subject": "feat(images): harden kitty/APC image pipeline, cell storage, and glyph cache"
       },
       "name": "frankenterm-blob-leases",
       "path": "frankenterm/blob-leases",
@@ -103,19 +104,23 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "cosmetic": 1,
-        "fix": 5,
-        "other": 1,
+        "cosmetic": 2,
+        "docs": 1,
+        "feat": 5,
+        "fix": 13,
+        "other": 2,
+        "refactor": 1,
         "rename": 1,
-        "test": 3
+        "security-fix": 2,
+        "test": 5
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 32,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-02-28T19:11:46-05:00",
-        "sha": "3a067e97eb3b6cbcb2739c36b06a3fba166c2d14",
-        "subject": "fix(clippy): minor lint fixes in cell and term test crates"
+        "classification": "cosmetic",
+        "committed_at": "2026-08-25T01:47:10-04:00",
+        "sha": "8e68db4acc7254b13cd94389d8e6f871ec963a81",
+        "subject": "style: format workspace files per rustfmt contract"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -124,19 +129,21 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
+        "docs": 1,
         "feat": 2,
         "fix": 2,
         "other": 1,
+        "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 15,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-02-20T08:50:49-05:00",
-        "sha": "a62d8f81b0d50d9851fe7ed113dcb7fb26796e55",
-        "subject": "fix(clippy): resolve all workspace-wide clippy warnings across vendored crates"
+        "classification": "refactor",
+        "committed_at": "2026-07-16T15:25:19-04:00",
+        "sha": "a219e050e95767a97f1b6665032ac55557de34bf",
+        "subject": "refactor(char-props): emit WCWIDTH_TABLE as `static` instead of `const`"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -145,46 +152,53 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 5,
-        "feat": 7,
-        "fix": 10,
-        "other": 1,
-        "refactor": 2,
-        "runtime-swap": 3,
+        "chore": 2,
+        "cleanup": 2,
+        "cosmetic": 18,
+        "feat": 48,
+        "fix": 67,
+        "other": 16,
+        "refactor": 4,
+        "rename": 2,
+        "runtime-swap": 4,
         "security-fix": 1,
-        "test": 1
+        "test": 23
       },
-      "fork_side_commit_count": 30,
+      "fork_side_commit_count": 187,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "cosmetic",
-        "committed_at": "2026-04-26T17:39:24-04:00",
-        "sha": "62c7052970b856c429eb517a85bdc468a5715cde",
-        "subject": "style(client): rustfmt handshake test (ft-kuxho.4)"
+        "committed_at": "2026-08-31T07:58:50-04:00",
+        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
+        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
       },
-      "name": "wezterm-client",
+      "name": "frankenterm-client",
       "path": "frankenterm/client",
       "version": "0.1.0"
     },
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 7,
-        "feat": 8,
-        "fix": 15,
-        "other": 3,
-        "rename": 1,
-        "runtime-swap": 3,
+        "chore": 1,
+        "cleanup": 1,
+        "cosmetic": 20,
+        "docs": 2,
+        "feat": 43,
+        "fix": 54,
+        "other": 21,
+        "refactor": 2,
+        "rename": 2,
+        "runtime-swap": 5,
         "security-fix": 1,
-        "test": 54
+        "test": 83
       },
-      "fork_side_commit_count": 92,
+      "fork_side_commit_count": 235,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "cosmetic",
-        "committed_at": "2026-04-28T00:18:41-04:00",
-        "sha": "7f46661123f9b25fd442ba81b6213118bca4c976",
-        "subject": "chore: rustfmt sweep across frankenterm-core, frankenterm, and codec"
+        "committed_at": "2026-08-31T07:58:50-04:00",
+        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
+        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -195,17 +209,18 @@
       "classification_summary": {
         "cosmetic": 1,
         "fix": 3,
-        "other": 2,
+        "other": 3,
+        "refactor": 1,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 14,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-04-20T22:50:26-04:00",
-        "sha": "8d39c725d78d89238d12e4f5f6201805782ac407",
-        "subject": "fix(termwiz): make named color lookup fallible"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "frankenterm-color-types",
       "path": "frankenterm/color-types",
@@ -214,24 +229,24 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "chore": 1,
-        "cosmetic": 1,
-        "feat": 22,
-        "fix": 16,
-        "other": 5,
-        "refactor": 2,
+        "chore": 3,
+        "cosmetic": 3,
+        "feat": 38,
+        "fix": 40,
+        "other": 10,
+        "refactor": 4,
         "rename": 1,
-        "runtime-swap": 6,
+        "runtime-swap": 8,
         "security-fix": 1,
-        "test": 9
+        "test": 14
       },
-      "fork_side_commit_count": 64,
+      "fork_side_commit_count": 122,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "feat",
+        "committed_at": "2026-08-25T01:45:04-04:00",
+        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
+        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -241,17 +256,18 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
-        "fix": 2,
-        "other": 2,
+        "fix": 4,
+        "other": 3,
+        "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 6,
+      "fork_side_commit_count": 10,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-04-03T16:24:17-04:00",
-        "sha": "7b4dc1302ff7fb7c626529930f9941af52a4b5d3",
-        "subject": "feat: vendored crate improvements \u2014 tmux PDU pipeline, SSH config expansion, terminfo rendering, window EGL/WGL, codec updates"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "frankenterm-config-derive",
       "path": "frankenterm/config/derive",
@@ -297,15 +313,15 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 2
+        "fix": 6
       },
-      "fork_side_commit_count": 6,
+      "fork_side_commit_count": 10,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-04-07T21:30:44-04:00",
-        "sha": "3a8cfe34bfb0567782579d62df7748a0ffd4b2c5",
-        "subject": "chore: fix clippy lints across leaf crates and sync beads tracker"
+        "classification": "fix",
+        "committed_at": "2026-05-18T19:10:27-04:00",
+        "sha": "1775a630f42b845d23b1678e8b0b2e917efbf832",
+        "subject": "fix(filedescriptor): repair poll timeout commit scope"
       },
       "name": "harfbuzz",
       "path": "frankenterm/deps-harfbuzz",
@@ -314,19 +330,22 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "cosmetic": 1,
+        "chore": 1,
+        "cosmetic": 2,
+        "docs": 1,
         "feat": 1,
         "other": 1,
+        "refactor": 1,
         "rename": 1,
         "test": 3
       },
-      "fork_side_commit_count": 7,
+      "fork_side_commit_count": 11,
       "last_modified": {
-        "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-04-19T21:46:04-04:00",
-        "sha": "e62795c20b4aeccdbcf32a84fe14e582f64698a1",
-        "subject": "test: add dynamic roundtrip proptests"
+        "author": "Dicklesworthstone",
+        "classification": "cosmetic",
+        "committed_at": "2026-08-27T13:18:52-04:00",
+        "sha": "c466be3bb531648c90538d48725c66046ace690a",
+        "subject": "chore(lints,deps): add workspace clippy exceptions and update hmac dependency"
       },
       "name": "frankenterm-dynamic",
       "path": "frankenterm/dynamic",
@@ -338,15 +357,16 @@
         "cosmetic": 1,
         "feat": 1,
         "other": 1,
+        "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 4,
+      "fork_side_commit_count": 5,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-04-03T16:24:17-04:00",
-        "sha": "7b4dc1302ff7fb7c626529930f9941af52a4b5d3",
-        "subject": "feat: vendored crate improvements \u2014 tmux PDU pipeline, SSH config expansion, terminfo rendering, window EGL/WGL, codec updates"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "frankenterm-dynamic-derive",
       "path": "frankenterm/dynamic/derive",
@@ -373,21 +393,24 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "cosmetic": 2,
-        "feat": 1,
-        "fix": 8,
-        "other": 1,
+        "chore": 1,
+        "cosmetic": 5,
+        "docs": 1,
+        "feat": 7,
+        "fix": 18,
+        "other": 6,
+        "refactor": 1,
         "rename": 1,
-        "security-fix": 21,
-        "test": 3
+        "security-fix": 49,
+        "test": 6
       },
-      "fork_side_commit_count": 37,
+      "fork_side_commit_count": 95,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-05-01T04:36:49-04:00",
-        "sha": "526e675cd430dbb480a519a627f95fc2e5102dd3",
-        "subject": "feat(osc): OSC 22 mouse shape dispatch + audit tests for OSC 8 and 52 (ft-7yiu2)"
+        "classification": "cosmetic",
+        "committed_at": "2026-08-25T01:47:10-04:00",
+        "sha": "8e68db4acc7254b13cd94389d8e6f871ec963a81",
+        "subject": "style: format workspace files per rustfmt contract"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -396,18 +419,18 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "feat": 1,
-        "fix": 3,
+        "feat": 3,
+        "fix": 7,
         "other": 2,
         "test": 4
       },
-      "fork_side_commit_count": 10,
+      "fork_side_commit_count": 16,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-02-24T16:19:09-05:00",
-        "sha": "4b376e7ad61720c1b8bee7feaa3773b71e25785c",
-        "subject": "fix(safety): eliminate unsafe transmute and mem::forget patterns across codebase"
+        "classification": "feat",
+        "committed_at": "2026-08-25T01:45:04-04:00",
+        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
+        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
       },
       "name": "filedescriptor",
       "path": "frankenterm/filedescriptor",
@@ -416,20 +439,24 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 2,
-        "feat": 1,
-        "fix": 6,
-        "other": 1
+        "cleanup": 1,
+        "cosmetic": 7,
+        "docs": 1,
+        "feat": 2,
+        "fix": 16,
+        "other": 2,
+        "refactor": 1,
+        "rename": 1
       },
-      "fork_side_commit_count": 10,
+      "fork_side_commit_count": 31,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-04-27T14:57:11-04:00",
-        "sha": "ab11211d6d72689e54f4a8f6efbe41231de8c999",
-        "subject": "fix(ft-6scm7): shape render clusters with paragraph context"
+        "classification": "feat",
+        "committed_at": "2026-08-07T21:24:35-04:00",
+        "sha": "e74e32709f53c4113d0a3c0a904d1013a90d54d8",
+        "subject": "feat(surface/platform): line clustering, termwiz widgets, window atlas, scripting"
       },
-      "name": "wezterm-font",
+      "name": "frankenterm-font",
       "path": "frankenterm/font",
       "version": "0.1.0"
     },
@@ -455,15 +482,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 2
+        "feat": 3,
+        "rename": 1
       },
-      "fork_side_commit_count": 2,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "feat",
-        "committed_at": "2026-03-02T20:41:36-05:00",
-        "sha": "e046ca1ba6c2075ba741beaad505c6cf3b10a1a5",
-        "subject": "feat(gui-cli): add --session alias for --workspace flag"
+        "committed_at": "2026-08-24T08:30:08-04:00",
+        "sha": "4d9e8ab14cd7b8ea39f7c05ca57ffd42703aa789",
+        "subject": "feat(client,codec,pty): harden clientpane writer guards, codec framing, and PTY handles"
       },
       "name": "frankenterm-gui-subcommands",
       "path": "frankenterm/gui-subcommands",
@@ -473,18 +501,21 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "chore": 1,
-        "fix": 4,
+        "cosmetic": 1,
+        "feat": 1,
+        "fix": 5,
         "other": 1,
+        "refactor": 1,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 16,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-04-21T16:30:49-04:00",
-        "sha": "0b65bc0b284d0551c25893455f36bb9a0a6f0551",
-        "subject": "fix(pane_tiers): port 4 test helper sites to DashMap API (ft-x2fvv)"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "frankenterm-input-types",
       "path": "frankenterm/input-types",
@@ -493,18 +524,19 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "cosmetic": 1,
-        "feat": 1,
+        "cosmetic": 2,
+        "feat": 4,
         "fix": 2,
-        "refactor": 1
+        "other": 2,
+        "refactor": 3
       },
-      "fork_side_commit_count": 5,
+      "fork_side_commit_count": 13,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-03-26T23:35:03-04:00",
-        "sha": "1adc44abf4e3504d620641908a9683f9bbd162f0",
-        "subject": "fix(vendored): guard division-by-zero, integer overflow, and unchecked ShellExecuteW"
+        "classification": "refactor",
+        "committed_at": "2026-08-07T23:53:54-04:00",
+        "sha": "0d50fcd963db1c4102d4f8cf0a037b5001e8978a",
+        "subject": "refactor(platform): surface, term, window, scripting, and test harness polish"
       },
       "name": "lfucache",
       "path": "frankenterm/lfucache",
@@ -513,19 +545,20 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "cosmetic": 1,
-        "feat": 1,
-        "fix": 4,
-        "other": 1,
-        "refactor": 2
+        "cosmetic": 3,
+        "feat": 8,
+        "fix": 12,
+        "other": 5,
+        "refactor": 3,
+        "test": 1
       },
-      "fork_side_commit_count": 9,
+      "fork_side_commit_count": 32,
       "last_modified": {
-        "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "author": "Dicklesworthstone",
+        "classification": "feat",
+        "committed_at": "2026-08-27T01:01:15-04:00",
+        "sha": "4b6f8ff633fbb8943799fe456b8f0ae054922526",
+        "subject": "feat(guardian,mux,replay): expand guardian proxy forwarding, tantivy schema ingestion, and replay verification"
       },
       "name": "mux-lua",
       "path": "frankenterm/lua-api-crates/mux-lua",
@@ -537,17 +570,18 @@
         "feat": 1,
         "fix": 1,
         "other": 1,
+        "refactor": 1,
         "rename": 1,
         "runtime-swap": 2,
         "test": 1
       },
-      "fork_side_commit_count": 7,
+      "fork_side_commit_count": 8,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "runtime-swap",
-        "committed_at": "2026-04-02T17:02:41-04:00",
-        "sha": "1761e2a2dc6875178d26ce0f8eeb6477275be2fa",
-        "subject": "feat: flip ssh, termwiz-funcs, mux-server defaults from async-smol to async-asupersync"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "termwiz-funcs",
       "path": "frankenterm/lua-api-crates/termwiz-funcs",
@@ -556,15 +590,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "refactor": 1
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 2,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-03-02T14:46:34-05:00",
-        "sha": "991996ffcbab6bf1fa8bb90c34ec8ef20489174b",
-        "subject": "feat(workspace): add GUI bootstrap crates and workspace dependencies (ft-1memj.3)"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "url-funcs",
       "path": "frankenterm/lua-api-crates/url-funcs",
@@ -574,18 +609,19 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 2,
-        "fix": 2,
-        "other": 1,
+        "feat": 1,
+        "fix": 3,
+        "other": 2,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 14,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-04-20T15:35:36-04:00",
-        "sha": "a580959946c26fc40083c448aac4a4a2fcf8053c",
-        "subject": "style: workspace-wide rustfmt sweep across benches + core + legacy crates"
+        "classification": "feat",
+        "committed_at": "2026-08-11T12:01:27-04:00",
+        "sha": "53b9e854768d4bb04a837e62f41a50dba79e258f",
+        "subject": "feat(session): host identity v5 (machine fence + process domain); schema v43"
       },
       "name": "luahelper",
       "path": "frankenterm/luahelper",
@@ -594,25 +630,26 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "chore": 1,
-        "cleanup": 2,
-        "cosmetic": 11,
-        "feat": 21,
-        "fix": 31,
-        "other": 8,
-        "refactor": 2,
-        "rename": 1,
+        "chore": 7,
+        "cleanup": 3,
+        "cosmetic": 27,
+        "docs": 6,
+        "feat": 184,
+        "fix": 188,
+        "other": 34,
+        "refactor": 11,
+        "rename": 2,
         "runtime-swap": 3,
-        "security-fix": 2,
-        "test": 30
+        "security-fix": 7,
+        "test": 68
       },
-      "fork_side_commit_count": 112,
+      "fork_side_commit_count": 540,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "cosmetic",
+        "committed_at": "2026-08-31T07:58:50-04:00",
+        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
+        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -624,36 +661,39 @@
         "feat": 1,
         "fix": 2,
         "other": 2,
+        "rename": 1,
         "test": 1
       },
-      "fork_side_commit_count": 6,
+      "fork_side_commit_count": 7,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "rename",
+        "committed_at": "2026-05-01T07:57:46-04:00",
+        "sha": "b41ea8d7904cd4f1adb02372af403d8d81fe779f",
+        "subject": "refactor(vendored): rename wezterm-* crates to frankenterm-* (br-ft-i2eni.4)"
       },
-      "name": "wezterm-open-url",
+      "name": "frankenterm-open-url",
       "path": "frankenterm/open-url",
       "version": "0.1.0"
     },
     {
       "authors_raw": null,
       "classification_summary": {
-        "fix": 2,
+        "cosmetic": 1,
+        "feat": 2,
+        "fix": 6,
         "other": 1,
         "refactor": 1,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 10,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-02-27T01:38:05-05:00",
-        "sha": "c0dc626b92ced8d37916daeb617474497ceeaabe",
-        "subject": "refactor: clippy fixes, API naming improvements, and sharding property test hardening"
+        "classification": "feat",
+        "committed_at": "2026-08-11T12:01:27-04:00",
+        "sha": "53b9e854768d4bb04a837e62f41a50dba79e258f",
+        "subject": "feat(session): host identity v5 (machine fence + process domain); schema v43"
       },
       "name": "procinfo",
       "path": "frankenterm/procinfo",
@@ -662,21 +702,21 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 2,
-        "feat": 1,
-        "fix": 3,
-        "other": 2,
-        "refactor": 1,
-        "runtime-swap": 1,
-        "test": 5
+        "cosmetic": 5,
+        "feat": 8,
+        "fix": 17,
+        "other": 5,
+        "refactor": 3,
+        "runtime-swap": 4,
+        "test": 7
       },
-      "fork_side_commit_count": 15,
+      "fork_side_commit_count": 49,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "feat",
+        "committed_at": "2026-08-25T01:45:04-04:00",
+        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
+        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -685,19 +725,21 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "cosmetic": 1,
-        "fix": 7,
-        "other": 3,
+        "cosmetic": 4,
+        "feat": 7,
+        "fix": 23,
+        "other": 4,
+        "refactor": 2,
         "runtime-swap": 1,
-        "test": 7
+        "test": 13
       },
-      "fork_side_commit_count": 19,
+      "fork_side_commit_count": 54,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "cosmetic",
+        "committed_at": "2026-08-31T07:58:50-04:00",
+        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
+        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -706,18 +748,20 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 1,
-        "fix": 3,
-        "other": 2,
+        "cleanup": 1,
+        "cosmetic": 3,
+        "fix": 4,
+        "other": 3,
+        "refactor": 1,
         "test": 5
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "rangeset",
       "path": "frankenterm/rangeset",
@@ -728,15 +772,16 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
+        "refactor": 1,
         "test": 1
       },
-      "fork_side_commit_count": 3,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-04-19T21:25:53-04:00",
-        "sha": "128d73aa3639f6958e61ea7ddba16f12fdbba156",
-        "subject": "test: add ratelim property tests"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "ratelim",
       "path": "frankenterm/ratelim",
@@ -745,19 +790,22 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 5,
-        "fix": 2,
+        "cosmetic": 1,
+        "docs": 1,
+        "feat": 7,
+        "fix": 22,
+        "refactor": 2,
         "runtime-swap": 2,
-        "security-fix": 1,
-        "test": 7
+        "security-fix": 5,
+        "test": 8
       },
-      "fork_side_commit_count": 17,
+      "fork_side_commit_count": 48,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "runtime-swap",
-        "committed_at": "2026-03-08T21:55:04-04:00",
-        "sha": "57ed3719e97e2750e1cc85b76fb1def73a631292",
-        "subject": "refactor(main): continue tokio::test \u2192 run_async_test migration and sort imports"
+        "classification": "refactor",
+        "committed_at": "2026-08-07T23:53:54-04:00",
+        "sha": "0d50fcd963db1c4102d4f8cf0a037b5001e8978a",
+        "subject": "refactor(platform): surface, term, window, scripting, and test harness polish"
       },
       "name": "frankenterm-scripting",
       "path": "frankenterm/scripting",
@@ -766,23 +814,24 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 3,
+        "chore": 1,
+        "cosmetic": 5,
         "feat": 7,
-        "fix": 12,
-        "other": 3,
-        "refactor": 2,
+        "fix": 21,
+        "other": 4,
+        "refactor": 3,
         "rename": 1,
         "runtime-swap": 7,
         "security-fix": 1,
         "test": 8
       },
-      "fork_side_commit_count": 44,
+      "fork_side_commit_count": 58,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "refactor",
+        "committed_at": "2026-06-15T14:11:53-04:00",
+        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
+        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
       },
       "name": "frankenterm-ssh",
       "path": "frankenterm/ssh",
@@ -792,20 +841,22 @@
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
         "cleanup": 1,
-        "cosmetic": 1,
-        "feat": 3,
-        "fix": 8,
-        "other": 3,
+        "cosmetic": 7,
+        "feat": 12,
+        "fix": 27,
+        "other": 11,
+        "refactor": 2,
         "rename": 1,
-        "test": 19
+        "security-fix": 2,
+        "test": 20
       },
-      "fork_side_commit_count": 36,
+      "fork_side_commit_count": 83,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "classification": "cosmetic",
+        "committed_at": "2026-08-31T07:58:50-04:00",
+        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
+        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -834,22 +885,23 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "cosmetic": 5,
-        "feat": 19,
-        "fix": 28,
-        "other": 6,
-        "refactor": 1,
-        "rename": 1,
-        "security-fix": 3,
-        "test": 22
+        "cleanup": 3,
+        "cosmetic": 14,
+        "feat": 48,
+        "fix": 78,
+        "other": 28,
+        "refactor": 5,
+        "rename": 2,
+        "security-fix": 6,
+        "test": 41
       },
-      "fork_side_commit_count": 85,
+      "fork_side_commit_count": 225,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "feat",
-        "committed_at": "2026-05-01T05:59:13-04:00",
-        "sha": "726f33c202d4cd61e5f99a3bfb8f24d48cb58d89",
-        "subject": "feat(term/kitty): wire kitty_image_max_transmission_bytes through config (ft-heic8)"
+        "committed_at": "2026-08-26T11:43:29-04:00",
+        "sha": "1eea629df0048141b0b608541834a63deb6401cd",
+        "subject": "feat(guardian): restore authenticated replay before mux activation"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -858,22 +910,25 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "cosmetic": 5,
-        "feat": 5,
-        "fix": 12,
-        "other": 3,
+        "chore": 1,
+        "cleanup": 1,
+        "cosmetic": 9,
+        "feat": 11,
+        "fix": 61,
+        "other": 8,
+        "refactor": 2,
         "rename": 1,
         "runtime-swap": 1,
-        "security-fix": 1,
-        "test": 4
+        "security-fix": 5,
+        "test": 10
       },
-      "fork_side_commit_count": 32,
+      "fork_side_commit_count": 110,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-04-26T19:50:23-04:00",
-        "sha": "1261521c46e680c62abd6afe2b4c82cfe5f6f09d",
-        "subject": "test(termwiz): cover modified application keypad input (ft-fws9f)"
+        "classification": "refactor",
+        "committed_at": "2026-08-07T23:53:54-04:00",
+        "sha": "0d50fcd963db1c4102d4f8cf0a037b5001e8978a",
+        "subject": "refactor(platform): surface, term, window, scripting, and test harness polish"
       },
       "name": "termwiz",
       "path": "frankenterm/termwiz",
@@ -883,20 +938,21 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
-        "feat": 2,
-        "fix": 2,
-        "other": 2,
-        "refactor": 1
+        "feat": 3,
+        "fix": 4,
+        "other": 3,
+        "refactor": 1,
+        "rename": 1
       },
-      "fork_side_commit_count": 8,
+      "fork_side_commit_count": 13,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-04-25T13:30:39-04:00",
-        "sha": "c59d0777808de4c4a1b06f9df6ad5fec79b11c07",
-        "subject": "hardening(frankenterm/*): vendored mux/client/term/window stack \u2014 overflow + lifecycle fixes"
+        "committed_at": "2026-06-14T21:11:53-04:00",
+        "sha": "ba8f580b4a5a767d8d6a3eaec36d9206fdea784b",
+        "subject": "ft-3qe22: prove rgb workspace-dep materialization resolved on remote"
       },
-      "name": "wezterm-toast-notification",
+      "name": "frankenterm-toast-notification",
       "path": "frankenterm/toast-notification",
       "version": "0.1.0"
     },
@@ -904,19 +960,19 @@
       "authors_raw": null,
       "classification_summary": {
         "cosmetic": 1,
-        "fix": 3,
-        "other": 2,
+        "fix": 9,
+        "other": 3,
         "rename": 1,
         "runtime-swap": 3,
         "test": 5
       },
-      "fork_side_commit_count": 15,
+      "fork_side_commit_count": 22,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-04-20T15:35:36-04:00",
-        "sha": "a580959946c26fc40083c448aac4a4a2fcf8053c",
-        "subject": "style: workspace-wide rustfmt sweep across benches + core + legacy crates"
+        "classification": "fix",
+        "committed_at": "2026-08-20T20:37:55-04:00",
+        "sha": "c18ba6b60e253cc6716bbf312ea6dcdd7cef6790",
+        "subject": "fix(uds): compile combined readiness helper only on unix"
       },
       "name": "frankenterm-uds",
       "path": "frankenterm/uds",
@@ -927,17 +983,17 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 3,
+        "fix": 7,
         "other": 1,
         "test": 5
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 15,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-04-19T21:14:03-04:00",
-        "sha": "2e734092bbef9cb5578b4189aa68098e12a76cc3",
-        "subject": "test: add umask property roundtrips"
+        "classification": "fix",
+        "committed_at": "2026-05-18T19:10:27-04:00",
+        "sha": "1775a630f42b845d23b1678e8b0b2e917efbf832",
+        "subject": "fix(filedescriptor): repair poll timeout commit scope"
       },
       "name": "umask",
       "path": "frankenterm/umask",
@@ -947,18 +1003,19 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
+        "feat": 1,
         "fix": 3,
         "other": 2,
-        "security-fix": 1,
+        "security-fix": 2,
         "test": 4
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 13,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-02-25T14:29:13-05:00",
-        "sha": "6c8c1699500c5a5e3402cdaf3c6afbc9990867d0",
-        "subject": "fix(vtparse): use explicit format argument for MSRV compatibility"
+        "classification": "feat",
+        "committed_at": "2026-08-25T01:45:04-04:00",
+        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
+        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
       },
       "name": "vtparse",
       "path": "frankenterm/vtparse",
@@ -967,21 +1024,25 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "cosmetic": 4,
-        "feat": 7,
-        "fix": 13,
-        "other": 3,
-        "refactor": 1,
+        "chore": 3,
+        "cleanup": 1,
+        "cosmetic": 8,
+        "docs": 1,
+        "feat": 13,
+        "fix": 81,
+        "other": 12,
+        "refactor": 6,
+        "rename": 1,
         "runtime-swap": 1,
-        "test": 2
+        "test": 3
       },
-      "fork_side_commit_count": 31,
+      "fork_side_commit_count": 130,
       "last_modified": {
-        "author": "Jeff Emanuel",
+        "author": "Dicklesworthstone",
         "classification": "feat",
-        "committed_at": "2026-05-01T04:45:58-04:00",
-        "sha": "3bb716799a5078a7e665388b83298e9e0b156401",
-        "subject": "feat(atlas): wire versioned atlas + grow path + version cursor + resize-stable scale change (br-ft-c9arc)"
+        "committed_at": "2026-08-27T01:01:15-04:00",
+        "sha": "4b6f8ff633fbb8943799fe456b8f0ae054922526",
+        "subject": "feat(guardian,mux,replay): expand guardian proxy forwarding, tantivy schema ingestion, and replay verification"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -994,8 +1055,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 878,
-  "generated_at": "2026-05-01T10:28:21.458413Z",
+  "fork_side_commit_total": 2352,
+  "generated_at": "2026-08-31T22:20:34.222726Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
