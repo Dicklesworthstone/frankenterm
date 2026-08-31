@@ -955,7 +955,7 @@ proptest! {
 
         // Trend magnitude should decrease when observations match the level.
         // Allow small floating-point tolerance.
-        let tol = trend_before * 1e-10 + 1e-6;
+        let tol = trend_before.mul_add(1e-10, 1e-6);
         prop_assert!(trend_after <= trend_before + tol,
             "repeated updates at current level should dampen trend: {} -> {}",
             trend_before, trend_after);

@@ -2187,7 +2187,7 @@ proptest! {
         prop_assert_eq!(item.arrived_us, back.arrived_us);
         prop_assert_eq!(item.deadline_us, back.deadline_us);
         let diff = (item.estimated_cost_us - back.estimated_cost_us).abs();
-        let tol = item.estimated_cost_us.abs() * 1e-12 + 1e-10;
+        let tol = item.estimated_cost_us.abs().mul_add(1e-12, 1e-10);
         prop_assert!(diff < tol, "cost roundtrip: {} vs {} diff {}", item.estimated_cost_us, back.estimated_cost_us, diff);
     }
 
@@ -2545,7 +2545,7 @@ proptest! {
         prop_assert_eq!(snap.total_starvation_events, back.total_starvation_events);
         prop_assert_eq!(snap.any_starving, back.any_starving);
         let diff = (snap.gini_coefficient - back.gini_coefficient).abs();
-        let tol = snap.gini_coefficient.abs() * 1e-12 + 1e-10;
+        let tol = snap.gini_coefficient.abs().mul_add(1e-12, 1e-10);
         prop_assert!(diff < tol);
     }
 
@@ -3352,7 +3352,7 @@ proptest! {
         prop_assert_eq!(dec.selected_mode, back.selected_mode);
         // f64 tolerance
         let est_diff = (dec.estimated_cost_us - back.estimated_cost_us).abs();
-        let tol = dec.estimated_cost_us.abs() * 1e-12 + 1e-10;
+        let tol = dec.estimated_cost_us.abs().mul_add(1e-12, 1e-10);
         prop_assert!(est_diff < tol, "est roundtrip: {} vs {}", dec.estimated_cost_us, back.estimated_cost_us);
     }
 }
