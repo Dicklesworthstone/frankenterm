@@ -284,7 +284,12 @@ run_rch_bundle_build() {
     (
         cd "$PROJECT_ROOT"
         RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
-        run_rch --no-self-healing exec -- env \
+        run_rch --no-self-healing exec \
+            --base "$SOURCE_REVISION" \
+            --clean-overlay \
+            --no-overlay \
+            --source-content-receipt \
+            -- env \
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" \
             FT_ATOMIC_BUILD_IDENTITY="$FT_ATOMIC_BUILD_IDENTITY" \
             FT_ATOMIC_BUILD_PROFILE="$BUILD_PROFILE" \

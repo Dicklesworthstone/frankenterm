@@ -19,7 +19,7 @@ TEST_ATOMIC_BUILD_ID="$(bash "${ROOT_DIR}/scripts/atomic-component-manifest.sh" 
   --version "${WORKSPACE_VERSION}" \
   --target "${BUNDLE_TARGET}" \
   --profile release-interactive \
-  --feature-contract application-family-gui-ft-mux-server-default-features-v1)"
+  --feature-contract application-family-gui-ft-mux-server-pty-guardian-default-features-v1)"
 
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 
@@ -30,8 +30,6 @@ TOTAL=0
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1memj_26_gui_bootstrap"
-RCH_SKIP_SMOKE_PREFLIGHT=1
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -208,7 +206,23 @@ if [[ "\${1:-}" == "exec" ]]; then
     'fi' \
     'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   printf '%s\n' '# FT_ATOMIC_COMPONENT_IDENTITY_V1:${TEST_ATOMIC_BUILD_ID}:frankenterm-mux-server:${BUNDLE_TARGET}:release-interactive:${WORKSPACE_VERSION};' >> "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
-  chmod +x "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'if [[ "${1:-}" == "--version" ]]; then' \
+    '  echo "stub 0.0.0"' \
+    '  exit 0' \
+    'fi' \
+    'if [[ "${1:-}" == "--help" ]]; then' \
+    '  echo "stub help"' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-pty-guardian"
+  printf '%s\n' '# FT_ATOMIC_COMPONENT_IDENTITY_V1:${TEST_ATOMIC_BUILD_ID}:frankenterm-pty-guardian:${BUNDLE_TARGET}:release-interactive:${WORKSPACE_VERSION};' >> "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-pty-guardian"
+  chmod +x \
+    "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui" \
+    "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft" \
+    "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server" \
+    "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-pty-guardian"
   exit 0
 fi
 
@@ -602,6 +616,7 @@ scenario_bundle_skip_build_creates_structure() {
   mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release-interactive" "${output_dir}"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-pty-guardian"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
@@ -616,6 +631,8 @@ scenario_bundle_skip_build_creates_structure() {
       "${app_bundle}/Contents/Resources/ft.icns" \
       "${app_bundle}/Contents/Resources/frankenterm.toml" \
       "${app_bundle}/Contents/MacOS/frankenterm-gui" \
+      "${app_bundle}/Contents/MacOS/frankenterm-mux-server" \
+      "${app_bundle}/Contents/MacOS/frankenterm-pty-guardian" \
       "${app_bundle}/Contents/MacOS/ft"; do
       if [[ ! -e "${required_path}" ]]; then
         record_result "bundle_skip_build_creates_structure" "false" "missing_bundle_artifact" "BUNDLE_STRUCTURE_MISSING" "missing ${required_path}"
@@ -645,6 +662,7 @@ scenario_bundle_refuses_overwrite() {
   mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release-interactive" "${output_dir}"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-pty-guardian"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
@@ -686,6 +704,7 @@ scenario_bundle_refuses_failed_codesign_verification() {
   mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release-interactive" "${output_dir}"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-pty-guardian"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   write_codesign_verification_failure_mock "${mock_bin}"
 
@@ -861,6 +880,13 @@ scenario_bundle_build_uses_repo_relative_paths() {
     fi
     if ! grep -Fq -- '--manifest-path Cargo.toml' "${marker_file}"; then
       record_result "bundle_build_uses_repo_relative_paths" "false" "missing_relative_manifest_path" "MANIFEST_PATH_NOT_RELATIVE" "bundle build omitted repo-relative manifest path"
+      return
+    fi
+    if ! grep -Fq -- "--base ${SOURCE_REVISION}" "${marker_file}" ||
+       ! grep -Fq -- '--clean-overlay' "${marker_file}" ||
+       ! grep -Fq -- '--no-overlay' "${marker_file}" ||
+       ! grep -Fq -- '--source-content-receipt' "${marker_file}"; then
+      record_result "bundle_build_uses_repo_relative_paths" "false" "missing_exact_source_fence" "EXACT_SOURCE_FENCE_MISSING" "bundle build omitted the exact committed-source RCH contract"
       return
     fi
     record_result "bundle_build_uses_repo_relative_paths" "true"
