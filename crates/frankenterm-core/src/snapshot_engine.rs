@@ -1135,8 +1135,8 @@ const EVIDENCE_CLIENT: &[&str] = &[
 const fn failure_contract(
     failure: SnapshotRecoveryFailureClass,
     recoverable_point: &'static str,
-    rpo_scope: &'static str,
-    rto_scope: &'static str,
+    recovery_point_objective_scope: &'static str,
+    recovery_time_objective_scope: &'static str,
     automation: &'static str,
     mutation: &'static str,
     operator_acknowledgement: bool,
@@ -1147,8 +1147,8 @@ const fn failure_contract(
     SnapshotRecoveryFailureContract {
         failure,
         recoverable_point,
-        rpo_scope,
-        rto_scope,
+        rpo_scope: recovery_point_objective_scope,
+        rto_scope: recovery_time_objective_scope,
         automation,
         mutation,
         operator_acknowledgement,
