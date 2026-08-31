@@ -151,6 +151,10 @@ fi
 if [[ "\${1:-}" == "exec" ]]; then
   shift
   printf '%s\n' "\$*" > "${marker_file}"
+  if [[ "\$*" == *"--clean-overlay"* && "\$*" == *"--source-content-receipt"* ]]; then
+    echo "--clean-overlay conflicts with --source-content-receipt" >&2
+    exit 2
+  fi
   if [[ "\$*" == *"pkg-config --exists x11"* ]]; then
     exit 0
   fi
@@ -884,9 +888,12 @@ scenario_bundle_build_uses_repo_relative_paths() {
     fi
     if ! grep -Fq -- "--base ${SOURCE_REVISION}" "${marker_file}" ||
        ! grep -Fq -- '--clean-overlay' "${marker_file}" ||
-       ! grep -Fq -- '--no-overlay' "${marker_file}" ||
-       ! grep -Fq -- '--source-content-receipt' "${marker_file}"; then
+       ! grep -Fq -- '--no-overlay' "${marker_file}"; then
       record_result "bundle_build_uses_repo_relative_paths" "false" "missing_exact_source_fence" "EXACT_SOURCE_FENCE_MISSING" "bundle build omitted the exact committed-source RCH contract"
+      return
+    fi
+    if grep -Fq -- '--source-content-receipt' "${marker_file}"; then
+      record_result "bundle_build_uses_repo_relative_paths" "false" "incompatible_source_receipt" "RCH_ARGUMENT_CONFLICT" "bundle build combined mutually exclusive RCH source modes"
       return
     fi
     record_result "bundle_build_uses_repo_relative_paths" "true"
