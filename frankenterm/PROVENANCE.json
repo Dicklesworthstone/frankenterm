@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 48,
-        "fix": 67,
+        "fix": 68,
         "other": 16,
         "refactor": 4,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 1,
         "test": 23
       },
-      "fork_side_commit_count": 187,
+      "fork_side_commit_count": 188,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-31T07:58:50-04:00",
-        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
-        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
+        "classification": "fix",
+        "committed_at": "2026-08-31T18:52:12-04:00",
+        "sha": "67e3f4a6d5b63a52253e81fb6933d5d4a179fe20",
+        "subject": "fix(gui): align socket discovery with runtime paths"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1055,8 +1055,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2352,
-  "generated_at": "2026-08-31T22:20:34.222726Z",
+  "fork_side_commit_total": 2353,
+  "generated_at": "2026-08-31T22:52:24.475377Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
