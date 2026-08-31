@@ -29,7 +29,7 @@ This doc is verifiable with `rg` + `jq` only: **no `cargo`, no RCH.**
 sub-assertion is missing) · `GAP` no check found · `n/a` dimension does not
 apply to this surface · `R`/`M` = read / mutation.
 
-## Matrix (38 `ApiSurface::ALL` surfaces × 6 dimensions)
+## Matrix (39 `ApiSurface::ALL` surfaces × 6 dimensions)
 
 | Surface | Cat | R/M | MCP twin | ENV | PAR | POL | RED | TOON | ERR |
 |---|---|---|---|---|---|---|---|---|---|
@@ -42,6 +42,7 @@ apply to this surface · `R`/`M` = read / mutation.
 | `search-explain` | search | R | none | ✓ | n/a | n/a | ✓ | ✓ | ✓ |
 | `search-pipeline-status` | search | R | none | ✓ | n/a | n/a | n/a | ✓ | ✓ |
 | `events` | events | R | `wa.events` | ✓ | ✓ | n/a | ✓ | ✓ | ✓ |
+| `event-stream` | events | R | none | ✓ | n/a | n/a | ✓ | n/a | ✓ |
 | `events-mutate` | events | M | `wa.events_annotate/triage/label` | ✓ | ✓ | GAP | ✓ | ✓ | ✓ |
 | `workflow-run` | workflow | M | `wa.workflow_run` | ✓ | ~ | ~ | n/a | ✓ | ✓ |
 | `workflow-list` | workflow | R | `wa.workflow_list` | ✓ | ~ | n/a | n/a | ✓ | ✓ |
@@ -72,7 +73,7 @@ apply to this surface · `R`/`M` = read / mutation.
 | `why` | meta | R | `wa.why` | ✓ | ~ | n/a | n/a | ✓ | ✓ |
 | `approve` | meta | M | `wa.approve` | ✓ | ~ | GAP | n/a | ✓ | ✓ |
 
-> ENV is COVERED for all 38 (existing `api-surface-coverage.md`). ERR and TOON
+> ENV is COVERED for all 39 (existing `api-surface-coverage.md`). ERR and TOON
 > are covered generically via the shared envelope (taxonomy + `proptest_toon_roundtrip`);
 > per-surface focused TOON goldens exist only for pane-state / mission / tx / rules.
 

@@ -193,6 +193,12 @@ xattr.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["trace"] }
+# `round6_quality_metric_harness` directly exercises the vendored cache API,
+# whose capacity callback is typed in terms of `config::ConfigHandle`. Keep
+# that integration-test dependency explicit so `--all-targets
+# --no-default-features` does not rely on the optional production `config`
+# edge being enabled by `frankenterm-deps`.
+config = { workspace = true }
 proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 loom = "0.7"

@@ -57,6 +57,8 @@ pub enum ApiSurface {
     // Events
     /// events — list detected events.
     Events,
+    /// event-stream — follow structured watch-events / await NDJSON records.
+    EventStream,
     /// events-mutate — annotate/handle events.
     EventsMutate,
 
@@ -149,6 +151,7 @@ impl ApiSurface {
         Self::SearchExplain,
         Self::SearchPipelineStatus,
         Self::Events,
+        Self::EventStream,
         Self::EventsMutate,
         Self::WorkflowRun,
         Self::WorkflowList,
@@ -193,6 +196,7 @@ impl ApiSurface {
             Self::SearchExplain => "search-explain",
             Self::SearchPipelineStatus => "search-pipeline-status",
             Self::Events => "events",
+            Self::EventStream => "event-stream",
             Self::EventsMutate => "events-mutate",
             Self::WorkflowRun => "workflow-run",
             Self::WorkflowList => "workflow-list",
@@ -269,7 +273,7 @@ impl ApiSurface {
                 "pane"
             }
             Self::Search | Self::SearchExplain | Self::SearchPipelineStatus => "search",
-            Self::Events | Self::EventsMutate => "events",
+            Self::Events | Self::EventStream | Self::EventsMutate => "events",
             Self::WorkflowRun | Self::WorkflowList | Self::WorkflowStatus | Self::WorkflowAbort => {
                 "workflow"
             }
