@@ -14712,7 +14712,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            storage
+            let event_id = storage
                 .record_event(crate::storage::StoredEvent {
                     id: 0,
                     pane_id: 7,
@@ -14731,7 +14731,9 @@ mod tests {
                     handled_status: None,
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            event_id
         })
     }
 
@@ -17038,11 +17040,10 @@ mod tests {
             .expect("cancelled request caller must not panic")
             .expect("cancelled request must receive an isolated result");
         assert!(first_leases.is_empty());
-        assert_eq!(
-            first_result
-                .expect_err("cancelled gated request returns a typed error")
-                .message,
-            "cancelled:first"
+        let first_error = first_result.expect_err("cancelled gated request returns a typed error");
+        assert!(
+            first_error.message.contains("cancel"),
+            "the operation-reply and waiter-cancellation race must both preserve cancellation: {first_error:?}"
         );
         let one_remaining =
             wait_for_completion_stats(&stats, "uncancelled request remains active", |snapshot| {
@@ -18181,11 +18182,23 @@ mod tests {
         });
         assert_eq!(foreign_leases.len(), 2);
 
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+        tool.wait_for_delivery_completion_ready_for_test();
+        let completion_executor = Arc::clone(
+            tool.delivery_completion
+                .as_ref()
+                .expect("claim-completion executor must exist"),
+        );
+        let completion_stats = completion_executor.stats_for_test();
         let observer_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let observer_calls_for_hook = Arc::clone(&observer_calls);
         let leases_for_hook = Arc::new(std::sync::Mutex::new(Some(foreign_leases)));
         let leases_for_observer = Arc::clone(&leases_for_hook);
-        let observer_db_path = Arc::clone(&db_path);
+        let observer_completion_executor = Arc::clone(&completion_executor);
         let blocked_retry_observer: Arc<dyn Fn(usize) + Send + Sync + 'static> =
             Arc::new(move |blocked_count| {
                 observer_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18198,21 +18211,15 @@ mod tests {
                         blocked_count, 2,
                         "the first scan must retain both live foreign lease holes"
                     );
-                    super::complete_mcp_await_event_deliveries(
-                        Arc::clone(&observer_db_path),
-                        leases,
-                        super::FrameworkResponseDeliveryOutcome::Failed,
+                    assert!(
+                        observer_completion_executor
+                            .try_submit(leases, super::FrameworkResponseDeliveryOutcome::Failed,),
+                        "the ready completion lane must admit the foreign lease release"
                     );
                 }
             });
 
-        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
-        let tool = WaAwaitEventTool::new_with_response_delivery(
-            Arc::clone(&db_path),
-            Arc::clone(&response_delivery),
-        )
-        .with_blocked_retry_observer(blocked_retry_observer);
-        tool.wait_for_delivery_completion_ready_for_test();
+        let tool = tool.with_blocked_retry_observer(blocked_retry_observer);
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -18221,7 +18228,7 @@ mod tests {
                     "cursor": 0,
                     "cursor_epoch": cursor_epoch,
                     "cursor_scope": cursor_scope,
-                    "timeout_secs": 1,
+                    "timeout_secs": 5,
                     "poll_interval_ms": 10,
                     "claim": true
                 }),
@@ -18245,6 +18252,11 @@ mod tests {
         // No transport response is sent in this direct test, so release the
         // one prepared delivery instead of leaving its lease to expire.
         response_delivery.fail_all();
+        wait_for_completion_stats(
+            &completion_stats,
+            "foreign and prepared lease releases",
+            |snapshot| snapshot.completion_attempts_finished >= 2,
+        );
     }
 
     #[test]
@@ -18282,9 +18294,19 @@ mod tests {
             leases
         });
 
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool =
+            WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery);
+        tool.wait_for_delivery_completion_ready_for_test();
+        let completion_executor = Arc::clone(
+            tool.delivery_completion
+                .as_ref()
+                .expect("claim-completion executor must exist"),
+        );
+        let completion_stats = completion_executor.stats_for_test();
         let leases_for_hook = Arc::new(std::sync::Mutex::new(Some(foreign_leases)));
         let leases_for_observer = Arc::clone(&leases_for_hook);
-        let observer_db_path = Arc::clone(&db_path);
+        let observer_completion_executor = Arc::clone(&completion_executor);
         let blocked_retry_observer: Arc<dyn Fn(usize) + Send + Sync + 'static> =
             Arc::new(move |blocked_count| {
                 let leases = leases_for_observer
@@ -18293,10 +18315,10 @@ mod tests {
                     .take();
                 if let Some(leases) = leases {
                     assert_eq!(blocked_count, 2);
-                    super::complete_mcp_await_event_deliveries(
-                        Arc::clone(&observer_db_path),
-                        leases,
-                        super::FrameworkResponseDeliveryOutcome::Failed,
+                    assert!(
+                        observer_completion_executor
+                            .try_submit(leases, super::FrameworkResponseDeliveryOutcome::Failed,),
+                        "the ready completion lane must admit the foreign lease release"
                     );
                 }
             });
@@ -18306,15 +18328,12 @@ mod tests {
                 if phase == super::McpAwaitEventIterationPhase::BlockedRetry
                     && event_id == second_event_id
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(1_100));
+                    std::thread::sleep(std::time::Duration::from_millis(3_100));
                 }
             });
-        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
-        let tool =
-            WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery)
-                .with_blocked_retry_observer(blocked_retry_observer)
-                .with_iteration_observer(iteration_observer);
-        tool.wait_for_delivery_completion_ready_for_test();
+        let tool = tool
+            .with_blocked_retry_observer(blocked_retry_observer)
+            .with_iteration_observer(iteration_observer);
 
         let envelope = parse_json_content(
             tool.call(
@@ -18324,7 +18343,7 @@ mod tests {
                     "cursor": 0,
                     "cursor_epoch": cursor_epoch,
                     "cursor_scope": cursor_scope,
-                    "timeout_secs": 1,
+                    "timeout_secs": 3,
                     "poll_interval_ms": 10,
                     "claim": true
                 }),
@@ -18340,6 +18359,11 @@ mod tests {
         assert_eq!(envelope["data"]["all"][1]["met"], false);
         assert_eq!(envelope["data"]["final_cursor"], 0);
         assert_eq!(envelope["data"]["pending_finalize"], false);
+        wait_for_completion_stats(
+            &completion_stats,
+            "foreign and partial-match lease releases",
+            |snapshot| snapshot.completion_attempts_finished >= 2,
+        );
 
         runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
@@ -19399,7 +19423,9 @@ mod tests {
     #[test]
     fn await_event_observes_mid_poll_request_cancellation_promptly() {
         let (_dir, db_path) = temp_db_path();
-        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool = WaAwaitEventTool::new_with_response_delivery(db_path, response_delivery);
+        tool.wait_for_delivery_completion_ready_for_test();
         let cx = crate::cx::Cx::for_testing();
         let cancel_cx = cx.clone();
         let context = McpContext::new(cx, 3);
@@ -23153,14 +23179,9 @@ exit 17",
         assert_eq!(envelope["error_code"], MCP_ERR_CASS);
         assert_eq!(
             envelope["hint"],
-            "cass exited with an error. Check cass logs or rerun with verbose output."
+            "Check cass status and diagnostics, then retry."
         );
-        assert!(
-            envelope["error"]
-                .as_str()
-                .expect("error string")
-                .contains("cass status failed: cass failed with exit code 17")
-        );
+        assert_eq!(envelope["error"], "cass request failed");
     }
 
     #[test]

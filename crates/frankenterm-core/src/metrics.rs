@@ -2761,11 +2761,12 @@ mod tests {
     ///
     /// `start_with_cx` clones the `Cx` into the spawned accept-loop
     /// task. Cancelling that cx *after* the server has started must
-    /// cause the loop to exit without requiring the shutdown flag.
+    /// cause the loop to exit before the handle's settlement path latches the
+    /// shutdown flag.
     /// The two signals are redundant-on-purpose (an operator may
-    /// cancel the cx while the shutdown flag is still unset, e.g. on
-    /// program termination via a signal handler), and this test pins
-    /// that the cx path alone is sufficient to stop the accept loop.
+    /// cancel the cx while the shutdown flag is still unset, e.g. on program
+    /// termination via a signal handler). The handle then latches the flag as
+    /// part of its mandatory terminal-settlement contract.
     ///
     /// Structure: start the server with a live cx, cancel the cx,
     /// wait for the handle to complete, assert the wait returns
@@ -2791,6 +2792,10 @@ mod tests {
                 crate::outcome::CancelKind::User,
                 Some("mid-flight cancel of metrics accept loop"),
             );
+            assert!(
+                !shutdown_flag.load(Ordering::SeqCst),
+                "cx cancellation must not directly mutate the shutdown flag"
+            );
 
             let start = std::time::Instant::now();
             handle.wait().await;
@@ -2807,11 +2812,11 @@ mod tests {
                 "accept loop must exit after cx-cancel without shutdown flag; took {elapsed:?}"
             );
 
-            // Sanity: the flag is still unset — proves the cancel took
-            // effect via the cx path, not the flag path.
+            // Joining owns terminal settlement and deliberately latches the
+            // shared flag even when the task already observed cx cancellation.
             assert!(
-                !shutdown_flag.load(Ordering::SeqCst),
-                "shutdown flag should still be false at test end"
+                shutdown_flag.load(Ordering::SeqCst),
+                "handle settlement must latch the shutdown flag"
             );
         });
     }

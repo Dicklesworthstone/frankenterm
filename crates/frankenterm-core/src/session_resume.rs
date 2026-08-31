@@ -4102,7 +4102,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_sessions_invalid_working_dir_is_typed_partial_without_path() {
+    fn discover_sessions_invalid_working_dir_is_typed_invalid_configuration_without_path() {
         let home = tempfile::tempdir().expect("isolated native discovery home");
         let r = SessionResumer::new(SessionResumeConfig {
             casr_binary: "rustc".into(),
@@ -4115,7 +4115,7 @@ mod tests {
             .expect("native inventory remains available when CASR cwd is invalid");
         assert!(report.incomplete.contains(&SessionDiscoveryIncomplete {
             source: SessionDiscoverySource::Casr,
-            reason: SessionDiscoveryIncompleteReason::SubprocessFailed,
+            reason: SessionDiscoveryIncompleteReason::InvalidConfiguration,
         }));
     }
 

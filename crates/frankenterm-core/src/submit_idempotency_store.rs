@@ -53,10 +53,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 // SQLite reports BUSY or a concurrent first-open sidecar transition produces a
 // transient open failure. Keep retries store-local so direct and MCP callers
 // obey the same one-owner contract instead of exposing scheduler-dependent
-// failures. Eight attempts cap SQLite busy-wait plus scheduled backoff below
-// 300 ms; capability-path and schema validation time remains separately
+// failures. Twelve attempts cap SQLite busy-wait plus scheduled backoff below
+// 550 ms; capability-path and schema validation time remains separately
 // bounded by ordinary filesystem/SQLite calls.
-const CLAIM_RETRY_MAX_ATTEMPTS: usize = 8;
+const CLAIM_RETRY_MAX_ATTEMPTS: usize = 12;
 const CLAIM_RETRY_INITIAL_BACKOFF_MS: u64 = 1;
 const CLAIM_RETRY_MAX_BACKOFF_MS: u64 = 32;
 const OWNER_NONCE_BYTES: usize = 32;

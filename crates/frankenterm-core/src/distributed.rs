@@ -1015,7 +1015,7 @@ impl DistributedHttpClient {
         url: &str,
     ) -> Result<runtime_http::Response, runtime_http::ClientError> {
         if cx.is_cancel_requested() {
-            return Err(runtime_http::ClientError::Cancelled);
+            return Err(distributed_http_context_termination(cx));
         }
         race_with_cx_cancel(cx, self.inner.get(url).send(cx)).await
     }
@@ -1033,9 +1033,42 @@ impl DistributedHttpClient {
         body: Vec<u8>,
     ) -> Result<runtime_http::Response, runtime_http::ClientError> {
         if cx.is_cancel_requested() {
-            return Err(runtime_http::ClientError::Cancelled);
+            return Err(distributed_http_context_termination(cx));
         }
         race_with_cx_cancel(cx, self.inner.post(url).body(body).send(cx)).await
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_http_context_termination(cx: &Cx) -> runtime_http::ClientError {
+    use crate::outcome::CancelKind;
+
+    match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => {
+            runtime_http::ClientError::DeadlineExceeded
+        }
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::PollQuota
+            | CancelKind::CostBudget
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => runtime_http::ClientError::Cancelled,
+        None => {
+            // A budget-aware operation can observe an exhausted deadline
+            // before the Cx has materialized a root cancellation cause. Keep
+            // that finite cause instead of collapsing it into operator cancel.
+            let budget = cx.budget_stats();
+            if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+                runtime_http::ClientError::DeadlineExceeded
+            } else {
+                runtime_http::ClientError::Cancelled
+            }
+        }
     }
 }
 
@@ -1094,24 +1127,26 @@ where
                 .await
                 .is_err()
             {
-                let error = if cx.is_cancel_requested() {
-                    runtime_http::ClientError::Cancelled
-                } else {
-                    runtime_http::ClientError::DeadlineExceeded
-                };
-                return Err::<runtime_http::Response, runtime_http::ClientError>(error);
+                return Err::<runtime_http::Response, runtime_http::ClientError>(
+                    distributed_http_context_termination(cx),
+                );
             }
             if cx.is_cancel_requested() {
                 return Err::<runtime_http::Response, runtime_http::ClientError>(
-                    runtime_http::ClientError::Cancelled,
+                    distributed_http_context_termination(cx),
                 );
             }
         }
     };
     let cancel_watcher = std::pin::pin!(cancel_watcher);
 
-    match select(inner, cancel_watcher).await {
+    let result = match select(inner, cancel_watcher).await {
         Either::Left((result, _)) | Either::Right((result, _)) => result,
+    };
+    if matches!(result, Err(runtime_http::ClientError::Cancelled)) {
+        Err(distributed_http_context_termination(cx))
+    } else {
+        result
     }
 }
 
