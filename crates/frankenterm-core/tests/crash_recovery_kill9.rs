@@ -76,6 +76,7 @@ use frankenterm_core::scrollback_mmap_recovery::{
     AlwaysOrphaned, LegacyRecoveryLimits, OrphanState, classify_path, scan_orphans,
 };
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt as _;
@@ -118,7 +119,10 @@ fn scrollback_path(dir: &Path, byte: u8) -> PathBuf {
 }
 
 fn scrollback_path_for_uuid(dir: &Path, pane_uuid: &[u8; 32]) -> PathBuf {
-    let stem: String = pane_uuid.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut stem = String::with_capacity(pane_uuid.len() * 2);
+    for byte in pane_uuid {
+        write!(&mut stem, "{byte:02x}").expect("writing hex into String cannot fail");
+    }
     dir.join(format!("{stem}.bin"))
 }
 

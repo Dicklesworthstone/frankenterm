@@ -871,14 +871,14 @@ CREATE TABLE maintenance_log (
 
 ```rust
 use rusqlite::{Connection, params};
-use tokio::sync::mpsc;
+use crate::runtime_async::mpsc;
 
 // ============================================================================
 // ASYNC-SAFE STORAGE ARCHITECTURE
 // ============================================================================
 // Why this design?
 // - rusqlite::Connection is NOT Clone and NOT Send
-// - Blocking SQLite calls in async workflows WILL block the Tokio runtime
+// - Blocking SQLite calls in async workflows WILL block the async executor
 // - Solution: single writer thread + read pool + async API via channels
 
 /// Commands sent to the dedicated DB writer thread
@@ -1879,7 +1879,7 @@ impl WorkflowEngine {
                 StepResult::Done(msg) => return Ok(Some(msg)),
                 StepResult::Retry { after, reason } => {
                     tracing::warn!("Retry after {:?}: {}", after, reason);
-                    tokio::time::sleep(after).await;
+                    crate::runtime_async::sleep(after).await;
                     // Retry same step
                     return Box::pin(self.run_workflow(workflow, ctx)).await;
                 }
@@ -1925,7 +1925,7 @@ impl WorkflowEngine {
                 }
             }
 
-            tokio::time::sleep(poll_interval).await;
+            crate::runtime_async::sleep(poll_interval).await;
         }
 
         Err(anyhow::anyhow!("Timeout waiting for condition"))
@@ -2035,7 +2035,7 @@ impl HandleUsageLimits {
             AgentType::Codex => {
                 // Send Ctrl-C twice
                 ctx.client.send_text(ctx.pane_id, "\x03", true).await?;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                crate::runtime_async::sleep(Duration::from_millis(200)).await;
                 ctx.client.send_text(ctx.pane_id, "\x03", true).await?;
             }
             AgentType::ClaudeCode => {
@@ -2138,7 +2138,7 @@ impl HandleUsageLimits {
                 ctx.client.send_text(ctx.pane_id, "cod login --device-auth\n", true).await?;
 
                 // Wait for device code
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                crate::runtime_async::sleep(Duration::from_secs(2)).await;
                 let text = ctx.client.get_text(ctx.pane_id, false).await?;
 
                 // Extract device code
@@ -2218,7 +2218,7 @@ impl HandleUsageLimits {
 
     async fn send_continue(&self, ctx: &mut WorkflowContext) -> Result<StepResult> {
         // Brief pause for session to stabilize
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        crate::runtime_async::sleep(Duration::from_secs(1)).await;
 
         ctx.client.send_text(ctx.pane_id, "proceed.\n", true).await?;
 
@@ -2262,7 +2262,7 @@ impl Workflow for HandleCompaction {
         match step {
             0 => {
                 // Wait for compaction to finish
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                crate::runtime_async::sleep(Duration::from_secs(1)).await;
                 Ok(StepResult::Continue)
             }
             1 => {
@@ -2672,7 +2672,7 @@ async fn robot_send(args: SendArgs, client: &WeztermClient) -> Result<RobotOutpu
                 break true;
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::runtime_async::sleep(Duration::from_millis(100)).await;
         }
     } else {
         false
@@ -2773,7 +2773,7 @@ impl BrowserAutomation {
         page.click_builder("button[type='submit']").click().await?;
 
         // Handle authentication (password, OTP, or SSO)
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        crate::runtime_async::sleep(Duration::from_secs(2)).await;
 
         // Check if we need password
         if page.query_selector("input[type='password']").await?.is_some() {
@@ -3033,7 +3033,7 @@ pub mod caut {
 
     /// Refresh usage data from APIs
     pub async fn refresh_usage(service: &str) -> Result<UsageInfo> {
-        let output = tokio::process::Command::new("caut")
+        let output = crate::runtime_async::process::Command::new("caut")
             .args(["refresh", "--service", service, "--format", "json"])
             .output()
             .await?;
@@ -3187,7 +3187,7 @@ pub fn parse_ssh_config() -> Result<Vec<SshHost>> {
 
 ```rust
 pub async fn setup_remote_host(host: &str, config: &SetupConfig) -> Result<SetupResult> {
-    use tokio::process::Command;
+    use crate::runtime_async::process::Command;
 
     let mut result = SetupResult::default();
 
@@ -3214,10 +3214,13 @@ pub async fn setup_remote_host(host: &str, config: &SetupConfig) -> Result<Setup
             fi
         "#;
 
-        Command::new("ssh")
+        let install = Command::new("ssh")
             .args([host, "bash", "-c", install_script])
-            .status()
+            .output()
             .await?;
+        if !install.status.success() {
+            anyhow::bail!("remote FrankenTerm dependency installation failed");
+        }
 
         result.wezterm_installed = true;
     }
@@ -3225,33 +3228,34 @@ pub async fn setup_remote_host(host: &str, config: &SetupConfig) -> Result<Setup
     // 2. Create systemd service
     let service_unit = include_str!("../resources/wezterm-mux-server.service");
 
-    Command::new("ssh")
-        .args([host, "mkdir", "-p", "~/.config/systemd/user"])
-        .status()
+    let create_service = Command::new("ssh")
+        .args([
+            host,
+            "sh", "-c",
+            "mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/wezterm-mux-server.service",
+        ])
+        .stdin_bytes(service_unit.as_bytes().to_vec())
+        .output()
         .await?;
-
-    let mut ssh = Command::new("ssh")
-        .args([host, "cat", ">", "~/.config/systemd/user/wezterm-mux-server.service"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    ssh.stdin.as_mut().unwrap()
-        .write_all(service_unit.as_bytes())
-        .await?;
-    ssh.wait().await?;
+    if !create_service.status.success() {
+        anyhow::bail!("remote mux service file creation failed");
+    }
 
     result.service_created = true;
 
     // 3. Enable and start service
-    Command::new("ssh")
+    let enable_service = Command::new("ssh")
         .args([
             host,
             "systemctl", "--user", "daemon-reload", "&&",
             "systemctl", "--user", "enable", "--now", "wezterm-mux-server", "&&",
             "sudo", "loginctl", "enable-linger", "$USER",
         ])
-        .status()
+        .output()
         .await?;
+    if !enable_service.status.success() {
+        anyhow::bail!("remote mux service activation failed");
+    }
 
     result.service_enabled = true;
 
@@ -3259,10 +3263,13 @@ pub async fn setup_remote_host(host: &str, config: &SetupConfig) -> Result<Setup
     if config.install_wa {
         let wa_binary = std::env::current_exe()?;
 
-        Command::new("scp")
+        let install_binary = Command::new("scp")
             .args([wa_binary.to_str().unwrap(), &format!("{}:~/.local/bin/wa", host)])
-            .status()
+            .output()
             .await?;
+        if !install_binary.status.success() {
+            anyhow::bail!("remote binary installation failed");
+        }
 
         result.wa_installed = true;
     }
@@ -3405,7 +3412,7 @@ impl AdaptivePoller {
 
 ```rust
 use futures::stream::{self, StreamExt};
-use tokio::sync::Semaphore;
+use crate::runtime_async::Semaphore;
 
 pub struct ParallelProcessor {
     semaphore: Arc<Semaphore>,
@@ -3717,7 +3724,7 @@ impl ResilientClient {
                             delay,
                             last_error.as_ref().unwrap()
                         );
-                        tokio::time::sleep(delay).await;
+                        crate::runtime_async::sleep(delay).await;
                     }
                 }
             }

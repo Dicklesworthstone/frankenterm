@@ -40,15 +40,15 @@
     },
     {
       "category": "perf/lindley-bounds",
-      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Substrate-pass artifact via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69 substrate-pass; ft-syqcz.5 sibling); the wired-pass cont-bead swaps the hard-coded per-stage rates for live latency_stages.rs telemetry reads + bench-driven empirical_p99_ms + sigstore signing.",
+      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Original substrate via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69); ft-7h5da.10.2 refreshes the published capture slice against the W9.1 append_segment group-commit storage service curve.",
       "media_type": "application/json",
       "path": "docs/attestations/perf/lindley-bounds.json",
-      "produced_by_bead": "ft-43x69",
+      "produced_by_bead": "ft-7h5da.10.2",
       "proof_categories": [
         8
       ],
-      "sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
-      "size_bytes": 3192
+      "sha256": "ea35d5fbd30aa8b2ebdc16e9b17c428a453a9194de2048f1017aa6864bffd262",
+      "size_bytes": 3206
     },
     {
       "category": "tui/render-parity",
@@ -60,8 +60,8 @@
         4,
         9
       ],
-      "sha256": "e469161dc96b4f5fb778b760f377fb59da340bd5f7a0c83af77528ad9ee34007",
-      "size_bytes": 14214
+      "sha256": "d61178dcb0948b6870eef2b4ff2a46a8017a1468028aeb4082acb1b4f80ed0fc",
+      "size_bytes": 17234
     },
     {
       "category": "tui/render-parity",
@@ -124,7 +124,20 @@
         9
       ],
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "size_bytes": 10087
+      "size_bytes": 17695
+    },
+    {
+      "category": "security/redaction-hygiene",
+      "description": "Temporal redaction hygiene (G10.5): catalog-versioned segment stamping (output_segments.redaction_catalog_version, schema v29) + catalog-aware backfill receipts (maintenance_log event_type='redaction_backfill').",
+      "media_type": "application/json",
+      "path": "docs/security/redaction-hygiene.json",
+      "produced_by_bead": "ft-7h5da.1.5",
+      "proof_categories": [
+        7,
+        9
+      ],
+      "sha256": "1999ebfc7483695c27a3112330ea9f51ee358cdb152b2691f4dfe63b02c39c3b",
+      "size_bytes": 4209
     },
     {
       "category": "security/distributed-threat-model",
@@ -173,8 +186,8 @@
       "proof_categories": [
         1
       ],
-      "sha256": "c056ef2473621ce6ae810e15e80fb749ec5165845b29afb613b4ba4de66ab884",
-      "size_bytes": 4208
+      "sha256": "1048904e8b4e20e78e81d5d66d9f5dacc0c153620c510b955fed4325b2f50cf5",
+      "size_bytes": 4730
     },
     {
       "category": "proofs/runtime-proof-trait",
@@ -199,8 +212,119 @@
         4,
         2
       ],
-      "sha256": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
-      "size_bytes": 49620
+      "sha256": "3103e220f887ae776e25eac2b54a3832d88bed0f97738c4cc3589ea5f68aa90b",
+      "size_bytes": 75138
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Mission objective-plan dry-run contract, reviewed golden corpus, no-mock harness, operator runbook, and Robot/MCP/CLI planning-surface convergence proof. Uses the existing robot-contracts release category because ft.mission_objective_plan.v1 is a schema-backed machine planning contract, not a new release taxonomy category.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/mission-objective-plan.json",
+      "produced_by_bead": "ft-auy2g.7",
+      "proof_categories": [
+        4
+      ],
+      "sha256": "40e0f3517ed95abee96e653e9ffed9f5d70a4790c963aaef110cdd6f560d169a",
+      "size_bytes": 8981
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Operating-envelope convergence/no-verdict artifact for the ft.operating_envelope.v1 fail-closed admission contract, retained fixture/proof-calendar corpus, operator runbook, and release-attestation posture. Uses the existing robot-contracts release category because this is a schema-backed read-only planning contract; it records that target-class capacity remains blocked while resource-cockpit target-class evidence is skipped_not_proven.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/operating-envelope.json",
+      "produced_by_bead": "ft-booek.7",
+      "proof_categories": [
+        4,
+        5
+      ],
+      "sha256": "d0004a4bbaf827654f5b0927d3289eb2092218a53172aa3fee1f25f32b88c189",
+      "size_bytes": 11341
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Mission-twin convergence proof mapping the snapshot, replay, counterfactual, ownership, Robot/MCP/CLI surface, retained corpus, and safety-policy child claims to code, tests, retained artifacts, and proof state. Uses the existing robot-contracts release category because ft.mission_twin.* is a schema-backed read-only planning contract; it does not claim live coordination authority or target-class capacity proof.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/mission-twin.json",
+      "produced_by_bead": "ft-u7r37.8",
+      "proof_categories": [
+        4
+      ],
+      "sha256": "f18ddb4430340ec1f947a0721966f8aedfd508ce02038d8d6c08a449458cf2bf",
+      "size_bytes": 13073
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Swarm-capacity completion readiness dashboard mapping each capacity child claim to implementation surfaces, tests, retained artifacts, target-class proof state, and release-attestation posture. The artifact is release evidence for the read-only Robot/MCP operator contract and keeps high-scale capacity wording blocked while target-class proof remains skipped_not_proven.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+      "produced_by_bead": "ft-b94bx.10",
+      "proof_categories": [
+        4,
+        5
+      ],
+      "sha256": "2cec8e0f2cbf7b5eb26f2b2693c9c0896d964c5d48bc361a8127e6373b204e7f",
+      "size_bytes": 19353
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Flight-recorder incident replay convergence proof mapping each ft-ogr3n child acceptance criterion to retained corpus artifacts, robot/MCP incident surfaces, no-side-effect guarantees, and RCH-only proof lanes. Uses the existing robot-contracts release category because ft.swarm.incident_surfaces.v1 is a schema-backed machine incident replay contract.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/flight-recorder-incident-replay.json",
+      "produced_by_bead": "ft-ogr3n.8",
+      "proof_categories": [
+        4
+      ],
+      "sha256": "e1e1277ea09491f8d5db0e9d8e2dfee366ff8e7b180abe079867ed85f8978d8f",
+      "size_bytes": 20703
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Deferred RCH proof replay convergence proof for the proof-debt queue contracts, ownership/admission fail-closed guards, retained live-attempt record, and focused remote-only replay proof. Uses the existing robot-contracts release category because the queue is a schema-backed operator/Robot/MCP contract; it does not claim that every queued proof debt has passed.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/deferred-proof-replay.json",
+      "produced_by_bead": "ft-zbnz4.7",
+      "proof_categories": [
+        4
+      ],
+      "sha256": "e3e95437beed2f9fa589b84c30060be20a565cec4dafcf20736ec6b67b7ca2cd",
+      "size_bytes": 15151
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Decision-API deadwire wiring-status doctrine artifact for designated allow_operation/evaluate/execute/observe entry points. The artifact publishes the schema and analyzer surface that CI can invoke to reject unwired production APIs unless a bead-owned dormant exemption is present.",
+      "media_type": "application/json",
+      "path": "docs/attestations/doctrine/wiring-status.json",
+      "produced_by_bead": "ft-7h5da.5.5",
+      "proof_categories": [
+        4,
+        11
+      ],
+      "sha256": "0924112562acf1f3bd86c4ac4e9fc30c41d9e19b97212a1cbdc5de13309103a7",
+      "size_bytes": 4454
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Unified Robot/MCP Contract Doctor verdict for the ft.robot_contract_doctor.v1 release contract. The artifact ties ApiSurface::ALL, the API-surface ledger, the six-dimension Contract Doctor matrix, MCP dispatch registry checks, tracked gap beads, CI workflow wiring, and the narrow RCH cargo proof into the proofs/robot-contracts category without promoting tracked exceptions to green claims.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/robot-contract-doctor.json",
+      "produced_by_bead": "ft-7h5da.13.7",
+      "proof_categories": [
+        4
+      ],
+      "sha256": "c5941826e1e3d560dfe55df8eae009cd321aa774a6f898cdfc8174f925184f47",
+      "size_bytes": 6081
+    },
+    {
+      "category": "proofs/rehearsal-score",
+      "description": "Rehearsal-score receipt golden matrix for the ft.rehearsal_score_receipt.v1 contract. Optional until the rehearsal scorer epic graduates release-required scoring evidence; blocked, skipped, degraded, missing-evidence, fixture-only, and local-fallback rows remain visible and must not be promoted to production proof claims.",
+      "media_type": "application/json",
+      "path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
+      "produced_by_bead": "ft-oohsx.5",
+      "proof_categories": [
+        4
+      ],
+      "sha256": "64322c734e7166ff826230f2ce77f4af93d6069895d230f67073e40079bbf74d",
+      "size_bytes": 26761
     },
     {
       "category": "proofs/tx-killswitch",
@@ -224,8 +348,8 @@
       "proof_categories": [
         5
       ],
-      "sha256": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
-      "size_bytes": 11245
+      "sha256": "286bbfc8726692b3b6bde18f0d14372c29d7e247b9db5d38a85325ff0510a179",
+      "size_bytes": 11320
     },
     {
       "category": "doctrine/vendored-provenance",
@@ -249,8 +373,8 @@
         1,
         5
       ],
-      "sha256": "e7a58aee6b1c29ab1954b2886ca31a9cad0aefa14eca4d98f11f4c34c7dae5ef",
-      "size_bytes": 4710
+      "sha256": "24f7ed41bf8a7adbe1a57c9db2c1a3f263859768e6fd11937679f6de16d6a5fb",
+      "size_bytes": 4928
     },
     {
       "category": "perf/atlas-packing",
@@ -305,7 +429,7 @@
           "unit": "delivered_artifacts",
           "value": 3
         },
-        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+        "source_artifact_hash": "3103e220f887ae776e25eac2b54a3832d88bed0f97738c4cc3589ea5f68aa90b",
         "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -349,10 +473,10 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 6
+          "value": 15
         },
-        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
-        "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+        "source_artifact_hash": "64322c734e7166ff826230f2ce77f4af93d6069895d230f67073e40079bbf74d",
+        "source_artifact_path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
         "time_budget_consumed": {
           "budget_seconds": null,
           "seconds": 0,
@@ -372,9 +496,9 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 7
+          "value": 9
         },
-        "source_artifact_hash": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
+        "source_artifact_hash": "286bbfc8726692b3b6bde18f0d14372c29d7e247b9db5d38a85325ff0510a179",
         "source_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -409,19 +533,19 @@
         "claim": "Best available confidence for Information-Theoretic Bound in this release bundle.",
         "confidence_type": "formal",
         "confidence_value": {
-          "reason": "Redactor coverage publishes the 99% recall sample floor but is under-sampled: current minimum 3 positive vectors per class; required 459.",
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
           "status": "not_quantified"
         },
-        "methodology_url": "docs/security/redactor-recall-derivation.md",
+        "methodology_url": "docs/proof-taxonomy.json#information-theoretic",
         "proof_category": 7,
         "proof_id": "release-bundle.information-theoretic.best-confidence",
         "sample_size_or_state_count": {
-          "kind": "sample_size",
-          "unit": "positive_examples_per_secret_class_floor",
-          "value": 459
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 2
         },
-        "source_artifact_hash": "4086804228aeb0b8c09136abf00aeec6632b56c34830a5bb0507d266a5a1fd9a",
-        "source_artifact_path": "docs/security/redactor-coverage.json",
+        "source_artifact_hash": "1999ebfc7483695c27a3112330ea9f51ee358cdb152b2691f4dfe63b02c39c3b",
+        "source_artifact_path": "docs/security/redaction-hygiene.json",
         "time_budget_consumed": {
           "budget_seconds": null,
           "seconds": 0,
@@ -443,7 +567,7 @@
           "unit": "delivered_artifacts",
           "value": 1
         },
-        "source_artifact_hash": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+        "source_artifact_hash": "ea35d5fbd30aa8b2ebdc16e9b17c428a453a9194de2048f1017aa6864bffd262",
         "source_artifact_path": "docs/attestations/perf/lindley-bounds.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -464,7 +588,7 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 6
+          "value": 7
         },
         "source_artifact_hash": "961df8a9d5f9addb82455269496ee6ff187cbdbe141bdad2b82001395e67baf8",
         "source_artifact_path": "docs/attestations/tui/render-parity-gpu.json",
@@ -510,10 +634,10 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 1
+          "value": 2
         },
-        "source_artifact_hash": "3a2198d2e2a4b0d031c0ace02e3d9eac4f887e7d8f6d8ef45d1abf8297365fec",
-        "source_artifact_path": "docs/attestations/tui/topology-parity.json",
+        "source_artifact_hash": "0924112562acf1f3bd86c4ac4e9fc30c41d9e19b97212a1cbdc5de13309103a7",
+        "source_artifact_path": "docs/attestations/doctrine/wiring-status.json",
         "time_budget_consumed": {
           "budget_seconds": null,
           "seconds": 0,
@@ -560,7 +684,7 @@
           "unit": "delivered_artifacts",
           "value": 3
         },
-        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+        "source_artifact_hash": "3103e220f887ae776e25eac2b54a3832d88bed0f97738c4cc3589ea5f68aa90b",
         "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -604,10 +728,10 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 6
+          "value": 15
         },
-        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
-        "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+        "source_artifact_hash": "64322c734e7166ff826230f2ce77f4af93d6069895d230f67073e40079bbf74d",
+        "source_artifact_path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
         "time_budget_consumed": {
           "budget_seconds": null,
           "seconds": 0,
@@ -627,9 +751,9 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 7
+          "value": 9
         },
-        "source_artifact_hash": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
+        "source_artifact_hash": "286bbfc8726692b3b6bde18f0d14372c29d7e247b9db5d38a85325ff0510a179",
         "source_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -664,19 +788,19 @@
         "claim": "Best available confidence for Information-Theoretic Bound in this release bundle.",
         "confidence_type": "formal",
         "confidence_value": {
-          "reason": "Redactor coverage publishes the 99% recall sample floor but is under-sampled: current minimum 3 positive vectors per class; required 459.",
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
           "status": "not_quantified"
         },
-        "methodology_url": "docs/security/redactor-recall-derivation.md",
+        "methodology_url": "docs/proof-taxonomy.json#information-theoretic",
         "proof_category": 7,
         "proof_id": "release-bundle.information-theoretic.best-confidence",
         "sample_size_or_state_count": {
-          "kind": "sample_size",
-          "unit": "positive_examples_per_secret_class_floor",
-          "value": 459
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 2
         },
-        "source_artifact_hash": "4086804228aeb0b8c09136abf00aeec6632b56c34830a5bb0507d266a5a1fd9a",
-        "source_artifact_path": "docs/security/redactor-coverage.json",
+        "source_artifact_hash": "1999ebfc7483695c27a3112330ea9f51ee358cdb152b2691f4dfe63b02c39c3b",
+        "source_artifact_path": "docs/security/redaction-hygiene.json",
         "time_budget_consumed": {
           "budget_seconds": null,
           "seconds": 0,
@@ -698,7 +822,7 @@
           "unit": "delivered_artifacts",
           "value": 1
         },
-        "source_artifact_hash": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+        "source_artifact_hash": "ea35d5fbd30aa8b2ebdc16e9b17c428a453a9194de2048f1017aa6864bffd262",
         "source_artifact_path": "docs/attestations/perf/lindley-bounds.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -719,7 +843,7 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 6
+          "value": 7
         },
         "source_artifact_hash": "961df8a9d5f9addb82455269496ee6ff187cbdbe141bdad2b82001395e67baf8",
         "source_artifact_path": "docs/attestations/tui/render-parity-gpu.json",
@@ -765,10 +889,10 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 1
+          "value": 2
         },
-        "source_artifact_hash": "3a2198d2e2a4b0d031c0ace02e3d9eac4f887e7d8f6d8ef45d1abf8297365fec",
-        "source_artifact_path": "docs/attestations/tui/topology-parity.json",
+        "source_artifact_hash": "0924112562acf1f3bd86c4ac4e9fc30c41d9e19b97212a1cbdc5de13309103a7",
+        "source_artifact_path": "docs/attestations/doctrine/wiring-status.json",
         "time_budget_consumed": {
           "budget_seconds": null,
           "seconds": 0,
@@ -780,15 +904,15 @@
     "schema_version": "1.0.0"
   },
   "deferred_slots": [],
-  "generated_at": "2026-05-24T23:46:25Z",
+  "generated_at": "2026-08-31T06:01:11Z",
   "generator": {
     "name": "scripts/attestation-build.sh",
     "version": "1.5.0"
   },
   "git": {
     "branch": "main",
-    "commit": "c0cdb05d2c462fefacfccb643061a77c1d2549de",
-    "tree": "4d06468e35dd6fd0b98bcb00d6c35fa12ea61ac7"
+    "commit": "f458f852e29b1c4522ff52fd04172d102a3b2799",
+    "tree": "e31a74e7039ac3a1d4a9d2094bfed18ec653f9d4"
   },
   "release": {
     "channel": "dev",
@@ -813,7 +937,7 @@
   "retractions": [],
   "schema_version": "1.0.0",
   "signature": {
-    "canonical_sha256": "efcd3ee7719dc366b299dcbe1b558997e8a2a3e378713957e03348d78319d40f",
+    "canonical_sha256": "ae2b2a49ed405de312df49b3b0feacd8536f957e7232b9a6b22ffe063b2024c4",
     "method": "unsigned",
     "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
   },
@@ -848,7 +972,7 @@
         "slug": "loom"
       },
       {
-        "artifact_count": 6,
+        "artifact_count": 15,
         "below_threshold": false,
         "bridge_plan_core": true,
         "deferred_slot_count": 0,
@@ -857,7 +981,7 @@
         "slug": "conformance"
       },
       {
-        "artifact_count": 7,
+        "artifact_count": 9,
         "below_threshold": false,
         "bridge_plan_core": true,
         "deferred_slot_count": 0,
@@ -875,7 +999,7 @@
         "slug": "formal-method"
       },
       {
-        "artifact_count": 1,
+        "artifact_count": 2,
         "below_threshold": false,
         "bridge_plan_core": true,
         "deferred_slot_count": 0,
@@ -893,7 +1017,7 @@
         "slug": "network-calculus"
       },
       {
-        "artifact_count": 6,
+        "artifact_count": 7,
         "below_threshold": false,
         "bridge_plan_core": true,
         "deferred_slot_count": 0,
@@ -911,7 +1035,7 @@
         "slug": "cryptographic"
       },
       {
-        "artifact_count": 1,
+        "artifact_count": 2,
         "below_threshold": false,
         "bridge_plan_core": false,
         "deferred_slot_count": 0,
@@ -941,13 +1065,13 @@
           "slug": "loom"
         },
         {
-          "artifact_delta": 6,
+          "artifact_delta": 15,
           "deferred_slot_delta": 0,
           "id": 4,
           "slug": "conformance"
         },
         {
-          "artifact_delta": 7,
+          "artifact_delta": 9,
           "deferred_slot_delta": 0,
           "id": 5,
           "slug": "quantitative-attestation"
@@ -959,7 +1083,7 @@
           "slug": "formal-method"
         },
         {
-          "artifact_delta": 1,
+          "artifact_delta": 2,
           "deferred_slot_delta": 0,
           "id": 7,
           "slug": "information-theoretic"
@@ -971,7 +1095,7 @@
           "slug": "network-calculus"
         },
         {
-          "artifact_delta": 6,
+          "artifact_delta": 7,
           "deferred_slot_delta": 0,
           "id": 9,
           "slug": "differential"
@@ -983,7 +1107,7 @@
           "slug": "cryptographic"
         },
         {
-          "artifact_delta": 1,
+          "artifact_delta": 2,
           "deferred_slot_delta": 0,
           "id": 11,
           "slug": "topological-invariant"

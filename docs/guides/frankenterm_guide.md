@@ -603,8 +603,7 @@ enum OutputFormat {
     Plain,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -613,6 +612,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::msg)?;
+    frankenterm_core::runtime_async::CompatRuntime::block_on(&runtime, async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     
     // Quick-start mode when no args
@@ -637,9 +644,8 @@ async fn main() -> Result<()> {
 ```rust
 // src/wezterm/client.rs
 use anyhow::{Context, Result};
+use frankenterm_core::runtime_async::process::Command;
 use serde::Deserialize;
-use std::process::Stdio;
-use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct WeztermClient {
@@ -675,9 +681,6 @@ impl WeztermClient {
         if let Some(ref socket) = self.socket {
             cmd.env("WEZTERM_UNIX_SOCKET", socket);
         }
-        
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
         
         let output = cmd.output().await?;
         
@@ -1453,7 +1456,7 @@ impl HandleUsageLimits {
     async fn handle_codex(&self, ctx: WorkflowContext) -> Result<String> {
         // 1. Send Ctrl-C twice to exit cleanly
         ctx.client.send_text(ctx.pane_id, "\x03\x03", true).await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(500)).await;
         
         // 2. Parse the session ID from the output
         let text = ctx.client.get_text(ctx.pane_id, false).await?;
@@ -1466,7 +1469,7 @@ impl HandleUsageLimits {
         
         // 4. Perform device auth login
         ctx.client.send_text(ctx.pane_id, "cod login --device-auth\n", true).await?;
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_secs(2)).await;
         
         // 5. Get the device code
         let text = ctx.client.get_text(ctx.pane_id, false).await?;
@@ -1480,7 +1483,7 @@ impl HandleUsageLimits {
         ).await?;
         
         // 7. Wait for login confirmation
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_secs(5)).await;
         
         // 8. Resume the session
         ctx.client.send_text(
@@ -1489,7 +1492,7 @@ impl HandleUsageLimits {
             true
         ).await?;
         
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_secs(2)).await;
         
         // 9. Send continue prompt
         ctx.client.send_text(ctx.pane_id, "proceed.\n", true).await?;
@@ -1528,7 +1531,7 @@ impl Workflow for HandleCompaction {
     
     async fn execute(&self, ctx: WorkflowContext) -> Result<String> {
         // Wait a moment for compaction to complete
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_secs(1)).await;
         
         // Send context refresh prompt
         let prompt = match ctx.detection.agent {
@@ -1558,7 +1561,7 @@ use anyhow::Result;
 use clap::Args;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::interval;
+use frankenterm_core::runtime_async;
 
 #[derive(Args, Debug)]
 pub struct WatchArgs {
@@ -1588,12 +1591,10 @@ pub async fn run(args: WatchArgs) -> Result<()> {
     // Track last seen content hash per pane for change detection
     let mut last_hashes: HashMap<u64, u64> = HashMap::new();
     
-    let mut ticker = interval(Duration::from_millis(args.interval_ms));
-    
     tracing::info!("Starting ft watcher daemon (interval={}ms)", args.interval_ms);
     
     loop {
-        ticker.tick().await;
+        runtime_async::sleep(Duration::from_millis(args.interval_ms)).await;
         
         let panes = match client.list_panes().await {
             Ok(p) => p,
@@ -1743,7 +1744,7 @@ pub async fn complete_openai_device_auth(
         .await?;
     
     // Wait for password or OTP page
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    frankenterm_core::runtime_async::sleep(std::time::Duration::from_secs(2)).await;
     
     // Handle password if needed (would need secure credential storage)
     // For now, assume SSO or already logged in
@@ -1764,7 +1765,7 @@ pub async fn complete_openai_device_auth(
         .await?;
     
     // Wait for confirmation
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    frankenterm_core::runtime_async::sleep(std::time::Duration::from_secs(3)).await;
     
     // Look for success indicator
     let success = page
@@ -2233,7 +2234,7 @@ return config
 // Part of setup.rs
 
 pub async fn setup_remote(host: &str) -> Result<()> {
-    use tokio::process::Command;
+    use frankenterm_core::runtime_async::process::Command;
     
     // 1. Check if wezterm is installed
     let check = Command::new("ssh")
@@ -2251,10 +2252,13 @@ pub async fn setup_remote(host: &str) -> Result<()> {
             sudo apt update && sudo apt install -y wezterm
         "#;
         
-        Command::new("ssh")
+        let install = Command::new("ssh")
             .args([host, "bash", "-c", install_script])
-            .status()
+            .output()
             .await?;
+        if !install.status.success() {
+            anyhow::bail!("remote FrankenTerm dependency installation failed");
+        }
     }
     
     // 2. Create systemd service
@@ -2273,23 +2277,21 @@ Environment=WEZTERM_LOG=warn
 WantedBy=default.target
 "#;
     
-    Command::new("ssh")
+    let create_service = Command::new("ssh")
         .args([
             host,
-            "mkdir", "-p", "~/.config/systemd/user",
-            "&&",
-            "cat", ">", "~/.config/systemd/user/wezterm-mux-server.service",
+            "sh", "-c",
+            "mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/wezterm-mux-server.service",
         ])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(service_unit.as_bytes())
+        .stdin_bytes(service_unit.as_bytes().to_vec())
+        .output()
         .await?;
+    if !create_service.status.success() {
+        anyhow::bail!("remote mux service file creation failed");
+    }
     
     // 3. Enable and start service
-    Command::new("ssh")
+    let enable_service = Command::new("ssh")
         .args([
             host,
             "systemctl", "--user", "daemon-reload",
@@ -2298,8 +2300,11 @@ WantedBy=default.target
             "&&",
             "sudo", "loginctl", "enable-linger", "$USER",
         ])
-        .status()
+        .output()
         .await?;
+    if !enable_service.status.success() {
+        anyhow::bail!("remote mux service activation failed");
+    }
     
     // 4. Verify
     let status = Command::new("ssh")
@@ -2569,7 +2574,7 @@ pub async fn safe_send_text(
             Ok(()) => return Ok(()),
             Err(e) if attempt < 3 => {
                 tracing::warn!("Send attempt {} failed: {}", attempt, e);
-                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                frankenterm_core::runtime_async::sleep(Duration::from_millis(100 * attempt as u64)).await;
             }
             Err(e) => return Err(e),
         }
