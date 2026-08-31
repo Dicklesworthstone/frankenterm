@@ -13,7 +13,7 @@
 #   - CLI commands (ft session list/show/delete/doctor) work correctly
 #
 # Requirements:
-#   - ft binary present (build via rch; script checks target/debug/ft or target/release-interactive/ft)
+#   - An explicit ft binary via --ft-bin PATH or FT_E2E_BIN
 #   - jq for JSON parsing
 #   - sqlite3 for database inspection
 #   - WezTerm mux server (optional; tests requiring it are skipped if unavailable)
@@ -46,11 +46,13 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-FT_BIN=""
+FT_BIN="${FT_E2E_BIN:-}"
 VERBOSE=false
 
-# Temp workspaces (cleaned up at exit)
-declare -a TEMP_DIRS=()
+# Private test evidence is intentionally preserved.  Agents in this repository
+# may not recursively delete even test-created directories, and retaining the
+# fixture root makes a failed native qualification auditable.
+E2E_RUN_ROOT=""
 
 # ==============================================================================
 # Argument parsing
@@ -62,9 +64,17 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        --ft-bin)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "--ft-bin requires a non-empty path" >&2
+                exit 3
+            fi
+            FT_BIN="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--verbose]" >&2
+            echo "Usage: $0 --ft-bin PATH [--verbose]" >&2
             exit 3
             ;;
     esac
@@ -105,12 +115,13 @@ log_info() {
 # Helpers
 # ==============================================================================
 
-# Create a temporary directory tracked for cleanup
+# Create a private temporary workspace beneath the retained evidence root.
 make_temp() {
-    local dir
-    dir=$(mktemp -d /tmp/ft-e2e-session-XXXXXX)
-    TEMP_DIRS+=("$dir")
-    echo "$dir"
+    if [[ -z "$E2E_RUN_ROOT" ]]; then
+        echo "internal error: E2E_RUN_ROOT is not initialized" >&2
+        return 1
+    fi
+    mktemp -d "$E2E_RUN_ROOT/workspace.XXXXXX"
 }
 
 # Create a fresh workspace with initialized database
@@ -243,15 +254,13 @@ insert_pane_state() {
         VALUES ($checkpoint_id, $pane_id, '$cwd', 'bash', '$terminal_state', '$agent_meta', $now);"
 }
 
-# Cleanup on exit
-cleanup() {
-    for dir in "${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}"; do
-        if [[ -d "$dir" ]]; then
-            rm -rf "$dir"
-        fi
-    done
+# Retain all evidence and make its location explicit on every exit path.
+report_evidence_root() {
+    if [[ -n "$E2E_RUN_ROOT" && -d "$E2E_RUN_ROOT" ]]; then
+        echo "Retained session-persistence evidence: $E2E_RUN_ROOT" >&2
+    fi
 }
-trap cleanup EXIT
+trap report_evidence_root EXIT
 
 # ==============================================================================
 # Prerequisites
@@ -260,15 +269,16 @@ trap cleanup EXIT
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if [[ -x "$PROJECT_ROOT/target/debug/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/debug/ft"
-    elif [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
-    else
-        echo -e "${RED}ERROR:${NC} ft binary not found. Build via rch first; this script checks target/debug/ft or target/release-interactive/ft." >&2
+    if [[ -z "$FT_BIN" ]]; then
+        echo -e "${RED}ERROR:${NC} no candidate binary selected; pass --ft-bin PATH or set FT_E2E_BIN" >&2
         exit 5
     fi
-    log_pass "P.1: ft binary found: $FT_BIN"
+    if [[ ! -x "$FT_BIN" ]]; then
+        echo -e "${RED}ERROR:${NC} selected ft binary is not executable: $FT_BIN" >&2
+        exit 5
+    fi
+    FT_BIN="$(cd "$(dirname "$FT_BIN")" && pwd -P)/$(basename "$FT_BIN")"
+    log_pass "P.1: explicit ft binary selected: $FT_BIN"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found" >&2
@@ -764,6 +774,9 @@ main() {
     echo -e "${BLUE}================================================================${NC}"
     echo -e "${BLUE}  ft Session Persistence E2E Test Suite${NC}"
     echo -e "${BLUE}================================================================${NC}"
+
+    E2E_RUN_ROOT=$(mktemp -d /tmp/ft-e2e-session-run.XXXXXX)
+    chmod 700 "$E2E_RUN_ROOT"
 
     check_prerequisites
 

@@ -12,7 +12,7 @@
 #   - No secrets leak into logs/artifacts
 #
 # Requirements:
-#   - wa/ft binary present (build via rch; script checks target/debug/wa or target/release-interactive/ft)
+#   - An explicit ft binary via --ft-bin PATH or FT_E2E_BIN
 #   - jq for JSON manipulation
 #   - sqlite3 for test data population
 # =============================================================================
@@ -20,7 +20,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
@@ -46,10 +45,11 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-FT_BIN=""
+FT_BIN="${FT_E2E_BIN:-}"
 VERBOSE=false
+E2E_RUN_ROOT=""
 
-# Temp workspaces (cleaned up at exit)
+# Named workspaces retained beneath E2E_RUN_ROOT.
 WORKSPACE_A=""
 WORKSPACE_B=""
 WORKSPACE_C=""
@@ -64,9 +64,17 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        --ft-bin)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "--ft-bin requires a non-empty path" >&2
+                exit 3
+            fi
+            FT_BIN="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--verbose]" >&2
+            echo "Usage: $0 --ft-bin PATH [--verbose]" >&2
             exit 3
             ;;
     esac
@@ -107,13 +115,40 @@ log_info() {
 # Helpers
 # ==============================================================================
 
-# Run wa command, extracting JSON from output (strips log lines)
-run_wa_json() {
+# Run ft command, extracting JSON from output (strips log lines)
+run_ft_json() {
     local raw_output
     raw_output=$("$FT_BIN" "$@" 2>/dev/null) || true
     # Extract JSON (first { to last })
     echo "$raw_output" | awk '/^{/{found=1} found{print}'
 }
+
+make_temp_workspace() {
+    if [[ -z "$E2E_RUN_ROOT" ]]; then
+        echo "internal error: E2E_RUN_ROOT is not initialized" >&2
+        return 1
+    fi
+    mktemp -d "$E2E_RUN_ROOT/workspace.XXXXXX"
+}
+
+sha256_file() {
+    local path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    else
+        echo "neither shasum nor sha256sum is available" >&2
+        return 1
+    fi
+}
+
+report_evidence_root() {
+    if [[ -n "$E2E_RUN_ROOT" && -d "$E2E_RUN_ROOT" ]]; then
+        echo "Retained backup/restore evidence: $E2E_RUN_ROOT" >&2
+    fi
+}
+trap report_evidence_root EXIT
 
 # Assert JSON field equals expected value
 assert_json_eq() {
@@ -182,7 +217,7 @@ assert_fails() {
 # Create a fresh workspace with initialized database
 create_workspace() {
     local ws
-    ws=$(mktemp -d)
+    ws=$(make_temp_workspace)
     "$FT_BIN" db migrate --workspace "$ws" --yes >/dev/null 2>&1
     echo "$ws"
 }
@@ -219,15 +254,16 @@ get_count() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
-    else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Build via rch first; this script checks target/debug/wa or target/release-interactive/ft." >&2
+    if [[ -z "$FT_BIN" ]]; then
+        echo -e "${RED}ERROR:${NC} no candidate binary selected; pass --ft-bin PATH or set FT_E2E_BIN" >&2
         exit 5
     fi
-    log_pass "P.1: wa binary found: $FT_BIN"
+    if [[ ! -x "$FT_BIN" ]]; then
+        echo -e "${RED}ERROR:${NC} selected ft binary is not executable: $FT_BIN" >&2
+        exit 5
+    fi
+    FT_BIN="$(cd "$(dirname "$FT_BIN")" && pwd -P)/$(basename "$FT_BIN")"
+    log_pass "P.1: explicit ft binary selected: $FT_BIN"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found" >&2
@@ -264,7 +300,7 @@ test_roundtrip() {
 
     # 1.1: Export from workspace A
     local export_json
-    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json)
+    export_json=$(run_ft_json backup export --workspace "$WORKSPACE_A" -f json)
 
     assert_json_eq "$export_json" '.ok' "true" "1.1: export succeeds"
 
@@ -303,7 +339,7 @@ test_roundtrip() {
 
     # 1.9: Verify the backup
     local verify_json
-    verify_json=$(run_wa_json backup import --workspace "$(mktemp -d)" "$export_path" --verify -f json)
+    verify_json=$(run_ft_json backup import --workspace "$(make_temp_workspace)" "$export_path" --verify -f json)
     assert_json_eq "$verify_json" '.ok' "true" "1.9: backup verification passes"
     assert_json_eq "$verify_json" '.data.verified' "true" "1.10: verified field is true"
 
@@ -312,7 +348,7 @@ test_roundtrip() {
     log_info "Workspace B: $WORKSPACE_B"
 
     local import_json
-    import_json=$(run_wa_json backup import --workspace "$WORKSPACE_B" "$export_path" --yes -f json)
+    import_json=$(run_ft_json backup import --workspace "$WORKSPACE_B" "$export_path" --yes -f json)
     assert_json_eq "$import_json" '.ok' "true" "1.11: import succeeds"
 
     # 1.12: Workspace B has same data as workspace A
@@ -374,7 +410,7 @@ test_corrupt_backup() {
 
     # Export a valid backup
     local export_json
-    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/corrupt_test")
+    export_json=$(run_ft_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/corrupt_test")
     local export_path
     export_path=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
 
@@ -390,7 +426,7 @@ test_corrupt_backup() {
 
     # 2.2: Verify detects corruption
     local verify_corrupt_json
-    verify_corrupt_json=$(run_wa_json backup import --workspace "$(mktemp -d)" "$corrupt_backup" --verify -f json)
+    verify_corrupt_json=$(run_ft_json backup import --workspace "$(make_temp_workspace)" "$corrupt_backup" --verify -f json)
 
     local verify_ok
     verify_ok=$(echo "$verify_corrupt_json" | jq -r '.ok' 2>/dev/null || echo "")
@@ -414,12 +450,12 @@ test_corrupt_backup() {
     cp -r "$export_path" "$corrupt_manifest"
     # Replace the db_checksum in manifest.json with a wrong value
     local tmp_manifest
-    tmp_manifest=$(mktemp)
+    tmp_manifest=$(mktemp "$E2E_RUN_ROOT/manifest.XXXXXX")
     jq '.db_checksum = "0000000000000000000000000000000000000000000000000000000000000000"' "$corrupt_manifest/manifest.json" > "$tmp_manifest"
     mv "$tmp_manifest" "$corrupt_manifest/manifest.json"
 
     local verify_manifest_json
-    verify_manifest_json=$(run_wa_json backup import --workspace "$(mktemp -d)" "$corrupt_manifest" --verify -f json)
+    verify_manifest_json=$(run_ft_json backup import --workspace "$(make_temp_workspace)" "$corrupt_manifest" --verify -f json)
 
     local verify_manifest_ok
     verify_manifest_ok=$(echo "$verify_manifest_json" | jq -r '.ok' 2>/dev/null || echo "")
@@ -432,7 +468,7 @@ test_corrupt_backup() {
 
     # 2.4: Import of backup with wrong manifest checksum fails
     local import_corrupt_json
-    import_corrupt_json=$(run_wa_json backup import --workspace "$(mktemp -d)" "$corrupt_manifest" --yes -f json)
+    import_corrupt_json=$(run_ft_json backup import --workspace "$(make_temp_workspace)" "$corrupt_manifest" --yes -f json)
 
     local import_ok
     import_ok=$(echo "$import_corrupt_json" | jq -r '.ok' 2>/dev/null || echo "")
@@ -457,7 +493,7 @@ test_corrupt_backup() {
     cp "$export_path/database.db" "$no_manifest/" 2>/dev/null || true
 
     local no_manifest_exit=0
-    "$FT_BIN" backup import --workspace "$(mktemp -d)" "$no_manifest" --verify -f json >/dev/null 2>&1 || no_manifest_exit=$?
+    "$FT_BIN" backup import --workspace "$(make_temp_workspace)" "$no_manifest" --verify -f json >/dev/null 2>&1 || no_manifest_exit=$?
     if [[ "$no_manifest_exit" -ne 0 ]]; then
         log_pass "2.5: missing manifest is detected (exit=$no_manifest_exit)"
     else
@@ -485,7 +521,7 @@ test_safety_backup() {
     local backup_for_import
     if [[ -n "$WORKSPACE_A" && -d "$WORKSPACE_A" ]]; then
         local export_json
-        export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/safety_test")
+        export_json=$(run_ft_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/safety_test")
         backup_for_import=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
     fi
 
@@ -494,7 +530,7 @@ test_safety_backup() {
         local tmp_ws
         tmp_ws=$(create_workspace)
         local export_json
-        export_json=$(run_wa_json backup export --workspace "$tmp_ws" -f json)
+        export_json=$(run_ft_json backup export --workspace "$tmp_ws" -f json)
         backup_for_import=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
     fi
 
@@ -505,7 +541,7 @@ test_safety_backup() {
 
     # 3.1: Import into workspace C (which has existing data)
     local import_json
-    import_json=$(run_wa_json backup import --workspace "$WORKSPACE_C" "$backup_for_import" --yes -f json)
+    import_json=$(run_ft_json backup import --workspace "$WORKSPACE_C" "$backup_for_import" --yes -f json)
     assert_json_eq "$import_json" '.ok' "true" "3.1: import into existing workspace succeeds"
 
     # 3.2: Safety backup was created
@@ -537,12 +573,12 @@ test_safety_backup() {
 
     # 3.5: Safety backup is itself verifiable
     local verify_safety_json
-    verify_safety_json=$(run_wa_json backup import --workspace "$(mktemp -d)" "$safety_path" --verify -f json)
+    verify_safety_json=$(run_ft_json backup import --workspace "$(make_temp_workspace)" "$safety_path" --verify -f json)
     assert_json_eq "$verify_safety_json" '.ok' "true" "3.5: safety backup passes verification"
 
     # 3.6: Import with --no-safety-backup skips safety
     local import_nosafety_json
-    import_nosafety_json=$(run_wa_json backup import --workspace "$WORKSPACE_C" "$backup_for_import" --yes --no-safety-backup -f json)
+    import_nosafety_json=$(run_ft_json backup import --workspace "$WORKSPACE_C" "$backup_for_import" --yes --no-safety-backup -f json)
     local nosafety_path
     nosafety_path=$(echo "$import_nosafety_json" | jq -r '.data.safety_backup_path // "null"' 2>/dev/null || echo "null")
     if [[ "$nosafety_path" == "null" ]]; then
@@ -567,7 +603,7 @@ test_export_options() {
 
     # 4.1: Export with --sql-dump
     local sqldump_json
-    sqldump_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json --sql-dump -o "$WORKSPACE_A/.ft/backups/sqldump_test")
+    sqldump_json=$(run_ft_json backup export --workspace "$WORKSPACE_A" -f json --sql-dump -o "$WORKSPACE_A/.ft/backups/sqldump_test")
     assert_json_eq "$sqldump_json" '.ok' "true" "4.1: export with --sql-dump succeeds"
 
     local sqldump_path
@@ -593,7 +629,7 @@ test_export_options() {
 
     # 4.4: Export with --no-verify
     local noverify_json
-    noverify_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json --no-verify -o "$WORKSPACE_A/.ft/backups/noverify_test")
+    noverify_json=$(run_ft_json backup export --workspace "$WORKSPACE_A" -f json --no-verify -o "$WORKSPACE_A/.ft/backups/noverify_test")
     assert_json_eq "$noverify_json" '.ok' "true" "4.4: export with --no-verify succeeds"
 
     # 4.5: Total size is reported
@@ -620,7 +656,7 @@ test_dry_run() {
     fi
 
     local export_json
-    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/dryrun_source")
+    export_json=$(run_ft_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/dryrun_source")
     local backup_path
     backup_path=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
 
@@ -636,17 +672,17 @@ test_dry_run() {
 
     # Record original state
     local orig_checksum
-    orig_checksum=$(sha256sum "$target_ws/.ft/ft.db" | awk '{print $1}')
+    orig_checksum=$(sha256_file "$target_ws/.ft/ft.db")
 
     # 5.1: Dry-run import
     local dryrun_json
-    dryrun_json=$(run_wa_json backup import --workspace "$target_ws" "$backup_path" --yes --dry-run -f json)
+    dryrun_json=$(run_ft_json backup import --workspace "$target_ws" "$backup_path" --yes --dry-run -f json)
     assert_json_eq "$dryrun_json" '.ok' "true" "5.1: dry-run import succeeds"
     assert_json_eq "$dryrun_json" '.data.dry_run' "true" "5.2: dry_run field is true"
 
     # 5.3: Database was NOT modified
     local new_checksum
-    new_checksum=$(sha256sum "$target_ws/.ft/ft.db" | awk '{print $1}')
+    new_checksum=$(sha256_file "$target_ws/.ft/ft.db")
     if [[ "$orig_checksum" == "$new_checksum" ]]; then
         log_pass "5.3: database unchanged after dry-run (checksum matches)"
     else
@@ -663,7 +699,7 @@ test_error_handling() {
 
     # 6.1: Export from non-existent workspace
     local bad_export_json
-    bad_export_json=$(run_wa_json backup export --workspace "/tmp/nonexistent_workspace_$(date +%s)" -f json)
+    bad_export_json=$(run_ft_json backup export --workspace "$E2E_RUN_ROOT/nonexistent-workspace" -f json)
     assert_json_eq "$bad_export_json" '.ok' "false" "6.1: export from missing workspace fails"
 
     # 6.2: Export error has error_code
@@ -671,7 +707,7 @@ test_error_handling() {
 
     # 6.3: Import from non-existent path
     local bad_import_json
-    bad_import_json=$(run_wa_json backup import --workspace "$(mktemp -d)" "/tmp/nonexistent_backup_$(date +%s)" --yes -f json)
+    bad_import_json=$(run_ft_json backup import --workspace "$(make_temp_workspace)" "$E2E_RUN_ROOT/nonexistent-backup" --yes -f json)
     assert_json_eq "$bad_import_json" '.ok' "false" "6.3: import from missing path fails"
 
     # 6.4: Import error has actionable hint
@@ -740,6 +776,9 @@ main() {
     echo -e "${BLUE}   E2E: Backup/Restore Cycle${NC}"
     echo -e "${BLUE}   Implements: wa-7fv${NC}"
     echo -e "${BLUE}================================================${NC}"
+
+    E2E_RUN_ROOT=$(mktemp -d /tmp/ft-e2e-backup-run.XXXXXX)
+    chmod 700 "$E2E_RUN_ROOT"
 
     # Initialize artifact collection
     e2e_init_artifacts "backup-restore-e2e" > /dev/null
