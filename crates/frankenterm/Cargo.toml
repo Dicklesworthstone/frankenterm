@@ -74,16 +74,6 @@ nix = { workspace = true, features = ["fs", "user"] }
 rustix.workspace = true
 tempfile.workspace = true
 
-# [round8 Windows port] openssl-sys reaches the `ft` build transitively via
-# frankenterm-ssh -> libssh-rs (config depends on frankenterm-ssh
-# unconditionally). Windows has no system OpenSSL, so vendor it (built from
-# source via openssl-src + Strawberry Perl, mirroring release.yml's Windows
-# Perl setup). Cargo feature-unification turns vendoring on for the whole
-# Windows build graph; Linux/macOS keep system OpenSSL (this target dep is
-# inactive there, so their builds are unchanged).
-[target.'cfg(windows)'.dependencies]
-openssl-sys = { version = "0.9", features = ["vendored"] }
-
 [features]
 # Round-5 test-build convenience: enables the compile-time moonshot optimizations
 # that measured as WINS or neutral — Q4 lazy-captures, Q5 Teddy, M1 ANSI-DFA.

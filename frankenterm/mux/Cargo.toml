@@ -57,7 +57,6 @@ luahelper = { workspace=true, optional = true }
 metrics.workspace = true
 mlua = { workspace=true, optional = true }
 names.workspace = true
-nix = {workspace=true, features=["term", "user"]}
 parking_lot.workspace = true
 percent-encoding.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
@@ -85,6 +84,9 @@ frankenterm-sigpipe.workspace = true
 # by mux feature flags instead of frankenterm-ssh defaults.
 frankenterm-ssh = { path = "../ssh", default-features = false, features = ["libssh-rs", "ssh2"] }
 frankenterm-term = { workspace=true, features=["use_serde"] }
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true, features = ["term", "user"] }
 
 [target."cfg(windows)".dependencies]
 ntapi.workspace = true

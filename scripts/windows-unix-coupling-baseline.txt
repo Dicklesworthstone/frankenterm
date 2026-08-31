@@ -26,7 +26,6 @@ frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for FileDescriptor
 frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for OwnedHandle {
 frankenterm/filedescriptor/src/unix.rs	unsafe { std::os::fd::BorrowedFd::borrow_raw(self.handle) }
 frankenterm/filedescriptor/src/unix.rs	use std::os::unix::prelude::*;
-frankenterm/mux/Cargo.toml	DEP nix = {workspace=true, features=["term"]}
 frankenterm/procinfo/src/macos.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
 frankenterm/pty/Cargo.toml	DEP nix = {workspace=true, features=["term", "fs"]}
 frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt;
@@ -48,3 +47,49 @@ frankenterm/window/src/os/wayland/window.rs	use std::os::fd::{FromRawFd, IntoRaw
 frankenterm/window/src/os/x11/connection.rs	use std::os::unix::io::AsRawFd;
 frankenterm/window/src/os/x11/keyboard.rs	use std::os::unix::ffi::OsStrExt;
 frankenterm/window/src/spawn.rs	pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&original_metadata)
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&replacement_metadata),
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&rewritten_metadata),
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&original_metadata)
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&replacement_metadata),
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&rewritten_metadata),
+crates/frankenterm-core/src/scrollback_mmap_writer.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&sentinel_path, &ledger_path)
+crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
+crates/frankenterm-core/tests/crash_recovery_kill9.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::fs::symlink(&real_parent, &symlink_parent).expect("create parent symlink");
+crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind replacement socket");
+crates/frankenterm-core/tests/integration_native_events.rs	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(other.path(), &manifest_paths(other.path())[0])
+crates/frankenterm-gui/src/native_bridge.rs	let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::fs::PermissionsExt;
+crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink(
+crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink("lease-target", &lease)
+crates/frankenterm-mux-server-impl/src/guardian_output_keys.rs	use std::os::fd::AsFd as _;
+crates/frankenterm-mux-server-impl/src/guardian_proxy.rs	fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+crates/frankenterm-pty-guardian/src/broker.rs	raw_fd: std::os::fd::RawFd,
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::fd::{AsFd, BorrowedFd};
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::net::UnixStream as BlockingUnixStream;
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::prelude::AsRawFd as _;
+crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::ffi::OsStrExt;
+crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{PermissionsExt, symlink};
+crates/frankenterm-pty-guardian/src/runtime.rs	use std::os::fd::{AsFd, AsRawFd};
+crates/frankenterm-pty-guardian/src/runtime.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-pty-guardian/src/transport.rs	let (old_stream, _old_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+crates/frankenterm-pty-guardian/src/transport.rs	use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+crates/frankenterm-pty-guardian/src/transport.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
+crates/frankenterm-pty-guardian/src/transport.rs	use std::os::unix::net::UnixStream as BlockingUnixStream;
+crates/frankenterm-pty-guardian/tests/pty_lifetime.rs	use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink("../escape", root.join("current"))
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&ft, &symlink).expect("plant source symlink");
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&retained_collision_target, root.join(&colliding_selector))
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&target, &link).expect("create escaping symlink");
+crates/frankenterm/src/main.rs	use std::os::unix::ffi::OsStrExt as _;
+crates/frankenterm/src/main.rs	use std::os::unix::fs::MetadataExt as _;
+crates/frankenterm/src/main.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm/tests/epipe_exit_code.rs	use std::os::unix::process::ExitStatusExt;
+frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt as _;
+frankenterm/pty/src/unix.rs	use std::os::fd::{AsFd, BorrowedFd};

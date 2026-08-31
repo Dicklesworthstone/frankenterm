@@ -2011,6 +2011,7 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -2088,6 +2089,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn deterministic_publication_temp_recovers_every_crash_mode_without_namespace_growth() {
         for retained_mode in [0o400, 0o600] {
@@ -2882,6 +2884,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn exact_intended_zero_and_prefix_records_are_quarantined_then_republished() {
         for corruption in [Vec::new(), b"{\"schema".to_vec()] {
@@ -3041,6 +3044,7 @@ mod tests {
         assert_eq!(transaction_names(&ledger), names_before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_newest_commit_poisons_transaction_without_older_record_fallback() {
         let (fixture, root, effective_uid) = root_fixture();
@@ -3086,6 +3090,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn detached_transaction_namespace_is_rejected_before_effect() {
         let (fixture, root, effective_uid) = root_fixture();
@@ -3116,6 +3121,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn uncommitted_partial_record_has_no_authority_and_advances_attempt_identity() {
         let (fixture, root, effective_uid) = root_fixture();

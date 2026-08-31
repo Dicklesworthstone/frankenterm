@@ -109820,6 +109820,7 @@ log_level = "debug"
         .expect("write atomic component fixture");
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_remote_setup_components_require_one_sealed_build_identity() {
         use sha2::Digest as _;

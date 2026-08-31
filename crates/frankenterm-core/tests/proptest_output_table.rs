@@ -101,6 +101,10 @@ proptest! {
     }
 
     /// Clone produces the same Debug representation as the original.
+    #[allow(
+        clippy::clone_on_copy,
+        reason = "this property intentionally exercises Alignment's Clone implementation separately from Copy"
+    )]
     #[test]
     fn alignment_clone(a in arb_alignment()) {
         let cloned = Clone::clone(&a);

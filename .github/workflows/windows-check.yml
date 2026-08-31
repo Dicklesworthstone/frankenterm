@@ -62,8 +62,8 @@ jobs:
           # lone green for a `-sys` crate behind a warm cache.
           key: windows-check-v2
 
-      # ft-x1klc: with openssl's `vendored` feature gated OFF on Windows (Mac stays
-      # vendored, Linux stays system), openssl-sys must find a *system* OpenSSL.
+      # ft-x1klc: with openssl's `vendored` feature gated OFF on Windows (macOS and
+      # Linux stay vendored), openssl-sys must find a provisioned OpenSSL SDK.
       # windows-latest ships vcpkg at $VCPKG_INSTALLATION_ROOT but does NOT pre-build
       # openssl, so provision it here and point openssl-sys at it via OPENSSL_DIR.
       # Triplet x64-windows-static-md = static OpenSSL libs against the dynamic CRT
