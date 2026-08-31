@@ -4230,8 +4230,11 @@ const MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MIN: std::time::Duration =
     std::time::Duration::from_millis(50);
 const MCP_AWAIT_EVENT_COMPLETION_RECONNECT_BACKOFF_MAX: std::time::Duration =
     std::time::Duration::from_secs(5);
+// StorageHandle owns a 30-second writer-settlement contract. Give that inner
+// authority one additional second so this wrapper cannot win the same-deadline
+// race and misclassify a clean but loaded shutdown as a service failure.
 const MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+    std::time::Duration::from_secs(31);
 #[cfg(not(test))]
 const MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE: std::time::Duration =
     std::time::Duration::from_secs(6);
@@ -4242,8 +4245,19 @@ const MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE: std::time::Duration =
 const MCP_AWAIT_EVENT_COMPLETION_BLOCKING_THREADS: usize = 1;
 const MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY: u64 = 16;
 const MCP_AWAIT_EVENT_REQUEST_CONCURRENCY: usize = 8;
+#[cfg(not(test))]
 const MCP_AWAIT_EVENT_SERVICE_RUNTIME_WORKERS: usize = 4;
+#[cfg(test)]
+const MCP_AWAIT_EVENT_SERVICE_RUNTIME_WORKERS: usize = 2;
+#[cfg(not(test))]
 const MCP_AWAIT_EVENT_SERVICE_BLOCKING_THREADS: usize = 8;
+// The core lib suite runs four tests concurrently in CI. Every await-event
+// fixture owns an isolated runtime, so using the production-sized pool in each
+// fixture can create 48 runtime threads before the tests' own request callers.
+// Four blocking threads still cover the test service's single SQLite writer
+// plus cleanup work while keeping the suite below ordinary CI process limits.
+#[cfg(test)]
+const MCP_AWAIT_EVENT_SERVICE_BLOCKING_THREADS: usize = 4;
 const MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY: usize = MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1;
 
 #[cfg(test)]
@@ -7724,7 +7738,7 @@ impl WaAwaitEventTool {
             .as_ref()
             .expect("test claim-completion executor must exist");
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            executor.wait_until_ready_for_test(std::time::Duration::from_secs(15)),
             "test claim-completion storage did not become ready"
         );
     }
@@ -14261,7 +14275,7 @@ mod tests {
                 return snapshot;
             }
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
+                started.elapsed() < std::time::Duration::from_secs(35),
                 "timed out waiting for {description}; last completion stats: {snapshot:?}"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -16263,7 +16277,7 @@ mod tests {
                 if phase == super::McpAwaitEventIterationPhase::PageScan
                     && event_id == second_event_id
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(1_100));
+                    std::thread::sleep(std::time::Duration::from_millis(5_100));
                 }
             });
         let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
@@ -16271,6 +16285,11 @@ mod tests {
             WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery)
                 .with_iteration_observer(iteration_observer);
         tool.wait_for_delivery_completion_ready_for_test();
+        let completion_stats = tool
+            .delivery_completion
+            .as_ref()
+            .expect("claim-completion executor must exist")
+            .stats_for_test();
 
         let envelope = parse_json_content(
             tool.call(
@@ -16280,7 +16299,7 @@ mod tests {
                     "cursor": 0,
                     "cursor_epoch": cursor_epoch,
                     "cursor_scope": cursor_scope,
-                    "timeout_secs": 1,
+                    "timeout_secs": 5,
                     "poll_interval_ms": 10,
                     "claim": true
                 }),
@@ -16296,6 +16315,11 @@ mod tests {
         assert_eq!(envelope["data"]["all"][1]["met"], false);
         assert_eq!(envelope["data"]["final_cursor"], 0);
         assert_eq!(envelope["data"]["pending_finalize"], false);
+        wait_for_completion_stats(
+            &completion_stats,
+            "partial page-scan lease release",
+            |snapshot| snapshot.completion_attempts_finished >= 1,
+        );
 
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
@@ -18328,7 +18352,7 @@ mod tests {
                 if phase == super::McpAwaitEventIterationPhase::BlockedRetry
                     && event_id == second_event_id
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(3_100));
+                    std::thread::sleep(std::time::Duration::from_millis(5_100));
                 }
             });
         let tool = tool
@@ -18343,7 +18367,7 @@ mod tests {
                     "cursor": 0,
                     "cursor_epoch": cursor_epoch,
                     "cursor_scope": cursor_scope,
-                    "timeout_secs": 3,
+                    "timeout_secs": 5,
                     "poll_interval_ms": 10,
                     "claim": true
                 }),
@@ -19098,7 +19122,7 @@ mod tests {
                     "cursor": 0,
                     "cursor_epoch": cursor_epoch,
                     "cursor_scope": cursor_scope,
-                    "timeout_secs": 1,
+                    "timeout_secs": 5,
                     "poll_interval_ms": 10,
                     "claim": true
                 }),
@@ -19380,9 +19404,11 @@ mod tests {
     }
 
     #[test]
-    fn await_event_threads_pre_cancelled_request_context_into_storage() {
+    fn await_event_service_rejects_pre_cancelled_request_before_poll() {
         let (_dir, db_path) = temp_db_path();
-        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool = WaAwaitEventTool::new_with_response_delivery(db_path, response_delivery);
+        tool.wait_for_delivery_completion_ready_for_test();
         let cx = crate::cx::Cx::for_testing();
         cx.set_cancel_requested(true);
         let context = McpContext::new(cx, 2);
