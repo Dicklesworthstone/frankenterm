@@ -25,11 +25,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
 LIST_ONLY=0
+WITH_CARGO=0
 FUZZ_SECONDS=""
 declare -a ONLY=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list) LIST_ONLY=1 ;;
+    --cargo) WITH_CARGO=1 ;;
     --only) shift; ONLY+=("${1:?--only needs a gate name}") ;;
     --fuzz-campaign) shift; FUZZ_SECONDS="${1:?--fuzz-campaign needs seconds}" ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
@@ -38,8 +40,14 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-declare -a GATE_NAMES=() GATE_CMDS=()
-gate() { GATE_NAMES+=("$1"); GATE_CMDS+=("$2"); }
+declare -a GATE_NAMES=() GATE_CMDS=() GATE_KINDS=()
+# gate NAME CMD            -> static: grep/jq/python over the tree, safe anywhere
+# cargo_gate NAME CMD      -> invokes cargo check/test; runs only with --cargo,
+#                             on a host where Cargo execution is admissible
+#                             (an RCH worker or the DSR quality lane), never as
+#                             a local substitute for remote proof.
+gate() { GATE_NAMES+=("$1"); GATE_CMDS+=("$2"); GATE_KINDS+=("static"); }
+cargo_gate() { GATE_NAMES+=("$1"); GATE_CMDS+=("$2"); GATE_KINDS+=("cargo"); }
 
 # --- Source doctrine -------------------------------------------------------
 gate "asupersync test-only doctrine"            "scripts/check_asupersync_test_only.sh"
@@ -53,7 +61,7 @@ gate "workspace cycles"                          "scripts/check_workspace_cycles
 gate "feature flag matrix"                       "bash scripts/check_feature_flag_matrix.sh"
 gate "release panic contract (profiles)"         "bash scripts/check-release-panic-contract.sh --profiles-only"
 gate "windows/unix coupling ratchet"             "bash scripts/check_windows_unix_coupling.sh"
-gate "finish-line guards"                        "bash scripts/check_finish_line_guards.sh"
+cargo_gate "finish-line guards"                  "bash scripts/check_finish_line_guards.sh"
 gate "spec conventions"                          "scripts/check-spec-conventions.sh"
 # --- Generated artifacts and docs ------------------------------------------
 gate "generated artifacts"                       "scripts/check_generated_artifacts.sh"
@@ -61,9 +69,9 @@ gate "renderer corpus drift"                     "scripts/check-renderer-corpus-
 gate "codec version release notes"               "scripts/check_codec_version_release_notes.sh"
 gate "readme counts"                             "bash scripts/stamp-readme-counts.sh --check"
 gate "vendored provenance"                       "bash scripts/check-provenance.sh"
-gate "ftui guardrails"                           "scripts/check_ftui_guardrails.sh"
+cargo_gate "ftui guardrails"                     "scripts/check_ftui_guardrails.sh"
 gate "ftui tests"                                "scripts/check_ftui_tests.sh"
-gate "ftui docs"                                 "scripts/check_ftui_docs.sh"
+cargo_gate "ftui docs"                           "scripts/check_ftui_docs.sh"
 gate "reality-check bead structure"              "scripts/check-reality-check-bead-structure.sh"
 # --- Attestation and contract verifiers ------------------------------------
 # Verifies the newest bundle in docs/attestations/ (today only the unsigned
@@ -80,13 +88,11 @@ gate "adversarial contract-fuzz manifest"        "tests/e2e/test_adversarial_con
 gate "Robot/MCP Contract Doctor static verdict"  "bash scripts/check-contract-doctor-coverage.sh"
 gate "Robot/MCP Contract Doctor attestation slot" "jq -e '.slots[] | select(.category == \"proofs/robot-contracts\") | select(.path == \"docs/attestations/proofs/robot-contract-doctor.json\") | select(.produced_by_bead == \"ft-7h5da.13.7\") | select(.proof_categories | index(4))' docs/attestations/manifest.json"
 gate "Robot/MCP Contract Doctor verdict contract" "tests/e2e/test_robot_contract_doctor_verdict_contract.sh"
-# The cargo half of the doctor verdict runs on RCH, not here:
-#   Robot/MCP Contract Doctor cargo verdict:
-#   cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture
+cargo_gate "Robot/MCP Contract Doctor cargo verdict" "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
 
 if [[ $LIST_ONLY -eq 1 ]]; then
   for i in "${!GATE_NAMES[@]}"; do
-    printf '%-46s %s\n' "${GATE_NAMES[$i]}" "${GATE_CMDS[$i]}"
+    printf '%-7s %-46s %s\n' "[${GATE_KINDS[$i]}]" "${GATE_NAMES[$i]}" "${GATE_CMDS[$i]}"
   done
   exit 0
 fi
@@ -105,6 +111,11 @@ declare -a FAILED=()
 for i in "${!GATE_NAMES[@]}"; do
   name="${GATE_NAMES[$i]}"; cmd="${GATE_CMDS[$i]}"
   selected "$name" || continue
+  if [[ "${GATE_KINDS[$i]}" == cargo && $WITH_CARGO -eq 0 ]]; then
+    printf 'SKIP %-46s (cargo gate; rerun with --cargo on an admissible host)\n' "$name"
+    skip=$((skip + 1))
+    continue
+  fi
   first_word="${cmd%% *}"
   if [[ "$first_word" == scripts/* || "$first_word" == tests/* ]] && [[ ! -x "$first_word" ]]; then
     printf 'SKIP %-46s (missing or not executable: %s)\n' "$name" "$first_word"
