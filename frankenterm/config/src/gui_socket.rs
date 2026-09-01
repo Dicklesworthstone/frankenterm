@@ -166,7 +166,10 @@ mod tests {
         assert_eq!(parse_gui_socket_pid("frankenterm-gui-sock-not-a-pid"), None);
         assert_eq!(parse_gui_socket_pid("frankenterm-gui-sock-0"), None);
         assert_eq!(parse_gui_socket_pid("frankenterm-gui-sock-00042"), None);
-        assert_eq!(parse_gui_socket_pid("frankenterm-gui-sock-4294967296"), None);
+        assert_eq!(
+            parse_gui_socket_pid("frankenterm-gui-sock-4294967296"),
+            None
+        );
         assert_eq!(parse_gui_socket_pid("frankenterm-gui-sock-42.lock"), None);
     }
 
@@ -203,7 +206,10 @@ mod tests {
             .expect("symlink");
         // The target does not exist; resolution still reports it, because
         // liveness is the caller's decision.
-        assert_eq!(resolve_published_gui_sock_in(dir.path(), "x.y.z").unwrap(), target);
+        assert_eq!(
+            resolve_published_gui_sock_in(dir.path(), "x.y.z").unwrap(),
+            target
+        );
         assert!(resolve_published_gui_sock_in(dir.path(), "missing").is_err());
     }
 }

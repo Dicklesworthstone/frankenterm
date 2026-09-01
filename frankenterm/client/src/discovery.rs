@@ -334,7 +334,7 @@ mod windows {
     use std::io::Error as IoError;
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
     use winapi::um::memoryapi::{
-        CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
     };
     use winapi::um::synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
     use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
@@ -967,7 +967,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_or_hardlinked_lease_refuses_quarantine() {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         for hardlink in [false, true] {
             let runtime = tempfile::tempdir().expect("unsafe lease runtime");

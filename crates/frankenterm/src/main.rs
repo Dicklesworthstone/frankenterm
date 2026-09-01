@@ -95541,6 +95541,35 @@ fn vendored_compatibility_diagnostic(
     DiagnosticCheck::ok_with_detail("WezTerm vendored", "vendored feature not enabled")
 }
 
+/// Report which mux socket the vendored client will dial and where that path
+/// came from, or list every source that was checked when none was found.
+fn mux_socket_diagnostic(
+    socket: Option<&frankenterm_core::wezterm::DiscoveredMuxSocket>,
+) -> DiagnosticCheck {
+    match socket {
+        Some(socket) => DiagnosticCheck::ok_with_detail(
+            "mux socket",
+            bounded_terminal_diagnostic(
+                &format!("{} (source: {})", socket.path.display(), socket.source),
+                256,
+                1_024,
+            ),
+        ),
+        None => {
+            let checked = frankenterm_core::wezterm::MuxSocketSource::ALL
+                .iter()
+                .map(|source| source.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            DiagnosticCheck::warning(
+                "mux socket",
+                format!("no listening mux socket discovered (checked: {checked})"),
+                "Start FrankenTerm.app or frankenterm-mux-server, or set [vendored].mux_socket_path",
+            )
+        }
+    }
+}
+
 /// Run all diagnostic checks and return results
 async fn run_diagnostics(
     cx: &frankenterm_core::cx::Cx,
@@ -95807,6 +95836,7 @@ async fn run_diagnostics(
         ));
     }
     checks.push(vendored_compatibility_diagnostic(&backend_selection));
+    checks.push(mux_socket_diagnostic(mux_client.discovered_socket()));
 
     // Check 3: WezTerm scrollback configuration
     match check_wezterm_scrollback() {

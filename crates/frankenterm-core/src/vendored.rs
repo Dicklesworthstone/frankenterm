@@ -344,42 +344,32 @@ pub fn compatibility_report_with(
     }
 }
 
-/// Discover the canonical WezTerm mux socket path by probing default unix
-/// domain paths from the vendored `config` crate.
+/// Socket path of the first unix domain in the vendored WezTerm configuration,
+/// when one is configured without a proxy command.
 ///
-/// This checks, in order:
-/// 1. The first configured unix domain from WezTerm's config file
-/// 2. The default unix domain (typically `$XDG_RUNTIME_DIR/wezterm/sock`)
-///
-/// Returns `Some(path)` if a socket file exists on disk at a canonical
-/// location, `None` otherwise. Proxy-command domains are skipped.
+/// Existence is deliberately not checked here; `wezterm::discover_mux_socket_ranked`
+/// applies the usability filter so every source is judged the same way.
 #[cfg(unix)]
 #[must_use]
-pub fn discover_canonical_mux_socket() -> Option<std::path::PathBuf> {
+pub fn configured_unix_domain_socket() -> Option<std::path::PathBuf> {
     use config as wezterm_config;
 
-    // Try user's WezTerm configuration unix domains first.
     let handle = wezterm_config::configuration_result()
         .unwrap_or_else(|_| wezterm_config::ConfigHandle::default_config());
-    if let Some(domain) = handle.unix_domains.first() {
-        if domain.proxy_command.is_none() {
-            let path = domain.socket_path();
-            if path.exists() {
-                return Some(path);
-            }
-        }
-    }
+    let domain = handle.unix_domains.first()?;
+    domain.proxy_command.is_none().then(|| domain.socket_path())
+}
 
-    // Fall back to default unix domains (e.g. /run/user/UID/wezterm/sock).
-    let mut default_domains = wezterm_config::UnixDomain::default_unix_domains();
-    if let Some(domain) = default_domains.pop() {
-        let path = domain.socket_path();
-        if path.exists() {
-            return Some(path);
-        }
-    }
+/// Socket path of the default unix domain (`<runtime dir>/sock`), which is
+/// where a headless `frankenterm-mux-server` listens. Existence is not checked.
+#[cfg(unix)]
+#[must_use]
+pub fn default_unix_domain_socket() -> Option<std::path::PathBuf> {
+    use config as wezterm_config;
 
-    None
+    wezterm_config::UnixDomain::default_unix_domains()
+        .pop()
+        .map(|domain| domain.socket_path())
 }
 
 fn commit_matches(vendored: &str, local: &str) -> bool {

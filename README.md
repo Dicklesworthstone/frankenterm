@@ -4,28 +4,11 @@
   <img src="frankenterm_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
 </div>
 
-<!-- ft-jjvxg + ft-xl2kc: Reality-check live demos.
-       - assets/demo.gif (tour) — CLI surface tour, synthetic. Render
-         with `vhs scripts/demo.tape`. Authored under ft-jjvxg.
-       - assets/demo-full.gif (swarm) — 5-min real-swarm scenario.
-         Render with `vhs scripts/demo-full.tape` AFTER staging the
-         10-pane NTM swarm per ft-xl2kc.1's runbook so the recording
-         captures real rate limits, real workflow auto-handling, real
-         search recoveries, and real mission orchestration.
-     Re-record both per major release per the release-checklist entry. -->
-<div align="center">
-  <img src="assets/demo.gif" alt="ft CLI tour — animated walkthrough of init / watch / robot / search / status">
-  <br>
-  <em>30-second tour of the <code>ft</code> CLI surface
-  (<a href="scripts/demo.tape">scripts/demo.tape</a>).</em>
-</div>
-
-<div align="center">
-  <img src="assets/demo-full.gif" alt="ft full scenario — 5-minute walkthrough of a 10-pane cc/cod/agy swarm with real rate-limit detection, workflow auto-handling, search recovery, and mission orchestration">
-  <br>
-  <em>5-minute swarm scenario — 10 live agents, real detections, no mocks
-  (<a href="scripts/demo-full.tape">scripts/demo-full.tape</a>).</em>
-</div>
+<!-- Demo recordings are embedded only once they exist in the tree.
+     `scripts/demo.tape` (CLI tour) and `scripts/demo-full.tape` (10-pane
+     live swarm) are the vhs sources; the swarm recording is tracked under
+     ft-xl2kc.1 / ft-xxfwy.21 and must be captured from real agents, not
+     staged output, before it is linked here. -->
 
 <div align="center">
 
@@ -298,9 +281,9 @@ This invokes the capacity-aware objective planner, which asks the operating enve
 Every load-bearing claim links to a signed artifact slot. The CLI re-hashes every artifact from disk, recomputes the canonical signing payload, checks the recorded `.sigstore` file hash + size, and verifies the Sigstore signature. Exits 0 on full pass, non-zero on any failure.
 
 ```bash
-ft attestation verify docs/attestations/0.2.0.json          # human-readable verdict
-ft attestation verify docs/attestations/0.2.0.json --json   # machine-readable verdict
-ft attestation show docs/attestations/0.2.0.json            # pretty-print without re-verifying
+ft attestation verify docs/attestations/<version>.json          # human-readable verdict
+ft attestation verify docs/attestations/<version>.json --json   # machine-readable verdict
+ft attestation show docs/attestations/<version>.json            # pretty-print without re-verifying
 ```
 
 `ft attestation` is a thin Rust wrapper over `scripts/attestation-verify.sh`; third parties without the `ft` binary can run the script directly.
@@ -433,7 +416,7 @@ Layering is enforced through sub-crate extraction, not just discipline. `franken
 
 ### 10. Reality-Check Discipline
 
-Every headline claim links to a signed attestation slot. The quarterly `/reality-check-for-project` discipline produces a bridge plan, a substrate of proof slots, and a per-release bundle. The current round (ft-tf6g3, opened 2026-05-12) is closing the final-mile gaps: attestation graph completeness, renderer SLO suite, round-3 statistical elevations (Lindley, Fano, SPRT, conformal bands, Mazurkiewicz cancel-traces, TLA+ TX-killswitch, Stateright work-family atomicity). See [`docs/reality-check-bridge-plan.md`](docs/reality-check-bridge-plan.md).
+Every headline claim is meant to link to a signed attestation slot. The quarterly `/reality-check-for-project` discipline produces a bridge plan, a substrate of proof slots, and a per-release bundle. The current round (ft-xxfwy, opened 2026-09-01) closes the entry ramp first: a signed installable release, `ft` attaching to the running FrankenTerm.app, a live-agent proof of the observe → detect → react → audit loop, and the first real signed bundle. See [`docs/reality-check-bridge-plan-2026-09-01.md`](docs/reality-check-bridge-plan-2026-09-01.md); the earlier rounds are [`docs/reality-check-bridge-plan.md`](docs/reality-check-bridge-plan.md) (2026-04-30) and [`docs/reality-check-bridge-plan-2026-05-12.md`](docs/reality-check-bridge-plan-2026-05-12.md) (ft-tf6g3).
 
 ---
 
@@ -533,17 +516,17 @@ production support claim unless the cited receipt criterion has proven evidence.
 Verify a release attestation bundle in one command, offline, without trusting GitHub or any registry:
 
 ```bash
-ft attestation verify docs/attestations/0.2.0.json
+ft attestation verify docs/attestations/<version>.json
 ```
 
 The CLI re-derives every artifact's SHA-256 from disk, recomputes the canonical signing payload, checks the recorded `.sigstore` file hash and size, and verifies the Sigstore signature. Exits 0 on full pass; non-zero on any failure. For machine-readable output:
 
 ```bash
-ft attestation verify docs/attestations/0.2.0.json --json
-ft attestation show docs/attestations/0.2.0.json
+ft attestation verify docs/attestations/<version>.json --json
+ft attestation show docs/attestations/<version>.json
 ```
 
-Use `--strict-required` on `verify` to fail when the bundle's `required_categories` list does not match the canonical manifest. Release CI runs the shell verifier with `--strict-deferred` so tagged releases cannot ship intentionally deferred slots.
+Use `--strict-required` on `verify` to fail when the bundle's `required_categories` list does not match the canonical manifest. The release gate is meant to run the shell verifier with `--strict-deferred` so tagged releases cannot ship intentionally deferred slots; wiring that check into the DSR quality gate is tracked under `ft-xxfwy.15`. At this revision the only bundle in the tree is `docs/attestations/0.0.0-dev.json` (dev channel, `signature.method: unsigned`); no tagged release has shipped a signed bundle yet, so `<version>` in the examples above is a placeholder until the first one lands.
 
 The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-verify.sh`](scripts/attestation-verify.sh); third parties without an `ft` binary can run the script directly with the same arguments. For Sigstore signing identity, Fulcio/Rekor trust-root details, and manual `cosign verify-blob` commands, see [`docs/attestations/SIGNING.md`](docs/attestations/SIGNING.md). For the per-release closure procedure (when to run, how to file regressions on hash mismatch), see [`docs/release/attestation-checklist.md`](docs/release/attestation-checklist.md).
 
@@ -1034,10 +1017,10 @@ ft proof-doctor                         # validate evidence artifacts in docs/at
 ### Attestation
 
 ```bash
-ft attestation verify docs/attestations/0.2.0.json
-ft attestation verify docs/attestations/0.2.0.json --json
-ft attestation verify docs/attestations/0.2.0.json --strict-required
-ft attestation show docs/attestations/0.2.0.json
+ft attestation verify docs/attestations/<version>.json
+ft attestation verify docs/attestations/<version>.json --json
+ft attestation verify docs/attestations/<version>.json --strict-required
+ft attestation show docs/attestations/<version>.json
 ```
 
 ### Bundled demo scenarios
@@ -1177,10 +1160,10 @@ agent continuity, titles, exact geometry, or full appearance.
 `ft restart` execution is likewise deliberately unavailable: it fails closed
 before locks, capture, process discovery, signals, spawning, or mux mutation
 until one authenticated mux endpoint can be bound to an exact process
-incarnation and verified relaunch receipt. The library can find unclean
-sessions, but the production `ft watch` startup path does not yet call that
-detector or offer a restore prompt. Use snapshot/session commands for evidence
-inspection and make any recovery changes manually.
+incarnation and verified relaunch receipt. The production `ft watch` startup
+path runs the unclean-session detector and logs what it finds, but it does not
+prompt or restore. Use snapshot/session commands for evidence inspection and
+make any recovery changes manually.
 
 The top-level `[session]` configuration table is entirely unsupported and is
 rejected, including the retired `session.restore_max_lines` key. The retired
@@ -1603,7 +1586,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 │   │   │   ├── ingest.rs                 # Pane discovery + delta extraction
 │   │   │   ├── patterns.rs               # Pattern detection engine
 │   │   │   ├── events.rs                 # Event bus and detection fanout
-│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v43)
+│   │   │   ├── storage/                  # SQLite + FTS5 (schema version: see storage/schema_ddl.rs::SCHEMA_VERSION)
 │   │   │   ├── policy.rs                 # Safety / access control
 │   │   │   ├── redactor.rs               # Secret redaction (T1/T2/T3 tiers)
 │   │   │   ├── plan.rs                   # Mission + Tx types
@@ -2449,7 +2432,7 @@ Top-level shape per the live bundles under `docs/attestations/`:
 ### Verify flow
 
 ```bash
-ft attestation verify docs/attestations/0.2.0.json
+ft attestation verify docs/attestations/<version>.json
 ```
 
 This:
@@ -2470,8 +2453,8 @@ Sigstore keyless signing via Fulcio + Rekor. The signing identity, trust roots, 
 When a shipped slot turns out to be wrong, the bundle is not edited. Instead, a retraction is recorded:
 
 ```bash
-ft attestation retract docs/attestations/0.2.0.json --slot proofs/tx-killswitch --reason "..."
-ft attestation retractions docs/attestations/0.2.0.json --json
+ft attestation retract docs/attestations/<version>.json --slot proofs/tx-killswitch --reason "..."
+ft attestation retractions docs/attestations/<version>.json --json
 ```
 
 Retractions are append-only and visible to anyone who verifies the bundle; this is the bundle-retraction substrate (ft-tf6g3.41).
@@ -2578,7 +2561,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v43**. The authoritative source is
+The current version is **v45** (as of 2026-09-01). The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -3023,7 +3006,7 @@ The project uses formal methods where they earn their keep, typically on invaria
 | **TLA+** | `docs/specs/blocker-radar-merge.tla` | Blocker-radar incident-merge invariants |
 | **TLA+** | `docs/specs/capture-fairness-scheduler.tla` | Round-robin scheduling fairness under priority overrides |
 | **TLA+** | `docs/specs/durable-state-checkpoint.tla` | Mux durable-state checkpoint correctness across crash + restore |
-| **Stateright** | `runtime_async` work-family atomicity (future round-3) | Atomicity properties on the work-claim queue under concurrent claim + complete |
+| **Explicit-state models (Stateright-style, hand-rolled)** | `tx_killswitch_model.rs`, `wire_dedup_model.rs`, `robot_fleet_state_machine.rs`, `robot_family_contract.rs` | Exhaustive small-bound state-space checks of the tx kill switch, wire dedup, fleet state machine, and work-claim atomicity (`docs/attestations/proofs/robot-work-atomicity.json`); no external model-checker crate is used |
 | **Lean** | [`docs/proofs/runtime-proof-soundness.lean`](docs/proofs/runtime-proof-soundness.lean) | The `RuntimeProof` sealed-trait argument (external code cannot implement `Sealed`) |
 | **proptest** | workspace-wide | Property-based testing of serde roundtrips, parser invariants, state-machine transitions (many hundreds of suites) |
 | **dylint** | custom lints | The `lints/cx_propagation` crate enforces `Cx` propagation conventions at lint time |
@@ -3056,6 +3039,7 @@ The current reality-check round (ft-tf6g3) is wiring the formal-methods substrat
 | `tui-oracle` | Legacy ratatui parity oracle for regression checks | off | Dev-only |
 | `disk-pressure` | Disk-pressure telemetry source | off | Envelope uses fallback signals |
 | `vendored` | Vendored migration map for upgrades | off | Older DBs need manual upgrade path |
+| `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | off | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
 | `subprocess-bridge` | Subprocess-bridge mission/tx surface | off | Subprocess-based mission steps unavailable |
 | `__journal_types_placeholder` | Test-only placeholder for unbuilt journal types | off | Test-internal |
 
@@ -3268,8 +3252,8 @@ outside that guarantee.
 Identical to SIGINT in steady state. The shutdown deadline is configurable; if
 the deadline passes before flush completes, the process exits with a non-zero
 code and the persisted unclean authority remains available to the explicit
-session-inspection commands. Production `ft watch` startup does not currently
-run the session detector or offer a recovery prompt.
+session-inspection commands. Production `ft watch` startup runs the session
+detector and logs its verdict; it does not offer a recovery prompt or restore.
 
 ### SIGKILL
 
@@ -3277,8 +3261,9 @@ There's no clean path. The watcher is killed mid-flush. On the next start:
 - The file lock is detected as stale (PID no longer exists).
 - The clean-shutdown marker is absent.
 - The persisted unclean marker remains available to the session inspection
-  commands. Automatic `ft watch` startup detection/prompting is not wired yet;
-  inspection and any manual reconstruction are explicit operator actions.
+  commands. `ft watch` startup detects and logs the unclean session but does
+  not prompt; inspection and any manual reconstruction are explicit operator
+  actions.
 - The DB is opened in WAL recovery mode; SQLite reconstructs consistent state from the WAL.
 
 ### Cancel-correctness in long ops
@@ -3803,7 +3788,7 @@ Reality-check is a quarterly / full-run discipline that produces a bridge plan, 
 - Attestation graph completeness (every headline claim → signed slot)
 - Renderer SLO attestation suite (resize FPS, input-to-photon, SSIM parity, atlas stability, idle GPU power)
 - Round-3 statistical elevations (Lindley, Fano, SPRT, conformal bands, Mazurkiewicz cancel-traces, TLA+ TX-killswitch, Stateright work-family atomicity)
-- `ft reality-check status` / `next` / `silent-close-audit` / `structure-audit` CLI verbs
+- `scripts/ft-reality-check.sh status` / `next` / `silent-close-audit` / `structure-audit` operator verbs (a shell script, not an `ft` subcommand)
 - Verify-the-verifier self-test for `ft attestation verify`
 
 See [`docs/process/reality-check-discipline.md`](docs/process/reality-check-discipline.md) for trigger rules; `scripts/check-reality-check-due.sh` reports when another full pass is due.
@@ -4309,7 +4294,7 @@ If admission is denied because telemetry is missing (rather than critical), the 
 
 ### Is my terminal output stored permanently?
 
-By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/ft/ft.db`. Long-running watchers periodically sample SQLite page statistics and report when an explicit operator-run `VACUUM` may be useful; they do not automatically monopolize the single writer with a full database rewrite. Backup and restore is supported via `ft backup export` / `ft backup import`.
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `<workspace>/.ft/ft.db` (the workspace is `FT_WORKSPACE` or the current directory; relocate it with an absolute `storage.db_path` or `general.data_dir`). Long-running watchers periodically sample SQLite page statistics and report when an explicit operator-run `VACUUM` may be useful; they do not automatically monopolize the single writer with a full database rewrite. Backup and restore is supported via `ft backup export` / `ft backup import`.
 
 ### Does ft send data anywhere?
 

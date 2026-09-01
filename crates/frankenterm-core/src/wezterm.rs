@@ -9347,46 +9347,237 @@ pub fn evaluate_backend_selection(inputs: &BackendSelectionInputs) -> BackendSel
     }
 }
 
-/// Discover the WezTerm mux socket path using all available sources.
+/// Where a discovered mux socket path came from. Variants are listed in
+/// ranking order: the first source that yields a usable socket wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxSocketSource {
+    /// `[vendored].mux_socket_path` in `ft.toml`.
+    ExplicitConfig,
+    /// `WEZTERM_UNIX_SOCKET` in the environment.
+    Environment,
+    /// The `default-<class>` (or `x11-*`/`wayland-*`) symlink a running
+    /// FrankenTerm GUI publishes in the runtime directory.
+    GuiPublished,
+    /// A live `frankenterm-gui-sock-<pid>` socket found by scanning the
+    /// runtime directory because the published symlink was missing or stale.
+    GuiInstance,
+    /// The first `unix_domains` entry of the vendored WezTerm configuration.
+    ConfigUnixDomain,
+    /// The headless mux-server default (`<runtime dir>/sock`).
+    DefaultUnixDomain,
+}
+
+impl MuxSocketSource {
+    /// Stable snake_case label used in diagnostics and JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitConfig => "explicit_config",
+            Self::Environment => "environment",
+            Self::GuiPublished => "gui_published",
+            Self::GuiInstance => "gui_instance",
+            Self::ConfigUnixDomain => "config_unix_domain",
+            Self::DefaultUnixDomain => "default_unix_domain",
+        }
+    }
+
+    /// Every source, in ranking order (what `ft doctor` reports as checked).
+    pub const ALL: [Self; 6] = [
+        Self::ExplicitConfig,
+        Self::Environment,
+        Self::GuiPublished,
+        Self::GuiInstance,
+        Self::ConfigUnixDomain,
+        Self::DefaultUnixDomain,
+    ];
+}
+
+impl std::fmt::Display for MuxSocketSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A mux socket path together with the source that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredMuxSocket {
+    /// Filesystem path of the listening socket.
+    pub path: std::path::PathBuf,
+    /// Which discovery source produced `path`.
+    pub source: MuxSocketSource,
+}
+
+/// Candidate socket paths per source, already filtered for usability
+/// (a socket exists at the path; GUI candidates additionally accept a
+/// connection). Pure input to [`rank_mux_socket_candidates`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MuxSocketCandidates {
+    /// Usable `[vendored].mux_socket_path`.
+    pub explicit_config: Option<std::path::PathBuf>,
+    /// Usable `WEZTERM_UNIX_SOCKET`.
+    pub environment: Option<std::path::PathBuf>,
+    /// Live socket behind the GUI's published symlink.
+    pub gui_published: Option<std::path::PathBuf>,
+    /// Live per-process GUI sockets, oldest instance first.
+    pub gui_instances: Vec<std::path::PathBuf>,
+    /// Existing socket of the first configured unix domain.
+    pub config_unix_domain: Option<std::path::PathBuf>,
+    /// Existing socket at the default unix-domain path.
+    pub default_unix_domain: Option<std::path::PathBuf>,
+}
+
+/// Pick the highest-ranked candidate. Pure: no filesystem or environment.
+#[must_use]
+pub fn rank_mux_socket_candidates(candidates: &MuxSocketCandidates) -> Option<DiscoveredMuxSocket> {
+    let pick = |path: &Option<std::path::PathBuf>, source: MuxSocketSource| {
+        path.as_ref().map(|path| DiscoveredMuxSocket {
+            path: path.clone(),
+            source,
+        })
+    };
+    pick(&candidates.explicit_config, MuxSocketSource::ExplicitConfig)
+        .or_else(|| pick(&candidates.environment, MuxSocketSource::Environment))
+        .or_else(|| pick(&candidates.gui_published, MuxSocketSource::GuiPublished))
+        .or_else(|| {
+            candidates
+                .gui_instances
+                .first()
+                .map(|path| DiscoveredMuxSocket {
+                    path: path.clone(),
+                    source: MuxSocketSource::GuiInstance,
+                })
+        })
+        .or_else(|| {
+            pick(
+                &candidates.config_unix_domain,
+                MuxSocketSource::ConfigUnixDomain,
+            )
+        })
+        .or_else(|| {
+            pick(
+                &candidates.default_unix_domain,
+                MuxSocketSource::DefaultUnixDomain,
+            )
+        })
+}
+
+/// Discover the mux socket to dial, reporting which source produced it.
 ///
-/// Resolution order:
-/// 1. Explicit config path (if set, non-empty, and usable)
-/// 2. `WEZTERM_UNIX_SOCKET` environment variable (if set and usable)
-/// 3. *(vendored feature, unix)* Canonical WezTerm unix-domain defaults
-///    (e.g. `$XDG_RUNTIME_DIR/wezterm/sock`)
+/// Resolution order (see [`MuxSocketSource`]):
+/// 1. `[vendored].mux_socket_path` (if set, non-empty, and a socket)
+/// 2. `WEZTERM_UNIX_SOCKET` (if set, non-empty, and a socket)
+/// 3. *(vendored feature, unix)* the socket a running FrankenTerm GUI
+///    published for the default window class, when it accepts connections
+/// 4. *(vendored feature, unix)* any live `frankenterm-gui-sock-<pid>` in the
+///    runtime directory, oldest instance first
+/// 5. *(vendored feature, unix)* the first configured unix domain
+/// 6. *(vendored feature, unix)* the default unix domain (`<runtime dir>/sock`)
 ///
-/// Returns the first usable socket path, or `None`. On Unix, regular
-/// files are rejected; the path must be a socket.
+/// Steps 3 and 4 are what let `ft` find FrankenTerm.app without an external
+/// `wezterm` binary: the GUI advertises its mux through the naming contract
+/// in `config::gui_socket`, and this is the consumer side of that contract.
+#[must_use]
+pub fn discover_mux_socket_ranked(config_socket_path: Option<&str>) -> Option<DiscoveredMuxSocket> {
+    rank_mux_socket_candidates(&gather_mux_socket_candidates(config_socket_path))
+}
+
+/// Discover the mux socket path using all available sources.
+///
+/// Path-only convenience over [`discover_mux_socket_ranked`]; callers that
+/// need to report *why* a socket was chosen should use the ranked form.
 #[must_use]
 pub fn discover_mux_socket(config_socket_path: Option<&str>) -> Option<std::path::PathBuf> {
+    discover_mux_socket_ranked(config_socket_path).map(|socket| socket.path)
+}
+
+fn gather_mux_socket_candidates(config_socket_path: Option<&str>) -> MuxSocketCandidates {
     use std::path::{Path, PathBuf};
 
-    // 1. Explicit config path.
-    if let Some(path) = config_socket_path {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() && mux_socket_path_is_usable(Path::new(trimmed)) {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
+    let usable_path = |raw: &str| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty() && mux_socket_path_is_usable(Path::new(trimmed)))
+            .then(|| PathBuf::from(trimmed))
+    };
 
-    // 2. WEZTERM_UNIX_SOCKET env var.
-    if let Ok(path) = std::env::var("WEZTERM_UNIX_SOCKET") {
-        if !path.trim().is_empty() && mux_socket_path_is_usable(Path::new(path.trim())) {
-            return Some(PathBuf::from(path.trim()));
-        }
-    }
+    let candidates = MuxSocketCandidates {
+        explicit_config: config_socket_path.and_then(usable_path),
+        environment: std::env::var("WEZTERM_UNIX_SOCKET")
+            .ok()
+            .as_deref()
+            .and_then(usable_path),
+        ..MuxSocketCandidates::default()
+    };
 
-    // 3. Canonical WezTerm unix-domain discovery (vendored feature, unix only).
     #[cfg(all(feature = "vendored", unix))]
-    {
-        if let Some(path) = crate::vendored::discover_canonical_mux_socket() {
-            if mux_socket_path_is_usable(&path) {
-                return Some(path);
-            }
-        }
-    }
+    let candidates = {
+        let mut candidates = candidates;
+        let (published, instances) = gui_socket_candidates_in(
+            ::config::RUNTIME_DIR.as_path(),
+            ::config::gui_socket::DEFAULT_WINDOW_CLASS,
+        );
+        candidates.gui_published = published;
+        candidates.gui_instances = instances;
+        candidates.config_unix_domain = crate::vendored::configured_unix_domain_socket()
+            .filter(|path| mux_socket_path_is_usable(path));
+        candidates.default_unix_domain = crate::vendored::default_unix_domain_socket()
+            .filter(|path| mux_socket_path_is_usable(path));
+        candidates
+    };
 
-    None
+    candidates
+}
+
+/// Find live FrankenTerm GUI sockets under `runtime_dir`.
+///
+/// Returns the socket behind the published `class_name` symlink (only when it
+/// resolves to a listening socket) and every live per-process GUI socket,
+/// oldest instance first. A socket whose owner has exited (connect refused)
+/// is never advertised, even if its file lingers.
+#[cfg(unix)]
+#[must_use]
+pub fn gui_socket_candidates_in(
+    runtime_dir: &std::path::Path,
+    class_name: &str,
+) -> (Option<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let published = ::config::gui_socket::resolve_published_gui_sock_in(runtime_dir, class_name)
+        .ok()
+        .map(|target| {
+            if target.is_absolute() {
+                target
+            } else {
+                runtime_dir.join(target)
+            }
+        })
+        .filter(|path| mux_socket_path_is_usable(path) && unix_socket_accepts_connections(path));
+
+    let mut instances: Vec<(std::time::SystemTime, std::path::PathBuf)> =
+        ::config::gui_socket::list_gui_socket_entries(runtime_dir)
+            .into_iter()
+            .filter(|(_, path)| unix_socket_accepts_connections(path))
+            .map(|(_, path)| {
+                let born = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (born, path)
+            })
+            .collect();
+    instances.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    (
+        published,
+        instances.into_iter().map(|(_, path)| path).collect(),
+    )
+}
+
+/// True when a unix socket at `path` currently accepts connections.
+///
+/// A refused or missing socket means its owner is gone; the connection is
+/// dropped immediately, which the mux listener treats as an idle client.
+#[cfg(unix)]
+fn unix_socket_accepts_connections(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 fn mux_socket_path_is_usable(path: &std::path::Path) -> bool {
@@ -9403,14 +9594,6 @@ fn mux_socket_path_is_usable(path: &std::path::Path) -> bool {
     {
         path.exists()
     }
-}
-
-fn explicit_mux_socket_path_is_usable(config: &crate::config::Config) -> bool {
-    let Some(path) = config.vendored.mux_socket_path.as_deref() else {
-        return false;
-    };
-    let trimmed = path.trim();
-    !trimmed.is_empty() && mux_socket_path_is_usable(std::path::Path::new(trimmed))
 }
 
 #[cfg(feature = "vendored")]
@@ -9438,8 +9621,7 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
     // the environment, the socket a running FrankenTerm GUI publishes, and the
     // headless mux-server defaults (GH #48, ft-xxfwy.5). The discovered path
     // is handed to the direct client below so selection and dialing agree.
-    let discovered_socket =
-        discover_mux_socket_ranked(config.vendored.mux_socket_path.as_deref());
+    let discovered_socket = discover_mux_socket_ranked(config.vendored.mux_socket_path.as_deref());
     let socket_found = discovered_socket.is_some();
 
     // Build compatibility inputs depending on feature availability.
@@ -9550,9 +9732,7 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
             // Dial the socket discovery actually found (typically the running
             // GUI's) instead of letting the direct client fall back to the
             // headless-server default and miss the app entirely.
-            mux.socket_path = discovered_socket
-                .as_ref()
-                .map(|socket| socket.path.clone());
+            mux.socket_path = discovered_socket.as_ref().map(|socket| socket.path.clone());
         }
         let pool = crate::pool::PoolConfig {
             max_size: config.vendored.mux_pool.max_connections.max(1),
@@ -12072,6 +12252,149 @@ mod unified_tests {
         let socket_path = dir.path().join("mux.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("unix socket");
         assert!(mux_socket_path_is_usable(&socket_path));
+    }
+
+    #[test]
+    fn rank_mux_socket_candidates_honors_source_order() {
+        use std::path::PathBuf;
+
+        let all = MuxSocketCandidates {
+            explicit_config: Some(PathBuf::from("/c")),
+            environment: Some(PathBuf::from("/e")),
+            gui_published: Some(PathBuf::from("/p")),
+            gui_instances: vec![PathBuf::from("/i1"), PathBuf::from("/i2")],
+            config_unix_domain: Some(PathBuf::from("/u")),
+            default_unix_domain: Some(PathBuf::from("/d")),
+        };
+        let expect = |candidates: &MuxSocketCandidates, path: &str, source: MuxSocketSource| {
+            assert_eq!(
+                rank_mux_socket_candidates(candidates),
+                Some(DiscoveredMuxSocket {
+                    path: PathBuf::from(path),
+                    source,
+                }),
+                "expected {source} to win"
+            );
+        };
+
+        expect(&all, "/c", MuxSocketSource::ExplicitConfig);
+        let mut candidates = all.clone();
+        candidates.explicit_config = None;
+        expect(&candidates, "/e", MuxSocketSource::Environment);
+        candidates.environment = None;
+        expect(&candidates, "/p", MuxSocketSource::GuiPublished);
+        candidates.gui_published = None;
+        expect(&candidates, "/i1", MuxSocketSource::GuiInstance);
+        candidates.gui_instances.clear();
+        expect(&candidates, "/u", MuxSocketSource::ConfigUnixDomain);
+        candidates.config_unix_domain = None;
+        expect(&candidates, "/d", MuxSocketSource::DefaultUnixDomain);
+        candidates.default_unix_domain = None;
+        assert_eq!(rank_mux_socket_candidates(&candidates), None);
+        assert_eq!(
+            rank_mux_socket_candidates(&MuxSocketCandidates::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn mux_socket_source_labels_are_stable_and_ordered() {
+        let labels: Vec<&str> = MuxSocketSource::ALL
+            .iter()
+            .map(|source| source.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "explicit_config",
+                "environment",
+                "gui_published",
+                "gui_instance",
+                "config_unix_domain",
+                "default_unix_domain",
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(MuxSocketSource::GuiPublished).expect("serialize"),
+            serde_json::json!("gui_published")
+        );
+        assert_eq!(MuxSocketSource::GuiInstance.to_string(), "gui_instance");
+        let socket = DiscoveredMuxSocket {
+            path: std::path::PathBuf::from("/tmp/frankenterm-gui-sock-1"),
+            source: MuxSocketSource::GuiPublished,
+        };
+        let round_trip: DiscoveredMuxSocket =
+            serde_json::from_value(serde_json::to_value(&socket).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_trip, socket);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn gui_socket_candidates_advertise_only_live_sockets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let class = "test.frankenterm.class";
+        // Live GUI instance: a listener is bound for the whole test.
+        let live = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 4242);
+        let _live_listener = std::os::unix::net::UnixListener::bind(&live).expect("bind live");
+        // Stale GUI instance: the socket file lingers after its owner exits.
+        let stale = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 7);
+        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind stale"));
+        assert!(
+            stale.exists(),
+            "stale socket file must linger for this test"
+        );
+        // The GUI published the live instance for this class.
+        std::os::unix::fs::symlink(
+            &live,
+            ::config::gui_socket::published_gui_sock_path_in(dir.path(), class),
+        )
+        .expect("publish symlink");
+
+        let (published, instances) = gui_socket_candidates_in(dir.path(), class);
+        assert_eq!(published.as_deref(), Some(live.as_path()));
+        assert_eq!(instances, vec![live.clone()]);
+
+        let discovered = rank_mux_socket_candidates(&MuxSocketCandidates {
+            gui_published: published,
+            gui_instances: instances,
+            ..MuxSocketCandidates::default()
+        })
+        .expect("live GUI socket is discoverable");
+        assert_eq!(discovered.path, live);
+        assert_eq!(discovered.source, MuxSocketSource::GuiPublished);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn gui_socket_candidates_reject_stale_and_dangling_published_links() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let class = "test.frankenterm.class";
+        let stale = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 9);
+        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind stale"));
+        std::os::unix::fs::symlink(
+            &stale,
+            ::config::gui_socket::published_gui_sock_path_in(dir.path(), class),
+        )
+        .expect("publish stale symlink");
+        std::os::unix::fs::symlink(
+            dir.path().join("missing"),
+            ::config::gui_socket::published_gui_sock_path_in(dir.path(), "other.class"),
+        )
+        .expect("publish dangling symlink");
+
+        assert_eq!(
+            gui_socket_candidates_in(dir.path(), class),
+            (None, Vec::new())
+        );
+        assert_eq!(
+            gui_socket_candidates_in(dir.path(), "other.class"),
+            (None, Vec::new())
+        );
+        assert_eq!(
+            gui_socket_candidates_in(dir.path(), "never.published"),
+            (None, Vec::new())
+        );
     }
 
     #[test]
