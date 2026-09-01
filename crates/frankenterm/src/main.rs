@@ -93042,7 +93042,7 @@ mod tests {
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
               total_bytes, checkpoint_role, topology_json)
-             SELECT ?1, ?2, 'periodic', '0000000000000000', ?3, 1024,
+             SELECT ?1, ?2, 'periodic', '0000000000000000', ?3, 0,
                     'snapshot', topology_json
              FROM mux_sessions
              WHERE session_id = ?1",
@@ -93066,6 +93066,16 @@ mod tests {
             rusqlite::params![checkpoint_id, pane_id as i64, cwd, command, terminal_json],
         )
         .expect("insert session show test pane state");
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET total_bytes = total_bytes + ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                checkpoint_id,
+                i64::try_from(terminal_json.len()).expect("test terminal state length fits in i64"),
+            ],
+        )
+        .expect("update session show test checkpoint payload bytes");
     }
 
     fn setup_robot_checkpoint_test_workspace() -> (
@@ -94548,7 +94558,7 @@ mod tests {
         let (db_path, conn, _dir) = setup_session_show_test_db();
         insert_session_for_session_show_test(&conn, "sess-empty-checkpoint", false);
         let checkpoint_id =
-            insert_checkpoint_for_session_show_test(&conn, "sess-empty-checkpoint", 2000, 2);
+            insert_checkpoint_for_session_show_test(&conn, "sess-empty-checkpoint", 2000, 0);
 
         let lookup = load_session_show_pane_lookup(
             &db_path,
@@ -96396,6 +96406,58 @@ mod tests {
         lock_mission_tx_contract(workspace_root, path).expect("lock tx contract fixture")
     }
 
+    const RESOURCE_WHAT_IF_ISOLATED_TEST_ENV: &str = "FT_RESOURCE_WHAT_IF_ISOLATED_TEST_CHILD";
+
+    /// Run a resource-digital-twin test in its own process.
+    ///
+    /// `ResourceDigitalTwinEngine` deliberately installs a process-wide
+    /// `SimulationGuard`: live side effects on any thread must fail closed
+    /// while a simulation is active because async work can migrate between
+    /// threads. The Rust test harness otherwise lets these pure simulation
+    /// tests overlap unrelated live-storage tests in this same process, where
+    /// the storage writer correctly observes the guard and panics. A child
+    /// test process preserves that production invariant while retaining
+    /// parallel execution between independent tests.
+    fn enter_isolated_resource_what_if_test(test_name: &str) -> bool {
+        let exact_name = format!("tests::{test_name}");
+        match std::env::var(RESOURCE_WHAT_IF_ISOLATED_TEST_ENV) {
+            Ok(child_name) => {
+                assert_eq!(
+                    child_name, exact_name,
+                    "resource what-if test child identity does not match the selected exact test"
+                );
+                true
+            }
+            Err(std::env::VarError::NotPresent) => {
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("resolve current resource what-if test binary"),
+                )
+                .arg(&exact_name)
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env(RESOURCE_WHAT_IF_ISOLATED_TEST_ENV, &exact_name)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("spawn isolated resource what-if test process");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success()
+                        && stdout.contains("running 1 test")
+                        && stdout.contains(&format!("test {exact_name} ... ok"))
+                        && stdout.contains("1 passed; 0 failed"),
+                    "isolated resource what-if test did not execute exactly once: status={:?}, stdout={stdout}, stderr={stderr}",
+                    output.status.code(),
+                );
+                false
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("resource what-if test child identity is not valid Unicode")
+            }
+        }
+    }
+
     fn sample_resource_what_if_package()
     -> frankenterm_core_replay::replay_counterfactual::ResourceControlOverridePackage {
         use frankenterm_core_replay::replay_counterfactual::ResourceControlOverrideLoader;
@@ -96759,6 +96821,11 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn resource_what_if_report_contract_covers_json_toon_and_human_gate_cases() {
+        if !enter_isolated_resource_what_if_test(
+            "resource_what_if_report_contract_covers_json_toon_and_human_gate_cases",
+        ) {
+            return;
+        }
         use frankenterm_core_replay::replay_resource_digital_twin::{
             ResourceDigitalTwinApplyRecommendation, ResourceDigitalTwinGateVerdict,
         };
@@ -96911,6 +96978,11 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn resource_what_if_proof_manifest_validates_fixed_replay_fixtures() {
+        if !enter_isolated_resource_what_if_test(
+            "resource_what_if_proof_manifest_validates_fixed_replay_fixtures",
+        ) {
+            return;
+        }
         use frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace;
         use std::collections::BTreeSet;
 
@@ -97695,6 +97767,11 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn resource_what_if_report_is_read_only_and_contract_shaped() {
+        if !enter_isolated_resource_what_if_test(
+            "resource_what_if_report_is_read_only_and_contract_shaped",
+        ) {
+            return;
+        }
         let trace = sample_resource_what_if_trace();
         let package = sample_resource_what_if_package();
         let package_toml = sample_resource_what_if_package_toml();
@@ -97741,6 +97818,11 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn resource_what_if_human_output_is_concise_and_operator_focused() {
+        if !enter_isolated_resource_what_if_test(
+            "resource_what_if_human_output_is_concise_and_operator_focused",
+        ) {
+            return;
+        }
         let trace = sample_resource_what_if_trace();
         let package = sample_resource_what_if_package();
         let package_toml = sample_resource_what_if_package_toml();
