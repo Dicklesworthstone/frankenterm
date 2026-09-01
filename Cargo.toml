@@ -606,6 +606,9 @@ fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fasta
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
 frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "4a75fd706917df915e644b00248540786df438f2", package = "frankensearch", default-features = false, features = ["hybrid"] }
+# Narrow registry alias for the audited descriptor-bound ACL presence probe.
+# Keep this isolated from the existing full-stack FrankenSearch git pin above.
+frankensearch-index-acl = { package = "frankensearch-index", version = "=0.2.3", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.1.8"
 

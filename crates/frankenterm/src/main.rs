@@ -6740,6 +6740,8 @@ where
     file.set_len(0)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
+    #[cfg(target_os = "macos")]
+    rustix::fs::fcntl_fullfsync(&file)?;
     let metadata = file.metadata()?;
     let path_metadata = parent.symlink_metadata(&temporary_name)?;
     anyhow::ensure!(
@@ -15182,6 +15184,839 @@ struct PreparedAgentConfig {
     slug: String,
 }
 
+const AGENT_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+const AGENT_CONFIG_TRANSACTION_PREFIX: &str = ".ft-agent-config-";
+const AGENT_CONFIG_TRANSACTION_ID_LEN: usize = 32;
+const AGENT_CONFIG_CANDIDATE_SUFFIX: &str = ".candidate";
+const AGENT_CONFIG_BACKUP_SUFFIX: &str = ".backup";
+const AGENT_CONFIG_CLAIM_SUFFIX: &str = ".claim.json";
+const AGENT_CONFIG_ACK_SUFFIX: &str = ".ack.json";
+const AGENT_CONFIG_PENDING_SUFFIX: &str = ".pending";
+const AGENT_CONFIG_MAX_TRANSACTION_FAMILIES: u64 = 64;
+const AGENT_CONFIG_MAX_TRANSACTION_ARTIFACTS: u64 = AGENT_CONFIG_MAX_TRANSACTION_FAMILIES * 4;
+const AGENT_CONFIG_MAX_TRANSACTION_ARTIFACT_BYTES: u64 =
+    AGENT_CONFIG_MAX_TRANSACTION_FAMILIES * (2 * AGENT_CONFIG_MAX_BYTES + 2 * 64 * 1024);
+const AGENT_CONFIG_MAX_DIRECTORY_ENTRIES_VISITED: u64 = 4_096;
+const AGENT_CONFIG_MAX_DIRECTORY_FILENAME_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentConfigTransaction {
+    id: String,
+    candidate_leaf: PathBuf,
+    backup_leaf: PathBuf,
+    claim_leaf: PathBuf,
+    ack_leaf: PathBuf,
+}
+
+impl AgentConfigTransaction {
+    fn new() -> Self {
+        Self::from_id(uuid::Uuid::new_v4().simple().to_string())
+            .expect("Uuid::simple must produce one valid 32-character transaction ID")
+    }
+
+    fn from_id(id: String) -> std::result::Result<Self, String> {
+        if id.len() != AGENT_CONFIG_TRANSACTION_ID_LEN
+            || !id
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(
+                "Agent config transaction ID must be 32 lowercase hexadecimal bytes.".to_string(),
+            );
+        }
+        Ok(Self {
+            candidate_leaf: PathBuf::from(format!(
+                "{AGENT_CONFIG_TRANSACTION_PREFIX}{id}{AGENT_CONFIG_CANDIDATE_SUFFIX}"
+            )),
+            backup_leaf: PathBuf::from(format!(
+                "{AGENT_CONFIG_TRANSACTION_PREFIX}{id}{AGENT_CONFIG_BACKUP_SUFFIX}"
+            )),
+            claim_leaf: PathBuf::from(format!(
+                "{AGENT_CONFIG_TRANSACTION_PREFIX}{id}{AGENT_CONFIG_CLAIM_SUFFIX}"
+            )),
+            ack_leaf: PathBuf::from(format!(
+                "{AGENT_CONFIG_TRANSACTION_PREFIX}{id}{AGENT_CONFIG_ACK_SUFFIX}"
+            )),
+            id,
+        })
+    }
+
+    fn validate_binding(&self) -> std::result::Result<(), String> {
+        let expected = Self::from_id(self.id.clone())?;
+        if self.candidate_leaf != expected.candidate_leaf
+            || self.backup_leaf != expected.backup_leaf
+            || self.claim_leaf != expected.claim_leaf
+            || self.ack_leaf != expected.ack_leaf
+        {
+            return Err(
+                "Agent config transaction artifact names are not bound to its ID.".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigTransactionClaim {
+    schema_version: String,
+    transaction_id: String,
+    parent_device: u64,
+    parent_inode: u64,
+    target_leaf: String,
+    action: String,
+    before: Option<AtomicPathObjectIdentity>,
+    candidate_leaf: String,
+    candidate_sha256: String,
+    backup_leaf: Option<String>,
+    backup_sha256: Option<String>,
+    requested_final_metadata: AgentConfigSecuritySnapshot,
+    durability_contract: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentConfigTransactionOutcome {
+    Applied,
+    AlreadyApplied,
+    ConflictBeforeEffect,
+    ConflictRolledBack,
+    Indeterminate,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigNamespaceObservation {
+    state: String,
+    metadata: Option<AtomicPathObjectMetadata>,
+    sha256: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigTransactionAck {
+    schema_version: String,
+    transaction_id: String,
+    claim_sha256: String,
+    outcome: AgentConfigTransactionOutcome,
+    observed_target: AgentConfigNamespaceObservation,
+    observed_candidate: AgentConfigNamespaceObservation,
+    observed_backup: AgentConfigNamespaceObservation,
+    candidate_file_synced: bool,
+    backup_file_synced: bool,
+    effect_parent_synced: bool,
+    ack_file_synced: bool,
+    ack_parent_synced: bool,
+    explicit_reconciliation_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct AgentConfigTransactionReceipt {
+    schema_version: String,
+    transaction_id: String,
+    target: String,
+    claim: String,
+    claim_sha256: String,
+    ack: String,
+    outcome: String,
+    candidate: String,
+    backup: Option<String>,
+    candidate_file_synced: bool,
+    backup_file_synced: bool,
+    effect_parent_synced: bool,
+    ack_file_synced: bool,
+    ack_parent_synced: bool,
+    explicit_reconciliation_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentConfigObjectIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl AgentConfigObjectIdentity {
+    fn from_metadata(metadata: &impl cap_fs_ext::MetadataExt) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentConfigFileObservation {
+    identity: AgentConfigObjectIdentity,
+    byte_len: u64,
+    modified: cap_std::time::SystemTime,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+fn agent_config_regular_file_observation(
+    metadata: &cap_std::fs::Metadata,
+    path: &Path,
+) -> std::result::Result<AgentConfigFileObservation, String> {
+    use cap_fs_ext::MetadataExt as _;
+    #[cfg(unix)]
+    use cap_std::fs::PermissionsExt as _;
+
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "Agent config '{}' must be a regular file and must not be a symbolic link.",
+            path.display()
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(format!(
+            "Agent config '{}' must have exactly one hard link.",
+            path.display()
+        ));
+    }
+    if metadata.len() > AGENT_CONFIG_MAX_BYTES {
+        return Err(format!(
+            "Agent config '{}' exceeds the 1 MiB safety limit.",
+            path.display()
+        ));
+    }
+    Ok(AgentConfigFileObservation {
+        identity: AgentConfigObjectIdentity::from_metadata(metadata),
+        byte_len: metadata.len(),
+        modified: metadata.modified().map_err(|err| {
+            format!(
+                "Failed to inspect modification time for '{}': {err}",
+                path.display()
+            )
+        })?,
+        #[cfg(unix)]
+        mode: metadata.permissions().mode() & 0o7777,
+        #[cfg(unix)]
+        uid: cap_std::fs::MetadataExt::uid(metadata),
+        #[cfg(unix)]
+        gid: cap_std::fs::MetadataExt::gid(metadata),
+        #[cfg(unix)]
+        changed_seconds: cap_std::fs::MetadataExt::ctime(metadata),
+        #[cfg(unix)]
+        changed_nanoseconds: cap_std::fs::MetadataExt::ctime_nsec(metadata),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_observation_matches_across_namespace_move(
+    current: AgentConfigFileObservation,
+    expected: AgentConfigFileObservation,
+) -> bool {
+    current.identity == expected.identity
+        && current.byte_len == expected.byte_len
+        && current.modified == expected.modified
+        && current.mode == expected.mode
+        && current.uid == expected.uid
+        && current.gid == expected.gid
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentConfigOpenIntent {
+    Inspect,
+    Update,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigSecuritySnapshot {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_security_snapshot_for_uid(
+    observation: AgentConfigFileObservation,
+    effective_uid: u32,
+    path: &Path,
+) -> std::result::Result<AgentConfigSecuritySnapshot, String> {
+    if observation.uid != effective_uid {
+        return Err(format!(
+            "Agent config '{}' is owned by uid {}, not the effective uid {effective_uid}.",
+            path.display(),
+            observation.uid
+        ));
+    }
+    if observation.mode & 0o7000 != 0 {
+        return Err(format!(
+            "Agent config '{}' has unsupported special mode bits {:04o}; refusing to replace metadata that cannot be preserved safely.",
+            path.display(),
+            observation.mode
+        ));
+    }
+    Ok(AgentConfigSecuritySnapshot {
+        uid: observation.uid,
+        gid: observation.gid,
+        mode: observation.mode,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_agent_config_has_no_extended_acl(
+    file: &impl std::os::fd::AsFd,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    use frankensearch_index_acl::fd_acl::extended_acl_presence;
+
+    match extended_acl_presence(file.as_fd()) {
+        Ok(presence) => validate_agent_config_acl_presence(presence, path),
+        Err(err) => Err(format!(
+            "Failed to inspect the descriptor-bound extended ACL for '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_agent_config_acl_presence(
+    presence: frankensearch_index_acl::fd_acl::ExtendedAclPresence,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    use frankensearch_index_acl::fd_acl::ExtendedAclPresence;
+
+    match presence {
+        ExtendedAclPresence::Absent => Ok(()),
+        ExtendedAclPresence::Present => Err(format!(
+            "Agent config '{}' has an extended ACL; refusing to replace metadata that cannot be preserved safely.",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_agent_config_has_no_xattrs(
+    file: &cap_std::fs::File,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    use std::os::fd::AsFd as _;
+
+    let mut empty = [0_u8; 0];
+    match rustix::fs::flistxattr(file.as_fd(), &mut empty) {
+        Ok(0) => Ok(()),
+        Ok(count) => Err(format!(
+            "Agent config '{}' has extended attributes ({count} name bytes); refusing to replace metadata that cannot be preserved safely.",
+            path.display()
+        )),
+        Err(err) if err == rustix::io::Errno::NOTSUP || err == rustix::io::Errno::OPNOTSUPP => {
+            Ok(())
+        }
+        Err(err) if err == rustix::io::Errno::RANGE => Err(format!(
+            "Agent config '{}' has extended attributes; refusing to replace metadata that cannot be preserved safely.",
+            path.display()
+        )),
+        Err(err) => Err(format!(
+            "Failed to inspect descriptor-bound extended attributes for '{}': {}",
+            path.display(),
+            std::io::Error::from(err)
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_agent_config_has_no_platform_flags(
+    file: &cap_std::fs::File,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    use std::os::fd::AsFd as _;
+
+    let flags = rustix::fs::fstat(file.as_fd())
+        .map_err(|err| {
+            format!(
+                "Failed to inspect descriptor-bound file flags for '{}': {}",
+                path.display(),
+                std::io::Error::from(err)
+            )
+        })?
+        .st_flags;
+    validate_macos_agent_config_flags(flags, path)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_agent_config_flags(flags: u32, path: &Path) -> std::result::Result<(), String> {
+    if flags == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Agent config '{}' has unsupported macOS file flags 0x{flags:x}; refusing to replace metadata that cannot be preserved safely.",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_agent_config_has_no_platform_flags(
+    file: &cap_std::fs::File,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    use std::os::fd::AsFd as _;
+
+    match rustix::fs::ioctl_getflags(file.as_fd()) {
+        Ok(flags) => validate_linux_agent_config_flags(flags, path),
+        Err(err)
+            if err == rustix::io::Errno::NOTTY
+                || err == rustix::io::Errno::NOTSUP
+                || err == rustix::io::Errno::OPNOTSUPP =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(format!(
+            "Failed to inspect descriptor-bound inode flags for '{}': {}",
+            path.display(),
+            std::io::Error::from(err)
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_agent_config_flags(
+    flags: rustix::fs::IFlags,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    // `FS_EXTENT_FL` is a kernel-managed structural marker on ordinary ext4
+    // files, not user policy metadata, and cannot be cleared with `chattr`.
+    // All preservation-relevant mutable or policy flags remain fail-closed.
+    const FS_EXTENT_FL: u32 = 0x0008_0000;
+    let policy_flags = flags & !rustix::fs::IFlags::from_bits_retain(FS_EXTENT_FL);
+    if policy_flags.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Agent config '{}' has unsupported Linux inode flags {policy_flags:?}; refusing to replace metadata that cannot be preserved safely.",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_agent_config_security(
+    parent: &AgentConfigParentDirectory,
+    path: &Path,
+    leaf: &Path,
+    file: &cap_std::fs::File,
+    expected_observation: AgentConfigFileObservation,
+) -> std::result::Result<AgentConfigSecuritySnapshot, String> {
+    let opened_before = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to inspect opened agent config security for '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    let named_before = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(leaf).map_err(|err| {
+            format!(
+                "Failed to inspect named agent config security for '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    if opened_before != expected_observation || named_before != expected_observation {
+        return Err(format!(
+            "Agent config '{}' changed before its security metadata was inspected.",
+            path.display()
+        ));
+    }
+
+    let security = agent_config_security_snapshot_for_uid(
+        opened_before,
+        nix::unistd::geteuid().as_raw(),
+        path,
+    )?;
+    ensure_agent_config_has_no_extended_acl(file, path)?;
+    ensure_agent_config_has_no_xattrs(file, path)?;
+    ensure_agent_config_has_no_platform_flags(file, path)?;
+
+    let opened_after = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to re-inspect opened agent config security for '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    let named_after = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(leaf).map_err(|err| {
+            format!(
+                "Failed to re-inspect named agent config security for '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    if opened_after != opened_before || named_after != opened_before {
+        return Err(format!(
+            "Agent config '{}' changed while its security metadata was inspected.",
+            path.display()
+        ));
+    }
+    parent.revalidate()?;
+    Ok(security)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_fresh_agent_config_security(
+    security: AgentConfigSecuritySnapshot,
+    source_security: Option<AgentConfigSecuritySnapshot>,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    if security.mode != 0o600 {
+        return Err(format!(
+            "New agent config artifact '{}' was not created with private mode 0600.",
+            path.display()
+        ));
+    }
+    if let Some(source_security) = source_security {
+        if security.uid != source_security.uid || security.gid != source_security.gid {
+            return Err(format!(
+                "New agent config artifact '{}' did not inherit source owner/group {}/{} exactly.",
+                path.display(),
+                source_security.uid,
+                source_security.gid
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn capture_agent_config_security(
+    _parent: &AgentConfigParentDirectory,
+    path: &Path,
+    _leaf: &Path,
+    _file: &cap_std::fs::File,
+    _expected_observation: AgentConfigFileObservation,
+) -> std::result::Result<AgentConfigSecuritySnapshot, String> {
+    Err(format!(
+        "Descriptor-bound agent config security inspection for '{}' is unsupported on this platform.",
+        path.display()
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn validate_fresh_agent_config_security(
+    _security: AgentConfigSecuritySnapshot,
+    _source_security: Option<AgentConfigSecuritySnapshot>,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    Err(format!(
+        "Descriptor-bound agent config artifact validation for '{}' is unsupported on this platform.",
+        path.display()
+    ))
+}
+
+struct AgentConfigParentDirectory {
+    directory: cap_std::fs::Dir,
+    file: fs::File,
+    path: PathBuf,
+    identity: AgentConfigObjectIdentity,
+}
+
+impl AgentConfigParentDirectory {
+    fn revalidate(&self) -> std::result::Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|err| {
+            format!(
+                "Failed to revalidate agent config directory '{}': {err}",
+                self.path.display()
+            )
+        })?;
+        let opened = self.file.metadata().map_err(|err| {
+            format!(
+                "Failed to revalidate opened agent config directory '{}': {err}",
+                self.path.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || !opened.file_type().is_dir()
+            || AgentConfigObjectIdentity::from_metadata(&metadata) != self.identity
+            || AgentConfigObjectIdentity::from_metadata(&opened) != self.identity
+        {
+            return Err(format!(
+                "Agent config directory '{}' changed identity during the operation.",
+                self.path.display()
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let effective_uid = nix::unistd::geteuid().as_raw();
+            if metadata.uid() != effective_uid
+                || opened.uid() != effective_uid
+                || metadata.mode() & 0o022 != 0
+                || opened.mode() & 0o022 != 0
+            {
+                return Err(format!(
+                    "Agent config directory '{}' must be owned by the effective user and must not be group- or world-writable.",
+                    self.path.display()
+                ));
+            }
+            ensure_agent_config_has_no_extended_acl(&self.file, &self.path)?;
+        }
+        Ok(())
+    }
+}
+
+fn open_agent_config_parent(
+    target_path: &Path,
+    create: bool,
+) -> std::result::Result<Option<AgentConfigParentDirectory>, String> {
+    let parent = target_path.parent().ok_or_else(|| {
+        format!(
+            "Agent config target '{}' has no parent directory.",
+            target_path.display()
+        )
+    })?;
+    if create {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Failed to create agent config directory '{}': {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let named = match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !create => {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect agent config directory '{}': {err}",
+                parent.display()
+            ));
+        }
+    };
+    if !named.file_type().is_dir() || named.file_type().is_symlink() {
+        return Err(format!(
+            "Agent config parent '{}' must be one direct non-symlink directory.",
+            parent.display()
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if named.uid() != nix::unistd::geteuid().as_raw() || named.mode() & 0o022 != 0 {
+            return Err(format!(
+                "Agent config directory '{}' must be owned by the effective user and must not be group- or world-writable.",
+                parent.display()
+            ));
+        }
+    }
+    let identity = AgentConfigObjectIdentity::from_metadata(&named);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+
+        let fd = rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .map_err(|err| {
+            format!(
+                "Failed to descriptor-pin agent config directory '{}': {err}",
+                parent.display()
+            )
+        })?;
+        fs::File::from(fd)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let file = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+        .and_then(|directory| directory.open("."))
+        .map(cap_std::fs::File::into_std)
+        .map_err(|err| {
+            format!(
+                "Failed to open agent config directory '{}': {err}",
+                parent.display()
+            )
+        })?;
+    let opened = file.metadata().map_err(|err| {
+        format!(
+            "Failed to inspect opened agent config directory '{}': {err}",
+            parent.display()
+        )
+    })?;
+    if !opened.file_type().is_dir() || AgentConfigObjectIdentity::from_metadata(&opened) != identity
+    {
+        return Err(format!(
+            "Agent config directory '{}' changed while it was opened.",
+            parent.display()
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ensure_agent_config_has_no_extended_acl(&file, parent)?;
+    let directory = cap_std::fs::Dir::from_std_file(file.try_clone().map_err(|err| {
+        format!(
+            "Failed to retain agent config directory '{}': {err}",
+            parent.display()
+        )
+    })?);
+    let parent = AgentConfigParentDirectory {
+        directory,
+        file,
+        path: parent.to_path_buf(),
+        identity,
+    };
+    parent.revalidate()?;
+    Ok(Some(parent))
+}
+
+fn agent_config_leaf(target_path: &Path) -> std::result::Result<PathBuf, String> {
+    target_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "Agent config target '{}' has no file name.",
+                target_path.display()
+            )
+        })
+}
+
+struct OpenAgentConfigFile {
+    file: cap_std::fs::File,
+    observation: AgentConfigFileObservation,
+    content: String,
+    security: Option<AgentConfigSecuritySnapshot>,
+}
+
+fn read_open_agent_config_file(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    intent: AgentConfigOpenIntent,
+) -> std::result::Result<Option<OpenAgentConfigFile>, String> {
+    let leaf = agent_config_leaf(target_path)?;
+    let named_before = match parent.directory.symlink_metadata(&leaf) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect '{}': {err}",
+                target_path.display()
+            ));
+        }
+    };
+    let named_observation = agent_config_regular_file_observation(&named_before, target_path)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    if intent == AgentConfigOpenIntent::Update {
+        options.write(true);
+    }
+    let mut file = parent.directory.open_with(&leaf, &options).map_err(|err| {
+        format!(
+            "Failed to open agent config '{}' for {} without following links: {err}",
+            target_path.display(),
+            match intent {
+                AgentConfigOpenIntent::Inspect => "inspection",
+                AgentConfigOpenIntent::Update => "authorized update",
+            }
+        )
+    })?;
+    let opened_observation = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to inspect opened agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    if opened_observation != named_observation {
+        return Err(format!(
+            "Agent config '{}' changed identity while it was opened.",
+            target_path.display()
+        ));
+    }
+    let mut content = String::new();
+    (&mut file)
+        .take(AGENT_CONFIG_MAX_BYTES.saturating_add(1))
+        .read_to_string(&mut content)
+        .map_err(|err| format!("Failed to read '{}': {err}", target_path.display()))?;
+    let opened_after = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to re-inspect opened agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    let named_after = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+            format!(
+                "Failed to re-inspect agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > AGENT_CONFIG_MAX_BYTES
+        || u64::try_from(content.len()).unwrap_or(u64::MAX) != opened_observation.byte_len
+        || opened_after != opened_observation
+        || named_after != opened_observation
+    {
+        return Err(format!(
+            "Agent config '{}' changed while it was read.",
+            target_path.display()
+        ));
+    }
+    parent.revalidate()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let security = match intent {
+        AgentConfigOpenIntent::Inspect => None,
+        AgentConfigOpenIntent::Update => Some(capture_agent_config_security(
+            parent,
+            target_path,
+            &leaf,
+            &file,
+            opened_observation,
+        )?),
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let security = None;
+    Ok(Some(OpenAgentConfigFile {
+        file,
+        observation: opened_observation,
+        content,
+        security,
+    }))
+}
+
+fn read_agent_config_path(target_path: &Path) -> std::result::Result<Option<String>, String> {
+    let Some(parent) = open_agent_config_parent(target_path, false)? else {
+        return Ok(None);
+    };
+    read_open_agent_config_file(&parent, target_path, AgentConfigOpenIntent::Inspect)
+        .map(|snapshot| snapshot.map(|snapshot| snapshot.content))
+}
+
 fn robot_agent_config_scope_label(scope: RobotAgentConfigScope) -> &'static str {
     match scope {
         RobotAgentConfigScope::Project => "project",
@@ -15331,14 +16166,7 @@ fn prepare_agent_config(
     let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
     let template = frankenterm_core::agent_config_templates::generate_template(&provider);
     let target_path = resolve_agent_config_target_path(entry, scope, workspace_root, &template)?;
-    let existing_content = if target_path.exists() {
-        Some(
-            fs::read_to_string(&target_path)
-                .map_err(|err| format!("Failed to read '{}': {err}", target_path.display()))?,
-        )
-    } else {
-        None
-    };
+    let existing_content = read_agent_config_path(&target_path)?;
     let action = classify_agent_config_action(existing_content.as_deref(), &template.content);
 
     Ok(PreparedAgentConfig {
@@ -15373,6 +16201,54 @@ fn classify_agent_config_action(
     } else {
         frankenterm_core::agent_config_templates::ConfigAction::Append
     }
+}
+
+fn bounded_agent_config_merged_len(existing: &str, new_section: &str) -> Option<u64> {
+    use frankenterm_core::agent_config_templates::{SECTION_END_MARKER, SECTION_START_MARKER};
+
+    let fenced_len = SECTION_START_MARKER
+        .len()
+        .checked_add(1)?
+        .checked_add(new_section.len())?
+        .checked_add(1)?
+        .checked_add(SECTION_END_MARKER.len())?;
+    let merged_len = if let Some(start_idx) = existing.find(SECTION_START_MARKER) {
+        if let Some(relative_end) = existing[start_idx..].find(SECTION_END_MARKER) {
+            let end_idx = start_idx
+                .checked_add(relative_end)?
+                .checked_add(SECTION_END_MARKER.len())?;
+            existing
+                .len()
+                .checked_sub(end_idx.checked_sub(start_idx)?)?
+                .checked_add(fenced_len)?
+        } else {
+            appended_agent_config_len(existing, fenced_len)?
+        }
+    } else {
+        appended_agent_config_len(existing, fenced_len)?
+    };
+    u64::try_from(merged_len).ok()
+}
+
+fn appended_agent_config_len(existing: &str, fenced_len: usize) -> Option<usize> {
+    existing
+        .len()
+        .checked_add(usize::from(
+            !existing.is_empty() && !existing.ends_with('\n'),
+        ))?
+        .checked_add(usize::from(!existing.is_empty()))?
+        .checked_add(fenced_len)?
+        .checked_add(1)
+}
+
+fn admit_agent_config_merge(existing: &str, new_section: &str) -> std::result::Result<u64, String> {
+    let merged_len = bounded_agent_config_merged_len(existing, new_section).ok_or_else(|| {
+        "Agent config merged length overflowed the platform size representation.".to_string()
+    })?;
+    if merged_len > AGENT_CONFIG_MAX_BYTES {
+        return Err("Merged agent config exceeds the 1 MiB safety limit.".to_string());
+    }
+    Ok(merged_len)
 }
 
 fn build_agent_configure_plan_item(
@@ -15420,7 +16296,30 @@ fn fallback_agent_config_file_exists(
     let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
     let template = frankenterm_core::agent_config_templates::generate_template(&provider);
     resolve_agent_config_target_path(entry, scope, workspace_root, &template)
-        .map(|path| path.exists())
+        .map(|path| match fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let parent_is_accessible = path
+                    .parent()
+                    .and_then(|parent| fs::metadata(parent).ok())
+                    .is_some_and(|metadata| metadata.is_dir());
+                if !parent_is_accessible {
+                    true
+                } else {
+                    // Close the observation window after checking the parent:
+                    // a newly appeared or newly inaccessible entry is present
+                    // for conservative error-reporting purposes.
+                    !matches!(
+                        fs::symlink_metadata(&path),
+                        Err(recheck) if recheck.kind() == std::io::ErrorKind::NotFound
+                    )
+                }
+            }
+            // This is error-reporting fallback metadata. An inaccessible path
+            // must not be represented as absent, because that would make a
+            // failed-safe inspection look like permission to create it.
+            Err(_) => true,
+        })
         .unwrap_or(false)
 }
 
@@ -15463,13 +16362,11 @@ fn build_agent_configure_error_result_item(
     }
 }
 
-fn agent_config_backup_path(path: &Path) -> PathBuf {
-    let stamp = now_ms();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config");
-    path.with_file_name(format!("{file_name}.{stamp}.bak"))
+fn persist_agent_config_regular_file(file: &cap_std::fs::File) -> std::io::Result<()> {
+    file.sync_all()?;
+    #[cfg(target_os = "macos")]
+    rustix::fs::fcntl_fullfsync(file).map_err(std::io::Error::from)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -15478,89 +16375,2330 @@ struct AgentConfigApplyError {
     backup_created: bool,
 }
 
+#[derive(Debug)]
+struct AppliedAgentConfig {
+    result: frankenterm_core::robot_types::AgentConfigureResultItem,
+    transaction: Option<AgentConfigTransactionReceipt>,
+}
+
+impl std::ops::Deref for AppliedAgentConfig {
+    type Target = frankenterm_core::robot_types::AgentConfigureResultItem;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AgentConfigureDataWithTransactions {
+    #[serde(flatten)]
+    base: frankenterm_core::robot_types::AgentConfigureData,
+    transactions: Vec<AgentConfigTransactionReceipt>,
+}
+
+fn revalidate_absent_agent_config(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+) -> std::result::Result<(), String> {
+    let leaf = agent_config_leaf(target_path)?;
+    match parent.directory.symlink_metadata(&leaf) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => parent.revalidate(),
+        Ok(_) => Err(format!(
+            "Agent config '{}' appeared during the operation.",
+            target_path.display()
+        )),
+        Err(err) => Err(format!(
+            "Failed to re-inspect absent agent config '{}': {err}",
+            target_path.display()
+        )),
+    }
+}
+
+fn revalidate_open_agent_config_file(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    snapshot: &mut OpenAgentConfigFile,
+) -> std::result::Result<(), String> {
+    let leaf = agent_config_leaf(target_path)?;
+    let opened_before = agent_config_regular_file_observation(
+        &snapshot.file.metadata().map_err(|err| {
+            format!(
+                "Failed to re-inspect opened agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    let named_before = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+            format!(
+                "Failed to re-inspect agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    if opened_before != snapshot.observation || named_before != snapshot.observation {
+        return Err(format!(
+            "Agent config '{}' changed after it was inspected.",
+            target_path.display()
+        ));
+    }
+
+    snapshot.file.rewind().map_err(|err| {
+        format!(
+            "Failed to rewind agent config '{}': {err}",
+            target_path.display()
+        )
+    })?;
+    let mut current = String::new();
+    (&mut snapshot.file)
+        .take(AGENT_CONFIG_MAX_BYTES.saturating_add(1))
+        .read_to_string(&mut current)
+        .map_err(|err| format!("Failed to re-read '{}': {err}", target_path.display()))?;
+    let opened_after = agent_config_regular_file_observation(
+        &snapshot.file.metadata().map_err(|err| {
+            format!(
+                "Failed to re-inspect opened agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    let named_after = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+            format!(
+                "Failed to re-inspect agent config '{}': {err}",
+                target_path.display()
+            )
+        })?,
+        target_path,
+    )?;
+    if u64::try_from(current.len()).unwrap_or(u64::MAX) != snapshot.observation.byte_len
+        || current != snapshot.content
+        || opened_after != snapshot.observation
+        || named_after != snapshot.observation
+    {
+        return Err(format!(
+            "Agent config '{}' changed while it was revalidated.",
+            target_path.display()
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(expected_security) = snapshot.security {
+        let actual_security = capture_agent_config_security(
+            parent,
+            target_path,
+            &leaf,
+            &snapshot.file,
+            snapshot.observation,
+        )?;
+        if actual_security != expected_security {
+            return Err(format!(
+                "Agent config '{}' changed owner, group, or mode after it was inspected.",
+                target_path.display()
+            ));
+        }
+    }
+    parent.revalidate()
+}
+
+fn create_agent_config_backup(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    snapshot: &OpenAgentConfigFile,
+    transaction: &AgentConfigTransaction,
+) -> std::result::Result<PathBuf, AgentConfigApplyError> {
+    #[cfg(unix)]
+    use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    transaction
+        .validate_binding()
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+
+    let source_security = snapshot.security.ok_or_else(|| AgentConfigApplyError {
+        message: format!(
+            "Agent config '{}' has no authenticated source security snapshot.",
+            target_path.display()
+        ),
+        backup_created: false,
+    })?;
+    let backup_path = parent.path.join(&transaction.backup_leaf);
+    let backup_leaf = transaction.backup_leaf.clone();
+    {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut backup = match parent.directory.open_with(&backup_leaf, &options) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(AgentConfigApplyError {
+                    message: format!(
+                        "Agent config transaction backup '{}' already exists; refusing to change transaction identity.",
+                        backup_path.display()
+                    ),
+                    backup_created: false,
+                });
+            }
+            Err(err) => {
+                return Err(AgentConfigApplyError {
+                    message: format!(
+                        "Failed to create backup '{}' from '{}': {err}",
+                        backup_path.display(),
+                        target_path.display()
+                    ),
+                    backup_created: false,
+                });
+            }
+        };
+        #[cfg(unix)]
+        backup
+            .set_permissions(cap_std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| AgentConfigApplyError {
+                message: format!(
+                    "Failed to set private initial mode on backup '{}': {err}",
+                    backup_path.display()
+                ),
+                backup_created: false,
+            })?;
+
+        let opened_before = agent_config_regular_file_observation(
+            &backup.metadata().map_err(|err| AgentConfigApplyError {
+                message: format!(
+                    "Failed to inspect new backup '{}': {err}",
+                    backup_path.display()
+                ),
+                backup_created: false,
+            })?,
+            &backup_path,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        let named_before = agent_config_regular_file_observation(
+            &parent
+                .directory
+                .symlink_metadata(&backup_leaf)
+                .map_err(|err| AgentConfigApplyError {
+                    message: format!(
+                        "Failed to inspect named backup '{}': {err}",
+                        backup_path.display()
+                    ),
+                    backup_created: false,
+                })?,
+            &backup_path,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        if opened_before != named_before || opened_before.byte_len != 0 {
+            return Err(AgentConfigApplyError {
+                message: format!(
+                    "New backup '{}' changed identity while it was created.",
+                    backup_path.display()
+                ),
+                backup_created: false,
+            });
+        }
+        capture_agent_config_security(parent, &backup_path, &backup_leaf, &backup, opened_before)
+            .and_then(|security| {
+                validate_fresh_agent_config_security(security, Some(source_security), &backup_path)
+            })
+            .map_err(|message| AgentConfigApplyError {
+                message,
+                backup_created: false,
+            })?;
+
+        backup
+            .write_all(snapshot.content.as_bytes())
+            .map_err(|err| AgentConfigApplyError {
+                message: format!(
+                    "Failed to publish backup '{}' from '{}': {err}",
+                    backup_path.display(),
+                    target_path.display()
+                ),
+                backup_created: false,
+            })?;
+        #[cfg(unix)]
+        backup
+            .set_permissions(cap_std::fs::Permissions::from_mode(source_security.mode))
+            .map_err(|err| AgentConfigApplyError {
+                message: format!(
+                    "Failed to restore authenticated source mode on backup '{}': {err}",
+                    backup_path.display()
+                ),
+                backup_created: false,
+            })?;
+        persist_agent_config_regular_file(&backup).map_err(|err| AgentConfigApplyError {
+            message: format!(
+                "Failed to synchronize backup '{}' from '{}': {err}",
+                backup_path.display(),
+                target_path.display()
+            ),
+            backup_created: false,
+        })?;
+        let opened_after = agent_config_regular_file_observation(
+            &backup.metadata().map_err(|err| AgentConfigApplyError {
+                message: format!("Failed to verify backup '{}': {err}", backup_path.display()),
+                backup_created: false,
+            })?,
+            &backup_path,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        let named_after = agent_config_regular_file_observation(
+            &parent
+                .directory
+                .symlink_metadata(&backup_leaf)
+                .map_err(|err| AgentConfigApplyError {
+                    message: format!(
+                        "Failed to verify named backup '{}': {err}",
+                        backup_path.display()
+                    ),
+                    backup_created: false,
+                })?,
+            &backup_path,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        let final_security = capture_agent_config_security(
+            parent,
+            &backup_path,
+            &backup_leaf,
+            &backup,
+            opened_after,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        backup.rewind().map_err(|err| AgentConfigApplyError {
+            message: format!("Failed to rewind backup '{}': {err}", backup_path.display()),
+            backup_created: false,
+        })?;
+        let mut backup_bytes = Vec::new();
+        (&mut backup)
+            .take(AGENT_CONFIG_MAX_BYTES.saturating_add(1))
+            .read_to_end(&mut backup_bytes)
+            .map_err(|err| AgentConfigApplyError {
+                message: format!("Failed to verify backup '{}': {err}", backup_path.display()),
+                backup_created: false,
+            })?;
+        let opened_final = agent_config_regular_file_observation(
+            &backup.metadata().map_err(|err| AgentConfigApplyError {
+                message: format!(
+                    "Failed to re-inspect backup '{}': {err}",
+                    backup_path.display()
+                ),
+                backup_created: false,
+            })?,
+            &backup_path,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        let named_final = agent_config_regular_file_observation(
+            &parent
+                .directory
+                .symlink_metadata(&backup_leaf)
+                .map_err(|err| AgentConfigApplyError {
+                    message: format!(
+                        "Failed to re-inspect named backup '{}': {err}",
+                        backup_path.display()
+                    ),
+                    backup_created: false,
+                })?,
+            &backup_path,
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+        if opened_after != named_after
+            || opened_after.identity != opened_before.identity
+            || opened_final != opened_after
+            || named_final != opened_after
+            || backup_bytes != snapshot.content.as_bytes()
+            || final_security != source_security
+        {
+            return Err(AgentConfigApplyError {
+                message: format!(
+                    "Backup '{}' did not retain the exact source bytes and identity.",
+                    backup_path.display()
+                ),
+                backup_created: false,
+            });
+        }
+
+        sync_capability_directory(&parent.directory).map_err(|err| AgentConfigApplyError {
+            message: format!(
+                "Backup '{}' exists but its directory could not be synchronized: {err}",
+                backup_path.display()
+            ),
+            backup_created: true,
+        })?;
+        parent
+            .revalidate()
+            .map_err(|message| AgentConfigApplyError {
+                message,
+                backup_created: true,
+            })?;
+        return Ok(backup_path);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentConfigTransactionArtifactKind {
+    Candidate,
+    Backup,
+    Claim,
+    Ack,
+    PendingClaim,
+    PendingAck,
+}
+
+fn parse_agent_config_transaction_artifact_name(
+    name: &std::ffi::OsStr,
+) -> std::result::Result<Option<(String, AgentConfigTransactionArtifactKind)>, String> {
+    let Some(name) = name.to_str() else {
+        if name
+            .as_encoded_bytes()
+            .starts_with(AGENT_CONFIG_TRANSACTION_PREFIX.as_bytes())
+        {
+            return Err("Agent config transaction artifact name is not valid UTF-8.".to_string());
+        }
+        return Ok(None);
+    };
+    let Some(rest) = name.strip_prefix(AGENT_CONFIG_TRANSACTION_PREFIX) else {
+        return Ok(None);
+    };
+    let (id, kind) = if let Some(id) = rest.strip_suffix(&format!(
+        "{AGENT_CONFIG_CLAIM_SUFFIX}{AGENT_CONFIG_PENDING_SUFFIX}"
+    )) {
+        (id, AgentConfigTransactionArtifactKind::PendingClaim)
+    } else if let Some(id) = rest.strip_suffix(&format!(
+        "{AGENT_CONFIG_ACK_SUFFIX}{AGENT_CONFIG_PENDING_SUFFIX}"
+    )) {
+        (id, AgentConfigTransactionArtifactKind::PendingAck)
+    } else if let Some(id) = rest.strip_suffix(AGENT_CONFIG_CANDIDATE_SUFFIX) {
+        (id, AgentConfigTransactionArtifactKind::Candidate)
+    } else if let Some(id) = rest.strip_suffix(AGENT_CONFIG_BACKUP_SUFFIX) {
+        (id, AgentConfigTransactionArtifactKind::Backup)
+    } else if let Some(id) = rest.strip_suffix(AGENT_CONFIG_CLAIM_SUFFIX) {
+        (id, AgentConfigTransactionArtifactKind::Claim)
+    } else if let Some(id) = rest.strip_suffix(AGENT_CONFIG_ACK_SUFFIX) {
+        (id, AgentConfigTransactionArtifactKind::Ack)
+    } else {
+        return Err(format!(
+            "Malformed agent config transaction artifact '{name}'."
+        ));
+    };
+    AgentConfigTransaction::from_id(id.to_string())?;
+    Ok(Some((id.to_string(), kind)))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentConfigTransactionInventory {
+    entries_visited: u64,
+    filename_bytes: u64,
+    families: u64,
+    artifacts: u64,
+    artifact_bytes: u64,
+    claim_ids: Vec<String>,
+}
+
+impl AgentConfigTransactionInventory {
+    fn observe_directory_entry(&mut self, filename_bytes: u64) -> std::result::Result<(), String> {
+        self.entries_visited = self
+            .entries_visited
+            .checked_add(1)
+            .ok_or_else(|| "Agent config directory entry count overflowed.".to_string())?;
+        self.filename_bytes = self
+            .filename_bytes
+            .checked_add(filename_bytes)
+            .ok_or_else(|| "Agent config directory filename byte count overflowed.".to_string())?;
+        if self.entries_visited > AGENT_CONFIG_MAX_DIRECTORY_ENTRIES_VISITED
+            || self.filename_bytes > AGENT_CONFIG_MAX_DIRECTORY_FILENAME_BYTES
+        {
+            return Err(
+                "Agent config directory exceeds the bounded inventory scan limit.".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn reserve(
+        self,
+        candidate_bytes: u64,
+        backup_bytes: Option<u64>,
+    ) -> std::result::Result<(), String> {
+        let added_artifacts = if backup_bytes.is_some() { 4 } else { 3 };
+        let added_bytes = candidate_bytes
+            .checked_add(backup_bytes.unwrap_or(0))
+            .and_then(|bytes| bytes.checked_add(2 * 64 * 1024))
+            .ok_or_else(|| "Agent config transaction byte reservation overflowed.".to_string())?;
+        if self.families >= AGENT_CONFIG_MAX_TRANSACTION_FAMILIES
+            || self
+                .artifacts
+                .checked_add(added_artifacts)
+                .is_none_or(|count| count > AGENT_CONFIG_MAX_TRANSACTION_ARTIFACTS)
+            || self
+                .artifact_bytes
+                .checked_add(added_bytes)
+                .is_none_or(|bytes| bytes > AGENT_CONFIG_MAX_TRANSACTION_ARTIFACT_BYTES)
+        {
+            return Err(
+                "Agent config transaction inventory is at its bounded retention limit.".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn agent_config_transaction_inventory(
+    parent: &AgentConfigParentDirectory,
+) -> std::result::Result<AgentConfigTransactionInventory, String> {
+    let mut inventory = AgentConfigTransactionInventory::default();
+    #[derive(Default)]
+    struct Family {
+        candidate: bool,
+        backup: bool,
+        claim: bool,
+        ack: bool,
+        pending_claim: bool,
+        pending_ack: bool,
+    }
+    let mut families = BTreeMap::<String, Family>::new();
+    for entry in parent.directory.entries().map_err(|err| {
+        format!(
+            "Failed to inventory retained agent config transactions in '{}': {err}",
+            parent.path.display()
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            format!(
+                "Failed to inspect a retained agent config transaction in '{}': {err}",
+                parent.path.display()
+            )
+        })?;
+        let name = entry.file_name();
+        inventory.observe_directory_entry(
+            u64::try_from(name.as_encoded_bytes().len()).unwrap_or(u64::MAX),
+        )?;
+        let Some((transaction_id, kind)) = parse_agent_config_transaction_artifact_name(&name)?
+        else {
+            continue;
+        };
+        let artifact_path = parent.path.join(&name);
+        let metadata = parent
+            .directory
+            .symlink_metadata(Path::new(&name))
+            .map_err(|err| {
+                format!(
+                    "Failed to inspect agent config transaction artifact '{}': {err}",
+                    artifact_path.display()
+                )
+            })?;
+        let observation = agent_config_regular_file_observation(&metadata, &artifact_path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if observation.uid != nix::unistd::geteuid().as_raw() || observation.mode & 0o7000 != 0 {
+            return Err(format!(
+                "Agent config transaction artifact '{}' is not one safe effective-user-owned file.",
+                artifact_path.display()
+            ));
+        }
+        inventory.artifacts = inventory
+            .artifacts
+            .checked_add(1)
+            .ok_or_else(|| "Agent config transaction artifact count overflowed.".to_string())?;
+        inventory.artifact_bytes = inventory
+            .artifact_bytes
+            .checked_add(observation.byte_len)
+            .ok_or_else(|| "Agent config transaction artifact bytes overflowed.".to_string())?;
+        if inventory.artifacts > AGENT_CONFIG_MAX_TRANSACTION_ARTIFACTS
+            || inventory.artifact_bytes > AGENT_CONFIG_MAX_TRANSACTION_ARTIFACT_BYTES
+        {
+            return Err(format!(
+                "Agent config directory '{}' exceeds the bounded transaction artifact limit.",
+                parent.path.display()
+            ));
+        }
+        let family = families.entry(transaction_id).or_default();
+        match kind {
+            AgentConfigTransactionArtifactKind::Candidate if family.candidate => {
+                return Err("Duplicate agent config candidate artifact.".to_string());
+            }
+            AgentConfigTransactionArtifactKind::Candidate => family.candidate = true,
+            AgentConfigTransactionArtifactKind::Backup if family.backup => {
+                return Err("Duplicate agent config backup artifact.".to_string());
+            }
+            AgentConfigTransactionArtifactKind::Backup => family.backup = true,
+            AgentConfigTransactionArtifactKind::Claim if family.claim => {
+                return Err("Duplicate agent config claim artifact.".to_string());
+            }
+            AgentConfigTransactionArtifactKind::Claim => family.claim = true,
+            AgentConfigTransactionArtifactKind::Ack if family.ack => {
+                return Err("Duplicate agent config acknowledgement artifact.".to_string());
+            }
+            AgentConfigTransactionArtifactKind::Ack => family.ack = true,
+            AgentConfigTransactionArtifactKind::PendingClaim if family.pending_claim => {
+                return Err("Duplicate pending agent config claim artifact.".to_string());
+            }
+            AgentConfigTransactionArtifactKind::PendingClaim => family.pending_claim = true,
+            AgentConfigTransactionArtifactKind::PendingAck if family.pending_ack => {
+                return Err("Duplicate pending agent config acknowledgement artifact.".to_string());
+            }
+            AgentConfigTransactionArtifactKind::PendingAck => family.pending_ack = true,
+        }
+    }
+    for (transaction_id, family) in &families {
+        if family.pending_claim || family.pending_ack {
+            return Err(format!(
+                "Agent config transaction '{transaction_id}' has an interrupted journal publication; explicit reconciliation is required."
+            ));
+        }
+        if !family.claim && (family.candidate || family.backup || family.ack) {
+            return Err(format!(
+                "Agent config transaction '{transaction_id}' has an artifact without its immutable claim; explicit reconciliation is required."
+            ));
+        }
+        if family.ack && !family.claim {
+            return Err(format!(
+                "Agent config transaction '{transaction_id}' has an acknowledgement without its immutable claim; explicit reconciliation is required."
+            ));
+        }
+    }
+    inventory.families = u64::try_from(families.len()).unwrap_or(u64::MAX);
+    if inventory.families > AGENT_CONFIG_MAX_TRANSACTION_FAMILIES {
+        return Err(format!(
+            "Agent config directory '{}' exceeds the retained transaction-family limit.",
+            parent.path.display()
+        ));
+    }
+    inventory.claim_ids = families
+        .into_iter()
+        .filter_map(|(id, family)| family.claim.then_some(id))
+        .collect();
+    Ok(inventory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_snapshot_identity(
+    snapshot: &OpenAgentConfigFile,
+) -> std::result::Result<AtomicPathObjectIdentity, String> {
+    let metadata = snapshot.file.metadata().map_err(|err| {
+        format!("Failed to inspect authenticated agent config for its durable claim: {err}")
+    })?;
+    Ok(AtomicPathObjectIdentity {
+        metadata: AtomicPathObjectMetadata::from_cap_metadata(&metadata)
+            .map_err(|err| format!("Failed to encode agent config claim metadata: {err:#}"))?,
+        content_id: agent_config_sha256(snapshot.content.as_bytes()),
+        fully_sealed: true,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_leaf_string(leaf: &Path, what: &str) -> std::result::Result<String, String> {
+    let value = leaf
+        .to_str()
+        .ok_or_else(|| format!("Agent config {what} is not valid UTF-8."))?;
+    if value.is_empty()
+        || value.len() > 255
+        || value.contains('/')
+        || value.contains('\\')
+        || value == "."
+        || value == ".."
+    {
+        return Err(format!(
+            "Agent config {what} is not one bounded path component."
+        ));
+    }
+    Ok(value.to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn build_agent_config_transaction_claim(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    action: frankenterm_core::agent_config_templates::ConfigAction,
+    current: Option<&OpenAgentConfigFile>,
+    candidate_bytes: &[u8],
+    requested_final_metadata: AgentConfigSecuritySnapshot,
+    transaction: &AgentConfigTransaction,
+) -> std::result::Result<AgentConfigTransactionClaim, String> {
+    transaction.validate_binding()?;
+    let target_leaf = agent_config_leaf_string(&agent_config_leaf(target_path)?, "target leaf")?;
+    let candidate_leaf =
+        agent_config_leaf_string(&transaction.candidate_leaf, "candidate leaf")?;
+    let backup_leaf = current
+        .is_some()
+        .then(|| agent_config_leaf_string(&transaction.backup_leaf, "backup leaf"))
+        .transpose()?;
+    let before = current.map(agent_config_snapshot_identity).transpose()?;
+    let backup_sha256 = before.as_ref().map(|identity| identity.content_id.clone());
+    Ok(AgentConfigTransactionClaim {
+        schema_version: "ft.agent-config-transaction-claim.v1".to_string(),
+        transaction_id: transaction.id.clone(),
+        parent_device: parent.identity.device,
+        parent_inode: parent.identity.inode,
+        target_leaf,
+        action: agent_config_action_label(action).to_string(),
+        before,
+        candidate_leaf,
+        candidate_sha256: agent_config_sha256(candidate_bytes),
+        backup_leaf,
+        backup_sha256,
+        requested_final_metadata,
+        durability_contract:
+            "candidate_and_backup_fdatasync_plus_fsync;macos_regular_files_f_fullfsync;namespace_and_journal_parent_fsync"
+                .to_string(),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_agent_config_transaction_claim(
+    parent: &AgentConfigParentDirectory,
+    target_leaf: &Path,
+    transaction: &AgentConfigTransaction,
+    claim: &AgentConfigTransactionClaim,
+) -> std::result::Result<(), String> {
+    transaction.validate_binding()?;
+    let expected_target = agent_config_leaf_string(target_leaf, "target leaf")?;
+    let expected_candidate =
+        agent_config_leaf_string(&transaction.candidate_leaf, "candidate leaf")?;
+    let expected_backup = agent_config_leaf_string(&transaction.backup_leaf, "backup leaf")?;
+    let valid_hash = |value: &str| {
+        value
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    };
+    if claim.schema_version != "ft.agent-config-transaction-claim.v1"
+        || claim.transaction_id != transaction.id
+        || claim.parent_device != parent.identity.device
+        || claim.parent_inode != parent.identity.inode
+        || claim.target_leaf != expected_target
+        || claim.candidate_leaf != expected_candidate
+        || !valid_hash(&claim.candidate_sha256)
+        || claim
+            .backup_sha256
+            .as_deref()
+            .is_some_and(|hash| !valid_hash(hash))
+        || !matches!(claim.action.as_str(), "create" | "append" | "replace")
+        || claim.requested_final_metadata.mode & 0o7000 != 0
+        || claim.durability_contract
+            != "candidate_and_backup_fdatasync_plus_fsync;macos_regular_files_f_fullfsync;namespace_and_journal_parent_fsync"
+    {
+        return Err(format!(
+            "Agent config transaction '{}' has a claim that is not bound to this exact target and durability contract.",
+            transaction.id
+        ));
+    }
+    match (&claim.before, &claim.backup_leaf, &claim.backup_sha256) {
+        (None, None, None) if claim.action == "create" => {}
+        (Some(before), Some(backup_leaf), Some(backup_sha256))
+            if claim.action != "create"
+                && backup_leaf == &expected_backup
+                && backup_sha256 == &before.content_id
+                && before.fully_sealed
+                && valid_hash(&before.content_id) => {}
+        _ => {
+            return Err(format!(
+                "Agent config transaction '{}' has inconsistent before/backup bindings.",
+                transaction.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn observe_agent_config_namespace_entry(
+    parent: &AgentConfigParentDirectory,
+    path: &Path,
+    leaf: &Path,
+) -> std::result::Result<AgentConfigNamespaceObservation, String> {
+    let metadata = match parent.directory.symlink_metadata(leaf) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentConfigNamespaceObservation {
+                state: "missing".to_string(),
+                metadata: None,
+                sha256: None,
+            });
+        }
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect agent config transaction entry '{}': {err}",
+                path.display()
+            ));
+        }
+    };
+    let encoded = AtomicPathObjectMetadata::from_cap_metadata(&metadata).map_err(|err| {
+        format!(
+            "Agent config transaction entry '{}' has an unsupported filesystem type: {err:#}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Ok(AgentConfigNamespaceObservation {
+            state: encoded.object_kind.clone(),
+            metadata: Some(encoded),
+            sha256: None,
+        });
+    }
+    if metadata.len() > AGENT_CONFIG_MAX_BYTES || metadata.nlink() != 1 {
+        return Ok(AgentConfigNamespaceObservation {
+            state: "unsafe_regular_file".to_string(),
+            metadata: Some(encoded),
+            sha256: None,
+        });
+    }
+    let opened = read_open_agent_config_bytes(parent, path, leaf)?;
+    capture_agent_config_security(parent, path, leaf, &opened.file, opened.observation)?;
+    Ok(AgentConfigNamespaceObservation {
+        state: "regular_file".to_string(),
+        metadata: Some(encoded),
+        sha256: Some(agent_config_sha256(&opened.bytes)),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_observation_matches_before(
+    observation: &AgentConfigNamespaceObservation,
+    before: &AtomicPathObjectIdentity,
+) -> bool {
+    observation.state == "regular_file"
+        && observation.sha256.as_deref() == Some(before.content_id.as_str())
+        && observation
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.equivalent_after_namespace_rename(&before.metadata))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_observation_matches_candidate(
+    observation: &AgentConfigNamespaceObservation,
+    claim: &AgentConfigTransactionClaim,
+) -> bool {
+    observation.state == "regular_file"
+        && observation.sha256.as_deref() == Some(claim.candidate_sha256.as_str())
+        && observation.metadata.as_ref().is_some_and(|metadata| {
+            metadata.uid == claim.requested_final_metadata.uid
+                && metadata.gid == claim.requested_final_metadata.gid
+                && metadata.mode & 0o7777 == claim.requested_final_metadata.mode
+                && metadata.hard_link_count == 1
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_outcome_label(outcome: AgentConfigTransactionOutcome) -> &'static str {
+    match outcome {
+        AgentConfigTransactionOutcome::Applied => "applied",
+        AgentConfigTransactionOutcome::AlreadyApplied => "already_applied",
+        AgentConfigTransactionOutcome::ConflictBeforeEffect => "conflict_before_effect",
+        AgentConfigTransactionOutcome::ConflictRolledBack => "conflict_rolled_back",
+        AgentConfigTransactionOutcome::Indeterminate => "indeterminate",
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_receipt(
+    target_path: &Path,
+    transaction: &AgentConfigTransaction,
+    claim_sha256: &str,
+    claim: &AgentConfigTransactionClaim,
+    ack: &AgentConfigTransactionAck,
+) -> AgentConfigTransactionReceipt {
+    AgentConfigTransactionReceipt {
+        schema_version: "ft.agent-config-transaction-receipt.v1".to_string(),
+        transaction_id: transaction.id.clone(),
+        target: target_path.display().to_string(),
+        claim: transaction.claim_leaf.display().to_string(),
+        claim_sha256: claim_sha256.to_string(),
+        ack: transaction.ack_leaf.display().to_string(),
+        outcome: agent_config_outcome_label(ack.outcome).to_string(),
+        candidate: transaction.candidate_leaf.display().to_string(),
+        backup: claim.backup_leaf.clone(),
+        candidate_file_synced: ack.candidate_file_synced,
+        backup_file_synced: ack.backup_file_synced,
+        effect_parent_synced: ack.effect_parent_synced,
+        ack_file_synced: ack.ack_file_synced,
+        ack_parent_synced: ack.ack_parent_synced,
+        explicit_reconciliation_required: ack.explicit_reconciliation_required,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_agent_config_transaction_ack(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    transaction: &AgentConfigTransaction,
+    claim: &AgentConfigTransactionClaim,
+    claim_sha256: &str,
+    outcome: AgentConfigTransactionOutcome,
+    candidate_file_synced: bool,
+    backup_file_synced: bool,
+    effect_parent_synced: bool,
+) -> std::result::Result<AgentConfigTransactionReceipt, String> {
+    let target_leaf = agent_config_leaf(target_path)?;
+    let observed_target = observe_agent_config_namespace_entry(
+        parent,
+        target_path,
+        &target_leaf,
+    )?;
+    let observed_candidate = observe_agent_config_namespace_entry(
+        parent,
+        &parent.path.join(&transaction.candidate_leaf),
+        &transaction.candidate_leaf,
+    )?;
+    let observed_backup = if claim.backup_leaf.is_some() {
+        observe_agent_config_namespace_entry(
+            parent,
+            &parent.path.join(&transaction.backup_leaf),
+            &transaction.backup_leaf,
+        )?
+    } else {
+        AgentConfigNamespaceObservation {
+            state: "missing".to_string(),
+            metadata: None,
+            sha256: None,
+        }
+    };
+    let explicit_reconciliation_required = outcome == AgentConfigTransactionOutcome::Indeterminate;
+    let ack = AgentConfigTransactionAck {
+        schema_version: "ft.agent-config-transaction-ack.v1".to_string(),
+        transaction_id: transaction.id.clone(),
+        claim_sha256: claim_sha256.to_string(),
+        outcome,
+        observed_target,
+        observed_candidate,
+        observed_backup,
+        candidate_file_synced,
+        backup_file_synced,
+        effect_parent_synced,
+        ack_file_synced: true,
+        ack_parent_synced: true,
+        explicit_reconciliation_required,
+    };
+    let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf")?;
+    write_atomic_path_transition_json(&parent.directory, &parent.file, &ack_name, &ack)
+        .map_err(|err| format!("Failed to publish durable agent config acknowledgement: {err:#}"))?;
+    parent.revalidate()?;
+    Ok(agent_config_receipt(
+        target_path,
+        transaction,
+        claim_sha256,
+        claim,
+        &ack,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn classify_unacknowledged_agent_config_transaction(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    transaction: &AgentConfigTransaction,
+    claim: &AgentConfigTransactionClaim,
+) -> std::result::Result<AgentConfigTransactionOutcome, String> {
+    let target_leaf = agent_config_leaf(target_path)?;
+    let target = observe_agent_config_namespace_entry(parent, target_path, &target_leaf)?;
+    let candidate = observe_agent_config_namespace_entry(
+        parent,
+        &parent.path.join(&transaction.candidate_leaf),
+        &transaction.candidate_leaf,
+    )?;
+    let target_after = agent_config_observation_matches_candidate(&target, claim);
+    let candidate_after = agent_config_observation_matches_candidate(&candidate, claim);
+    match claim.before.as_ref() {
+        None => {
+            if target_after && candidate.state == "missing" {
+                Ok(AgentConfigTransactionOutcome::AlreadyApplied)
+            } else if target.state == "missing" && candidate_after {
+                Ok(AgentConfigTransactionOutcome::ConflictBeforeEffect)
+            } else {
+                Ok(AgentConfigTransactionOutcome::Indeterminate)
+            }
+        }
+        Some(before) => {
+            let target_before = agent_config_observation_matches_before(&target, before);
+            let candidate_before = agent_config_observation_matches_before(&candidate, before);
+            let backup = observe_agent_config_namespace_entry(
+                parent,
+                &parent.path.join(&transaction.backup_leaf),
+                &transaction.backup_leaf,
+            )?;
+            let backup_before = agent_config_observation_matches_before(&backup, before);
+            if target_after && candidate_before && backup_before {
+                Ok(AgentConfigTransactionOutcome::AlreadyApplied)
+            } else if target_before && candidate_after && backup_before
+            {
+                Ok(AgentConfigTransactionOutcome::ConflictBeforeEffect)
+            } else {
+                Ok(AgentConfigTransactionOutcome::Indeterminate)
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_agent_config_transaction_ack_semantics(
+    claim: &AgentConfigTransactionClaim,
+    ack: &AgentConfigTransactionAck,
+) -> bool {
+    if ack.explicit_reconciliation_required
+        != (ack.outcome == AgentConfigTransactionOutcome::Indeterminate)
+    {
+        return false;
+    }
+    if ack.outcome == AgentConfigTransactionOutcome::Indeterminate {
+        return true;
+    }
+    let target_after = agent_config_observation_matches_candidate(&ack.observed_target, claim);
+    let candidate_after =
+        agent_config_observation_matches_candidate(&ack.observed_candidate, claim);
+    match claim.before.as_ref() {
+        None => {
+            let backup_missing = ack.observed_backup.state == "missing";
+            backup_missing
+                && match ack.outcome {
+                    AgentConfigTransactionOutcome::Applied
+                    | AgentConfigTransactionOutcome::AlreadyApplied => {
+                        target_after && ack.observed_candidate.state == "missing"
+                    }
+                    AgentConfigTransactionOutcome::ConflictBeforeEffect
+                    | AgentConfigTransactionOutcome::ConflictRolledBack => {
+                        ack.observed_target.state == "missing" && candidate_after
+                    }
+                    AgentConfigTransactionOutcome::Indeterminate => false,
+                }
+        }
+        Some(before) => {
+            let target_before =
+                agent_config_observation_matches_before(&ack.observed_target, before);
+            let candidate_before =
+                agent_config_observation_matches_before(&ack.observed_candidate, before);
+            let backup_before =
+                agent_config_observation_matches_before(&ack.observed_backup, before);
+            backup_before
+                && match ack.outcome {
+                    AgentConfigTransactionOutcome::Applied
+                    | AgentConfigTransactionOutcome::AlreadyApplied => {
+                        target_after && candidate_before
+                    }
+                    AgentConfigTransactionOutcome::ConflictBeforeEffect
+                    | AgentConfigTransactionOutcome::ConflictRolledBack => {
+                        target_before && candidate_after
+                    }
+                    AgentConfigTransactionOutcome::Indeterminate => false,
+                }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reconcile_agent_config_transactions_for_target(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+) -> std::result::Result<Vec<AgentConfigTransactionReceipt>, String> {
+    let target_leaf = agent_config_leaf(target_path)?;
+    let target_leaf_string = agent_config_leaf_string(&target_leaf, "target leaf")?;
+    let inventory = agent_config_transaction_inventory(parent)?;
+    let ids = inventory.claim_ids;
+    let mut receipts = Vec::new();
+    for id in ids {
+        let transaction = AgentConfigTransaction::from_id(id)?;
+        let claim_name = agent_config_leaf_string(&transaction.claim_leaf, "claim leaf")?;
+        let Some((claim, claim_bytes)) = read_atomic_path_transition_json::<
+            AgentConfigTransactionClaim,
+        >(&parent.directory, &claim_name)
+        .map_err(|err| format!("Failed to read retained agent config claim: {err:#}"))?
+        else {
+            return Err("A retained agent config claim disappeared during reconciliation.".to_string());
+        };
+        if claim.target_leaf != target_leaf_string {
+            continue;
+        }
+        validate_agent_config_transaction_claim(parent, &target_leaf, &transaction, &claim)?;
+        let claim_sha256 = agent_config_sha256(&claim_bytes)
+            .strip_prefix("sha256:")
+            .unwrap_or_default()
+            .to_string();
+        let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf")?;
+        if let Some((ack, _)) = read_atomic_path_transition_json::<AgentConfigTransactionAck>(
+            &parent.directory,
+            &ack_name,
+        )
+        .map_err(|err| format!("Failed to read retained agent config acknowledgement: {err:#}"))?
+        {
+            if ack.schema_version != "ft.agent-config-transaction-ack.v1"
+                || ack.transaction_id != transaction.id
+                || ack.claim_sha256 != claim_sha256
+                || ack.ack_file_synced != ack.ack_parent_synced
+                || !ack.ack_file_synced
+                || !validate_agent_config_transaction_ack_semantics(&claim, &ack)
+            {
+                return Err(format!(
+                    "Agent config transaction '{}' has an invalid acknowledgement; explicit reconciliation is required.",
+                    transaction.id
+                ));
+            }
+            let receipt = agent_config_receipt(
+                target_path,
+                &transaction,
+                &claim_sha256,
+                &claim,
+                &ack,
+            );
+            if receipt.explicit_reconciliation_required {
+                return Err(format!(
+                    "Agent config transaction '{}' is indeterminate; explicit reconciliation is required.",
+                    transaction.id
+                ));
+            }
+            receipts.push(receipt);
+            continue;
+        }
+        let outcome = classify_unacknowledged_agent_config_transaction(
+            parent,
+            target_path,
+            &transaction,
+            &claim,
+        )?;
+        let receipt = write_agent_config_transaction_ack(
+            parent,
+            target_path,
+            &transaction,
+            &claim,
+            &claim_sha256,
+            outcome,
+            false,
+            false,
+            outcome == AgentConfigTransactionOutcome::AlreadyApplied,
+        )?;
+        if receipt.explicit_reconciliation_required {
+            return Err(format!(
+                "Agent config transaction '{}' is indeterminate; explicit reconciliation is required.",
+                transaction.id
+            ));
+        }
+        receipts.push(receipt);
+    }
+    Ok(receipts)
+}
+
+struct StagedAgentConfig {
+    file: cap_std::fs::File,
+    leaf: PathBuf,
+    path: PathBuf,
+    identity: AgentConfigObjectIdentity,
+    security: AgentConfigSecuritySnapshot,
+}
+
+fn create_agent_config_candidate(
+    parent: &AgentConfigParentDirectory,
+    source_security: Option<AgentConfigSecuritySnapshot>,
+    transaction: &AgentConfigTransaction,
+) -> std::result::Result<StagedAgentConfig, String> {
+    #[cfg(unix)]
+    use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    transaction.validate_binding()?;
+
+    let leaf = transaction.candidate_leaf.clone();
+    {
+        let path = parent.path.join(&leaf);
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = match parent.directory.open_with(&leaf, &options) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "Agent config transaction candidate '{}' already exists; refusing to change transaction identity.",
+                    path.display()
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "Failed to create same-directory agent config candidate '{}': {err}",
+                    path.display()
+                ));
+            }
+        };
+        #[cfg(unix)]
+        file.set_permissions(cap_std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| {
+                format!(
+                    "Failed to set private initial mode on agent config candidate '{}': {err}",
+                    path.display()
+                )
+            })?;
+        let opened = agent_config_regular_file_observation(
+            &file.metadata().map_err(|err| {
+                format!(
+                    "Failed to inspect new agent config candidate '{}': {err}",
+                    path.display()
+                )
+            })?,
+            &path,
+        )?;
+        let named = agent_config_regular_file_observation(
+            &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+                format!(
+                    "Failed to inspect named agent config candidate '{}': {err}",
+                    path.display()
+                )
+            })?,
+            &path,
+        )?;
+        if opened != named || opened.byte_len != 0 {
+            return Err(format!(
+                "New agent config candidate '{}' changed identity while it was created.",
+                path.display()
+            ));
+        }
+        let initial_security = capture_agent_config_security(parent, &path, &leaf, &file, opened)?;
+        validate_fresh_agent_config_security(initial_security, source_security, &path)?;
+        let security = source_security.unwrap_or(initial_security);
+        parent.revalidate()?;
+        return Ok(StagedAgentConfig {
+            file,
+            leaf,
+            path,
+            identity: opened.identity,
+            security,
+        });
+    }
+}
+
+fn verify_named_agent_config(
+    parent: &AgentConfigParentDirectory,
+    path: &Path,
+    leaf: &Path,
+    file: &mut cap_std::fs::File,
+    expected_identity: AgentConfigObjectIdentity,
+    expected_bytes: &[u8],
+) -> std::result::Result<AgentConfigFileObservation, String> {
+    if u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX) > AGENT_CONFIG_MAX_BYTES {
+        return Err(format!(
+            "Agent config '{}' exceeds the 1 MiB safety limit.",
+            path.display()
+        ));
+    }
+    let opened_before = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to inspect written agent config '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    let named_before = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+            format!(
+                "Failed to inspect named written agent config '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    if opened_before != named_before
+        || opened_before.identity != expected_identity
+        || opened_before.byte_len != u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(format!(
+            "Agent config '{}' changed identity or length while it was written.",
+            path.display()
+        ));
+    }
+
+    file.rewind().map_err(|err| {
+        format!(
+            "Failed to rewind written agent config '{}': {err}",
+            path.display()
+        )
+    })?;
+    let mut actual_bytes = Vec::new();
+    (&mut *file)
+        .take(AGENT_CONFIG_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut actual_bytes)
+        .map_err(|err| {
+            format!(
+                "Failed to verify written agent config '{}': {err}",
+                path.display()
+            )
+        })?;
+    let opened_after = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to re-inspect written agent config '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    let named_after = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+            format!(
+                "Failed to re-inspect named written agent config '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    if actual_bytes != expected_bytes
+        || opened_after != opened_before
+        || named_after != opened_before
+    {
+        return Err(format!(
+            "Agent config '{}' did not retain the exact requested bytes and identity.",
+            path.display()
+        ));
+    }
+    parent.revalidate()?;
+    Ok(opened_before)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_secure_named_agent_config(
+    parent: &AgentConfigParentDirectory,
+    path: &Path,
+    leaf: &Path,
+    file: &mut cap_std::fs::File,
+    expected_identity: AgentConfigObjectIdentity,
+    expected_bytes: &[u8],
+    expected_security: AgentConfigSecuritySnapshot,
+) -> std::result::Result<AgentConfigFileObservation, String> {
+    let observation =
+        verify_named_agent_config(parent, path, leaf, file, expected_identity, expected_bytes)?;
+    let security = capture_agent_config_security(parent, path, leaf, file, observation)?;
+    if security != expected_security {
+        return Err(format!(
+            "Agent config '{}' did not retain the authenticated owner, group, and mode.",
+            path.display()
+        ));
+    }
+    Ok(observation)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finalize_agent_config_candidate(
+    parent: &AgentConfigParentDirectory,
+    candidate: &mut StagedAgentConfig,
+    expected_bytes: &[u8],
+) -> std::result::Result<AgentConfigFileObservation, String> {
+    #[cfg(unix)]
+    use cap_std::fs::PermissionsExt as _;
+
+    #[cfg(unix)]
+    candidate
+        .file
+        .set_permissions(cap_std::fs::Permissions::from_mode(candidate.security.mode))
+        .map_err(|err| {
+            format!(
+                "Failed to apply authenticated source permissions to candidate '{}': {err}",
+                candidate.path.display()
+            )
+        })?;
+    persist_agent_config_regular_file(&candidate.file).map_err(|err| {
+        format!(
+            "Failed to synchronize agent config candidate '{}': {err}",
+            candidate.path.display()
+        )
+    })?;
+    verify_secure_named_agent_config(
+        parent,
+        &candidate.path,
+        &candidate.leaf,
+        &mut candidate.file,
+        candidate.identity,
+        expected_bytes,
+        candidate.security,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn finalize_agent_config_candidate(
+    _parent: &AgentConfigParentDirectory,
+    candidate: &mut StagedAgentConfig,
+    _expected_bytes: &[u8],
+) -> std::result::Result<AgentConfigFileObservation, String> {
+    Err(format!(
+        "Durable agent config candidate finalization for '{}' is unsupported on this platform.",
+        candidate.path.display()
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct OpenAgentConfigBytes {
+    file: cap_std::fs::File,
+    observation: AgentConfigFileObservation,
+    bytes: Vec<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentConfigSymlinkEvidence {
+    identity: AgentConfigObjectIdentity,
+    byte_len: u64,
+    modified: cap_std::time::SystemTime,
+    mode: u32,
+    target: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_agent_config_symlink_evidence(
+    parent: &AgentConfigParentDirectory,
+    path: &Path,
+    leaf: &Path,
+) -> std::result::Result<AgentConfigSymlinkEvidence, String> {
+    use cap_fs_ext::MetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let metadata_before = parent.directory.symlink_metadata(leaf).map_err(|err| {
+        format!(
+            "Failed to inspect displaced symlink '{}': {err}",
+            path.display()
+        )
+    })?;
+    if !metadata_before.file_type().is_symlink() || metadata_before.nlink() != 1 {
+        return Err(format!(
+            "Displaced entry '{}' is not one single-link regular file or symbolic link.",
+            path.display()
+        ));
+    }
+    let target = parent.directory.read_link(leaf).map_err(|err| {
+        format!(
+            "Failed to read displaced symlink '{}': {err}",
+            path.display()
+        )
+    })?;
+    if u64::try_from(target.as_os_str().as_bytes().len()).unwrap_or(u64::MAX)
+        > AGENT_CONFIG_MAX_BYTES
+    {
+        return Err(format!(
+            "Displaced symlink '{}' exceeds the 1 MiB evidence limit.",
+            path.display()
+        ));
+    }
+    let evidence = AgentConfigSymlinkEvidence {
+        identity: AgentConfigObjectIdentity::from_metadata(&metadata_before),
+        byte_len: metadata_before.len(),
+        modified: metadata_before.modified().map_err(|err| {
+            format!(
+                "Failed to inspect displaced symlink modification time '{}': {err}",
+                path.display()
+            )
+        })?,
+        mode: metadata_before.permissions().mode() & 0o7777,
+        target,
+    };
+    let metadata_after = parent.directory.symlink_metadata(leaf).map_err(|err| {
+        format!(
+            "Failed to re-inspect displaced symlink '{}': {err}",
+            path.display()
+        )
+    })?;
+    let after = AgentConfigSymlinkEvidence {
+        identity: AgentConfigObjectIdentity::from_metadata(&metadata_after),
+        byte_len: metadata_after.len(),
+        modified: metadata_after.modified().map_err(|err| {
+            format!(
+                "Failed to re-inspect displaced symlink modification time '{}': {err}",
+                path.display()
+            )
+        })?,
+        mode: metadata_after.permissions().mode() & 0o7777,
+        target: parent.directory.read_link(leaf).map_err(|err| {
+            format!(
+                "Failed to re-read displaced symlink '{}': {err}",
+                path.display()
+            )
+        })?,
+    };
+    if after != evidence {
+        return Err(format!(
+            "Displaced symlink '{}' changed while its identity was captured.",
+            path.display()
+        ));
+    }
+    parent.revalidate()?;
+    Ok(evidence)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_open_agent_config_bytes(
+    parent: &AgentConfigParentDirectory,
+    path: &Path,
+    leaf: &Path,
+) -> std::result::Result<OpenAgentConfigBytes, String> {
+    let named_before = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(leaf).map_err(|err| {
+            format!(
+                "Failed to inspect displaced agent config '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent.directory.open_with(leaf, &options).map_err(|err| {
+        format!(
+            "Failed to open displaced agent config '{}' without following links: {err}",
+            path.display()
+        )
+    })?;
+    let opened_before = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to inspect displaced agent config handle '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    if opened_before != named_before {
+        return Err(format!(
+            "Displaced agent config '{}' changed identity while it was opened.",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(AGENT_CONFIG_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            format!(
+                "Failed to read displaced agent config '{}': {err}",
+                path.display()
+            )
+        })?;
+    let opened_after = agent_config_regular_file_observation(
+        &file.metadata().map_err(|err| {
+            format!(
+                "Failed to re-inspect displaced agent config handle '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    let named_after = agent_config_regular_file_observation(
+        &parent.directory.symlink_metadata(leaf).map_err(|err| {
+            format!(
+                "Failed to re-inspect displaced agent config '{}': {err}",
+                path.display()
+            )
+        })?,
+        path,
+    )?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != opened_before.byte_len
+        || opened_after != opened_before
+        || named_after != opened_before
+    {
+        return Err(format!(
+            "Displaced agent config '{}' changed while its bytes were captured.",
+            path.display()
+        ));
+    }
+    parent.revalidate()?;
+    Ok(OpenAgentConfigBytes {
+        file,
+        observation: opened_before,
+        bytes,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_agent_config_candidate_with_hooks<F, G>(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    candidate: &mut StagedAgentConfig,
+    candidate_bytes: &[u8],
+    mut source: Option<&mut OpenAgentConfigFile>,
+    before_effect: F,
+    before_rollback: G,
+) -> std::result::Result<Option<PathBuf>, String>
+where
+    F: FnOnce() -> std::io::Result<()>,
+    G: FnOnce() -> std::io::Result<()>,
+{
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let target_leaf = agent_config_leaf(target_path)?;
+    verify_secure_named_agent_config(
+        parent,
+        &candidate.path,
+        &candidate.leaf,
+        &mut candidate.file,
+        candidate.identity,
+        candidate_bytes,
+        candidate.security,
+    )?;
+    let source_observation = if let Some(snapshot) = source.as_deref_mut() {
+        revalidate_open_agent_config_file(parent, target_path, snapshot)?;
+        Some(snapshot.observation)
+    } else {
+        revalidate_absent_agent_config(parent, target_path)?;
+        None
+    };
+    before_effect().map_err(|err| {
+        format!(
+            "Agent config publication hook failed for '{}': {err}",
+            target_path.display()
+        )
+    })?;
+
+    let parent_file = parent.file.try_clone().map_err(|err| {
+        format!(
+            "Failed to clone the pinned agent config parent descriptor '{}': {err}",
+            parent.path.display()
+        )
+    })?;
+    let flags = if source_observation.is_some() {
+        RenameFlags::EXCHANGE
+    } else {
+        RenameFlags::NOREPLACE
+    };
+    renameat_with(
+        &parent_file,
+        &candidate.leaf,
+        &parent_file,
+        &target_leaf,
+        flags,
+    )
+    .map_err(|err| {
+        format!(
+            "Atomic agent config publication for '{}' failed; candidate retained at '{}': {}",
+            target_path.display(),
+            candidate.path.display(),
+            std::io::Error::from(err)
+        )
+    })?;
+    parent_file.sync_all().map_err(|err| {
+        format!(
+            "Agent config namespace changed but parent synchronization failed for '{}'; target and rollback evidence require reconciliation: {err}",
+            target_path.display()
+        )
+    })?;
+    parent.revalidate()?;
+
+    verify_secure_named_agent_config(
+        parent,
+        target_path,
+        &target_leaf,
+        &mut candidate.file,
+        candidate.identity,
+        candidate_bytes,
+        candidate.security,
+    )
+    .map_err(|message| {
+        format!(
+            "{message} Atomic publication completed, so retained rollback evidence requires reconciliation."
+        )
+    })?;
+
+    let displaced_path = if let (Some(snapshot), Some(expected)) = (source, source_observation) {
+        let mut displaced = match read_open_agent_config_bytes(
+            parent,
+            &candidate.path,
+            &candidate.leaf,
+        ) {
+            Ok(displaced) => displaced,
+            Err(regular_error) => {
+                let symlink = capture_agent_config_symlink_evidence(
+                    parent,
+                    &candidate.path,
+                    &candidate.leaf,
+                )
+                .map_err(|symlink_error| {
+                    format!(
+                        "Published agent config '{}' but could not bind retained rollback evidence '{}': regular evidence error: {regular_error}; symlink evidence error: {symlink_error}; outcome is indeterminate and reconciliation is required.",
+                        target_path.display(),
+                        candidate.path.display()
+                    )
+                })?;
+                before_rollback().map_err(|err| {
+                    format!(
+                        "Atomic agent config publication for '{}' displaced an unexpected symlink, and rollback could not begin; outcome is indeterminate and reconciliation is required: {err}",
+                        target_path.display()
+                    )
+                })?;
+                verify_secure_named_agent_config(
+                    parent,
+                    target_path,
+                    &target_leaf,
+                    &mut candidate.file,
+                    candidate.identity,
+                    candidate_bytes,
+                    candidate.security,
+                )
+                .map_err(|message| {
+                    format!(
+                        "Atomic agent config symlink rollback precondition failed for '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                        target_path.display()
+                    )
+                })?;
+                let symlink_revalidated = capture_agent_config_symlink_evidence(
+                    parent,
+                    &candidate.path,
+                    &candidate.leaf,
+                )
+                .map_err(|message| {
+                    format!(
+                        "Atomic agent config symlink rollback evidence changed for '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                        target_path.display()
+                    )
+                })?;
+                if symlink_revalidated != symlink {
+                    return Err(format!(
+                        "Atomic agent config symlink rollback evidence changed identity for '{}'; outcome is indeterminate and reconciliation is required.",
+                        target_path.display()
+                    ));
+                }
+                renameat_with(
+                    &parent_file,
+                    &candidate.leaf,
+                    &parent_file,
+                    &target_leaf,
+                    RenameFlags::EXCHANGE,
+                )
+                .map_err(|err| {
+                    format!(
+                        "Atomic agent config symlink rollback exchange failed for '{}'; outcome is indeterminate and reconciliation is required: {}",
+                        target_path.display(),
+                        std::io::Error::from(err)
+                    )
+                })?;
+                parent_file.sync_all().map_err(|err| {
+                    format!(
+                        "Atomic agent config symlink rollback changed '{}' but parent synchronization failed; outcome is indeterminate and reconciliation is required: {err}",
+                        target_path.display()
+                    )
+                })?;
+                parent.revalidate()?;
+                let restored = capture_agent_config_symlink_evidence(
+                    parent,
+                    target_path,
+                    &target_leaf,
+                )
+                .map_err(|message| {
+                    format!(
+                        "Atomic agent config symlink rollback could not verify restored target '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                        target_path.display()
+                    )
+                })?;
+                if restored != symlink {
+                    return Err(format!(
+                        "Atomic agent config symlink rollback restored conflicting bytes or identity at '{}'; outcome is indeterminate and reconciliation is required.",
+                        target_path.display()
+                    ));
+                }
+                verify_secure_named_agent_config(
+                    parent,
+                    &candidate.path,
+                    &candidate.leaf,
+                    &mut candidate.file,
+                    candidate.identity,
+                    candidate_bytes,
+                    candidate.security,
+                )
+                .map_err(|message| {
+                    format!(
+                        "Atomic agent config symlink rollback could not verify retained candidate '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                        candidate.path.display()
+                    )
+                })?;
+                parent.revalidate()?;
+                return Err(format!(
+                    "Atomic agent config publication for '{}' was rolled back because a symlink replaced the target at the effect boundary; the symlink was restored exactly and the complete candidate is retained at '{}'.",
+                    target_path.display(),
+                    candidate.path.display()
+                ));
+            }
+        };
+        let source_security = snapshot.security.ok_or_else(|| {
+            format!(
+                "Agent config '{}' lost its authenticated source security snapshot during publication.",
+                target_path.display()
+            )
+        })?;
+        let displaced_bytes_and_metadata_match =
+            agent_config_observation_matches_across_namespace_move(displaced.observation, expected)
+                && displaced.bytes == snapshot.content.as_bytes();
+        let displaced_security_matches = displaced_bytes_and_metadata_match
+            && verify_secure_named_agent_config(
+                parent,
+                &candidate.path,
+                &candidate.leaf,
+                &mut displaced.file,
+                expected.identity,
+                snapshot.content.as_bytes(),
+                source_security,
+            )
+            .is_ok();
+        if displaced_security_matches {
+            Some(candidate.path.clone())
+        } else {
+            before_rollback().map_err(|err| {
+                format!(
+                    "Atomic agent config publication for '{}' displaced an unexpected object, and rollback could not begin; outcome is indeterminate and reconciliation is required: {err}",
+                    target_path.display()
+                )
+            })?;
+            verify_secure_named_agent_config(
+                parent,
+                target_path,
+                &target_leaf,
+                &mut candidate.file,
+                candidate.identity,
+                candidate_bytes,
+                candidate.security,
+            )
+            .map_err(|message| {
+                format!(
+                    "Atomic agent config rollback precondition failed for '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                    target_path.display()
+                )
+            })?;
+            verify_named_agent_config(
+                parent,
+                &candidate.path,
+                &candidate.leaf,
+                &mut displaced.file,
+                displaced.observation.identity,
+                &displaced.bytes,
+            )
+            .map_err(|message| {
+                format!(
+                    "Atomic agent config rollback evidence changed for '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                    target_path.display()
+                )
+            })?;
+            renameat_with(
+                &parent_file,
+                &candidate.leaf,
+                &parent_file,
+                &target_leaf,
+                RenameFlags::EXCHANGE,
+            )
+            .map_err(|err| {
+                format!(
+                    "Atomic agent config rollback exchange failed for '{}'; outcome is indeterminate and reconciliation is required: {}",
+                    target_path.display(),
+                    std::io::Error::from(err)
+                )
+            })?;
+            parent_file.sync_all().map_err(|err| {
+                format!(
+                    "Atomic agent config rollback changed '{}' but parent synchronization failed; outcome is indeterminate and reconciliation is required: {err}",
+                    target_path.display()
+                )
+            })?;
+            parent.revalidate()?;
+            verify_named_agent_config(
+                parent,
+                target_path,
+                &target_leaf,
+                &mut displaced.file,
+                displaced.observation.identity,
+                &displaced.bytes,
+            )
+            .map_err(|message| {
+                format!(
+                    "Atomic agent config rollback could not verify restored target '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                    target_path.display()
+                )
+            })?;
+            verify_secure_named_agent_config(
+                parent,
+                &candidate.path,
+                &candidate.leaf,
+                &mut candidate.file,
+                candidate.identity,
+                candidate_bytes,
+                candidate.security,
+            )
+            .map_err(|message| {
+                format!(
+                    "Atomic agent config rollback could not verify retained candidate '{}': {message}; outcome is indeterminate and reconciliation is required.",
+                    candidate.path.display()
+                )
+            })?;
+            parent.revalidate()?;
+            return Err(format!(
+                "Atomic agent config publication for '{}' was rolled back because the target changed at the effect boundary; the substituted target was restored exactly and the complete candidate is retained at '{}'.",
+                target_path.display(),
+                candidate.path.display()
+            ));
+        }
+    } else {
+        None
+    };
+    parent.revalidate()?;
+    Ok(displaced_path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_agent_config_candidate_with_hook<F>(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    candidate: &mut StagedAgentConfig,
+    candidate_bytes: &[u8],
+    source: Option<&mut OpenAgentConfigFile>,
+    before_effect: F,
+) -> std::result::Result<Option<PathBuf>, String>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    publish_agent_config_candidate_with_hooks(
+        parent,
+        target_path,
+        candidate,
+        candidate_bytes,
+        source,
+        before_effect,
+        || Ok(()),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_agent_config_candidate(
+    parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    candidate: &mut StagedAgentConfig,
+    candidate_bytes: &[u8],
+    source: Option<&mut OpenAgentConfigFile>,
+) -> std::result::Result<Option<PathBuf>, String> {
+    publish_agent_config_candidate_with_hook(
+        parent,
+        target_path,
+        candidate,
+        candidate_bytes,
+        source,
+        || Ok(()),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_agent_config_candidate(
+    _parent: &AgentConfigParentDirectory,
+    target_path: &Path,
+    _candidate: &mut StagedAgentConfig,
+    _candidate_bytes: &[u8],
+    _source: Option<&mut OpenAgentConfigFile>,
+) -> std::result::Result<Option<PathBuf>, String> {
+    Err(format!(
+        "Atomic agent config publication for '{}' is unsupported on this platform.",
+        target_path.display()
+    ))
+}
+
 fn apply_prepared_agent_config(
     prepared: &PreparedAgentConfig,
-) -> std::result::Result<
-    frankenterm_core::robot_types::AgentConfigureResultItem,
-    AgentConfigApplyError,
-> {
-    apply_prepared_agent_config_with_writer(prepared, |path, bytes| fs::write(path, bytes))
+) -> std::result::Result<AppliedAgentConfig, AgentConfigApplyError> {
+    apply_prepared_agent_config_with_writer(prepared, |file, bytes| {
+        file.rewind()?;
+        file.write_all(bytes)?;
+        file.set_len(u64::try_from(bytes.len()).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("agent config length does not fit u64: {err}"),
+            )
+        })?)
+    })
 }
 
 fn apply_prepared_agent_config_with_writer<F>(
     prepared: &PreparedAgentConfig,
     write_final: F,
-) -> std::result::Result<
-    frankenterm_core::robot_types::AgentConfigureResultItem,
-    AgentConfigApplyError,
->
+) -> std::result::Result<AppliedAgentConfig, AgentConfigApplyError>
 where
-    F: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    F: FnOnce(&mut cap_std::fs::File, &[u8]) -> std::io::Result<()>,
 {
-    let current_content = if prepared.target_path.exists() {
-        Some(
-            fs::read_to_string(&prepared.target_path).map_err(|err| AgentConfigApplyError {
-                message: format!("Failed to read '{}': {err}", prepared.target_path.display()),
+    let parent =
+        match open_agent_config_parent(&prepared.target_path, false).map_err(|message| {
+            AgentConfigApplyError {
+                message,
                 backup_created: false,
-            })?,
-        )
-    } else {
-        None
-    };
-    let actual_action =
-        classify_agent_config_action(current_content.as_deref(), &prepared.template.content);
+            }
+        })? {
+            Some(parent) => parent,
+            None => open_agent_config_parent(&prepared.target_path, true)
+                .map_err(|message| AgentConfigApplyError {
+                    message,
+                    backup_created: false,
+                })?
+                .ok_or_else(|| AgentConfigApplyError {
+                    message: format!(
+                        "Agent config directory for '{}' was not created.",
+                        prepared.target_path.display()
+                    ),
+                    backup_created: false,
+                })?,
+        };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _transition_lock =
+        acquire_atomic_path_transition_lock(&parent.directory, &parent.file).map_err(|err| {
+            AgentConfigApplyError {
+                message: format!(
+                    "Failed to acquire the parent-domain agent config transition lock for '{}': {err:#}",
+                    prepared.target_path.display()
+                ),
+                backup_created: false,
+            }
+        })?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _reconciled_transactions = reconcile_agent_config_transactions_for_target(
+        &parent,
+        &prepared.target_path,
+    )
+    .map_err(|message| AgentConfigApplyError {
+        message,
+        backup_created: false,
+    })?;
+    let mut current = read_open_agent_config_file(
+        &parent,
+        &prepared.target_path,
+        AgentConfigOpenIntent::Update,
+    )
+    .map_err(|message| AgentConfigApplyError {
+        message,
+        backup_created: false,
+    })?;
+    let current_content = current.as_ref().map(|snapshot| snapshot.content.as_str());
+    let actual_action = classify_agent_config_action(current_content, &prepared.template.content);
 
     if actual_action == frankenterm_core::agent_config_templates::ConfigAction::Skip {
-        return Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
-            slug: prepared.slug.clone(),
-            display_name: prepared.display_name.clone(),
-            action: agent_config_action_label(actual_action).to_string(),
-            filename: prepared.filename.clone(),
+        let snapshot = current.as_mut().ok_or_else(|| AgentConfigApplyError {
+            message: format!(
+                "Agent config '{}' disappeared before its current contents were confirmed.",
+                prepared.target_path.display()
+            ),
             backup_created: false,
-            error: None,
+        })?;
+        revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
+            |message| AgentConfigApplyError {
+                message,
+                backup_created: false,
+            },
+        )?;
+        return Ok(AppliedAgentConfig {
+            result: frankenterm_core::robot_types::AgentConfigureResultItem {
+                slug: prepared.slug.clone(),
+                display_name: prepared.display_name.clone(),
+                action: agent_config_action_label(actual_action).to_string(),
+                filename: prepared.filename.clone(),
+                backup_created: false,
+                error: None,
+            },
+            transaction: None,
         });
     }
 
-    if let Some(parent) = prepared.target_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| AgentConfigApplyError {
-            message: format!("Failed to create '{}': {err}", parent.display()),
-            backup_created: false,
-        })?;
-    }
-
-    let mut backup_created = false;
-    if prepared.target_path.exists() {
-        let backup_path = agent_config_backup_path(&prepared.target_path);
-        fs::copy(&prepared.target_path, &backup_path).map_err(|err| AgentConfigApplyError {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(AgentConfigApplyError {
             message: format!(
-                "Failed to create backup '{}' from '{}': {err}",
-                backup_path.display(),
+                "Atomic agent config publication for '{}' is unsupported on this platform.",
                 prepared.target_path.display()
             ),
-            backup_created,
-        })?;
-        backup_created = true;
+            backup_created: false,
+        });
     }
 
+    let expected_merged_len =
+        admit_agent_config_merge(current_content.unwrap_or(""), &prepared.template.content)
+            .map_err(|message| AgentConfigApplyError {
+                message,
+                backup_created: false,
+            })?;
     let merged = frankenterm_core::agent_config_templates::merge_into_existing(
-        current_content.as_deref().unwrap_or(""),
+        current_content.unwrap_or(""),
         &prepared.template.content,
     );
-    write_final(&prepared.target_path, merged.as_bytes()).map_err(|err| AgentConfigApplyError {
+    if u64::try_from(merged.len()).unwrap_or(u64::MAX) != expected_merged_len {
+        return Err(AgentConfigApplyError {
+            message: "Agent config merge length differed from its bounded preflight.".to_string(),
+            backup_created: false,
+        });
+    }
+
+    let source_security = current
+        .as_ref()
+        .map(|snapshot| {
+            snapshot.security.ok_or_else(|| {
+                format!(
+                    "Agent config '{}' has no authenticated source security snapshot.",
+                    prepared.target_path.display()
+                )
+            })
+        })
+        .transpose()
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+    if let Some(snapshot) = current.as_mut() {
+        revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
+            |message| AgentConfigApplyError {
+                message,
+                backup_created: false,
+            },
+        )?;
+    } else {
+        revalidate_absent_agent_config(&parent, &prepared.target_path).map_err(|message| {
+            AgentConfigApplyError {
+                message,
+                backup_created: false,
+            }
+        })?;
+    }
+    let transaction = AgentConfigTransaction::new();
+    let inventory =
+        agent_config_transaction_inventory(&parent).map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+    inventory
+        .reserve(
+            expected_merged_len,
+            current
+                .as_ref()
+                .map(|snapshot| snapshot.observation.byte_len),
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let requested_final_metadata = source_security.unwrap_or(AgentConfigSecuritySnapshot {
+        uid: nix::unistd::geteuid().as_raw(),
+        gid: nix::unistd::getegid().as_raw(),
+        mode: 0o600,
+    });
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let claim = build_agent_config_transaction_claim(
+        &parent,
+        &prepared.target_path,
+        actual_action,
+        current.as_ref(),
+        merged.as_bytes(),
+        requested_final_metadata,
+        &transaction,
+    )
+    .map_err(|message| AgentConfigApplyError {
+        message,
+        backup_created: false,
+    })?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let claim_name = agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").map_err(
+        |message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        },
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let claim_bytes = write_atomic_path_transition_json(
+        &parent.directory,
+        &parent.file,
+        &claim_name,
+        &claim,
+    )
+    .map_err(|err| AgentConfigApplyError {
         message: format!(
-            "Failed to write '{}': {err}",
+            "Failed to durably publish immutable agent config claim for '{}': {err:#}",
+            prepared.target_path.display()
+        ),
+        backup_created: false,
+    })?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let claim_sha256 = agent_config_sha256(&claim_bytes)
+        .strip_prefix("sha256:")
+        .unwrap_or_default()
+        .to_string();
+    parent
+        .revalidate()
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+    let publication = (|| -> std::result::Result<bool, AgentConfigApplyError> {
+    // Reserve the bounded, private, empty candidate slot before publishing a
+    // backup. A full candidate inventory therefore cannot create one backup on
+    // every rejected retry, and no candidate bytes exist before the exact
+    // source backup is durable.
+    let mut candidate = create_agent_config_candidate(&parent, source_security, &transaction)
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
+
+    let backup_created = if let Some(snapshot) = current.as_mut() {
+        revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
+            |message| AgentConfigApplyError {
+                message,
+                backup_created: false,
+            },
+        )?;
+        let _backup_path =
+            create_agent_config_backup(&parent, &prepared.target_path, snapshot, &transaction)?;
+        revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
+            |message| AgentConfigApplyError {
+                message,
+                backup_created: true,
+            },
+        )?;
+        true
+    } else {
+        revalidate_absent_agent_config(&parent, &prepared.target_path).map_err(|message| {
+            AgentConfigApplyError {
+                message,
+                backup_created: false,
+            }
+        })?;
+        false
+    };
+    write_final(&mut candidate.file, merged.as_bytes()).map_err(|err| AgentConfigApplyError {
+        message: format!(
+            "Failed to write same-directory candidate '{}' for '{}': {err}",
+            candidate.path.display(),
             prepared.target_path.display()
         ),
         backup_created,
     })?;
-
-    Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
-        slug: prepared.slug.clone(),
-        display_name: prepared.display_name.clone(),
-        action: agent_config_action_label(actual_action).to_string(),
-        filename: prepared.filename.clone(),
+    finalize_agent_config_candidate(&parent, &mut candidate, merged.as_bytes()).map_err(
+        |message| AgentConfigApplyError {
+            message,
+            backup_created,
+        },
+    )?;
+    parent.file.sync_all().map_err(|err| AgentConfigApplyError {
+        message: format!(
+            "Agent config candidate '{}' is complete but its parent directory could not be synchronized before publication: {err}",
+            candidate.path.display()
+        ),
         backup_created,
-        error: None,
+    })?;
+    parent
+        .revalidate()
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created,
+        })?;
+    let _displaced_path = publish_agent_config_candidate(
+        &parent,
+        &prepared.target_path,
+        &mut candidate,
+        merged.as_bytes(),
+        current.as_mut(),
+    )
+    .map_err(|message| AgentConfigApplyError {
+        message,
+        backup_created,
+    })?;
+        Ok(backup_created)
+    })();
+    let backup_created = match publication {
+        Ok(backup_created) => backup_created,
+        Err(mut error) => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let recovery_outcome = classify_unacknowledged_agent_config_transaction(
+                    &parent,
+                    &prepared.target_path,
+                    &transaction,
+                    &claim,
+                )
+                .unwrap_or(AgentConfigTransactionOutcome::Indeterminate);
+                match write_agent_config_transaction_ack(
+                    &parent,
+                    &prepared.target_path,
+                    &transaction,
+                    &claim,
+                    &claim_sha256,
+                    recovery_outcome,
+                    false,
+                    false,
+                    recovery_outcome == AgentConfigTransactionOutcome::AlreadyApplied,
+                ) {
+                    Ok(receipt) => {
+                        if let Ok(receipt_json) = serde_json::to_string(&receipt) {
+                            error.message.push_str(" Durable transaction receipt: ");
+                            error.message.push_str(&receipt_json);
+                        }
+                    }
+                    Err(ack_error) => {
+                        error.message.push_str(
+                            " Durable acknowledgement could not be published; explicit reconciliation is required: ",
+                        );
+                        error.message.push_str(&ack_error);
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let transaction_receipt = write_agent_config_transaction_ack(
+        &parent,
+        &prepared.target_path,
+        &transaction,
+        &claim,
+        &claim_sha256,
+        AgentConfigTransactionOutcome::Applied,
+        true,
+        backup_created,
+        true,
+    )
+    .map_err(|message| AgentConfigApplyError {
+        message: format!(
+            "Agent config '{}' was applied but its durable acknowledgement failed: {message}",
+            prepared.target_path.display()
+        ),
+        backup_created,
+    })?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let transaction_receipt = unreachable!();
+
+    Ok(AppliedAgentConfig {
+        result: frankenterm_core::robot_types::AgentConfigureResultItem {
+            slug: prepared.slug.clone(),
+            display_name: prepared.display_name.clone(),
+            action: agent_config_action_label(actual_action).to_string(),
+            filename: prepared.filename.clone(),
+            backup_created,
+            error: None,
+        },
+        transaction: Some(transaction_receipt),
     })
 }
 
@@ -52933,7 +56071,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             print_robot_response(&response, format, stats)?;
                                         } else {
                                             let response = RobotResponse::<
-                                                frankenterm_core::robot_types::AgentConfigureData,
+                                                AgentConfigureDataWithTransactions,
                                             >::error_with_code(
                                                 ROBOT_ERR_FEATURE_NOT_AVAILABLE,
                                                 "Agent detection feature is not available in this build",
@@ -53156,7 +56294,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 print_robot_response(&response, format, stats)?;
                                             } else {
                                                 let response = RobotResponse::<
-                                                    frankenterm_core::robot_types::AgentConfigureData,
+                                                    AgentConfigureDataWithTransactions,
                                                 >::error_with_code(
                                                     "robot.agent_detection_error",
                                                     format!(
@@ -53192,7 +56330,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 print_robot_response(&response, format, stats)?;
                                             } else {
                                                 let response = RobotResponse::<
-                                                        frankenterm_core::robot_types::AgentConfigureData,
+                                                        AgentConfigureDataWithTransactions,
                                                     >::error_with_code(
                                                         ROBOT_ERR_INVALID_ARGS,
                                                         err,
@@ -53302,6 +56440,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         let mut updated = 0_usize;
                                         let mut skipped = 0_usize;
                                         let mut errors = 0_usize;
+                                        let mut transactions = Vec::new();
 
                                         for entry in &selected_entries {
                                             match prepare_agent_config(
@@ -53338,7 +56477,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                                 backup_created = result.backup_created,
                                                                 "applied agent config action"
                                                             );
-                                                            results.push(result);
+                                                            if let Some(receipt) = result.transaction {
+                                                                transactions.push(receipt);
+                                                            }
+                                                            results.push(result.result);
                                                         }
                                                         Err(err) => {
                                                             errors += 1;
@@ -53383,22 +56525,24 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             }
                                         }
 
-                                        let data =
-                                            frankenterm_core::robot_types::AgentConfigureData {
+                                        let data = AgentConfigureDataWithTransactions {
+                                            base: frankenterm_core::robot_types::AgentConfigureData {
                                                 total: results.len(),
                                                 created,
                                                 updated,
                                                 skipped,
                                                 errors,
                                                 results,
-                                            };
+                                            },
+                                            transactions,
+                                        };
                                         let elapsed = elapsed_ms(start);
                                         tracing::info!(
                                             command = "robot.agents.configure",
                                             dry_run = false,
                                             response_time_ms = elapsed,
-                                            agents_processed = data.total,
-                                            errors = data.errors,
+                                            agents_processed = data.base.total,
+                                            errors = data.base.errors,
                                             "robot agents configure completed"
                                         );
                                         let response = RobotResponse::success(data, elapsed);
@@ -87665,6 +90809,81 @@ fn commit_pending_live_owner_after_selector_observation(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn reconcile_remote_generation_noreplace_result_with_sync<F>(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    manifest: &RemoteGenerationManifest,
+    effective_uid: u32,
+    publication: Result<(), nix::errno::Errno>,
+    sync_generations: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+{
+    match publication {
+        Ok(()) => {
+            sync_generations(generations)?;
+            revalidate_remote_generations_binding(root, generations, effective_uid)?;
+            verify_remote_generation_directory(
+                generations,
+                generation_id,
+                true,
+                Some(manifest),
+                effective_uid,
+            )?;
+        }
+        Err(nix::errno::Errno::EEXIST) => {
+            // A concurrent exact publisher may have won before this lock
+            // domain existed. Keep our immutable stage and accept only an
+            // exact existing generation; a conflict fails closed.
+            verify_remote_generation_directory(
+                generations,
+                generation_id,
+                true,
+                Some(manifest),
+                effective_uid,
+            )?;
+            sync_generations(generations)?;
+            revalidate_remote_generations_binding(root, generations, effective_uid)?;
+            verify_remote_generation_directory(
+                generations,
+                generation_id,
+                true,
+                Some(manifest),
+                effective_uid,
+            )?;
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "atomic no-replace generation publication failed: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn reconcile_remote_generation_noreplace_result(
+    root: &cap_std::fs::Dir,
+    generations: &cap_std::fs::Dir,
+    generation_id: &str,
+    manifest: &RemoteGenerationManifest,
+    effective_uid: u32,
+    publication: Result<(), nix::errno::Errno>,
+) -> anyhow::Result<()> {
+    reconcile_remote_generation_noreplace_result_with_sync(
+        root,
+        generations,
+        generation_id,
+        manifest,
+        effective_uid,
+        publication,
+        sync_capability_directory,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn publish_remote_process_family_generation(
     request: &RemoteGenerationPublishRequest<'_>,
 ) -> anyhow::Result<RemoteGenerationPublicationReceipt> {
@@ -88066,44 +91285,21 @@ fn publish_remote_process_family_generation(
             effective_uid,
         )?;
 
-        match renameat2(
+        let publication = renameat2(
             &generations,
             stage_name.as_str(),
             &generations,
             generation_id.as_str(),
             RenameFlags::RENAME_NOREPLACE,
-        ) {
-            Ok(()) => {
-                sync_capability_directory(&generations)?;
-                revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
-                verify_remote_generation_directory(
-                    &generations,
-                    &generation_id,
-                    true,
-                    Some(&manifest),
-                    effective_uid,
-                )?;
-            }
-            Err(nix::errno::Errno::EEXIST) => {
-                // A concurrent exact publisher may have won before this lock
-                // domain existed. Keep our immutable stage and accept only an
-                // exact existing generation; a conflict fails closed.
-                verify_remote_generation_directory(
-                    &generations,
-                    &generation_id,
-                    true,
-                    Some(&manifest),
-                    effective_uid,
-                )?;
-                sync_capability_directory(&generations)?;
-                revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
-            }
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "atomic no-replace generation publication failed: {error}"
-                ));
-            }
-        }
+        );
+        reconcile_remote_generation_noreplace_result(
+            &root,
+            &generations,
+            &generation_id,
+            &manifest,
+            effective_uid,
+            publication,
+        )?;
     }
 
     let receipt = if activation_requested {
@@ -109699,8 +112895,9 @@ log_level = "debug"
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
-    fn remote_generation_conflicting_eexist_fails_without_overwrite() {
+    fn remote_generation_eexist_reconciliation_accepts_exact_and_rejects_conflict() {
         use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
 
         let fixture = tempfile::tempdir().expect("create conflicting generation fixture");
@@ -109723,20 +112920,43 @@ log_level = "debug"
         );
         let family = validate_local_process_family(&ft, &mux, &guardian).unwrap();
         let expected = ProcessFamilyByteReceipt::from(&family);
+        let manifest = RemoteGenerationManifest::from_process_family(&family)
+            .expect("construct exact generation manifest");
         let first = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
             root: &root,
             ft_source: &ft,
             mux_server_source: &mux,
             guardian_source: &guardian,
-            expected: expected.clone(),
+            expected,
             transaction_id: "66666666666666666666666666666666",
             activate_current: false,
         })
         .unwrap();
-        let published_mux = root
-            .join("generations")
-            .join(&first.generation_id)
-            .join(REMOTE_GENERATION_MUX_FILE);
+        assert_eq!(first.generation_id, manifest.generation_id);
+        let generation_path = root.join("generations").join(&first.generation_id);
+        let published_mux = generation_path.join(REMOTE_GENERATION_MUX_FILE);
+        let existing_before = std::fs::symlink_metadata(&generation_path)
+            .expect("inspect exact existing generation before EEXIST reconciliation");
+        let exact_mux_bytes = std::fs::read(&published_mux).expect("read exact existing mux");
+        let effective_uid = remote_generation_effective_uid();
+        let (root_dir, generations) = open_remote_generation_root(&root, effective_uid)
+            .expect("open exact existing generation root");
+
+        reconcile_remote_generation_noreplace_result(
+            &root_dir,
+            &generations,
+            &first.generation_id,
+            &manifest,
+            effective_uid,
+            Err(nix::errno::Errno::EEXIST),
+        )
+        .expect("an exact existing generation must reconcile after EEXIST");
+        let existing_after = std::fs::symlink_metadata(&generation_path)
+            .expect("inspect exact existing generation after EEXIST reconciliation");
+        assert_eq!(existing_after.dev(), existing_before.dev());
+        assert_eq!(existing_after.ino(), existing_before.ino());
+        assert_eq!(std::fs::read(&published_mux).unwrap(), exact_mux_bytes);
+
         std::fs::set_permissions(&published_mux, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::OpenOptions::new()
             .append(true)
@@ -109744,19 +112964,58 @@ log_level = "debug"
             .unwrap()
             .write_all(b"conflict")
             .unwrap();
+        std::fs::set_permissions(
+            &published_mux,
+            std::fs::Permissions::from_mode(REMOTE_GENERATION_BINARY_MODE),
+        )
+        .unwrap();
         let planted = std::fs::read(&published_mux).unwrap();
-        let error = publish_remote_process_family_generation(&RemoteGenerationPublishRequest {
-            root: &root,
-            ft_source: &ft,
-            mux_server_source: &mux,
-            guardian_source: &guardian,
-            expected,
-            transaction_id: "77777777777777777777777777777777",
-            activate_current: false,
-        })
-        .expect_err("conflicting EEXIST generation must fail closed");
-        assert!(error.to_string().contains("generation"));
+        let error = reconcile_remote_generation_noreplace_result(
+            &root_dir,
+            &generations,
+            &first.generation_id,
+            &manifest,
+            effective_uid,
+            Err(nix::errno::Errno::EEXIST),
+        )
+        .expect_err("a conflicting existing generation must fail EEXIST reconciliation closed");
+        assert!(error.to_string().contains("length does not match"));
         assert_eq!(std::fs::read(&published_mux).unwrap(), planted);
+        assert!(!root.join("current").exists());
+
+        std::fs::set_permissions(&published_mux, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&published_mux, &exact_mux_bytes).unwrap();
+        std::fs::set_permissions(
+            &published_mux,
+            std::fs::Permissions::from_mode(REMOTE_GENERATION_BINARY_MODE),
+        )
+        .unwrap();
+        let post_sync_error = reconcile_remote_generation_noreplace_result_with_sync(
+            &root_dir,
+            &generations,
+            &first.generation_id,
+            &manifest,
+            effective_uid,
+            Err(nix::errno::Errno::EEXIST),
+            |directory| {
+                sync_capability_directory(directory)?;
+                std::fs::set_permissions(&published_mux, std::fs::Permissions::from_mode(0o700))?;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&published_mux)?
+                    .write_all(b"post-sync-conflict")?;
+                std::fs::set_permissions(
+                    &published_mux,
+                    std::fs::Permissions::from_mode(REMOTE_GENERATION_BINARY_MODE),
+                )
+            },
+        )
+        .expect_err("post-sync generation mutation must fail final EEXIST reconciliation closed");
+        assert!(
+            post_sync_error
+                .to_string()
+                .contains("length does not match")
+        );
         assert!(!root.join("current").exists());
     }
 
@@ -121351,6 +124610,359 @@ printf x > "$MINISIGN_MARKER"
     }
 
     #[test]
+    fn agent_config_merge_preflight_accepts_exact_cap_and_rejects_cap_plus_one() {
+        use frankenterm_core::agent_config_templates::{SECTION_END_MARKER, SECTION_START_MARKER};
+
+        let fixed_bytes = SECTION_START_MARKER.len() + 1 + 1 + SECTION_END_MARKER.len() + 1;
+        let exact_section_len = usize::try_from(AGENT_CONFIG_MAX_BYTES).unwrap() - fixed_bytes;
+        let exact_section = "x".repeat(exact_section_len);
+        assert_eq!(
+            admit_agent_config_merge("", &exact_section).unwrap(),
+            AGENT_CONFIG_MAX_BYTES
+        );
+
+        let oversized_section = "x".repeat(exact_section_len + 1);
+        let error = admit_agent_config_merge("", &oversized_section)
+            .expect_err("cap plus one must fail before merge allocation");
+        assert!(error.contains("1 MiB safety limit"));
+    }
+
+    #[test]
+    fn agent_config_transaction_names_have_one_fixed_family_binding() {
+        let fixed = AgentConfigTransaction::from_id("0123456789abcdef0123456789abcdef".to_string())
+            .unwrap();
+        assert_eq!(fixed.id.len(), AGENT_CONFIG_TRANSACTION_ID_LEN);
+        assert_eq!(
+            fixed.candidate_leaf,
+            PathBuf::from(".ft-agent-config-0123456789abcdef0123456789abcdef.candidate")
+        );
+        assert_eq!(
+            fixed.backup_leaf,
+            PathBuf::from(".ft-agent-config-0123456789abcdef0123456789abcdef.backup")
+        );
+        assert_eq!(
+            parse_agent_config_transaction_artifact_name(fixed.candidate_leaf.as_os_str()).unwrap(),
+            Some((
+                fixed.id.clone(),
+                AgentConfigTransactionArtifactKind::Candidate
+            ))
+        );
+        assert_eq!(
+            parse_agent_config_transaction_artifact_name(fixed.backup_leaf.as_os_str()).unwrap(),
+            Some((fixed.id.clone(), AgentConfigTransactionArtifactKind::Backup))
+        );
+
+        let random = AgentConfigTransaction::new();
+        assert_eq!(random.id.len(), AGENT_CONFIG_TRANSACTION_ID_LEN);
+        assert!(random.id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(random.candidate_leaf.to_string_lossy().contains(&random.id));
+        assert!(random.backup_leaf.to_string_lossy().contains(&random.id));
+        assert!(
+            AgentConfigTransaction::from_id("ABCDEF0123456789ABCDEF0123456789".to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_config_transaction_inventory_caps_are_combined_and_bounded() {
+        let mut scan = AgentConfigTransactionInventory {
+            entries_visited: AGENT_CONFIG_MAX_DIRECTORY_ENTRIES_VISITED,
+            ..AgentConfigTransactionInventory::default()
+        };
+        assert!(scan.observe_directory_entry(1).is_err());
+
+        let mut filename_scan = AgentConfigTransactionInventory {
+            filename_bytes: AGENT_CONFIG_MAX_DIRECTORY_FILENAME_BYTES,
+            ..AgentConfigTransactionInventory::default()
+        };
+        assert!(filename_scan.observe_directory_entry(1).is_err());
+
+        let at_last_slot = AgentConfigTransactionInventory {
+            families: AGENT_CONFIG_MAX_TRANSACTION_FAMILIES - 1,
+            artifacts: AGENT_CONFIG_MAX_TRANSACTION_ARTIFACTS - 2,
+            artifact_bytes: AGENT_CONFIG_MAX_TRANSACTION_ARTIFACT_BYTES
+                - (2 * AGENT_CONFIG_MAX_BYTES),
+            ..AgentConfigTransactionInventory::default()
+        };
+        assert!(
+            at_last_slot
+                .reserve(AGENT_CONFIG_MAX_BYTES, Some(AGENT_CONFIG_MAX_BYTES))
+                .is_ok()
+        );
+        assert!(
+            AgentConfigTransactionInventory {
+                families: AGENT_CONFIG_MAX_TRANSACTION_FAMILIES,
+                ..AgentConfigTransactionInventory::default()
+            }
+            .reserve(1, None)
+            .is_err()
+        );
+        assert!(
+            AgentConfigTransactionInventory {
+                artifact_bytes: AGENT_CONFIG_MAX_TRANSACTION_ARTIFACT_BYTES,
+                ..AgentConfigTransactionInventory::default()
+            }
+            .reserve(1, None)
+            .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_transaction_inventory_rejects_orphans_and_malformed_prefixes() {
+        let orphan_root = unique_temp_dir("agent_config_orphan_transaction");
+        let orphan_target = orphan_root.join("AGENTS.md");
+        let orphan_parent = open_agent_config_parent(&orphan_target, false)
+            .unwrap()
+            .unwrap();
+        let orphan = AgentConfigTransaction::from_id("1".repeat(32)).unwrap();
+        std::fs::write(orphan_root.join(orphan.candidate_leaf), []).unwrap();
+        let orphan_error = agent_config_transaction_inventory(&orphan_parent)
+            .expect_err("candidate without its bound backup must fail closed");
+        assert!(orphan_error.contains("orphan artifact"));
+
+        let malformed_root = unique_temp_dir("agent_config_malformed_transaction");
+        let malformed_target = malformed_root.join("AGENTS.md");
+        let malformed_parent = open_agent_config_parent(&malformed_target, false)
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            malformed_root.join(".ft-agent-config-not-a-transaction.candidate"),
+            [],
+        )
+        .unwrap();
+        let malformed_error = agent_config_transaction_inventory(&malformed_parent)
+            .expect_err("malformed reserved prefix must fail closed");
+        assert!(malformed_error.contains("32 lowercase hexadecimal"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_rejects_group_or_world_writable_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_temp_dir("agent_config_public_parent");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let target = root.join("AGENTS.md");
+        let error = open_agent_config_parent(&target, false)
+            .expect_err("publicly writable parent must fail closed");
+        assert!(error.contains("must not be group- or world-writable"));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn prepare_agent_config_rejects_source_above_finite_cap() {
+        let root = unique_temp_dir("agent_config_source_cap");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::write(
+            workspace_root.join("AGENTS.md"),
+            vec![b'x'; usize::try_from(AGENT_CONFIG_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![root.join(".codex").display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let error = prepare_agent_config(&entry, RobotAgentConfigScope::Project, &workspace_root)
+            .expect_err("oversized source must be rejected before reading");
+        assert!(error.contains("1 MiB safety limit"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_candidate_cap_rejection_creates_no_backup() {
+        let root = unique_temp_dir("agent_config_candidate_cap");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let target = workspace_root.join("AGENTS.md");
+        std::fs::write(&target, b"original instructions\n").unwrap();
+        for sequence in 0..AGENT_CONFIG_MAX_TRANSACTION_FAMILIES {
+            let transaction = AgentConfigTransaction::from_id(format!("{sequence:032x}")).unwrap();
+            std::fs::write(workspace_root.join(transaction.candidate_leaf), []).unwrap();
+            std::fs::write(workspace_root.join(transaction.backup_leaf), []).unwrap();
+        }
+        let backups_before = std::fs::read_dir(&workspace_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_BACKUP_SUFFIX))
+            })
+            .count();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![root.join(".codex").display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Project, &workspace_root).unwrap();
+
+        let error = apply_prepared_agent_config(&prepared)
+            .expect_err("full retained-candidate inventory must reject publication");
+        assert!(!error.backup_created);
+        assert!(error.message.contains("bounded retention limit"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original instructions\n");
+        let backups = std::fs::read_dir(&workspace_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_BACKUP_SUFFIX))
+            })
+            .count();
+        assert_eq!(
+            backups, backups_before,
+            "capacity rejection must not create a backup"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_update_intent_and_metadata_validators_fail_closed() {
+        use frankensearch_index_acl::fd_acl::ExtendedAclPresence;
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_temp_dir("agent_config_update_descriptor");
+        let target = root.join("AGENTS.md");
+        std::fs::write(&target, b"existing instructions\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
+        let snapshot = read_open_agent_config_file(&parent, &target, AgentConfigOpenIntent::Update)
+            .unwrap()
+            .unwrap();
+
+        let descriptor_flags = rustix::fs::fcntl_getfl(snapshot.file.as_fd()).unwrap();
+        assert_eq!(
+            descriptor_flags & rustix::fs::OFlags::RWMODE,
+            rustix::fs::OFlags::RDWR,
+            "the retained update descriptor must prove read/write authorization"
+        );
+
+        let mut foreign_owner = snapshot.observation;
+        foreign_owner.uid ^= 1;
+        let owner_error = agent_config_security_snapshot_for_uid(
+            foreign_owner,
+            snapshot.observation.uid,
+            &target,
+        )
+        .expect_err("a foreign owner must fail closed");
+        assert!(owner_error.contains("not the effective uid"));
+
+        let source_security = snapshot.security.unwrap();
+        let wrong_group = AgentConfigSecuritySnapshot {
+            gid: source_security.gid ^ 1,
+            mode: 0o600,
+            ..source_security
+        };
+        let group_error =
+            validate_fresh_agent_config_security(wrong_group, Some(source_security), &target)
+                .expect_err("a fresh artifact with the wrong group must fail closed");
+        assert!(group_error.contains("owner/group"));
+
+        let acl_error = validate_agent_config_acl_presence(ExtendedAclPresence::Present, &target)
+            .expect_err("an extended ACL must fail closed");
+        assert!(acl_error.contains("extended ACL"));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                validate_linux_agent_config_flags(
+                    rustix::fs::IFlags::from_bits_retain(0x0008_0000),
+                    &target,
+                )
+                .is_ok(),
+                "the kernel-managed extents marker is not preservation policy"
+            );
+            assert!(
+                validate_linux_agent_config_flags(rustix::fs::IFlags::NODUMP, &target)
+                    .unwrap_err()
+                    .contains("inode flags")
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert!(
+            validate_macos_agent_config_flags(1, &target)
+                .unwrap_err()
+                .contains("file flags")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn apply_agent_config_rejects_source_xattrs_before_artifacts() {
+        use std::os::fd::AsFd as _;
+
+        let root = unique_temp_dir("agent_config_source_xattr");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let target = global_root.join(".cursorrules");
+        let original = b"# existing cursor rules\n";
+        std::fs::write(&target, original).unwrap();
+        let source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target)
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        let xattr_name = "user.frankenterm-test";
+        #[cfg(target_os = "macos")]
+        let xattr_name = "com.frankenterm.test";
+        rustix::fs::fsetxattr(
+            source.as_fd(),
+            xattr_name,
+            b"present",
+            rustix::fs::XattrFlags::CREATE,
+        )
+        .unwrap();
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        let error = apply_prepared_agent_config(&prepared)
+            .expect_err("source xattrs must be rejected before publication artifacts");
+
+        assert!(!error.backup_created);
+        assert!(error.message.contains("extended attributes"));
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let publication_artifacts = std::fs::read_dir(&global_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(AGENT_CONFIG_TRANSACTION_PREFIX)
+            })
+            .count();
+        assert_eq!(publication_artifacts, 0);
+    }
+
+    #[test]
     fn project_scope_agent_config_write_is_idempotent() {
         let root = unique_temp_dir("agent_config_project");
         let workspace_root = root.join("workspace");
@@ -121395,6 +125007,9 @@ printf x > "$MINISIGN_MARKER"
 
     #[test]
     fn global_scope_agent_config_targets_detected_root_and_creates_backup() {
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
         let root = unique_temp_dir("agent_config_global");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
@@ -121402,6 +125017,10 @@ printf x > "$MINISIGN_MARKER"
         std::fs::create_dir_all(&global_root).unwrap();
         let target = global_root.join(".cursorrules");
         write_file(&target, "# existing cursor rules\n");
+        #[cfg(unix)]
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        #[cfg(unix)]
+        let source_metadata = std::fs::metadata(&target).unwrap();
 
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "cursor".to_string(),
@@ -121434,17 +125053,19 @@ printf x > "$MINISIGN_MARKER"
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                let name_match = path
-                    .file_name()
+                path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".cursorrules."));
-                name_match
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_BACKUP_SUFFIX))
             })
             .collect();
         assert_eq!(backups.len(), 1, "expected exactly one backup file");
+        #[cfg(unix)]
+        for published_path in [&target, &backups[0]] {
+            let metadata = std::fs::metadata(published_path).unwrap();
+            assert_eq!(metadata.uid(), source_metadata.uid());
+            assert_eq!(metadata.gid(), source_metadata.gid());
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        }
     }
 
     #[test]
@@ -121704,7 +125325,7 @@ printf x > "$MINISIGN_MARKER"
 
         let prepared =
             prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
-        let err = apply_prepared_agent_config_with_writer(&prepared, |_path, _bytes| {
+        let err = apply_prepared_agent_config_with_writer(&prepared, |_file, _bytes| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "injected final-write failure",
@@ -121727,7 +125348,7 @@ printf x > "$MINISIGN_MARKER"
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".cursorrules.") && name.ends_with(".bak"))
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_BACKUP_SUFFIX))
             })
             .collect::<Vec<_>>();
         assert_eq!(backups.len(), 1, "exactly one backup must be published");
@@ -121739,6 +125360,195 @@ printf x > "$MINISIGN_MARKER"
             std::fs::read(&target).expect("read unchanged target"),
             original.as_bytes()
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_partial_candidate_never_broadens_source_mode_or_mutates_target() {
+        use cap_std::fs::PermissionsExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_temp_dir("agent_config_private_partial_candidate");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let target = global_root.join(".cursorrules");
+        let original = b"# private cursor rules\n";
+        std::fs::write(&target, original).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+
+        let error = apply_prepared_agent_config_with_writer(&prepared, |candidate, bytes| {
+            assert_eq!(candidate.metadata()?.permissions().mode() & 0o7777, 0o600);
+            candidate.write_all(&bytes[..bytes.len().min(17)])?;
+            Err(std::io::Error::other("injected partial candidate failure"))
+        })
+        .expect_err("partial candidate failure must withhold publication");
+        assert!(error.backup_created);
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        let candidates = std::fs::read_dir(&global_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_CANDIDATE_SUFFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            std::fs::metadata(&candidates[0])
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_create_conflict_retains_candidate_without_clobbering_target() {
+        let root = unique_temp_dir("agent_config_create_conflict");
+        let target = root.join("AGENTS.md");
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
+        let candidate_bytes = b"complete candidate\n";
+        let competitor_bytes = b"concurrent creator\n";
+        let transaction = AgentConfigTransaction::new();
+        let mut candidate = create_agent_config_candidate(&parent, None, &transaction).unwrap();
+        candidate.file.write_all(candidate_bytes).unwrap();
+        candidate
+            .file
+            .set_len(u64::try_from(candidate_bytes.len()).unwrap())
+            .unwrap();
+        finalize_agent_config_candidate(&parent, &mut candidate, candidate_bytes).unwrap();
+        parent
+            .file
+            .sync_all()
+            .expect("completed candidate name must be durable before NOREPLACE");
+
+        let error = publish_agent_config_candidate_with_hook(
+            &parent,
+            &target,
+            &mut candidate,
+            candidate_bytes,
+            None,
+            || std::fs::write(&target, competitor_bytes),
+        )
+        .expect_err("NOREPLACE must lose to a concurrent creator");
+        assert!(error.contains("candidate retained"));
+        assert_eq!(std::fs::read(&target).unwrap(), competitor_bytes);
+        assert_eq!(std::fs::read(&candidate.path).unwrap(), candidate_bytes);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_exchange_retains_substituted_target_and_exact_backup() {
+        let root = unique_temp_dir("agent_config_exchange_substitution");
+        let target = root.join("AGENTS.md");
+        let moved_original = root.join("moved-original");
+        let original = b"original config\n";
+        let competitor = b"concurrent replacement\n";
+        let replacement = b"complete replacement\n";
+        std::fs::write(&target, original).unwrap();
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
+        let mut source =
+            read_open_agent_config_file(&parent, &target, AgentConfigOpenIntent::Update)
+                .unwrap()
+                .unwrap();
+        let source_security = source.security.unwrap();
+        let transaction = AgentConfigTransaction::new();
+        let mut candidate =
+            create_agent_config_candidate(&parent, Some(source_security), &transaction).unwrap();
+        let backup = create_agent_config_backup(&parent, &target, &source, &transaction).unwrap();
+        candidate.file.write_all(replacement).unwrap();
+        candidate
+            .file
+            .set_len(u64::try_from(replacement.len()).unwrap())
+            .unwrap();
+        finalize_agent_config_candidate(&parent, &mut candidate, replacement).unwrap();
+
+        let error = publish_agent_config_candidate_with_hook(
+            &parent,
+            &target,
+            &mut candidate,
+            replacement,
+            Some(&mut source),
+            || {
+                std::fs::rename(&target, &moved_original)?;
+                std::fs::write(&target, competitor)
+            },
+        )
+        .expect_err("substituted target must be restored by exact rollback");
+        assert!(error.contains("was rolled back"));
+        assert_eq!(std::fs::read(&target).unwrap(), competitor);
+        assert_eq!(std::fs::read(&candidate.path).unwrap(), replacement);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(std::fs::read(&moved_original).unwrap(), original);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_exchange_reports_indeterminate_when_rollback_cannot_begin() {
+        let root = unique_temp_dir("agent_config_exchange_rollback_failure");
+        let target = root.join("AGENTS.md");
+        let moved_original = root.join("moved-original");
+        let original = b"original config\n";
+        let competitor = b"concurrent replacement\n";
+        let replacement = b"complete replacement\n";
+        std::fs::write(&target, original).unwrap();
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
+        let mut source =
+            read_open_agent_config_file(&parent, &target, AgentConfigOpenIntent::Update)
+                .unwrap()
+                .unwrap();
+        let source_security = source.security.unwrap();
+        let transaction = AgentConfigTransaction::new();
+        let mut candidate =
+            create_agent_config_candidate(&parent, Some(source_security), &transaction).unwrap();
+        let backup = create_agent_config_backup(&parent, &target, &source, &transaction).unwrap();
+        candidate.file.write_all(replacement).unwrap();
+        candidate
+            .file
+            .set_len(u64::try_from(replacement.len()).unwrap())
+            .unwrap();
+        finalize_agent_config_candidate(&parent, &mut candidate, replacement).unwrap();
+
+        let error = publish_agent_config_candidate_with_hooks(
+            &parent,
+            &target,
+            &mut candidate,
+            replacement,
+            Some(&mut source),
+            || {
+                std::fs::rename(&target, &moved_original)?;
+                std::fs::write(&target, competitor)
+            },
+            || Err(std::io::Error::other("injected rollback refusal")),
+        )
+        .expect_err("rollback refusal must be reported as indeterminate");
+        assert!(error.contains("outcome is indeterminate"));
+        assert!(error.contains("injected rollback refusal"));
+        assert_eq!(std::fs::read(&target).unwrap(), replacement);
+        assert_eq!(std::fs::read(&candidate.path).unwrap(), competitor);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(std::fs::read(&moved_original).unwrap(), original);
     }
 
     #[test]
@@ -121774,6 +125584,306 @@ printf x > "$MINISIGN_MARKER"
         );
         assert!(plan_item.file_exists);
         assert_eq!(plan_item.action, "error");
+    }
+
+    #[test]
+    fn prepare_agent_config_rejects_non_regular_target() {
+        let root = unique_temp_dir("agent_config_non_regular_target");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(global_root.join(".cursorrules")).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let err = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
+            .expect_err("a directory must not be accepted as an agent config file");
+
+        assert!(
+            err.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_agent_config_rejects_symlink_without_reading_victim() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("agent_config_symlink_target");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let victim = root.join("victim.txt");
+        let victim_bytes = b"private victim contents\n";
+        std::fs::write(&victim, victim_bytes).unwrap();
+        let target = global_root.join(".cursorrules");
+        symlink(&victim, &target).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let err = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
+            .expect_err("a symlink must not be accepted as an agent config file");
+
+        assert!(
+            err.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), victim_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn error_plan_marks_dangling_agent_config_symlink_as_existing() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("agent_config_dangling_symlink");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        symlink(
+            root.join("missing-victim"),
+            global_root.join(".cursorrules"),
+        )
+        .unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let err = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
+            .expect_err("a dangling symlink must be rejected");
+
+        let plan_item = build_agent_configure_error_plan_item(
+            &entry,
+            RobotAgentConfigScope::Global,
+            &workspace_root,
+            err,
+        );
+
+        assert!(
+            plan_item.file_exists,
+            "a dangling or inaccessible entry must not be represented as absent"
+        );
+        assert_eq!(plan_item.action, "error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_agent_config_rejects_multiply_linked_file() {
+        let root = unique_temp_dir("agent_config_hard_link_target");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let original = root.join("original-rules");
+        std::fs::write(&original, b"shared rules\n").unwrap();
+        std::fs::hard_link(&original, global_root.join(".cursorrules")).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let err = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
+            .expect_err("a multiply linked config must be rejected");
+
+        assert!(
+            err.contains("exactly one hard link"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), b"shared rules\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_agent_config_rejects_symlink_substituted_after_prepare() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("agent_config_symlink_after_prepare");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let target = global_root.join(".cursorrules");
+        let retained = global_root.join("retained-original");
+        let original = b"# existing cursor rules\n";
+        std::fs::write(&target, original).unwrap();
+        let victim = root.join("victim.txt");
+        let victim_bytes = b"private victim contents\n";
+        std::fs::write(&victim, victim_bytes).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        std::fs::rename(&target, &retained).unwrap();
+        symlink(&victim, &target).unwrap();
+
+        let err = apply_prepared_agent_config(&prepared)
+            .expect_err("apply must reject a symlink substituted after prepare");
+
+        assert!(!err.backup_created);
+        assert!(
+            err.message.contains("must be a regular file"),
+            "unexpected error: {}",
+            err.message
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), victim_bytes);
+        assert_eq!(std::fs::read(&retained).unwrap(), original);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn apply_agent_config_stages_update_across_final_name_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("agent_config_symlink_during_write");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let target = global_root.join(".cursorrules");
+        let retained = global_root.join("retained-original");
+        let original = b"# existing cursor rules\n";
+        std::fs::write(&target, original).unwrap();
+        let victim = root.join("victim.txt");
+        let victim_bytes = b"private victim contents\n";
+        std::fs::write(&victim, victim_bytes).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        let expected_merged = frankenterm_core::agent_config_templates::merge_into_existing(
+            std::str::from_utf8(original).unwrap(),
+            &prepared.template.content,
+        );
+
+        let err = apply_prepared_agent_config_with_writer(&prepared, |file, bytes| {
+            std::fs::rename(&target, &retained)?;
+            symlink(&victim, &target)?;
+            file.rewind()?;
+            file.write_all(bytes)?;
+            file.set_len(u64::try_from(bytes.len()).unwrap())
+        })
+        .expect_err("name substitution during the write must be detected");
+
+        assert!(
+            err.backup_created,
+            "the exact pre-write backup must remain reported after the race"
+        );
+        assert!(
+            err.message.contains("must be a regular file")
+                || err.message.contains("changed identity"),
+            "unexpected error: {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            victim_bytes,
+            "the pinned handle must prevent writes through the substituted symlink"
+        );
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            original,
+            "the live source must remain unchanged because writes go to the candidate"
+        );
+        let candidates = std::fs::read_dir(&global_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_CANDIDATE_SUFFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 1, "the completed candidate is retained");
+        assert_eq!(
+            std::fs::read(&candidates[0]).unwrap(),
+            expected_merged.as_bytes()
+        );
+        let backups = std::fs::read_dir(&global_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_BACKUP_SUFFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "exactly one backup must be retained");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_config_rejects_symlinked_parent_without_writing_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("agent_config_symlink_parent");
+        let workspace_root = root.join("workspace");
+        let real_global_root = root.join("real-cursor-config");
+        let linked_global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&real_global_root).unwrap();
+        symlink(&real_global_root, &linked_global_root).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![linked_global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        let error = apply_prepared_agent_config(&prepared)
+            .expect_err("a symlinked parent must fail closed before publication");
+
+        assert!(!error.backup_created);
+        assert!(error.message.contains("direct non-symlink directory"));
+        assert!(!real_global_root.join(".cursorrules").exists());
     }
 
     // ========================================================================

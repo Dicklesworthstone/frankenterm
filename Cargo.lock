@@ -353,15 +353,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7"
 dependencies = [
  "aes-gcm",
- "asupersync-macros",
+ "asupersync-macros 0.3.10",
  "base64 0.23.1",
  "bincode-next",
  "chacha20poly1305 0.11.0",
  "crc32fast",
  "crossbeam-queue",
- "franken-decision",
- "franken-evidence",
- "franken-kernel",
+ "franken-decision 0.3.10",
+ "franken-evidence 0.3.10",
+ "franken-kernel 0.3.10",
  "futures-lite",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",
@@ -409,10 +409,74 @@ dependencies = [
 ]
 
 [[package]]
+name = "asupersync"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e8b505d6aadb778c9c4b0ae174966641f11d578d253b7786f2407b17d5045ec"
+dependencies = [
+ "aes-gcm",
+ "asupersync-macros 0.4.9",
+ "base64 0.23.1",
+ "bincode-next",
+ "chacha20poly1305 0.11.0",
+ "crc32fast",
+ "crossbeam-queue",
+ "franken-decision 0.4.9",
+ "franken-evidence 0.4.9",
+ "franken-kernel 0.4.9",
+ "futures-lite",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.1",
+ "hex",
+ "hmac 0.13.0",
+ "js-sys",
+ "libc",
+ "memchr",
+ "nix 0.31.3",
+ "nkeys",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "prost",
+ "rmp-serde",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "signal-hook 0.4.4",
+ "slab",
+ "smallvec",
+ "socket2",
+ "subtle",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.20",
+ "unicode-normalization",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.61.2",
+ "xattr",
+ "zeroize",
+]
+
+[[package]]
 name = "asupersync-macros"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2792b6a6d99856814acdf0b854dd208125d032939f996dc3e6c3eaff2a8edb25"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "asupersync-macros"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a14f9f162d8418e4e347f4965f42f41ca970f8e81be496e04ab4f79c94818c8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -576,7 +640,7 @@ dependencies = [
 name = "async_ossl"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "async-io",
  "futures",
  "openssl",
@@ -1419,7 +1483,7 @@ name = "codec"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.3.10",
  "base91",
  "byteorder",
  "chrono",
@@ -1500,6 +1564,20 @@ dependencies = [
  "ryu",
  "serde",
  "static_assertions",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "serde",
+ "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -2905,7 +2983,7 @@ name = "fastapi-core"
 version = "0.3.0"
 source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "fastapi-openapi",
  "fastapi-router",
  "fastapi-types",
@@ -2921,7 +2999,7 @@ name = "fastapi-http"
 version = "0.3.0"
 source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "fastapi-core",
 ]
 
@@ -3027,7 +3105,7 @@ name = "fastmcp-client"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=1038dd4e64cc7df8ea8122dbfb8806b0b04a7130#1038dd4e64cc7df8ea8122dbfb8806b0b04a7130"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -3061,7 +3139,7 @@ name = "fastmcp-core"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=1038dd4e64cc7df8ea8122dbfb8806b0b04a7130#1038dd4e64cc7df8ea8122dbfb8806b0b04a7130"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "log",
  "serde",
  "serde_json",
@@ -3094,7 +3172,7 @@ name = "fastmcp-rust"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=1038dd4e64cc7df8ea8122dbfb8806b0b04a7130#1038dd4e64cc7df8ea8122dbfb8806b0b04a7130"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-derive",
@@ -3110,7 +3188,7 @@ name = "fastmcp-server"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=1038dd4e64cc7df8ea8122dbfb8806b0b04a7130#1038dd4e64cc7df8ea8122dbfb8806b0b04a7130"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "base64 0.22.1",
  "chrono",
  "fastmcp-client",
@@ -3131,7 +3209,7 @@ name = "fastmcp-transport"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=1038dd4e64cc7df8ea8122dbfb8806b0b04a7130#1038dd4e64cc7df8ea8122dbfb8806b0b04a7130"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.4.3",
@@ -3432,8 +3510,19 @@ version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69ebbe3cb66f3d9c4f780ff9d7f03d666b770d5cf8c2cbec20d64dd2c4efd394"
 dependencies = [
- "franken-evidence",
- "franken-kernel",
+ "franken-evidence 0.3.10",
+ "franken-kernel 0.3.10",
+ "serde",
+]
+
+[[package]]
+name = "franken-decision"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3645a3f60a4e63b19feac3121871cd5599fe46a10c4e90cabaee9fd6d27a030"
+dependencies = [
+ "franken-evidence 0.4.9",
+ "franken-kernel 0.4.9",
  "serde",
 ]
 
@@ -3442,6 +3531,16 @@ name = "franken-evidence"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b88c812fbe5a25cad64e4bbe4bed49e1a5e8951e4c84d7778d7414bb85cdc46"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "franken-evidence"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad9d4f7ad2461e03e792809d98c9f02dc816ab3b3766493a0b0bf6a07d7effc0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3457,15 +3556,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-kernel"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92263c58ff55e6f171441ce40efb70ed26a2588d38a793435f2aeef456246696"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "frankensearch"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=4a75fd706917df915e644b00248540786df438f2#4a75fd706917df915e644b00248540786df438f2"
 dependencies = [
- "asupersync",
- "frankensearch-core",
+ "asupersync 0.3.10",
+ "frankensearch-core 0.2.1",
  "frankensearch-embed",
  "frankensearch-fusion",
- "frankensearch-index",
+ "frankensearch-index 0.2.1",
  "frankensearch-lexical",
  "tracing",
 ]
@@ -3475,7 +3583,24 @@ name = "frankensearch-core"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=4a75fd706917df915e644b00248540786df438f2#4a75fd706917df915e644b00248540786df438f2"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "toml",
+ "tracing",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "frankensearch-core"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "151c1800c07f3b08c37bf866e7cd60a08c70a65011aa6a46af5a6ecb4acbe434"
+dependencies = [
+ "asupersync 0.4.10",
+ "compact_str 0.10.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3490,10 +3615,10 @@ name = "frankensearch-embed"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=4a75fd706917df915e644b00248540786df438f2#4a75fd706917df915e644b00248540786df438f2"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "dirs",
  "fastembed",
- "frankensearch-core",
+ "frankensearch-core 0.2.1",
  "openssl-sys",
  "safetensors 0.7.0",
  "serde",
@@ -3509,10 +3634,10 @@ version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=4a75fd706917df915e644b00248540786df438f2#4a75fd706917df915e644b00248540786df438f2"
 dependencies = [
  "ahash",
- "asupersync",
- "frankensearch-core",
+ "asupersync 0.3.10",
+ "frankensearch-core 0.2.1",
  "frankensearch-embed",
- "frankensearch-index",
+ "frankensearch-index 0.2.1",
  "rayon",
  "serde",
  "serde_json",
@@ -3530,7 +3655,7 @@ dependencies = [
  "ahash",
  "bytemuck",
  "crc32fast",
- "frankensearch-core",
+ "frankensearch-core 0.2.1",
  "half",
  "memmap2",
  "rayon",
@@ -3540,12 +3665,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankensearch-index"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a10c3a5c2f97466a869fb463d316de9819f4a4ca23dc3435eaa1d3f8509d8aa"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "crc32fast",
+ "frankensearch-core 0.2.3",
+ "half",
+ "libc",
+ "memmap2",
+ "rayon",
+ "rustix",
+ "same-file",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "tracing",
+ "wide",
+]
+
+[[package]]
 name = "frankensearch-lexical"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=4a75fd706917df915e644b00248540786df438f2#4a75fd706917df915e644b00248540786df438f2"
 dependencies = [
- "asupersync",
- "frankensearch-core",
+ "asupersync 0.3.10",
+ "frankensearch-core 0.2.1",
  "rayon",
  "serde",
  "serde_json",
@@ -3559,7 +3707,7 @@ version = "0.15.2-rc.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "asupersync",
+ "asupersync 0.3.10",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -3568,6 +3716,7 @@ dependencies = [
  "dirs",
  "fancy-regex 0.18.0",
  "filedescriptor 0.8.3",
+ "frankensearch-index 0.2.3",
  "frankenterm-alloc",
  "frankenterm-build-identity",
  "frankenterm-client",
@@ -3671,7 +3820,7 @@ name = "frankenterm-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.3.10",
  "async-channel",
  "async-trait",
  "async_ossl",
@@ -3733,7 +3882,7 @@ name = "frankenterm-core"
 version = "0.15.2-rc.1"
 dependencies = [
  "aho-corasick",
- "asupersync",
+ "asupersync 0.3.10",
  "base64 0.22.1",
  "bloomfilter",
  "cap-fs-ext",
@@ -4338,7 +4487,7 @@ name = "frankenterm-mux-server-impl"
 version = "0.15.2-rc.1"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.3.10",
  "async-channel",
  "async-trait",
  "async_ossl",
@@ -4465,7 +4614,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_fs",
- "asupersync",
+ "asupersync 0.3.10",
  "async-channel",
  "async_ossl",
  "base64 0.22.1",
@@ -4593,7 +4742,7 @@ dependencies = [
 name = "frankenterm-uds"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "async-io",
  "futures",
  "libc",
@@ -8721,7 +8870,7 @@ name = "portable-pty"
 version = "0.9.0"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.3.10",
  "bitflags 2.13.1",
  "downcast-rs 2.0.2",
  "filedescriptor 0.8.3",
@@ -8886,7 +9035,7 @@ name = "promise"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "asupersync",
+ "asupersync 0.3.10",
  "async-executor",
  "async-io",
  "async-task",
@@ -9241,7 +9390,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
 dependencies = [
  "bitflags 2.13.1",
- "compact_str",
+ "compact_str 0.9.1",
  "critical-section",
  "hashbrown 0.17.1",
  "itertools 0.14.0",
@@ -11277,7 +11426,7 @@ checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
 dependencies = [
  "ahash",
  "aho-corasick",
- "compact_str",
+ "compact_str 0.9.1",
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
@@ -11309,7 +11458,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44e5bea67576e04b6ff8564c5d9e09c2ef0cf476502245f2f120e497769d3112"
 dependencies = [
  "ahash",
- "compact_str",
+ "compact_str 0.9.1",
  "daachorse",
  "dary_heap",
  "derive_builder",

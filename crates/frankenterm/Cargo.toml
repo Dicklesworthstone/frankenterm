@@ -70,6 +70,7 @@ zstd.workspace = true
 asupersync = { workspace = true, features = ["tls"] }
 
 [target.'cfg(unix)'.dependencies]
+frankensearch-index-acl.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }
 rustix.workspace = true
 tempfile.workspace = true
