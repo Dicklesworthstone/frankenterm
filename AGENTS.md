@@ -432,6 +432,15 @@ locally`, `no admissible workers`, `worker=null`, `local fallback`, or any other
 path that did not reach a remote worker, stop the proof lane and mark the bead
 blocked with the exact RCH reason. Do not count local Cargo output as proof.
 
+Static release gates (no Cargo) live in one script and are what the DSR
+quality lane runs; there is no GitHub workflow (Rule 0.1):
+
+```bash
+scripts/release-gates.sh            # every static gate; exit non-zero on any failure
+scripts/release-gates.sh --list     # names + commands (wiring tests grep this file)
+scripts/release-gates.sh --cargo    # also the cargo gates — only where Cargo may run (RCH worker / DSR lane)
+```
+
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
 ---
