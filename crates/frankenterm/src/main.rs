@@ -15425,6 +15425,19 @@ fn apply_prepared_agent_config(
     frankenterm_core::robot_types::AgentConfigureResultItem,
     AgentConfigApplyError,
 > {
+    apply_prepared_agent_config_with_writer(prepared, fs::write)
+}
+
+fn apply_prepared_agent_config_with_writer<F>(
+    prepared: &PreparedAgentConfig,
+    write_final: F,
+) -> std::result::Result<
+    frankenterm_core::robot_types::AgentConfigureResultItem,
+    AgentConfigApplyError,
+>
+where
+    F: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+{
     let current_content = if prepared.target_path.exists() {
         Some(
             fs::read_to_string(&prepared.target_path).map_err(|err| AgentConfigApplyError {
@@ -15474,7 +15487,7 @@ fn apply_prepared_agent_config(
         current_content.as_deref().unwrap_or(""),
         &prepared.template.content,
     );
-    fs::write(&prepared.target_path, merged).map_err(|err| AgentConfigApplyError {
+    write_final(&prepared.target_path, merged.as_bytes()).map_err(|err| AgentConfigApplyError {
         message: format!(
             "Failed to write '{}': {err}",
             prepared.target_path.display()
@@ -114124,7 +114137,35 @@ printf x > "$MINISIGN_MARKER"
         let fixture = tempfile::tempdir().expect("create duplicate-marker fixture");
         let package = fixture.path().join("package");
         std::fs::create_dir(&package).expect("create duplicate-marker package root");
-        let build_id = "f".repeat(64);
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verifier = repository.join("scripts/atomic-component-manifest.sh");
+        let source_revision = "1".repeat(40);
+        let feature_contract =
+            "process-family-ft-mux-server-pty-guardian-default-features-v1";
+        let derived = std::process::Command::new("bash")
+            .arg(&verifier)
+            .arg("derive-build-id")
+            .arg("--source-revision")
+            .arg(&source_revision)
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg("x86_64-unknown-linux-gnu")
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg(feature_contract)
+            .output()
+            .expect("derive duplicate-marker fixture build identity");
+        assert!(
+            derived.status.success(),
+            "duplicate-marker build identity derivation failed: {}",
+            String::from_utf8_lossy(&derived.stderr)
+        );
+        let build_id = String::from_utf8(derived.stdout)
+            .expect("derived build identity is UTF-8")
+            .trim()
+            .to_string();
         let ft = package.join("ft");
         let mux = package.join("frankenterm-mux-server");
         let guardian = package.join("frankenterm-pty-guardian");
@@ -114155,9 +114196,6 @@ printf x > "$MINISIGN_MARKER"
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
                 .expect("make duplicate-marker component executable");
         }
-
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let verifier = repository.join("scripts/atomic-component-manifest.sh");
         let packaged_verifier = package.join("verify-components.sh");
         std::fs::copy(&verifier, &packaged_verifier).expect("copy verifier into package");
         std::fs::set_permissions(&packaged_verifier, std::fs::Permissions::from_mode(0o555))
@@ -114175,7 +114213,7 @@ printf x > "$MINISIGN_MARKER"
             .arg("--build-id")
             .arg(&build_id)
             .arg("--source-revision")
-            .arg("1".repeat(40))
+            .arg(&source_revision)
             .arg("--version")
             .arg("0.15.2")
             .arg("--target")
@@ -114183,7 +114221,7 @@ printf x > "$MINISIGN_MARKER"
             .arg("--profile")
             .arg("release-interactive")
             .arg("--feature-contract")
-            .arg("process-family-ft-mux-server-pty-guardian-default-features-v1")
+            .arg(feature_contract)
             .arg("--entry")
             .arg("executable:cli:ft:ft")
             .arg("--entry")
