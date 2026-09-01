@@ -15284,7 +15284,6 @@ struct AgentConfigTransactionClaim {
     durability_contract: String,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AgentConfigTransactionOutcome {
@@ -16417,7 +16416,6 @@ struct AgentConfigApplyError {
     backup_created: bool,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 struct AgentConfigPublicationError {
     message: String,
@@ -40707,6 +40705,17 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
                     "Failed to parse WezTerm output. This may indicate a version mismatch."
                         .to_string(),
                 ),
+            ),
+            WeztermError::VersionSkew {
+                local_codec,
+                remote_codec,
+                remote_version,
+                ..
+            } => (
+                "robot.mux_version_skew",
+                Some(format!(
+                    "This ft speaks codec {local_codec}; the mux at the discovered socket speaks codec {remote_codec} (version {remote_version}). Install matching generations of ft and FrankenTerm.app (`ft doctor --json` shows the socket); retrying cannot help."
+                )),
             ),
             WeztermError::OutputTooLarge { .. } => (
                 "robot.wezterm_output_too_large",
@@ -96288,11 +96297,26 @@ async fn run_diagnostics(
                 "WezTerm connection",
                 format!("{} pane(s) detected via vendored client", panes.len()),
             )),
-            Ok(Err(_)) => checks.push(DiagnosticCheck::error(
-                "WezTerm connection",
-                "direct mux pane probe failed",
-                "Check the configured mux socket and backend compatibility",
-            )),
+            Ok(Err(err)) => {
+                let detail = bounded_terminal_diagnostic(
+                    &format!("direct mux pane probe failed: {err}"),
+                    320,
+                    1_024,
+                );
+                let recommendation = match &err {
+                    frankenterm_core::Error::Wezterm(
+                        frankenterm_core::error::WeztermError::VersionSkew { .. },
+                    ) => {
+                        "The discovered mux is from a different release than this ft; install matching generations of ft and FrankenTerm.app (see the `mux socket` row for which socket was dialed)"
+                    }
+                    _ => "Check the configured mux socket and backend compatibility",
+                };
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm connection",
+                    detail,
+                    recommendation,
+                ));
+            }
             Err(_) if cx.checkpoint().is_err() => checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
                 "direct mux pane probe cancelled",
@@ -125752,6 +125776,57 @@ printf x > "$MINISIGN_MARKER"
             std::fs::metadata(backup).unwrap().gid(),
             alternate_gid.as_raw()
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn project_scope_agent_config_corrects_setgid_inheritance_to_claimed_gid() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let effective_gid = nix::unistd::getegid();
+        let Some(alternate_gid) = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .find(|gid| *gid != effective_gid)
+        else {
+            return;
+        };
+        let root = unique_temp_dir("agent_config_setgid_parent");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let parent_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&workspace_root)
+            .unwrap();
+        rustix::fs::fchown(
+            parent_handle.as_fd(),
+            None,
+            Some(rustix::process::Gid::from_raw(alternate_gid.as_raw())),
+        )
+        .unwrap();
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&workspace_root).unwrap().gid(),
+            alternate_gid.as_raw()
+        );
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![root.join(".codex").display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Project, &workspace_root).unwrap();
+        let result = apply_prepared_agent_config(&prepared).unwrap();
+        assert_eq!(result.action, "create");
+        let target_metadata = std::fs::metadata(workspace_root.join("AGENTS.md")).unwrap();
+        assert_eq!(target_metadata.gid(), effective_gid.as_raw());
+        assert_eq!(target_metadata.permissions().mode() & 0o7777, 0o600);
     }
 
     #[test]

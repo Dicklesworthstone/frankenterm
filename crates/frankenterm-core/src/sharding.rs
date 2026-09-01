@@ -885,7 +885,9 @@ fn classify_backend_error(error: &crate::Error) -> ShardBackendErrorClass {
             | WeztermError::SocketNotFound(_) => ShardBackendErrorClass::Unavailable,
             WeztermError::PaneNotFound(_) => ShardBackendErrorClass::PaneNotFound,
             WeztermError::CommandFailed(_) => ShardBackendErrorClass::CommandFailed,
-            WeztermError::ParseError(_) => ShardBackendErrorClass::InvalidResponse,
+            WeztermError::ParseError(_) | WeztermError::VersionSkew { .. } => {
+                ShardBackendErrorClass::InvalidResponse
+            }
             WeztermError::OutputTooLarge { .. } => ShardBackendErrorClass::OutputTooLarge,
             WeztermError::Timeout(_) => ShardBackendErrorClass::TimedOut,
             WeztermError::CircuitOpen { .. } => ShardBackendErrorClass::CircuitOpen,
@@ -1308,6 +1310,22 @@ impl ShardedWeztermClient {
                     WeztermError::MuxRejection(rejection)
                 }
                 WeztermError::ParseError(_) => WeztermError::ParseError(finite_detail()),
+                WeztermError::VersionSkew {
+                    local_codec,
+                    local_min,
+                    remote_codec,
+                    remote_min,
+                    remote_version,
+                } => WeztermError::VersionSkew {
+                    local_codec,
+                    local_min,
+                    remote_codec,
+                    remote_min,
+                    remote_version: format!(
+                        "shard {shard_id}: {}",
+                        remote_version.chars().take(64).collect::<String>()
+                    ),
+                },
                 WeztermError::OutputTooLarge { len, cap, .. } => WeztermError::OutputTooLarge {
                     command: format!("{op} on shard {shard_id}"),
                     len,

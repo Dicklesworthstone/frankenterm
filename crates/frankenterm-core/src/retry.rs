@@ -565,6 +565,7 @@ pub fn is_retryable(error: &Error) -> bool {
             }
             WeztermError::ParseError(_) => false, // Structural issue
             WeztermError::OutputTooLarge { .. } => false, // Output won't shrink on retry
+            WeztermError::VersionSkew { .. } => false, // Needs a matching install, not a retry
         },
         // Storage errors - only generic database errors are retryable (lock conflicts)
         Error::Storage(e) => match e {

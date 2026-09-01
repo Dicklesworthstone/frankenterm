@@ -60,6 +60,7 @@ impl ErrorRenderer {
                     | MuxRejectionCode::BackendFailure => "FT-1020",
                 },
                 WeztermError::ParseError(_) => "FT-1021",
+                WeztermError::VersionSkew { .. } => "FT-1025",
                 WeztermError::OutputTooLarge { .. } => "FT-1023",
                 WeztermError::Timeout(_) => "FT-1022",
                 WeztermError::CircuitOpen { .. } => "FT-1030",
@@ -639,6 +640,16 @@ mod tests {
                 cap: 512,
             })),
             "FT-1023"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Wezterm(WeztermError::VersionSkew {
+                local_codec: 64,
+                local_min: 61,
+                remote_codec: 58,
+                remote_min: 55,
+                remote_version: "0.13.0".to_string(),
+            })),
+            "FT-1025"
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Wezterm(WeztermError::Timeout(30))),

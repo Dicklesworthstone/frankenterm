@@ -238,7 +238,10 @@ def validate_local_proof!(local_proof, target_names, manifest_path)
     expected: "array",
     actual: commands,
   )
-  rch_command = commands.map { |row| row["command"] }.find { |command| command.to_s.include?("rch exec") }
+  # The retained compile proof is an `rch ... exec --` invocation; the project
+  # convention now inserts `--no-self-healing` between `rch` and `exec`, so
+  # match the two words rather than the literal pair.
+  rch_command = commands.map { |row| row["command"] }.find { |command| command.to_s.match?(/\brch\b.*\bexec\b/) }
   assert_ok(
     !rch_command.nil?,
     "local_proof missing RCH compile command",

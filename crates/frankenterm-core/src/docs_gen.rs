@@ -584,6 +584,9 @@ fn error_code_description(code: &str) -> &'static str {
         "robot.wezterm_parse_error" => {
             "Terminal backend response could not be parsed into the expected format"
         }
+        "robot.mux_version_skew" => {
+            "The ft CLI and the running mux are from different releases; their codec windows do not overlap"
+        }
         "robot.circuit_open" => {
             "Terminal backend circuit breaker is open after repeated recent failures"
         }

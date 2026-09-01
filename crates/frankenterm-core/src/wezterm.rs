@@ -3424,6 +3424,9 @@ impl WeztermClient {
             crate::vendored::MuxPoolError::Mux(
                 crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. },
             ) => "mux_authoritative_response_mismatch",
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::IncompatibleCodec { .. },
+            ) => "mux_codec_version_skew",
             crate::vendored::MuxPoolError::Mux(_) => "mux_transport_or_protocol_failure",
         }
     }
@@ -3663,6 +3666,26 @@ impl WeztermClient {
             crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => runtime_failure(
                 RuntimeOperationSource::Cancelled("mux_transport_context_cancelled".to_string()),
             ),
+            // A codec-window mismatch is the "CLI and app are different
+            // releases" case. Surface it as its own typed error so callers get
+            // the two generations and a pairing hint instead of a generic
+            // transport failure (ft-xxfwy.7).
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::IncompatibleCodec {
+                    local,
+                    local_min,
+                    remote,
+                    remote_min,
+                    remote_version,
+                },
+            ) => WeztermError::VersionSkew {
+                local_codec: *local,
+                local_min: *local_min,
+                remote_codec: *remote,
+                remote_min: *remote_min,
+                remote_version: remote_version.chars().take(64).collect(),
+            }
+            .into(),
             _ => WeztermError::CommandFailed(format!(
                 "wezterm mux {op} failed without CLI fallback: {}",
                 Self::mux_error_public_code(&err)
@@ -7251,6 +7274,59 @@ mod tests {
             )),
         )));
         assert_mux_recovery_axes(&abandoned, MuxCircuitEvidence::BackendFailure, false);
+    }
+
+    /// ft-xxfwy.7: a codec-window mismatch (CLI and app from different
+    /// releases) must surface as the typed `VersionSkew` error carrying both
+    /// generations, not as a generic transport failure, and must never be
+    /// classified as retryable.
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn incompatible_codec_maps_to_typed_version_skew() {
+        use crate::vendored::{DirectMuxError, MuxPoolError};
+
+        let err = MuxPoolError::Mux(DirectMuxError::IncompatibleCodec {
+            local: 64,
+            local_min: 61,
+            remote: 58,
+            remote_min: 55,
+            remote_version: "frankenterm 0.13.0 (3ebd60566)".to_string(),
+        });
+        assert_eq!(
+            WeztermClient::mux_error_public_code(&err),
+            "mux_codec_version_skew"
+        );
+
+        let mapped = WeztermClient::mux_cancelled_error("list_panes_with_cx", err);
+        match &mapped {
+            crate::Error::Wezterm(WeztermError::VersionSkew {
+                local_codec,
+                local_min,
+                remote_codec,
+                remote_min,
+                remote_version,
+            }) => {
+                assert_eq!((*local_codec, *local_min), (64, 61));
+                assert_eq!((*remote_codec, *remote_min), (58, 55));
+                assert_eq!(remote_version, "frankenterm 0.13.0 (3ebd60566)");
+            }
+            other => panic!("expected VersionSkew, got {other:?}"),
+        }
+        let text = mapped.to_string();
+        assert!(text.contains("codec 64"), "{text}");
+        assert!(text.contains("codec 58"), "{text}");
+        assert!(text.contains("install matching generations"), "{text}");
+        assert!(
+            !crate::retry::is_retryable(&mapped),
+            "version skew must not be retried"
+        );
+
+        // Unrelated transport failures keep the generic public code.
+        let disconnected = MuxPoolError::Mux(DirectMuxError::Disconnected);
+        assert_eq!(
+            WeztermClient::mux_error_public_code(&disconnected),
+            "mux_transport_or_protocol_failure"
+        );
     }
 
     #[cfg(all(feature = "vendored", unix))]

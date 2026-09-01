@@ -927,6 +927,28 @@ pub enum WeztermError {
     #[error("{0}")]
     MuxRejection(MuxRejection),
 
+    /// The mux at the discovered socket speaks a codec generation this build
+    /// cannot use: the two compatibility windows do not overlap. This is the
+    /// "CLI and FrankenTerm.app are from different releases" case; it is
+    /// never transient and retrying cannot fix it (ft-xxfwy.7).
+    #[error(
+        "mux version skew: this ft speaks codec {local_codec} (min {local_min}) but the mux at the \
+         discovered socket speaks codec {remote_codec} (min {remote_min}, version \
+         {remote_version}); install matching generations of ft and FrankenTerm.app"
+    )]
+    VersionSkew {
+        /// Codec version this build emits.
+        local_codec: usize,
+        /// Oldest codec this build can still decode.
+        local_min: usize,
+        /// Codec version the remote mux emits.
+        remote_codec: usize,
+        /// Oldest codec the remote mux can still decode.
+        remote_min: usize,
+        /// Version string the remote mux reported (bounded, redacted upstream).
+        remote_version: String,
+    },
+
     /// JSON parsing failed
     #[error("Failed to parse WezTerm output: {0}")]
     ParseError(String),
@@ -988,6 +1010,23 @@ impl WeztermError {
                     .command("List socket", format!("ls \"{path}\""))
                     .alternative("Unset WEZTERM_UNIX_SOCKET to use the default socket.")
             }
+            Self::VersionSkew {
+                local_codec,
+                remote_codec,
+                remote_version,
+                ..
+            } => Remediation::new(format!(
+                "This ft (codec {local_codec}) and the running mux (codec {remote_codec}, version {remote_version}) are from different releases. Install the same generation of ft and FrankenTerm.app, or point ft at a matching mux."
+            ))
+            .command("Show which socket ft found", "ft doctor --json | jq '.checks[] | select(.name == \"mux socket\")'")
+            .command("Show ft's generation", "ft --version")
+            .command(
+                "Reinstall a matching generation",
+                "curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash",
+            )
+            .alternative(
+                "To keep the running app, install the ft that shipped with it (same release tag) instead of upgrading the CLI alone.",
+            ),
             Self::CommandFailed(_) => {
                 Remediation::new(
                     "Backend bridge CLI command failed. Check WezTerm/backend logs and retry.",

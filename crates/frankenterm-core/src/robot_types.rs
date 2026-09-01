@@ -377,6 +377,7 @@ impl ErrorCode {
             | "robot.wezterm_mutation_indeterminate"
             | "robot.wezterm_parse_error"
             | "robot.wezterm_output_too_large"
+            | "robot.mux_version_skew"
             | "robot.pane_not_found"
             | "robot.circuit_open" => ErrorCategory::Wezterm,
             "robot.internal_error"
@@ -464,6 +465,9 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         }
         "robot.wezterm_parse_error" => {
             "WezTerm output didn't match the expected schema — likely a version skew."
+        }
+        "robot.mux_version_skew" => {
+            "This ft and the running mux are from different releases (their codec windows do not overlap). Install matching generations of ft and FrankenTerm.app; `ft doctor --json` shows which socket was dialed. Retrying cannot help."
         }
         "robot.wezterm_output_too_large" => {
             "Inspect backend health and reduce the metadata scope or pane count; retrying the same oversized response cannot succeed."
@@ -4027,6 +4031,7 @@ mod tests {
             ("robot.unsupported", ErrorCategory::Config),
             ("robot.wezterm_command_failed", ErrorCategory::Wezterm),
             ("robot.wezterm_error", ErrorCategory::Wezterm),
+            ("robot.mux_version_skew", ErrorCategory::Wezterm),
             ("robot.wezterm_not_found", ErrorCategory::Wezterm),
             ("robot.wezterm_not_running", ErrorCategory::Wezterm),
             (
@@ -5025,6 +5030,7 @@ mod tests {
             "robot.wezterm_mutation_indeterminate",
             "robot.wezterm_parse_error",
             "robot.wezterm_output_too_large",
+            "robot.mux_version_skew",
             "robot.circuit_open",
             "robot.timeout",
             "robot.cass_timeout",
@@ -5141,6 +5147,7 @@ mod tests {
             "robot.wezterm_mutation_indeterminate",
             "robot.wezterm_parse_error",
             "robot.wezterm_output_too_large",
+            "robot.mux_version_skew",
             "robot.pane_not_found",
             "robot.storage_error",
             "robot.storage_effect_indeterminate",
@@ -5629,6 +5636,7 @@ mod tests {
             "robot.wezterm_mutation_indeterminate",
             "robot.wezterm_parse_error",
             "robot.wezterm_output_too_large",
+            "robot.mux_version_skew",
             "robot.circuit_open",
             "robot.rule_not_found",
             "robot.storage_error",

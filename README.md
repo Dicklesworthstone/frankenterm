@@ -1063,6 +1063,8 @@ curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
 
 Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, and redact secret material before emission.
 
+`ft web` runs no capture pipeline of its own. `/stream/events` is fed by a storage tail: the server follows newly persisted `events` rows written by the watcher (another process) and republishes them on its in-process bus, so a detection reaches SSE clients within one poll interval (250 ms) after `ft watch` stores it. The tail starts after the newest existing row, so a restart never replays history. Embedders that publish to the same bus in-process can disable it with `WebServerConfig::with_storage_event_tail(false)`.
+
 ### Session persistence
 
 ```bash
@@ -1393,7 +1395,7 @@ Robot mode returns structured errors using the flat envelope shape (`error`, `er
 }
 ```
 
-Error codes include `robot.pane_not_found`, `robot.timeout`, `robot.wezterm_not_running`, `robot.policy_denied`, `robot.require_approval`, `robot.storage_error`, `robot.feature_not_available`, `robot.fleet.inventory_unavailable`, `robot.profile.spawn_failed`, and the full `robot.fleet.*` typed envelope family.
+Error codes include `robot.pane_not_found`, `robot.timeout`, `robot.wezterm_not_running`, `robot.mux_version_skew` (the CLI and the running FrankenTerm.app are from different releases; the hint names both codec generations), `robot.policy_denied`, `robot.require_approval`, `robot.storage_error`, `robot.feature_not_available`, `robot.fleet.inventory_unavailable`, `robot.profile.spawn_failed`, and the full `robot.fleet.*` typed envelope family.
 
 ### MCP (Model Context Protocol)
 
