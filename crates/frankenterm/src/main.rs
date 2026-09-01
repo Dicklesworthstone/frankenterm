@@ -16658,13 +16658,13 @@ fn create_agent_config_backup(
         let opened_after = agent_config_regular_file_observation(
             &backup.metadata().map_err(|err| AgentConfigApplyError {
                 message: format!("Failed to verify backup '{}': {err}", backup_path.display()),
-                backup_created: false,
+                backup_created: true,
             })?,
             &backup_path,
         )
         .map_err(|message| AgentConfigApplyError {
             message,
-            backup_created: false,
+            backup_created: true,
         })?;
         let named_after = agent_config_regular_file_observation(
             &parent
@@ -16675,13 +16675,13 @@ fn create_agent_config_backup(
                         "Failed to verify named backup '{}': {err}",
                         backup_path.display()
                     ),
-                    backup_created: false,
+                    backup_created: true,
                 })?,
             &backup_path,
         )
         .map_err(|message| AgentConfigApplyError {
             message,
-            backup_created: false,
+            backup_created: true,
         })?;
         let final_security = capture_agent_config_security(
             parent,
@@ -16692,11 +16692,11 @@ fn create_agent_config_backup(
         )
         .map_err(|message| AgentConfigApplyError {
             message,
-            backup_created: false,
+            backup_created: true,
         })?;
         backup.rewind().map_err(|err| AgentConfigApplyError {
             message: format!("Failed to rewind backup '{}': {err}", backup_path.display()),
-            backup_created: false,
+            backup_created: true,
         })?;
         let mut backup_bytes = Vec::new();
         (&mut backup)
@@ -16704,7 +16704,7 @@ fn create_agent_config_backup(
             .read_to_end(&mut backup_bytes)
             .map_err(|err| AgentConfigApplyError {
                 message: format!("Failed to verify backup '{}': {err}", backup_path.display()),
-                backup_created: false,
+                backup_created: true,
             })?;
         let opened_final = agent_config_regular_file_observation(
             &backup.metadata().map_err(|err| AgentConfigApplyError {
@@ -16712,13 +16712,13 @@ fn create_agent_config_backup(
                     "Failed to re-inspect backup '{}': {err}",
                     backup_path.display()
                 ),
-                backup_created: false,
+                backup_created: true,
             })?,
             &backup_path,
         )
         .map_err(|message| AgentConfigApplyError {
             message,
-            backup_created: false,
+            backup_created: true,
         })?;
         let named_final = agent_config_regular_file_observation(
             &parent
@@ -16729,13 +16729,13 @@ fn create_agent_config_backup(
                         "Failed to re-inspect named backup '{}': {err}",
                         backup_path.display()
                     ),
-                    backup_created: false,
+                    backup_created: true,
                 })?,
             &backup_path,
         )
         .map_err(|message| AgentConfigApplyError {
             message,
-            backup_created: false,
+            backup_created: true,
         })?;
         if opened_after != named_after
             || opened_after.identity != opened_before.identity
@@ -16749,7 +16749,7 @@ fn create_agent_config_backup(
                     "Backup '{}' did not retain the exact source bytes and identity.",
                     backup_path.display()
                 ),
-                backup_created: false,
+                backup_created: true,
             });
         }
 
@@ -17446,18 +17446,15 @@ fn reconcile_agent_config_transactions_for_target(
             published
         } else {
             let pending_name = format!("{claim_name}{AGENT_CONFIG_PENDING_SUFFIX}");
-            let Some((pending_claim, pending_bytes)) =
-                read_atomic_path_transition_json::<AgentConfigTransactionClaim>(
-                    &parent.directory,
-                    &pending_name,
-                )
-                .map_err(|err| {
-                    format!("Failed to read interrupted agent config claim: {err:#}")
-                })?
+            let Some((pending_claim, pending_bytes)) = read_atomic_path_transition_json::<
+                AgentConfigTransactionClaim,
+            >(
+                &parent.directory, &pending_name
+            )
+            .map_err(|err| format!("Failed to read interrupted agent config claim: {err:#}"))?
             else {
                 return Err(
-                    "A retained agent config claim disappeared during reconciliation."
-                        .to_string(),
+                    "A retained agent config claim disappeared during reconciliation.".to_string(),
                 );
             };
             write_atomic_path_transition_json(
@@ -56537,7 +56534,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                                 backup_created = result.backup_created,
                                                                 "applied agent config action"
                                                             );
-                                                            transactions.extend(result.transactions);
+                                                            transactions
+                                                                .extend(result.transactions);
                                                             results.push(result.result);
                                                         }
                                                         Err(err) => {
