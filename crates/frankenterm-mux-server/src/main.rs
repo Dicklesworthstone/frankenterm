@@ -303,6 +303,7 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         remove_process_env_for_mux_server_startup(name);
     }
 
+    config::create_user_owned_dirs(config::CACHE_DIR.as_path())?;
     wezterm_blob_leases::register_storage(Arc::new(
         wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
     ))?;

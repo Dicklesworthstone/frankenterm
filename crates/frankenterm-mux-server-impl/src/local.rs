@@ -159,19 +159,99 @@ fn socket_lock_path(sock_path: &Path) -> PathBuf {
 
 fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<File> {
     let lock_path = socket_lock_path(sock_path);
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .truncate(false)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let lock_file = options
         .open(&lock_path)
         .with_context(|| format!("opening socket lock {}", lock_path.display()))?;
+
+    #[cfg(unix)]
+    validate_socket_lock_identity(sock_path, &lock_path, &lock_file, false)?;
 
     lock_file
         .try_lock_exclusive()
         .with_context(|| format!("locking socket lock {}", lock_path.display()))?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Pre-lease FrankenTerm builds created otherwise valid lock files with
+        // the process umask (commonly 0644). Normalize only after structural
+        // validation and exclusive acquisition, and do it through the pinned
+        // descriptor so no pathname alias can be chmodded accidentally.
+        if lock_file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            lock_file.sync_all()?;
+        }
+        validate_socket_lock_identity(sock_path, &lock_path, &lock_file, true)?;
+    }
+
     Ok(lock_file)
+}
+
+#[cfg(unix)]
+fn validate_socket_lock_identity(
+    sock_path: &Path,
+    lock_path: &Path,
+    lock_file: &File,
+    require_private_mode: bool,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let socket_directory = sock_path
+        .parent()
+        .ok_or_else(|| anyhow!("socket path {} has no parent", sock_path.display()))?;
+    let directory_metadata = socket_directory
+        .symlink_metadata()
+        .with_context(|| format!("inspecting socket directory {}", socket_directory.display()))?;
+    let open_metadata = lock_file
+        .metadata()
+        .with_context(|| format!("inspecting open socket lock {}", lock_path.display()))?;
+    let named_metadata = lock_path
+        .symlink_metadata()
+        .with_context(|| format!("revalidating socket lock {}", lock_path.display()))?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+
+    if !directory_metadata.is_dir()
+        || directory_metadata.uid() != expected_uid
+        || directory_metadata.permissions().mode() & 0o077 != 0
+    {
+        anyhow::bail!(
+            "socket directory is not a private directory owned by uid {expected_uid}: {}",
+            socket_directory.display()
+        );
+    }
+    if !open_metadata.is_file()
+        || !named_metadata.is_file()
+        || open_metadata.uid() != expected_uid
+        || named_metadata.uid() != expected_uid
+        || open_metadata.dev() != directory_metadata.dev()
+        || open_metadata.dev() != named_metadata.dev()
+        || open_metadata.ino() != named_metadata.ino()
+        || open_metadata.nlink() != 1
+        || named_metadata.nlink() != 1
+        || open_metadata.len() != 0
+        || named_metadata.len() != 0
+        || (require_private_mode
+            && (open_metadata.permissions().mode() & 0o077 != 0
+                || named_metadata.permissions().mode() & 0o077 != 0))
+    {
+        anyhow::bail!(
+            "socket lock is not a private, direct, empty single-link file owned by uid {expected_uid}: {}",
+            lock_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -201,6 +281,87 @@ mod tests {
         assert_eq!(
             socket_lock_path(Path::new("/tmp/tmux-501/default")),
             PathBuf::from("/tmp/tmux-501/default.lock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_lock_is_private_and_rejects_aliases() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{
+            MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _, symlink,
+        };
+
+        for unsafe_kind in ["symlink", "hardlink", "nonempty"] {
+            let runtime = tempfile::tempdir().expect("socket lock runtime");
+            std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make socket lock runtime private");
+            let socket = runtime.path().join("gui.sock");
+            let lock = socket_lock_path(&socket);
+            let target = runtime.path().join("target");
+            let mut target_file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&target)
+                .expect("create alias target");
+            match unsafe_kind {
+                "symlink" => symlink(&target, &lock).expect("create symlink lock"),
+                "hardlink" => std::fs::hard_link(&target, &lock).expect("create hardlink lock"),
+                "nonempty" => {
+                    target_file.write_all(b"not a lease").expect("write target");
+                    std::fs::rename(&target, &lock).expect("install nonempty lock");
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                acquire_socket_lock(&socket).is_err(),
+                "{unsafe_kind} lock must fail closed"
+            );
+        }
+
+        let runtime = tempfile::tempdir().expect("valid socket lock runtime");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make valid runtime private");
+        let socket = runtime.path().join("gui.sock");
+        let lock_file = acquire_socket_lock(&socket).expect("acquire valid lock");
+        let lock = socket_lock_path(&socket);
+        let metadata = lock_file.metadata().expect("inspect valid lock");
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(
+            metadata.ino(),
+            lock.symlink_metadata().expect("inspect named lock").ino()
+        );
+
+        let legacy_runtime = tempfile::tempdir().expect("legacy socket lock runtime");
+        std::fs::set_permissions(
+            legacy_runtime.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make legacy runtime private");
+        let legacy_socket = legacy_runtime.path().join("gui.sock");
+        let legacy_lock = socket_lock_path(&legacy_socket);
+        let legacy_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o644)
+            .open(&legacy_lock)
+            .expect("create legacy mode lock");
+        drop(legacy_file);
+        let normalized = acquire_socket_lock(&legacy_socket).expect("normalize legacy lock mode");
+        assert_eq!(
+            normalized
+                .metadata()
+                .expect("inspect normalized lock")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 }

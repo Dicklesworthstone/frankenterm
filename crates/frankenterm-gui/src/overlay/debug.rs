@@ -34,13 +34,15 @@ struct LuaReplHost {
 }
 
 fn history_file_name() -> PathBuf {
-    config::DATA_DIR.join("repl-history")
+    config::DATA_DIR.join(config::DATA_ARTIFACT_REPL_HISTORY)
 }
 
 impl LuaReplHost {
     fn new(lua: mlua::Lua) -> Self {
         let mut history = BasicHistory::default();
-        if let Ok(data) = std::fs::read_to_string(history_file_name()) {
+        if let Ok(data) = config::read_user_owned_file(&history_file_name())
+            .and_then(|bytes| String::from_utf8(bytes).map_err(anyhow::Error::from))
+        {
             for line in data.lines() {
                 history.add(line);
             }
@@ -60,12 +62,10 @@ impl LuaReplHost {
             }
         }
         self.history.add(line);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(history_file_name())
-        {
-            writeln!(file, "{}", line).ok();
+        let mut encoded = line.as_bytes().to_vec();
+        encoded.push(b'\n');
+        if let Err(error) = config::append_user_owned_file(&history_file_name(), &encoded) {
+            log::warn!("debug REPL history was not persisted: {error:#}");
         }
     }
 }

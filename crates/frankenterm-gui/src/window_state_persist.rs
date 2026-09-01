@@ -3176,10 +3176,12 @@ fn validate_state_file_descriptor(
             "window-state file is not a private, direct, single-link authority",
         ));
     }
+
     if normalize_mode && opened.permissions().mode() & 0o7777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|error| PersistenceFailure::io("tighten state file permissions", error))?;
     }
+
     let opened_after = file
         .metadata()
         .map_err(|error| PersistenceFailure::io("re-inspect open state file", error))?;
@@ -3410,7 +3412,7 @@ fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFai
 }
 
 fn state_file_name() -> PathBuf {
-    config::DATA_DIR.join("window-state.json")
+    config::DATA_DIR.join(config::DATA_ARTIFACT_WINDOW_STATE)
 }
 
 fn shadow_file_name(primary: &Path) -> PathBuf {
@@ -3435,12 +3437,117 @@ fn open_lock_file(primary: &Path) -> Result<File, PersistenceFailure> {
             PersistenceFailure::io("create private state directory", io::Error::other(error))
         })?;
     }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(lock_file_name(primary))
-        .map_err(|error| PersistenceFailure::io("open state lock", error))
+    let lock_path = lock_file_name(primary);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| PersistenceFailure::io("open state lock", error))?;
+    validate_lock_file(primary, &lock_path, &lock)?;
+    Ok(lock)
+}
+
+fn validate_lock_file(
+    primary: &Path,
+    lock_path: &Path,
+    lock: &File,
+) -> Result<(), PersistenceFailure> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let parent = primary.parent().ok_or_else(|| {
+            PersistenceFailure::invalid("window-state authority has no parent directory")
+        })?;
+        let directory = parent
+            .symlink_metadata()
+            .map_err(|error| PersistenceFailure::io("inspect state lock directory", error))?;
+        let open = lock
+            .metadata()
+            .map_err(|error| PersistenceFailure::io("inspect open state lock", error))?;
+        let named = lock_path
+            .symlink_metadata()
+            .map_err(|error| PersistenceFailure::io("revalidate named state lock", error))?;
+        let expected_uid = rustix::process::geteuid().as_raw();
+        if !directory.is_dir()
+            || directory.file_type().is_symlink()
+            || directory.uid() != expected_uid
+            || directory.permissions().mode() & 0o7777 != 0o700
+            || !open.is_file()
+            || named.file_type().is_symlink()
+            || !named.is_file()
+            || open.uid() != expected_uid
+            || named.uid() != expected_uid
+            || open.dev() != directory.dev()
+            || open.dev() != named.dev()
+            || open.ino() != named.ino()
+            || open.nlink() != 1
+            || named.nlink() != 1
+            || open.len() != 0
+            || named.len() != 0
+        {
+            return Err(PersistenceFailure::invalid(
+                "window-state lock is not a private, direct, empty single-link authority",
+            ));
+        }
+        if open.permissions().mode() & 0o7777 != 0o600 {
+            lock.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| PersistenceFailure::io("tighten state lock permissions", error))?;
+        }
+        let open_after = lock
+            .metadata()
+            .map_err(|error| PersistenceFailure::io("re-inspect open state lock", error))?;
+        let named_after = lock_path
+            .symlink_metadata()
+            .map_err(|error| PersistenceFailure::io("revalidate named state lock", error))?;
+        if !open_after.is_file()
+            || named_after.file_type().is_symlink()
+            || !named_after.is_file()
+            || open_after.uid() != expected_uid
+            || named_after.uid() != expected_uid
+            || open_after.dev() != directory.dev()
+            || open_after.dev() != named_after.dev()
+            || open_after.ino() != named_after.ino()
+            || open_after.nlink() != 1
+            || named_after.nlink() != 1
+            || open_after.len() != 0
+            || named_after.len() != 0
+            || open_after.permissions().mode() & 0o7777 != 0o600
+            || named_after.permissions().mode() & 0o7777 != 0o600
+        {
+            return Err(PersistenceFailure::invalid(
+                "window-state lock identity or permissions changed during validation",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (primary, lock_path, lock);
+    }
+
+    Ok(())
+}
+
+fn open_locked_file(primary: &Path, exclusive: bool) -> Result<File, PersistenceFailure> {
+    let lock_path = lock_file_name(primary);
+    let lock = open_lock_file(primary)?;
+    let result = if exclusive {
+        fs2::FileExt::lock_exclusive(&lock)
+    } else {
+        fs2::FileExt::lock_shared(&lock)
+    };
+    result.map_err(|error| PersistenceFailure::io("lock state authority", error))?;
+    validate_lock_file(primary, &lock_path, &lock)?;
+    Ok(lock)
 }
 
 fn reject_blocking_slot(slot: &ReadSlot) -> Result<(), PersistenceFailure> {
@@ -3646,14 +3753,13 @@ fn load_snapshot_unlocked(primary_path: &Path) -> Result<LayoutStateSnapshot, Pe
 
 /// Load and validate the current authority at an explicit path.
 pub fn load_snapshot_at(primary_path: &Path) -> Result<LayoutStateSnapshot, PersistenceFailure> {
-    let lock = open_lock_file(primary_path)?;
-    fs2::FileExt::lock_shared(&lock)
-        .map_err(|error| PersistenceFailure::io("lock state for reading", error))?;
+    let _lock = open_locked_file(primary_path, false)?;
     load_snapshot_unlocked(primary_path)
 }
 
 /// Load the default GUI state authority.
 pub fn load_layout_state() -> Result<LayoutStateSnapshot, PersistenceFailure> {
+    ensure_legacy_window_state_migrated()?;
     load_snapshot_at(&state_file_name())
 }
 
@@ -6054,12 +6160,11 @@ fn write_inactive_slot(
             PersistenceFailure::io("create private state directory", io::Error::other(error))
         })?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| PersistenceFailure::io("open inactive state slot", error))?;
+    let (mut file, _) = open_state_file(path, true, true, "open inactive state slot")?;
+    file.set_len(0)
+        .map_err(|error| PersistenceFailure::io("truncate inactive state slot", error))?;
+    file.rewind()
+        .map_err(|error| PersistenceFailure::io("seek inactive state slot", error))?;
     #[cfg(test)]
     if interruption == WriteInterruption::AfterTruncate {
         return Err(PersistenceFailure::injected_io(
@@ -6084,6 +6189,7 @@ fn write_inactive_slot(
     }
     file.sync_all()
         .map_err(|error| PersistenceFailure::io("sync inactive state slot", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     #[cfg(test)]
     if interruption == WriteInterruption::AfterSync {
         return Err(PersistenceFailure::injected_io(
@@ -6209,8 +6315,8 @@ fn encode_initial_retirement_receipt(
 fn read_initial_retirement_receipt(
     path: &Path,
 ) -> Result<ReadInitialRetirementReceipt, PersistenceFailure> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let (mut file, metadata) = match path.symlink_metadata() {
+        Ok(_) => open_state_file(path, false, false, "open initial retirement receipt")?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ReadInitialRetirementReceipt::Missing);
         }
@@ -6221,11 +6327,6 @@ fn read_initial_retirement_receipt(
             ));
         }
     };
-    if !metadata.file_type().is_file() {
-        return Ok(ReadInitialRetirementReceipt::Corrupt(
-            PersistenceFailure::corrupt("initial retirement receipt is not a regular file"),
-        ));
-    }
     if metadata.len() > MAX_INITIAL_RETIREMENT_RECEIPT_BYTES {
         return Ok(ReadInitialRetirementReceipt::Corrupt(
             PersistenceFailure::Oversized {
@@ -6235,11 +6336,11 @@ fn read_initial_retirement_receipt(
         ));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    File::open(path)
-        .map_err(|error| PersistenceFailure::io("open initial retirement receipt", error))?
+    (&mut file)
         .take(MAX_INITIAL_RETIREMENT_RECEIPT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| PersistenceFailure::io("read initial retirement receipt", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual > MAX_INITIAL_RETIREMENT_RECEIPT_BYTES {
         return Ok(ReadInitialRetirementReceipt::Corrupt(
@@ -6413,13 +6514,8 @@ fn choose_initial_attempt_slot(
 }
 
 fn read_initial_attempt_bytes(path: &Path) -> Result<Vec<u8>, PersistenceFailure> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| PersistenceFailure::io("inspect retired initial attempt", error))?;
-    if !metadata.file_type().is_file() {
-        return Err(PersistenceFailure::corrupt(
-            "retired initial attempt is not a regular file",
-        ));
-    }
+    let (mut file, metadata) =
+        open_state_file(path, false, false, "open retired initial attempt")?;
     if metadata.len() > MAX_STATE_FILE_BYTES {
         return Err(PersistenceFailure::Oversized {
             actual: metadata.len(),
@@ -6427,11 +6523,11 @@ fn read_initial_attempt_bytes(path: &Path) -> Result<Vec<u8>, PersistenceFailure
         });
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    File::open(path)
-        .map_err(|error| PersistenceFailure::io("open retired initial attempt", error))?
+    (&mut file)
         .take(MAX_STATE_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| PersistenceFailure::io("read retired initial attempt", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual > MAX_STATE_FILE_BYTES {
         return Err(PersistenceFailure::Oversized {
@@ -6513,15 +6609,32 @@ fn write_initial_slot(
         );
     }
     let mut options = OpenOptions::new();
-    options.write(true);
+    options.read(true).write(true);
     if choice.occupied {
-        options.truncate(true);
+        // Open without truncating so alias, ownership, and link-count checks
+        // run against the exact descriptor before any retained evidence is
+        // mutated.
     } else {
         options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
     let mut file = options
         .open(&choice.candidate)
         .map_err(|error| PersistenceFailure::io("create initial state slot", error))?;
+    validate_state_file_descriptor(&choice.candidate, &file, true)?;
+    if choice.occupied {
+        file.set_len(0)
+            .map_err(|error| PersistenceFailure::io("truncate initial state slot", error))?;
+        file.rewind()
+            .map_err(|error| PersistenceFailure::io("seek initial state slot", error))?;
+    }
     #[cfg(test)]
     if interruption == WriteInterruption::AfterTruncate {
         return Err(PersistenceFailure::injected_io(
@@ -6546,6 +6659,7 @@ fn write_initial_slot(
     }
     file.sync_all()
         .map_err(|error| PersistenceFailure::io("sync initial state slot", error))?;
+    validate_state_file_descriptor(&choice.candidate, &file, false)?;
     #[cfg(test)]
     if interruption == WriteInterruption::AfterSync {
         return Err(PersistenceFailure::injected_io(
@@ -6554,6 +6668,7 @@ fn write_initial_slot(
     }
     std::fs::rename(&choice.candidate, path)
         .map_err(|error| PersistenceFailure::io("publish initial state slot", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     sync_parent_directory(path)?;
     #[cfg(test)]
     if interruption == WriteInterruption::AfterDirectorySync {
@@ -6565,12 +6680,10 @@ fn write_initial_slot(
 }
 
 fn sync_authoritative_slot(path: &Path) -> Result<(), PersistenceFailure> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .and_then(|file| file.sync_all())
+    let (file, _) = open_state_file(path, true, false, "open authoritative state slot")?;
+    file.sync_all()
         .map_err(|error| PersistenceFailure::io("sync authoritative state slot", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     sync_parent_directory(path)
 }
 
@@ -6703,13 +6816,11 @@ fn commit_batch_with_byte_limit(
     interruption: WriteInterruption,
     maximum_bytes: u64,
 ) -> Result<BatchCommit, PersistenceFailure> {
-    // Declared before `lock` so Rust drops the file lock first and records the
+    // Declared before `_lock` so Rust drops the file lock first and records the
     // finite, label-free metrics outside the cross-process critical section on
     // every return path.
     let mut lock_telemetry = PersistenceLockTelemetry::begin();
-    let lock = open_lock_file(primary_path)?;
-    fs2::FileExt::lock_exclusive(&lock)
-        .map_err(|error| PersistenceFailure::io("lock state for writing", error))?;
+    let _lock = open_locked_file(primary_path, true)?;
     lock_telemetry.acquired();
 
     let loaded = load_authoritative_unlocked(primary_path)?;
@@ -6858,17 +6969,60 @@ fn commit_batch_with_byte_limit(
 
 static GLOBAL_WRITER: OnceLock<Result<PersistenceWriter, PersistenceFailure>> = OnceLock::new();
 static STARTUP_SNAPSHOT: OnceLock<StartupRestoreCache> = OnceLock::new();
+static NAMESPACE_MIGRATION: OnceLock<Result<(), PersistenceFailure>> = OnceLock::new();
 
 fn migrate_legacy_window_state_at(
     legacy_primary: &Path,
     canonical_primary: &Path,
 ) -> Result<bool, PersistenceFailure> {
+    migrate_legacy_window_state_at_with_interruption(
+        legacy_primary,
+        canonical_primary,
+        WriteInterruption::None,
+    )
+}
+
+fn migrate_legacy_window_state_at_with_interruption(
+    legacy_primary: &Path,
+    canonical_primary: &Path,
+    interruption: WriteInterruption,
+) -> Result<bool, PersistenceFailure> {
     if legacy_primary == canonical_primary {
         return Ok(false);
     }
+    if config::legacy_data_artifact_treatment(Path::new(
+        config::DATA_ARTIFACT_WINDOW_STATE,
+    )) != config::LegacyDataArtifactTreatment::MigrateValidatedState
+        || config::legacy_data_artifact_treatment(Path::new("window-state.json.shadow"))
+            != config::LegacyDataArtifactTreatment::MigrateValidatedState
+    {
+        return Err(PersistenceFailure::invalid(
+            "window-state namespace migration is absent from the enforced artifact inventory",
+        ));
+    }
 
     let legacy_shadow = shadow_file_name(legacy_primary);
-    if legacy_primary.symlink_metadata().is_err() && legacy_shadow.symlink_metadata().is_err() {
+    let legacy_primary_present = match legacy_primary.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(PersistenceFailure::io(
+                "inspect legacy primary for namespace migration",
+                error,
+            ));
+        }
+    };
+    let legacy_shadow_present = match legacy_shadow.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(PersistenceFailure::io(
+                "inspect legacy shadow for namespace migration",
+                error,
+            ));
+        }
+    };
+    if !legacy_primary_present && !legacy_shadow_present {
         return Ok(false);
     }
 
@@ -6878,18 +7032,13 @@ fn migrate_legacy_window_state_at(
     // cross-root deadlock or a torn snapshot.
     let canonical_lock_path = lock_file_name(canonical_primary);
     let legacy_lock_path = lock_file_name(legacy_primary);
-    let (first_path, second_path, canonical_is_first) =
-        if canonical_lock_path <= legacy_lock_path {
-            (canonical_primary, legacy_primary, true)
-        } else {
-            (legacy_primary, canonical_primary, false)
-        };
-    let first_lock = open_lock_file(first_path)?;
-    fs2::FileExt::lock_exclusive(&first_lock)
-        .map_err(|error| PersistenceFailure::io("lock first namespace for migration", error))?;
-    let second_lock = open_lock_file(second_path)?;
-    fs2::FileExt::lock_exclusive(&second_lock)
-        .map_err(|error| PersistenceFailure::io("lock second namespace for migration", error))?;
+    let (first_path, second_path, canonical_is_first) = if canonical_lock_path <= legacy_lock_path {
+        (canonical_primary, legacy_primary, true)
+    } else {
+        (legacy_primary, canonical_primary, false)
+    };
+    let first_lock = open_locked_file(first_path, true)?;
+    let second_lock = open_locked_file(second_path, true)?;
 
     let (canonical_lock, _legacy_lock) = if canonical_is_first {
         (&first_lock, &second_lock)
@@ -6916,12 +7065,7 @@ fn migrate_legacy_window_state_at(
     let encoded = encode_disk_slot(&state)?;
     let mut telemetry = PersistenceLockTelemetry::begin();
     telemetry.acquired();
-    write_initial_slot(
-        canonical_primary,
-        &encoded,
-        WriteInterruption::None,
-        &mut telemetry,
-    )?;
+    write_initial_slot(canonical_primary, &encoded, interruption, &mut telemetry)?;
     canonical_lock
         .sync_all()
         .map_err(|error| PersistenceFailure::io("sync canonical migration lock", error))?;
@@ -6934,25 +7078,51 @@ fn migrate_legacy_window_state_at(
     Ok(true)
 }
 
-fn migrate_legacy_window_state_if_needed() {
-    let legacy_primary = config::legacy_data_dir().join("window-state.json");
+fn migrate_legacy_window_state_if_needed() -> Result<(), PersistenceFailure> {
+    let legacy_primary = config::legacy_data_dir().join(config::DATA_ARTIFACT_WINDOW_STATE);
     let canonical_primary = state_file_name();
     match migrate_legacy_window_state_at(&legacy_primary, &canonical_primary) {
-        Ok(true) => log::info!(
-            "window-state: migrated validated legacy authority from {} to {} without removing legacy evidence",
-            legacy_primary.display(),
-            canonical_primary.display()
-        ),
-        Ok(false) => {}
-        Err(failure) => log::warn!(
-            "window-state: legacy namespace was not migrated ({:?}); starting only from canonical authority",
-            failure.code()
-        ),
+        Ok(true) => {
+            log::info!(
+                "window-state: migrated validated legacy authority from {} to {} without removing legacy evidence",
+                legacy_primary.display(),
+                canonical_primary.display()
+            );
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(failure) => {
+            log::error!(
+                "window-state: legacy namespace migration failed closed ({:?})",
+                failure.code()
+            );
+            Err(failure)
+        }
     }
 }
 
+fn migration_result_from<F>(
+    fence: &OnceLock<Result<(), PersistenceFailure>>,
+    migrate: F,
+) -> Result<(), PersistenceFailure>
+where
+    F: FnOnce() -> Result<(), PersistenceFailure>,
+{
+    match fence.get_or_init(migrate) {
+        Ok(()) => Ok(()),
+        Err(failure) => Err(failure.clone()),
+    }
+}
+
+fn ensure_legacy_window_state_migrated() -> Result<(), PersistenceFailure> {
+    migration_result_from(&NAMESPACE_MIGRATION, migrate_legacy_window_state_if_needed)
+}
+
 fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
-    match GLOBAL_WRITER.get_or_init(|| PersistenceWriter::open(state_file_name())) {
+    match GLOBAL_WRITER.get_or_init(|| {
+        ensure_legacy_window_state_migrated()?;
+        PersistenceWriter::open(state_file_name())
+    }) {
         Ok(writer) => Ok(writer),
         Err(failure) => Err(failure.clone()),
     }
@@ -6966,7 +7136,7 @@ fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
 /// attempted independently and retain distinct finite diagnostics; per-window
 /// lookups then remain silent and allocation-bounded.
 pub fn initialize() -> Result<(), PersistenceFailure> {
-    migrate_legacy_window_state_if_needed();
+    ensure_legacy_window_state_migrated()?;
     let writer_failure = global_writer().err();
     let snapshot_failure =
         cached_startup_snapshot(&STARTUP_SNAPSHOT, load_layout_state).snapshot_failure();
@@ -7096,14 +7266,117 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn window_state_lock_rejects_symlink_and_hardlink_authorities() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        for hardlink in [false, true] {
+            let fixture = tempfile::tempdir().expect("window-state lock fixture");
+            let primary = fixture.path().join("data").join("window-state.json");
+            let parent = primary.parent().expect("state parent");
+            std::fs::create_dir(parent).expect("create state parent");
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .expect("make state parent private");
+            let target = fixture.path().join("lock-target");
+            std::fs::File::create(&target).expect("create lock target");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                .expect("make lock target private");
+            let lock_path = lock_file_name(&primary);
+            if hardlink {
+                std::fs::hard_link(&target, &lock_path).expect("create hardlinked state lock");
+            } else {
+                symlink(&target, &lock_path).expect("create symlinked state lock");
+            }
+
+            assert!(
+                open_locked_file(&primary, true).is_err(),
+                "aliased window-state lock must fail closed"
+            );
+            assert!(!primary.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn window_state_lock_normalizes_legacy_0644_mode_before_use() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("window-state lock mode fixture");
+        let primary = fixture.path().join("data").join("window-state.json");
+        let parent = primary.parent().expect("state parent");
+        std::fs::create_dir(parent).expect("create state parent");
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make state parent private");
+        let lock_path = lock_file_name(&primary);
+        std::fs::write(&lock_path, b"").expect("plant legacy empty state lock");
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644))
+            .expect("plant legacy state lock mode");
+
+        let _lock = open_locked_file(&primary, true)
+            .expect("owned legacy lock mode must be tightened, not stranded");
+        assert_eq!(
+            lock_path
+                .symlink_metadata()
+                .expect("inspect normalized state lock")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn window_state_slots_reject_symlink_and_hardlink_authorities() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        for hardlink in [false, true] {
+            let fixture = tempfile::tempdir().expect("window-state slot alias fixture");
+            let primary = fixture.path().join("data").join("window-state.json");
+            let parent = primary.parent().expect("state parent");
+            std::fs::create_dir(parent).expect("create state parent");
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .expect("make state parent private");
+            let target = fixture.path().join("foreign-state");
+            std::fs::write(&target, b"foreign-authority").expect("write foreign authority");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                .expect("make foreign authority private");
+            if hardlink {
+                std::fs::hard_link(&target, &primary).expect("create hardlinked state slot");
+            } else {
+                symlink(&target, &primary).expect("create symlinked state slot");
+            }
+
+            assert!(load_snapshot_at(&primary).is_err());
+            assert_eq!(
+                std::fs::read(&target).expect("foreign target remains readable"),
+                b"foreign-authority"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_migration_failure_is_pinned_process_wide() {
+        let fence = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            assert!(
+                migration_result_from(&fence, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(PersistenceFailure::corrupt("injected migration failure"))
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn legacy_namespace_migration_preserves_validated_state_and_source_evidence() {
         let fixture = tempfile::tempdir().expect("window-state migration fixture");
         let legacy = fixture.path().join("wezterm").join("window-state.json");
-        let canonical = fixture
-            .path()
-            .join("frankenterm")
-            .join("window-state.json");
+        let canonical = fixture.path().join("frankenterm").join("window-state.json");
         let mut batch = PendingBatch::default();
         batch
             .queue_window_state(
@@ -7117,22 +7390,38 @@ mod tests {
         commit_for_test(&legacy, &batch, WriteInterruption::None)
             .expect("publish validated legacy authority");
         let legacy_before = load_snapshot_at(&legacy).expect("load legacy authority");
+        let ambiguous_relative = config::DATA_ARTIFACT_RECENT_COMMANDS;
+        let ambiguous_legacy = legacy
+            .parent()
+            .expect("legacy data root")
+            .join(ambiguous_relative);
+        std::fs::write(&ambiguous_legacy, b"ambiguous-legacy-command-history")
+            .expect("write ambiguous sibling fixture");
 
         assert!(
             migrate_legacy_window_state_at(&legacy, &canonical)
                 .expect("migrate validated legacy authority")
         );
         let canonical_after = load_snapshot_at(&canonical).expect("load canonical authority");
-        assert_eq!(
-            canonical_after.window_states,
-            legacy_before.window_states
-        );
+        assert_eq!(canonical_after.window_states, legacy_before.window_states);
         assert!(canonical_after.store_revision > legacy_before.store_revision);
         assert_eq!(
             load_snapshot_at(&legacy)
                 .expect("legacy evidence remains readable")
                 .window_states,
             legacy_before.window_states
+        );
+        assert_eq!(
+            std::fs::read(&ambiguous_legacy).expect("ambiguous legacy sibling remains"),
+            b"ambiguous-legacy-command-history"
+        );
+        assert!(
+            !canonical
+                .parent()
+                .expect("canonical data root")
+                .join(ambiguous_relative)
+                .exists(),
+            "window-state migration must not copy an ambiguous sibling artifact"
         );
         assert!(
             !migrate_legacy_window_state_at(&legacy, &canonical)
@@ -7144,10 +7433,7 @@ mod tests {
     fn canonical_window_state_authority_is_never_overwritten_by_legacy_migration() {
         let fixture = tempfile::tempdir().expect("window-state divergence fixture");
         let legacy = fixture.path().join("wezterm").join("window-state.json");
-        let canonical = fixture
-            .path()
-            .join("frankenterm")
-            .join("window-state.json");
+        let canonical = fixture.path().join("frankenterm").join("window-state.json");
         for (path, workspace) in [(&legacy, "legacy"), (&canonical, "canonical")] {
             let mut batch = PendingBatch::default();
             batch
@@ -7170,6 +7456,70 @@ mod tests {
         let canonical_after = load_snapshot_at(&canonical).expect("load canonical authority");
         assert!(canonical_after.window_states.contains_key("canonical"));
         assert!(!canonical_after.window_states.contains_key("legacy"));
+    }
+
+    #[test]
+    fn legacy_namespace_migration_recovers_every_initial_publication_cut() {
+        for interruption in [
+            WriteInterruption::AfterTruncate,
+            WriteInterruption::AfterPartialWrite,
+            WriteInterruption::AfterFullWrite,
+            WriteInterruption::AfterSync,
+            WriteInterruption::AfterDirectorySync,
+        ] {
+            let fixture = tempfile::tempdir().expect("window-state interrupted migration fixture");
+            let legacy = fixture.path().join("wezterm").join("window-state.json");
+            let canonical = fixture.path().join("frankenterm").join("window-state.json");
+            let mut batch = PendingBatch::default();
+            batch
+                .queue_window_state(
+                    "interrupted-migration".to_string(),
+                    PersistedWindowState {
+                        maximized: true,
+                        fullscreen: false,
+                    },
+                )
+                .expect("queue interrupted migration state");
+            commit_for_test(&legacy, &batch, WriteInterruption::None)
+                .expect("publish legacy interrupted migration authority");
+
+            migrate_legacy_window_state_at_with_interruption(&legacy, &canonical, interruption)
+                .expect_err("injected publication cut must interrupt acknowledgement");
+            migrate_legacy_window_state_at(&legacy, &canonical)
+                .expect("retry interrupted namespace migration");
+
+            let migrated = load_snapshot_at(&canonical).expect("load recovered migration");
+            assert!(migrated.window_states.contains_key("interrupted-migration"));
+            assert!(
+                load_snapshot_at(&legacy)
+                    .expect("legacy evidence remains after recovery")
+                    .window_states
+                    .contains_key("interrupted-migration")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_namespace_migration_rejects_symlinked_authority_without_copying() {
+        let fixture = tempfile::tempdir().expect("window-state symlink migration fixture");
+        let outside = fixture.path().join("outside-window-state.json");
+        let legacy = fixture.path().join("wezterm").join("window-state.json");
+        let canonical = fixture.path().join("frankenterm").join("window-state.json");
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+            .expect("create legacy symlink parent");
+        std::fs::write(&outside, b"foreign").expect("write foreign window-state authority");
+        std::os::unix::fs::symlink(&outside, &legacy).expect("plant legacy window-state symlink");
+
+        assert!(migrate_legacy_window_state_at(&legacy, &canonical).is_err());
+        assert!(!canonical.exists());
+        assert!(
+            legacy
+                .symlink_metadata()
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
     }
 
     struct ControlledPersistenceWorker {

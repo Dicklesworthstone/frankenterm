@@ -79,8 +79,8 @@ pub fn load_last_release_info_and_set_banner() {
         return;
     }
 
-    let update_file_name = config::DATA_DIR.join("check_update");
-    if let Ok(data) = std::fs::read(update_file_name) {
+    let update_file_name = config::DATA_DIR.join(config::DATA_ARTIFACT_UPDATE_METADATA);
+    if let Ok(data) = config::read_user_owned_file(&update_file_name) {
         let latest: Release = match serde_json::from_slice(&data) {
             Ok(d) => d,
             Err(_) => return,
@@ -192,7 +192,7 @@ fn update_checker() {
 
     let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
 
-    let update_file_name = config::DATA_DIR.join("check_update");
+    let update_file_name = config::DATA_DIR.join(config::DATA_ARTIFACT_UPDATE_METADATA);
     let delay = update_file_name
         .metadata()
         .and_then(|metadata| metadata.modified())
@@ -239,16 +239,13 @@ fn update_checker() {
                     }
                 }
 
-                config::create_user_owned_dirs(update_file_name.parent().unwrap()).ok();
-
                 // Record the time of this check
-                if let Ok(f) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&update_file_name)
-                {
-                    serde_json::to_writer_pretty(f, &latest).ok();
+                if let Ok(encoded) = serde_json::to_vec_pretty(&latest) {
+                    if let Err(error) = config::write_user_owned_file(&update_file_name, &encoded) {
+                        log::warn!(
+                            "update metadata was not persisted because its private file contract failed: {error:#}"
+                        );
+                    }
                 }
             }
         }

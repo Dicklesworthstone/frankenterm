@@ -3104,6 +3104,7 @@ async fn async_run_terminal_gui(
         std::env::set_var("FRANKENTERM_UNIX_SOCKET", unix_socket_path.clone());
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
     }
+    config::create_user_owned_dirs(config::CACHE_DIR.as_path())?;
     wezterm_blob_leases::register_storage(Arc::new(
         wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
     ))?;

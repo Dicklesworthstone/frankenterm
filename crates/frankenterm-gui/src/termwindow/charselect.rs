@@ -96,13 +96,13 @@ struct Recent {
 }
 
 fn recent_file_name() -> PathBuf {
-    config::DATA_DIR.join("recent-emoji.json")
+    config::DATA_DIR.join(config::DATA_ARTIFACT_RECENT_EMOJI)
 }
 
 fn load_recents() -> anyhow::Result<Vec<Recent>> {
     let file_name = recent_file_name();
-    let f = std::fs::File::open(&file_name)?;
-    let mut recents: Vec<Recent> = serde_json::from_reader(f)?;
+    let bytes = config::read_user_owned_file(&file_name)?;
+    let mut recents: Vec<Recent> = serde_json::from_slice(&bytes)?;
     recents.sort_by(|a, b| b.frecency.score().total_cmp(&a.frecency.score()));
     Ok(recents)
 }
@@ -125,7 +125,7 @@ fn save_recent(alias: &Alias) -> anyhow::Result<()> {
 
     let json = serde_json::to_string(&recents)?;
     let file_name = recent_file_name();
-    std::fs::write(&file_name, json)?;
+    config::write_user_owned_file(&file_name, json.as_bytes())?;
     Ok(())
 }
 

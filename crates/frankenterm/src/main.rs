@@ -110522,18 +110522,62 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
         use std::os::unix::fs::PermissionsExt as _;
 
         std::fs::create_dir_all(root).expect("create installer family root");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verifier_source = repository.join("scripts/atomic-component-manifest.sh");
+        let source_revision = build_id
+            .get(..40)
+            .filter(|revision| {
+                revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+            .expect("installer fixture identity seed must begin with 40 lowercase hex characters");
+        let derived = std::process::Command::new("bash")
+            .arg(&verifier_source)
+            .arg("derive-build-id")
+            .arg("--source-revision")
+            .arg(source_revision)
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg(target)
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg(feature_contract)
+            .output()
+            .expect("derive installer fixture build identity");
+        assert!(
+            derived.status.success(),
+            "installer fixture build identity derivation failed: {}",
+            String::from_utf8_lossy(&derived.stderr)
+        );
+        let derived_build_id = String::from_utf8(derived.stdout)
+            .expect("derived installer fixture build identity must be UTF-8")
+            .trim()
+            .to_string();
+        assert!(
+            derived_build_id.len() == 64
+                && derived_build_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "derived installer fixture build identity must be canonical SHA-256"
+        );
         let ft = root.join("ft");
         let mux = root.join("frankenterm-mux-server");
         let guardian = root.join("frankenterm-pty-guardian");
-        write_installer_atomic_helper_fixture(&ft, build_id, target);
-        write_atomic_component_fixture(&mux, build_id, "frankenterm-mux-server", target);
-        write_atomic_component_fixture(&guardian, build_id, "frankenterm-pty-guardian", target);
+        write_installer_atomic_helper_fixture(&ft, &derived_build_id, target);
+        write_atomic_component_fixture(&mux, &derived_build_id, "frankenterm-mux-server", target);
+        write_atomic_component_fixture(
+            &guardian,
+            &derived_build_id,
+            "frankenterm-pty-guardian",
+            target,
+        );
         for path in [&mux, &guardian] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
                 .expect("make installer family member executable");
         }
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let verifier_source = repository.join("scripts/atomic-component-manifest.sh");
         let verifier = root.join("verify-components.sh");
         std::fs::copy(&verifier_source, &verifier)
             .expect("copy externally trusted component verifier");
@@ -110550,9 +110594,9 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             .arg("--output")
             .arg(&manifest)
             .arg("--build-id")
-            .arg(build_id)
+            .arg(&derived_build_id)
             .arg("--source-revision")
-            .arg("1".repeat(40))
+            .arg(source_revision)
             .arg("--version")
             .arg("0.15.2")
             .arg("--target")
@@ -110773,24 +110817,66 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let verifier_source = repository.join("scripts/atomic-component-manifest.sh");
+        let source_revision = build_id
+            .get(..40)
+            .filter(|revision| {
+                revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+            .expect("app fixture identity seed must begin with 40 lowercase hex characters");
+        let feature_contract =
+            "application-family-gui-ft-mux-server-pty-guardian-default-features-v1";
+        let derived = std::process::Command::new("bash")
+            .arg(&verifier_source)
+            .arg("derive-build-id")
+            .arg("--source-revision")
+            .arg(source_revision)
+            .arg("--version")
+            .arg("0.15.2")
+            .arg("--target")
+            .arg(target)
+            .arg("--profile")
+            .arg("release-interactive")
+            .arg("--feature-contract")
+            .arg(feature_contract)
+            .output()
+            .expect("derive app fixture build identity");
+        assert!(
+            derived.status.success(),
+            "app fixture build identity derivation failed: {}",
+            String::from_utf8_lossy(&derived.stderr)
+        );
+        let derived_build_id = String::from_utf8(derived.stdout)
+            .expect("derived app fixture build identity must be UTF-8")
+            .trim()
+            .to_string();
+        assert!(
+            derived_build_id.len() == 64
+                && derived_build_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "derived app fixture build identity must be canonical SHA-256"
+        );
+
         let app_root = root.join("FrankenTerm.app");
         let macos = app_root.join("Contents/MacOS");
         let resources = app_root.join("Contents/Resources");
         std::fs::create_dir_all(&macos).expect("create app executable directory");
         std::fs::create_dir_all(&resources).expect("create app resource directory");
-        write_installer_atomic_helper_fixture(&macos.join("ft"), build_id, target);
+        write_installer_atomic_helper_fixture(&macos.join("ft"), &derived_build_id, target);
         for (name, component) in [
             ("frankenterm-gui", "frankenterm-gui"),
             ("frankenterm-mux-server", "frankenterm-mux-server"),
             ("frankenterm-pty-guardian", "frankenterm-pty-guardian"),
         ] {
             let path = macos.join(name);
-            write_atomic_component_fixture(&path, build_id, component, target);
+            write_atomic_component_fixture(&path, &derived_build_id, component, target);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
                 .expect("make app executable fixture runnable");
         }
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let verifier_source = repository.join("scripts/atomic-component-manifest.sh");
         let verifier = resources.join("verify-components.sh");
         std::fs::copy(&verifier_source, &verifier).expect("copy app verifier fixture");
         std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o555))
@@ -110827,9 +110913,9 @@ test "${FT_INSTALL_TEST_READINESS_FAIL:-0}" != 1
             .arg("--output")
             .arg(&manifest)
             .arg("--build-id")
-            .arg(build_id)
+            .arg(&derived_build_id)
             .arg("--source-revision")
-            .arg("1".repeat(40))
+            .arg(source_revision)
             .arg("--version")
             .arg("0.15.2")
             .arg("--target")
@@ -110837,7 +110923,7 @@ test "${FT_INSTALL_TEST_READINESS_FAIL:-0}" != 1
             .arg("--profile")
             .arg("release-interactive")
             .arg("--feature-contract")
-            .arg("application-family-gui-ft-mux-server-pty-guardian-default-features-v1")
+            .arg(feature_contract)
             .arg("--entry")
             .arg("executable:gui:Contents/MacOS/frankenterm-gui:frankenterm-gui")
             .arg("--entry")
@@ -110947,7 +111033,25 @@ esac
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o555))
             .expect("make fake app curl executable");
         let codesign = directory.join("codesign");
-        std::fs::write(&codesign, b"#!/bin/sh\nexit 0\n").expect("write fake codesign");
+        std::fs::write(
+            &codesign,
+            br#"#!/bin/sh
+set -eu
+state=${FAKE_CODESIGN_STATE:?}
+count=0
+if test -f "$state"; then
+  count=$(cat "$state")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" >"$state"
+fail_after=${FAKE_CODESIGN_FAIL_AFTER:-0}
+if test "$fail_after" -gt 0 && test "$count" -gt "$fail_after"; then
+  exit 1
+fi
+exit 0
+"#,
+        )
+        .expect("write fake codesign");
         std::fs::set_permissions(&codesign, std::fs::Permissions::from_mode(0o555))
             .expect("make fake codesign executable");
     }
@@ -110964,6 +111068,40 @@ esac
         fake_tools: &Path,
         failpoint: Option<&str>,
         tree_fail_after_files: Option<usize>,
+        readiness_failure: bool,
+        codesign_fail_after: Option<u64>,
+    ) -> std::process::Output {
+        run_installer_app_function_with_selector_policy(
+            installer,
+            family,
+            destination,
+            app,
+            app_destination,
+            scratch,
+            fake_tools,
+            failpoint,
+            tree_fail_after_files,
+            readiness_failure,
+            codesign_fail_after,
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_installer_app_function_with_selector_policy(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        app: &InstallerTestApp,
+        app_destination: &Path,
+        scratch: &Path,
+        fake_tools: &Path,
+        failpoint: Option<&str>,
+        tree_fail_after_files: Option<usize>,
+        readiness_failure: bool,
+        codesign_fail_after: Option<u64>,
+        allow_selector: bool,
     ) -> std::process::Output {
         std::fs::create_dir_all(scratch).expect("create app installer shell scratch");
         let selected_manifest = destination
@@ -110974,7 +111112,7 @@ esac
         let test_path = format!("{}:{inherited_path}", fake_tools.display());
         let failpoint = failpoint.unwrap_or("");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_SIGSTORE=1\nMAX_APP_ARCHIVE_BYTES={}\nMAX_APP_EXPANDED_BYTES={}\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_MINISIGN=1\nMAX_APP_ARCHIVE_BYTES={}\nMAX_APP_EXPANDED_BYTES={}\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nPUBLISHED_PROCESS_FAMILY_ROOT={}\nPUBLISHED_PROCESS_FAMILY_VERSION=0.15.2\nPUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY={}\nAPP_RECEIPT_REQUESTED=true\nAPP_RECEIPT_RESULT=in_progress\nAPP_RECEIPT_REASON=selected\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\nfinalize_app_receipt_state\nemit_app_receipt\n",
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&destination.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
@@ -110990,6 +111128,13 @@ esac
                     .join("ft")
                     .to_string_lossy()
             ),
+            shell_single_quote(
+                &destination
+                    .join(".frankenterm-process-family/generations")
+                    .join(&family.generation_id)
+                    .to_string_lossy()
+            ),
+            shell_single_quote(&family.verifier.to_string_lossy()),
             if failpoint.is_empty() && tree_fail_after_files.is_none() {
                 "0"
             } else {
@@ -110998,13 +111143,29 @@ esac
             shell_single_quote(failpoint),
             tree_fail_after_files.unwrap_or(0),
         );
-        std::process::Command::new("bash")
+        let mut command = std::process::Command::new("bash");
+        command
             .arg("-c")
             .arg(script)
             .env("PATH", test_path)
             .env("COPYFILE_DISABLE", "1")
             .env("FAKE_APP_ARCHIVE", &app.archive)
             .env("FAKE_APP_CHECKSUM", &app.checksum)
+            .env(
+                "FT_INSTALL_TEST_READINESS_FAIL",
+                if readiness_failure { "1" } else { "0" },
+            )
+            .env("FAKE_CODESIGN_STATE", scratch.join("codesign-state"))
+            .env(
+                "FAKE_CODESIGN_FAIL_AFTER",
+                codesign_fail_after.unwrap_or(0).to_string(),
+            );
+        if allow_selector {
+            command.env("FT_INSTALL_TEST_ALLOW_APP_SELECTOR", "1");
+        } else {
+            command.env_remove("FT_INSTALL_TEST_ALLOW_APP_SELECTOR");
+        }
+        command
             .output()
             .expect("execute production installer app function")
     }
@@ -111628,7 +111789,27 @@ cat "$FAKE_FONT_ARCHIVE"
             .find("install_process_family \"$BIN\" \"$MUX_BIN\" \"$GUARDIAN_BIN\"")
             .expect("offline archive triplet installation");
         assert!(offline_verification < offline_install);
-        assert!(installer.contains("--no-verify) NO_SIGSTORE=1; shift ;;"));
+        assert!(installer.contains("--no-verify) NO_MINISIGN=1; shift ;;"));
+        let minisign_gate = installer
+            .find("require_release_minisign || exit 1")
+            .expect("mandatory release minisign preflight");
+        let release_transfer = installer
+            .find("# Download / source build")
+            .expect("release artifact transfer section");
+        assert!(minisign_gate < release_transfer);
+        assert!(installer.contains(
+            "DSR release verification is mandatory before any release artifact download."
+        ));
+        let dsr_minisign_public_key = include_str!("../../../release/minisign.pub");
+        let dsr_minisign_public_key = dsr_minisign_public_key
+            .lines()
+            .nth(1)
+            .expect("DSR minisign public key payload");
+        assert!(installer.contains(dsr_minisign_public_key));
+        assert!(installer.contains("verify_minisign_signature"));
+        assert!(installer.contains("offline_minisign=\"${OFFLINE_TARBALL}.minisig\""));
+        assert!(installer.contains("\"$VERIFIED_ARCHIVE_IDENTITY\" \"\" \"$offline_minisign\""));
+        assert!(!installer.contains("SIGSTORE_BUNDLE_URL"));
         assert!(!installer.contains("NO_CHECKSUM"));
         assert!(installer.contains(
             "Existing ft path detected; it will not be executed before authenticated family verification"
@@ -111669,7 +111850,7 @@ cat "$FAKE_FONT_ARCHIVE"
             .find("extract_authenticated_archive() {")
             .expect("authenticated extractor function");
         let extractor_end = installer[extractor_start..]
-            .find("\n}\n\nverify_sigstore_bundle()")
+            .find("\n}\n\nverify_minisign_signature()")
             .map(|offset| extractor_start + offset)
             .expect("authenticated extractor function end");
         let extractor = &installer[extractor_start..extractor_end];
@@ -111704,55 +111885,32 @@ cat "$FAKE_FONT_ARCHIVE"
         assert!(!checksum.contains("sha256sum"));
         assert!(!checksum.contains("shasum"));
 
-        let release_workflow = include_str!("../../../.github/workflows/release.yml");
-        let standalone_archive_start = release_workflow
-            .find("# macOS bsdtar otherwise synthesizes ._* AppleDouble members")
-            .expect("standalone release archive contract");
-        let standalone_archive_end = release_workflow[standalone_archive_start..]
-            .find("\n\n      - name: Bundle + checksum macOS .app")
-            .map(|offset| standalone_archive_start + offset)
-            .expect("standalone release archive contract end");
-        let standalone_archive =
-            &release_workflow[standalone_archive_start..standalone_archive_end];
-        let archive_creation = standalone_archive
-            .find("COPYFILE_DISABLE=1 tar -C \"$STAGING\" -cJf")
-            .expect("AppleDouble-disabled standalone archive creation");
-        let archive_inventory = standalone_archive
-            .find("archive_entries=\"$(tar -tJf")
-            .expect("standalone archive inventory");
-        let exact_count = standalone_archive
-            .find("test \"$(wc -l <<<\"$archive_entries\" | tr -d '[:space:]')\" = 5")
-            .expect("exact five-entry standalone archive assertion");
-        let no_appledouble = standalone_archive
-            .find("! grep -E '(^|/)\\._' <<<\"$archive_entries\"")
-            .expect("AppleDouble rejection assertion");
-        assert!(archive_creation < archive_inventory);
-        assert!(archive_inventory < exact_count && exact_count < no_appledouble);
-        assert_eq!(standalone_archive.matches("grep -Fxq ").count(), 5);
-
-        let app_archive_start = release_workflow
-            .find("# COPYFILE_DISABLE stops bsdtar from emitting ._* AppleDouble sidecars.")
-            .expect("app release archive contract");
-        let app_archive = &release_workflow[app_archive_start..];
+        let bundle_script = include_str!("../../../scripts/create-macos-bundle.sh");
+        for copy in [
+            "cp \"$GUI_BINARY\" \"$APP_BUNDLE/Contents/MacOS/frankenterm-gui\"",
+            "cp \"$MUX_SERVER_BINARY\" \"$APP_BUNDLE/Contents/MacOS/frankenterm-mux-server\"",
+            "cp \"$GUARDIAN_BINARY\" \"$APP_BUNDLE/Contents/MacOS/frankenterm-pty-guardian\"",
+            "cp \"$FT_BINARY\" \"$APP_BUNDLE/Contents/MacOS/ft\"",
+        ] {
+            assert!(
+                bundle_script.contains(copy),
+                "missing app component copy: {copy}"
+            );
+        }
+        assert!(bundle_script.contains(
+            "--entry executable:pty-guardian:Contents/MacOS/frankenterm-pty-guardian:frankenterm-pty-guardian"
+        ));
+        assert!(bundle_script.contains(
+            "--entry verifier:native-readiness-harness:Contents/Resources/e2e-native-events.sh"
+        ));
+        assert!(bundle_script.contains(
+            "--source-match Contents/Resources/e2e-native-events.sh=scripts/e2e_native_events.sh"
+        ));
         assert!(
-            app_archive.contains(
-                "test \"$(grep -Fxc 'FrankenTerm.app/' <<<\"$app_archive_entries\")\" = 1"
+            bundle_script.contains(
+                "browser runtime source and app destination must not contain one another"
             )
         );
-        assert!(app_archive.contains(
-            "test \"$(grep -Fxc FrankenTerm.app.component-manifest.json <<<\"$app_archive_entries\")\" = 1"
-        ));
-        assert!(app_archive.contains("! grep -E '(^|/)\\._' <<<\"$app_archive_entries\""));
-        let app_checksum = app_archive
-            .find("verify_checksum \"$app_archive\" \"$app_archive_checksum\"")
-            .expect("production app checksum gate");
-        let app_extractor = app_archive
-            .find("extract_authenticated_archive \"$app_archive\" \"$APP_PROBE\" app")
-            .expect("production app extractor gate");
-        let app_verifier = app_archive
-            .find("bash \"../$STANDALONE_STAGING/verify-components.sh\" verify")
-            .expect("post-extraction app component verifier");
-        assert!(app_checksum < app_extractor && app_extractor < app_verifier);
 
         let app_start = installer
             .find("install_macos_app() {")
@@ -111766,6 +111924,28 @@ cat "$FAKE_FONT_ARCHIVE"
         );
         assert!(app.contains("before-app-selector-switch"));
         assert!(app.contains("after-app-selector-switch"));
+        let readiness = app
+            .find("Running non-activating native readiness proof")
+            .expect("pre-switch native readiness proof");
+        let selector_switch = app
+            .find("installer_failpoint before-app-selector-switch")
+            .expect("app selector switch boundary");
+        assert!(readiness < selector_switch);
+        assert!(app.contains("FRANKENTERM_ATOMIC_MANIFEST_TOOL=\"$staged_verifier\""));
+        assert!(app.contains(
+            "FRANKENTERM_MUX_SERVER=\"$staged_app/Contents/MacOS/frankenterm-mux-server\""
+        ));
+        assert!(app.contains(
+            "FRANKENTERM_PTY_GUARDIAN=\"$staged_app/Contents/MacOS/frankenterm-pty-guardian\""
+        ));
+        assert!(
+            app.contains("Post-switch app verification failed; restoring the prior app authority")
+        );
+        assert!(app.contains("app-rollback:$dest:$app_id"));
+        assert!(app.contains("app-first-publish-rollback:$dest:$app_id"));
+        assert!(
+            app.contains("Candidate app retained for diagnosis; prior app authority was restored")
+        );
         assert!(app.contains("$operation\" || return 0"));
         assert!(!app.contains("move_no_clobber \"$target_app\""));
         assert!(app.contains("dest=\"/Applications\""));
@@ -111774,6 +111954,26 @@ cat "$FAKE_FONT_ARCHIVE"
         assert!(app.contains("App destination cannot provide descriptor-pinned atomic authority"));
         assert!(app.contains("ensure_exact_staged_tree \"$extracted_app\" \"$staged_app\""));
         assert!(!app.contains("ditto \"$extracted_app\" \"$staged_app\""));
+
+        let native_readiness = include_str!("../../../scripts/e2e_native_events.sh");
+        for role in [
+            "FRANKENTERM_CLI",
+            "FRANKENTERM_GUI",
+            "FRANKENTERM_MUX_SERVER",
+            "FRANKENTERM_PTY_GUARDIAN",
+        ] {
+            assert!(
+                native_readiness.contains(role),
+                "native readiness omitted the {role} identity"
+            );
+        }
+        assert!(native_readiness.contains("bounded_version_probe \"$FT_MUX_SERVER\""));
+        assert!(native_readiness.contains("bounded_version_probe \"$FT_PTY_GUARDIAN\""));
+        assert!(native_readiness.contains("private_mux_socket_absent_after_execution"));
+        assert!(native_readiness.contains("frankenterm-mux-server--version"));
+        assert!(native_readiness.contains("frankenterm-pty-guardian--version"));
+        assert!(installer.contains("FT_INSTALL_APP_RECEIPT_V1="));
+        assert!(installer.contains("frankenterm.install.app-receipt.v1"));
 
         let source_build_start = installer
             .find("build_from_source() {")
@@ -112690,14 +112890,44 @@ printf '%s' 'attacker-controlled download bytes'
 
     #[cfg(unix)]
     #[test]
-    fn installer_sigstore_verifies_pinned_descriptors_and_fails_closed_on_path_replacement() {
+    fn installer_requires_minisign_unless_the_operator_explicitly_disables_release_signatures() {
+        let fixture = tempfile::tempdir().expect("create missing-minisign fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let empty_path = fixture.path().join("empty-path");
+        std::fs::create_dir(&empty_path).expect("create empty executable search path");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nFROM_SOURCE=0\nNO_MINISIGN=0\nif require_release_minisign; then exit 91; fi\nNO_MINISIGN=1\nrequire_release_minisign\n",
+            shell_single_quote(&installer.to_string_lossy()),
+        );
+        let output = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", &empty_path)
+            .output()
+            .expect("execute missing-minisign preflight proof");
+        assert!(
+            output.status.success(),
+            "missing minisign did not fail closed before explicit opt-out: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Required tool not found: minisign"));
+        assert!(stderr.contains("brew install minisign"));
+        assert!(
+            stderr.contains("Use --no-verify only for an explicitly trusted local test artifact")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_minisign_verifies_pinned_descriptors_and_fails_closed_on_path_replacement() {
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create Sigstore descriptor-race fixture");
+        let fixture = tempfile::tempdir().expect("create minisign descriptor-race fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
-        std::fs::create_dir(&fake_tools).expect("create Sigstore fake tools");
+        std::fs::create_dir(&fake_tools).expect("create minisign fake tools");
         let fake_curl = fake_tools.join("curl");
         std::fs::write(
             &fake_curl,
@@ -112710,68 +112940,68 @@ fi
 printf '%s' 'signed bundle bytes'
 "#,
         )
-        .expect("write Sigstore fake curl");
+        .expect("write minisign fake curl");
         std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o555))
-            .expect("make Sigstore fake curl executable");
-        let fake_cosign = fake_tools.join("cosign");
+            .expect("make minisign fake curl executable");
+        let fake_minisign = fake_tools.join("minisign");
         std::fs::write(
-            &fake_cosign,
+            &fake_minisign,
             r#"#!/bin/sh
 set -eu
-bundle_descriptor=""
+signature_descriptor=""
 archive_descriptor=""
 while test "$#" -gt 0; do
   case "$1" in
-    verify-blob) ;;
-    --bundle)
+    -Vm)
       shift
-      bundle_descriptor=$1
+      archive_descriptor=$1
       ;;
-    --certificate-identity-regexp|--certificate-oidc-issuer)
+    -x)
       shift
+      signature_descriptor=$1
       ;;
-    *) archive_descriptor=$1 ;;
+    -P) shift ;;
   esac
   shift
 done
 case "$archive_descriptor" in /dev/fd/[0-9]*) ;; *) exit 71 ;; esac
-case "$bundle_descriptor" in /dev/fd/[0-9]*) ;; *) exit 72 ;; esac
+case "$signature_descriptor" in /dev/fd/[0-9]*) ;; *) exit 72 ;; esac
 mv "$ATTACK_ARCHIVE" "$RETAINED_ARCHIVE"
 cp "$ARCHIVE_REPLACEMENT" "$ATTACK_ARCHIVE"
-mv "$ATTACK_BUNDLE" "$RETAINED_BUNDLE"
-printf '%s' 'replacement bundle bytes' > "$ATTACK_BUNDLE"
+mv "$ATTACK_SIGNATURE" "$RETAINED_SIGNATURE"
+printf '%s' 'replacement signature bytes' > "$ATTACK_SIGNATURE"
 cp "$archive_descriptor" "$ARCHIVE_CAPTURE"
-cp "$bundle_descriptor" "$BUNDLE_CAPTURE"
+cp "$signature_descriptor" "$SIGNATURE_CAPTURE"
 cmp "$ARCHIVE_CAPTURE" "$RETAINED_ARCHIVE"
 ! cmp "$ARCHIVE_CAPTURE" "$ATTACK_ARCHIVE"
-cmp "$BUNDLE_CAPTURE" "$RETAINED_BUNDLE"
-! cmp "$BUNDLE_CAPTURE" "$ATTACK_BUNDLE"
-printf x > "$COSIGN_MARKER"
+cmp "$SIGNATURE_CAPTURE" "$RETAINED_SIGNATURE"
+! cmp "$SIGNATURE_CAPTURE" "$ATTACK_SIGNATURE"
+printf x > "$MINISIGN_MARKER"
 "#,
         )
-        .expect("write descriptor-aware fake cosign");
-        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o555))
-            .expect("make descriptor-aware fake cosign executable");
+        .expect("write descriptor-aware fake minisign");
+        std::fs::set_permissions(&fake_minisign, std::fs::Permissions::from_mode(0o555))
+            .expect("make descriptor-aware fake minisign executable");
 
         let scratch = fixture.path().join("scratch");
-        std::fs::create_dir(&scratch).expect("create Sigstore scratch directory");
+        std::fs::create_dir(&scratch).expect("create minisign scratch directory");
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
-            .expect("make Sigstore scratch private");
+            .expect("make minisign scratch private");
         let archive = fixture.path().join("archive");
         let archive_replacement = fixture.path().join("archive-replacement");
         let retained_archive = fixture.path().join("archive-authenticated");
-        let archive_capture = fixture.path().join("archive-cosign-capture");
+        let archive_capture = fixture.path().join("archive-minisign-capture");
         let authenticated_bytes = b"checksum-authenticated bytes\n";
-        std::fs::write(&archive, authenticated_bytes).expect("write Sigstore archive fixture");
+        std::fs::write(&archive, authenticated_bytes).expect("write minisign archive fixture");
         std::fs::write(&archive_replacement, b"swapped archive bytes\n")
-            .expect("write Sigstore archive replacement");
+            .expect("write minisign archive replacement");
         let checksum = hex::encode(sha2::Sha256::digest(authenticated_bytes));
-        let bundle = scratch.join("archive.sigstore.json");
-        let retained_bundle = fixture.path().join("bundle-authenticated");
-        let bundle_capture = fixture.path().join("bundle-cosign-capture");
-        let cosign_marker = fixture.path().join("cosign-invoked");
+        let signature = scratch.join("archive.minisig");
+        let retained_signature = fixture.path().join("signature-authenticated");
+        let signature_capture = fixture.path().join("signature-minisign-capture");
+        let minisign_marker = fixture.path().join("minisign-invoked");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nTMP={}\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nverify_checksum {} {}\nif verify_sigstore_bundle {} https://example.invalid/archive; then\n  exit 91\nfi\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nTMP={}\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nverify_checksum {} {}\nif verify_minisign_signature {} https://example.invalid/archive; then\n  exit 91\nfi\n",
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
             shell_single_quote(&archive.to_string_lossy()),
@@ -112787,24 +113017,24 @@ printf x > "$COSIGN_MARKER"
             .env("ARCHIVE_REPLACEMENT", &archive_replacement)
             .env("RETAINED_ARCHIVE", &retained_archive)
             .env("ARCHIVE_CAPTURE", &archive_capture)
-            .env("ATTACK_BUNDLE", &bundle)
-            .env("RETAINED_BUNDLE", &retained_bundle)
-            .env("BUNDLE_CAPTURE", &bundle_capture)
-            .env("COSIGN_MARKER", &cosign_marker)
+            .env("ATTACK_SIGNATURE", &signature)
+            .env("RETAINED_SIGNATURE", &retained_signature)
+            .env("SIGNATURE_CAPTURE", &signature_capture)
+            .env("MINISIGN_MARKER", &minisign_marker)
             .output()
-            .expect("execute Sigstore descriptor-race proof");
+            .expect("execute minisign descriptor-race proof");
         assert!(
             output.status.success(),
-            "Sigstore pathname replacement was not rejected: {}",
+            "minisign pathname replacement was not rejected: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(cosign_marker.is_file(), "fake cosign did not run");
+        assert!(minisign_marker.is_file(), "fake minisign did not run");
         assert_eq!(
-            std::fs::read(&archive_capture).expect("read cosign archive capture"),
+            std::fs::read(&archive_capture).expect("read minisign archive capture"),
             authenticated_bytes
         );
         assert_eq!(
-            std::fs::read(&bundle_capture).expect("read cosign bundle capture"),
+            std::fs::read(&signature_capture).expect("read minisign signature capture"),
             b"signed bundle bytes"
         );
         assert_eq!(
@@ -112812,25 +113042,25 @@ printf x > "$COSIGN_MARKER"
             b"swapped archive bytes\n"
         );
         assert_eq!(
-            std::fs::read(&bundle).expect("read swapped bundle pathname"),
-            b"replacement bundle bytes"
+            std::fs::read(&signature).expect("read swapped signature pathname"),
+            b"replacement signature bytes"
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("checksum-authenticated archive changed during Sigstore verification")
+                .contains("checksum-authenticated archive changed during minisign verification")
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn installer_sigstore_child_is_killed_at_its_finite_wall_clock_bound() {
+    fn installer_minisign_child_is_killed_at_its_finite_wall_clock_bound() {
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create Sigstore timeout fixture");
+        let fixture = tempfile::tempdir().expect("create minisign timeout fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
-        std::fs::create_dir(&fake_tools).expect("create Sigstore timeout fake tools");
+        std::fs::create_dir(&fake_tools).expect("create minisign timeout fake tools");
         let fake_curl = fake_tools.join("curl");
         std::fs::write(
             &fake_curl,
@@ -112839,21 +113069,21 @@ printf x > "$COSIGN_MARKER"
         .expect("write timeout fake curl");
         std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o555))
             .expect("make timeout fake curl executable");
-        let fake_cosign = fake_tools.join("cosign");
-        std::fs::write(&fake_cosign, b"#!/bin/sh\nset -eu\nsleep 5\n")
-            .expect("write blocking fake cosign");
-        std::fs::set_permissions(&fake_cosign, std::fs::Permissions::from_mode(0o555))
-            .expect("make blocking fake cosign executable");
+        let fake_minisign = fake_tools.join("minisign");
+        std::fs::write(&fake_minisign, b"#!/bin/sh\nset -eu\nsleep 5\n")
+            .expect("write blocking fake minisign");
+        std::fs::set_permissions(&fake_minisign, std::fs::Permissions::from_mode(0o555))
+            .expect("make blocking fake minisign executable");
         let scratch = fixture.path().join("scratch");
-        std::fs::create_dir(&scratch).expect("create Sigstore timeout scratch");
+        std::fs::create_dir(&scratch).expect("create minisign timeout scratch");
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
-            .expect("make Sigstore timeout scratch private");
+            .expect("make minisign timeout scratch private");
         let archive = fixture.path().join("archive");
         let archive_bytes = b"checksum-authenticated timeout fixture\n";
         std::fs::write(&archive, archive_bytes).expect("write timeout archive fixture");
         let checksum = hex::encode(sha2::Sha256::digest(archive_bytes));
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nTMP={}\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nverify_checksum {} {}\nif verify_sigstore_bundle {} https://example.invalid/archive; then exit 91; fi\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nQUIET=1\nHAS_GUM=0\nTMP={}\nINSTALLER_FREE_SPACE_HEADROOM_BYTES=0\nverify_checksum {} {}\nif verify_minisign_signature {} https://example.invalid/archive; then exit 91; fi\n",
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
             shell_single_quote(&archive.to_string_lossy()),
@@ -112866,18 +113096,18 @@ printf x > "$COSIGN_MARKER"
             .arg(script)
             .env("PATH", format!("{}:{inherited_path}", fake_tools.display()))
             .env("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES", "1")
-            .env("FT_INSTALL_TEST_COSIGN_TIMEOUT_SECONDS", "1")
+            .env("FT_INSTALL_TEST_MINISIGN_TIMEOUT_SECONDS", "1")
             .output()
-            .expect("execute Sigstore timeout proof");
+            .expect("execute minisign timeout proof");
         assert!(
             output.status.success(),
-            "Sigstore timeout did not fail closed: {}",
+            "minisign timeout did not fail closed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("Sigstore verifier exceeded its finite wall-clock bound"),
-            "Sigstore timeout lacked its exact diagnosis: {}",
+                .contains("minisign verifier exceeded its finite wall-clock bound"),
+            "minisign timeout lacked its exact diagnosis: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -113303,29 +113533,34 @@ printf x > "$COSIGN_MARKER"
         );
         let receipt = parse_installer_process_family_receipt(&install_output.stdout);
         assert_eq!(receipt["activation"], "pending");
-        activate_installer_test_generation(&destination, &family);
-        assert!(family_bytes_match(&destination, &family));
         let app = create_installer_test_app(&fixture.path().join("app-release"), &build_id, target);
         let fake_tools = fixture.path().join("fake-app-tools");
         write_installer_fake_download_tools(&fake_tools);
 
-        let verify_live = |app_destination: &Path| {
-            let retained_manifest = app_destination
-                .join(".frankenterm-app-manifests")
-                .join(format!("{}.json", app.app_id));
+        let verify_root = |root: &Path, manifest: &Path, context: &str| {
             let verified = std::process::Command::new("bash")
                 .arg(&family.verifier)
                 .arg("verify")
                 .arg("--root")
-                .arg(app_destination.join("FrankenTerm.app"))
+                .arg(root)
                 .arg("--manifest")
-                .arg(retained_manifest)
+                .arg(manifest)
                 .output()
-                .expect("verify installed app fixture");
+                .expect("verify app fixture root");
             assert!(
                 verified.status.success(),
-                "installed app did not match retained manifest: {}",
+                "{context}: app fixture root did not match retained manifest: {}",
                 String::from_utf8_lossy(&verified.stderr)
+            );
+        };
+        let verify_live = |app_destination: &Path, context: &str| {
+            let retained_manifest = app_destination
+                .join(".frankenterm-app-manifests")
+                .join(format!("{}.json", app.app_id));
+            verify_root(
+                &app_destination.join("FrankenTerm.app"),
+                &retained_manifest,
+                context,
             );
         };
         let plant_old = |app_destination: &Path| {
@@ -113337,6 +113572,65 @@ printf x > "$COSIGN_MARKER"
             )
             .expect("plant prior app bytes");
         };
+
+        let pending_destination = fixture.path().join("app-production-pending");
+        std::fs::create_dir(&pending_destination).expect("create pending app destination");
+        std::fs::set_permissions(&pending_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make pending app destination private");
+        plant_old(&pending_destination);
+        let pending = run_installer_app_function_with_selector_policy(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &pending_destination,
+            &fixture.path().join("app-production-pending-scratch"),
+            &fake_tools,
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        assert!(
+            pending.status.success(),
+            "pending-only app publication failed: {}",
+            String::from_utf8_lossy(&pending.stderr)
+        );
+        let pending_receipt = parse_installer_app_receipt(&pending.stdout);
+        assert_eq!(pending_receipt["requested"], true);
+        assert_eq!(pending_receipt["result"], "verified");
+        assert_eq!(
+            pending_receipt["reason"],
+            "activation_pending_lifecycle_transaction"
+        );
+        assert_eq!(
+            pending_receipt["manifest_id"],
+            format!("sha256:{}", app.app_id)
+        );
+        assert_eq!(pending_receipt["readiness"], "passed");
+        assert_eq!(pending_receipt["activation"], "pending");
+        assert_eq!(
+            pending_receipt["candidate_path"],
+            pending_destination
+                .join(format!(".FrankenTerm.app.installing-{}", app.app_id))
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            std::fs::read(pending_destination.join("FrankenTerm.app/old-generation.txt")).unwrap(),
+            b"retained old app generation\n"
+        );
+        let pending_manifest = pending_destination
+            .join(".frankenterm-app-manifests")
+            .join(format!("{}.json", app.app_id));
+        verify_root(
+            &pending_destination.join(format!(".FrankenTerm.app.installing-{}", app.app_id)),
+            &pending_manifest,
+            "production policy retains a verified pending app candidate",
+        );
+        activate_installer_test_generation(&destination, &family);
+        assert!(family_bytes_match(&destination, &family));
 
         for (index, (failpoint, switched)) in [
             ("before-app-selector-switch", false),
@@ -113360,6 +113654,8 @@ printf x > "$COSIGN_MARKER"
                 &fake_tools,
                 Some(failpoint),
                 None,
+                false,
+                None,
             );
             assert_eq!(
                 interrupted.status.signal(),
@@ -113368,7 +113664,7 @@ printf x > "$COSIGN_MARKER"
                 String::from_utf8_lossy(&interrupted.stderr)
             );
             if switched {
-                verify_live(&app_destination);
+                verify_live(&app_destination, "post-switch crash cut");
                 assert!(
                     app_destination
                         .join(format!(
@@ -113395,13 +113691,19 @@ printf x > "$COSIGN_MARKER"
                 &fake_tools,
                 None,
                 None,
+                false,
+                None,
             );
             assert!(
                 replay.status.success(),
                 "app retry after {failpoint} failed: {}",
                 String::from_utf8_lossy(&replay.stderr)
             );
-            verify_live(&app_destination);
+            let replay_receipt = parse_installer_app_receipt(&replay.stdout);
+            assert_eq!(replay_receipt["result"], "verified");
+            assert_eq!(replay_receipt["readiness"], "passed");
+            assert_eq!(replay_receipt["activation"], "current");
+            verify_live(&app_destination, "replay after app switch crash cut");
         }
 
         let mid_tree_destination = fixture.path().join("app-mid-tree");
@@ -113422,6 +113724,8 @@ printf x > "$COSIGN_MARKER"
             &fake_tools,
             None,
             Some(1),
+            false,
+            None,
         );
         assert_eq!(
             interrupted.status.signal(),
@@ -113450,13 +113754,139 @@ printf x > "$COSIGN_MARKER"
             &fake_tools,
             None,
             None,
+            false,
+            None,
         );
         assert!(
             replay.status.success(),
             "mid-tree app retry failed: {}",
             String::from_utf8_lossy(&replay.stderr)
         );
-        verify_live(&mid_tree_destination);
+        verify_live(&mid_tree_destination, "replay after partial app tree");
+
+        let readiness_failure_destination = fixture.path().join("app-readiness-failure");
+        std::fs::create_dir(&readiness_failure_destination)
+            .expect("create readiness-failure app destination");
+        std::fs::set_permissions(
+            &readiness_failure_destination,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make readiness-failure app destination private");
+        plant_old(&readiness_failure_destination);
+        let readiness_failure = run_installer_app_function(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &readiness_failure_destination,
+            &fixture.path().join("app-readiness-failure-scratch"),
+            &fake_tools,
+            None,
+            None,
+            true,
+            None,
+        );
+        assert!(
+            readiness_failure.status.success(),
+            "optional app installation must stop safely on readiness failure: {}",
+            String::from_utf8_lossy(&readiness_failure.stderr)
+        );
+        let readiness_receipt = parse_installer_app_receipt(&readiness_failure.stdout);
+        assert_eq!(readiness_receipt["requested"], true);
+        assert_eq!(readiness_receipt["result"], "skipped");
+        assert_eq!(readiness_receipt["reason"], "native_readiness_failed");
+        assert_eq!(readiness_receipt["readiness"], "failed");
+        assert_eq!(readiness_receipt["activation"], "none");
+        assert_eq!(
+            std::fs::read(readiness_failure_destination.join("FrankenTerm.app/old-generation.txt"))
+                .unwrap(),
+            b"retained old app generation\n"
+        );
+        assert!(
+            readiness_failure_destination
+                .join(format!(".FrankenTerm.app.installing-{}", app.app_id))
+                .is_dir(),
+            "failed readiness candidate must remain recoverable"
+        );
+
+        let rollback_destination = fixture.path().join("app-post-switch-rollback");
+        std::fs::create_dir(&rollback_destination)
+            .expect("create post-switch rollback app destination");
+        std::fs::set_permissions(
+            &rollback_destination,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make post-switch rollback app destination private");
+        plant_old(&rollback_destination);
+        let rolled_back = run_installer_app_function(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &rollback_destination,
+            &fixture.path().join("app-post-switch-rollback-scratch"),
+            &fake_tools,
+            None,
+            None,
+            false,
+            Some(1),
+        );
+        assert!(
+            rolled_back.status.success(),
+            "post-switch verification failure did not recover safely: {}",
+            String::from_utf8_lossy(&rolled_back.stderr)
+        );
+        assert_eq!(
+            std::fs::read(rollback_destination.join("FrankenTerm.app/old-generation.txt")).unwrap(),
+            b"retained old app generation\n"
+        );
+        let rollback_manifest = rollback_destination
+            .join(".frankenterm-app-manifests")
+            .join(format!("{}.json", app.app_id));
+        verify_root(
+            &rollback_destination.join(format!(".FrankenTerm.app.installing-{}", app.app_id)),
+            &rollback_manifest,
+            "candidate retained after post-switch rollback",
+        );
+
+        let first_publish_destination = fixture.path().join("app-first-publish-rollback");
+        std::fs::create_dir(&first_publish_destination)
+            .expect("create first-publish rollback app destination");
+        std::fs::set_permissions(
+            &first_publish_destination,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make first-publish rollback app destination private");
+        let first_publish_rolled_back = run_installer_app_function(
+            &installer,
+            &family,
+            &destination,
+            &app,
+            &first_publish_destination,
+            &fixture.path().join("app-first-publish-rollback-scratch"),
+            &fake_tools,
+            None,
+            None,
+            false,
+            Some(1),
+        );
+        assert!(
+            first_publish_rolled_back.status.success(),
+            "first-publish verification failure did not recover safely: {}",
+            String::from_utf8_lossy(&first_publish_rolled_back.stderr)
+        );
+        assert!(
+            !first_publish_destination.join("FrankenTerm.app").exists(),
+            "failed first publication must restore an absent live authority"
+        );
+        let first_publish_manifest = first_publish_destination
+            .join(".frankenterm-app-manifests")
+            .join(format!("{}.json", app.app_id));
+        verify_root(
+            &first_publish_destination.join(format!(".FrankenTerm.app.installing-{}", app.app_id)),
+            &first_publish_manifest,
+            "candidate retained after first-publish rollback",
+        );
 
         let source_ft = std::fs::read(app.app_root.join("Contents/MacOS/ft"))
             .expect("read source app ft fixture");
@@ -113466,12 +113896,19 @@ printf x > "$COSIGN_MARKER"
             std::fs::set_permissions(&app_destination, std::fs::Permissions::from_mode(0o700))
                 .expect("make app prefix destination private");
             plant_old(&app_destination);
-            let prefix_path = app_destination.join(format!(
-                ".FrankenTerm.app.installing-{}/Contents/MacOS/ft",
-                app.app_id
-            ));
+            let prefix_stage =
+                app_destination.join(format!(".FrankenTerm.app.installing-{}", app.app_id));
+            let prefix_path = prefix_stage.join("Contents/MacOS/ft");
             std::fs::create_dir_all(prefix_path.parent().unwrap())
                 .expect("create partial app tree directories");
+            for directory in [
+                prefix_stage.as_path(),
+                &prefix_stage.join("Contents"),
+                &prefix_stage.join("Contents/MacOS"),
+            ] {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .expect("make planted resumable app directory private");
+            }
             std::fs::write(&prefix_path, &source_ft[..prefix_len])
                 .expect("plant exact app file prefix");
             std::fs::set_permissions(&prefix_path, std::fs::Permissions::from_mode(0o600))
@@ -113486,13 +113923,20 @@ printf x > "$COSIGN_MARKER"
                 &fake_tools,
                 None,
                 None,
+                false,
+                None,
             );
             assert!(
                 replay.status.success(),
                 "app prefix retry failed: {}",
                 String::from_utf8_lossy(&replay.stderr)
             );
-            verify_live(&app_destination);
+            let replay_context = format!(
+                "replay after partial app member {index}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&replay.stdout),
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            verify_live(&app_destination, &replay_context);
         }
 
         let conflict_destination = fixture.path().join("app-conflict");
@@ -113523,6 +113967,8 @@ printf x > "$COSIGN_MARKER"
             &fixture.path().join("app-conflict-retry"),
             &fake_tools,
             None,
+            None,
+            false,
             None,
         );
         assert!(
