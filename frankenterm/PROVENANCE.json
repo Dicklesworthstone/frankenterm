@@ -155,22 +155,22 @@
         "chore": 2,
         "cleanup": 2,
         "cosmetic": 18,
-        "feat": 48,
+        "feat": 51,
         "fix": 68,
         "other": 16,
-        "refactor": 4,
+        "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
-        "security-fix": 1,
+        "security-fix": 2,
         "test": 23
       },
-      "fork_side_commit_count": 188,
+      "fork_side_commit_count": 193,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-08-31T18:52:12-04:00",
-        "sha": "67e3f4a6d5b63a52253e81fb6933d5d4a179fe20",
-        "subject": "fix(gui): align socket discovery with runtime paths"
+        "classification": "feat",
+        "committed_at": "2026-09-01T19:03:22-04:00",
+        "sha": "3ae6370884db2d459e31f95a9f5b2c078dd19873",
+        "subject": "feat(diagnostics,socket): add mux socket diagnostic check in ft doctor and add no-orphan source tests"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -190,15 +190,15 @@
         "rename": 2,
         "runtime-swap": 5,
         "security-fix": 1,
-        "test": 83
+        "test": 84
       },
-      "fork_side_commit_count": 235,
+      "fork_side_commit_count": 236,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-31T07:58:50-04:00",
-        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
-        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
+        "classification": "test",
+        "committed_at": "2026-09-01T12:05:51-04:00",
+        "sha": "b52dd58d41ec359d56ea72198a1ec85aa2d09936",
+        "subject": "test(codec): bind unknown PDU fixtures to registry gap"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -230,23 +230,24 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "chore": 3,
+        "cleanup": 1,
         "cosmetic": 3,
-        "feat": 38,
+        "feat": 41,
         "fix": 40,
         "other": 10,
-        "refactor": 4,
+        "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
-        "security-fix": 1,
+        "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 122,
+      "fork_side_commit_count": 128,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-25T01:45:04-04:00",
-        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
-        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
+        "classification": "cleanup",
+        "committed_at": "2026-09-01T19:32:48-04:00",
+        "sha": "3828705fc12fc9fd4c1efbc4357426a7693cb7c4",
+        "subject": "chore(cleanups): fix lints, classify workspace cycles gate, and normalize fuzz seed corpus paths"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -483,15 +484,16 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 3,
+        "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 4,
+      "fork_side_commit_count": 5,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-24T08:30:08-04:00",
-        "sha": "4d9e8ab14cd7b8ea39f7c05ca57ffd42703aa789",
-        "subject": "feat(client,codec,pty): harden clientpane writer guards, codec framing, and PTY handles"
+        "classification": "refactor",
+        "committed_at": "2026-09-01T18:46:02-04:00",
+        "sha": "f862716ce873f76f5fbe9bb8fdffc044e4072fb3",
+        "subject": "refactor(socket): centralize GUI socket naming in config and track discovered mux socket on UnifiedClient"
       },
       "name": "frankenterm-gui-subcommands",
       "path": "frankenterm/gui-subcommands",
@@ -1028,7 +1030,7 @@
         "cleanup": 1,
         "cosmetic": 8,
         "docs": 1,
-        "feat": 13,
+        "feat": 15,
         "fix": 81,
         "other": 12,
         "refactor": 6,
@@ -1036,13 +1038,13 @@
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 130,
+      "fork_side_commit_count": 132,
       "last_modified": {
-        "author": "Dicklesworthstone",
+        "author": "Jeff Emanuel",
         "classification": "feat",
-        "committed_at": "2026-08-27T01:01:15-04:00",
-        "sha": "4b6f8ff633fbb8943799fe456b8f0ae054922526",
-        "subject": "feat(guardian,mux,replay): expand guardian proxy forwarding, tantivy schema ingestion, and replay verification"
+        "committed_at": "2026-08-31T23:16:28-04:00",
+        "sha": "a17cb485c15b77298955d30708d1f77fa75b46e3",
+        "subject": "feat(config,client,window): enhance config loading, discovery, and macos window connections"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1055,8 +1057,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2353,
-  "generated_at": "2026-08-31T22:52:24.475377Z",
+  "fork_side_commit_total": 2368,
+  "generated_at": "2026-09-01T23:43:06.483356Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

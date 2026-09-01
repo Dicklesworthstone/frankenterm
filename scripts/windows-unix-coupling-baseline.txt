@@ -6,63 +6,36 @@ Cargo.toml	DEP nix = "0.31.3"
 Cargo.toml	DEP passfd = "0.1.6"
 Cargo.toml	DEP signal-hook = "0.4.4"
 Cargo.toml	DEP termios = "0.3.3"
-crates/frankenterm-core/Cargo.toml	DEP nix = { workspace = true, optional = true, features = ["fs"] }
-crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
-crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link_path).unwrap();
-crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
-crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
-crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
-crates/frankenterm-core/src/vendored/mux_client.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix socket");
-crates/frankenterm-core/src/vendored/mux_client.rs	use std::os::unix::fs::FileTypeExt;
-crates/frankenterm-core/src/workflows/coordination.rs	std::os::unix::fs::symlink(&linked_dir_target, root.path().join("linked_dir")).unwrap();
-crates/frankenterm-core/src/workflows/descriptors.rs	std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
-crates/frankenterm-core/tests/frankensqlite_gate_tests.rs	use std::os::unix::fs::PermissionsExt;
-crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::net::UnixStream;
-crates/frankenterm-mux-server-impl/src/dispatch.rs	let (left, mut right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-frankenterm/client/src/discovery.rs	std::os::unix::fs::symlink(path, &name)
-frankenterm/escape-parser/Cargo.toml	DEP nix = { workspace=true, optional=true, features=["mman", "fs"] }
-frankenterm/filedescriptor/src/unix.rs	fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for FileDescriptor {
-frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for OwnedHandle {
-frankenterm/filedescriptor/src/unix.rs	unsafe { std::os::fd::BorrowedFd::borrow_raw(self.handle) }
-frankenterm/filedescriptor/src/unix.rs	use std::os::unix::prelude::*;
-frankenterm/procinfo/src/macos.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
-frankenterm/pty/Cargo.toml	DEP nix = {workspace=true, features=["term", "fs"]}
-frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt;
-frankenterm/pty/src/unix.rs	pub use std::os::unix::io::RawFd;
-frankenterm/pty/src/unix.rs	use std::os::fd::AsFd;
-frankenterm/pty/src/unix.rs	use std::os::unix::ffi::OsStrExt;
-frankenterm/pty/src/unix.rs	use std::os::unix::io::{AsRawFd, FromRawFd};
-frankenterm/pty/src/unix.rs	use std::os::unix::process::CommandExt;
-frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::OsStringExt;
-frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
-frankenterm/termwiz/src/render/terminfo.rs	use std::os::fd::FromRawFd;
-frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::io::AsRawFd;
-frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::net::UnixStream;
-frankenterm/window/src/os/wayland/connection.rs	use std::os::fd::AsRawFd;
-frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, RawFd};
-frankenterm/window/src/os/wayland/window.rs	use std::os::fd::AsRawFd;
-frankenterm/window/src/os/wayland/window.rs	use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-frankenterm/window/src/os/x11/connection.rs	use std::os::unix::io::AsRawFd;
-frankenterm/window/src/os/x11/keyboard.rs	use std::os::unix::ffi::OsStrExt;
-frankenterm/window/src/spawn.rs	pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&original_metadata)
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&replacement_metadata),
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&rewritten_metadata),
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&original_metadata)
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&replacement_metadata),
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&rewritten_metadata),
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link_path).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
 crates/frankenterm-core/src/scrollback_mmap_writer.rs	use std::os::unix::fs::PermissionsExt as _;
 crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&sentinel_path, &ledger_path)
 crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
+crates/frankenterm-core/src/vendored/mux_client.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+crates/frankenterm-core/src/vendored/mux_client.rs	use std::os::unix::fs::FileTypeExt;
+crates/frankenterm-core/src/workflows/coordination.rs	std::os::unix::fs::symlink(&linked_dir_target, root.path().join("linked_dir")).unwrap();
+crates/frankenterm-core/src/workflows/descriptors.rs	std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
 crates/frankenterm-core/tests/crash_recovery_kill9.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-core/tests/frankensqlite_gate_tests.rs	use std::os::unix::fs::PermissionsExt;
 crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::fs::symlink(&real_parent, &symlink_parent).expect("create parent symlink");
 crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind replacement socket");
 crates/frankenterm-core/tests/integration_native_events.rs	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(&outside, &legacy).expect("plant legacy namespace symlink");
 crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(other.path(), &manifest_paths(other.path())[0])
 crates/frankenterm-gui/src/native_bridge.rs	let listener = std::os::unix::net::UnixListener::bind(&socket_path)
 crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::fs::PermissionsExt;
+crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::net::UnixStream;
+crates/frankenterm-gui/src/window_state_persist.rs	std::os::unix::fs::symlink(&outside, &legacy).expect("plant legacy window-state symlink");
+crates/frankenterm-mux-server-impl/src/dispatch.rs	let (left, mut right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
 crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink(
 crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink("lease-target", &lease)
 crates/frankenterm-mux-server-impl/src/guardian_output_keys.rs	use std::os::fd::AsFd as _;
@@ -91,5 +64,39 @@ crates/frankenterm/src/main.rs	use std::os::unix::ffi::OsStrExt as _;
 crates/frankenterm/src/main.rs	use std::os::unix::fs::MetadataExt as _;
 crates/frankenterm/src/main.rs	use std::os::unix::fs::PermissionsExt as _;
 crates/frankenterm/tests/epipe_exit_code.rs	use std::os::unix::process::ExitStatusExt;
+frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind legacy socket"));
+frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind replacement socket"));
+frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
+frankenterm/client/src/discovery.rs	let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind live socket");
+frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+frankenterm/client/src/discovery.rs	std::os::unix::fs::symlink(path, &name)
+frankenterm/client/src/discovery.rs	std::os::unix::net::UnixListener::bind(&socket).expect("bind original socket");
+frankenterm/client/src/discovery.rs	use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+frankenterm/escape-parser/Cargo.toml	DEP nix = { workspace=true, optional=true, features=["mman", "fs"] }
+frankenterm/filedescriptor/src/unix.rs	fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for FileDescriptor {
+frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for OwnedHandle {
+frankenterm/filedescriptor/src/unix.rs	unsafe { std::os::fd::BorrowedFd::borrow_raw(self.handle) }
+frankenterm/filedescriptor/src/unix.rs	use std::os::unix::prelude::*;
+frankenterm/procinfo/src/macos.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
+frankenterm/pty/Cargo.toml	DEP nix = {workspace=true, features=["term", "fs"]}
 frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt as _;
+frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt;
+frankenterm/pty/src/unix.rs	pub use std::os::unix::io::RawFd;
 frankenterm/pty/src/unix.rs	use std::os::fd::{AsFd, BorrowedFd};
+frankenterm/pty/src/unix.rs	use std::os::unix::ffi::OsStrExt;
+frankenterm/pty/src/unix.rs	use std::os::unix::io::{AsRawFd, FromRawFd};
+frankenterm/pty/src/unix.rs	use std::os::unix::process::CommandExt;
+frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::OsStringExt;
+frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
+frankenterm/termwiz/src/render/terminfo.rs	use std::os::fd::FromRawFd;
+frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::io::AsRawFd;
+frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::net::UnixStream;
+frankenterm/window/src/os/wayland/connection.rs	use std::os::fd::AsRawFd;
+frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, RawFd};
+frankenterm/window/src/os/wayland/window.rs	use std::os::fd::AsRawFd;
+frankenterm/window/src/os/wayland/window.rs	use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+frankenterm/window/src/os/x11/connection.rs	use std::os::unix::io::AsRawFd;
+frankenterm/window/src/os/x11/keyboard.rs	use std::os::unix::ffi::OsStrExt;
+frankenterm/window/src/spawn.rs	pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {

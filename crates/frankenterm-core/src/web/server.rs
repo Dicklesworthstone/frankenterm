@@ -91,7 +91,10 @@ pub(super) async fn spawn_storage_event_tail(
                     let drained = events.len();
                     for stored in events {
                         cursor = cursor.max(stored.id);
-                        bus.publish(stored_event_to_bus_event(stored));
+                        // A zero-subscriber publish is normal here (no SSE
+                        // client connected yet); the cursor still advances so
+                        // late subscribers do not receive stale history.
+                        let _ = bus.publish(stored_event_to_bus_event(stored));
                     }
                     drained
                 }

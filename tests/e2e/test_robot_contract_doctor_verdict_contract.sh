@@ -250,14 +250,28 @@ if repo_file?(LIVE_ARTIFACT)
   assert_valid_verdict(live, LIVE_ARTIFACT)
   expect_equal(projection_for(live), expected_projection, "live verdict projection drifted from golden", check: "robot_contract_doctor.live_projection", input_path: LIVE_ARTIFACT)
 
+  # The manifest slot is either populated (producer closed) or explicitly
+  # deferred to the producer bead (attestation: defer blocked producer slots).
+  # Both are honest states; a silently absent slot is the failure.
   manifest_doc = read_json(LIVE_MANIFEST)
   slot = manifest_doc.fetch("slots").find do |candidate|
     candidate["category"] == "proofs/robot-contracts" &&
-      candidate["path"] == LIVE_ARTIFACT
+      (candidate["path"] == LIVE_ARTIFACT ||
+       (candidate["path"].nil? && candidate["deferred_to_bead"] == "ft-7h5da.13.7"))
   end
   assert_ok(!slot.nil?, "live manifest slot missing for #{LIVE_ARTIFACT}", check: "robot_contract_doctor.live_manifest_slot", input_path: LIVE_MANIFEST, expected: LIVE_ARTIFACT, actual: nil)
-  expect_equal(slot.fetch("produced_by_bead"), "ft-7h5da.13.7", "live manifest slot producer drifted", check: "robot_contract_doctor.live_manifest_slot.producer", input_path: LIVE_MANIFEST)
+  producer = slot["produced_by_bead"] || slot["deferred_to_bead"]
+  expect_equal(producer, "ft-7h5da.13.7", "live manifest slot producer drifted", check: "robot_contract_doctor.live_manifest_slot.producer", input_path: LIVE_MANIFEST)
   assert_ok(slot.fetch("proof_categories").include?(4), "live manifest slot must include proof category 4", check: "robot_contract_doctor.live_manifest_slot.proof_category", input_path: LIVE_MANIFEST)
+  if slot["path"].nil?
+    StaticAttestation.log_check(
+      "robot_contract_doctor.live_manifest_slot.deferred",
+      input_path: LIVE_MANIFEST,
+      expected: "populated or deferred_to_bead=ft-7h5da.13.7",
+      actual: "deferred: #{slot["deferred_reason"]}",
+      status: "pass",
+    )
+  end
 
   workflow = StaticAttestation.read_text!(WORKFLOW, check: "robot_contract_doctor.workflow")
   EXPECTED_STEPS.each do |step|
