@@ -121222,11 +121222,8 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(plan_item.action, "append");
     }
 
-    #[cfg(unix)]
     #[test]
     fn apply_agent_config_preserves_backup_flag_on_write_error() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = unique_temp_dir("agent_config_write_error");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
@@ -121234,7 +121231,8 @@ printf x > "$MINISIGN_MARKER"
         std::fs::create_dir_all(&global_root).unwrap();
 
         let target = global_root.join(".cursorrules");
-        write_file(&target, "# existing cursor rules\n");
+        let original = "# existing cursor rules\n";
+        write_file(&target, original);
 
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "cursor".to_string(),
@@ -121248,11 +121246,13 @@ printf x > "$MINISIGN_MARKER"
 
         let prepared =
             prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
-        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
-        permissions.set_mode(0o444);
-        std::fs::set_permissions(&target, permissions).unwrap();
-
-        let err = apply_prepared_agent_config(&prepared).expect_err("write should fail");
+        let err = apply_prepared_agent_config_with_writer(&prepared, |_path, _bytes| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected final-write failure",
+            ))
+        })
+        .expect_err("injected final write should fail after backup publication");
         assert!(
             err.backup_created,
             "backup flag should survive write failure"
@@ -121262,13 +121262,31 @@ printf x > "$MINISIGN_MARKER"
             "unexpected error: {}",
             err.message
         );
+        let backups = std::fs::read_dir(&global_root)
+            .expect("enumerate backup directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(".cursorrules.") && name.ends_with(".bak")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "exactly one backup must be published");
+        assert_eq!(
+            std::fs::read(&backups[0]).expect("read published backup"),
+            original.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read unchanged target"),
+            original.as_bytes()
+        );
     }
 
-    #[cfg(unix)]
     #[test]
     fn dry_run_error_plan_marks_existing_file_when_target_is_unreadable() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = unique_temp_dir("agent_config_plan_error");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
@@ -121276,7 +121294,7 @@ printf x > "$MINISIGN_MARKER"
         std::fs::create_dir_all(&global_root).unwrap();
 
         let target = global_root.join(".cursorrules");
-        write_file(&target, "# existing cursor rules\n");
+        std::fs::write(&target, [0xff]).expect("write invalid UTF-8 config fixture");
 
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "cursor".to_string(),
@@ -121287,10 +121305,6 @@ printf x > "$MINISIGN_MARKER"
             binary_path: None,
             version: None,
         };
-
-        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
-        permissions.set_mode(0o000);
-        std::fs::set_permissions(&target, permissions).unwrap();
 
         let err = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
             .unwrap_err();
