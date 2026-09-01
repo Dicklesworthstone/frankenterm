@@ -29,7 +29,9 @@ PROJECTION = "fixtures/robot-contract-doctor/golden/verdict-projection.v1.json"
 INVALID = "fixtures/robot-contract-doctor/invalid/fragments.v1.json"
 LIVE_ARTIFACT = "docs/attestations/proofs/robot-contract-doctor.json"
 LIVE_MANIFEST = "docs/attestations/manifest.json"
-WORKFLOW = ".github/workflows/contract-families-matrix.yml"
+# Releases are DSR-only (AGENTS.md Rule 0.1): the verdict steps are wired in
+# the repo release-gate script, not a GitHub workflow (ft-xxfwy.16).
+WORKFLOW = "scripts/release-gates.sh"
 MATRIX = "docs/robot-contracts/contract-doctor-matrix.md"
 ORACLE = "scripts/check-contract-doctor-coverage.sh"
 

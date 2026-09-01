@@ -2022,12 +2022,13 @@ mod tests {
             );
         }
 
-        let workflow =
-            std::fs::read_to_string(root.join(".github/workflows/contract-families-matrix.yml"))
-                .expect("read Contract Doctor workflow");
-        assert!(workflow.contains("Robot/MCP Contract Doctor static verdict"));
-        assert!(workflow.contains("bash scripts/check-contract-doctor-coverage.sh"));
-        assert!(workflow.contains("docs/attestations/proofs/robot-contract-doctor.json"));
+        // Releases are DSR-only (AGENTS.md Rule 0.1); the static verdict is
+        // wired through the repo release-gate script, not a GitHub workflow.
+        let gates = std::fs::read_to_string(root.join("scripts/release-gates.sh"))
+            .expect("read release gate script");
+        assert!(gates.contains("Robot/MCP Contract Doctor static verdict"));
+        assert!(gates.contains("bash scripts/check-contract-doctor-coverage.sh"));
+        assert!(gates.contains("docs/attestations/proofs/robot-contract-doctor.json"));
     }
 
     // ---- E2E lifecycle ----

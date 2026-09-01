@@ -51,7 +51,9 @@ gate "lua api no promise block_on"               "bash scripts/check_lua_api_no_
 gate "mux interface imports"                     "scripts/check_mux_interface_imports.sh"
 gate "workspace cycles"                          "scripts/check_workspace_cycles.sh"
 gate "feature flag matrix"                       "bash scripts/check_feature_flag_matrix.sh"
-gate "release panic contract (profiles)"         "scripts/check-release-panic-contract.sh --profiles-only"
+gate "release panic contract (profiles)"         "bash scripts/check-release-panic-contract.sh --profiles-only"
+gate "windows/unix coupling ratchet"             "bash scripts/check_windows_unix_coupling.sh"
+gate "finish-line guards"                        "bash scripts/check_finish_line_guards.sh"
 gate "spec conventions"                          "scripts/check-spec-conventions.sh"
 # --- Generated artifacts and docs ------------------------------------------
 gate "generated artifacts"                       "scripts/check_generated_artifacts.sh"
@@ -64,7 +66,9 @@ gate "ftui tests"                                "scripts/check_ftui_tests.sh"
 gate "ftui docs"                                 "scripts/check_ftui_docs.sh"
 gate "reality-check bead structure"              "scripts/check-reality-check-bead-structure.sh"
 # --- Attestation and contract verifiers ------------------------------------
-gate "attestation manifest verify"               "scripts/attestation-verify.sh docs/attestations/manifest.json"
+# Verifies the newest bundle in docs/attestations/ (today only the unsigned
+# dev-channel bundle exists; the first signed release bundle is ft-xxfwy.15).
+gate "attestation bundle verify"                 "bash scripts/attestation-verify.sh \"\$(ls -t docs/attestations/[0-9]*.json | head -1)\""
 gate "deferred proof family integrity"           "tests/e2e/test_deferred_proof_family_integrity.sh"
 gate "deferred proof family conformance"         "tests/e2e/test_deferred_proof_family_conformance.sh"
 gate "deferred proof comment extractor contract" "tests/e2e/test_deferred_proof_comment_extractor_contract.sh"

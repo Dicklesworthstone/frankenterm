@@ -11,7 +11,7 @@
     "docs/robot-contracts/contract-doctor-matrix.md",
     "docs/robot-contracts/api-surface-coverage.md",
     "scripts/check-contract-doctor-coverage.sh",
-    ".github/workflows/contract-families-matrix.yml",
+    "scripts/release-gates.sh",
     "docs/attestations/manifest.json"
   ]
 }

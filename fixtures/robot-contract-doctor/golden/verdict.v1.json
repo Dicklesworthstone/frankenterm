@@ -26,7 +26,7 @@
     "does_not_mutate_panes_services_or_beads": true
   },
   "ci_verdict": {
-    "workflow": ".github/workflows/contract-families-matrix.yml",
+    "workflow": "scripts/release-gates.sh",
     "job": "matrix",
     "job_name": "Cross-family + Robot/MCP Contract Doctor verdict",
     "fail_closed_steps": [
@@ -97,7 +97,7 @@
       "role": "read-path redaction tracked-gap ledger"
     },
     {
-      "path": ".github/workflows/contract-families-matrix.yml",
+      "path": "scripts/release-gates.sh",
       "role": "single CI verdict wiring"
     }
   ]
