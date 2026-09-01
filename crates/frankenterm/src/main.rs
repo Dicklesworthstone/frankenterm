@@ -6419,6 +6419,19 @@ impl AtomicPathObjectMetadata {
             changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
+
+    fn equivalent_after_namespace_rename(&self, before: &Self) -> bool {
+        self.device == before.device
+            && self.inode == before.inode
+            && self.object_kind == before.object_kind
+            && self.mode == before.mode
+            && self.uid == before.uid
+            && self.gid == before.gid
+            && self.hard_link_count == before.hard_link_count
+            && self.byte_len == before.byte_len
+            && self.modified_seconds == before.modified_seconds
+            && self.modified_nanoseconds == before.modified_nanoseconds
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6428,6 +6441,16 @@ struct AtomicPathObjectIdentity {
     metadata: AtomicPathObjectMetadata,
     content_id: String,
     fully_sealed: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl AtomicPathObjectIdentity {
+    fn equivalent_after_namespace_rename(&self, before: &Self) -> bool {
+        self.metadata
+            .equivalent_after_namespace_rename(&before.metadata)
+            && self.content_id == before.content_id
+            && self.fully_sealed == before.fully_sealed
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6455,6 +6478,8 @@ struct AtomicPathTransitionAck {
     transaction_id: String,
     claim_sha256: String,
     outcome: String,
+    stage_after: Option<AtomicPathObjectIdentity>,
+    target_after: Option<AtomicPathObjectIdentity>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -118039,9 +118064,10 @@ printf x > "$MINISIGN_MARKER"
         #[test]
         fn build_profile_status_no_profile() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
+            let profiles_root = tmp.path().join("profiles");
 
             let profile = frankenterm_core::browser::BrowserProfile::new(
-                tmp.path(),
+                &profiles_root,
                 "nonexistent_service",
                 "nonexistent_account",
             );
@@ -118060,13 +118086,16 @@ printf x > "$MINISIGN_MARKER"
         #[test]
         fn build_profile_status_with_profile_dir() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
+            let profiles_root = tmp.path().join("profiles");
 
             let profile = frankenterm_core::browser::BrowserProfile::new(
-                tmp.path(),
+                &profiles_root,
                 "testservice",
                 "testaccount",
             );
-            let _ = profile.ensure_dir();
+            profile
+                .ensure_dir()
+                .expect("create private test profile directory");
 
             let status = build_profile_status(&profile);
             assert!(status.profile_exists);
@@ -118078,15 +118107,23 @@ printf x > "$MINISIGN_MARKER"
         #[test]
         fn build_profile_status_with_metadata() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
+            let profiles_root = tmp.path().join("profiles");
 
-            let profile =
-                frankenterm_core::browser::BrowserProfile::new(tmp.path(), "openai", "default");
-            let _ = profile.ensure_dir();
+            let profile = frankenterm_core::browser::BrowserProfile::new(
+                &profiles_root,
+                "openai",
+                "default",
+            );
+            profile
+                .ensure_dir()
+                .expect("create private metadata test profile directory");
 
             let mut metadata = frankenterm_core::browser::ProfileMetadata::new("openai", "default");
             metadata.record_bootstrap(frankenterm_core::browser::BootstrapMethod::Interactive);
             metadata.record_use();
-            let _ = profile.write_metadata(&metadata);
+            profile
+                .write_metadata(&metadata)
+                .expect("write valid profile metadata fixture");
 
             let status = build_profile_status(&profile);
             assert!(status.profile_exists);
@@ -118100,10 +118137,16 @@ printf x > "$MINISIGN_MARKER"
         #[test]
         fn build_profile_status_with_storage_state() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
+            let profiles_root = tmp.path().join("profiles");
 
-            let profile =
-                frankenterm_core::browser::BrowserProfile::new(tmp.path(), "openai", "default");
-            let _ = profile.ensure_dir();
+            let profile = frankenterm_core::browser::BrowserProfile::new(
+                &profiles_root,
+                "openai",
+                "default",
+            );
+            profile
+                .ensure_dir()
+                .expect("create private storage-state test profile directory");
             profile
                 .save_storage_state(br#"{"cookies":[],"origins":[]}"#)
                 .expect("valid bounded storage-state fixture");
@@ -118121,9 +118164,16 @@ printf x > "$MINISIGN_MARKER"
         #[test]
         fn classify_auth_profile_evidence_reaches_local_ready_from_a_real_bound_pair() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
-            let profile =
-                frankenterm_core::browser::BrowserProfile::try_new(tmp.path(), "openai", "default")
-                    .expect("valid profile identity");
+            let profiles_root = tmp.path().join("profiles");
+            let profile = frankenterm_core::browser::BrowserProfile::try_new(
+                &profiles_root,
+                "openai",
+                "default",
+            )
+            .expect("valid profile identity");
+            profile
+                .ensure_dir()
+                .expect("create private bound-pair profile directory");
             profile
                 .record_authenticated_state(
                     br#"{"cookies":[],"origins":[]}"#,
