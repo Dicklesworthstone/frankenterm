@@ -17288,9 +17288,7 @@ fn agent_config_outcome_label(outcome: AgentConfigTransactionOutcome) -> &'stati
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn agent_config_observation_is_safe_staged(
-    observation: &AgentConfigNamespaceObservation,
-) -> bool {
+fn agent_config_observation_is_safe_staged(observation: &AgentConfigNamespaceObservation) -> bool {
     matches!(observation.state.as_str(), "missing" | "regular_file")
 }
 
@@ -17457,7 +17455,7 @@ fn validate_agent_config_transaction_ack_semantics(
     if !ack.ack_file_synced
         || !ack.ack_parent_synced
         || ack.explicit_reconciliation_required
-        != (ack.outcome == AgentConfigTransactionOutcome::Indeterminate)
+            != (ack.outcome == AgentConfigTransactionOutcome::Indeterminate)
     {
         return false;
     }
@@ -17467,8 +17465,8 @@ fn validate_agent_config_transaction_ack_semantics(
     let target_after = agent_config_observation_matches_candidate(&ack.observed_target, claim);
     let candidate_after =
         agent_config_observation_matches_candidate(&ack.observed_candidate, claim);
-    let required_staging_milestones = ack.candidate_file_synced
-        && claim.before.is_none_or(|_| ack.backup_file_synced);
+    let required_staging_milestones =
+        ack.candidate_file_synced && claim.before.is_none_or(|_| ack.backup_file_synced);
     let completed_effect_milestones = required_staging_milestones && ack.effect_parent_synced;
     match claim.before.as_ref() {
         None => {
@@ -17487,9 +17485,7 @@ fn validate_agent_config_transaction_ack_semantics(
                             && agent_config_observation_is_safe_staged(&ack.observed_candidate)
                     }
                     AgentConfigTransactionOutcome::ConflictBeforeEffect => {
-                        required_staging_milestones
-                            && !ack.effect_parent_synced
-                            && candidate_after
+                        required_staging_milestones && !ack.effect_parent_synced && candidate_after
                     }
                     AgentConfigTransactionOutcome::ConflictRolledBack => false,
                     AgentConfigTransactionOutcome::Indeterminate => false,
@@ -17503,34 +17499,31 @@ fn validate_agent_config_transaction_ack_semantics(
             let backup_before =
                 agent_config_observation_matches_before(&ack.observed_backup, before);
             match ack.outcome {
-                    AgentConfigTransactionOutcome::Applied
-                    | AgentConfigTransactionOutcome::AlreadyApplied => {
-                        completed_effect_milestones
-                            && backup_before
-                            && target_after
-                            && candidate_before
-                    }
-                    AgentConfigTransactionOutcome::NoEffect => {
-                        !ack.effect_parent_synced
-                            && target_before
-                            && agent_config_observation_is_safe_staged(&ack.observed_candidate)
-                            && agent_config_observation_is_safe_staged(&ack.observed_backup)
-                    }
-                    AgentConfigTransactionOutcome::ConflictBeforeEffect => {
-                        required_staging_milestones
-                            && backup_before
-                            && !ack.effect_parent_synced
-                            && candidate_after
-                    }
-                    AgentConfigTransactionOutcome::ConflictRolledBack => {
-                        completed_effect_milestones
-                            && backup_before
-                            && !target_after
-                            && ack.observed_target.state != "missing"
-                            && candidate_after
-                    }
-                    AgentConfigTransactionOutcome::Indeterminate => false,
+                AgentConfigTransactionOutcome::Applied
+                | AgentConfigTransactionOutcome::AlreadyApplied => {
+                    completed_effect_milestones && backup_before && target_after && candidate_before
                 }
+                AgentConfigTransactionOutcome::NoEffect => {
+                    !ack.effect_parent_synced
+                        && target_before
+                        && agent_config_observation_is_safe_staged(&ack.observed_candidate)
+                        && agent_config_observation_is_safe_staged(&ack.observed_backup)
+                }
+                AgentConfigTransactionOutcome::ConflictBeforeEffect => {
+                    required_staging_milestones
+                        && backup_before
+                        && !ack.effect_parent_synced
+                        && candidate_after
+                }
+                AgentConfigTransactionOutcome::ConflictRolledBack => {
+                    completed_effect_milestones
+                        && backup_before
+                        && !target_after
+                        && ack.observed_target.state != "missing"
+                        && candidate_after
+                }
+                AgentConfigTransactionOutcome::Indeterminate => false,
+            }
         }
     }
 }
@@ -17685,8 +17678,13 @@ fn reconcile_agent_config_transactions_for_target(
                     transaction.id
                 ));
             }
-            let receipt =
-                agent_config_receipt(target_path, &transaction, &claim_sha256, &claim, &durable_ack);
+            let receipt = agent_config_receipt(
+                target_path,
+                &transaction,
+                &claim_sha256,
+                &claim,
+                &durable_ack,
+            );
             if receipt.explicit_reconciliation_required && !allow_indeterminate_receipts {
                 return Err(format!(
                     "Agent config transaction '{}' is indeterminate; explicit reconciliation is required.",
@@ -18205,41 +18203,41 @@ where
     let result = (|| -> std::result::Result<Option<PathBuf>, String> {
         use rustix::fs::{RenameFlags, renameat_with};
 
-    let target_leaf = agent_config_leaf(target_path)?;
-    verify_secure_named_agent_config(
-        parent,
-        &candidate.path,
-        &candidate.leaf,
-        &mut candidate.file,
-        candidate.identity,
-        candidate_bytes,
-        candidate.security,
-    )?;
-    let source_observation = if let Some(snapshot) = source.as_deref_mut() {
-        revalidate_open_agent_config_file(parent, target_path, snapshot)?;
-        Some(snapshot.observation)
-    } else {
-        revalidate_absent_agent_config(parent, target_path)?;
-        None
-    };
-    before_effect().map_err(|err| {
-        format!(
-            "Agent config publication hook failed for '{}': {err}",
-            target_path.display()
-        )
-    })?;
+        let target_leaf = agent_config_leaf(target_path)?;
+        verify_secure_named_agent_config(
+            parent,
+            &candidate.path,
+            &candidate.leaf,
+            &mut candidate.file,
+            candidate.identity,
+            candidate_bytes,
+            candidate.security,
+        )?;
+        let source_observation = if let Some(snapshot) = source.as_deref_mut() {
+            revalidate_open_agent_config_file(parent, target_path, snapshot)?;
+            Some(snapshot.observation)
+        } else {
+            revalidate_absent_agent_config(parent, target_path)?;
+            None
+        };
+        before_effect().map_err(|err| {
+            format!(
+                "Agent config publication hook failed for '{}': {err}",
+                target_path.display()
+            )
+        })?;
 
-    let parent_file = parent.file.try_clone().map_err(|err| {
-        format!(
-            "Failed to clone the pinned agent config parent descriptor '{}': {err}",
-            parent.path.display()
-        )
-    })?;
-    let flags = if source_observation.is_some() {
-        RenameFlags::EXCHANGE
-    } else {
-        RenameFlags::NOREPLACE
-    };
+        let parent_file = parent.file.try_clone().map_err(|err| {
+            format!(
+                "Failed to clone the pinned agent config parent descriptor '{}': {err}",
+                parent.path.display()
+            )
+        })?;
+        let flags = if source_observation.is_some() {
+            RenameFlags::EXCHANGE
+        } else {
+            RenameFlags::NOREPLACE
+        };
         if let Err(err) = renameat_with(
             &parent_file,
             &candidate.leaf,
@@ -18256,16 +18254,16 @@ where
             ));
         }
         effect_occurred = true;
-    parent_file.sync_all().map_err(|err| {
+        parent_file.sync_all().map_err(|err| {
         format!(
             "Agent config namespace changed but parent synchronization failed for '{}'; target and rollback evidence require reconciliation: {err}",
             target_path.display()
         )
     })?;
         effect_parent_synced = true;
-    parent.revalidate()?;
+        parent.revalidate()?;
 
-    verify_secure_named_agent_config(
+        verify_secure_named_agent_config(
         parent,
         target_path,
         &target_leaf,
@@ -18280,15 +18278,16 @@ where
         )
     })?;
 
-    let displaced_path = if let (Some(snapshot), Some(expected)) = (source, source_observation) {
-        let mut displaced = match read_open_agent_config_bytes(
-            parent,
-            &candidate.path,
-            &candidate.leaf,
-        ) {
-            Ok(displaced) => displaced,
-            Err(regular_error) => {
-                let symlink = capture_agent_config_symlink_evidence(
+        let displaced_path = if let (Some(snapshot), Some(expected)) = (source, source_observation)
+        {
+            let mut displaced = match read_open_agent_config_bytes(
+                parent,
+                &candidate.path,
+                &candidate.leaf,
+            ) {
+                Ok(displaced) => displaced,
+                Err(regular_error) => {
+                    let symlink = capture_agent_config_symlink_evidence(
                     parent,
                     &candidate.path,
                     &candidate.leaf,
@@ -18300,13 +18299,13 @@ where
                         candidate.path.display()
                     )
                 })?;
-                before_rollback().map_err(|err| {
+                    before_rollback().map_err(|err| {
                     format!(
                         "Atomic agent config publication for '{}' displaced an unexpected symlink, and rollback could not begin; outcome is indeterminate and reconciliation is required: {err}",
                         target_path.display()
                     )
                 })?;
-                verify_secure_named_agent_config(
+                    verify_secure_named_agent_config(
                     parent,
                     target_path,
                     &target_leaf,
@@ -18321,7 +18320,7 @@ where
                         target_path.display()
                     )
                 })?;
-                let symlink_revalidated = capture_agent_config_symlink_evidence(
+                    let symlink_revalidated = capture_agent_config_symlink_evidence(
                     parent,
                     &candidate.path,
                     &candidate.leaf,
@@ -18332,13 +18331,13 @@ where
                         target_path.display()
                     )
                 })?;
-                if symlink_revalidated != symlink {
-                    return Err(format!(
-                        "Atomic agent config symlink rollback evidence changed identity for '{}'; outcome is indeterminate and reconciliation is required.",
-                        target_path.display()
-                    ));
-                }
-                renameat_with(
+                    if symlink_revalidated != symlink {
+                        return Err(format!(
+                            "Atomic agent config symlink rollback evidence changed identity for '{}'; outcome is indeterminate and reconciliation is required.",
+                            target_path.display()
+                        ));
+                    }
+                    renameat_with(
                     &parent_file,
                     &candidate.leaf,
                     &parent_file,
@@ -18352,14 +18351,14 @@ where
                         std::io::Error::from(err)
                     )
                 })?;
-                parent_file.sync_all().map_err(|err| {
+                    parent_file.sync_all().map_err(|err| {
                     format!(
                         "Atomic agent config symlink rollback changed '{}' but parent synchronization failed; outcome is indeterminate and reconciliation is required: {err}",
                         target_path.display()
                     )
                 })?;
-                parent.revalidate()?;
-                let restored = capture_agent_config_symlink_evidence(
+                    parent.revalidate()?;
+                    let restored = capture_agent_config_symlink_evidence(
                     parent,
                     target_path,
                     &target_leaf,
@@ -18370,13 +18369,13 @@ where
                         target_path.display()
                     )
                 })?;
-                if restored != symlink {
-                    return Err(format!(
-                        "Atomic agent config symlink rollback restored conflicting bytes or identity at '{}'; outcome is indeterminate and reconciliation is required.",
-                        target_path.display()
-                    ));
-                }
-                verify_secure_named_agent_config(
+                    if restored != symlink {
+                        return Err(format!(
+                            "Atomic agent config symlink rollback restored conflicting bytes or identity at '{}'; outcome is indeterminate and reconciliation is required.",
+                            target_path.display()
+                        ));
+                    }
+                    verify_secure_named_agent_config(
                     parent,
                     &candidate.path,
                     &candidate.leaf,
@@ -18391,45 +18390,47 @@ where
                         candidate.path.display()
                     )
                 })?;
-                parent.revalidate()?;
-                rollback_completed = true;
-                return Err(format!(
-                    "Atomic agent config publication for '{}' was rolled back because a symlink replaced the target at the effect boundary; the symlink was restored exactly and the complete candidate is retained at '{}'.",
-                    target_path.display(),
-                    candidate.path.display()
-                ));
-            }
-        };
-        let source_security = snapshot.security.ok_or_else(|| {
+                    parent.revalidate()?;
+                    rollback_completed = true;
+                    return Err(format!(
+                        "Atomic agent config publication for '{}' was rolled back because a symlink replaced the target at the effect boundary; the symlink was restored exactly and the complete candidate is retained at '{}'.",
+                        target_path.display(),
+                        candidate.path.display()
+                    ));
+                }
+            };
+            let source_security = snapshot.security.ok_or_else(|| {
             format!(
                 "Agent config '{}' lost its authenticated source security snapshot during publication.",
                 target_path.display()
             )
         })?;
-        let displaced_bytes_and_metadata_match =
-            agent_config_observation_matches_across_namespace_move(displaced.observation, expected)
-                && displaced.bytes == snapshot.content.as_bytes();
-        let displaced_security_matches = displaced_bytes_and_metadata_match
-            && verify_secure_named_agent_config(
-                parent,
-                &candidate.path,
-                &candidate.leaf,
-                &mut displaced.file,
-                expected.identity,
-                snapshot.content.as_bytes(),
-                source_security,
-            )
-            .is_ok();
-        if displaced_security_matches {
-            Some(candidate.path.clone())
-        } else {
-            before_rollback().map_err(|err| {
+            let displaced_bytes_and_metadata_match =
+                agent_config_observation_matches_across_namespace_move(
+                    displaced.observation,
+                    expected,
+                ) && displaced.bytes == snapshot.content.as_bytes();
+            let displaced_security_matches = displaced_bytes_and_metadata_match
+                && verify_secure_named_agent_config(
+                    parent,
+                    &candidate.path,
+                    &candidate.leaf,
+                    &mut displaced.file,
+                    expected.identity,
+                    snapshot.content.as_bytes(),
+                    source_security,
+                )
+                .is_ok();
+            if displaced_security_matches {
+                Some(candidate.path.clone())
+            } else {
+                before_rollback().map_err(|err| {
                 format!(
                     "Atomic agent config publication for '{}' displaced an unexpected object, and rollback could not begin; outcome is indeterminate and reconciliation is required: {err}",
                     target_path.display()
                 )
             })?;
-            verify_secure_named_agent_config(
+                verify_secure_named_agent_config(
                 parent,
                 target_path,
                 &target_leaf,
@@ -18444,7 +18445,7 @@ where
                     target_path.display()
                 )
             })?;
-            verify_named_agent_config(
+                verify_named_agent_config(
                 parent,
                 &candidate.path,
                 &candidate.leaf,
@@ -18458,7 +18459,7 @@ where
                     target_path.display()
                 )
             })?;
-            renameat_with(
+                renameat_with(
                 &parent_file,
                 &candidate.leaf,
                 &parent_file,
@@ -18472,14 +18473,14 @@ where
                     std::io::Error::from(err)
                 )
             })?;
-            parent_file.sync_all().map_err(|err| {
+                parent_file.sync_all().map_err(|err| {
                 format!(
                     "Atomic agent config rollback changed '{}' but parent synchronization failed; outcome is indeterminate and reconciliation is required: {err}",
                     target_path.display()
                 )
             })?;
-            parent.revalidate()?;
-            verify_named_agent_config(
+                parent.revalidate()?;
+                verify_named_agent_config(
                 parent,
                 target_path,
                 &target_leaf,
@@ -18493,7 +18494,7 @@ where
                     target_path.display()
                 )
             })?;
-            verify_secure_named_agent_config(
+                verify_secure_named_agent_config(
                 parent,
                 &candidate.path,
                 &candidate.leaf,
@@ -18508,18 +18509,18 @@ where
                     candidate.path.display()
                 )
             })?;
-            parent.revalidate()?;
-            rollback_completed = true;
-            return Err(format!(
-                "Atomic agent config publication for '{}' was rolled back because the target changed at the effect boundary; the substituted target was restored exactly and the complete candidate is retained at '{}'.",
-                target_path.display(),
-                candidate.path.display()
-            ));
-        }
-    } else {
-        None
-    };
-    parent.revalidate()?;
+                parent.revalidate()?;
+                rollback_completed = true;
+                return Err(format!(
+                    "Atomic agent config publication for '{}' was rolled back because the target changed at the effect boundary; the substituted target was restored exactly and the complete candidate is retained at '{}'.",
+                    target_path.display(),
+                    candidate.path.display()
+                ));
+            }
+        } else {
+            None
+        };
+        parent.revalidate()?;
         Ok(displaced_path)
     })();
     result.map_err(|message| AgentConfigPublicationError {
@@ -18923,15 +18924,12 @@ where
                     &claim,
                 )
                 .unwrap_or(AgentConfigTransactionOutcome::Indeterminate);
-                let (recovery_outcome, effect_parent_synced) =
-                    match typed_publication_failure {
-                        Some((AgentConfigTransactionOutcome::NoEffect, _)) | None => {
-                            (classified_outcome, false)
-                        }
-                        Some((outcome, effect_parent_synced)) => {
-                            (outcome, effect_parent_synced)
-                        }
-                    };
+                let (recovery_outcome, effect_parent_synced) = match typed_publication_failure {
+                    Some((AgentConfigTransactionOutcome::NoEffect, _)) | None => {
+                        (classified_outcome, false)
+                    }
+                    Some((outcome, effect_parent_synced)) => (outcome, effect_parent_synced),
+                };
                 match write_agent_config_transaction_ack(
                     &parent,
                     &prepared.target_path,
@@ -125211,13 +125209,8 @@ printf x > "$MINISIGN_MARKER"
             };
             let claim_name =
                 agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
-            write_atomic_path_transition_json(
-                &parent.directory,
-                &parent.file,
-                &claim_name,
-                &claim,
-            )
-            .unwrap();
+            write_atomic_path_transition_json(&parent.directory, &parent.file, &claim_name, &claim)
+                .unwrap();
         }
         let backups_before = std::fs::read_dir(&workspace_root)
             .unwrap()
