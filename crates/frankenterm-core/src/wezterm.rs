@@ -9434,11 +9434,13 @@ fn compatibility_inputs_for_backend_selection(
 /// 4. If all pass, use vendored backend; else fall back to CLI.
 pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
     let vendored_enabled = cfg!(feature = "vendored");
-    let explicit_socket_found = explicit_mux_socket_path_is_usable(config);
-    // Socket discovery: use the shared resolver that checks config, env, AND
-    // canonical WezTerm unix-domain defaults (GH #48).
-    let socket_found = explicit_socket_found
-        || discover_mux_socket(config.vendored.mux_socket_path.as_deref()).is_some();
+    // Socket discovery: one ranked resolver covers the explicit config path,
+    // the environment, the socket a running FrankenTerm GUI publishes, and the
+    // headless mux-server defaults (GH #48, ft-xxfwy.5). The discovered path
+    // is handed to the direct client below so selection and dialing agree.
+    let discovered_socket =
+        discover_mux_socket_ranked(config.vendored.mux_socket_path.as_deref());
+    let socket_found = discovered_socket.is_some();
 
     // Build compatibility inputs depending on feature availability.
     let (allow_vendored, compat_message, compat_json) = if vendored_enabled {
@@ -9523,6 +9525,7 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
                 return UnifiedClient {
                     inner,
                     selection: shard_selection,
+                    mux_socket: discovered_socket,
                 };
             }
             Err(_err) => {
@@ -9542,7 +9545,15 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
 
     #[cfg(all(feature = "vendored", unix))]
     let client = if selection.kind == BackendKind::Vendored {
-        let mux = crate::vendored::DirectMuxClientConfig::from_wa_config(config);
+        let mut mux = crate::vendored::DirectMuxClientConfig::from_wa_config(config);
+        if mux.socket_path.is_none() {
+            // Dial the socket discovery actually found (typically the running
+            // GUI's) instead of letting the direct client fall back to the
+            // headless-server default and miss the app entirely.
+            mux.socket_path = discovered_socket
+                .as_ref()
+                .map(|socket| socket.path.clone());
+        }
         let pool = crate::pool::PoolConfig {
             max_size: config.vendored.mux_pool.max_connections.max(1),
             idle_timeout: std::time::Duration::from_secs(
@@ -9569,7 +9580,11 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
 
     let inner: WeztermHandle = Arc::new(client);
 
-    UnifiedClient { inner, selection }
+    UnifiedClient {
+        inner,
+        selection,
+        mux_socket: discovered_socket,
+    }
 }
 
 impl WeztermInterface for UnifiedClient {
