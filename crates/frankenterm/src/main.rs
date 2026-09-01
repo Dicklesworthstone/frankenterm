@@ -15290,6 +15290,7 @@ struct AgentConfigTransactionClaim {
 enum AgentConfigTransactionOutcome {
     Applied,
     AlreadyApplied,
+    NoEffect,
     ConflictBeforeEffect,
     ConflictRolledBack,
     Indeterminate,
@@ -17089,12 +17090,11 @@ fn build_agent_config_transaction_claim(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_agent_config_transaction_claim(
     parent: &AgentConfigParentDirectory,
-    target_leaf: &Path,
     transaction: &AgentConfigTransaction,
     claim: &AgentConfigTransactionClaim,
 ) -> std::result::Result<(), String> {
     transaction.validate_binding()?;
-    let expected_target = agent_config_leaf_string(target_leaf, "target leaf")?;
+    let claimed_target = agent_config_leaf_string(Path::new(&claim.target_leaf), "target leaf")?;
     let expected_candidate =
         agent_config_leaf_string(&transaction.candidate_leaf, "candidate leaf")?;
     let expected_backup = agent_config_leaf_string(&transaction.backup_leaf, "backup leaf")?;
@@ -17110,7 +17110,7 @@ fn validate_agent_config_transaction_claim(
         || claim.transaction_id != transaction.id
         || claim.parent_device != parent.identity.device
         || claim.parent_inode != parent.identity.inode
-        || claim.target_leaf != expected_target
+        || claim.target_leaf != claimed_target
         || claim.candidate_leaf != expected_candidate
         || !valid_hash(&claim.candidate_sha256)
         || claim
@@ -17118,6 +17118,7 @@ fn validate_agent_config_transaction_claim(
             .as_deref()
             .is_some_and(|hash| !valid_hash(hash))
         || !matches!(claim.action.as_str(), "create" | "append" | "replace")
+        || claim.requested_final_metadata.uid != nix::unistd::geteuid().as_raw()
         || claim.requested_final_metadata.mode & 0o7000 != 0
         || claim.durability_contract
             != "candidate_and_backup_fdatasync_plus_fsync;macos_regular_files_f_fullfsync;namespace_and_journal_parent_fsync"
@@ -17133,7 +17134,12 @@ fn validate_agent_config_transaction_claim(
             if claim.action != "create"
                 && backup_leaf == &expected_backup
                 && backup_sha256 == &before.sha256
-                && valid_hash(&before.sha256) => {}
+                && valid_hash(&before.sha256)
+                && before.metadata.object_kind == "regular_file"
+                && before.metadata.hard_link_count == 1
+                && before.metadata.uid == claim.requested_final_metadata.uid
+                && before.metadata.gid == claim.requested_final_metadata.gid
+                && before.metadata.mode & 0o7777 == claim.requested_final_metadata.mode => {}
         _ => {
             return Err(format!(
                 "Agent config transaction '{}' has inconsistent before/backup bindings.",
@@ -17150,6 +17156,8 @@ fn observe_agent_config_namespace_entry(
     path: &Path,
     leaf: &Path,
 ) -> std::result::Result<AgentConfigNamespaceObservation, String> {
+    use cap_fs_ext::MetadataExt as _;
+
     let metadata = match parent.directory.symlink_metadata(leaf) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -17228,10 +17236,18 @@ fn agent_config_outcome_label(outcome: AgentConfigTransactionOutcome) -> &'stati
     match outcome {
         AgentConfigTransactionOutcome::Applied => "applied",
         AgentConfigTransactionOutcome::AlreadyApplied => "already_applied",
+        AgentConfigTransactionOutcome::NoEffect => "no_effect",
         AgentConfigTransactionOutcome::ConflictBeforeEffect => "conflict_before_effect",
         AgentConfigTransactionOutcome::ConflictRolledBack => "conflict_rolled_back",
         AgentConfigTransactionOutcome::Indeterminate => "indeterminate",
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_observation_is_safe_staged(
+    observation: &AgentConfigNamespaceObservation,
+) -> bool {
+    matches!(observation.state.as_str(), "missing" | "regular_file")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -17294,7 +17310,11 @@ fn write_agent_config_transaction_ack(
         }
     };
     let explicit_reconciliation_required = outcome == AgentConfigTransactionOutcome::Indeterminate;
-    let ack = AgentConfigTransactionAck {
+    // An acknowledgement cannot truthfully assert that its own bytes and
+    // directory entry are durable before those operations happen. Persist the
+    // self-durability flags as false, then upgrade only the returned in-memory
+    // receipt after the create-new writer and an explicit parent sync succeed.
+    let persisted_ack = AgentConfigTransactionAck {
         schema_version: "ft.agent-config-transaction-ack.v1".to_string(),
         transaction_id: transaction.id.clone(),
         claim_sha256: claim_sha256.to_string(),
@@ -17305,21 +17325,26 @@ fn write_agent_config_transaction_ack(
         candidate_file_synced,
         backup_file_synced,
         effect_parent_synced,
-        ack_file_synced: true,
-        ack_parent_synced: true,
+        ack_file_synced: false,
+        ack_parent_synced: false,
         explicit_reconciliation_required,
     };
     let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf")?;
-    write_atomic_path_transition_json(&parent.directory, &parent.file, &ack_name, &ack).map_err(
-        |err| format!("Failed to publish durable agent config acknowledgement: {err:#}"),
-    )?;
+    write_atomic_path_transition_json(&parent.directory, &parent.file, &ack_name, &persisted_ack)
+        .map_err(|err| format!("Failed to publish durable agent config acknowledgement: {err:#}"))?;
+    sync_capability_directory(&parent.directory).map_err(|err| {
+        format!("Failed to synchronize the agent config acknowledgement directory: {err}")
+    })?;
     parent.revalidate()?;
+    let mut durable_ack = persisted_ack;
+    durable_ack.ack_file_synced = true;
+    durable_ack.ack_parent_synced = true;
     Ok(agent_config_receipt(
         target_path,
         transaction,
         claim_sha256,
         claim,
-        &ack,
+        &durable_ack,
     ))
 }
 
@@ -17343,8 +17368,10 @@ fn classify_unacknowledged_agent_config_transaction(
         None => {
             if target_after && candidate.state == "missing" {
                 Ok(AgentConfigTransactionOutcome::AlreadyApplied)
-            } else if target.state == "missing" && candidate_after {
-                Ok(AgentConfigTransactionOutcome::ConflictBeforeEffect)
+            } else if target.state == "missing"
+                && agent_config_observation_is_safe_staged(&candidate)
+            {
+                Ok(AgentConfigTransactionOutcome::NoEffect)
             } else {
                 Ok(AgentConfigTransactionOutcome::Indeterminate)
             }
@@ -17360,8 +17387,11 @@ fn classify_unacknowledged_agent_config_transaction(
             let backup_before = agent_config_observation_matches_before(&backup, before);
             if target_after && candidate_before && backup_before {
                 Ok(AgentConfigTransactionOutcome::AlreadyApplied)
-            } else if target_before && candidate_after && backup_before {
-                Ok(AgentConfigTransactionOutcome::ConflictBeforeEffect)
+            } else if target_before
+                && agent_config_observation_is_safe_staged(&candidate)
+                && agent_config_observation_is_safe_staged(&backup)
+            {
+                Ok(AgentConfigTransactionOutcome::NoEffect)
             } else {
                 Ok(AgentConfigTransactionOutcome::Indeterminate)
             }
@@ -17374,7 +17404,9 @@ fn validate_agent_config_transaction_ack_semantics(
     claim: &AgentConfigTransactionClaim,
     ack: &AgentConfigTransactionAck,
 ) -> bool {
-    if ack.explicit_reconciliation_required
+    if !ack.ack_file_synced
+        || !ack.ack_parent_synced
+        || ack.explicit_reconciliation_required
         != (ack.outcome == AgentConfigTransactionOutcome::Indeterminate)
     {
         return false;
@@ -17385,6 +17417,9 @@ fn validate_agent_config_transaction_ack_semantics(
     let target_after = agent_config_observation_matches_candidate(&ack.observed_target, claim);
     let candidate_after =
         agent_config_observation_matches_candidate(&ack.observed_candidate, claim);
+    let required_staging_milestones = ack.candidate_file_synced
+        && claim.before.is_none_or(|_| ack.backup_file_synced);
+    let completed_effect_milestones = required_staging_milestones && ack.effect_parent_synced;
     match claim.before.as_ref() {
         None => {
             let backup_missing = ack.observed_backup.state == "missing";
@@ -17392,12 +17427,22 @@ fn validate_agent_config_transaction_ack_semantics(
                 && match ack.outcome {
                     AgentConfigTransactionOutcome::Applied
                     | AgentConfigTransactionOutcome::AlreadyApplied => {
-                        target_after && ack.observed_candidate.state == "missing"
+                        completed_effect_milestones
+                            && target_after
+                            && ack.observed_candidate.state == "missing"
                     }
-                    AgentConfigTransactionOutcome::ConflictBeforeEffect
-                    | AgentConfigTransactionOutcome::ConflictRolledBack => {
-                        ack.observed_target.state == "missing" && candidate_after
+                    AgentConfigTransactionOutcome::NoEffect => {
+                        !ack.effect_parent_synced
+                            && ack.observed_target.state == "missing"
+                            && agent_config_observation_is_safe_staged(&ack.observed_candidate)
                     }
+                    AgentConfigTransactionOutcome::ConflictBeforeEffect => {
+                        required_staging_milestones
+                            && !ack.effect_parent_synced
+                            && ack.observed_target.state != "missing"
+                            && candidate_after
+                    }
+                    AgentConfigTransactionOutcome::ConflictRolledBack => false,
                     AgentConfigTransactionOutcome::Indeterminate => false,
                 }
         }
@@ -17412,11 +17457,25 @@ fn validate_agent_config_transaction_ack_semantics(
                 && match ack.outcome {
                     AgentConfigTransactionOutcome::Applied
                     | AgentConfigTransactionOutcome::AlreadyApplied => {
-                        target_after && candidate_before
+                        completed_effect_milestones && target_after && candidate_before
                     }
-                    AgentConfigTransactionOutcome::ConflictBeforeEffect
-                    | AgentConfigTransactionOutcome::ConflictRolledBack => {
-                        target_before && candidate_after
+                    AgentConfigTransactionOutcome::NoEffect => {
+                        !ack.effect_parent_synced
+                            && target_before
+                            && agent_config_observation_is_safe_staged(&ack.observed_candidate)
+                            && agent_config_observation_is_safe_staged(&ack.observed_backup)
+                    }
+                    AgentConfigTransactionOutcome::ConflictBeforeEffect => {
+                        required_staging_milestones
+                            && !ack.effect_parent_synced
+                            && target_before
+                            && candidate_after
+                    }
+                    AgentConfigTransactionOutcome::ConflictRolledBack => {
+                        completed_effect_milestones
+                            && !target_after
+                            && ack.observed_target.state != "missing"
+                            && candidate_after
                     }
                     AgentConfigTransactionOutcome::Indeterminate => false,
                 }
