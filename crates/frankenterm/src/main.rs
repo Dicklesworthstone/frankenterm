@@ -15260,6 +15260,14 @@ impl AgentConfigTransaction {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct AgentConfigClaimFileIdentity {
+    metadata: AtomicPathObjectMetadata,
+    sha256: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct AgentConfigTransactionClaim {
     schema_version: String,
     transaction_id: String,
@@ -15267,7 +15275,7 @@ struct AgentConfigTransactionClaim {
     parent_inode: u64,
     target_leaf: String,
     action: String,
-    before: Option<AtomicPathObjectIdentity>,
+    before: Option<AgentConfigClaimFileIdentity>,
     candidate_leaf: String,
     candidate_sha256: String,
     backup_leaf: Option<String>,
@@ -16378,7 +16386,7 @@ struct AgentConfigApplyError {
 #[derive(Debug)]
 struct AppliedAgentConfig {
     result: frankenterm_core::robot_types::AgentConfigureResultItem,
-    transaction: Option<AgentConfigTransactionReceipt>,
+    transactions: Vec<AgentConfigTransactionReceipt>,
 }
 
 impl std::ops::Deref for AppliedAgentConfig {
@@ -16967,17 +16975,20 @@ fn agent_config_transaction_inventory(
         }
     }
     for (transaction_id, family) in &families {
-        if family.pending_claim || family.pending_ack {
+        if family.claim && family.pending_claim || family.ack && family.pending_ack {
             return Err(format!(
-                "Agent config transaction '{transaction_id}' has an interrupted journal publication; explicit reconciliation is required."
+                "Agent config transaction '{transaction_id}' has both pending and published journal identities; explicit reconciliation is required."
             ));
         }
-        if !family.claim && (family.candidate || family.backup || family.ack) {
+        if !family.claim
+            && !family.pending_claim
+            && (family.candidate || family.backup || family.ack || family.pending_ack)
+        {
             return Err(format!(
                 "Agent config transaction '{transaction_id}' has an artifact without its immutable claim; explicit reconciliation is required."
             ));
         }
-        if family.ack && !family.claim {
+        if (family.ack || family.pending_ack) && !family.claim && !family.pending_claim {
             return Err(format!(
                 "Agent config transaction '{transaction_id}' has an acknowledgement without its immutable claim; explicit reconciliation is required."
             ));
@@ -16992,7 +17003,7 @@ fn agent_config_transaction_inventory(
     }
     inventory.claim_ids = families
         .into_iter()
-        .filter_map(|(id, family)| family.claim.then_some(id))
+        .filter_map(|(id, family)| (family.claim || family.pending_claim).then_some(id))
         .collect();
     Ok(inventory)
 }
@@ -17007,15 +17018,14 @@ fn agent_config_sha256(bytes: &[u8]) -> String {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn agent_config_snapshot_identity(
     snapshot: &OpenAgentConfigFile,
-) -> std::result::Result<AtomicPathObjectIdentity, String> {
+) -> std::result::Result<AgentConfigClaimFileIdentity, String> {
     let metadata = snapshot.file.metadata().map_err(|err| {
         format!("Failed to inspect authenticated agent config for its durable claim: {err}")
     })?;
-    Ok(AtomicPathObjectIdentity {
+    Ok(AgentConfigClaimFileIdentity {
         metadata: AtomicPathObjectMetadata::from_cap_metadata(&metadata)
             .map_err(|err| format!("Failed to encode agent config claim metadata: {err:#}"))?,
-        content_id: agent_config_sha256(snapshot.content.as_bytes()),
-        fully_sealed: true,
+        sha256: agent_config_sha256(snapshot.content.as_bytes()),
     })
 }
 
@@ -17050,14 +17060,13 @@ fn build_agent_config_transaction_claim(
 ) -> std::result::Result<AgentConfigTransactionClaim, String> {
     transaction.validate_binding()?;
     let target_leaf = agent_config_leaf_string(&agent_config_leaf(target_path)?, "target leaf")?;
-    let candidate_leaf =
-        agent_config_leaf_string(&transaction.candidate_leaf, "candidate leaf")?;
+    let candidate_leaf = agent_config_leaf_string(&transaction.candidate_leaf, "candidate leaf")?;
     let backup_leaf = current
         .is_some()
         .then(|| agent_config_leaf_string(&transaction.backup_leaf, "backup leaf"))
         .transpose()?;
     let before = current.map(agent_config_snapshot_identity).transpose()?;
-    let backup_sha256 = before.as_ref().map(|identity| identity.content_id.clone());
+    let backup_sha256 = before.as_ref().map(|identity| identity.sha256.clone());
     Ok(AgentConfigTransactionClaim {
         schema_version: "ft.agent-config-transaction-claim.v1".to_string(),
         transaction_id: transaction.id.clone(),
@@ -17090,9 +17099,12 @@ fn validate_agent_config_transaction_claim(
         agent_config_leaf_string(&transaction.candidate_leaf, "candidate leaf")?;
     let expected_backup = agent_config_leaf_string(&transaction.backup_leaf, "backup leaf")?;
     let valid_hash = |value: &str| {
-        value
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+        value.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
     };
     if claim.schema_version != "ft.agent-config-transaction-claim.v1"
         || claim.transaction_id != transaction.id
@@ -17120,9 +17132,8 @@ fn validate_agent_config_transaction_claim(
         (Some(before), Some(backup_leaf), Some(backup_sha256))
             if claim.action != "create"
                 && backup_leaf == &expected_backup
-                && backup_sha256 == &before.content_id
-                && before.fully_sealed
-                && valid_hash(&before.content_id) => {}
+                && backup_sha256 == &before.sha256
+                && valid_hash(&before.sha256) => {}
         _ => {
             return Err(format!(
                 "Agent config transaction '{}' has inconsistent before/backup bindings.",
@@ -17187,10 +17198,10 @@ fn observe_agent_config_namespace_entry(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn agent_config_observation_matches_before(
     observation: &AgentConfigNamespaceObservation,
-    before: &AtomicPathObjectIdentity,
+    before: &AgentConfigClaimFileIdentity,
 ) -> bool {
     observation.state == "regular_file"
-        && observation.sha256.as_deref() == Some(before.content_id.as_str())
+        && observation.sha256.as_deref() == Some(before.sha256.as_str())
         && observation
             .metadata
             .as_ref()
@@ -17263,11 +17274,7 @@ fn write_agent_config_transaction_ack(
     effect_parent_synced: bool,
 ) -> std::result::Result<AgentConfigTransactionReceipt, String> {
     let target_leaf = agent_config_leaf(target_path)?;
-    let observed_target = observe_agent_config_namespace_entry(
-        parent,
-        target_path,
-        &target_leaf,
-    )?;
+    let observed_target = observe_agent_config_namespace_entry(parent, target_path, &target_leaf)?;
     let observed_candidate = observe_agent_config_namespace_entry(
         parent,
         &parent.path.join(&transaction.candidate_leaf),
@@ -17303,8 +17310,9 @@ fn write_agent_config_transaction_ack(
         explicit_reconciliation_required,
     };
     let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf")?;
-    write_atomic_path_transition_json(&parent.directory, &parent.file, &ack_name, &ack)
-        .map_err(|err| format!("Failed to publish durable agent config acknowledgement: {err:#}"))?;
+    write_atomic_path_transition_json(&parent.directory, &parent.file, &ack_name, &ack).map_err(
+        |err| format!("Failed to publish durable agent config acknowledgement: {err:#}"),
+    )?;
     parent.revalidate()?;
     Ok(agent_config_receipt(
         target_path,
@@ -17352,8 +17360,7 @@ fn classify_unacknowledged_agent_config_transaction(
             let backup_before = agent_config_observation_matches_before(&backup, before);
             if target_after && candidate_before && backup_before {
                 Ok(AgentConfigTransactionOutcome::AlreadyApplied)
-            } else if target_before && candidate_after && backup_before
-            {
+            } else if target_before && candidate_after && backup_before {
                 Ok(AgentConfigTransactionOutcome::ConflictBeforeEffect)
             } else {
                 Ok(AgentConfigTransactionOutcome::Indeterminate)
@@ -17430,12 +17437,39 @@ fn reconcile_agent_config_transactions_for_target(
     for id in ids {
         let transaction = AgentConfigTransaction::from_id(id)?;
         let claim_name = agent_config_leaf_string(&transaction.claim_leaf, "claim leaf")?;
-        let Some((claim, claim_bytes)) = read_atomic_path_transition_json::<
-            AgentConfigTransactionClaim,
-        >(&parent.directory, &claim_name)
-        .map_err(|err| format!("Failed to read retained agent config claim: {err:#}"))?
-        else {
-            return Err("A retained agent config claim disappeared during reconciliation.".to_string());
+        let published_claim = read_atomic_path_transition_json::<AgentConfigTransactionClaim>(
+            &parent.directory,
+            &claim_name,
+        )
+        .map_err(|err| format!("Failed to read retained agent config claim: {err:#}"))?;
+        let (claim, claim_bytes) = if let Some(published) = published_claim {
+            published
+        } else {
+            let pending_name = format!("{claim_name}{AGENT_CONFIG_PENDING_SUFFIX}");
+            let Some((pending_claim, pending_bytes)) =
+                read_atomic_path_transition_json::<AgentConfigTransactionClaim>(
+                    &parent.directory,
+                    &pending_name,
+                )
+                .map_err(|err| {
+                    format!("Failed to read interrupted agent config claim: {err:#}")
+                })?
+            else {
+                return Err(
+                    "A retained agent config claim disappeared during reconciliation."
+                        .to_string(),
+                );
+            };
+            write_atomic_path_transition_json(
+                &parent.directory,
+                &parent.file,
+                &claim_name,
+                &pending_claim,
+            )
+            .map_err(|err| {
+                format!("Failed to finish interrupted agent config claim publication: {err:#}")
+            })?;
+            (pending_claim, pending_bytes)
         };
         if claim.target_leaf != target_leaf_string {
             continue;
@@ -17446,12 +17480,40 @@ fn reconcile_agent_config_transactions_for_target(
             .unwrap_or_default()
             .to_string();
         let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf")?;
-        if let Some((ack, _)) = read_atomic_path_transition_json::<AgentConfigTransactionAck>(
+        let published_ack = read_atomic_path_transition_json::<AgentConfigTransactionAck>(
             &parent.directory,
             &ack_name,
         )
-        .map_err(|err| format!("Failed to read retained agent config acknowledgement: {err:#}"))?
-        {
+        .map_err(|err| format!("Failed to read retained agent config acknowledgement: {err:#}"))?;
+        let recovered_ack = if let Some(published) = published_ack {
+            Some(published)
+        } else {
+            let pending_name = format!("{ack_name}{AGENT_CONFIG_PENDING_SUFFIX}");
+            let pending = read_atomic_path_transition_json::<AgentConfigTransactionAck>(
+                &parent.directory,
+                &pending_name,
+            )
+            .map_err(|err| {
+                format!("Failed to read interrupted agent config acknowledgement: {err:#}")
+            })?;
+            if let Some((pending_ack, pending_bytes)) = pending {
+                write_atomic_path_transition_json(
+                    &parent.directory,
+                    &parent.file,
+                    &ack_name,
+                    &pending_ack,
+                )
+                .map_err(|err| {
+                    format!(
+                        "Failed to finish interrupted agent config acknowledgement publication: {err:#}"
+                    )
+                })?;
+                Some((pending_ack, pending_bytes))
+            } else {
+                None
+            }
+        };
+        if let Some((ack, _)) = recovered_ack {
             if ack.schema_version != "ft.agent-config-transaction-ack.v1"
                 || ack.transaction_id != transaction.id
                 || ack.claim_sha256 != claim_sha256
@@ -17464,13 +17526,8 @@ fn reconcile_agent_config_transactions_for_target(
                     transaction.id
                 ));
             }
-            let receipt = agent_config_receipt(
-                target_path,
-                &transaction,
-                &claim_sha256,
-                &claim,
-                &ack,
-            );
+            let receipt =
+                agent_config_receipt(target_path, &transaction, &claim_sha256, &claim, &ack);
             if receipt.explicit_reconciliation_required {
                 return Err(format!(
                     "Agent config transaction '{}' is indeterminate; explicit reconciliation is required.",
@@ -18378,14 +18435,15 @@ where
             }
         })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let _reconciled_transactions = reconcile_agent_config_transactions_for_target(
-        &parent,
-        &prepared.target_path,
-    )
-    .map_err(|message| AgentConfigApplyError {
-        message,
-        backup_created: false,
-    })?;
+    let mut reconciled_transactions =
+        reconcile_agent_config_transactions_for_target(&parent, &prepared.target_path).map_err(
+            |message| AgentConfigApplyError {
+                message,
+                backup_created: false,
+            },
+        )?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut reconciled_transactions = Vec::new();
     let mut current = read_open_agent_config_file(
         &parent,
         &prepared.target_path,
@@ -18421,7 +18479,7 @@ where
                 backup_created: false,
                 error: None,
             },
-            transaction: None,
+            transactions: reconciled_transactions,
         });
     }
 
@@ -18520,26 +18578,23 @@ where
         backup_created: false,
     })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let claim_name = agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").map_err(
-        |message| AgentConfigApplyError {
-            message,
-            backup_created: false,
-        },
-    )?;
+    let claim_name =
+        agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").map_err(|message| {
+            AgentConfigApplyError {
+                message,
+                backup_created: false,
+            }
+        })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let claim_bytes = write_atomic_path_transition_json(
-        &parent.directory,
-        &parent.file,
-        &claim_name,
-        &claim,
-    )
-    .map_err(|err| AgentConfigApplyError {
-        message: format!(
-            "Failed to durably publish immutable agent config claim for '{}': {err:#}",
-            prepared.target_path.display()
-        ),
-        backup_created: false,
-    })?;
+    let claim_bytes =
+        write_atomic_path_transition_json(&parent.directory, &parent.file, &claim_name, &claim)
+            .map_err(|err| AgentConfigApplyError {
+                message: format!(
+                    "Failed to durably publish immutable agent config claim for '{}': {err:#}",
+                    prepared.target_path.display()
+                ),
+                backup_created: false,
+            })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let claim_sha256 = agent_config_sha256(&claim_bytes)
         .strip_prefix("sha256:")
@@ -18552,79 +18607,81 @@ where
             backup_created: false,
         })?;
     let publication = (|| -> std::result::Result<bool, AgentConfigApplyError> {
-    // Reserve the bounded, private, empty candidate slot before publishing a
-    // backup. A full candidate inventory therefore cannot create one backup on
-    // every rejected retry, and no candidate bytes exist before the exact
-    // source backup is durable.
-    let mut candidate = create_agent_config_candidate(&parent, source_security, &transaction)
-        .map_err(|message| AgentConfigApplyError {
+        // Reserve the bounded, private, empty candidate slot before publishing a
+        // backup. A full candidate inventory therefore cannot create one backup on
+        // every rejected retry, and no candidate bytes exist before the exact
+        // source backup is durable.
+        let mut candidate = create_agent_config_candidate(&parent, source_security, &transaction)
+            .map_err(|message| AgentConfigApplyError {
             message,
             backup_created: false,
         })?;
 
-    let backup_created = if let Some(snapshot) = current.as_mut() {
-        revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
-            |message| AgentConfigApplyError {
-                message,
-                backup_created: false,
-            },
-        )?;
-        let _backup_path =
-            create_agent_config_backup(&parent, &prepared.target_path, snapshot, &transaction)?;
-        revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
-            |message| AgentConfigApplyError {
-                message,
-                backup_created: true,
-            },
-        )?;
-        true
-    } else {
-        revalidate_absent_agent_config(&parent, &prepared.target_path).map_err(|message| {
+        let backup_created = if let Some(snapshot) = current.as_mut() {
+            revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
+                |message| AgentConfigApplyError {
+                    message,
+                    backup_created: false,
+                },
+            )?;
+            let _backup_path =
+                create_agent_config_backup(&parent, &prepared.target_path, snapshot, &transaction)?;
+            revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
+                |message| AgentConfigApplyError {
+                    message,
+                    backup_created: true,
+                },
+            )?;
+            true
+        } else {
+            revalidate_absent_agent_config(&parent, &prepared.target_path).map_err(|message| {
+                AgentConfigApplyError {
+                    message,
+                    backup_created: false,
+                }
+            })?;
+            false
+        };
+        write_final(&mut candidate.file, merged.as_bytes()).map_err(|err| {
             AgentConfigApplyError {
-                message,
-                backup_created: false,
+                message: format!(
+                    "Failed to write same-directory candidate '{}' for '{}': {err}",
+                    candidate.path.display(),
+                    prepared.target_path.display()
+                ),
+                backup_created,
             }
         })?;
-        false
-    };
-    write_final(&mut candidate.file, merged.as_bytes()).map_err(|err| AgentConfigApplyError {
-        message: format!(
-            "Failed to write same-directory candidate '{}' for '{}': {err}",
-            candidate.path.display(),
-            prepared.target_path.display()
-        ),
-        backup_created,
-    })?;
-    finalize_agent_config_candidate(&parent, &mut candidate, merged.as_bytes()).map_err(
-        |message| AgentConfigApplyError {
-            message,
-            backup_created,
-        },
-    )?;
-    parent.file.sync_all().map_err(|err| AgentConfigApplyError {
+        finalize_agent_config_candidate(&parent, &mut candidate, merged.as_bytes()).map_err(
+            |message| AgentConfigApplyError {
+                message,
+                backup_created,
+            },
+        )?;
+        parent.file.sync_all().map_err(|err| AgentConfigApplyError {
         message: format!(
             "Agent config candidate '{}' is complete but its parent directory could not be synchronized before publication: {err}",
             candidate.path.display()
         ),
         backup_created,
     })?;
-    parent
-        .revalidate()
+        parent
+            .revalidate()
+            .map_err(|message| AgentConfigApplyError {
+                message,
+                backup_created,
+            })?;
+        let _displaced_path = publish_agent_config_candidate(
+            &parent,
+            &prepared.target_path,
+            &mut candidate,
+            merged.as_bytes(),
+            current.as_mut(),
+        )
         .map_err(|message| AgentConfigApplyError {
             message,
             backup_created,
         })?;
-    let _displaced_path = publish_agent_config_candidate(
-        &parent,
-        &prepared.target_path,
-        &mut candidate,
-        merged.as_bytes(),
-        current.as_mut(),
-    )
-    .map_err(|message| AgentConfigApplyError {
-        message,
-        backup_created,
-    })?;
         Ok(backup_created)
     })();
     let backup_created = match publication {
@@ -18698,7 +18755,10 @@ where
             backup_created,
             error: None,
         },
-        transaction: Some(transaction_receipt),
+        transactions: {
+            reconciled_transactions.push(transaction_receipt);
+            reconciled_transactions
+        },
     })
 }
 
@@ -56477,9 +56537,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                                 backup_created = result.backup_created,
                                                                 "applied agent config action"
                                                             );
-                                                            if let Some(receipt) = result.transaction {
-                                                                transactions.push(receipt);
-                                                            }
+                                                            transactions.extend(result.transactions);
                                                             results.push(result.result);
                                                         }
                                                         Err(err) => {
@@ -56526,14 +56584,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         }
 
                                         let data = AgentConfigureDataWithTransactions {
-                                            base: frankenterm_core::robot_types::AgentConfigureData {
-                                                total: results.len(),
-                                                created,
-                                                updated,
-                                                skipped,
-                                                errors,
-                                                results,
-                                            },
+                                            base:
+                                                frankenterm_core::robot_types::AgentConfigureData {
+                                                    total: results.len(),
+                                                    created,
+                                                    updated,
+                                                    skipped,
+                                                    errors,
+                                                    results,
+                                                },
                                             transactions,
                                         };
                                         let elapsed = elapsed_ms(start);
