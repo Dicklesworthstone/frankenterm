@@ -103162,11 +103162,11 @@ recorder_backend = "rusqlite"
             let over_range_result = distributed_persist_payload(
                 sender,
                 None,
-                frankenterm_core::wire_protocol::WirePayload::Gap(
-                    frankenterm_core::wire_protocol::GapNotice {
-                        pane_id: source_pane_id,
-                        seq_before: 0,
-                        seq_after: u64::MAX,
+                    frankenterm_core::wire_protocol::WirePayload::Gap(
+                        frankenterm_core::wire_protocol::GapNotice {
+                            pane_id: source_pane_id,
+                            seq_before: 0,
+                            seq_after: i64::MAX as u64,
                         reason: "forged-overflow".to_string(),
                         detected_at_ms: now_ms(),
                     },
@@ -103905,7 +103905,7 @@ recorder_backend = "rusqlite"
                 assert_eq!(pane_gaps.len(), 1);
                 assert_eq!(
                     pane_gaps.first().map(|gap| gap.reason.as_str()),
-                    Some("distributed_gap:forged-high-gap:0:18446744073709551615")
+                    Some("distributed_gap:forged-high-gap:0:9223372036854775807")
                 );
 
                 let segments = storage_handle
@@ -105258,6 +105258,29 @@ recorder_backend = "rusqlite"
                     .expect("flush envelope writes");
                 distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
+
+                frankenterm_core::runtime_async::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                            if storage_handle
+                                .get_pane(remote_pane_id)
+                                .await
+                                .expect("poll canonical remote pane")
+                                .is_some()
+                            {
+                                break;
+                            }
+                            frankenterm_core::runtime_async::sleep(
+                                std::time::Duration::from_millis(10),
+                            )
+                            .await;
+                        }
+                    },
+                )
+                .await
+                .expect("listener should persist the canonical pane within its bounded deadline");
 
                 {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
