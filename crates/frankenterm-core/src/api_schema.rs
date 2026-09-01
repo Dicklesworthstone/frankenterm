@@ -784,8 +784,20 @@ mod tests {
 
     #[test]
     fn current_version_parses() {
+        // `ApiVersion` carries only the semver core; pre-release (`-rc.1`)
+        // and build metadata (`+sha`) are intentionally dropped by `parse`,
+        // so compare against the core of the crate version, not the whole
+        // string (release-candidate builds otherwise fail this test).
         let v = ApiVersion::current();
-        assert_eq!(v.to_string(), crate::VERSION);
+        let core = crate::VERSION
+            .split(['-', '+'])
+            .next()
+            .unwrap_or(crate::VERSION);
+        assert_eq!(v.to_string(), core);
+        assert_eq!(
+            ApiVersion::parse("0.15.2-rc.1+build.7").map(|v| v.to_string()),
+            Some("0.15.2".to_string())
+        );
     }
 
     #[test]
