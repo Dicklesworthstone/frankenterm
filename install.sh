@@ -21,14 +21,14 @@
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --no-verify        Skip optional Sigstore verification (SHA-256 remains required)
+#   --no-verify        Skip DSR minisign verification (SHA-256 remains required)
 #   --offline TARBALL  Skip network entirely; install from local tarball
 #   --force            Force reinstall even if same version is installed
 #   --help             Show this message
 #
 # Environment overrides:
 #   VERSION, OWNER, REPO, DEST, APP_DEST, ARTIFACT_URL, CHECKSUM, CHECKSUM_URL,
-#   SIGSTORE_BUNDLE_URL, COSIGN_IDENTITY_RE, COSIGN_OIDC_ISSUER,
+#   MINISIGN_SIGNATURE_URL,
 #   HTTP_PROXY, HTTPS_PROXY
 #
 set -euo pipefail
@@ -65,21 +65,25 @@ VERIFY=0
 WITH_FONT=0
 FROM_SOURCE=0
 NO_GUM=0
-NO_SIGSTORE=0
+NO_MINISIGN=0
 FORCE_INSTALL=0
 # macOS GUI app (.app) install. -1 = auto (on for darwin-arm64 prebuilt
 # installs), 0 = disabled (--no-app), 1 = forced (--with-app). APP_DEST
 # overrides the install directory (default /Applications, fallback
 # ~/Applications when /Applications isn't writable). APP_ASSET is the
-# published bundle archive; APP_INSTALLED_PATH is set on success for the
-# final summary box.
+# published bundle archive; APP_INSTALLED_PATH and APP_ACTIVATION_STATE report
+# the exact current-or-pending app authority in the final summary box.
 INSTALL_APP=-1
 APP_DEST="${APP_DEST:-}"
 APP_ASSET="FrankenTerm-darwin-arm64.app.tar.xz"
 APP_INSTALLED_PATH=""
-ACTIVE_PROCESS_FAMILY_MANIFEST=""
-ACTIVE_PROCESS_FAMILY_VERIFIER=""
-ACTIVE_ATOMIC_TRANSITION_HELPER=""
+APP_ACTIVATION_STATE=""
+APP_RECEIPT_REQUESTED="false"
+APP_RECEIPT_RESULT="not_requested"
+APP_RECEIPT_REASON="not_selected"
+APP_RECEIPT_MANIFEST_ID=""
+APP_RECEIPT_CANDIDATE_PATH=""
+APP_RECEIPT_READINESS="not_run"
 PENDING_PROCESS_FAMILY_GENERATION=""
 PUBLISHED_PROCESS_FAMILY_VERSION=""
 PUBLISHED_PROCESS_FAMILY_ROOT=""
@@ -94,9 +98,9 @@ FONT_INSTALLED_PATH=""
 OFFLINE_TARBALL=""
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
-SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/release.yml@refs/tags/.*$}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+MINISIGN_SIGNATURE_URL="${MINISIGN_SIGNATURE_URL:-}"
+APP_MINISIGN_SIGNATURE_URL="${APP_MINISIGN_SIGNATURE_URL:-}"
+MINISIGN_PUBLIC_KEY="RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/ft-install.lock"
 HARDCODED_FALLBACK_VERSION="v0.2.0"
@@ -262,9 +266,9 @@ detect_platform() {
   # FrankenTerm release assets are named ft-{os}-{arch}.tar.xz where:
   #   arch ∈ {amd64, arm64}   — NOT Rust triples
   #   os   ∈ {linux, darwin}
-  # See .github/workflows/release.yml asset names.
+  # Keep these names identical to the DSR release contract.
   ASSET=""
-  TARGET="" # informational only — matches release.yml matrix target
+  TARGET="" # informational only — matches the DSR build target
   case "${OS}-${ARCH}" in
     linux-x86_64)    ASSET="ft-linux-amd64.tar.xz";  TARGET="x86_64-unknown-linux-gnu"  ;;
     linux-aarch64)   ASSET="ft-linux-arm64.tar.xz";  TARGET="aarch64-unknown-linux-gnu" ;;
@@ -1574,9 +1578,6 @@ install_process_family() {
   local metadata manifest_id build_id source_revision version target profile feature_contract inventory_bytes
   local generation_id generation stage stage_name helper="$ft_source" stage_id txid
 
-  ACTIVE_PROCESS_FAMILY_MANIFEST=""
-  ACTIVE_PROCESS_FAMILY_VERIFIER=""
-  ACTIVE_ATOMIC_TRANSITION_HELPER=""
   PENDING_PROCESS_FAMILY_GENERATION=""
   PUBLISHED_PROCESS_FAMILY_VERSION=""
   PUBLISHED_PROCESS_FAMILY_ROOT=""
@@ -1745,9 +1746,6 @@ install_process_family() {
       stable_entrypoint_is_managed "$name" || return 1
       cmp "$DEST/$name" "$generation/$name" >/dev/null 2>&1 || return 1
     done
-    ACTIVE_PROCESS_FAMILY_MANIFEST="$generation/process-family.component-manifest.json"
-    ACTIVE_PROCESS_FAMILY_VERIFIER="$verifier_source"
-    ACTIVE_ATOMIC_TRANSITION_HELPER="$DEST/ft"
     PROCESS_FAMILY_ACTIVATION_STATE="current"
     PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
     PROCESS_FAMILY_ACTIVE_ROOT="$generation"
@@ -1843,6 +1841,75 @@ print("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=" + json.dumps(
     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
 ))
 PY
+}
+
+emit_app_receipt() {
+  python3 - "$APP_RECEIPT_REQUESTED" "$APP_RECEIPT_RESULT" \
+    "$APP_RECEIPT_REASON" "$APP_RECEIPT_MANIFEST_ID" \
+    "$APP_RECEIPT_CANDIDATE_PATH" "$APP_RECEIPT_READINESS" \
+    "${APP_ACTIVATION_STATE:-none}" <<'PY'
+import json, os, re, sys
+
+requested, result, reason, manifest_id, candidate_path, readiness, activation = sys.argv[1:]
+if requested not in ("true", "false"):
+    raise SystemExit("app receipt has an invalid requested flag")
+if result not in ("not_requested", "skipped", "verified"):
+    raise SystemExit("app receipt has an invalid result")
+if re.fullmatch(r"[a-z0-9_]+", reason) is None:
+    raise SystemExit("app receipt has an invalid reason")
+if readiness not in ("not_run", "running", "failed", "passed", "existing_manifest_verified"):
+    raise SystemExit("app receipt has an invalid readiness state")
+if activation not in ("none", "pending", "current"):
+    raise SystemExit("app receipt has an invalid activation state")
+if manifest_id and re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_id) is None:
+    raise SystemExit("app receipt has an invalid manifest identity")
+if candidate_path:
+    candidate_path = os.path.abspath(candidate_path)
+if result == "verified":
+    if not manifest_id or not candidate_path or activation not in ("pending", "current"):
+        raise SystemExit("verified app receipt lacks candidate authority")
+elif activation != "none":
+    raise SystemExit("non-verified app receipt claims active authority")
+if result == "not_requested" and requested != "false":
+    raise SystemExit("not-requested app receipt claims a request")
+payload = {
+    "activation": activation,
+    "candidate_path": candidate_path or None,
+    "manifest_id": manifest_id or None,
+    "readiness": readiness,
+    "reason": reason,
+    "requested": requested == "true",
+    "result": result,
+    "schema_version": "frankenterm.install.app-receipt.v1",
+}
+print("FT_INSTALL_APP_RECEIPT_V1=" + json.dumps(
+    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+))
+PY
+}
+
+mark_app_not_selected() {
+  local reason="$1"
+  APP_RECEIPT_REQUESTED="false"
+  APP_RECEIPT_RESULT="not_requested"
+  APP_RECEIPT_REASON="$reason"
+  APP_RECEIPT_MANIFEST_ID=""
+  APP_RECEIPT_CANDIDATE_PATH=""
+  APP_RECEIPT_READINESS="not_run"
+  APP_ACTIVATION_STATE="none"
+}
+
+mark_app_skipped() {
+  local reason="$1"
+  APP_RECEIPT_RESULT="skipped"
+  APP_RECEIPT_REASON="$reason"
+  APP_ACTIVATION_STATE="none"
+}
+
+finalize_app_receipt_state() {
+  if [ "$APP_RECEIPT_RESULT" = in_progress ]; then
+    mark_app_skipped app_install_incomplete
+  fi
 }
 
 check_write_permissions() {
@@ -1947,7 +2014,7 @@ maybe_add_path() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Checksum + Sigstore verification
+# Checksum + DSR minisign verification
 # ───────────────────────────────────────────────────────────────────────────
 verify_checksum() {
   local file="$1" expected="$2" proof="" actual="" identity=""
@@ -3319,46 +3386,49 @@ finally:
 PY
 }
 
-verify_sigstore_bundle() {
+verify_minisign_signature() {
   local file="$1" artifact_url="$2" expected_identity="${3:-$VERIFIED_ARCHIVE_IDENTITY}"
-  local cosign_path cosign_timeout=120
-  if ! command -v cosign &>/dev/null; then
-    warn "cosign not found; skipping signature verification"
-    warn "Install cosign for stronger authenticity checks: https://docs.sigstore.dev/cosign/installation/"
-    return 0
+  local signature_override="${4:-}"
+  local signature_source="${5:-}"
+  local minisign_path minisign_timeout=120 signature_url signature_file
+  if ! command -v minisign >/dev/null 2>&1; then
+    err "minisign is required to verify DSR release artifacts"
+    return 1
   fi
-  # Per-binary sigstore bundles aren't published yet for FrankenTerm
-  # (the v0.2.0 release ships only a bundle-level sigstore at
-  # 0.2.0.sigstore which signs the attestation JSON, not each tarball).
-  # If/when per-asset bundles ship, the URL convention will be
-  # ${artifact_url}.sigstore.json — match that and verify; otherwise skip.
-  local bundle_url="$SIGSTORE_BUNDLE_URL"
-  [ -z "$bundle_url" ] && bundle_url="${artifact_url}.sigstore.json"
-  local bundle_file
-  bundle_file="$TMP/$(basename "$bundle_url")"
-  if ! download_https_bounded "$bundle_url" "$bundle_file" 16777216 30 2>/dev/null; then
-    warn "Sigstore bundle not found at $bundle_url; skipping signature verification"
-    return 0
+  signature_url="$signature_override"
+  signature_file="$TMP/$(basename "$file").minisig"
+  if [ -n "$signature_source" ]; then
+    if ! ensure_exact_staged_file "$signature_source" "$signature_file" 0400; then
+      err "Required offline DSR minisign signature is unsafe or unreadable: $signature_source"
+      return 1
+    fi
+  else
+    [ -z "$signature_url" ] && signature_url="${artifact_url}.minisig"
+    if [ -z "$artifact_url" ] || \
+       ! download_https_bounded "$signature_url" "$signature_file" 65536 30 2>/dev/null; then
+      err "Required DSR minisign signature not found at $signature_url"
+      return 1
+    fi
   fi
   [ -n "$expected_identity" ] || {
-    err "Sigstore verification lacks the checksum-authenticated archive identity"
+    err "Minisign verification lacks the checksum-authenticated archive identity"
     return 1
   }
-  cosign_path=$(command -v cosign) || return 1
+  minisign_path=$(command -v minisign) || return 1
   if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] &&
       [ "${FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES:-0}" = 1 ] &&
-      [ -n "${FT_INSTALL_TEST_COSIGN_TIMEOUT_SECONDS:-}" ]; then
-    cosign_timeout="$FT_INSTALL_TEST_COSIGN_TIMEOUT_SECONDS"
+      [ -n "${FT_INSTALL_TEST_MINISIGN_TIMEOUT_SECONDS:-}" ]; then
+    minisign_timeout="$FT_INSTALL_TEST_MINISIGN_TIMEOUT_SECONDS"
   fi
-  [[ "$cosign_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
-  # Both inputs reach cosign through inherited descriptors. Reopening either
+  [[ "$minisign_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
+  # Both inputs reach minisign through inherited descriptors. Reopening either
   # pathname would let a same-UID replacement make the checksum, signature,
   # and extractor authenticate different bytes.
-  if ! python3 - "$file" "$expected_identity" "$bundle_file" "$cosign_path" \
-      "$COSIGN_IDENTITY_RE" "$COSIGN_OIDC_ISSUER" "$cosign_timeout" <<'PY'
+  if ! python3 - "$file" "$expected_identity" "$signature_file" "$minisign_path" \
+      "$MINISIGN_PUBLIC_KEY" "$minisign_timeout" <<'PY'
 import os, resource, signal, stat, subprocess, sys
 
-archive_path, expected_raw, bundle_path, cosign, identity, issuer, timeout_text = sys.argv[1:]
+archive_path, expected_raw, signature_path, minisign, public_key, timeout_text = sys.argv[1:]
 timeout_seconds = int(timeout_text)
 try:
     expected = tuple(int(value) for value in expected_raw.split(":"))
@@ -3368,14 +3438,14 @@ if len(expected) != 5 or ":".join(str(value) for value in expected) != expected_
     raise SystemExit("checksum-authenticated archive identity is non-canonical")
 
 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-archive_fd = bundle_fd = -1
+archive_fd = signature_fd = -1
 try:
     archive_fd = os.open(archive_path, flags)
-    bundle_fd = os.open(bundle_path, flags)
+    signature_fd = os.open(signature_path, flags)
     archive_before = os.fstat(archive_fd)
-    bundle_before = os.fstat(bundle_fd)
+    signature_before = os.fstat(signature_fd)
     archive_named = os.stat(archive_path, follow_symlinks=False)
-    bundle_named = os.stat(bundle_path, follow_symlinks=False)
+    signature_named = os.stat(signature_path, follow_symlinks=False)
     archive_observed = (
         archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
         archive_before.st_mtime_ns, archive_before.st_ctime_ns,
@@ -3384,17 +3454,17 @@ try:
             archive_observed != expected or
             (archive_before.st_dev, archive_before.st_ino) !=
             (archive_named.st_dev, archive_named.st_ino)):
-        raise SystemExit("Sigstore archive is not the checksum-authenticated inode")
-    if (not stat.S_ISREG(bundle_before.st_mode) or bundle_before.st_nlink != 1 or
-            bundle_before.st_size > 16 * 1024 * 1024 or
-            (bundle_before.st_dev, bundle_before.st_ino) !=
-            (bundle_named.st_dev, bundle_named.st_ino)):
-        raise SystemExit("Sigstore bundle is not one bounded single-link regular file")
+        raise SystemExit("minisign archive is not the checksum-authenticated inode")
+    if (not stat.S_ISREG(signature_before.st_mode) or signature_before.st_nlink != 1 or
+            signature_before.st_size > 64 * 1024 or
+            (signature_before.st_dev, signature_before.st_ino) !=
+            (signature_named.st_dev, signature_named.st_ino)):
+        raise SystemExit("minisign signature is not one bounded single-link regular file")
 
     archive_descriptor = f"/dev/fd/{archive_fd}"
-    bundle_descriptor = f"/dev/fd/{bundle_fd}"
-    if not os.path.exists(archive_descriptor) or not os.path.exists(bundle_descriptor):
-        raise SystemExit("descriptor-backed Sigstore verification is unavailable")
+    signature_descriptor = f"/dev/fd/{signature_fd}"
+    if not os.path.exists(archive_descriptor) or not os.path.exists(signature_descriptor):
+        raise SystemExit("descriptor-backed minisign verification is unavailable")
 
     def constrain_verifier_child():
         def finite_limit(resource_id, maximum, minimum):
@@ -3420,15 +3490,14 @@ try:
     try:
         verifier = subprocess.Popen(
             [
-                cosign, "verify-blob", "--bundle", bundle_descriptor,
-                "--certificate-identity-regexp", identity,
-                "--certificate-oidc-issuer", issuer, archive_descriptor,
+                minisign, "-Vm", archive_descriptor, "-x", signature_descriptor,
+                "-P", public_key,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
-            pass_fds=(archive_fd, bundle_fd),
+            pass_fds=(archive_fd, signature_fd),
             preexec_fn=constrain_verifier_child,
             start_new_session=True,
         )
@@ -3441,7 +3510,7 @@ try:
                 pass
             verifier.wait()
             raise SystemExit(
-                "Sigstore verifier exceeded its finite wall-clock bound"
+                "minisign verifier exceeded its finite wall-clock bound"
             ) from error
     except (OSError, subprocess.SubprocessError) as error:
         if verifier is not None and verifier.poll() is None:
@@ -3451,39 +3520,57 @@ try:
                 pass
             verifier.wait()
         raise SystemExit(
-            "Sigstore verifier could not establish its child resource contract"
+            "minisign verifier could not establish its child resource contract"
         ) from error
     archive_after = os.fstat(archive_fd)
-    bundle_after = os.fstat(bundle_fd)
+    signature_after = os.fstat(signature_fd)
     archive_named_after = os.stat(archive_path, follow_symlinks=False)
-    bundle_named_after = os.stat(bundle_path, follow_symlinks=False)
+    signature_named_after = os.stat(signature_path, follow_symlinks=False)
     if archive_observed != (
             archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
             archive_after.st_mtime_ns, archive_after.st_ctime_ns,
     ) or (archive_after.st_dev, archive_after.st_ino) != (
             archive_named_after.st_dev, archive_named_after.st_ino,
     ):
-        raise SystemExit("checksum-authenticated archive changed during Sigstore verification")
-    if (bundle_before.st_dev, bundle_before.st_ino, bundle_before.st_size,
-        bundle_before.st_mtime_ns, bundle_before.st_ctime_ns) != (
-            bundle_after.st_dev, bundle_after.st_ino, bundle_after.st_size,
-            bundle_after.st_mtime_ns, bundle_after.st_ctime_ns,
-    ) or (bundle_after.st_dev, bundle_after.st_ino) != (
-            bundle_named_after.st_dev, bundle_named_after.st_ino,
+        raise SystemExit("checksum-authenticated archive changed during minisign verification")
+    if (signature_before.st_dev, signature_before.st_ino, signature_before.st_size,
+        signature_before.st_mtime_ns, signature_before.st_ctime_ns) != (
+            signature_after.st_dev, signature_after.st_ino, signature_after.st_size,
+            signature_after.st_mtime_ns, signature_after.st_ctime_ns,
+    ) or (signature_after.st_dev, signature_after.st_ino) != (
+            signature_named_after.st_dev, signature_named_after.st_ino,
     ):
-        raise SystemExit("Sigstore bundle changed during verification")
+        raise SystemExit("minisign signature changed during verification")
     raise SystemExit(returncode)
 finally:
-    if bundle_fd >= 0:
-        os.close(bundle_fd)
+    if signature_fd >= 0:
+        os.close(signature_fd)
     if archive_fd >= 0:
         os.close(archive_fd)
 PY
   then
     return 1
   fi
-  ok "Signature verified (cosign)"
+  ok "Signature verified (DSR minisign key 69B3955C8D2E62A8)"
   return 0
+}
+
+require_release_minisign() {
+  if [ "$FROM_SOURCE" -eq 1 ] || [ "$NO_MINISIGN" -eq 1 ]; then
+    return 0
+  fi
+  if command -v minisign >/dev/null 2>&1; then
+    return 0
+  fi
+  err "Required tool not found: minisign"
+  err "DSR release verification is mandatory before any release artifact download."
+  err "Install minisign via your package manager:"
+  err "  macOS:        brew install minisign"
+  err "  Debian/Ubuntu: sudo apt-get install -y minisign"
+  err "  RHEL/Fedora:   sudo dnf install -y minisign"
+  err "  Alpine:        sudo apk add minisign"
+  err "Use --no-verify only for an explicitly trusted local test artifact; SHA-256 remains mandatory."
+  return 1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3676,26 +3763,60 @@ install_pragmasevka() {
 # ───────────────────────────────────────────────────────────────────────────
 should_install_app() {
   # Explicit opt-out always wins.
-  [ "$INSTALL_APP" -eq 0 ] && return 1
+  if [ "$INSTALL_APP" -eq 0 ]; then
+    mark_app_not_selected explicit_opt_out
+    return 1
+  fi
   # GUI app is macOS-only.
   if [ "${OS:-}" != "darwin" ]; then
-    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored: the FrankenTerm GUI app is macOS-only"
+    if [ "$INSTALL_APP" -eq 1 ]; then
+      APP_RECEIPT_REQUESTED="true"
+      mark_app_skipped unsupported_platform
+      warn "--with-app ignored: the FrankenTerm GUI app is macOS-only"
+    else
+      mark_app_not_selected automatic_platform_exclusion
+    fi
     return 1
   fi
   # Only the arm64 prebuilt bundle is published.
   if [ "${ARCH:-}" != "aarch64" ]; then
-    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored: no prebuilt FrankenTerm.app for ${OS}/${ARCH}; build it with scripts/create-macos-bundle.sh"
+    if [ "$INSTALL_APP" -eq 1 ]; then
+      APP_RECEIPT_REQUESTED="true"
+      mark_app_skipped unsupported_architecture
+      warn "--with-app ignored: no prebuilt FrankenTerm.app for ${OS}/${ARCH}; build it with scripts/create-macos-bundle.sh"
+    else
+      mark_app_not_selected automatic_architecture_exclusion
+    fi
     return 1
   fi
   # Source builds and offline mode have no published .app to fetch.
   if [ "$FROM_SOURCE" -eq 1 ]; then
-    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored for source builds; run scripts/create-macos-bundle.sh after building"
+    if [ "$INSTALL_APP" -eq 1 ]; then
+      APP_RECEIPT_REQUESTED="true"
+      mark_app_skipped source_build_has_no_app_asset
+      warn "--with-app ignored for source builds; run scripts/create-macos-bundle.sh after building"
+    else
+      mark_app_not_selected automatic_source_build_exclusion
+    fi
     return 1
   fi
   if [ -n "$OFFLINE_TARBALL" ]; then
-    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored in --offline mode (no network for the .app asset)"
+    if [ "$INSTALL_APP" -eq 1 ]; then
+      APP_RECEIPT_REQUESTED="true"
+      mark_app_skipped offline_mode_has_no_app_asset
+      warn "--with-app ignored in --offline mode (no network for the .app asset)"
+    else
+      mark_app_not_selected automatic_offline_exclusion
+    fi
     return 1
   fi
+  APP_RECEIPT_REQUESTED="true"
+  APP_RECEIPT_RESULT="in_progress"
+  APP_RECEIPT_REASON="selected"
+  APP_RECEIPT_MANIFEST_ID=""
+  APP_RECEIPT_CANDIDATE_PATH=""
+  APP_RECEIPT_READINESS="not_run"
+  APP_ACTIVATION_STATE="none"
   return 0
 }
 
@@ -3706,13 +3827,26 @@ install_macos_app() {
   local app_inventory_bytes _family_manifest_id family_build family_source family_version
   local family_target family_profile family_features family_inventory_bytes
   local stage_id target_id txid operation retained_manifest manifest_store manifest_stage
+  local family_manifest family_verifier transition_helper
   app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
 
-  [ -n "$ACTIVE_PROCESS_FAMILY_MANIFEST" ] && [ -n "$ACTIVE_PROCESS_FAMILY_VERIFIER" ] && \
-    [ -n "$ACTIVE_ATOMIC_TRANSITION_HELPER" ] || {
-      warn "No externally authenticated installed process-family authority is available; skipping GUI app"
-      return 0
-    }
+  # Bind the app to the externally authenticated generation published by this
+  # exact installer transaction, not only to the pre-existing live selector.
+  # Fresh installs and upgrades intentionally leave that candidate pending, so
+  # requiring ACTIVE_* here would silently skip app staging on every safe
+  # non-activating path.
+  family_manifest="$PUBLISHED_PROCESS_FAMILY_ROOT/process-family.component-manifest.json"
+  family_verifier="$PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY"
+  transition_helper="$PUBLISHED_PROCESS_FAMILY_ROOT/ft"
+  if [ -z "$PUBLISHED_PROCESS_FAMILY_ROOT" ] || \
+     [ -z "$PUBLISHED_PROCESS_FAMILY_VERSION" ] || \
+     [ -z "$family_verifier" ] || [ ! -x "$transition_helper" ] || \
+     ! verify_canonical_generation "$PUBLISHED_PROCESS_FAMILY_ROOT" \
+       "$PUBLISHED_PROCESS_FAMILY_VERSION" "$family_verifier"; then
+    warn "No externally authenticated published process-family authority is available; skipping GUI app"
+    mark_app_skipped published_family_authority_unavailable
+    return 0
+  fi
 
   # Atomic rename authority is descriptor-pinned and refuses group/world
   # writable parents. Prefer /Applications only when this process owns that
@@ -3733,6 +3867,7 @@ PY
   fi
   if ! mkdir -p "$dest" 2>/dev/null; then
     warn "Could not create app destination $dest; skipping GUI app install"
+    mark_app_skipped destination_creation_failed
     return 0
   fi
   if ! python3 - "$dest" <<'PY'
@@ -3744,12 +3879,14 @@ if (not stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode) or
 PY
   then
     warn "App destination cannot provide descriptor-pinned atomic authority: $dest"
+    mark_app_skipped unsafe_destination_authority
     return 0
   fi
   if ! require_transfer_capacity "$TMP" "$dest" \
       "$MAX_APP_ARCHIVE_BYTES" "$MAX_APP_EXPANDED_BYTES" \
       "FrankenTerm.app"; then
     warn "Insufficient bounded capacity for FrankenTerm.app; skipping GUI app install"
+    mark_app_skipped insufficient_destination_capacity
     return 0
   fi
 
@@ -3759,12 +3896,13 @@ PY
       download_https_bounded "$app_url" "$tmp_app_tar" \
         "$MAX_APP_ARCHIVE_BYTES" 300 1; then
     warn "FrankenTerm.app asset not found at $app_url; skipping GUI app install"
+    mark_app_skipped app_asset_download_failed
     return 0
   fi
 
   # The detached manifest and verifier are meaningful only when rooted in the
-  # externally fetched release archive checksum. Optional Sigstore verification
-  # may be disabled, but SHA-256 authentication is never bypassed.
+  # externally fetched release archive checksum. DSR minisign verification may
+  # be explicitly disabled, but SHA-256 authentication is never bypassed.
   local app_sum=""
   if download_https_bounded "${app_url}.sha256" "$TMP/app.sha256" 4096 30 \
       2>/dev/null; then
@@ -3772,9 +3910,20 @@ PY
   fi
   if [ -z "$app_sum" ] || ! verify_checksum "$tmp_app_tar" "$app_sum"; then
     warn "FrankenTerm.app checksum is absent or invalid; skipping GUI app install"
+    mark_app_skipped app_checksum_invalid
     return 0
   fi
   app_archive_identity="$VERIFIED_ARCHIVE_IDENTITY"
+  if [ "$NO_MINISIGN" -eq 0 ]; then
+    if ! verify_minisign_signature "$tmp_app_tar" "$app_url" \
+        "$app_archive_identity" "$APP_MINISIGN_SIGNATURE_URL"; then
+      warn "FrankenTerm.app DSR minisign verification failed; live app authority is unchanged"
+      mark_app_skipped app_minisign_invalid
+      return 0
+    fi
+  else
+    warn "FrankenTerm.app DSR minisign verification skipped (--no-verify); SHA-256 was still verified"
+  fi
 
   # Validate the complete archive namespace before extracting into a new
   # private directory. No member may traverse out of the two expected roots or
@@ -3782,41 +3931,54 @@ PY
   # forbidden. This makes the outer checksum an authority over exact bytes,
   # not permission to let tar interpret an attacker-controlled namespace.
   extraction_root="$TMP/app-package"
-  mkdir -m 0700 "$extraction_root" || return 0
+  mkdir -m 0700 "$extraction_root" || {
+    mark_app_skipped extraction_root_creation_failed
+    return 0
+  }
   if ! extract_authenticated_archive "$tmp_app_tar" "$extraction_root" app \
       FrankenTerm.app.component-manifest.json "$app_archive_identity"
   then
     warn "FrankenTerm.app archive namespace failed validation; skipping GUI app install"
+    mark_app_skipped app_archive_invalid
     return 0
   fi
   extracted_app="$extraction_root/FrankenTerm.app"
   app_manifest="$extraction_root/FrankenTerm.app.component-manifest.json"
   [ -d "$extracted_app" ] && [ ! -L "$extracted_app" ] && \
-    [ -f "$app_manifest" ] && [ ! -L "$app_manifest" ] || return 0
+    [ -f "$app_manifest" ] && [ ! -L "$app_manifest" ] || {
+    mark_app_skipped app_archive_incomplete
+    return 0
+  }
 
   # The verifier authority comes from the independently checksummed standalone
   # package. It re-hashes the complete app tree, including the app's shipped
   # verifier, and then the two detached manifests must bind one exact release.
-  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+  bash "$family_verifier" verify \
     --root "$extracted_app" --manifest "$app_manifest" >/dev/null || {
-      warn "Detached app component verification failed; skipping GUI app install"
-      return 0
+    warn "Detached app component verification failed; skipping GUI app install"
+    mark_app_skipped app_component_verification_failed
+    return 0
     }
   app_metadata=$(process_family_manifest_metadata "$app_manifest" app) || return 0
-  standalone_metadata=$(process_family_manifest_metadata "$ACTIVE_PROCESS_FAMILY_MANIFEST" triplet) || return 0
+  standalone_metadata=$(process_family_manifest_metadata "$family_manifest" triplet) || return 0
   IFS=$'\t' read -r app_manifest_id app_build app_source app_version app_target app_profile app_features app_inventory_bytes <<<"$app_metadata"
   IFS=$'\t' read -r _family_manifest_id family_build family_source family_version family_target family_profile family_features family_inventory_bytes <<<"$standalone_metadata"
   [[ "$app_inventory_bytes" =~ ^[0-9]+$ ]] && \
     [[ "$family_inventory_bytes" =~ ^[0-9]+$ ]] || return 0
   [ "$app_build" = "$family_build" ] && [ "$app_source" = "$family_source" ] && \
     [ "$app_version" = "$family_version" ] && [ "$app_target" = "$family_target" ] && \
-    [ "$app_profile" = "$family_profile" ] && [ "$app_features" = "$family_features" ] && \
+  [ "$app_profile" = "$family_profile" ] && [ "$app_features" = "$family_features" ] && \
     [ "$app_features" = application-family-gui-ft-mux-server-pty-guardian-default-features-v1 ] || {
       warn "FrankenTerm.app identity does not match the installed standalone process family"
+      mark_app_skipped app_family_identity_mismatch
       return 0
     }
   app_id="${app_manifest_id#sha256:}"
-  [[ "$app_id" =~ ^[0-9a-f]{64}$ ]] || return 0
+  [[ "$app_id" =~ ^[0-9a-f]{64}$ ]] || {
+    mark_app_skipped invalid_app_manifest_identity
+    return 0
+  }
+  APP_RECEIPT_MANIFEST_ID="$app_manifest_id"
 
   manifest_store="$dest/.frankenterm-app-manifests"
   mkdir -p "$manifest_store" || return 0
@@ -3829,10 +3991,10 @@ PY
     manifest_stage="$manifest_store/.manifest-$app_id.installing"
     ensure_exact_staged_file "$app_manifest" "$manifest_stage" 0444 || return 0
     fsync_installer_tree "$manifest_store" || return 0
-    stage_id=$(atomic_path_content_id "$ACTIVE_ATOMIC_TRANSITION_HELPER" \
+    stage_id=$(atomic_path_content_id "$transition_helper" \
       "$manifest_store" "$(basename "$manifest_stage")") || return 0
     txid=$(atomic_transition_txid "app-manifest:$dest:$app_id") || return 0
-    atomic_path_transition "$ACTIVE_ATOMIC_TRANSITION_HELPER" "$manifest_store" \
+    atomic_path_transition "$transition_helper" "$manifest_store" \
       "$(basename "$manifest_stage")" "$app_id.json" "$txid" "$stage_id" missing \
       publish-noreplace || return 0
   fi
@@ -3840,58 +4002,161 @@ PY
   target_app="$dest/FrankenTerm.app"
   staged_app="$dest/.FrankenTerm.app.installing-$app_id"
   if [ -d "$target_app" ] && [ ! -L "$target_app" ] && \
-      bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+      bash "$family_verifier" verify \
         --root "$target_app" --manifest "$retained_manifest" >/dev/null 2>&1; then
     APP_INSTALLED_PATH="$target_app"
+    APP_ACTIVATION_STATE="current"
+    APP_RECEIPT_CANDIDATE_PATH="$target_app"
+    APP_RECEIPT_READINESS="existing_manifest_verified"
+    APP_RECEIPT_RESULT="verified"
+    APP_RECEIPT_REASON="already_current"
     ok "FrankenTerm.app already matches atomic app generation $app_id"
     return 0
   fi
+  APP_RECEIPT_CANDIDATE_PATH="$staged_app"
   if { [ -e "$target_app" ] || [ -L "$target_app" ]; } && \
      { [ ! -d "$target_app" ] || [ -L "$target_app" ]; }; then
     warn "Refusing to replace non-directory or symlink app target at $target_app"
+    mark_app_skipped unsafe_live_app_target
     return 0
   fi
   if { [ -e "$staged_app" ] || [ -L "$staged_app" ]; } && \
      { [ ! -d "$staged_app" ] || [ -L "$staged_app" ]; }; then
     warn "Retained app stage is not one resumable directory"
+    mark_app_skipped unsafe_retained_app_stage
     return 0
   fi
   require_filesystem_capacity "$dest" \
     "$((app_inventory_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))" \
     "atomic app generation" || {
     warn "Insufficient destination capacity for FrankenTerm.app"
+    mark_app_skipped insufficient_generation_capacity
     return 0
   }
   if ! ensure_exact_staged_tree "$extracted_app" "$staged_app"; then
     warn "Retained app stage is not an exact resumable prefix of the requested app generation"
+    mark_app_skipped retained_app_stage_conflict
     return 0
   fi
-  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+  bash "$family_verifier" verify \
     --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0
   fsync_installer_tree "$staged_app" || return 0
-  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
+  bash "$family_verifier" verify \
     --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0
   if command -v codesign >/dev/null 2>&1; then
     codesign --verify --deep --strict "$staged_app" >/dev/null 2>&1 || return 0
   fi
 
-  stage_id=$(atomic_path_content_id "$ACTIVE_ATOMIC_TRANSITION_HELPER" \
+  local readiness_harness="$staged_app/Contents/Resources/e2e-native-events.sh"
+  local staged_verifier="$staged_app/Contents/Resources/verify-components.sh"
+  [ -f "$readiness_harness" ] && [ -x "$readiness_harness" ] && \
+    [ ! -L "$readiness_harness" ] && [ -f "$staged_verifier" ] && \
+    [ -x "$staged_verifier" ] && [ ! -L "$staged_verifier" ] || {
+      warn "FrankenTerm.app lacks its manifest-bound native readiness authorities"
+      mark_app_skipped readiness_authority_missing
+      return 0
+    }
+  info "Running non-activating native readiness proof before app selector switch"
+  APP_RECEIPT_READINESS="running"
+  if ! FRANKENTERM_ALLOW_GUI_E2E=1 \
+      FRANKENTERM_GUI="$staged_app/Contents/MacOS/frankenterm-gui" \
+      FRANKENTERM_CLI="$staged_app/Contents/MacOS/ft" \
+      FRANKENTERM_MUX_SERVER="$staged_app/Contents/MacOS/frankenterm-mux-server" \
+      FRANKENTERM_PTY_GUARDIAN="$staged_app/Contents/MacOS/frankenterm-pty-guardian" \
+      FRANKENTERM_CANDIDATE_ROOT="$staged_app" \
+      FRANKENTERM_COMPONENT_MANIFEST="$retained_manifest" \
+      FRANKENTERM_CANDIDATE_SHA="$app_source" \
+      FRANKENTERM_BUILD_PROFILE="$app_profile" \
+      FRANKENTERM_ATOMIC_MANIFEST_TOOL="$staged_verifier" \
+      /bin/bash "$readiness_harness"; then
+    warn "FrankenTerm.app native readiness proof failed; live app authority is unchanged"
+    APP_RECEIPT_READINESS="failed"
+    mark_app_skipped native_readiness_failed
+    return 0
+  fi
+  APP_RECEIPT_READINESS="passed"
+
+  # Publication is deliberately non-activating until one production lifecycle
+  # authority serializes every GUI/CLI/mux/guardian launcher, proves guardian
+  # PTY handoff and exact successor readiness, and owns rollback under the same
+  # lease. A pathname exchange by the installer alone would recreate the mixed
+  # live-family window that immutable generations are intended to eliminate.
+  # The source-only test harness may cross this boundary to exercise the exact
+  # crash and rollback state machine against private fixtures.
+  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" != 1 ] || \
+     [ "${FT_INSTALL_TEST_ALLOW_APP_SELECTOR:-0}" != 1 ]; then
+    APP_INSTALLED_PATH="$staged_app"
+    APP_ACTIVATION_STATE="pending"
+    APP_RECEIPT_RESULT="verified"
+    APP_RECEIPT_REASON="activation_pending_lifecycle_transaction"
+    warn "FrankenTerm.app candidate is verified and retained; live app authority is unchanged"
+    warn "Activation requires the cross-launcher lifetime and guardian-handoff transaction"
+    return 0
+  fi
+
+  stage_id=$(atomic_path_content_id "$transition_helper" \
     "$dest" "$(basename "$staged_app")") || return 0
   txid=$(atomic_transition_txid "app-publish:$dest:$app_id") || return 0
   if [ -e "$target_app" ]; then
-    target_id=$(atomic_path_content_id "$ACTIVE_ATOMIC_TRANSITION_HELPER" "$dest" FrankenTerm.app) || return 0
+    target_id=$(atomic_path_content_id "$transition_helper" "$dest" FrankenTerm.app) || return 0
     operation=exchange
   else
     target_id=missing
     operation=publish-noreplace
   fi
   installer_failpoint before-app-selector-switch
-  atomic_path_transition "$ACTIVE_ATOMIC_TRANSITION_HELPER" "$dest" \
+  atomic_path_transition "$transition_helper" "$dest" \
     "$(basename "$staged_app")" FrankenTerm.app "$txid" "$stage_id" "$target_id" \
     "$operation" || return 0
   installer_failpoint after-app-selector-switch
-  bash "$ACTIVE_PROCESS_FAMILY_VERIFIER" verify \
-    --root "$target_app" --manifest "$retained_manifest" >/dev/null || return 0
+  if ! bash "$family_verifier" verify \
+      --root "$target_app" --manifest "$retained_manifest" >/dev/null || \
+     { command -v codesign >/dev/null 2>&1 && \
+       ! codesign --verify --deep --strict "$target_app" >/dev/null 2>&1; }; then
+    warn "Post-switch app verification failed; restoring the prior app authority"
+    local rollback_txid rollback_stage_id rollback_target_id restored_id failed_app
+    if [ "$operation" = exchange ]; then
+      rollback_stage_id=$(atomic_path_content_id "$transition_helper" \
+        "$dest" "$(basename "$staged_app")") || return 1
+      rollback_target_id=$(atomic_path_content_id "$transition_helper" \
+        "$dest" FrankenTerm.app) || return 1
+      rollback_txid=$(atomic_transition_txid "app-rollback:$dest:$app_id") || return 1
+      atomic_path_transition "$transition_helper" "$dest" \
+        "$(basename "$staged_app")" FrankenTerm.app "$rollback_txid" \
+        "$rollback_stage_id" "$rollback_target_id" exchange || return 1
+      restored_id=$(atomic_path_content_id "$transition_helper" \
+        "$dest" FrankenTerm.app) || return 1
+      [ "$restored_id" = "$target_id" ] || {
+        err "App rollback completed without restoring the exact prior authority"
+        return 1
+      }
+    else
+      # The successful publish consumed the exact staging name, so moving the
+      # failed first generation back to that same name is collision-free under
+      # the installer lease and restores both the prior absent authority and
+      # the original recoverable candidate location.
+      failed_app="$(basename "$staged_app")"
+      rollback_stage_id=$(atomic_path_content_id "$transition_helper" \
+        "$dest" FrankenTerm.app) || return 1
+      rollback_txid=$(atomic_transition_txid "app-first-publish-rollback:$dest:$app_id") || return 1
+      atomic_path_transition "$transition_helper" "$dest" \
+        FrankenTerm.app "$failed_app" "$rollback_txid" \
+        "$rollback_stage_id" missing publish-noreplace || return 1
+      if [ -e "$target_app" ] || [ -L "$target_app" ]; then
+        err "First-publish rollback did not restore the prior absent app authority"
+        return 1
+      fi
+      restored_id=$(atomic_path_content_id "$transition_helper" \
+        "$dest" "$failed_app") || return 1
+      [ "$restored_id" = "$rollback_stage_id" ] || {
+        err "Failed app quarantine differs from the switched candidate authority"
+        return 1
+      }
+    fi
+    warn "Candidate app retained for diagnosis; prior app authority was restored"
+    mark_app_skipped post_switch_verification_failed
+    return 0
+  fi
 
   # A terminal/curl-placed bundle isn't Gatekeeper-quarantined, but strip the
   # attribute defensively so a proxy/CDN that tagged the download can't force a
@@ -3906,18 +4171,15 @@ PY
     "$lsreg" -f "$target_app" >/dev/null 2>&1 || true
   fi
 
-  # Refresh (not re-pin) the Dock so a pinned tile rebinds to the new bundle.
-  # Only when a Dock is actually running (a GUI login session); the Dock
-  # relaunches itself. Never adds a tile.
-  if pgrep -x Dock >/dev/null 2>&1; then
-    killall Dock >/dev/null 2>&1 || true
-  fi
-
   ok "Installed atomic FrankenTerm.app generation $app_id → $target_app"
   if [ "$operation" = exchange ]; then
     info "Previous FrankenTerm.app preserved at $staged_app"
   fi
   APP_INSTALLED_PATH="$target_app"
+  APP_ACTIVATION_STATE="current"
+  APP_RECEIPT_CANDIDATE_PATH="$target_app"
+  APP_RECEIPT_RESULT="verified"
+  APP_RECEIPT_REASON="activated_test_selector"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -4116,8 +4378,9 @@ Options:
   --from-source      Build from source (slow; requires Rust + git)
   --quiet, -q        Suppress non-error output
   --no-gum           Disable gum formatting even if available
-  --no-verify        Skip optional Sigstore verification (SHA-256 remains required)
-  --offline TARBALL  Install from local tarball; skip all network calls
+  --no-verify        Skip DSR minisign verification (SHA-256 remains required)
+  --offline TARBALL  Install from local tarball; require adjacent .sha256 and
+                     .minisig files by default; skip all network calls
   --force            Force reinstall even if same version is installed
   --artifact-url URL Override artifact URL (e.g. custom mirror)
   --checksum HEX     Inline SHA256 (skips checksum fetch)
@@ -4126,7 +4389,7 @@ Options:
 
 Environment overrides:
   VERSION, OWNER, REPO, DEST, APP_DEST, ARTIFACT_URL, CHECKSUM, CHECKSUM_URL,
-  SIGSTORE_BUNDLE_URL, COSIGN_IDENTITY_RE, COSIGN_OIDC_ISSUER,
+  MINISIGN_SIGNATURE_URL, APP_MINISIGN_SIGNATURE_URL,
   HTTP_PROXY, HTTPS_PROXY
 EOFU
 }
@@ -4152,7 +4415,7 @@ while [ $# -gt 0 ]; do
     --from-source) FROM_SOURCE=1; shift ;;
     --quiet|-q) QUIET=1; shift ;;
     --no-gum) NO_GUM=1; shift ;;
-    --no-verify) NO_SIGSTORE=1; shift ;;
+    --no-verify) NO_MINISIGN=1; shift ;;
     --offline) require_option_value "$1" "${2:-}"; OFFLINE_TARBALL="$2"; shift 2 ;;
     --force) FORCE_INSTALL=1; shift ;;
     --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2 ;;
@@ -4226,6 +4489,8 @@ else
   detect_platform
   set_artifact_url
 fi
+
+require_release_minisign || exit 1
 
 mkdir -p "$DEST" 2>/dev/null || true
 preflight_checks
@@ -4309,8 +4574,15 @@ if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] 
   if [ "$WITH_FONT" -eq 1 ] || [ "$app_wanted" -eq 1 ]; then
     TMP=$(mktemp -d)
     if [ "$WITH_FONT" -eq 1 ]; then install_pragmasevka; fi
-    if [ "$app_wanted" -eq 1 ]; then install_macos_app; fi
+    if [ "$app_wanted" -eq 1 ] && ! install_macos_app; then
+      mark_app_skipped app_install_transaction_failed
+      finalize_app_receipt_state
+      emit_app_receipt || true
+      exit 1
+    fi
   fi
+  finalize_app_receipt_state
+  emit_app_receipt || exit 1
   exit 0
 fi
 
@@ -4359,18 +4631,31 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
 else
   # The archive-provided verifier is executable code, so one externally
   # supplied SHA-256 authority is mandatory before extraction or execution.
-  # --no-verify disables only the optional Sigstore layer.
+  # --no-verify disables only the DSR minisign layer.
   verify_archive_checksum_authority "$TMP/$TAR" "$TAR" || {
     err "Installation aborted before archive extraction"
     exit 1
   }
-  if [ "$NO_SIGSTORE" -eq 0 ] && [ -n "$URL" ]; then
-    verify_sigstore_bundle "$TMP/$TAR" "$URL" "$VERIFIED_ARCHIVE_IDENTITY" || {
+  if [ "$NO_MINISIGN" -eq 0 ] && [ -n "$OFFLINE_TARBALL" ]; then
+    offline_minisign="${OFFLINE_TARBALL}.minisig"
+    [ -f "$offline_minisign" ] && [ ! -L "$offline_minisign" ] || {
+      err "Offline DSR minisign signature not found: $offline_minisign"
+      err "Use --no-verify only for an explicitly trusted local test artifact."
+      exit 1
+    }
+    verify_minisign_signature "$TMP/$TAR" "" \
+      "$VERIFIED_ARCHIVE_IDENTITY" "" "$offline_minisign" || {
+      err "Offline signature verification failed"
+      exit 1
+    }
+  elif [ "$NO_MINISIGN" -eq 0 ] && [ -n "$URL" ]; then
+    verify_minisign_signature "$TMP/$TAR" "$URL" \
+      "$VERIFIED_ARCHIVE_IDENTITY" "$MINISIGN_SIGNATURE_URL" || {
       err "Signature verification failed"
       exit 1
     }
-  elif [ "$NO_SIGSTORE" -eq 1 ]; then
-    warn "Optional Sigstore verification skipped (--no-verify); SHA-256 was still verified"
+  elif [ "$NO_MINISIGN" -eq 1 ]; then
+    warn "DSR minisign verification skipped (--no-verify); SHA-256 was still verified"
   fi
 
   # Extract into an otherwise-empty private package root with a two-pass
@@ -4454,7 +4739,12 @@ if [ "$WITH_FONT" -eq 1 ]; then
 fi
 
 if should_install_app; then
-  install_macos_app
+  if ! install_macos_app; then
+    mark_app_skipped app_install_transaction_failed
+    finalize_app_receipt_state
+    emit_app_receipt || true
+    exit 1
+  fi
 fi
 
 if [ "$VERIFY" -eq 1 ]; then
@@ -4525,7 +4815,12 @@ if [ "$QUIET" -eq 0 ]; then
     summary_lines+=("Font:     Pragmasevka NF installed at $FONT_INSTALLED_PATH")
   fi
   if [ -n "$APP_INSTALLED_PATH" ]; then
-    summary_lines+=("GUI app:  $APP_INSTALLED_PATH")
+    if [ "$APP_ACTIVATION_STATE" = pending ]; then
+      summary_lines+=("GUI candidate:       $APP_INSTALLED_PATH")
+      summary_lines+=("GUI activation:      pending; live app authority unchanged")
+    else
+      summary_lines+=("GUI app:  $APP_INSTALLED_PATH")
+    fi
   fi
   summary_lines+=("")
   if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
@@ -4555,7 +4850,7 @@ if [ "$QUIET" -eq 0 ]; then
     esac
   fi
   if [ -n "$APP_INSTALLED_PATH" ]; then
-    summary_lines+=("  rm -rf $APP_INSTALLED_PATH")
+    summary_lines+=("  rm -r $APP_INSTALLED_PATH")
   fi
   summary_lines+=("")
   summary_lines+=("Docs:     https://github.com/${OWNER}/${REPO}")
@@ -4568,3 +4863,5 @@ fi
 # Automation must branch on `activation`; exit zero alone never means that a
 # selector or live mux was changed.
 emit_process_family_receipt || exit 1
+finalize_app_receipt_state
+emit_app_receipt || exit 1

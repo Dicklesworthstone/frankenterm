@@ -57,10 +57,23 @@ _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See
 <h3>Quick Install</h3>
 
 ```bash
-cargo install --profile release-interactive --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
 ```
 
-`ft --version` works immediately after install. `ft doctor` / `ft doctor --json` run immediately. Pane/session operations require a reachable FrankenTerm/WezTerm-fork mux endpoint. Native vendored builds prefer the direct pooled mux protocol; the external `wezterm` CLI is a compatibility fallback, not a universal prerequisite.
+The installer verifies the DSR-published checksum and minisign signature, then
+publishes `ft`, the mux server, the PTY guardian, and (on Apple-Silicon macOS)
+a verified `FrankenTerm.app` candidate as one manifest-bound generation. Live
+activation remains pending until the lifecycle transaction can serialize every
+launcher and prove PTY handoff, successor readiness, and rollback. When the
+receipt says `activation: pending`, the stable `ft` path intentionally remains
+absent (first install) or points to the prior generation (upgrade); use the
+absolute `Candidate CLI` path printed by the installer to test the new build in
+isolation. Only a `current` receipt authorizes ordinary `ft --version` and
+`ft doctor` through `PATH`.
+Pane/session operations require a reachable FrankenTerm/WezTerm-fork mux
+endpoint. Native vendored builds prefer the direct pooled mux protocol; the
+external `wezterm` CLI is a compatibility fallback, not a universal
+prerequisite.
 
 </div>
 
@@ -93,13 +106,23 @@ A guided walkthrough from "I cloned this" to "I have an AI driving an AI." Each 
 ### 1 · Install + verify (1 minute)
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
 
-ft --version       # smoke test — should print version + git commit
-ft doctor          # environment check — exits non-zero on missing prerequisites
+# If the receipt is pending, copy the printed absolute "Candidate CLI" path:
+/absolute/candidate/generation/ft --version
+/absolute/candidate/generation/ft doctor
 ```
 
-`ft` talks to a live FrankenTerm/WezTerm-fork mux. Native vendored builds can use the direct pooled mux protocol; compatibility configurations may instead require the external `wezterm` CLI in `PATH`. `ft doctor` reports the available backend prerequisites. If you need from-source builds or optional features (`mcp`, `web`, `distributed`, `semantic-search`, `ftui`), see [Installation](#installation) below.
+The installer selects one DSR release generation and verifies its checksum and
+minisign signature before publication. It never treats a standalone `ft`
+binary as a complete installation. `ft` talks to a live
+FrankenTerm/WezTerm-fork mux. Native vendored builds can use the direct pooled
+mux protocol; compatibility configurations may instead require the external
+`wezterm` CLI in `PATH`. `ft doctor` reports the available backend
+prerequisites. If you need a source build or optional features (`mcp`, `web`,
+`distributed`, `semantic-search`, `ftui`), see [Installation](#installation)
+below. Do not substitute the stable `ft` path for the printed candidate path
+unless the installer receipt explicitly says the generation is current.
 
 ### 2 · See the fleet (1 minute, no daemon yet)
 
@@ -732,8 +755,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main
 ```
 
 What it does:
-- Downloads the release asset for your platform, verifies its SHA-256 checksum (and Sigstore signature when published), and installs the `ft` CLI to `~/.local/bin` (override with `--dest DIR`, or `--system` for `/usr/local/bin`).
-- **On macOS arm64**, it also installs **FrankenTerm.app** (the GUI terminal emulator) to `/Applications` (or `~/Applications` when `/Applications` isn't writable), registers it with LaunchServices, and refreshes the Dock so an existing Dock pin resolves to the new version. It does **not** add a new Dock tile. Skip it with `--no-app`, force it with `--with-app`, relocate it with `--app-dest DIR`.
+- Downloads one DSR-published release generation for your platform, verifies its SHA-256 checksum and repository-pinned minisign signature, and stages the manifest-bound `ft`, mux-server, and PTY-guardian process family under `~/.local/bin` (override with `--dest DIR`, or `--system` for `/usr/local/bin`).
+- Requires `minisign` for release verification (`brew install minisign` on macOS); the installer checks this before downloading any release artifact.
+- **On macOS arm64**, it also stages and proves the matching **FrankenTerm.app** (the GUI terminal emulator, bundled `ft`, mux server, and PTY guardian) at `/Applications` (or `~/Applications` when `/Applications` isn't writable). Until cross-launcher lifetime serialization and PTY handoff are production-proven, the verified app remains at its generation-specific candidate path and the live app bundle is unchanged. It does **not** restart the Dock or add a Dock tile. Skip it with `--no-app`, force it with `--with-app`, or relocate it with `--app-dest DIR`.
 - Falls back to a from-source build when no prebuilt asset matches your platform (Intel Mac, uncommon targets).
 
 | Flag | Effect |
@@ -745,22 +769,27 @@ What it does:
 | `--no-app` / `--with-app` / `--app-dest DIR` | macOS GUI-app control (skip / force / relocate) |
 | `--from-source` | Build from source instead of downloading (needs Rust + git) |
 | `--offline TARBALL` | Install from a local tarball; no network |
-| `--no-verify` | Skip checksum/signature verification (testing only) |
+| `--no-verify` | Skip the DSR minisign signature check only; SHA-256 remains mandatory (testing only) |
 | `--verify` | Run `ft doctor` after install |
 
 The bundled GUI app is **ad-hoc signed** (not Developer-ID notarized). A curl/terminal-placed bundle isn't Gatekeeper-quarantined, so it launches normally; if you instead fetch the `.app` asset through a browser, clear the quarantine flag with `xattr -dr com.apple.quarantine /Applications/FrankenTerm.app` before first launch.
 
-### Via Cargo (fastest)
+On the first launch that uses the canonical `frankenterm` data and cache
+namespaces, FrankenTerm transactionally reconstructs only validated,
+FrankenTerm-owned window state and remembered-domain authority from the former
+`wezterm` data leaf. It never bulk-copies that directory and never deletes old
+evidence. Rebuildable cache and update metadata start fresh. Plugins, REPL
+history, recent commands, recent emoji, unknown files, and other
+ownership-ambiguous state remain untouched only in the legacy leaf so a
+side-by-side WezTerm installation cannot be imported or overwritten.
 
-```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
-```
+### Why direct `cargo install` is not an installation path
 
-Post-install expectations:
-- `ft --version` succeeds immediately
-- `ft doctor` / `ft doctor --json` emit diagnostics immediately
-- On a clean host, doctor reports the available mux-backend prerequisites. A compatibility-CLI setup requires `wezterm --version` and `wezterm cli list --format json`; a native vendored setup may use a reachable direct mux endpoint instead.
-- `.ft`, logs, and the SQLite database are created on first daemon/watch startup
+Installing only the `ft` Cargo binary can silently combine a new CLI with an
+older mux server, PTY guardian, or GUI bundle. That is not a supported
+FrankenTerm installation. Use the release installer above for a coherent,
+signed generation. Use the next section only to build an uninstalled checkout
+for development.
 
 ### Build a checkout from source
 

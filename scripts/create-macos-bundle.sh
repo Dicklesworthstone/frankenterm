@@ -431,6 +431,27 @@ echo "Packaging $APP_NAME.app v$VERSION (build $BUILD_STRING)..."
 # --- Bundle structure ---
 APP_BUNDLE="$OUTPUT_DIR/$APP_NAME.app"
 ATOMIC_MANIFEST="$OUTPUT_DIR/$APP_NAME.app.component-manifest.json"
+if ! python3 - "$BROWSER_RUNTIME_ROOT" "$APP_BUNDLE" <<'PY'
+import os
+import sys
+
+source = os.path.realpath(sys.argv[1])
+destination = os.path.realpath(sys.argv[2])
+try:
+    common = os.path.commonpath((source, destination))
+except ValueError as error:
+    raise SystemExit(f"cannot compare browser runtime and app paths: {error}") from error
+if common == source or common == destination:
+    raise SystemExit(
+        "browser runtime source and app destination must not contain one another: "
+        f"source={source!r} destination={destination!r}"
+    )
+PY
+then
+    echo "Error: unsafe browser runtime/app destination relationship"
+    echo "Choose a --browser-runtime-root and --output directory with disjoint trees."
+    exit 1
+fi
 if [ -e "$APP_BUNDLE" ]; then
     echo "Error: app bundle already exists at $APP_BUNDLE"
     echo "Choose a fresh --output directory or remove the existing bundle manually."
@@ -563,6 +584,17 @@ echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 cp "$ATOMIC_MANIFEST_TOOL" "$APP_BUNDLE/Contents/Resources/verify-components.sh"
 chmod 0755 "$APP_BUNDLE/Contents/Resources/verify-components.sh"
 
+# Ship the non-activating native readiness harness beside its verifier. The
+# installer executes this exact manifest-bound copy against a private snapshot
+# before switching the live app namespace.
+NATIVE_READINESS_HARNESS="$PROJECT_ROOT/scripts/e2e_native_events.sh"
+if [ ! -f "$NATIVE_READINESS_HARNESS" ] || [ -L "$NATIVE_READINESS_HARNESS" ]; then
+    echo "Error: native readiness harness is unavailable or unsafe at $NATIVE_READINESS_HARNESS"
+    exit 1
+fi
+cp "$NATIVE_READINESS_HARNESS" "$APP_BUNDLE/Contents/Resources/e2e-native-events.sh"
+chmod 0755 "$APP_BUNDLE/Contents/Resources/e2e-native-events.sh"
+
 # --- Codesign (ad-hoc) ---
 if ! command -v codesign &>/dev/null; then
     echo "Error: codesign is required to produce a macOS application bundle"
@@ -617,6 +649,7 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --entry config:default-lua:Contents/Resources/frankenterm.lua \
     --entry asset:application-icon:Contents/Resources/ft.icns \
     --entry verifier:offline-verifier:Contents/Resources/verify-components.sh \
+    --entry verifier:native-readiness-harness:Contents/Resources/e2e-native-events.sh \
     --entry metadata:browser-runtime-source-manifest:Contents/Resources/browser-runtime.source-manifest.json \
     --entry metadata:info-plist:Contents/Info.plist \
     --entry metadata:package-info:Contents/PkgInfo \
@@ -627,6 +660,7 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --source-match Contents/Resources/frankenterm.lua=crates/frankenterm-gui/frankenterm.lua \
     --source-match Contents/Resources/ft.icns=assets/macos/ft.icns \
     --source-match Contents/Resources/verify-components.sh=scripts/atomic-component-manifest.sh \
+    --source-match Contents/Resources/e2e-native-events.sh=scripts/e2e_native_events.sh \
     --input workspace.manifest=Cargo.toml \
     --input protocol.codec="$CODEC_SOURCE" \
     --input protocol.core-wire="$WIRE_SOURCE" \

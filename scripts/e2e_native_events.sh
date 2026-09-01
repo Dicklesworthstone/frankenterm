@@ -6,7 +6,9 @@
 # remains the authoritative text-capture path.
 #
 # Prerequisites:
-#   - Explicit absolute candidate paths in FRANKENTERM_CLI/FRANKENTERM_GUI
+#   - Explicit absolute candidate paths for all four shipped process roles in
+#     FRANKENTERM_CLI, FRANKENTERM_GUI, FRANKENTERM_MUX_SERVER, and
+#     FRANKENTERM_PTY_GUARDIAN
 #   - Their common candidate root in FRANKENTERM_CANDIDATE_ROOT
 #   - Its detached atomic manifest in FRANKENTERM_COMPONENT_MANIFEST
 #   - Full source SHA/profile metadata for the retained artifact manifest
@@ -99,9 +101,11 @@ PATH=$SANITIZED_PATH
 export PATH
 
 if [ -z "${FRANKENTERM_GUI:-}" ] || [ -z "${FRANKENTERM_CLI:-}" ] || \
+   [ -z "${FRANKENTERM_MUX_SERVER:-}" ] || \
+   [ -z "${FRANKENTERM_PTY_GUARDIAN:-}" ] || \
    [ -z "${FRANKENTERM_CANDIDATE_ROOT:-}" ] || \
    [ -z "${FRANKENTERM_COMPONENT_MANIFEST:-}" ]; then
-    echo "FRANKENTERM_GUI, FRANKENTERM_CLI, FRANKENTERM_CANDIDATE_ROOT, and FRANKENTERM_COMPONENT_MANIFEST must be explicit absolute candidate paths" >&2
+    echo "FRANKENTERM_GUI, FRANKENTERM_CLI, FRANKENTERM_MUX_SERVER, FRANKENTERM_PTY_GUARDIAN, FRANKENTERM_CANDIDATE_ROOT, and FRANKENTERM_COMPONENT_MANIFEST must be explicit absolute candidate paths" >&2
     exit 2
 fi
 if [ -z "${FRANKENTERM_CANDIDATE_SHA:-}" ] || \
@@ -117,10 +121,12 @@ fi
 
 FT_GUI="$FRANKENTERM_GUI"
 FT_CLI="$FRANKENTERM_CLI"
+FT_MUX_SERVER="$FRANKENTERM_MUX_SERVER"
+FT_PTY_GUARDIAN="$FRANKENTERM_PTY_GUARDIAN"
 CANDIDATE_ROOT="$FRANKENTERM_CANDIDATE_ROOT"
 CANDIDATE_MANIFEST="$FRANKENTERM_COMPONENT_MANIFEST"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-ATOMIC_MANIFEST_TOOL="$SCRIPT_DIR/atomic-component-manifest.sh"
+ATOMIC_MANIFEST_TOOL="${FRANKENTERM_ATOMIC_MANIFEST_TOOL:-$SCRIPT_DIR/atomic-component-manifest.sh}"
 LOG_DIR=$(mktemp -d /tmp/e2e-native-events.XXXXXX)
 WORKSPACE_DIR="$LOG_DIR/workspace"
 NATIVE_RUNTIME_DIR="$WORKSPACE_DIR/native-runtime"
@@ -146,6 +152,9 @@ GUI_LAUNCHED=0
 WATCH_LAUNCHED=0
 CANDIDATE_IDENTITY_SHA256=''
 FRONTMOST_PID_BEFORE=''
+MUX_VERSION_PROBED=0
+GUARDIAN_VERSION_PROBED=0
+PRIVATE_MUX_SOCKET_VIOLATION=0
 
 case "$(uname -s)" in
     Darwin|Linux|FreeBSD|DragonFly) ;;
@@ -174,7 +183,9 @@ if [ "$GUI_E2E_MODE" = nonactivating ]; then
     fi
 fi
 
-for candidate_path in "$FT_GUI" "$FT_CLI" "$CANDIDATE_ROOT" "$CANDIDATE_MANIFEST"; do
+for candidate_path in \
+    "$FT_GUI" "$FT_CLI" "$FT_MUX_SERVER" "$FT_PTY_GUARDIAN" \
+    "$CANDIDATE_ROOT" "$CANDIDATE_MANIFEST"; do
     case "$candidate_path" in
         /*) ;;
         *) echo "candidate paths must be absolute: $candidate_path" >&2; exit 2 ;;
@@ -189,7 +200,7 @@ if [ "$CANDIDATE_ROOT" = "/" ]; then
     echo "candidate root may not be the filesystem root" >&2
     exit 2
 fi
-for candidate_binary in "$FT_GUI" "$FT_CLI"; do
+for candidate_binary in "$FT_GUI" "$FT_CLI" "$FT_MUX_SERVER" "$FT_PTY_GUARDIAN"; do
     if [ ! -f "$candidate_binary" ] || [ ! -x "$candidate_binary" ] || [ -L "$candidate_binary" ]; then
         echo "candidate binary must be an executable non-symlink file: $candidate_binary" >&2
         exit 2
@@ -202,6 +213,8 @@ for candidate_binary in "$FT_GUI" "$FT_CLI"; do
 done
 FT_GUI=$(cd "$(dirname "$FT_GUI")" && pwd -P)/$(basename "$FT_GUI")
 FT_CLI=$(cd "$(dirname "$FT_CLI")" && pwd -P)/$(basename "$FT_CLI")
+FT_MUX_SERVER=$(cd "$(dirname "$FT_MUX_SERVER")" && pwd -P)/$(basename "$FT_MUX_SERVER")
+FT_PTY_GUARDIAN=$(cd "$(dirname "$FT_PTY_GUARDIAN")" && pwd -P)/$(basename "$FT_PTY_GUARDIAN")
 if [ ! -f "$CANDIDATE_MANIFEST" ] || [ -L "$CANDIDATE_MANIFEST" ]; then
     echo "candidate component manifest must be a regular non-symlink file: $CANDIDATE_MANIFEST" >&2
     exit 2
@@ -221,10 +234,14 @@ fi
 DECLARED_CANDIDATE_ROOT="$CANDIDATE_ROOT"
 DECLARED_FT_GUI="$FT_GUI"
 DECLARED_FT_CLI="$FT_CLI"
+DECLARED_FT_MUX_SERVER="$FT_MUX_SERVER"
+DECLARED_FT_PTY_GUARDIAN="$FT_PTY_GUARDIAN"
 DECLARED_CANDIDATE_MANIFEST="$CANDIDATE_MANIFEST"
 DECLARED_ATOMIC_MANIFEST_TOOL="$ATOMIC_MANIFEST_TOOL"
 FT_GUI_RELATIVE=${FT_GUI#"$CANDIDATE_ROOT"/}
 FT_CLI_RELATIVE=${FT_CLI#"$CANDIDATE_ROOT"/}
+FT_MUX_SERVER_RELATIVE=${FT_MUX_SERVER#"$CANDIDATE_ROOT"/}
+FT_PTY_GUARDIAN_RELATIVE=${FT_PTY_GUARDIAN#"$CANDIDATE_ROOT"/}
 
 hash_file() {
     "$ENV_BIN" -i \
@@ -274,8 +291,12 @@ verify_candidate_manifest_contract() {
         "$CANDIDATE_ROOT" \
         "$FT_CLI" \
         "$FT_GUI" \
+        "$FT_MUX_SERVER" \
+        "$FT_PTY_GUARDIAN" \
         "$CLI_SHA256" \
-        "$GUI_SHA256" <<'PY'
+        "$GUI_SHA256" \
+        "$MUX_SERVER_SHA256" \
+        "$PTY_GUARDIAN_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -299,8 +320,10 @@ expected_source_revision = sys.argv[2]
 expected_profile = sys.argv[3]
 package_root = Path(sys.argv[4]).resolve(strict=True)
 expected_components = {
-    "ft": (Path(sys.argv[5]).resolve(strict=True), sys.argv[7]),
-    "frankenterm-gui": (Path(sys.argv[6]).resolve(strict=True), sys.argv[8]),
+    "ft": (Path(sys.argv[5]).resolve(strict=True), sys.argv[9]),
+    "frankenterm-gui": (Path(sys.argv[6]).resolve(strict=True), sys.argv[10]),
+    "frankenterm-mux-server": (Path(sys.argv[7]).resolve(strict=True), sys.argv[11]),
+    "frankenterm-pty-guardian": (Path(sys.argv[8]).resolve(strict=True), sys.argv[12]),
 }
 
 try:
@@ -375,6 +398,8 @@ PY
 
 GUI_SHA256=$(hash_file "$FT_GUI")
 CLI_SHA256=$(hash_file "$FT_CLI")
+MUX_SERVER_SHA256=$(hash_file "$FT_MUX_SERVER")
+PTY_GUARDIAN_SHA256=$(hash_file "$FT_PTY_GUARDIAN")
 MANIFEST_SHA256_BEFORE=$(hash_file "$CANDIDATE_MANIFEST")
 ATOMIC_MANIFEST_TOOL_SHA256=$(hash_file "$ATOMIC_MANIFEST_TOOL")
 
@@ -400,10 +425,14 @@ fi
 MANIFEST_SHA256_AFTER=$(hash_file "$CANDIDATE_MANIFEST")
 GUI_SHA256_AFTER=$(hash_file "$FT_GUI")
 CLI_SHA256_AFTER=$(hash_file "$FT_CLI")
+MUX_SERVER_SHA256_AFTER=$(hash_file "$FT_MUX_SERVER")
+PTY_GUARDIAN_SHA256_AFTER=$(hash_file "$FT_PTY_GUARDIAN")
 ATOMIC_MANIFEST_TOOL_SHA256_AFTER=$(hash_file "$ATOMIC_MANIFEST_TOOL")
 if [ "$MANIFEST_SHA256_AFTER" != "$MANIFEST_SHA256_BEFORE" ] || \
    [ "$GUI_SHA256_AFTER" != "$GUI_SHA256" ] || \
    [ "$CLI_SHA256_AFTER" != "$CLI_SHA256" ] || \
+   [ "$MUX_SERVER_SHA256_AFTER" != "$MUX_SERVER_SHA256" ] || \
+   [ "$PTY_GUARDIAN_SHA256_AFTER" != "$PTY_GUARDIAN_SHA256" ] || \
    [ "$ATOMIC_MANIFEST_TOOL_SHA256_AFTER" != "$ATOMIC_MANIFEST_TOOL_SHA256" ]; then
     echo "candidate manifest, verifier, or executable changed during verification; refusing process launch" >&2
     exit 2
@@ -440,7 +469,9 @@ fi
 CANDIDATE_ROOT=$(cd "$EXECUTION_CANDIDATE_PARENT/$CANDIDATE_ROOT_BASENAME" && pwd -P)
 FT_GUI="$CANDIDATE_ROOT/$FT_GUI_RELATIVE"
 FT_CLI="$CANDIDATE_ROOT/$FT_CLI_RELATIVE"
-for snapshot_binary in "$FT_GUI" "$FT_CLI"; do
+FT_MUX_SERVER="$CANDIDATE_ROOT/$FT_MUX_SERVER_RELATIVE"
+FT_PTY_GUARDIAN="$CANDIDATE_ROOT/$FT_PTY_GUARDIAN_RELATIVE"
+for snapshot_binary in "$FT_GUI" "$FT_CLI" "$FT_MUX_SERVER" "$FT_PTY_GUARDIAN"; do
     if [ ! -f "$snapshot_binary" ] || [ ! -x "$snapshot_binary" ] || [ -L "$snapshot_binary" ]; then
         echo "private candidate snapshot lost executable identity: $snapshot_binary" >&2
         exit 2
@@ -462,7 +493,9 @@ if ! verify_candidate_manifest_contract \
 fi
 if [ "$(hash_file "$CANDIDATE_MANIFEST")" != "$MANIFEST_SHA256_AFTER" ] || \
    [ "$(hash_file "$FT_GUI")" != "$GUI_SHA256" ] || \
-   [ "$(hash_file "$FT_CLI")" != "$CLI_SHA256" ]; then
+   [ "$(hash_file "$FT_CLI")" != "$CLI_SHA256" ] || \
+   [ "$(hash_file "$FT_MUX_SERVER")" != "$MUX_SERVER_SHA256" ] || \
+   [ "$(hash_file "$FT_PTY_GUARDIAN")" != "$PTY_GUARDIAN_SHA256" ]; then
     echo "private candidate snapshot bytes differ from the verified candidate; refusing process launch" >&2
     exit 2
 fi
@@ -472,7 +505,9 @@ verify_execution_snapshot_integrity() {
     if [ "$(hash_file "$CANDIDATE_MANIFEST")" != "$MANIFEST_SHA256_AFTER" ] || \
        [ "$(hash_file "$ATOMIC_MANIFEST_TOOL")" != "$ATOMIC_MANIFEST_TOOL_SHA256" ] || \
        [ "$(hash_file "$FT_GUI")" != "$GUI_SHA256" ] || \
-       [ "$(hash_file "$FT_CLI")" != "$CLI_SHA256" ]; then
+       [ "$(hash_file "$FT_CLI")" != "$CLI_SHA256" ] || \
+       [ "$(hash_file "$FT_MUX_SERVER")" != "$MUX_SERVER_SHA256" ] || \
+       [ "$(hash_file "$FT_PTY_GUARDIAN")" != "$PTY_GUARDIAN_SHA256" ]; then
         echo "candidate snapshot identity changed during $phase" >&2
         return 1
     fi
@@ -584,9 +619,82 @@ fi
 
 assert_private_mux_socket_absent() {
     if [ -e "$PRIVATE_MUX_SOCKET_PATH" ] || [ -L "$PRIVATE_MUX_SOCKET_PATH" ]; then
+        PRIVATE_MUX_SOCKET_VIOLATION=1
         echo "private watcher mux socket unexpectedly exists; refusing process launch: $PRIVATE_MUX_SOCKET_PATH" >&2
         return 1
     fi
+}
+
+# Prove the two non-interactive shipped roles are launchable without granting
+# either one daemon, PTY, or ambient mux authority. `--version` is handled by
+# each role's clap parser before service startup; Python supplies the finite
+# wall-clock/process-group boundary that shell `timeout` cannot portably offer
+# on macOS.
+bounded_version_probe() {
+    local binary="$1"
+    local label="$2"
+    local stdout_path="$LOG_DIR/$label-version.stdout"
+    local stderr_path="$LOG_DIR/$label-version.stderr"
+    "$ENV_BIN" -i \
+        "PATH=$PREFLIGHT_PATH" \
+        "LANG=${LANG:-C}" \
+        "HOME=$HERMETIC_HOME" \
+        "TMPDIR=$HERMETIC_TMPDIR" \
+        PYTHONNOUSERSITE=1 \
+        "$PYTHON3_BIN" - \
+        "$binary" "$stdout_path" "$stderr_path" "$WORKSPACE_DIR" \
+        "$SANITIZED_PATH" "$HERMETIC_HOME" "$HERMETIC_TMPDIR" \
+        "$PRIVATE_MUX_SOCKET_PATH" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+(
+    binary,
+    stdout_path,
+    stderr_path,
+    workspace,
+    path,
+    home,
+    tmpdir,
+    private_mux_socket,
+) = sys.argv[1:]
+environment = {
+    "PATH": path,
+    "LANG": "C",
+    "HOME": home,
+    "TMPDIR": tmpdir,
+    "FRANKENTERM_UNIX_SOCKET": private_mux_socket,
+    "WEZTERM_UNIX_SOCKET": private_mux_socket,
+}
+try:
+    with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+        child = subprocess.Popen(
+            [binary, "--version"],
+            cwd=workspace,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        try:
+            returncode = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            raise SystemExit("version probe exceeded its 10-second deadline")
+except OSError as error:
+    raise SystemExit(f"version probe launch failed: {error}") from error
+if returncode != 0:
+    raise SystemExit(f"version probe exited with status {returncode}")
+if not os.path.getsize(stdout_path):
+    raise SystemExit("version probe emitted no stdout identity")
+PY
 }
 
 # Invoked through the EXIT trap below.
@@ -622,6 +730,10 @@ cleanup() {
         printf '%s\n' '[cleanup] candidate snapshot post-execution verification failed' >&2
         cleanup_failed=1
         integrity_failed=1
+    fi
+    if ! assert_private_mux_socket_absent; then
+        printf '%s\n' '[cleanup] private mux socket appeared during native readiness execution' >&2
+        cleanup_failed=1
     fi
     printf '%s\n' "[cleanup] Harness-owned child settlement attempt completed" >&2
     printf '%s\n' "[cleanup] Logs in $LOG_DIR" >&2
@@ -861,7 +973,12 @@ write_terminal_result() {
         "$CANDIDATE_IDENTITY_SHA256" \
         "$MANIFEST_SHA256_AFTER" \
         "$CLI_SHA256" \
-        "$GUI_SHA256" <<'PY'
+        "$GUI_SHA256" \
+        "$MUX_SERVER_SHA256" \
+        "$PTY_GUARDIAN_SHA256" \
+        "$MUX_VERSION_PROBED" \
+        "$GUARDIAN_VERSION_PROBED" \
+        "$PRIVATE_MUX_SOCKET_VIOLATION" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -882,12 +999,18 @@ from pathlib import Path
     manifest_sha256,
     cli_sha256,
     gui_sha256,
+    mux_server_sha256,
+    pty_guardian_sha256,
+    mux_version_probed,
+    guardian_version_probed,
+    private_mux_socket_violation,
 ) = sys.argv[1:]
 final_code = int(final_status)
 record = {
     "schema_version": "ft.native_event_e2e_result.v1",
     "authority_scope": (
-        "native_bridge_runtime_lifecycle_from_private_verified_bundle_copy; "
+        "four_role_identity_and_bounded_launch_from_private_verified_bundle_copy; "
+        "native_bridge_runtime_lifecycle; "
         "excludes LaunchServices, Gatekeeper, notarization, installation, latency, and soak"
     ),
     "e2e_result": "passed" if final_code == 0 else "failed",
@@ -901,6 +1024,8 @@ record = {
         "component_manifest": manifest_sha256,
         "ft": cli_sha256,
         "frankenterm-gui": gui_sha256,
+        "frankenterm-mux-server": mux_server_sha256,
+        "frankenterm-pty-guardian": pty_guardian_sha256,
     },
     "body_exit_status": int(body_status),
     "final_exit_status": final_code,
@@ -909,6 +1034,13 @@ record = {
         "watch": bool(int(watch_launched)),
         "gui": bool(int(gui_launched)),
     },
+    "role_probes": {
+        "frankenterm-mux-server--version": bool(int(mux_version_probed)),
+        "frankenterm-pty-guardian--version": bool(int(guardian_version_probed)),
+    },
+    "private_mux_socket_absent_after_execution": not bool(
+        int(private_mux_socket_violation)
+    ),
     "child_settlement": "failed" if int(settlement_failed) else "passed",
     "post_execution_candidate_integrity": (
         "failed" if int(integrity_failed) else "passed"
@@ -971,7 +1103,13 @@ echo ""
     "$CLI_SHA256" \
     "$DECLARED_FT_GUI" \
     "$FT_GUI" \
-    "$GUI_SHA256" <<'PY'
+    "$GUI_SHA256" \
+    "$DECLARED_FT_MUX_SERVER" \
+    "$FT_MUX_SERVER" \
+    "$MUX_SERVER_SHA256" \
+    "$DECLARED_FT_PTY_GUARDIAN" \
+    "$FT_PTY_GUARDIAN" \
+    "$PTY_GUARDIAN_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -998,6 +1136,12 @@ from pathlib import Path
     declared_gui,
     execution_gui,
     gui_sha256,
+    declared_mux_server,
+    execution_mux_server,
+    mux_server_sha256,
+    declared_pty_guardian,
+    execution_pty_guardian,
+    pty_guardian_sha256,
 ) = sys.argv[1:]
 receipt = {
     "schema_version": "ft.native_event_e2e_candidate_identity.v1",
@@ -1034,6 +1178,16 @@ receipt = {
             "execution_path": execution_gui,
             "sha256": gui_sha256,
         },
+        "frankenterm-mux-server": {
+            "declared_path": declared_mux_server,
+            "execution_path": execution_mux_server,
+            "sha256": mux_server_sha256,
+        },
+        "frankenterm-pty-guardian": {
+            "declared_path": declared_pty_guardian,
+            "execution_path": execution_pty_guardian,
+            "sha256": pty_guardian_sha256,
+        },
     },
 }
 Path(output_path).write_text(
@@ -1042,6 +1196,27 @@ Path(output_path).write_text(
 )
 PY
 CANDIDATE_IDENTITY_SHA256=$(hash_file "$LOG_DIR/candidate-identity.json")
+
+# Step 0: Launch the remaining two shipped roles only through their bounded,
+# side-effect-free version parsers. This proves the exact manifest-bound mux
+# and guardian bytes are executable without starting either service.
+echo "[step 0] Probing mux-server and PTY-guardian identities..."
+if bounded_version_probe "$FT_MUX_SERVER" mux-server; then
+    MUX_VERSION_PROBED=1
+    check "frankenterm-mux-server bounded version probe" "pass"
+else
+    check "frankenterm-mux-server bounded version probe" "fail"
+    exit 1
+fi
+assert_private_mux_socket_absent
+if bounded_version_probe "$FT_PTY_GUARDIAN" pty-guardian; then
+    GUARDIAN_VERSION_PROBED=1
+    check "frankenterm-pty-guardian bounded version probe" "pass"
+else
+    check "frankenterm-pty-guardian bounded version probe" "fail"
+    exit 1
+fi
+assert_private_mux_socket_absent
 
 # Step 1: Start ft watch in foreground mode with an isolated, explicitly
 # enabled native-event configuration. The listener exclusively owns
@@ -1117,6 +1292,7 @@ else
     echo "Check $LOG_DIR/gui-stderr.log and $LOG_DIR/watch-stderr.log" >&2
     exit 1
 fi
+assert_private_mux_socket_absent
 
 if [ "$GUI_E2E_MODE" = nonactivating ]; then
     FRONTMOST_PID_AFTER=$(frontmost_application_pid) || {
@@ -1213,6 +1389,7 @@ else
     WATCH_PID=''
     check "ft watch survived GUI disconnect" "fail"
 fi
+assert_private_mux_socket_absent
 
 # Summary
 echo ""
