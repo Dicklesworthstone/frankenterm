@@ -110667,6 +110667,22 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
     }
 
     #[cfg(unix)]
+    fn parse_installer_app_receipt(stdout: &[u8]) -> serde_json::Value {
+        let stdout = std::str::from_utf8(stdout).expect("installer app receipt is UTF-8");
+        let prefix = "FT_INSTALL_APP_RECEIPT_V1=";
+        let records = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            1,
+            "installer must emit one exact app receipt"
+        );
+        serde_json::from_str(records[0]).expect("installer app receipt is canonical JSON")
+    }
+
+    #[cfg(unix)]
     fn activate_installer_test_generation(destination: &Path, family: &InstallerTestFamily) {
         use std::os::unix::fs::symlink;
 
@@ -110779,6 +110795,27 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
         std::fs::copy(&verifier_source, &verifier).expect("copy app verifier fixture");
         std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o555))
             .expect("make app verifier executable");
+        let readiness_harness = resources.join("e2e-native-events.sh");
+        std::fs::write(
+            &readiness_harness,
+            br#"#!/bin/sh
+set -eu
+test "${FRANKENTERM_ALLOW_GUI_E2E:-}" = 1
+test -x "${FRANKENTERM_GUI:?}"
+test -x "${FRANKENTERM_CLI:?}"
+test -x "${FRANKENTERM_MUX_SERVER:?}"
+test -x "${FRANKENTERM_PTY_GUARDIAN:?}"
+test -d "${FRANKENTERM_CANDIDATE_ROOT:?}"
+test -f "${FRANKENTERM_COMPONENT_MANIFEST:?}"
+test -n "${FRANKENTERM_CANDIDATE_SHA:?}"
+test "${FRANKENTERM_BUILD_PROFILE:?}" = release-interactive
+test -x "${FRANKENTERM_ATOMIC_MANIFEST_TOOL:?}"
+test "${FT_INSTALL_TEST_READINESS_FAIL:-0}" != 1
+"#,
+        )
+        .expect("write app readiness fixture");
+        std::fs::set_permissions(&readiness_harness, std::fs::Permissions::from_mode(0o555))
+            .expect("make app readiness fixture executable");
         let manifest = root.join("FrankenTerm.app.component-manifest.json");
         let generated = std::process::Command::new("bash")
             .arg(&verifier_source)
@@ -110811,6 +110848,8 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{
             .arg("executable:pty-guardian:Contents/MacOS/frankenterm-pty-guardian:frankenterm-pty-guardian")
             .arg("--entry")
             .arg("verifier:offline-verifier:Contents/Resources/verify-components.sh")
+            .arg("--entry")
+            .arg("verifier:native-readiness-harness:Contents/Resources/e2e-native-events.sh")
             .arg("--source-match")
             .arg("Contents/Resources/verify-components.sh=scripts/atomic-component-manifest.sh")
             .output()

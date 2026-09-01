@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -3136,23 +3136,137 @@ fn migrate_v2_state(state: PersistedStateV2) -> Result<PersistedState, Persisten
     Ok(current)
 }
 
+#[cfg(unix)]
+fn validate_state_file_descriptor(
+    path: &Path,
+    file: &File,
+    normalize_mode: bool,
+) -> Result<std::fs::Metadata, PersistenceFailure> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let parent = path.parent().ok_or_else(|| {
+        PersistenceFailure::invalid("window-state file has no parent directory")
+    })?;
+    let directory = parent
+        .symlink_metadata()
+        .map_err(|error| PersistenceFailure::io("inspect state directory", error))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| PersistenceFailure::io("inspect open state file", error))?;
+    let named = path
+        .symlink_metadata()
+        .map_err(|error| PersistenceFailure::io("revalidate named state file", error))?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if directory.file_type().is_symlink()
+        || !directory.is_dir()
+        || directory.uid() != expected_uid
+        || directory.permissions().mode() & 0o7777 != 0o700
+        || !opened.is_file()
+        || named.file_type().is_symlink()
+        || !named.is_file()
+        || opened.uid() != expected_uid
+        || named.uid() != expected_uid
+        || opened.dev() != directory.dev()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.nlink() != 1
+        || named.nlink() != 1
+    {
+        return Err(PersistenceFailure::invalid(
+            "window-state file is not a private, direct, single-link authority",
+        ));
+    }
+    if normalize_mode && opened.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| PersistenceFailure::io("tighten state file permissions", error))?;
+    }
+    let opened_after = file
+        .metadata()
+        .map_err(|error| PersistenceFailure::io("re-inspect open state file", error))?;
+    let named_after = path
+        .symlink_metadata()
+        .map_err(|error| PersistenceFailure::io("revalidate named state file", error))?;
+    if !opened_after.is_file()
+        || named_after.file_type().is_symlink()
+        || !named_after.is_file()
+        || opened_after.uid() != expected_uid
+        || named_after.uid() != expected_uid
+        || opened_after.dev() != directory.dev()
+        || opened_after.dev() != named_after.dev()
+        || opened_after.ino() != named_after.ino()
+        || opened_after.nlink() != 1
+        || named_after.nlink() != 1
+        || opened_after.permissions().mode() & 0o7777 != 0o600
+        || named_after.permissions().mode() & 0o7777 != 0o600
+    {
+        return Err(PersistenceFailure::invalid(
+            "window-state file identity or permissions changed during validation",
+        ));
+    }
+    Ok(opened_after)
+}
+
+#[cfg(not(unix))]
+fn validate_state_file_descriptor(
+    path: &Path,
+    file: &File,
+    _normalize_mode: bool,
+) -> Result<std::fs::Metadata, PersistenceFailure> {
+    let opened = file
+        .metadata()
+        .map_err(|error| PersistenceFailure::io("inspect open state file", error))?;
+    let named = path
+        .symlink_metadata()
+        .map_err(|error| PersistenceFailure::io("revalidate named state file", error))?;
+    if !opened.is_file() || named.file_type().is_symlink() || !named.is_file() {
+        return Err(PersistenceFailure::invalid(
+            "window-state file is not a direct regular file",
+        ));
+    }
+    Ok(opened)
+}
+
+fn open_state_file(
+    path: &Path,
+    write: bool,
+    create: bool,
+    operation: &'static str,
+) -> Result<(File, std::fs::Metadata), PersistenceFailure> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| PersistenceFailure::io(operation, error))?;
+    let metadata = validate_state_file_descriptor(path, &file, true)?;
+    Ok((file, metadata))
+}
+
 fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFailure> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    match path.symlink_metadata() {
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ReadSlot::Missing),
-        Err(error) => return Err(PersistenceFailure::io("stat state slot", error)),
-    };
+        Err(error) => return Err(PersistenceFailure::io("inspect state slot", error)),
+    }
+    let (mut file, metadata) = open_state_file(path, false, false, "open state slot")?;
     if metadata.len() > MAX_STATE_FILE_BYTES {
         return Ok(ReadSlot::Oversized(metadata.len()));
     }
     let read_limit = MAX_STATE_FILE_BYTES + 1;
     let bounded_capacity = usize::try_from(metadata.len().min(MAX_STATE_FILE_BYTES)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(bounded_capacity);
-    File::open(path)
-        .map_err(|error| PersistenceFailure::io("open state slot", error))?
+    (&mut file)
         .take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(|error| PersistenceFailure::io("read state slot", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual > MAX_STATE_FILE_BYTES {
         return Ok(ReadSlot::Oversized(actual));
