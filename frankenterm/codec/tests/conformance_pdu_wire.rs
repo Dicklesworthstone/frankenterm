@@ -15,6 +15,7 @@
 //! under test control.
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::path::PathBuf;
 
 use codec::{
@@ -43,6 +44,8 @@ use termwiz::surface::Line;
 // accidentally succeed against wrong boundaries.
 const MAX_PDU_SIZE: usize = 256 * 1024 * 1024;
 const COMPRESSED_MASK: u64 = 1 << 63;
+/// Wire ID 5 is a retained historical gap in the exhaustive registry contract.
+const HISTORICAL_UNASSIGNED_PDU_IDENT: u64 = 5;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -724,16 +727,29 @@ fn conformance_mux_pdu_roundtrip_decodes_one_byte_chunks_in_order() {
 
 #[test]
 fn conformance_valid_non_canonical_leb128_headers_are_accepted() {
-    // tagged_len=4, serial=1, ident=99, each encoded in a 2-byte non-canonical
-    // form. The frame is valid because tagged_len counts the ACTUAL bytes consumed
-    // by serial + ident on the wire: 2 + 2 = 4, leaving data_len = 0.
-    let wire = frame_verbatim(&[0x84, 0x00], &[0x81, 0x00], &[0xE3, 0x00], &[]);
+    assert!(
+        Pdu::wire_spec_for_ident(HISTORICAL_UNASSIGNED_PDU_IDENT).is_none(),
+        "the unknown-ID fixture must remain unassigned"
+    );
+    // tagged_len=4; serial and the historical-gap ident are each encoded in a
+    // 2-byte non-canonical form. The frame is valid because tagged_len counts
+    // the ACTUAL bytes consumed on the wire: 2 + 2 = 4, leaving data_len = 0.
+    let ident_byte =
+        u8::try_from(HISTORICAL_UNASSIGNED_PDU_IDENT).expect("historical gap ID fits one byte");
+    let wire = frame_verbatim(
+        &[0x84, 0x00],
+        &[0x81, 0x00],
+        &[ident_byte | 0x80, 0x00],
+        &[],
+    );
     let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
     assert_eq!(
         decoded,
         DecodedPdu {
             serial: 1,
-            pdu: Pdu::Invalid { ident: 99 },
+            pdu: Pdu::Invalid {
+                ident: HISTORICAL_UNASSIGNED_PDU_IDENT,
+            },
         }
     );
 }
@@ -794,8 +810,13 @@ fn conformance_stream_decode_preserves_malformed_complete_frame() {
 
 #[test]
 fn conformance_unknown_ident_zero_data_yields_invalid_variant() {
-    // tagged_len = enc_len(serial=7) + enc_len(ident=99) = 1 + 1 = 2, data_len = 0.
-    let wire = frame(2, 7, 99, &[]);
+    assert!(
+        Pdu::wire_spec_for_ident(HISTORICAL_UNASSIGNED_PDU_IDENT).is_none(),
+        "the unknown-ID fixture must remain unassigned"
+    );
+    let serial = 7;
+    let tagged_len = well_formed_len(serial, HISTORICAL_UNASSIGNED_PDU_IDENT, 0);
+    let wire = frame(tagged_len, serial, HISTORICAL_UNASSIGNED_PDU_IDENT, &[]);
     let mut stream = StreamingPduBuffer::from(wire);
     let decoded = Pdu::stream_decode(&mut stream)
         .unwrap()
@@ -803,8 +824,10 @@ fn conformance_unknown_ident_zero_data_yields_invalid_variant() {
     assert_eq!(
         decoded,
         DecodedPdu {
-            serial: 7,
-            pdu: Pdu::Invalid { ident: 99 },
+            serial,
+            pdu: Pdu::Invalid {
+                ident: HISTORICAL_UNASSIGNED_PDU_IDENT,
+            },
         }
     );
 }

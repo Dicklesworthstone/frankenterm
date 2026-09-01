@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::io::{self, Read};
 
 use codec::{
@@ -50,14 +51,19 @@ impl Read for ScriptedReader {
 
 #[test]
 fn stream_decode_unknown_ident_consumes_frame() {
-    // len=2, serial=1, ident=99 (unknown), no payload
-    let mut buffer = StreamingPduBuffer::from(vec![2, 1, 99]);
+    // Wire ID 5 is a retained historical gap in the registry.  Using an
+    // assigned-looking future ID here made this fixture silently stale when
+    // PDU 99 became SendPasteTracedV1.
+    let ident = 5;
+    assert!(Pdu::wire_spec_for_ident(ident).is_none());
+    let ident_byte = u8::try_from(ident).expect("historical gap ID fits one byte");
+    let mut buffer = StreamingPduBuffer::from(vec![2, 1, ident_byte]);
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(
         decoded,
         DecodedPdu {
             serial: 1,
-            pdu: Pdu::Invalid { ident: 99 }
+            pdu: Pdu::Invalid { ident }
         }
     );
     assert!(buffer.is_empty());
