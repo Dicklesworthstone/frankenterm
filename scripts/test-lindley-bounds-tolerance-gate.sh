@@ -15,7 +15,7 @@
 #
 # This is the substrate-level test that backs the bead's
 # "Synthetic test with deviation > 20% triggers / ≤ 20% does not"
-# acceptance. The PR-CI workflow at .github/workflows/lindley-bounds-check.yml
+# acceptance. The retired PR-CI workflow (lindley-bounds-check; releases are DSR-only now)
 # inherits the same exit-code contract — passing this test on any
 # host is sufficient evidence that the gate semantics hold.
 #
@@ -27,7 +27,7 @@
 # Bead: br-ft-jfyz7.1 (PR-CI regression bead automation).
 # Substrate: scripts/lindley-bounds-build.sh +
 #   crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69).
-# Workflow: .github/workflows/lindley-bounds-check.yml (cc_1, br-ft-jfyz7.1).
+# Origin: the retired lindley-bounds-check workflow (cc_1, br-ft-jfyz7.1); run manually or via DSR.
 
 set -uo pipefail
 

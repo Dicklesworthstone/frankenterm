@@ -68,7 +68,7 @@
     }
   ],
   "ci": {
-    "workflow": ".github/workflows/adversarial-contract-fuzz.yml",
+    "workflow": "scripts/release-gates.sh",
     "pull_request_seconds_per_target": 1800,
     "release_seconds_per_target": 86400,
     "release_campaign_status": "not_run_in_this_bead"

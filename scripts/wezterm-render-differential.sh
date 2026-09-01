@@ -245,7 +245,7 @@ artifact = {
     "allowlisted_divergences": allowlisted,
     "novel_divergences": novel,
     "ci_contract": {
-        "workflow": ".github/workflows/wezterm-render-differential.yml",
+        "workflow": "scripts/wezterm-render-differential.sh (manual/DSR; no GitHub workflow)",
         "fixed_corpus_seed": "tests/fixtures/terminal-conformance/manifest.json",
         "ssim_infra": "crates/frankenterm-gui/src/gpu_regression.rs::compare_images",
         "new_divergence_policy": "fail",

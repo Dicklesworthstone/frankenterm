@@ -24,7 +24,9 @@
 #                                                      # at the latest
 #                                                      # report)
 #
-# Cron cadence: see .github/workflows/reality-check-drumbeat.yml.
+# Cadence: run manually (or from a local cron) when
+# scripts/check-reality-check-due.sh reports a due trigger; releases are
+# DSR-only and no GitHub workflow drives this script.
 # README link cadence: the cron job rewrites the dated link in the
 # README's "Trust & Attestation" section after each run.
 #
@@ -201,7 +203,7 @@ EOF
 - Bead board (open RC work): \`br list --label reality-check --status=open\`
 - Bridge plan: [\`docs/reality-check-bridge-plan.md\`](../reality-check-bridge-plan.md)
 - Attestation schema + verifier: [\`docs/attestations/schema.json\`](../attestations/schema.json), [\`scripts/attestation-verify.sh\`](../../scripts/attestation-verify.sh)
-- Cadence: weekly via \`.github/workflows/reality-check-drumbeat.yml\`
+- Cadence: manual, when \`scripts/check-reality-check-due.sh\` reports a due trigger
 EOF
 }
 

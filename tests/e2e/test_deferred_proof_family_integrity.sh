@@ -15,7 +15,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
-CI_WORKFLOW=".github/workflows/ci.yml"
+# Releases are DSR-only; the static verifiers are wired in the repo gate
+# script instead of a GitHub workflow (ft-xxfwy.16).
+CI_WORKFLOW="scripts/release-gates.sh"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 MANIFEST_GLOB="fixtures/deferred-proof-replay"
 SCHEMA_GLOB="docs/json-schema"
@@ -26,7 +28,7 @@ fail() {
 }
 
 command -v jq >/dev/null 2>&1 || fail "missing command: jq"
-[[ -f "${CI_WORKFLOW}" ]] || fail "missing CI workflow: ${CI_WORKFLOW}"
+[[ -f "${CI_WORKFLOW}" ]] || fail "missing release gate script: ${CI_WORKFLOW}"
 [[ -f "${PROVENANCE}" ]] || fail "missing provenance: ${PROVENANCE}"
 
 # --- A. Every family verifier is executable and wired into CI ------------
@@ -37,7 +39,7 @@ for v in "${verifiers[@]}"; do
   [[ -f "${v}" ]] || fail "verifier missing: ${v}"
   [[ -x "${v}" ]] || fail "verifier not executable: ${v}"
   base="$(basename "${v}")"
-  grep -Fq "${base}" "${CI_WORKFLOW}" || fail "verifier not wired into CI: ${base} (add it to ${CI_WORKFLOW})"
+  grep -Fq "${base}" "${CI_WORKFLOW}" || fail "verifier not wired into the release gate: ${base} (add it to ${CI_WORKFLOW})"
 done
 
 # --- B. Every manifest's referenced files exist --------------------------

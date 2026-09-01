@@ -416,7 +416,7 @@ parity_report = {
     },
     "threshold_semantics": "pass requires ssim >= min_ssim AND l_inf <= max_l_inf AND changed_pixel_fraction <= max_changed_pixel_fraction; fixture meta.json may tighten or loosen these defaults",
     "ci_contract": {
-        "nightly_trigger": ".github/workflows/ci.yml schedule",
+        "nightly_trigger": "manual (DSR-only; no GitHub workflow schedule)",
         "hard_gate_job": "gpu-regression-macos",
         "hard_gate_runner": "macos-15",
         "soft_pilot_job": "gpu-linux-llvmpipe-pilot",

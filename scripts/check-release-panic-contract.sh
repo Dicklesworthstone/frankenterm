@@ -160,24 +160,9 @@ if [[ $stale_packaging_script_status -ne 1 ]]; then
   exit 1
 fi
 
-STALE_RELEASE_WORKFLOW_PATTERN='panic\.cli=abort|target/\$\{\{ matrix\.target \}\}/(release|release-abort-probe)/\$\{\{ matrix\.artifact \}\}|cargo build --release --target'
-set +e
-stale_release_workflow_refs="$(
-  grep -n -E "$STALE_RELEASE_WORKFLOW_PATTERN" \
-    "$REPO_ROOT/.github/workflows/release.yml" \
-    "$REPO_ROOT/.github/workflows/ci.yml"
-)"
-stale_release_workflow_status=$?
-set -e
-if [[ $stale_release_workflow_status -eq 0 ]]; then
-  echo "release workflow still packages outside the release-interactive identity:" >&2
-  echo "$stale_release_workflow_refs" >&2
-  exit 1
-fi
-if [[ $stale_release_workflow_status -ne 1 ]]; then
-  echo "could not audit shipped workflow profile selection" >&2
-  exit 1
-fi
+# Release packaging is DSR-only (AGENTS.md Rule 0.1); there is no GitHub
+# workflow to audit. The packaging scripts audited above are the shipped
+# profile-selection surface.
 
 if [[ "$PROFILES_ONLY" == true ]]; then
   echo "PANIC_PROFILE_STATIC_CONTRACT_SUCCESS"

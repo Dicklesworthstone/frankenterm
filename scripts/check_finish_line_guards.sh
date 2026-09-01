@@ -3,7 +3,7 @@
 #
 # Runs every guard listed in docs/ft-xbnl0-5-2-finish-line-guards.json
 # and aggregates the results into a single summary.json. This is the entry
-# point wired into CI (.github/workflows/finish-line-guards.yml) and the
+# point for the release gate (scripts/release-gates.sh; DSR-only) and the
 # contributor path (cargo test ft_xbnl0_5_2_finish_line_guards).
 #
 # Exit codes:

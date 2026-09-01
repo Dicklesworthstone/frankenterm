@@ -14,7 +14,9 @@ static_attestation_run_ruby - <<'RUBY'
 require "yaml"
 
 MANIFEST = "docs/security/adversarial-contract-fuzz.json"
-WORKFLOW = ".github/workflows/adversarial-contract-fuzz.yml"
+# Releases are DSR-only (AGENTS.md Rule 0.1): the fuzz campaign is wired
+# through the repo release-gate script, not a GitHub workflow (ft-xxfwy.16).
+WORKFLOW = "scripts/release-gates.sh"
 FUZZ_CARGO = "fuzz/Cargo.toml"
 
 def assert_ok(condition, message, check:, input_path: nil, expected: true, actual: condition)
@@ -260,7 +262,6 @@ StaticAttestation.require_direct_exec_script!(
 
 manifest = StaticAttestation.read_json!(MANIFEST, check: "adversarial.manifest_json")
 workflow_text = StaticAttestation.read_text!(WORKFLOW, check: "adversarial.workflow_text")
-workflow = YAML.safe_load(workflow_text, aliases: true)
 fuzz_toml = StaticAttestation.read_text!(FUZZ_CARGO, check: "adversarial.fuzz_cargo")
 fuzz_bins = parse_fuzz_bins(fuzz_toml)
 
@@ -303,53 +304,30 @@ expect_equal(ci["workflow"], WORKFLOW, "ci.workflow must point at workflow file"
 expect_equal(ci["pull_request_seconds_per_target"], 1800, "PR fuzz seconds must remain 1800", check: "adversarial.ci.pr_seconds", input_path: MANIFEST)
 expect_equal(ci["release_seconds_per_target"], 86_400, "release fuzz seconds must remain 86400", check: "adversarial.ci.release_seconds", input_path: MANIFEST)
 
-workflow_events = workflow["on"] || workflow[true]
-assert_ok(
-  workflow_events.is_a?(Hash),
-  "workflow event block missing",
-  check: "adversarial.workflow.events",
-  input_path: WORKFLOW,
-  expected: "hash",
-  actual: workflow_events,
+# The release-gate script must run this static verifier and must derive the
+# fuzz campaign (targets, corpora, and the per-target time budget) from the
+# manifest itself rather than from a hand-maintained matrix, so the manifest
+# stays the single source of truth for what gets fuzzed.
+StaticAttestation.require_terms!(
+  workflow_text,
+  StaticAttestation.expected_strings(
+    "tests/e2e/test_adversarial_contract_fuzz_manifest.sh",
+    MANIFEST,
+    "cargo fuzz run",
+    "-max_total_time=",
+    ".targets[] | [.cargo_fuzz_target, .corpus]",
+  ),
+  source: WORKFLOW,
+  check: "adversarial.workflow.campaign_wiring",
 )
-paths = workflow_events.fetch("pull_request").fetch("paths")
-[
-  "crates/frankenterm-core/**",
-  "docs/json-schema/**",
-  MANIFEST,
-  "fuzz/**",
-  WORKFLOW,
-].each do |path|
+manifest_pairs.each do |target, corpus|
   assert_ok(
-    paths.include?(path),
-    "workflow pull_request paths missing #{path}",
-    check: "adversarial.workflow.pr_paths",
-    input_path: WORKFLOW,
-    expected: path,
-    actual: paths,
-  )
-end
-
-jobs = workflow.fetch("jobs")
-{
-  "pr-fuzz" => 1800,
-  "release-fuzz" => 86_400,
-}.each do |job_name, expected_seconds|
-  job = jobs.fetch(job_name)
-  matrix = job.fetch("strategy").fetch("matrix").fetch("include")
-  matrix_pairs = matrix.map { |row| [row.fetch("target"), normalize_dir(row.fetch("corpus"))] }.sort
-  expect_equal(
-    matrix_pairs,
-    manifest_pairs.sort,
-    "#{job_name} matrix does not match manifest targets",
-    check: "adversarial.workflow.#{job_name}.matrix",
-    input_path: WORKFLOW,
-  )
-  StaticAttestation.require_terms!(
-    workflow_text,
-    StaticAttestation.expected_strings("-max_total_time=#{expected_seconds}"),
-    source: WORKFLOW,
-    check: "adversarial.workflow.#{job_name}.timeout",
+    File.directory?(corpus),
+    "manifest corpus directory missing for #{target}",
+    check: "adversarial.manifest.corpus_dir",
+    input_path: MANIFEST,
+    expected: corpus,
+    actual: File.directory?(corpus) ? "present" : "missing",
   )
 end
 

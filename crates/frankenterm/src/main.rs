@@ -18157,12 +18157,17 @@ fn publish_agent_config_candidate_with_hooks<F, G>(
     mut source: Option<&mut OpenAgentConfigFile>,
     before_effect: F,
     before_rollback: G,
-) -> std::result::Result<Option<PathBuf>, String>
+) -> std::result::Result<Option<PathBuf>, AgentConfigPublicationError>
 where
     F: FnOnce() -> std::io::Result<()>,
     G: FnOnce() -> std::io::Result<()>,
 {
-    use rustix::fs::{RenameFlags, renameat_with};
+    let mut effect_occurred = false;
+    let mut rename_failed_before_effect = false;
+    let mut effect_parent_synced = false;
+    let mut rollback_completed = false;
+    let result = (|| -> std::result::Result<Option<PathBuf>, String> {
+        use rustix::fs::{RenameFlags, renameat_with};
 
     let target_leaf = agent_config_leaf(target_path)?;
     verify_secure_named_agent_config(
@@ -18199,27 +18204,29 @@ where
     } else {
         RenameFlags::NOREPLACE
     };
-    renameat_with(
-        &parent_file,
-        &candidate.leaf,
-        &parent_file,
-        &target_leaf,
-        flags,
-    )
-    .map_err(|err| {
-        format!(
-            "Atomic agent config publication for '{}' failed; candidate retained at '{}': {}",
-            target_path.display(),
-            candidate.path.display(),
-            std::io::Error::from(err)
-        )
-    })?;
+        if let Err(err) = renameat_with(
+            &parent_file,
+            &candidate.leaf,
+            &parent_file,
+            &target_leaf,
+            flags,
+        ) {
+            rename_failed_before_effect = true;
+            return Err(format!(
+                "Atomic agent config publication for '{}' failed before changing the namespace; candidate retained at '{}': {}",
+                target_path.display(),
+                candidate.path.display(),
+                std::io::Error::from(err)
+            ));
+        }
+        effect_occurred = true;
     parent_file.sync_all().map_err(|err| {
         format!(
             "Agent config namespace changed but parent synchronization failed for '{}'; target and rollback evidence require reconciliation: {err}",
             target_path.display()
         )
     })?;
+        effect_parent_synced = true;
     parent.revalidate()?;
 
     verify_secure_named_agent_config(
@@ -18349,6 +18356,7 @@ where
                     )
                 })?;
                 parent.revalidate()?;
+                rollback_completed = true;
                 return Err(format!(
                     "Atomic agent config publication for '{}' was rolled back because a symlink replaced the target at the effect boundary; the symlink was restored exactly and the complete candidate is retained at '{}'.",
                     target_path.display(),
@@ -18465,6 +18473,7 @@ where
                 )
             })?;
             parent.revalidate()?;
+            rollback_completed = true;
             return Err(format!(
                 "Atomic agent config publication for '{}' was rolled back because the target changed at the effect boundary; the substituted target was restored exactly and the complete candidate is retained at '{}'.",
                 target_path.display(),
@@ -18475,7 +18484,21 @@ where
         None
     };
     parent.revalidate()?;
-    Ok(displaced_path)
+        Ok(displaced_path)
+    })();
+    result.map_err(|message| AgentConfigPublicationError {
+        outcome: if rollback_completed {
+            AgentConfigTransactionOutcome::ConflictRolledBack
+        } else if rename_failed_before_effect {
+            AgentConfigTransactionOutcome::ConflictBeforeEffect
+        } else if effect_occurred {
+            AgentConfigTransactionOutcome::Indeterminate
+        } else {
+            AgentConfigTransactionOutcome::NoEffect
+        },
+        message,
+        effect_parent_synced,
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -18486,7 +18509,7 @@ fn publish_agent_config_candidate_with_hook<F>(
     candidate_bytes: &[u8],
     source: Option<&mut OpenAgentConfigFile>,
     before_effect: F,
-) -> std::result::Result<Option<PathBuf>, String>
+) -> std::result::Result<Option<PathBuf>, AgentConfigPublicationError>
 where
     F: FnOnce() -> std::io::Result<()>,
 {
@@ -18508,7 +18531,7 @@ fn publish_agent_config_candidate(
     candidate: &mut StagedAgentConfig,
     candidate_bytes: &[u8],
     source: Option<&mut OpenAgentConfigFile>,
-) -> std::result::Result<Option<PathBuf>, String> {
+) -> std::result::Result<Option<PathBuf>, AgentConfigPublicationError> {
     publish_agent_config_candidate_with_hook(
         parent,
         target_path,
@@ -18526,11 +18549,15 @@ fn publish_agent_config_candidate(
     _candidate: &mut StagedAgentConfig,
     _candidate_bytes: &[u8],
     _source: Option<&mut OpenAgentConfigFile>,
-) -> std::result::Result<Option<PathBuf>, String> {
-    Err(format!(
-        "Atomic agent config publication for '{}' is unsupported on this platform.",
-        target_path.display()
-    ))
+) -> std::result::Result<Option<PathBuf>, AgentConfigPublicationError> {
+    Err(AgentConfigPublicationError {
+        message: format!(
+            "Atomic agent config publication for '{}' is unsupported on this platform.",
+            target_path.display()
+        ),
+        outcome: AgentConfigTransactionOutcome::NoEffect,
+        effect_parent_synced: false,
+    })
 }
 
 fn apply_prepared_agent_config(
@@ -23413,6 +23440,30 @@ const SEND_OSC_SEGMENT_LIMIT: usize = 200;
 struct CapabilityResolution {
     capabilities: frankenterm_core::policy::PaneCapabilities,
     warnings: Vec<String>,
+}
+
+/// Resolve prompt / alt-screen / gap evidence for every pane a tx contract
+/// references, so the CLI prepare gates see the same capability chain the
+/// MCP tx surface uses (ft-zhwa6, mirrors `mcp_tools::resolve_tx_prepare_capabilities`).
+///
+/// Without this the storage-backed target lookup evaluates every pane as
+/// `PaneCapabilities::unknown`, which makes `prompt_active` preconditions
+/// impossible to satisfy from `ft tx run` / `ft tx rollback` no matter what
+/// the pane is actually doing.
+async fn resolve_tx_contract_capabilities(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    storage: &frankenterm_core::storage::StorageHandle,
+    ipc_socket_path: Option<&Path>,
+) -> HashMap<u64, frankenterm_core::policy::PaneCapabilities> {
+    let mut capabilities = HashMap::new();
+    for pane_id in contract.referenced_pane_ids() {
+        let resolution = resolve_pane_capabilities(pane_id, Some(storage), ipc_socket_path).await;
+        for warning in &resolution.warnings {
+            tracing::debug!(pane_id, %warning, "tx capability resolution warning");
+        }
+        capabilities.insert(pane_id, resolution.capabilities);
+    }
+    capabilities
 }
 
 async fn derive_osc_state_from_storage(
@@ -55889,11 +55940,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
                                                 Some(&storage),
                                             );
+                                        let resolved_capabilities =
+                                            resolve_tx_contract_capabilities(
+                                                &contract,
+                                                &storage,
+                                                Some(layout.ipc_socket_path.as_path()),
+                                            )
+                                            .await;
                                         let targets =
                                             frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
                                                 None,
                                                 Some(&storage),
-                                            );
+                                            )
+                                            .with_resolved_capabilities(resolved_capabilities);
                                         let prepare_context =
                                             frankenterm_core::plan::TxPrepareEvaluationContext::new(
                                                 layout.root.to_string_lossy().to_string(),
@@ -56126,11 +56185,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
                                                 Some(&storage),
                                             );
+                                        let resolved_capabilities =
+                                            resolve_tx_contract_capabilities(
+                                                &contract,
+                                                &storage,
+                                                Some(layout.ipc_socket_path.as_path()),
+                                            )
+                                            .await;
                                         let targets =
                                             frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
                                                 None,
                                                 Some(&storage),
-                                            );
+                                            )
+                                            .with_resolved_capabilities(resolved_capabilities);
                                         let prepare_context =
                                             frankenterm_core::plan::TxPrepareEvaluationContext::new(
                                                 layout.root.to_string_lossy().to_string(),
@@ -62431,10 +62498,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(Some(
                             &storage,
                         ));
+                    let resolved_capabilities = resolve_tx_contract_capabilities(
+                        &contract,
+                        &storage,
+                        Some(layout.ipc_socket_path.as_path()),
+                    )
+                    .await;
                     let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
                         None,
                         Some(&storage),
-                    );
+                    )
+                    .with_resolved_capabilities(resolved_capabilities);
                     let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
                         layout.root.to_string_lossy().to_string(),
                     )
@@ -76774,10 +76848,17 @@ async fn handle_tx_command(
                 let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
                     Some(&storage),
                 );
+                let resolved_capabilities = resolve_tx_contract_capabilities(
+                    &contract,
+                    &storage,
+                    Some(layout.ipc_socket_path.as_path()),
+                )
+                .await;
                 let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
                     None,
                     Some(&storage),
-                );
+                )
+                .with_resolved_capabilities(resolved_capabilities);
                 let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
                     layout.root.to_string_lossy().to_string(),
                 )
@@ -76973,10 +77054,17 @@ async fn handle_tx_command(
                 let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
                     Some(&storage),
                 );
+                let resolved_capabilities = resolve_tx_contract_capabilities(
+                    &contract,
+                    &storage,
+                    Some(layout.ipc_socket_path.as_path()),
+                )
+                .await;
                 let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
                     None,
                     Some(&storage),
-                );
+                )
+                .with_resolved_capabilities(resolved_capabilities);
                 let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
                     layout.root.to_string_lossy().to_string(),
                 )
