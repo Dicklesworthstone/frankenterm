@@ -125259,6 +125259,212 @@ printf x > "$MINISIGN_MARKER"
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn agent_config_unacknowledged_pre_effect_crash_windows_are_no_effect() {
+        let create_root = unique_temp_dir("agent_config_create_no_effect_recovery");
+        let create_target = create_root.join("AGENTS.md");
+        let create_parent = open_agent_config_parent(&create_target, false)
+            .unwrap()
+            .unwrap();
+        let create_transaction = AgentConfigTransaction::new();
+        let requested = AgentConfigSecuritySnapshot {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            mode: 0o600,
+        };
+        let create_claim = build_agent_config_transaction_claim(
+            &create_parent,
+            &create_target,
+            frankenterm_core::agent_config_templates::ConfigAction::Create,
+            None,
+            b"complete candidate\n",
+            requested,
+            &create_transaction,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_unacknowledged_agent_config_transaction(
+                &create_parent,
+                &create_target,
+                &create_transaction,
+                &create_claim,
+            )
+            .unwrap(),
+            AgentConfigTransactionOutcome::NoEffect
+        );
+        let mut create_candidate =
+            create_agent_config_candidate(&create_parent, None, &create_transaction).unwrap();
+        create_candidate.file.write_all(b"partial").unwrap();
+        assert_eq!(
+            classify_unacknowledged_agent_config_transaction(
+                &create_parent,
+                &create_target,
+                &create_transaction,
+                &create_claim,
+            )
+            .unwrap(),
+            AgentConfigTransactionOutcome::NoEffect,
+            "a private partial candidate cannot imply a target effect"
+        );
+
+        let update_root = unique_temp_dir("agent_config_update_no_effect_recovery");
+        let update_target = update_root.join("AGENTS.md");
+        std::fs::write(&update_target, b"original\n").unwrap();
+        let update_parent = open_agent_config_parent(&update_target, false)
+            .unwrap()
+            .unwrap();
+        let update_source = read_open_agent_config_file(
+            &update_parent,
+            &update_target,
+            AgentConfigOpenIntent::Update,
+        )
+        .unwrap()
+        .unwrap();
+        let update_security = update_source.security.unwrap();
+        let update_transaction = AgentConfigTransaction::new();
+        let update_claim = build_agent_config_transaction_claim(
+            &update_parent,
+            &update_target,
+            frankenterm_core::agent_config_templates::ConfigAction::Append,
+            Some(&update_source),
+            b"complete replacement\n",
+            update_security,
+            &update_transaction,
+        )
+        .unwrap();
+        let mut update_candidate = create_agent_config_candidate(
+            &update_parent,
+            Some(update_security),
+            &update_transaction,
+        )
+        .unwrap();
+        update_candidate.file.write_all(b"partial").unwrap();
+        create_agent_config_backup(
+            &update_parent,
+            &update_target,
+            &update_source,
+            &update_transaction,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_unacknowledged_agent_config_transaction(
+                &update_parent,
+                &update_target,
+                &update_transaction,
+                &update_claim,
+            )
+            .unwrap(),
+            AgentConfigTransactionOutcome::NoEffect,
+            "an unchanged target plus safe staged artifacts is retryable no-effect state"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_reconciliation_validates_unrelated_claims_before_filtering() {
+        let root = unique_temp_dir("agent_config_unrelated_malformed_claim");
+        let target = root.join("AGENTS.md");
+        let unrelated_target = root.join("OTHER.md");
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
+        let transaction = AgentConfigTransaction::new();
+        let mut claim = build_agent_config_transaction_claim(
+            &parent,
+            &unrelated_target,
+            frankenterm_core::agent_config_templates::ConfigAction::Create,
+            None,
+            b"candidate\n",
+            AgentConfigSecuritySnapshot {
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                mode: 0o600,
+            },
+            &transaction,
+        )
+        .unwrap();
+        claim.candidate_sha256 = "sha256:NOT-LOWERCASE-OR-COMPLETE".to_string();
+        let claim_name =
+            agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
+        write_atomic_path_transition_json(
+            &parent.directory,
+            &parent.file,
+            &claim_name,
+            &claim,
+        )
+        .unwrap();
+
+        let error = reconcile_agent_config_transactions_for_target(&parent, &target, false)
+            .expect_err("an unrelated malformed claim must fail before target filtering");
+        assert!(error.contains("claim that is not bound"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_ack_self_sync_milestones_are_promoted_only_after_recovery() {
+        let root = unique_temp_dir("agent_config_ack_self_sync");
+        let target = root.join("AGENTS.md");
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
+        let transaction = AgentConfigTransaction::new();
+        let claim = build_agent_config_transaction_claim(
+            &parent,
+            &target,
+            frankenterm_core::agent_config_templates::ConfigAction::Create,
+            None,
+            b"candidate\n",
+            AgentConfigSecuritySnapshot {
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                mode: 0o600,
+            },
+            &transaction,
+        )
+        .unwrap();
+        let claim_name =
+            agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
+        let claim_bytes = write_atomic_path_transition_json(
+            &parent.directory,
+            &parent.file,
+            &claim_name,
+            &claim,
+        )
+        .unwrap();
+        let claim_sha256 = agent_config_sha256(&claim_bytes)
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string();
+        let immediate_receipt = write_agent_config_transaction_ack(
+            &parent,
+            &target,
+            &transaction,
+            &claim,
+            &claim_sha256,
+            AgentConfigTransactionOutcome::NoEffect,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(immediate_receipt.ack_file_synced);
+        assert!(immediate_receipt.ack_parent_synced);
+
+        let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf").unwrap();
+        let (persisted_ack, _) = read_atomic_path_transition_json::<AgentConfigTransactionAck>(
+            &parent.directory,
+            &ack_name,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!persisted_ack.ack_file_synced);
+        assert!(!persisted_ack.ack_parent_synced);
+
+        let recovered =
+            reconcile_agent_config_transactions_for_target(&parent, &target, false).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].outcome, "no_effect");
+        assert!(recovered[0].ack_file_synced);
+        assert!(recovered[0].ack_parent_synced);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn agent_config_update_intent_and_metadata_validators_fail_closed() {
         use frankensearch_index_acl::fd_acl::ExtendedAclPresence;
         use std::os::fd::AsFd as _;
@@ -125822,6 +126028,19 @@ printf x > "$MINISIGN_MARKER"
         })
         .expect_err("partial candidate failure must withhold publication");
         assert!(error.backup_created);
+        assert!(
+            !error.message.contains("Durable transaction receipt"),
+            "receipts belong in the structured response, never inside an error string"
+        );
+        let receipts =
+            collect_agent_config_transaction_receipts_after_failure(&target).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].outcome, "no_effect");
+        assert!(receipts[0].backup_file_synced);
+        assert!(!receipts[0].candidate_file_synced);
+        assert!(!receipts[0].effect_parent_synced);
+        assert!(receipts[0].ack_file_synced);
+        assert!(receipts[0].ack_parent_synced);
         assert_eq!(std::fs::read(&target).unwrap(), original);
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,

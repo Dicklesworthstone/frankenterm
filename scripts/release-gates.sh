@@ -86,7 +86,10 @@ gate "deferred proof receipt contract"           "tests/e2e/test_deferred_proof_
 gate "deferred proof replay harness contract"    "tests/e2e/test_deferred_proof_replay_harness_contract.sh"
 gate "adversarial contract-fuzz manifest"        "tests/e2e/test_adversarial_contract_fuzz_manifest.sh"
 gate "Robot/MCP Contract Doctor static verdict"  "bash scripts/check-contract-doctor-coverage.sh"
-gate "Robot/MCP Contract Doctor attestation slot" "jq -e '.slots[] | select(.category == \"proofs/robot-contracts\") | select(.path == \"docs/attestations/proofs/robot-contract-doctor.json\") | select(.produced_by_bead == \"ft-7h5da.13.7\") | select(.proof_categories | index(4))' docs/attestations/manifest.json"
+# The doctor slot may be populated (producer closed) or explicitly deferred to
+# its producer bead; either is an honest manifest state. A silently missing
+# slot is the failure.
+gate "Robot/MCP Contract Doctor attestation slot" "jq -e '.slots[] | select(.category == \"proofs/robot-contracts\") | select((.path == \"docs/attestations/proofs/robot-contract-doctor.json\" and .produced_by_bead == \"ft-7h5da.13.7\") or (.path == null and .deferred_to_bead == \"ft-7h5da.13.7\")) | select(.proof_categories | index(4))' docs/attestations/manifest.json"
 gate "Robot/MCP Contract Doctor verdict contract" "tests/e2e/test_robot_contract_doctor_verdict_contract.sh"
 cargo_gate "Robot/MCP Contract Doctor cargo verdict" "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
 

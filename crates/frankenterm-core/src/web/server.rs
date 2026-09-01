@@ -2,13 +2,125 @@
 //!
 //! Extracted from `web.rs` as part of Wave 4B migration (ft-1zej2).
 
-use super::{WebServerConfig, WebServerHandle, build_app};
+use super::{StorageEventTail, WebServerConfig, WebServerHandle, build_app};
+use crate::events::{Event, EventBus};
+use crate::patterns::{AgentType, Detection, Severity};
 use crate::runtime_async::signal;
+use crate::storage::{EventQuery, EventStreamQuery, StorageHandle, StoredEvent};
 use crate::web_framework::{FrameworkWebRuntime, web_cx_error};
 use crate::{Error, Result};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// How often the storage tail polls for new events when it is caught up.
+const STORAGE_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Rows fetched per poll; a full batch means "poll again immediately".
+const STORAGE_TAIL_BATCH: usize = 256;
+
+/// Rebuild the bus event the watcher would have published for a stored
+/// detection. Unknown agent/severity labels fall back to the least-privileged
+/// variants instead of dropping the event, so a malformed row is still
+/// visible to stream consumers.
+fn stored_event_to_bus_event(stored: StoredEvent) -> Event {
+    let agent_type =
+        serde_json::from_value(serde_json::Value::String(stored.agent_type.clone()))
+            .unwrap_or(AgentType::Unknown);
+    let severity = serde_json::from_value(serde_json::Value::String(stored.severity.clone()))
+        .unwrap_or(Severity::Info);
+    let detection = Detection {
+        rule_id: stored.rule_id,
+        agent_type,
+        event_type: stored.event_type,
+        severity,
+        confidence: stored.confidence,
+        extracted: stored.extracted.unwrap_or(serde_json::Value::Null),
+        matched_text: stored.matched_text.unwrap_or_default(),
+        span: (0, 0),
+    };
+    Event::PatternDetected {
+        pane_id: stored.pane_id,
+        pane_uuid: None,
+        detection: crate::runtime::redact_detection(&detection),
+        event_id: Some(stored.id),
+    }
+}
+
+/// Follow newly persisted detection events from `storage` and republish them
+/// on `bus`, so a standalone `ft web` streams live detections without running
+/// a capture pipeline of its own (ft-zeo5o).
+///
+/// Starts after the newest persisted event so a server restart never replays
+/// history through the bus. Rows are delivered in ascending id order; the
+/// cursor only moves forward, so a retention sweep that removes old rows
+/// cannot cause redelivery.
+pub(super) async fn spawn_storage_event_tail(
+    cx: &crate::cx::Cx,
+    storage: StorageHandle,
+    bus: Arc<EventBus>,
+    poll_interval: Duration,
+    batch: usize,
+) -> StorageEventTail {
+    let (stop, stop_rx) = crate::runtime_async::watch::channel(false);
+    let mut cursor = storage
+        .get_events(EventQuery {
+            limit: Some(1),
+            ..EventQuery::default()
+        })
+        .await
+        .ok()
+        .and_then(|events| events.first().map(|event| event.id))
+        .unwrap_or(0);
+    let batch = batch.max(1);
+
+    let task = crate::runtime_async::task::spawn_with_cx(cx, move |child_cx| async move {
+        info!(target: "wa.web", start_after_event_id = cursor, "storage event tail started");
+        loop {
+            if *stop_rx.borrow() || child_cx.checkpoint().is_err() {
+                break;
+            }
+            let query = EventStreamQuery {
+                after_id: Some(cursor),
+                limit: Some(batch),
+                ..EventStreamQuery::default()
+            };
+            let drained = match storage.get_events_stream(query).await {
+                Ok(events) => {
+                    let drained = events.len();
+                    for stored in events {
+                        cursor = cursor.max(stored.id);
+                        bus.publish(stored_event_to_bus_event(stored));
+                    }
+                    drained
+                }
+                Err(error) => {
+                    warn!(
+                        target: "wa.web",
+                        error = %error,
+                        "storage event tail query failed; retrying after the poll interval"
+                    );
+                    0
+                }
+            };
+            if drained >= batch {
+                // More rows may be waiting; yield and poll again immediately.
+                crate::runtime_async::task::yield_now().await;
+                continue;
+            }
+            if crate::runtime_async::sleep_with_cx(&child_cx, poll_interval)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        info!(target: "wa.web", last_event_id = cursor, "storage event tail stopped");
+    });
+
+    StorageEventTail::new(stop, task)
+}
 
 /// Start the web server and return a handle for shutdown.
 ///
@@ -40,18 +152,33 @@ pub async fn start_web_server_with_cx(
     validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
     let runtime_limits = config.runtime_limits;
+    let tail_inputs = if config.storage_event_tail_enabled() {
+        config.storage.clone().zip(config.event_bus.clone())
+    } else {
+        None
+    };
     let app = build_app(config.storage, config.event_bus, runtime_limits);
     let (local_addr, runtime) = FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
+
+    let storage_tail = match tail_inputs {
+        Some((storage, bus)) => Some(
+            spawn_storage_event_tail(cx, storage, bus, STORAGE_TAIL_POLL_INTERVAL, STORAGE_TAIL_BATCH)
+                .await,
+        ),
+        None => None,
+    };
 
     info!(
         target: "wa.web",
         bound_addr = %local_addr,
+        event_source = if storage_tail.is_some() { "storage_tail" } else { "bus_only" },
         "web server listening"
     );
 
     Ok(WebServerHandle {
         bound_addr: local_addr,
         runtime,
+        storage_tail,
     })
 }
 
@@ -105,6 +232,7 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
     let WebServerHandle {
         bound_addr,
         mut runtime,
+        storage_tail,
     } = start_web_server_with_cx(cx, config).await?;
 
     if let Err(error) = write_listening_announcement(std::io::stdout().lock(), bound_addr) {
@@ -125,6 +253,9 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
             (result, Some(shutdown))
         }
     };
+    if let Some(tail) = storage_tail {
+        tail.stop();
+    }
 
     // Once start succeeds, cleanup is mandatory. `finish_with_cx` always runs
     // shutdown hooks after its drain attempt. A cancelled or exhausted caller

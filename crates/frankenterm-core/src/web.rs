@@ -150,6 +150,13 @@ pub struct WebServerConfig {
     /// This does not currently permit non-localhost binding because the web API
     /// has no authentication boundary yet.
     allow_public_bind: bool,
+    /// Tail newly persisted detection events from storage into the event bus
+    /// so a standalone `ft web` (which runs no capture pipeline of its own)
+    /// still serves live detections on `/stream/events`. The watcher writes
+    /// `events` rows from another process and the in-memory bus cannot span
+    /// processes, so the durable table is the bridge (ft-zeo5o). Disable when
+    /// an in-process producer already publishes to the same bus.
+    storage_event_tail: bool,
 }
 
 impl std::fmt::Debug for WebServerConfig {
@@ -161,6 +168,7 @@ impl std::fmt::Debug for WebServerConfig {
             .field("storage", &self.storage.is_some())
             .field("event_bus", &self.event_bus.is_some())
             .field("allow_public_bind", &self.allow_public_bind)
+            .field("storage_event_tail", &self.storage_event_tail)
             .finish()
     }
 }
@@ -176,6 +184,7 @@ impl WebServerConfig {
             storage: None,
             event_bus: None,
             allow_public_bind: false,
+            storage_event_tail: true,
         }
     }
 
@@ -224,6 +233,23 @@ impl WebServerConfig {
         self
     }
 
+    /// Enable or disable the storage → event-bus tail (enabled by default).
+    ///
+    /// Keep it enabled for a standalone `ft web`; disable it when the same
+    /// process already publishes detections to the attached bus, otherwise
+    /// every event would be delivered twice.
+    #[must_use]
+    pub fn with_storage_event_tail(mut self, enabled: bool) -> Self {
+        self.storage_event_tail = enabled;
+        self
+    }
+
+    /// Whether the storage → event-bus tail is enabled.
+    #[must_use]
+    pub fn storage_event_tail_enabled(&self) -> bool {
+        self.storage_event_tail
+    }
+
     /// Record explicit operator intent for a future public bind.
     ///
     /// The current web server still refuses non-localhost binds because its
@@ -269,10 +295,43 @@ impl Default for WebServerConfig {
     }
 }
 
+/// Background task that republishes newly persisted events on the bus.
+///
+/// Raising the stop flag ends the loop at its next poll; cancelling the
+/// context it was spawned under ends it at its next checkpoint.
+pub struct StorageEventTail {
+    stop: crate::runtime_async::watch::Sender<bool>,
+    task: crate::runtime_async::task::JoinHandle<()>,
+}
+
+impl StorageEventTail {
+    pub(crate) fn new(
+        stop: crate::runtime_async::watch::Sender<bool>,
+        task: crate::runtime_async::task::JoinHandle<()>,
+    ) -> Self {
+        Self { stop, task }
+    }
+
+    /// Ask the tail to stop after its current poll.
+    pub fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    /// Stop the tail and hand back its join handle.
+    #[must_use]
+    pub fn into_task(self) -> crate::runtime_async::task::JoinHandle<()> {
+        self.stop();
+        self.task
+    }
+}
+
 /// Handle to a running web server.
 pub struct WebServerHandle {
     bound_addr: SocketAddr,
     runtime: FrameworkWebRuntime,
+    /// Storage → bus event tail, when the server was configured with both a
+    /// storage handle and an event bus and the tail was not disabled.
+    storage_tail: Option<StorageEventTail>,
 }
 
 impl WebServerHandle {
@@ -303,7 +362,14 @@ impl WebServerHandle {
     ///
     /// Tick 101 established the consuming shutdown seam.
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) -> Result<()> {
-        let WebServerHandle { mut runtime, .. } = self;
+        let WebServerHandle {
+            mut runtime,
+            storage_tail,
+            ..
+        } = self;
+        if let Some(tail) = storage_tail {
+            tail.stop();
+        }
         runtime.signal_shutdown();
 
         // Graceful shutdown is a consuming cleanup boundary. `finish_with_cx`
