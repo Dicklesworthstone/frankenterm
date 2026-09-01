@@ -118,11 +118,13 @@ def validate_target!(target, fuzz_bins)
     "#{cargo_target}.schema",
     check: "adversarial.target.schema",
   )
-  seed_corpus = normalize_dir(checked_repo_relative_path(
-    target.fetch("seed_corpus"),
+  # Corpus directories are declared with a trailing slash in the manifest;
+  # strip it before the repo-relative path guard, which rejects empty segments.
+  seed_corpus = checked_repo_relative_path(
+    normalize_dir(target.fetch("seed_corpus")),
     "#{cargo_target}.seed_corpus",
     check: "adversarial.target.seed_corpus",
-  ))
+  )
   entry_points = target.fetch("production_entry_points")
 
   assert_ok(

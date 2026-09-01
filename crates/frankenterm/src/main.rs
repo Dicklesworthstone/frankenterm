@@ -17411,7 +17411,6 @@ fn classify_unacknowledged_agent_config_transaction(
         &transaction.candidate_leaf,
     )?;
     let target_after = agent_config_observation_matches_candidate(&target, claim);
-    let candidate_after = agent_config_observation_matches_candidate(&candidate, claim);
     match claim.before.as_ref() {
         None => {
             if target_after && candidate.state == "missing" {
@@ -17465,8 +17464,11 @@ fn validate_agent_config_transaction_ack_semantics(
     let target_after = agent_config_observation_matches_candidate(&ack.observed_target, claim);
     let candidate_after =
         agent_config_observation_matches_candidate(&ack.observed_candidate, claim);
-    let required_staging_milestones =
-        ack.candidate_file_synced && claim.before.is_none_or(|_| ack.backup_file_synced);
+    let required_staging_milestones = ack.candidate_file_synced
+        && claim
+            .before
+            .as_ref()
+            .is_none_or(|_| ack.backup_file_synced);
     let completed_effect_milestones = required_staging_milestones && ack.effect_parent_synced;
     match claim.before.as_ref() {
         None => {
@@ -17760,7 +17762,7 @@ fn create_agent_config_candidate(
     transaction: &AgentConfigTransaction,
 ) -> std::result::Result<StagedAgentConfig, String> {
     #[cfg(unix)]
-    use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use cap_std::fs::OpenOptionsExt as _;
 
     transaction.validate_binding()?;
 

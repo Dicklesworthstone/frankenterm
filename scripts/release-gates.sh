@@ -57,7 +57,7 @@ gate "runtime proof soundness (Lean)"            "scripts/check-runtime-proof-so
 gate "loom skeleton coverage"                    "scripts/check_loom_skeleton_coverage.sh"
 gate "lua api no promise block_on"               "bash scripts/check_lua_api_no_promise_block_on.sh"
 gate "mux interface imports"                     "scripts/check_mux_interface_imports.sh"
-gate "workspace cycles"                          "scripts/check_workspace_cycles.sh"
+cargo_gate "workspace cycles"                    "scripts/check_workspace_cycles.sh"
 cargo_gate "feature flag matrix"                 "bash scripts/check_feature_flag_matrix.sh"
 gate "release panic contract (profiles)"         "bash scripts/check-release-panic-contract.sh --profiles-only"
 gate "windows/unix coupling ratchet"             "bash scripts/check_windows_unix_coupling.sh"

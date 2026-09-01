@@ -5376,6 +5376,10 @@ fn ms_u64(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use std::sync::Arc;
 
     fn isolated_cli_client() -> WeztermClient {
@@ -12250,7 +12254,7 @@ mod unified_tests {
     fn mux_socket_path_accepts_unix_socket() {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket_path = dir.path().join("mux.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("unix socket");
+        let _listener = UnixListener::bind(&socket_path).expect("unix socket");
         assert!(mux_socket_path_is_usable(&socket_path));
     }
 
@@ -12336,16 +12340,16 @@ mod unified_tests {
         let class = "test.frankenterm.class";
         // Live GUI instance: a listener is bound for the whole test.
         let live = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 4242);
-        let _live_listener = std::os::unix::net::UnixListener::bind(&live).expect("bind live");
+        let _live_listener = UnixListener::bind(&live).expect("bind live");
         // Stale GUI instance: the socket file lingers after its owner exits.
         let stale = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 7);
-        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind stale"));
+        drop(UnixListener::bind(&stale).expect("bind stale"));
         assert!(
             stale.exists(),
             "stale socket file must linger for this test"
         );
         // The GUI published the live instance for this class.
-        std::os::unix::fs::symlink(
+        symlink(
             &live,
             ::config::gui_socket::published_gui_sock_path_in(dir.path(), class),
         )
@@ -12371,13 +12375,13 @@ mod unified_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let class = "test.frankenterm.class";
         let stale = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 9);
-        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind stale"));
-        std::os::unix::fs::symlink(
+        drop(UnixListener::bind(&stale).expect("bind stale"));
+        symlink(
             &stale,
             ::config::gui_socket::published_gui_sock_path_in(dir.path(), class),
         )
         .expect("publish stale symlink");
-        std::os::unix::fs::symlink(
+        symlink(
             dir.path().join("missing"),
             ::config::gui_socket::published_gui_sock_path_in(dir.path(), "other.class"),
         )

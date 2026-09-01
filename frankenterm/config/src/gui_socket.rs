@@ -151,6 +151,10 @@ fn entry_is_socket(_entry: &std::fs::DirEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn socket_path_uses_canonical_prefix() {
@@ -187,11 +191,11 @@ mod tests {
     fn list_entries_returns_only_sockets_with_canonical_names() {
         let dir = tempfile::tempdir().expect("temp dir");
         let live = gui_socket_path_for_pid_in(dir.path(), 4242);
-        let _listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
+        let _listener = UnixListener::bind(&live).expect("bind");
         std::fs::write(dir.path().join("frankenterm-gui-sock-7"), b"not a socket").unwrap();
         std::fs::write(dir.path().join("frankenterm-gui-sock-4242.lock"), b"").unwrap();
         let other = dir.path().join("sock");
-        let _other = std::os::unix::net::UnixListener::bind(&other).expect("bind");
+        let _other = UnixListener::bind(&other).expect("bind");
 
         let entries = list_gui_socket_entries(dir.path());
         assert_eq!(entries, vec![(4242, live)]);
@@ -202,8 +206,7 @@ mod tests {
     fn resolve_published_follows_symlink_only() {
         let dir = tempfile::tempdir().expect("temp dir");
         let target = gui_socket_path_for_pid_in(dir.path(), 99);
-        std::os::unix::fs::symlink(&target, published_gui_sock_path_in(dir.path(), "x.y.z"))
-            .expect("symlink");
+        symlink(&target, published_gui_sock_path_in(dir.path(), "x.y.z")).expect("symlink");
         // The target does not exist; resolution still reports it, because
         // liveness is the caller's decision.
         assert_eq!(
