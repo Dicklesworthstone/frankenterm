@@ -4527,7 +4527,7 @@ Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode]
                   [--app-dest DIR] [--from-source] [--quiet]
                   [--no-gum] [--no-verify] [--offline TARBALL] [--force]
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL]
-                  [--help]
+                  [--activate ID --idle-host-confirmed] [--help]
 
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
@@ -4546,6 +4546,14 @@ Options:
   --offline TARBALL  Install from local tarball; require adjacent .sha256 and
                      .minisig files by default; skip all network calls
   --force            Force reinstall even if same version is installed
+  --activate ID      Promote the published candidate generation ID (64 hex,
+                     from the install receipt) to the current authority so
+                     the stable ft / mux-server / pty-guardian paths resolve
+                     to it. Requires --idle-host-confirmed.
+  --idle-host-confirmed
+                     Attest that no FrankenTerm window, mux server, PTY
+                     guardian, or ft watcher is running on this host; the
+                     installer also checks the process census before acting
   --artifact-url URL Override artifact URL (e.g. custom mirror)
   --checksum HEX     Inline SHA256 (skips checksum fetch)
   --checksum-url URL Override checksum file URL
