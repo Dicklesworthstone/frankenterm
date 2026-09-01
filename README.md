@@ -495,7 +495,7 @@ Terminology used throughout this document and the codebase. Reading these once s
 ### Trust & Attestation
 
 <!-- reality-check-drumbeat:auto -->
-_Latest weekly reality-check drumbeat: [`docs/reports/reality-check-2026-05-02.md`](docs/reports/reality-check-2026-05-02.md) (2026-05-02). Round-2 epic (ft-tf6g3) opened 2026-05-12 — next drumbeat publishes when the next pass closes._
+_Latest reality-check drumbeat: [`docs/reports/reality-check-2026-09-01.md`](docs/reports/reality-check-2026-09-01.md) (2026-09-01). Third full pass: [`docs/reality-check-bridge-plan-2026-09-01.md`](docs/reality-check-bridge-plan-2026-09-01.md), epic `ft-xxfwy` (entry-ramp truth: signed install, GUI attach, live-loop proof, real attestation bundle). Predecessors: 2026-04-30 plan and 2026-05-12 plan (`ft-tf6g3`)._
 <!-- reality-check-drumbeat:auto:end -->
 
 The canonical manifest is [`docs/attestations/manifest.json`](docs/attestations/manifest.json); each slot maps a claim category to its producing-bead artifact, and the per-release bundle signs those slot hashes.
