@@ -15709,6 +15709,39 @@ fn validate_fresh_agent_config_security(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_new_agent_config_artifact_security(
+    file: &cap_std::fs::File,
+    path: &Path,
+    owner: AgentConfigSecuritySnapshot,
+) -> std::result::Result<(), String> {
+    use cap_std::fs::PermissionsExt as _;
+    use std::os::fd::AsFd as _;
+
+    rustix::fs::fchown(
+        file.as_fd(),
+        Some(rustix::process::Uid::from_raw(owner.uid)),
+        Some(rustix::process::Gid::from_raw(owner.gid)),
+    )
+    .map_err(|err| {
+        format!(
+            "Failed to set descriptor-bound owner/group {}/{} on new agent config artifact '{}': {}",
+            owner.uid,
+            owner.gid,
+            path.display(),
+            std::io::Error::from(err)
+        )
+    })?;
+    file.set_permissions(cap_std::fs::Permissions::from_mode(owner.mode))
+        .map_err(|err| {
+            format!(
+                "Failed to set descriptor-bound mode {:04o} on new agent config artifact '{}': {err}",
+                owner.mode,
+                path.display()
+            )
+        })
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn capture_agent_config_security(
     _parent: &AgentConfigParentDirectory,
@@ -16568,16 +16601,19 @@ fn create_agent_config_backup(
                 });
             }
         };
-        #[cfg(unix)]
-        backup
-            .set_permissions(cap_std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| AgentConfigApplyError {
-                message: format!(
-                    "Failed to set private initial mode on backup '{}': {err}",
-                    backup_path.display()
-                ),
-                backup_created: false,
-            })?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        set_new_agent_config_artifact_security(
+            &backup,
+            &backup_path,
+            AgentConfigSecuritySnapshot {
+                mode: 0o600,
+                ..source_security
+            },
+        )
+        .map_err(|message| AgentConfigApplyError {
+            message,
+            backup_created: false,
+        })?;
 
         let opened_before = agent_config_regular_file_observation(
             &backup.metadata().map_err(|err| AgentConfigApplyError {
@@ -17453,11 +17489,13 @@ fn validate_agent_config_transaction_ack_semantics(
                 agent_config_observation_matches_before(&ack.observed_candidate, before);
             let backup_before =
                 agent_config_observation_matches_before(&ack.observed_backup, before);
-            backup_before
-                && match ack.outcome {
+            match ack.outcome {
                     AgentConfigTransactionOutcome::Applied
                     | AgentConfigTransactionOutcome::AlreadyApplied => {
-                        completed_effect_milestones && target_after && candidate_before
+                        completed_effect_milestones
+                            && backup_before
+                            && target_after
+                            && candidate_before
                     }
                     AgentConfigTransactionOutcome::NoEffect => {
                         !ack.effect_parent_synced
@@ -17467,12 +17505,14 @@ fn validate_agent_config_transaction_ack_semantics(
                     }
                     AgentConfigTransactionOutcome::ConflictBeforeEffect => {
                         required_staging_milestones
+                            && backup_before
                             && !ack.effect_parent_synced
                             && target_before
                             && candidate_after
                     }
                     AgentConfigTransactionOutcome::ConflictRolledBack => {
                         completed_effect_milestones
+                            && backup_before
                             && !target_after
                             && ack.observed_target.state != "missing"
                             && candidate_after
@@ -17487,6 +17527,7 @@ fn validate_agent_config_transaction_ack_semantics(
 fn reconcile_agent_config_transactions_for_target(
     parent: &AgentConfigParentDirectory,
     target_path: &Path,
+    allow_indeterminate_receipts: bool,
 ) -> std::result::Result<Vec<AgentConfigTransactionReceipt>, String> {
     let target_leaf = agent_config_leaf(target_path)?;
     let target_leaf_string = agent_config_leaf_string(&target_leaf, "target leaf")?;
@@ -17527,10 +17568,13 @@ fn reconcile_agent_config_transactions_for_target(
             })?;
             (pending_claim, pending_bytes)
         };
+        // Validate the intrinsic journal binding before filtering by target.
+        // Otherwise one malformed claim for a different target would remain a
+        // reusable bypass in the same trusted parent namespace.
+        validate_agent_config_transaction_claim(parent, &transaction, &claim)?;
         if claim.target_leaf != target_leaf_string {
             continue;
         }
-        validate_agent_config_transaction_claim(parent, &target_leaf, &transaction, &claim)?;
         let claim_sha256 = agent_config_sha256(&claim_bytes)
             .strip_prefix("sha256:")
             .unwrap_or_default()
@@ -17569,22 +17613,69 @@ fn reconcile_agent_config_transactions_for_target(
                 None
             }
         };
-        if let Some((ack, _)) = recovered_ack {
-            if ack.schema_version != "ft.agent-config-transaction-ack.v1"
-                || ack.transaction_id != transaction.id
-                || ack.claim_sha256 != claim_sha256
-                || ack.ack_file_synced != ack.ack_parent_synced
-                || !ack.ack_file_synced
-                || !validate_agent_config_transaction_ack_semantics(&claim, &ack)
+        if let Some((persisted_ack, _)) = recovered_ack {
+            if persisted_ack.schema_version != "ft.agent-config-transaction-ack.v1"
+                || persisted_ack.transaction_id != transaction.id
+                || persisted_ack.claim_sha256 != claim_sha256
+                || persisted_ack.ack_file_synced
+                || persisted_ack.ack_parent_synced
             {
                 return Err(format!(
                     "Agent config transaction '{}' has an invalid acknowledgement; explicit reconciliation is required.",
                     transaction.id
                 ));
             }
+            // The immutable acknowledgement deliberately records its own sync
+            // milestones as false. Recovery must perform and verify the parent
+            // sync before promoting those fields in the returned receipt.
+            sync_capability_directory(&parent.directory).map_err(|err| {
+                format!(
+                    "Failed to synchronize retained acknowledgement for agent config transaction '{}': {err}",
+                    transaction.id
+                )
+            })?;
+            parent.revalidate()?;
+            let observed_target =
+                observe_agent_config_namespace_entry(parent, target_path, &target_leaf)?;
+            let observed_candidate = observe_agent_config_namespace_entry(
+                parent,
+                &parent.path.join(&transaction.candidate_leaf),
+                &transaction.candidate_leaf,
+            )?;
+            let observed_backup = if claim.backup_leaf.is_some() {
+                observe_agent_config_namespace_entry(
+                    parent,
+                    &parent.path.join(&transaction.backup_leaf),
+                    &transaction.backup_leaf,
+                )?
+            } else {
+                AgentConfigNamespaceObservation {
+                    state: "missing".to_string(),
+                    metadata: None,
+                    sha256: None,
+                }
+            };
+            if observed_target != persisted_ack.observed_target
+                || observed_candidate != persisted_ack.observed_candidate
+                || observed_backup != persisted_ack.observed_backup
+            {
+                return Err(format!(
+                    "Agent config transaction '{}' changed after its acknowledgement; explicit reconciliation is required.",
+                    transaction.id
+                ));
+            }
+            let mut durable_ack = persisted_ack;
+            durable_ack.ack_file_synced = true;
+            durable_ack.ack_parent_synced = true;
+            if !validate_agent_config_transaction_ack_semantics(&claim, &durable_ack) {
+                return Err(format!(
+                    "Agent config transaction '{}' has invalid acknowledgement semantics; explicit reconciliation is required.",
+                    transaction.id
+                ));
+            }
             let receipt =
-                agent_config_receipt(target_path, &transaction, &claim_sha256, &claim, &ack);
-            if receipt.explicit_reconciliation_required {
+                agent_config_receipt(target_path, &transaction, &claim_sha256, &claim, &durable_ack);
+            if receipt.explicit_reconciliation_required && !allow_indeterminate_receipts {
                 return Err(format!(
                     "Agent config transaction '{}' is indeterminate; explicit reconciliation is required.",
                     transaction.id
@@ -17606,11 +17697,11 @@ fn reconcile_agent_config_transactions_for_target(
             &claim,
             &claim_sha256,
             outcome,
-            false,
-            false,
+            outcome == AgentConfigTransactionOutcome::AlreadyApplied,
+            outcome == AgentConfigTransactionOutcome::AlreadyApplied && claim.before.is_some(),
             outcome == AgentConfigTransactionOutcome::AlreadyApplied,
         )?;
-        if receipt.explicit_reconciliation_required {
+        if receipt.explicit_reconciliation_required && !allow_indeterminate_receipts {
             return Err(format!(
                 "Agent config transaction '{}' is indeterminate; explicit reconciliation is required.",
                 transaction.id
@@ -17665,14 +17756,20 @@ fn create_agent_config_candidate(
                 ));
             }
         };
-        #[cfg(unix)]
-        file.set_permissions(cap_std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| {
-                format!(
-                    "Failed to set private initial mode on agent config candidate '{}': {err}",
-                    path.display()
-                )
-            })?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        set_new_agent_config_artifact_security(
+            &file,
+            &path,
+            AgentConfigSecuritySnapshot {
+                uid: source_security
+                    .map(|security| security.uid)
+                    .unwrap_or_else(|| nix::unistd::geteuid().as_raw()),
+                gid: source_security
+                    .map(|security| security.gid)
+                    .unwrap_or_else(|| nix::unistd::getegid().as_raw()),
+                mode: 0o600,
+            },
+        )?;
         let opened = agent_config_regular_file_observation(
             &file.metadata().map_err(|err| {
                 format!(
