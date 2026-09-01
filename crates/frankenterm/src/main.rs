@@ -17464,11 +17464,8 @@ fn validate_agent_config_transaction_ack_semantics(
     let target_after = agent_config_observation_matches_candidate(&ack.observed_target, claim);
     let candidate_after =
         agent_config_observation_matches_candidate(&ack.observed_candidate, claim);
-    let required_staging_milestones = ack.candidate_file_synced
-        && claim
-            .before
-            .as_ref()
-            .is_none_or(|_| ack.backup_file_synced);
+    let required_staging_milestones =
+        ack.candidate_file_synced && claim.before.as_ref().is_none_or(|_| ack.backup_file_synced);
     let completed_effect_milestones = required_staging_milestones && ack.effect_parent_synced;
     match claim.before.as_ref() {
         None => {
@@ -125381,15 +125378,9 @@ printf x > "$MINISIGN_MARKER"
         )
         .unwrap();
         claim.candidate_sha256 = "sha256:NOT-LOWERCASE-OR-COMPLETE".to_string();
-        let claim_name =
-            agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
-        write_atomic_path_transition_json(
-            &parent.directory,
-            &parent.file,
-            &claim_name,
-            &claim,
-        )
-        .unwrap();
+        let claim_name = agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
+        write_atomic_path_transition_json(&parent.directory, &parent.file, &claim_name, &claim)
+            .unwrap();
 
         let error = reconcile_agent_config_transactions_for_target(&parent, &target, false)
             .expect_err("an unrelated malformed claim must fail before target filtering");
@@ -125417,15 +125408,10 @@ printf x > "$MINISIGN_MARKER"
             &transaction,
         )
         .unwrap();
-        let claim_name =
-            agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
-        let claim_bytes = write_atomic_path_transition_json(
-            &parent.directory,
-            &parent.file,
-            &claim_name,
-            &claim,
-        )
-        .unwrap();
+        let claim_name = agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
+        let claim_bytes =
+            write_atomic_path_transition_json(&parent.directory, &parent.file, &claim_name, &claim)
+                .unwrap();
         let claim_sha256 = agent_config_sha256(&claim_bytes)
             .strip_prefix("sha256:")
             .unwrap()
@@ -125698,6 +125684,74 @@ printf x > "$MINISIGN_MARKER"
             assert_eq!(metadata.gid(), source_metadata.gid());
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn global_scope_agent_config_preserves_a_supplementary_source_gid() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let effective_gid = nix::unistd::getegid();
+        let Some(alternate_gid) = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .find(|gid| *gid != effective_gid)
+        else {
+            return;
+        };
+        let root = unique_temp_dir("agent_config_supplementary_gid");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let target = global_root.join(".cursorrules");
+        std::fs::write(&target, b"# existing cursor rules\n").unwrap();
+        let source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target)
+            .unwrap();
+        rustix::fs::fchown(
+            source.as_fd(),
+            None,
+            Some(rustix::process::Gid::from_raw(alternate_gid.as_raw())),
+        )
+        .unwrap();
+        drop(source);
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        let result = apply_prepared_agent_config(&prepared).unwrap();
+        assert!(result.backup_created);
+
+        let backup = std::fs::read_dir(&global_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(AGENT_CONFIG_BACKUP_SUFFIX))
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().gid(),
+            alternate_gid.as_raw()
+        );
+        assert_eq!(
+            std::fs::metadata(backup).unwrap().gid(),
+            alternate_gid.as_raw()
+        );
     }
 
     #[test]
@@ -126032,8 +126086,7 @@ printf x > "$MINISIGN_MARKER"
             !error.message.contains("Durable transaction receipt"),
             "receipts belong in the structured response, never inside an error string"
         );
-        let receipts =
-            collect_agent_config_transaction_receipts_after_failure(&target).unwrap();
+        let receipts = collect_agent_config_transaction_receipts_after_failure(&target).unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].outcome, "no_effect");
         assert!(receipts[0].backup_file_synced);

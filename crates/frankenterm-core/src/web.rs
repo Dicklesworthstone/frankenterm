@@ -6,11 +6,13 @@
 //!
 //! SSE streams: `/stream/deltas` serves output deltas + gaps from periodic DB
 //! scans, so it works for a standalone `ft web`. `/stream/events` is an EventBus
-//! SSE that carries live events only when an in-process producer publishes to the
-//! shared bus; a standalone `ft web` runs no capture/watch pipeline (and an
-//! in-memory `EventBus` cannot span processes), so its `/stream/events` emits the
-//! `ready` frame then keepalives. Wiring a producer (an in-process capture
-//! pipeline or a storage-tail → `EventBus` bridge) is tracked under ft-zeo5o.
+//! SSE. A standalone `ft web` runs no capture pipeline and an in-memory
+//! `EventBus` cannot span processes, so the server tails newly persisted
+//! `events` rows from storage and republishes them on its bus
+//! (`server::spawn_storage_event_tail`, ft-zeo5o); detections written by a
+//! watcher in another process reach `/stream/events` within one poll interval.
+//! Disable the tail with `WebServerConfig::with_storage_event_tail(false)`
+//! when an in-process producer already publishes to the same bus.
 
 use crate::Result;
 use crate::events::EventBus;
