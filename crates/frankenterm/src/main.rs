@@ -96125,11 +96125,20 @@ async fn run_diagnostics(
         &mut policy_engine,
         now_ms(),
     );
-    checks.extend(
-        policy_checks
-            .iter()
-            .map(diagnostic_check_from_runtime_health),
-    );
+    // These rows describe the engine built for THIS doctor run. Policy state
+    // (kill switch, quarantines, audit chain, approvals, ...) lives in the
+    // watcher process and is not persisted, so the counters here are always
+    // those of a fresh engine. Say so, rather than letting "0 quarantines,
+    // kill switch disarmed" read as a statement about the running watcher
+    // (ft-xxfwy.14).
+    checks.extend(policy_checks.iter().map(|check| {
+        let mut diagnostic = diagnostic_check_from_runtime_health(check);
+        diagnostic.detail = Some(format!(
+            "{} [process-local: fresh engine for this doctor run; the watcher's live policy state is not persisted]",
+            diagnostic.detail.unwrap_or_default()
+        ));
+        diagnostic
+    }));
 
     // Select the same mux backend used by production clients. This selection
     // is finite: the local-version compatibility probe is timeout- and

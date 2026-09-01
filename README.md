@@ -2119,7 +2119,7 @@ Every outbound pane-content read path (`ft get-text`, `ft search`, `ft robot get
 
 ### Policy surfaces and subsystem diagnostics
 
-The policy framework recognizes a small set of `PolicySurface` variants — `Mux`, `Swarm`, `Robot`, `Connector`, `Workflow`, `Mcp`, `Ipc`, `Unknown` — on every decision, so audit rows record *which subsystem* originated the request. Around those surfaces, the framework exposes a wider set of diagnostic subsystems (capability passport, command guard, approval flow, rate limiter, redactor, audit writer, etc.) — `ft doctor --json` reports per-subsystem health verdicts and `ft proof-doctor` validates the matching evidence artifacts. Failures are typed and routed back through the same error-code taxonomy as the rest of robot mode.
+The policy framework recognizes a small set of `PolicySurface` variants — `Mux`, `Swarm`, `Robot`, `Connector`, `Workflow`, `Mcp`, `Ipc`, `Unknown` — on every decision, so audit rows record *which subsystem* originated the request. Around those surfaces, the framework exposes a wider set of diagnostic subsystems (capability passport, command guard, approval flow, rate limiter, redactor, audit writer, etc.) — `ft doctor --json` reports per-subsystem health verdicts and `ft proof-doctor` validates the matching evidence artifacts. Those doctor rows describe a fresh engine built for the doctor run: policy state (kill-switch tier, quarantines, the in-memory audit chain, pending approvals) lives in the watcher process and is not persisted, so a running watcher's live counters are not visible from a separate `ft doctor` invocation (tracked under `ft-xxfwy.14`). Failures are typed and routed back through the same error-code taxonomy as the rest of robot mode.
 
 ---
 
