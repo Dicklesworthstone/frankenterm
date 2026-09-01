@@ -16417,6 +16417,14 @@ struct AgentConfigApplyError {
     backup_created: bool,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct AgentConfigPublicationError {
+    message: String,
+    outcome: AgentConfigTransactionOutcome,
+    effect_parent_synced: bool,
+}
+
 #[derive(Debug)]
 struct AppliedAgentConfig {
     result: frankenterm_core::robot_types::AgentConfigureResultItem,
@@ -17365,6 +17373,15 @@ fn write_agent_config_transaction_ack(
         ack_parent_synced: false,
         explicit_reconciliation_required,
     };
+    let mut durable_ack = persisted_ack.clone();
+    durable_ack.ack_file_synced = true;
+    durable_ack.ack_parent_synced = true;
+    if !validate_agent_config_transaction_ack_semantics(claim, &durable_ack) {
+        return Err(format!(
+            "Refusing to publish an acknowledgement with impossible transaction semantics for '{}'.",
+            target_path.display()
+        ));
+    }
     let ack_name = agent_config_leaf_string(&transaction.ack_leaf, "ack leaf")?;
     write_atomic_path_transition_json(&parent.directory, &parent.file, &ack_name, &persisted_ack)
         .map_err(|err| format!("Failed to publish durable agent config acknowledgement: {err:#}"))?;
@@ -17372,9 +17389,6 @@ fn write_agent_config_transaction_ack(
         format!("Failed to synchronize the agent config acknowledgement directory: {err}")
     })?;
     parent.revalidate()?;
-    let mut durable_ack = persisted_ack;
-    durable_ack.ack_file_synced = true;
-    durable_ack.ack_parent_synced = true;
     Ok(agent_config_receipt(
         target_path,
         transaction,
@@ -17475,7 +17489,6 @@ fn validate_agent_config_transaction_ack_semantics(
                     AgentConfigTransactionOutcome::ConflictBeforeEffect => {
                         required_staging_milestones
                             && !ack.effect_parent_synced
-                            && ack.observed_target.state != "missing"
                             && candidate_after
                     }
                     AgentConfigTransactionOutcome::ConflictRolledBack => false,
@@ -17507,7 +17520,6 @@ fn validate_agent_config_transaction_ack_semantics(
                         required_staging_milestones
                             && backup_before
                             && !ack.effect_parent_synced
-                            && target_before
                             && candidate_after
                     }
                     AgentConfigTransactionOutcome::ConflictRolledBack => {
@@ -17710,6 +17722,30 @@ fn reconcile_agent_config_transactions_for_target(
         receipts.push(receipt);
     }
     Ok(receipts)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_agent_config_transaction_receipts_after_failure(
+    target_path: &Path,
+) -> std::result::Result<Vec<AgentConfigTransactionReceipt>, String> {
+    let Some(parent) = open_agent_config_parent(target_path, false)? else {
+        return Ok(Vec::new());
+    };
+    let _transition_lock =
+        acquire_atomic_path_transition_lock(&parent.directory, &parent.file).map_err(|err| {
+            format!(
+                "Failed to acquire the parent-domain agent config transition lock for '{}': {err:#}",
+                target_path.display()
+            )
+        })?;
+    reconcile_agent_config_transactions_for_target(&parent, target_path, true)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn collect_agent_config_transaction_receipts_after_failure(
+    _target_path: &Path,
+) -> std::result::Result<Vec<AgentConfigTransactionReceipt>, String> {
+    Ok(Vec::new())
 }
 
 struct StagedAgentConfig {
@@ -18616,12 +18652,11 @@ where
         })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut reconciled_transactions =
-        reconcile_agent_config_transactions_for_target(&parent, &prepared.target_path).map_err(
-            |message| AgentConfigApplyError {
+        reconcile_agent_config_transactions_for_target(&parent, &prepared.target_path, false)
+            .map_err(|message| AgentConfigApplyError {
                 message,
                 backup_created: false,
-            },
-        )?;
+            })?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut reconciled_transactions = Vec::new();
     let mut current = read_open_agent_config_file(
@@ -18786,6 +18821,10 @@ where
             message,
             backup_created: false,
         })?;
+    let mut candidate_file_synced = false;
+    let mut backup_file_synced = false;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut typed_publication_failure = None;
     let publication = (|| -> std::result::Result<bool, AgentConfigApplyError> {
         // Reserve the bounded, private, empty candidate slot before publishing a
         // backup. A full candidate inventory therefore cannot create one backup on
@@ -18806,6 +18845,7 @@ where
             )?;
             let _backup_path =
                 create_agent_config_backup(&parent, &prepared.target_path, snapshot, &transaction)?;
+            backup_file_synced = true;
             revalidate_open_agent_config_file(&parent, &prepared.target_path, snapshot).map_err(
                 |message| AgentConfigApplyError {
                     message,
@@ -18838,6 +18878,7 @@ where
                 backup_created,
             },
         )?;
+        candidate_file_synced = true;
         parent.file.sync_all().map_err(|err| AgentConfigApplyError {
         message: format!(
             "Agent config candidate '{}' is complete but its parent directory could not be synchronized before publication: {err}",
@@ -18858,9 +18899,15 @@ where
             merged.as_bytes(),
             current.as_mut(),
         )
-        .map_err(|message| AgentConfigApplyError {
-            message,
-            backup_created,
+        .map_err(|error| {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                typed_publication_failure = Some((error.outcome, error.effect_parent_synced));
+            }
+            AgentConfigApplyError {
+                message: error.message,
+                backup_created,
+            }
         })?;
         Ok(backup_created)
     })();
@@ -18869,13 +18916,22 @@ where
         Err(mut error) => {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                let recovery_outcome = classify_unacknowledged_agent_config_transaction(
+                let classified_outcome = classify_unacknowledged_agent_config_transaction(
                     &parent,
                     &prepared.target_path,
                     &transaction,
                     &claim,
                 )
                 .unwrap_or(AgentConfigTransactionOutcome::Indeterminate);
+                let (recovery_outcome, effect_parent_synced) =
+                    match typed_publication_failure {
+                        Some((AgentConfigTransactionOutcome::NoEffect, _)) | None => {
+                            (classified_outcome, false)
+                        }
+                        Some((outcome, effect_parent_synced)) => {
+                            (outcome, effect_parent_synced)
+                        }
+                    };
                 match write_agent_config_transaction_ack(
                     &parent,
                     &prepared.target_path,
@@ -18883,16 +18939,12 @@ where
                     &claim,
                     &claim_sha256,
                     recovery_outcome,
-                    false,
-                    false,
-                    recovery_outcome == AgentConfigTransactionOutcome::AlreadyApplied,
+                    candidate_file_synced,
+                    backup_file_synced,
+                    effect_parent_synced
+                        || recovery_outcome == AgentConfigTransactionOutcome::AlreadyApplied,
                 ) {
-                    Ok(receipt) => {
-                        if let Ok(receipt_json) = serde_json::to_string(&receipt) {
-                            error.message.push_str(" Durable transaction receipt: ");
-                            error.message.push_str(&receipt_json);
-                        }
-                    }
+                    Ok(_) => {}
                     Err(ack_error) => {
                         error.message.push_str(
                             " Durable acknowledgement could not be published; explicit reconciliation is required: ",
@@ -56763,6 +56815,23 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         }
                                                         Err(err) => {
                                                             errors += 1;
+                                                            match collect_agent_config_transaction_receipts_after_failure(
+                                                                &prepared.target_path,
+                                                            ) {
+                                                                Ok(receipts) => {
+                                                                    transactions.extend(receipts);
+                                                                }
+                                                                Err(receipt_error) => {
+                                                                    tracing::warn!(
+                                                                        command = "robot.agents.configure",
+                                                                        agent_slug = %prepared.slug,
+                                                                        scope = %robot_agent_config_scope_label(scope),
+                                                                        file_path = %prepared.target_path.display(),
+                                                                        error = %receipt_error,
+                                                                        "failed to collect structured agent config transaction receipts after apply failure"
+                                                                    );
+                                                                }
+                                                            }
                                                             tracing::warn!(
                                                                 command = "robot.agents.configure",
                                                                 agent_slug = %prepared.slug,
@@ -125050,7 +125119,7 @@ printf x > "$MINISIGN_MARKER"
         std::fs::write(orphan_root.join(orphan.candidate_leaf), []).unwrap();
         let orphan_error = agent_config_transaction_inventory(&orphan_parent)
             .expect_err("candidate without its bound backup must fail closed");
-        assert!(orphan_error.contains("orphan artifact"));
+        assert!(orphan_error.contains("artifact without its immutable claim"));
 
         let malformed_root = unique_temp_dir("agent_config_malformed_transaction");
         let malformed_target = malformed_root.join("AGENTS.md");
@@ -125075,8 +125144,10 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_public_parent");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
         let target = root.join("AGENTS.md");
-        let error = open_agent_config_parent(&target, false)
-            .expect_err("publicly writable parent must fail closed");
+        let error = match open_agent_config_parent(&target, false) {
+            Ok(_) => panic!("publicly writable parent must fail closed"),
+            Err(error) => error,
+        };
         assert!(error.contains("must not be group- or world-writable"));
         assert!(!target.exists());
     }
@@ -125114,10 +125185,39 @@ printf x > "$MINISIGN_MARKER"
         std::fs::create_dir_all(&workspace_root).unwrap();
         let target = workspace_root.join("AGENTS.md");
         std::fs::write(&target, b"original instructions\n").unwrap();
+        let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
         for sequence in 0..AGENT_CONFIG_MAX_TRANSACTION_FAMILIES {
             let transaction = AgentConfigTransaction::from_id(format!("{sequence:032x}")).unwrap();
-            std::fs::write(workspace_root.join(transaction.candidate_leaf), []).unwrap();
-            std::fs::write(workspace_root.join(transaction.backup_leaf), []).unwrap();
+            let claim = AgentConfigTransactionClaim {
+                schema_version: "ft.agent-config-transaction-claim.v1".to_string(),
+                transaction_id: transaction.id.clone(),
+                parent_device: parent.identity.device,
+                parent_inode: parent.identity.inode,
+                target_leaf: format!("unrelated-{sequence}"),
+                action: "create".to_string(),
+                before: None,
+                candidate_leaf: transaction.candidate_leaf.display().to_string(),
+                candidate_sha256: agent_config_sha256(b""),
+                backup_leaf: None,
+                backup_sha256: None,
+                requested_final_metadata: AgentConfigSecuritySnapshot {
+                    uid: nix::unistd::geteuid().as_raw(),
+                    gid: nix::unistd::getegid().as_raw(),
+                    mode: 0o600,
+                },
+                durability_contract:
+                    "candidate_and_backup_fdatasync_plus_fsync;macos_regular_files_f_fullfsync;namespace_and_journal_parent_fsync"
+                        .to_string(),
+            };
+            let claim_name =
+                agent_config_leaf_string(&transaction.claim_leaf, "claim leaf").unwrap();
+            write_atomic_path_transition_json(
+                &parent.directory,
+                &parent.file,
+                &claim_name,
+                &claim,
+            )
+            .unwrap();
         }
         let backups_before = std::fs::read_dir(&workspace_root)
             .unwrap()
@@ -125783,7 +125883,11 @@ printf x > "$MINISIGN_MARKER"
             || std::fs::write(&target, competitor_bytes),
         )
         .expect_err("NOREPLACE must lose to a concurrent creator");
-        assert!(error.contains("candidate retained"));
+        assert_eq!(
+            error.outcome,
+            AgentConfigTransactionOutcome::ConflictBeforeEffect
+        );
+        assert!(error.message.contains("candidate retained"));
         assert_eq!(std::fs::read(&target).unwrap(), competitor_bytes);
         assert_eq!(std::fs::read(&candidate.path).unwrap(), candidate_bytes);
     }
@@ -125827,7 +125931,12 @@ printf x > "$MINISIGN_MARKER"
             },
         )
         .expect_err("substituted target must be restored by exact rollback");
-        assert!(error.contains("was rolled back"));
+        assert_eq!(
+            error.outcome,
+            AgentConfigTransactionOutcome::ConflictRolledBack
+        );
+        assert!(error.effect_parent_synced);
+        assert!(error.message.contains("was rolled back"));
         assert_eq!(std::fs::read(&target).unwrap(), competitor);
         assert_eq!(std::fs::read(&candidate.path).unwrap(), replacement);
         assert_eq!(std::fs::read(&backup).unwrap(), original);
@@ -125874,8 +125983,10 @@ printf x > "$MINISIGN_MARKER"
             || Err(std::io::Error::other("injected rollback refusal")),
         )
         .expect_err("rollback refusal must be reported as indeterminate");
-        assert!(error.contains("outcome is indeterminate"));
-        assert!(error.contains("injected rollback refusal"));
+        assert_eq!(error.outcome, AgentConfigTransactionOutcome::Indeterminate);
+        assert!(error.effect_parent_synced);
+        assert!(error.message.contains("outcome is indeterminate"));
+        assert!(error.message.contains("injected rollback refusal"));
         assert_eq!(std::fs::read(&target).unwrap(), replacement);
         assert_eq!(std::fs::read(&candidate.path).unwrap(), competitor);
         assert_eq!(std::fs::read(&backup).unwrap(), original);

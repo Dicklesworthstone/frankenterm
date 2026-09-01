@@ -19075,7 +19075,7 @@ mod tests {
                 interval_seconds: 30,
                 ..SnapshotConfig::default()
             };
-            let engine = Arc::new(SnapshotEngine::new(db_path, config));
+            let engine = Arc::new(SnapshotEngine::new(db_path.clone(), config));
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let cx = crate::cx::for_testing();
@@ -19092,8 +19092,12 @@ mod tests {
             });
 
             // Let the scheduler complete its startup capture and settle
-            // into the shutdown-watcher poll.
-            crate::runtime_async::sleep(Duration::from_millis(100)).await;
+            // into the shutdown-watcher poll. Wait for the capture itself
+            // (bounded) rather than sleeping a fixed 100 ms: on a loaded host
+            // the cancel otherwise lands inside the startup capture and the
+            // scheduler surfaces the capture's error instead of the typed
+            // mid-flight `Cancelled` this test is about.
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             // Cancel the caller's cx mid-flight; the scheduler should
             // notice at its next checkpoint / shutdown.changed(&cx) poll.
@@ -19771,10 +19775,14 @@ mod tests {
                     .expect("snapshot scheduler");
             });
 
-            sleep(Duration::from_millis(100)).await;
+            // Wait for the startup capture to land before emitting triggers;
+            // a fixed 100 ms sleep raced it on a loaded host and observed 0.
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+            // Negative assertion: give the scheduler a settle window and
+            // confirm the triggers did NOT add a capture in periodic mode.
             sleep(Duration::from_millis(200)).await;
 
             let count = checkpoint_count(db_path.as_str());
@@ -19989,13 +19997,11 @@ mod tests {
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
             sleep(Duration::from_millis(50)).await;
             let _ = engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 5.0
-            sleep(Duration::from_millis(200)).await;
-
-            assert_eq!(
-                checkpoint_count(db_path.as_str()),
-                2,
-                "exactly at threshold captures"
-            );
+            // The scheduler processes triggers on its own task; under a
+            // loaded test host a fixed 200 ms sleep raced the capture and
+            // reported 1 checkpoint. Wait (bounded) for the capture instead;
+            // the assertion is unchanged.
+            await_checkpoint_count(db_path.as_str(), 2, "exactly at threshold captures").await;
 
             shutdown_tx.send(true).unwrap();
             handle.await.unwrap();
