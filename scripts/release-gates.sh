@@ -70,7 +70,7 @@ gate "codec version release notes"               "scripts/check_codec_version_re
 gate "readme counts"                             "bash scripts/stamp-readme-counts.sh --check"
 gate "vendored provenance"                       "bash scripts/check-provenance.sh"
 cargo_gate "ftui guardrails"                     "scripts/check_ftui_guardrails.sh"
-gate "ftui tests"                                "scripts/check_ftui_tests.sh"
+cargo_gate "ftui tests"                          "scripts/check_ftui_tests.sh"
 cargo_gate "ftui docs"                           "scripts/check_ftui_docs.sh"
 gate "reality-check bead structure"              "scripts/check-reality-check-bead-structure.sh"
 # --- Attestation and contract verifiers ------------------------------------
