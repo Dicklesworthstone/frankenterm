@@ -67,6 +67,10 @@ FROM_SOURCE=0
 NO_GUM=0
 NO_MINISIGN=0
 FORCE_INSTALL=0
+# --activate <generation-id>: promote a published candidate to the current
+# process-family authority; requires --idle-host-confirmed (ft-xxfwy.3).
+ACTIVATE_GENERATION=""
+IDLE_HOST_CONFIRMED=0
 # macOS GUI app (.app) install. -1 = auto (on for darwin-arm64 prebuilt
 # installs), 0 = disabled (--no-app), 1 = forced (--with-app). APP_DEST
 # overrides the install directory (default /Applications, fallback
@@ -1789,6 +1793,169 @@ install_process_family() {
     warn "Activation is pending; the existing process-family selector and live mux were left unchanged"
   fi
   info "All previous generations and entrypoint authority were retained for recovery"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Explicit activation of a published candidate generation (ft-xxfwy.3).
+#
+# The automatic install path never publishes the selector: a process census
+# is evidence, not exclusion (see require_no_live_mux_for_initial_selector),
+# so every fresh candidate is left `pending` and the stable `ft` path stays
+# absent. This subcommand is the documented way to finish the job. It moves
+# the live authority to a verified candidate only when the operator attests
+# that no FrankenTerm GUI, mux server, PTY guardian, or watcher is running
+# (--idle-host-confirmed) AND the census agrees it cannot see one. Every
+# mutation reuses the descriptor-pinned atomic transitions that candidate
+# publication uses, so a crash leaves either the previous authority or the
+# new one, never a torn triplet.
+#
+# Failpoints (FT_INSTALL_TEST_ENABLE_FAILPOINTS=1 FT_INSTALL_TEST_FAILPOINT=...):
+#   before-selector-activation, after-selector-activation,
+#   before-entrypoint-activation:<name>
+# ───────────────────────────────────────────────────────────────────────────
+activate_process_family_generation() {
+  local generation_id="$1"
+  local managed="$DEST/.frankenterm-process-family"
+  local generations="$managed/generations"
+  local generation="$generations/$generation_id"
+  local helper verifier manifest metadata manifest_id build_id source_revision
+  local version target profile feature_contract inventory_bytes
+  local census authority_state txid stage stage_id target_id operation name
+  local legacy_root candidate
+
+  command -v python3 >/dev/null 2>&1 || {
+    err "python3 is required for crash-atomic activation"
+    return 1
+  }
+  [[ "$generation_id" =~ ^[0-9a-f]{64}$ ]] || {
+    err "--activate expects the 64-hex candidate generation id printed in the install receipt"
+    return 2
+  }
+  [ -d "$generation" ] && [ ! -L "$generation" ] || {
+    err "No published candidate generation at $generation"
+    err "Run the installer first; it publishes the candidate and prints its id"
+    return 1
+  }
+  if [ "$IDLE_HOST_CONFIRMED" -ne 1 ]; then
+    err "Activation replaces the live process-family authority under $DEST."
+    err "Quit every FrankenTerm window, frankenterm-mux-server, PTY guardian, and ft watcher,"
+    err "then rerun with --idle-host-confirmed to attest that the host is idle."
+    return 1
+  fi
+  census=$(installer_mux_ownership_state) || census=ambiguous
+  if [ "$census" != inactive ]; then
+    err "Mux ownership census reports '$census'; refusing activation while a FrankenTerm/WezTerm launcher may own session state"
+    return 1
+  fi
+
+  helper="$generation/ft"
+  verifier="$generation/verify-components.sh"
+  manifest="$generation/process-family.component-manifest.json"
+  verify_canonical_generation "$generation" "" "$verifier" || {
+    err "Candidate generation $generation_id failed canonical verification; refusing to activate it"
+    return 1
+  }
+  metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
+  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
+
+  authority_state=$(inspect_installer_process_family_authority) || {
+    err "Process-family selector authority is ambiguous or unsafe"
+    return 1
+  }
+  if [ "$authority_state" = $'managed\t'"generations/$generation_id" ]; then
+    info "Generation $generation_id is already the current selector target"
+  else
+    # 1. Point the selector at the candidate: publish when absent, exchange
+    #    when a previous generation is current. Both are single atomic
+    #    transitions performed by the candidate's own ft helper.
+    txid=$(atomic_transition_txid "selector:$DEST:$generation_id") || return 1
+    stage=".current.${txid}"
+    ensure_staged_symlink "generations/$generation_id" "$managed/$stage" || return 1
+    stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
+    if [ -L "$managed/current" ] || [ -e "$managed/current" ]; then
+      target_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+      operation=exchange
+    else
+      target_id=missing
+      operation=publish-noreplace
+    fi
+    installer_failpoint before-selector-activation
+    atomic_path_transition "$helper" "$managed" "$stage" current "$txid" \
+      "$stage_id" "$target_id" "$operation" || {
+      err "Selector activation failed; the previous authority is unchanged"
+      return 1
+    }
+    installer_failpoint after-selector-activation
+  fi
+
+  # 2. Publish the three stable entrypoints as managed symlinks. A legacy
+  #    direct-install binary is exchanged only when a retained legacy
+  #    generation proves it is the exact file the installer captured.
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    installer_failpoint "before-entrypoint-activation:$name"
+    if stable_entrypoint_is_managed "$name"; then
+      publish_stable_entrypoint "$helper" "$name" missing "$generation" || {
+        err "Managed entrypoint $name does not resolve to generation $generation_id"
+        return 1
+      }
+    elif [ -e "$DEST/$name" ] || [ -L "$DEST/$name" ]; then
+      [ -f "$DEST/$name" ] && [ ! -L "$DEST/$name" ] || {
+        err "Refusing to replace unmanaged entrypoint $DEST/$name (not a regular file)"
+        return 1
+      }
+      legacy_root=""
+      for candidate in "$generations"/legacy-*/; do
+        [ -d "$candidate" ] || continue
+        if cmp "$DEST/$name" "${candidate%/}/$name" >/dev/null 2>&1; then
+          legacy_root="${candidate%/}"
+          break
+        fi
+      done
+      [ -n "$legacy_root" ] || {
+        err "Direct-install entrypoint $DEST/$name matches no retained legacy generation; rerun the installer to capture it before activating"
+        return 1
+      }
+      publish_stable_entrypoint "$helper" "$name" exchange "$legacy_root" || {
+        err "Failed to exchange legacy entrypoint $name for the managed selector"
+        return 1
+      }
+    else
+      publish_stable_entrypoint "$helper" "$name" missing "$generation" || {
+        err "Failed to publish managed entrypoint $name"
+        return 1
+      }
+    fi
+  done
+
+  # 3. Prove the result before claiming it.
+  [ "$(inspect_installer_process_family_authority)" = $'managed\t'"generations/$generation_id" ] || {
+    err "Selector authority did not settle on generation $generation_id"
+    return 1
+  }
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    stable_entrypoint_is_managed "$name" || {
+      err "Stable entrypoint $name is not a managed selector link"
+      return 1
+    }
+    cmp "$DEST/$name" "$generation/$name" >/dev/null 2>&1 || {
+      err "Stable entrypoint $name does not resolve to generation $generation_id"
+      return 1
+    }
+  done
+  "$DEST/ft" --version >/dev/null 2>&1 || {
+    err "Activated ft does not execute from $DEST"
+    return 1
+  }
+
+  PROCESS_FAMILY_ACTIVATION_STATE="current"
+  PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
+  PROCESS_FAMILY_ACTIVE_ROOT="$generation"
+  PROCESS_FAMILY_PENDING_REASON=""
+  PENDING_PROCESS_FAMILY_GENERATION=""
+  PUBLISHED_PROCESS_FAMILY_ROOT="$generation"
+  PUBLISHED_PROCESS_FAMILY_VERSION="$version"
+  ok "Activated process-family generation $generation_id (v$version) as the current authority under $DEST"
+  return 0
 }
 
 emit_process_family_receipt() {
@@ -4415,6 +4582,8 @@ while [ $# -gt 0 ]; do
     --no-verify) NO_MINISIGN=1; shift ;;
     --offline) require_option_value "$1" "${2:-}"; OFFLINE_TARBALL="$2"; shift 2 ;;
     --force) FORCE_INSTALL=1; shift ;;
+    --activate) require_option_value "$1" "${2:-}"; ACTIVATE_GENERATION="$2"; shift 2 ;;
+    --idle-host-confirmed) IDLE_HOST_CONFIRMED=1; shift ;;
     --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2 ;;
     --checksum) require_option_value "$1" "${2:-}"; CHECKSUM="$2"; shift 2 ;;
     --checksum-url) require_option_value "$1" "${2:-}"; CHECKSUM_URL="$2"; shift 2 ;;
@@ -4450,6 +4619,14 @@ fi
 # extract the local tarball, and curl is used by ensure_rust /
 # install_pragmasevka even when the main download path is bypassed.
 # ───────────────────────────────────────────────────────────────────────────
+# --activate is a self-contained subcommand: it needs only python3 and the
+# already-published candidate under $DEST, never the network.
+if [ -n "$ACTIVATE_GENERATION" ]; then
+  activate_process_family_generation "$ACTIVATE_GENERATION" || exit 1
+  emit_process_family_receipt || exit 1
+  exit 0
+fi
+
 for required in curl tar python3; do
   if ! command -v "$required" >/dev/null 2>&1; then
     err "Required tool not found: $required"
@@ -4821,7 +4998,9 @@ if [ "$QUIET" -eq 0 ]; then
   fi
   summary_lines+=("")
   if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
-    summary_lines+=("Candidate publication is complete; activation requires the cross-launcher lease transaction.")
+    summary_lines+=("Candidate publication is complete; the installer never activates it automatically.")
+    summary_lines+=("To activate on an idle host (no FrankenTerm window, mux server, guardian, or watcher running):")
+    summary_lines+=("  install.sh --dest $DEST --activate $PENDING_PROCESS_FAMILY_GENERATION --idle-host-confirmed")
   else
     summary_lines+=("Quick start:")
     summary_lines+=("  ft --help               Show all subcommands")
