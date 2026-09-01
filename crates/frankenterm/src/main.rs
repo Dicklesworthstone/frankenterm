@@ -105279,7 +105279,34 @@ recorder_backend = "rusqlite"
         distributed_shutdown_tcp_test_reader(&mut reader);
         drop(reader);
 
-        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150)).await;
+        frankenterm_core::runtime_async::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    let pane_persisted = storage_handle
+                        .get_pane(remote_pane_id)
+                        .await
+                        .expect("poll persisted remote pane")
+                        .is_some();
+                    let delta_persisted = storage_handle
+                        .search(marker)
+                        .await
+                        .expect("poll searchable remote output")
+                        .iter()
+                        .any(|segment| segment.pane_id == remote_pane_id);
+                    if pane_persisted && delta_persisted {
+                        break;
+                    }
+                    frankenterm_core::runtime_async::sleep(
+                        std::time::Duration::from_millis(10),
+                    )
+                    .await;
+                }
+            },
+        )
+        .await
+        .expect("listener should durably persist the pane and delta within its bounded deadline");
 
         {
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -106274,7 +106301,30 @@ recorder_backend = "rusqlite"
                 distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
 
-                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150)).await;
+                frankenterm_core::runtime_async::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                            if storage_handle
+                                .get_pane(remote_pane_id)
+                                .await
+                                .expect("poll recovered remote pane")
+                                .is_some()
+                            {
+                                break;
+                            }
+                            frankenterm_core::runtime_async::sleep(
+                                std::time::Duration::from_millis(10),
+                            )
+                            .await;
+                        }
+                    },
+                )
+                .await
+                .expect(
+                    "listener should persist the recovery envelope within its bounded deadline",
+                );
 
                 {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
