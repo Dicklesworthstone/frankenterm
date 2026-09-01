@@ -24,6 +24,9 @@ pub const MAX_SENDER_ID_LEN: usize =
 /// Default idle window before a sender is considered stale.
 pub const DEFAULT_AGENT_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// Largest sequence value that can be persisted losslessly in SQLite INTEGER.
+const MAX_DURABLE_SEQUENCE: u64 = i64::MAX as u64;
+
 /// Resolved wire-protocol limits derived from tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireProtocolLimits {
@@ -936,6 +939,14 @@ fn validate_envelope_protocol_with_limits(
         }
     }
     if let WirePayload::Gap(gap) = &envelope.payload {
+        if gap.seq_before > MAX_DURABLE_SEQUENCE || gap.seq_after > MAX_DURABLE_SEQUENCE {
+            return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+                format!(
+                    "GapNotice sequence bounds ({}, {}) must not exceed the durable signed 64-bit sequence maximum ({MAX_DURABLE_SEQUENCE})",
+                    gap.seq_before, gap.seq_after
+                ),
+            )));
+        }
         if gap.seq_after <= gap.seq_before {
             return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
                 format!(
@@ -2123,6 +2134,65 @@ mod tests {
             .expect_err("decoded envelope path must enforce GapNotice invariants");
         assert!(matches!(err, WireProtocolError::InvalidJson(_)));
         assert_eq!(agg.total_rejected(), 1);
+        assert_eq!(agg.total_accepted(), 0);
+    }
+
+    #[test]
+    fn aggregator_accepts_gap_notice_at_durable_sequence_maximum() {
+        let mut agg = Aggregator::new(10);
+        let envelope = WireEnvelope::new(
+            1,
+            "agent-valid",
+            WirePayload::Gap(GapNotice {
+                pane_id: 7,
+                seq_before: MAX_DURABLE_SEQUENCE - 1,
+                seq_after: MAX_DURABLE_SEQUENCE,
+                reason: "durable-boundary".to_string(),
+                detected_at_ms: 123,
+            }),
+        );
+
+        assert!(matches!(
+            agg.ingest_envelope(envelope)
+                .expect("i64::MAX must remain a valid durable gap boundary"),
+            IngestResult::Accepted(WirePayload::Gap(_))
+        ));
+        assert_eq!(agg.total_accepted(), 1);
+        assert_eq!(agg.total_rejected(), 0);
+    }
+
+    #[test]
+    fn aggregator_rejects_gap_notice_outside_durable_sequence_range() {
+        let mut agg = Aggregator::new(10);
+        let above_durable_max = MAX_DURABLE_SEQUENCE + 1;
+        for (seq_before, seq_after) in [
+            (MAX_DURABLE_SEQUENCE, above_durable_max),
+            (MAX_DURABLE_SEQUENCE, u64::MAX),
+            (above_durable_max, above_durable_max + 1),
+            (u64::MAX, u64::MAX),
+        ] {
+            let envelope = WireEnvelope::new(
+                1,
+                "agent-valid",
+                WirePayload::Gap(GapNotice {
+                    pane_id: 7,
+                    seq_before,
+                    seq_after,
+                    reason: "out-of-durable-range".to_string(),
+                    detected_at_ms: 123,
+                }),
+            );
+            let err = agg
+                .ingest_envelope(envelope)
+                .expect_err("out-of-range durable gap bounds must be rejected");
+            assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+            assert!(
+                err.to_string().contains("durable signed 64-bit"),
+                "range rejection must precede ordering validation: {err}"
+            );
+        }
+
+        assert_eq!(agg.total_rejected(), 4);
         assert_eq!(agg.total_accepted(), 0);
     }
 

@@ -11,7 +11,7 @@
       "status": "ok"
     },
     {
-      "detail": "schema mismatch (found v0, expected v43)",
+      "detail": "schema mismatch (found v0, expected v45)",
       "name": "database",
       "recommendation": "Preserve .ft/ft.db, run ft session doctor, and recover from a verified backup or migration receipt",
       "status": "error"

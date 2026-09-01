@@ -4917,7 +4917,7 @@ enum RobotDomCommands {
         pane_id: u64,
 
         /// Command index; -1 selects the latest command
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         command_index: i64,
     },
     /// Return the retained OSC 133 exit status
@@ -4926,7 +4926,7 @@ enum RobotDomCommands {
         pane_id: u64,
 
         /// Command index; -1 selects the latest command
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         command_index: i64,
     },
 }
@@ -22933,7 +22933,7 @@ mod robot_work_backend_tests {
     }
 
     #[test]
-    fn work_assign_declines_active_pane_limit_before_claiming() {
+    fn work_assign_declines_active_pane_limit_without_seeding_or_claiming() {
         let (_dir, db_path) = temp_work_db();
         seed_active_limit_window(&db_path, 7, now_ms_i64() + 60_000);
 
@@ -22950,9 +22950,8 @@ mod robot_work_backend_tests {
         );
 
         let ready = expect_ok(robot_work_ready_data(&db_path, Some("codex:7"), 10, 0));
-        assert_eq!(ready["total_ready"], 1);
-        assert_eq!(ready["items"][0]["state"], "unclaimed");
-        assert!(ready["items"][0]["pane_id"].is_null());
+        assert_eq!(ready["total_ready"], 0);
+        assert_eq!(ready["items"], serde_json::json!([]));
     }
 
     #[test]
@@ -34945,7 +34944,11 @@ fn build_robot_help() -> RobotHelp {
             },
             RobotCommandInfo {
                 name: "wait-for",
-                description: "Wait for a pattern on a pane (aliases: await, watch)",
+                description: "Wait for a pattern on a pane (alias: watch)",
+            },
+            RobotCommandInfo {
+                name: "await",
+                description: "Wait for composite rule, state, and quiescence conditions",
             },
             RobotCommandInfo {
                 name: "search",
@@ -35304,6 +35307,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 ],
             },
             QuickStartCommand {
+                name: "await",
+                args: "[--any CONDITION]... [--all CONDITION]... [--timeout-secs N]",
+                summary: "Wait for composite rule, state, and quiescence conditions",
+                examples: vec![
+                    "ft robot await --any 'rule:build.*' --timeout-secs 60",
+                    "ft robot await --all 'quiescence:0:1000' --checkpoint-only",
+                ],
+            },
+            QuickStartCommand {
                 name: "search",
                 args: "\"<query>\" [--limit N] [--pane ID]",
                 summary: "Full-text search across captured output",
@@ -35622,7 +35634,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             "Use 'now' timestamp in responses to track freshness",
             "Pane IDs are stable within a backend session (current bridge: WezTerm) but may change across restarts",
             "Use --format toon for compact output when piping robot results between agents",
-            "NTM-compat aliases are supported: status|panes->state, read|tail->get-text, inject|write->send, await|watch->wait-for, find|grep->search, event-log|eventlog->events",
+            "NTM-compat aliases are supported: status|panes->state, read|tail->get-text, inject|write->send, watch->wait-for, find|grep->search, event-log|eventlog->events; await is the composite condition command",
         ],
         error_handling: QuickStartErrorHandling {
             common_codes: vec![
@@ -91283,9 +91295,9 @@ const LOGS_DIRECTORY_NOT_DIRECTORY_DETAIL: &str =
 const LOGS_DIRECTORY_READ_ONLY_DETAIL: &str =
     "basic permission metadata reports a read-only logs directory";
 const LOGS_DIRECTORY_INSPECTED_DETAIL: &str =
-    "shape/basic permission metadata inspected; writability was not tested";
+    "shape and basic permission metadata inspected; writability was not tested";
 const LOGS_DIRECTORY_METADATA_ERROR_DETAIL: &str =
-    "shape/basic permission metadata could not be inspected";
+    "shape and basic permission metadata could not be inspected";
 const LOGS_DIRECTORY_MISSING_DETAIL: &str = "shape check: configured logs directory does not exist";
 
 #[cfg(feature = "browser")]
@@ -92883,115 +92895,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("create session show tempdir");
         let db_path = dir.path().join("session-show.db");
         let conn = rusqlite::Connection::open(&db_path).expect("open session show sqlite db");
-        conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            PRAGMA user_version = 38;
-
-            CREATE TABLE mux_sessions (
-                session_id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                last_checkpoint_at INTEGER,
-                shutdown_clean INTEGER NOT NULL DEFAULT 0,
-                topology_json TEXT NOT NULL,
-                window_metadata_json TEXT,
-                ft_version TEXT NOT NULL,
-                host_id TEXT,
-                clean_checkpoint_id INTEGER REFERENCES session_checkpoints(id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE session_checkpoints (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
-                checkpoint_at INTEGER NOT NULL,
-                checkpoint_type TEXT NOT NULL
-                    CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
-                state_hash TEXT NOT NULL,
-                pane_count INTEGER NOT NULL,
-                total_bytes INTEGER NOT NULL,
-                metadata_json TEXT,
-                checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
-                    CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
-                topology_json TEXT,
-                restore_intent_checkpoint_id INTEGER
-                    REFERENCES session_checkpoints(id) ON DELETE CASCADE,
-                CHECK(checkpoint_role = 'restore_receipt'
-                      OR restore_intent_checkpoint_id IS NULL)
-            );
-
-            CREATE INDEX idx_checkpoints_session
-                ON session_checkpoints(session_id, checkpoint_at);
-            CREATE INDEX idx_checkpoints_session_role_latest
-                ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
-            CREATE INDEX idx_checkpoints_session_role_causal
-                ON session_checkpoints(session_id, checkpoint_role, id DESC);
-            CREATE INDEX idx_checkpoints_global_latest
-                ON session_checkpoints(checkpoint_at DESC, id DESC);
-            CREATE INDEX idx_checkpoints_global_snapshot_latest
-                ON session_checkpoints(checkpoint_at DESC, id DESC)
-                WHERE checkpoint_role = 'snapshot';
-            CREATE UNIQUE INDEX idx_checkpoints_restore_intent_outcome
-                ON session_checkpoints(restore_intent_checkpoint_id)
-                WHERE restore_intent_checkpoint_id IS NOT NULL;
-            CREATE INDEX idx_mux_sessions_clean_checkpoint
-                ON mux_sessions(clean_checkpoint_id);
-
-            CREATE TABLE restore_attempt_lifecycle (
-                intent_checkpoint_id INTEGER PRIMARY KEY
-                    REFERENCES session_checkpoints(id)
-                    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
-                session_id TEXT NOT NULL
-                    REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
-                source_checkpoint_id INTEGER NOT NULL,
-                outcome_checkpoint_id INTEGER
-                    REFERENCES session_checkpoints(id) ON DELETE SET NULL,
-                status TEXT NOT NULL
-                    CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                CHECK(intent_checkpoint_id <> source_checkpoint_id),
-                CHECK(outcome_checkpoint_id IS NULL
-                      OR outcome_checkpoint_id <> intent_checkpoint_id),
-                CHECK(outcome_checkpoint_id IS NULL
-                      OR outcome_checkpoint_id <> source_checkpoint_id),
-                CHECK(created_at >= 0),
-                CHECK(resolved_at IS NULL OR resolved_at >= created_at),
-                CHECK(
-                    (status = 'intent'
-                        AND outcome_checkpoint_id IS NULL
-                        AND resolved_at IS NULL)
-                    OR (status = 'outcome_complete'
-                        AND outcome_checkpoint_id IS NOT NULL
-                        AND resolved_at IS NULL)
-                    OR (status = 'reconciliation_required'
-                        AND resolved_at IS NULL)
-                    OR (status = 'resolved'
-                        AND resolved_at IS NOT NULL)
-                )
-            );
-
-            CREATE INDEX idx_restore_attempt_lifecycle_session_status
-                ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);
-            CREATE UNIQUE INDEX idx_restore_attempt_lifecycle_outcome
-                ON restore_attempt_lifecycle(outcome_checkpoint_id)
-                WHERE outcome_checkpoint_id IS NOT NULL;
-
-            CREATE TABLE mux_pane_state (
-                id INTEGER PRIMARY KEY,
-                checkpoint_id INTEGER NOT NULL
-                    REFERENCES session_checkpoints(id) ON DELETE CASCADE,
-                pane_id INTEGER NOT NULL,
-                cwd TEXT,
-                command TEXT,
-                env_json TEXT,
-                terminal_state_json TEXT NOT NULL,
-                agent_metadata_json TEXT,
-                scrollback_checkpoint_seq INTEGER,
-                last_output_at INTEGER
-            );
-            ",
-        )
-        .expect("create session show test tables");
+        frankenterm_core::storage::initialize_schema(&conn)
+            .expect("initialize the current session show schema");
         let fixture_schema_version = conn
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
             .expect("read session show fixture schema version");
@@ -125385,35 +125290,44 @@ A  docs/new-proof.md\n";
     }
 
     #[test]
-    fn cli_robot_wait_for_alias_await_parses() {
+    fn cli_robot_await_parses_composite_conditions() {
         let cli = Cli::try_parse_from([
             "ft",
             "robot",
             "await",
-            "4",
-            "ready>",
+            "--any",
+            "rule:build.*",
+            "--all",
+            "quiescence:4:1000",
             "--timeout-secs",
             "60",
-            "--regex",
+            "--poll-interval-ms",
+            "250",
         ])
-        .expect("robot await alias should parse");
+        .expect("robot composite await should parse");
 
         match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
-                Some(RobotCommands::WaitFor {
-                    pane_id,
-                    pattern,
+                Some(RobotCommands::Await {
+                    any,
+                    all,
                     timeout_secs,
-                    tail,
-                    regex,
+                    poll_interval_ms,
+                    checkpoint_only,
+                    cursor,
+                    cursor_epoch,
+                    cursor_scope,
                 }) => {
-                    assert_eq!(pane_id, 4);
-                    assert_eq!(pattern, "ready>");
+                    assert_eq!(any, vec!["rule:build.*"]);
+                    assert_eq!(all, vec!["quiescence:4:1000"]);
                     assert_eq!(timeout_secs, 60);
-                    assert_eq!(tail, 200);
-                    assert!(regex);
+                    assert_eq!(poll_interval_ms, 250);
+                    assert!(!checkpoint_only);
+                    assert!(cursor.is_none());
+                    assert!(cursor_epoch.is_none());
+                    assert!(cursor_scope.is_none());
                 }
-                _ => panic!("expected RobotCommands::WaitFor"),
+                _ => panic!("expected RobotCommands::Await"),
             },
             _ => panic!("expected Robot command"),
         }
