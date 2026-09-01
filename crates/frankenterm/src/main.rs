@@ -6823,7 +6823,11 @@ fn atomic_path_hash_bounded_bytes(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn atomic_path_hash_metadata(hasher: &mut sha2::Sha256, metadata: &AtomicPathObjectMetadata) {
+fn atomic_path_hash_metadata(
+    hasher: &mut sha2::Sha256,
+    metadata: &AtomicPathObjectMetadata,
+    include_changed_time: bool,
+) {
     use sha2::Digest as _;
 
     hasher.update(metadata.object_kind.as_bytes());
@@ -6835,8 +6839,10 @@ fn atomic_path_hash_metadata(hasher: &mut sha2::Sha256, metadata: &AtomicPathObj
     hasher.update(metadata.byte_len.to_le_bytes());
     hasher.update(metadata.modified_seconds.to_le_bytes());
     hasher.update(metadata.modified_nanoseconds.to_le_bytes());
-    hasher.update(metadata.changed_seconds.to_le_bytes());
-    hasher.update(metadata.changed_nanoseconds.to_le_bytes());
+    if include_changed_time {
+        hasher.update(metadata.changed_seconds.to_le_bytes());
+        hasher.update(metadata.changed_nanoseconds.to_le_bytes());
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6892,7 +6898,10 @@ fn atomic_path_hash_node(
             hex::encode(name.as_bytes())
         );
     }
-    atomic_path_hash_metadata(hasher, &metadata_before);
+    // A namespace rename is allowed to update the root object's ctime even
+    // though the object, bytes, and tree are unchanged. Descendant ctimes
+    // remain part of the identity so mutations inside a directory stay fenced.
+    atomic_path_hash_metadata(hasher, &metadata_before, depth > 0);
 
     let mut fully_sealed =
         metadata_before.object_kind == "symlink" || metadata_before.mode & 0o222 == 0;
@@ -7034,7 +7043,7 @@ fn atomic_path_entry_identity(
         }
     }
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"frankenterm.atomic-path-object-content.v2\0");
+    hasher.update(b"frankenterm.atomic-path-object-content.v3\0");
     let mut budget = AtomicPathHashBudget::default();
     let (metadata, fully_sealed) = atomic_path_hash_node(
         parent,
@@ -7103,12 +7112,23 @@ fn atomic_path_transition_is_after(
     target: Option<&AtomicPathObjectIdentity>,
     operation: AtomicPathTransitionOperation,
 ) -> bool {
+    let equivalent = |observed: Option<&AtomicPathObjectIdentity>,
+                      before: Option<&AtomicPathObjectIdentity>| {
+        match (observed, before) {
+            (Some(observed), Some(before)) => {
+                observed.equivalent_after_namespace_rename(before)
+            }
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    };
     match operation {
         AtomicPathTransitionOperation::PublishNoreplace => {
-            stage.is_none() && target == Some(&claim.stage_before)
+            stage.is_none() && equivalent(target, Some(&claim.stage_before))
         }
         AtomicPathTransitionOperation::Exchange => {
-            stage == claim.target_before.as_ref() && target == Some(&claim.stage_before)
+            equivalent(stage, claim.target_before.as_ref())
+                && equivalent(target, Some(&claim.stage_before))
         }
     }
 }
