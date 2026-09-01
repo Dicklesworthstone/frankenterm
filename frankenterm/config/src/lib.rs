@@ -507,6 +507,14 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
         if !before.is_dir() {
             bail!("private user path is not a directory: {}", p.display());
         }
+        let expected_uid = nix::unistd::geteuid().as_raw();
+        if before.uid() != expected_uid {
+            bail!(
+                "private user directory is owned by uid {}, expected uid {expected_uid}: {}",
+                before.uid(),
+                p.display()
+            );
+        }
         if before.permissions().mode() & 0o7777 != 0o700 {
             directory
                 .set_permissions(std::fs::Permissions::from_mode(0o700))
@@ -534,6 +542,12 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
                 p.display()
             );
         }
+        if after.uid() != expected_uid || path_after.uid() != expected_uid {
+            bail!(
+                "private user directory ownership changed during validation: {}",
+                p.display()
+            );
+        }
     }
 
     #[cfg(not(unix))]
@@ -549,6 +563,177 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_user_owned_file(
+    path: &Path,
+    file: &std::fs::File,
+    normalize_mode: bool,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private user file has no parent: {}", path.display()))?;
+    let directory = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("inspecting private user file directory {}", parent.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspecting open private user file {}", path.display()))?;
+    let named = std::fs::symlink_metadata(path)
+        .with_context(|| format!("revalidating private user file name {}", path.display()))?;
+    let expected_uid = nix::unistd::geteuid().as_raw();
+    if !directory.is_dir()
+        || directory.file_type().is_symlink()
+        || directory.uid() != expected_uid
+        || directory.permissions().mode() & 0o7777 != 0o700
+        || !opened.is_file()
+        || !named.is_file()
+        || named.file_type().is_symlink()
+        || opened.uid() != expected_uid
+        || named.uid() != expected_uid
+        || opened.dev() != directory.dev()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.nlink() != 1
+        || named.nlink() != 1
+    {
+        bail!(
+            "private user file is not a direct, single-link authority owned by uid {expected_uid}: {}",
+            path.display()
+        );
+    }
+
+    if normalize_mode && opened.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("tightening private user file {}", path.display()))?;
+    }
+
+    let opened_after = file
+        .metadata()
+        .with_context(|| format!("re-inspecting private user file {}", path.display()))?;
+    let named_after = std::fs::symlink_metadata(path)
+        .with_context(|| format!("revalidating private user file name {}", path.display()))?;
+    if !opened_after.is_file()
+        || !named_after.is_file()
+        || named_after.file_type().is_symlink()
+        || opened_after.uid() != expected_uid
+        || named_after.uid() != expected_uid
+        || opened_after.dev() != directory.dev()
+        || opened_after.dev() != named_after.dev()
+        || opened_after.ino() != named_after.ino()
+        || opened_after.nlink() != 1
+        || named_after.nlink() != 1
+        || opened_after.permissions().mode() & 0o077 != 0
+        || named_after.permissions().mode() & 0o077 != 0
+    {
+        bail!(
+            "private user file identity or permissions changed during validation: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_user_owned_file(
+    path: &Path,
+    file: &std::fs::File,
+    _normalize_mode: bool,
+) -> anyhow::Result<()> {
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspecting open private user file {}", path.display()))?;
+    let named = std::fs::symlink_metadata(path)
+        .with_context(|| format!("revalidating private user file name {}", path.display()))?;
+    if !opened.is_file() || !named.is_file() || named.file_type().is_symlink() {
+        bail!(
+            "private user file is not a direct regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn open_user_owned_file_for_write(path: &Path) -> anyhow::Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private user file has no parent: {}", path.display()))?;
+    create_user_owned_dirs(parent)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening private user file {}", path.display()))?;
+    validate_user_owned_file(path, &file, true)?;
+    Ok(file)
+}
+
+/// Read one bounded-by-caller file from a private, direct, single-link user
+/// authority. The pathname and opened descriptor must continue to name the
+/// same file for the complete read.
+pub fn read_user_owned_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening private user file {}", path.display()))?;
+    validate_user_owned_file(path, &file, true)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("reading private user file {}", path.display()))?;
+    validate_user_owned_file(path, &file, false)?;
+    Ok(bytes)
+}
+
+/// Replace one private user file after validating its direct, single-link
+/// descriptor authority. Existing owned files with older permissive modes are
+/// tightened through the opened descriptor before truncation.
+pub fn write_user_owned_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::{Seek as _, Write as _};
+
+    let mut file = open_user_owned_file_for_write(path)?;
+    file.set_len(0)
+        .with_context(|| format!("truncating private user file {}", path.display()))?;
+    file.rewind()
+        .with_context(|| format!("seeking private user file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing private user file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing private user file {}", path.display()))?;
+    validate_user_owned_file(path, &file, false)
+}
+
+/// Append to one private user file without following aliases or accepting a
+/// multi-link authority.
+pub fn append_user_owned_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::{Seek as _, Write as _};
+
+    let mut file = open_user_owned_file_for_write(path)?;
+    file.seek(std::io::SeekFrom::End(0))
+        .with_context(|| format!("seeking private user file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("appending private user file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing private user file {}", path.display()))?;
+    validate_user_owned_file(path, &file, false)
 }
 
 fn xdg_config_home() -> PathBuf {
@@ -1570,5 +1755,68 @@ mod tests {
             0o755,
             "rejected symbolic-link authority must not tighten its target"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_file_io_normalizes_legacy_mode_and_preserves_descriptor_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("private-file fixture");
+        let private = fixture.path().join("state");
+        create_user_owned_dirs(&private).expect("create private file directory");
+        let path = private.join("state.json");
+        std::fs::write(&path, b"legacy").expect("plant legacy private file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("plant legacy permissive file mode");
+
+        assert_eq!(
+            read_user_owned_file(&path).expect("read and normalize legacy file"),
+            b"legacy"
+        );
+        assert_eq!(
+            path.symlink_metadata()
+                .expect("inspect normalized private file")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        write_user_owned_file(&path, b"new").expect("replace private file");
+        append_user_owned_file(&path, b"-tail").expect("append private file");
+        assert_eq!(
+            read_user_owned_file(&path).expect("read replaced private file"),
+            b"new-tail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_file_io_rejects_symlink_and_hardlink_aliases_without_mutating_targets() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        for hardlink in [false, true] {
+            let fixture = tempfile::tempdir().expect("private-file alias fixture");
+            let private = fixture.path().join("state");
+            create_user_owned_dirs(&private).expect("create private file directory");
+            let target = fixture.path().join("foreign-target");
+            std::fs::write(&target, b"foreign").expect("write foreign target");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                .expect("make foreign target private");
+            let alias = private.join("state.json");
+            if hardlink {
+                std::fs::hard_link(&target, &alias).expect("plant hardlink alias");
+            } else {
+                symlink(&target, &alias).expect("plant symlink alias");
+            }
+
+            assert!(read_user_owned_file(&alias).is_err());
+            assert!(write_user_owned_file(&alias, b"replacement").is_err());
+            assert!(append_user_owned_file(&alias, b"tail").is_err());
+            assert_eq!(
+                std::fs::read(&target).expect("foreign target remains readable"),
+                b"foreign"
+            );
+        }
     }
 }

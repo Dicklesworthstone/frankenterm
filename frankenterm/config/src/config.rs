@@ -2433,12 +2433,90 @@ fn default_font_size() -> f64 {
     12.0
 }
 
-pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
-    if let Some(cache) = dirs_next::cache_dir() {
-        return Ok(cache.join("frankenterm"));
-    }
+fn cache_dir_from_base(cache: Option<PathBuf>, home: &Path) -> PathBuf {
+    cache
+        .map(|cache| cache.join("frankenterm"))
+        .unwrap_or_else(|| home.join(".cache/frankenterm"))
+}
 
-    Ok(crate::HOME_DIR.join(".local/share/frankenterm"))
+pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(cache_dir_from_base(
+        dirs_next::cache_dir(),
+        crate::HOME_DIR.as_path(),
+    ))
+}
+
+/// How one artifact from FrankenTerm's former shared WezTerm namespace may be
+/// handled during the namespace transition.
+///
+/// `RetainLegacyOnly` is deliberately the fail-safe default. A new artifact
+/// must not be copied merely because it happens to live below the old data
+/// root; it needs an ownership proof and an artifact-specific validator first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyDataArtifactTreatment {
+    /// Decode and validate the old authority, then publish a fresh canonical
+    /// representation under both old/new namespace locks.
+    MigrateValidatedState,
+    /// Start clean in the canonical namespace because the content is derived
+    /// or can be fetched again.
+    RebuildInCanonicalNamespace,
+    /// Leave the old bytes in place and neither copy nor delete them because
+    /// they may belong to a side-by-side WezTerm installation.
+    RetainLegacyOnly,
+}
+
+pub const DATA_ARTIFACT_WINDOW_STATE: &str = "window-state.json";
+pub const DATA_ARTIFACT_DOMAIN_RECONNECT_PRIVATE: &str = "frankenterm-domain-reconnect-private-v1";
+pub const DATA_ARTIFACT_UPDATE_METADATA: &str = "check_update";
+pub const DATA_ARTIFACT_PLUGIN_ROOT: &str = "plugins";
+pub const DATA_ARTIFACT_REPL_HISTORY: &str = "repl-history";
+pub const DATA_ARTIFACT_RECENT_COMMANDS: &str = "recent-commands.json";
+pub const DATA_ARTIFACT_RECENT_EMOJI: &str = "recent-emoji.json";
+
+fn is_domain_reconnect_slot(relative_path: &Path) -> bool {
+    matches!(
+        relative_path.to_str(),
+        Some(
+            "domain-reconnect-manifest.slot-0"
+                | "domain-reconnect-manifest.slot-1"
+                | "domain-reconnect-manifest.slot-2"
+        )
+    )
+}
+
+/// Classify one path relative to the former shared data root.
+///
+/// The two migration-capable families are not bulk-copied. Their owning GUI
+/// modules decode bounded, checksummed state and reconstruct new canonical
+/// authorities transactionally. Everything unknown remains legacy-only.
+#[must_use]
+pub fn legacy_data_artifact_treatment(relative_path: &Path) -> LegacyDataArtifactTreatment {
+    if relative_path == Path::new(DATA_ARTIFACT_WINDOW_STATE)
+        || relative_path == Path::new("window-state.json.shadow")
+        || is_domain_reconnect_slot(relative_path)
+        || relative_path
+            .strip_prefix(DATA_ARTIFACT_DOMAIN_RECONNECT_PRIVATE)
+            .is_ok_and(is_domain_reconnect_slot)
+    {
+        LegacyDataArtifactTreatment::MigrateValidatedState
+    } else if relative_path == Path::new(DATA_ARTIFACT_UPDATE_METADATA) {
+        LegacyDataArtifactTreatment::RebuildInCanonicalNamespace
+    } else {
+        LegacyDataArtifactTreatment::RetainLegacyOnly
+    }
+}
+
+/// Return the former shared WezTerm cache namespace used by FrankenTerm.
+///
+/// Cache entries are deliberately not migrated: they are reproducible,
+/// version-sensitive derivatives and copying them would reintroduce stale
+/// WezTerm identities into the canonical FrankenTerm namespace. The path is
+/// exposed only so diagnostics can prove that legacy cache evidence remains
+/// untouched while [`CACHE_DIR`](crate::CACHE_DIR) starts clean.
+pub fn legacy_cache_dir() -> PathBuf {
+    dirs_next::cache_dir()
+        .map(|cache| cache.join("wezterm"))
+        .unwrap_or_else(|| crate::HOME_DIR.join(".local/share/wezterm"))
 }
 
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
@@ -2454,6 +2532,8 @@ pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
 /// This path is migration input only. New writes must always target
 /// [`DATA_DIR`](crate::DATA_DIR), and migration code must recognize and copy
 /// individual FrankenTerm-owned artifacts without deleting legacy evidence.
+/// [`legacy_data_artifact_treatment`] is the fail-closed artifact inventory;
+/// there is intentionally no whole-directory migration operation.
 pub fn legacy_data_dir() -> PathBuf {
     dirs_next::data_dir()
         .map(|data| data.join("wezterm"))
@@ -3731,20 +3811,98 @@ mod tests {
     #[test]
     fn compute_cache_dir_returns_ok() {
         let path = compute_cache_dir().expect("compute cache directory");
-        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("frankenterm"));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("frankenterm")
+        );
+    }
+
+    #[test]
+    fn cache_fallback_is_distinct_from_the_data_fallback() {
+        let home = Path::new("/private/test-home");
+        assert_eq!(
+            cache_dir_from_base(None, home),
+            home.join(".cache/frankenterm")
+        );
+        assert_ne!(
+            cache_dir_from_base(None, home),
+            home.join(".local/share/frankenterm")
+        );
     }
 
     #[test]
     fn compute_data_dir_returns_ok() {
         let path = compute_data_dir().expect("compute data directory");
-        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("frankenterm"));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("frankenterm")
+        );
     }
 
     #[test]
     fn legacy_data_dir_is_read_only_wezterm_migration_input() {
         let path = legacy_data_dir();
-        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("wezterm"));
-        assert_ne!(path, compute_data_dir().expect("compute canonical data directory"));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("wezterm")
+        );
+        assert_ne!(
+            path,
+            compute_data_dir().expect("compute canonical data directory")
+        );
+    }
+
+    #[test]
+    fn legacy_cache_dir_is_retained_but_never_canonical() {
+        let path = legacy_cache_dir();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("wezterm")
+        );
+        assert_ne!(
+            path,
+            compute_cache_dir().expect("compute canonical cache directory")
+        );
+    }
+
+    #[test]
+    fn legacy_data_artifact_policy_is_explicit_and_fail_closed() {
+        use LegacyDataArtifactTreatment::{
+            MigrateValidatedState, RebuildInCanonicalNamespace, RetainLegacyOnly,
+        };
+
+        for path in [
+            DATA_ARTIFACT_WINDOW_STATE,
+            "window-state.json.shadow",
+            "domain-reconnect-manifest.slot-0",
+            "domain-reconnect-manifest.slot-1",
+            "domain-reconnect-manifest.slot-2",
+            "frankenterm-domain-reconnect-private-v1/domain-reconnect-manifest.slot-0",
+        ] {
+            assert_eq!(
+                legacy_data_artifact_treatment(Path::new(path)),
+                MigrateValidatedState,
+                "validated FrankenTerm authority must have an artifact-specific migration: {path}"
+            );
+        }
+        assert_eq!(
+            legacy_data_artifact_treatment(Path::new(DATA_ARTIFACT_UPDATE_METADATA)),
+            RebuildInCanonicalNamespace
+        );
+        for path in [
+            "plugins/example/plugin/init.lua",
+            DATA_ARTIFACT_REPL_HISTORY,
+            DATA_ARTIFACT_RECENT_COMMANDS,
+            DATA_ARTIFACT_RECENT_EMOJI,
+            "foreign-wezterm-state",
+        ] {
+            assert_eq!(
+                legacy_data_artifact_treatment(Path::new(path)),
+                RetainLegacyOnly,
+                "ambiguous or unknown legacy artifact must never be copied: {path}"
+            );
+        }
+>>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
     }
 
     #[test]

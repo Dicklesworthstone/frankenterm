@@ -16,6 +16,7 @@ async_ossl = { workspace = true, default-features = false, features = ["async-as
 codec = { workspace = true, default-features = false, features = ["async-asupersync"] }
 config.workspace = true
 filedescriptor.workspace = true
+fs2.workspace = true
 futures.workspace = true
 lazy_static.workspace = true
 libc.workspace = true
@@ -47,3 +48,4 @@ winapi = { workspace=true, features = [
 
 [dev-dependencies]
 promise = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

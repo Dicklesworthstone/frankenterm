@@ -56,7 +56,7 @@ frankenterm-ssh.workspace = true
 frankenterm-term = { workspace = true, features=["use_serde"] }
 
 [target."cfg(unix)".dependencies]
-nix = {workspace=true, features=["resource"]}
+nix = {workspace=true, features=["resource", "user"]}
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = ["winuser"]}

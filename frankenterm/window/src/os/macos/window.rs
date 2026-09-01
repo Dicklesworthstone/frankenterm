@@ -1256,8 +1256,7 @@ impl WindowInner {
 impl WindowInner {
     fn show(&mut self) {
         unsafe {
-            let nonactivating_native_e2e =
-                super::connection::nonactivating_native_e2e_enabled();
+            let nonactivating_native_e2e = super::connection::nonactivating_native_e2e_enabled();
             if !nonactivating_native_e2e {
                 let current_app = NSRunningApplication::currentApplication(nil);
                 current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);

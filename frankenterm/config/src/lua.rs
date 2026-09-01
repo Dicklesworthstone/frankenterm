@@ -279,7 +279,11 @@ pub fn make_lua_context(config_file: &Path) -> anyhow::Result<Lua> {
         );
         path_array.insert(
             2,
-            format!("{}/plugins/?/plugin/init.lua", crate::DATA_DIR.display()),
+            format!(
+                "{}/{}/?/plugin/init.lua",
+                crate::DATA_DIR.display(),
+                crate::DATA_ARTIFACT_PLUGIN_ROOT
+            ),
         );
 
         if let Ok(exe) = std::env::current_exe() {
