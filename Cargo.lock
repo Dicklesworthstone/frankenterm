@@ -1523,6 +1523,7 @@ dependencies = [
  "enum-display-derive",
  "env_logger",
  "flume",
+ "fs2",
  "frankenterm-bidi",
  "frankenterm-cell",
  "frankenterm-config-derive",
