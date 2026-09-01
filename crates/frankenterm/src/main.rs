@@ -111472,13 +111472,11 @@ with tarfile.open(path, "w:xz") as archive:
             path,
             r#"#!/bin/sh
 set -eu
-descriptor=""
+input=""
 for argument in "$@"; do
-  case "$argument" in
-    /dev/fd/[0-9]*) descriptor=$argument ;;
-  esac
+  input=$argument
 done
-test -n "$descriptor"
+test "$input" = -
 if test -n "${ATTACK_FONT_ARCHIVE:-}" && test ! -e "$ATTACK_MARKER"; then
   mv "$ATTACK_FONT_ARCHIVE" "$RETAINED_FONT_ARCHIVE"
   cp "$REPLACEMENT_FONT_ARCHIVE" "$ATTACK_FONT_ARCHIVE"
@@ -111679,8 +111677,11 @@ cat "$FAKE_FONT_ARCHIVE"
     fn plant_installer_old_font_tree(data_root: &Path, marker: &[u8]) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let target = data_root.join("fonts/pragmasevka");
+        let font_parent = data_root.join("fonts");
+        let target = font_parent.join("pragmasevka");
         std::fs::create_dir_all(&target).expect("create prior font tree");
+        std::fs::set_permissions(&font_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make prior font parent private");
         for name in [
             "pragmasevka-nf-regular.ttf",
             "pragmasevka-nf-bold.ttf",
@@ -111833,7 +111834,8 @@ cat "$FAKE_FONT_ARCHIVE"
         let checksum_authority = prebuilt
             .find("verify_archive_checksum_authority \"$TMP/$TAR\" \"$TAR\"")
             .expect("mandatory external SHA-256 authority");
-        assert!(installer.contains("--proto '=https' --proto-redir '=https' --max-time 30"));
+        assert!(installer.contains("--proto '=https' --proto-redir '=https'"));
+        assert!(installer.contains("--max-filesize \"$max_bytes\" --max-time \"$max_time\""));
         let streaming_extraction = prebuilt
             .find("extract_authenticated_archive \"$TMP/$TAR\" \"$PACKAGE_ROOT\" process-family")
             .expect("bounded authenticated archive extraction");
@@ -111855,9 +111857,7 @@ cat "$FAKE_FONT_ARCHIVE"
             .expect("authenticated extractor function end");
         let extractor = &installer[extractor_start..extractor_end];
         assert_eq!(
-            extractor
-                .matches("tarfile.open(fileobj=raw, mode=\"r|*\")")
-                .count(),
+            extractor.matches("fileobj=raw, mode=\"r|\"").count(),
             2,
             "archive inventory and extraction must use two bounded streaming passes"
         );
@@ -111979,7 +111979,7 @@ cat "$FAKE_FONT_ARCHIVE"
             .find("build_from_source() {")
             .expect("source-build function start");
         let source_build_end = installer[source_build_start..]
-            .find("\n}\n\n# ───────────────────────────────────────────────────────────────────────────\n# Usage + arg parsing")
+            .find("\n}\n\n# Test subprocesses source the exact production functions")
             .map(|relative| source_build_start + relative)
             .expect("source-build function end");
         let source_build = &installer[source_build_start..source_build_end];
@@ -112591,15 +112591,16 @@ fi
         let checksum = font
             .find("verify_checksum")
             .expect("font checksum verification");
-        let extraction = font
-            .find("extract_authenticated_archive")
-            .expect("bounded font extraction");
         let scan_receipt = font
             .find("font_identity\" scan")
             .expect("authenticated inner-tree receipt scan");
         let direct_stage = font
             .find("prepare_font_generation_stage")
             .expect("private sibling generation stage");
+        let extraction = direct_stage
+            + font[direct_stage..]
+                .find("extract_authenticated_archive")
+                .expect("bounded font extraction");
         let seal = font
             .find("seal_font_generation_stage")
             .expect("exact font receipt seal");
@@ -112737,7 +112738,7 @@ fi
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("generation failed exact receipt sealing")
+                .contains("font tree differs from its authenticated exact receipt")
         );
     }
 
@@ -113701,7 +113702,14 @@ printf x > "$MINISIGN_MARKER"
             );
             let replay_receipt = parse_installer_app_receipt(&replay.stdout);
             assert_eq!(replay_receipt["result"], "verified");
-            assert_eq!(replay_receipt["readiness"], "passed");
+            assert_eq!(
+                replay_receipt["readiness"],
+                if switched {
+                    "existing_manifest_verified"
+                } else {
+                    "passed"
+                }
+            );
             assert_eq!(replay_receipt["activation"], "current");
             verify_live(&app_destination, "replay after app switch crash cut");
         }

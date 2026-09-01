@@ -22,6 +22,7 @@
 #![allow(clippy::useless_conversion)]
 #![allow(clippy::wrong_self_convention)]
 
+use std::convert::TryFrom as _;
 use std::future::Future;
 
 use anyhow::{anyhow, bail, Context, Error};
@@ -565,6 +566,8 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+const MAX_USER_OWNED_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[cfg(unix)]
 fn validate_user_owned_file(
     path: &Path,
@@ -576,8 +579,12 @@ fn validate_user_owned_file(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("private user file has no parent: {}", path.display()))?;
-    let directory = std::fs::symlink_metadata(parent)
-        .with_context(|| format!("inspecting private user file directory {}", parent.display()))?;
+    let directory = std::fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "inspecting private user file directory {}",
+            parent.display()
+        )
+    })?;
     let opened = file
         .metadata()
         .with_context(|| format!("inspecting open private user file {}", path.display()))?;
@@ -625,8 +632,8 @@ fn validate_user_owned_file(
         || opened_after.ino() != named_after.ino()
         || opened_after.nlink() != 1
         || named_after.nlink() != 1
-        || opened_after.permissions().mode() & 0o077 != 0
-        || named_after.permissions().mode() & 0o077 != 0
+        || opened_after.permissions().mode() & 0o7777 != 0o600
+        || named_after.permissions().mode() & 0o7777 != 0o600
     {
         bail!(
             "private user file identity or permissions changed during validation: {}",
@@ -656,13 +663,13 @@ fn validate_user_owned_file(
     Ok(())
 }
 
-fn open_user_owned_file_for_write(path: &Path) -> anyhow::Result<std::fs::File> {
+fn open_user_owned_file_for_write(path: &Path, append: bool) -> anyhow::Result<std::fs::File> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("private user file has no parent: {}", path.display()))?;
     create_user_owned_dirs(parent)?;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true);
+    options.create(true).read(true).write(true).append(append);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -674,11 +681,13 @@ fn open_user_owned_file_for_write(path: &Path) -> anyhow::Result<std::fs::File> 
     let file = options
         .open(path)
         .with_context(|| format!("opening private user file {}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("locking private user file {}", path.display()))?;
     validate_user_owned_file(path, &file, true)?;
     Ok(file)
 }
 
-/// Read one bounded-by-caller file from a private, direct, single-link user
+/// Read one bounded file from a private, direct, single-link user
 /// authority. The pathname and opened descriptor must continue to name the
 /// same file for the complete read.
 pub fn read_user_owned_file(path: &Path) -> anyhow::Result<Vec<u8>> {
@@ -695,10 +704,40 @@ pub fn read_user_owned_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     let mut file = options
         .open(path)
         .with_context(|| format!("opening private user file {}", path.display()))?;
-    validate_user_owned_file(path, &file, true)?;
+    fs2::FileExt::lock_shared(&file)
+        .with_context(|| format!("locking private user file {}", path.display()))?;
+    #[cfg(unix)]
+    let requires_mode_normalization = {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.metadata()
+            .with_context(|| format!("inspecting private user file {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o7777
+            != 0o600
+    };
+    #[cfg(not(unix))]
+    let requires_mode_normalization = false;
+    if requires_mode_normalization {
+        fs2::FileExt::unlock(&file)
+            .with_context(|| format!("upgrading private user file lock {}", path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking private user file {} exclusively", path.display()))?;
+    }
+    validate_user_owned_file(path, &file, requires_mode_normalization)?;
+    let maximum = MAX_USER_OWNED_FILE_BYTES;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
         .with_context(|| format!("reading private user file {}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
+        bail!(
+            "private user file exceeds the {maximum}-byte bound: {}",
+            path.display()
+        );
+    }
     validate_user_owned_file(path, &file, false)?;
     Ok(bytes)
 }
@@ -709,7 +748,14 @@ pub fn read_user_owned_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 pub fn write_user_owned_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::{Seek as _, Write as _};
 
-    let mut file = open_user_owned_file_for_write(path)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_USER_OWNED_FILE_BYTES {
+        bail!(
+            "private user file replacement exceeds the {}-byte bound: {}",
+            MAX_USER_OWNED_FILE_BYTES,
+            path.display()
+        );
+    }
+    let mut file = open_user_owned_file_for_write(path, false)?;
     file.set_len(0)
         .with_context(|| format!("truncating private user file {}", path.display()))?;
     file.rewind()
@@ -724,11 +770,24 @@ pub fn write_user_owned_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// Append to one private user file without following aliases or accepting a
 /// multi-link authority.
 pub fn append_user_owned_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    use std::io::{Seek as _, Write as _};
+    use std::io::Write as _;
 
-    let mut file = open_user_owned_file_for_write(path)?;
-    file.seek(std::io::SeekFrom::End(0))
-        .with_context(|| format!("seeking private user file {}", path.display()))?;
+    let mut file = open_user_owned_file_for_write(path, true)?;
+    let current = file
+        .metadata()
+        .with_context(|| format!("inspecting private user file {}", path.display()))?
+        .len();
+    let addition = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if current
+        .checked_add(addition)
+        .is_none_or(|total| total > MAX_USER_OWNED_FILE_BYTES)
+    {
+        bail!(
+            "private user file append exceeds the {}-byte bound: {}",
+            MAX_USER_OWNED_FILE_BYTES,
+            path.display()
+        );
+    }
     file.write_all(bytes)
         .with_context(|| format!("appending private user file {}", path.display()))?;
     file.sync_all()
@@ -1793,7 +1852,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn user_owned_file_io_rejects_symlink_and_hardlink_aliases_without_mutating_targets() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         for hardlink in [false, true] {
             let fixture = tempfile::tempdir().expect("private-file alias fixture");
@@ -1818,5 +1877,66 @@ mod tests {
                 b"foreign"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_file_io_fails_closed_at_the_size_bound() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("private-file bound fixture");
+        let private = fixture.path().join("state");
+        create_user_owned_dirs(&private).expect("create private file directory");
+        let path = private.join("bounded-state");
+        let file = std::fs::File::create(&path).expect("create bounded state fixture");
+        file.set_len(MAX_USER_OWNED_FILE_BYTES.saturating_add(1))
+            .expect("create sparse oversized fixture");
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .expect("make bounded state fixture private");
+
+        assert!(read_user_owned_file(&path).is_err());
+        assert!(append_user_owned_file(&path, b"x").is_err());
+        assert_eq!(
+            path.metadata()
+                .expect("inspect unchanged oversized file")
+                .len(),
+            MAX_USER_OWNED_FILE_BYTES.saturating_add(1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_user_owned_appends_serialize_the_size_bound() {
+        let fixture = tempfile::tempdir().expect("concurrent private-file fixture");
+        let private = fixture.path().join("state");
+        create_user_owned_dirs(&private).expect("create private file directory");
+        let path = private.join("bounded-append-state");
+        write_user_owned_file(&path, b"").expect("initialize bounded append authority");
+
+        let append_bytes =
+            usize::try_from(MAX_USER_OWNED_FILE_BYTES / 4).expect("append test payload fits usize");
+        let payload = std::sync::Arc::new(vec![b'x'; append_bytes]);
+        let successes = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    let payload = std::sync::Arc::clone(&payload);
+                    scope.spawn(move || append_user_owned_file(&path, payload.as_slice()).is_ok())
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("append worker did not panic"))
+                .filter(|success| *success)
+                .count()
+        });
+
+        assert_eq!(successes, 4);
+        assert_eq!(
+            path.metadata()
+                .expect("inspect serialized append authority")
+                .len(),
+            MAX_USER_OWNED_FILE_BYTES
+        );
     }
 }

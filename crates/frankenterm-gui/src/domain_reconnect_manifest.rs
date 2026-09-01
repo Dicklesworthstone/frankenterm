@@ -50,8 +50,7 @@ const LOCK_NAME: &str = "domain-reconnect-manifest.lock";
 const PRIVATE_AUTHORITY_DIRECTORY: &str = config::DATA_ARTIFACT_DOMAIN_RECONNECT_PRIVATE;
 const NAMESPACE_MIGRATION_INTENT_NAME: &str = "namespace-migration-intent-v1";
 const NAMESPACE_MIGRATION_COMPLETE_NAME: &str = "namespace-migration-complete-v1";
-static NAMESPACE_MIGRATION_RESULT: OnceLock<Result<bool, DomainReconnectManifestError>> =
-    OnceLock::new();
+static NAMESPACE_MIGRATION_FAILURE: OnceLock<DomainReconnectManifestError> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1528,20 +1527,29 @@ fn migrate_legacy_data_namespace_at(
 }
 
 fn namespace_migration_result_from<F>(
-    fence: &OnceLock<Result<bool, DomainReconnectManifestError>>,
+    failure_fence: &OnceLock<DomainReconnectManifestError>,
     migrate: F,
 ) -> Result<bool, DomainReconnectManifestError>
 where
     F: FnOnce() -> Result<bool, DomainReconnectManifestError>,
 {
-    match fence.get_or_init(migrate) {
-        Ok(migrated) => Ok(*migrated),
-        Err(error) => Err(error.clone()),
+    if let Some(error) = failure_fence.get() {
+        return Err(error.clone());
+    }
+    match migrate() {
+        Ok(migrated) => match failure_fence.get() {
+            Some(error) => Err(error.clone()),
+            None => Ok(migrated),
+        },
+        Err(error) => {
+            let _ = failure_fence.set(error.clone());
+            Err(failure_fence.get().cloned().unwrap_or(error))
+        }
     }
 }
 
 fn migrate_legacy_data_namespace() -> Result<bool, DomainReconnectManifestError> {
-    namespace_migration_result_from(&NAMESPACE_MIGRATION_RESULT, || {
+    namespace_migration_result_from(&NAMESPACE_MIGRATION_FAILURE, || {
         migrate_legacy_data_namespace_at(&config::legacy_data_dir(), config::DATA_DIR.as_path())
     })
 }
@@ -1649,7 +1657,9 @@ fn write_slot_with_interruption(
     #[cfg(test)]
     if interruption == SlotWriteInterruption::AfterPartialWrite {
         file.write_all(&encoded[..encoded.len() / 2])
-            .map_err(|error| DomainReconnectManifestError::io("write partial authority slot", error))?;
+            .map_err(|error| {
+                DomainReconnectManifestError::io("write partial authority slot", error)
+            })?;
         return Err(DomainReconnectManifestError::io(
             "injected slot interruption during write",
             io::Error::other("injected slot interruption"),
@@ -2120,6 +2130,25 @@ mod tests {
             );
         }
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn namespace_migration_success_is_rechecked_until_a_failure_is_pinned() {
+        use std::cell::Cell;
+
+        let fence = OnceLock::new();
+        let calls = Cell::new(0usize);
+        for expected in [false, true] {
+            assert_eq!(
+                namespace_migration_result_from(&fence, || {
+                    calls.set(calls.get().saturating_add(1));
+                    Ok(expected)
+                })
+                .expect("successful namespace checks remain live"),
+                expected
+            );
+        }
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

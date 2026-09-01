@@ -31,6 +31,7 @@ colorgrad.workspace = true
 dirs-next.workspace = true
 enum-display-derive.workspace = true
 flume.workspace = true
+fs2.workspace = true
 hostname.workspace = true
 lazy_static.workspace = true
 libc.workspace = true

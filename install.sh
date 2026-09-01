@@ -188,9 +188,9 @@ warn() {
 
 err() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 "✗ $*"
+    gum style --foreground 196 "✗ $*" >&2
   else
-    echo -e "\033[0;31m✗\033[0m $*"
+    echo -e "\033[0;31m✗\033[0m $*" >&2
   fi
 }
 
@@ -3117,17 +3117,14 @@ try:
     def streaming_archive():
         os.lseek(archive_fd, 0, os.SEEK_SET)
         if archive_kind == "font":
-            if not os.path.isdir("/dev/fd"):
-                raise SystemExit("descriptor-backed zstd input is unavailable")
             source_fd = os.dup(archive_fd)
             try:
                 process = subprocess.Popen(
-                    ["zstd", "-dc", "-M64M", f"/dev/fd/{source_fd}"],
-                    stdin=subprocess.DEVNULL,
+                    ["zstd", "-dc", "-M64M", "-"],
+                    stdin=source_fd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
-                    pass_fds=(source_fd,),
                 )
             except (OSError, ValueError) as error:
                 raise SystemExit("cannot start the bounded descriptor-fed zstd decoder") from error

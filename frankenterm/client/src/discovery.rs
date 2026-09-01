@@ -1,4 +1,6 @@
 use anyhow::Context;
+#[cfg(unix)]
+use std::convert::TryFrom as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 #[cfg(unix)]
@@ -23,13 +25,8 @@ fn parse_gui_socket_pid(name: &str) -> Option<u32> {
     if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-<<<<<<< HEAD
-    let pid = pid.parse::<u32>().ok()?;
-    (pid != 0).then_some(pid)
-=======
     let parsed = pid.parse::<u32>().ok()?;
     (parsed != 0 && parsed.to_string() == pid).then_some(parsed)
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
 }
 
 #[cfg(unix)]
@@ -50,7 +47,9 @@ fn is_socket_entry(_entry: &std::fs::DirEntry) -> bool {
 const STALE_GUI_SOCKET_QUARANTINE: &str = ".stale-gui-sockets";
 
 #[cfg(unix)]
-<<<<<<< HEAD
+const SOCKET_LEASE_RECORD_MAX_BYTES: u64 = 256;
+
+#[cfg(unix)]
 fn process_is_proven_absent(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -59,16 +58,17 @@ fn process_is_proven_absent(pid: u32) -> bool {
     // strictly positive, range-checked pid prevents process-group semantics.
     let result = unsafe { libc::kill(pid, 0) };
     result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-=======
+}
+
+#[cfg(unix)]
 fn socket_lock_path(socket_path: &Path) -> PathBuf {
     let mut path = socket_path.as_os_str().to_os_string();
     path.push(".lock");
     PathBuf::from(path)
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
 }
 
 #[cfg(unix)]
-fn socket_identity_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+fn socket_object_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
     left.file_type().is_socket()
@@ -81,8 +81,31 @@ fn socket_identity_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) 
 }
 
 #[cfg(unix)]
-<<<<<<< HEAD
-=======
+fn socket_identity_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    socket_object_matches(left, right)
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(unix)]
+fn canonical_socket_lease_record(
+    socket_metadata: &std::fs::Metadata,
+    publisher_pid: u32,
+) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+
+    format!(
+        "FT_SOCKET_LEASE_V1 pid={publisher_pid} dev={} ino={} ctime={} ctime_nsec={}\n",
+        socket_metadata.dev(),
+        socket_metadata.ino(),
+        socket_metadata.ctime(),
+        socket_metadata.ctime_nsec(),
+    )
+}
+
+#[cfg(unix)]
 fn lock_identity_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -93,16 +116,41 @@ fn lock_identity_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) ->
         && left.uid() == right.uid()
         && left.nlink() == 1
         && right.nlink() == 1
-        && left.len() == 0
-        && right.len() == 0
+        && left.len() == right.len()
+        && left.len() <= SOCKET_LEASE_RECORD_MAX_BYTES
         && left.mode() & 0o077 == 0
         && right.mode() & 0o077 == 0
+}
+
+#[cfg(unix)]
+fn socket_lease_record_matches(
+    lock_file: &std::fs::File,
+    socket_metadata: &std::fs::Metadata,
+    publisher_pid: u32,
+) -> bool {
+    use std::os::unix::fs::FileExt as _;
+
+    let Ok(lock_metadata) = lock_file.metadata() else {
+        return false;
+    };
+    if lock_metadata.len() == 0 || lock_metadata.len() > SOCKET_LEASE_RECORD_MAX_BYTES {
+        return false;
+    }
+    let Ok(record_len) = usize::try_from(lock_metadata.len()) else {
+        return false;
+    };
+    let mut observed = vec![0_u8; record_len];
+    if lock_file.read_exact_at(&mut observed, 0).is_err() {
+        return false;
+    }
+    observed == canonical_socket_lease_record(socket_metadata, publisher_pid).as_bytes()
 }
 
 #[cfg(unix)]
 fn try_lock_stale_socket_owner(
     path: &Path,
     socket_metadata: &std::fs::Metadata,
+    publisher_pid: u32,
     expected_uid: u32,
     expected_device: u64,
 ) -> Option<(std::fs::File, PathBuf, std::fs::Metadata)> {
@@ -145,6 +193,8 @@ fn try_lock_stale_socket_owner(
     if !socket_identity_matches(socket_metadata, &revalidated_socket)
         || !lock_identity_matches(&lock_metadata, &revalidated_lock)
         || !lock_identity_matches(&lock_metadata, &open_lock_after)
+        || !socket_lease_record_matches(&lock_file, socket_metadata, publisher_pid)
+        || !process_is_proven_absent(publisher_pid)
     {
         return None;
     }
@@ -190,7 +240,6 @@ fn create_quarantine_slot(
 }
 
 #[cfg(unix)]
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
 fn quarantine_proven_stale_socket(
     runtime_dir: &Path,
     path: &Path,
@@ -199,56 +248,6 @@ fn quarantine_proven_stale_socket(
 ) -> bool {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
-<<<<<<< HEAD
-    if !initial.file_type().is_socket()
-        || initial.uid() != unsafe { libc::geteuid() }
-        || initial.nlink() != 1
-        || !process_is_proven_absent(pid)
-    {
-        return false;
-    }
-
-    let quarantine_dir = runtime_dir.join(STALE_GUI_SOCKET_QUARANTINE);
-    if config::create_user_owned_dirs(&quarantine_dir).is_err() {
-        return false;
-    }
-    let quarantine_name = format!(
-        "{GUI_SOCKET_PREFIX}{pid}.dev-{}.ino-{}",
-        initial.dev(),
-        initial.ino()
-    );
-    let quarantine_path = quarantine_dir.join(quarantine_name);
-    if quarantine_path.exists() || quarantine_path.symlink_metadata().is_ok() {
-        return false;
-    }
-
-    let Ok(revalidated) = path.symlink_metadata() else {
-        return false;
-    };
-    if !socket_identity_matches(initial, &revalidated) || !process_is_proven_absent(pid) {
-        return false;
-    }
-
-    match std::fs::rename(path, &quarantine_path) {
-        Ok(()) => {
-            let moved_matches = quarantine_path
-                .symlink_metadata()
-                .is_ok_and(|moved| socket_identity_matches(initial, &moved));
-            if moved_matches {
-                log::info!(
-                    "quarantined stale GUI socket {} as {}",
-                    path.display(),
-                    quarantine_path.display()
-                );
-                true
-            } else {
-                log::error!(
-                    "stale GUI socket quarantine identity changed unexpectedly at {}",
-                    quarantine_path.display()
-                );
-                false
-            }
-=======
     let Ok(runtime_metadata) = runtime_dir.symlink_metadata() else {
         return false;
     };
@@ -263,6 +262,7 @@ fn quarantine_proven_stale_socket(
     let Some((_lock_file, lock_path, lock_metadata)) = try_lock_stale_socket_owner(
         path,
         initial,
+        pid,
         runtime_metadata.uid(),
         runtime_metadata.dev(),
     ) else {
@@ -277,12 +277,22 @@ fn quarantine_proven_stale_socket(
     ) else {
         return false;
     };
+    let Ok(revalidated) = path.symlink_metadata() else {
+        return false;
+    };
+    if !socket_identity_matches(initial, &revalidated) || !process_is_proven_absent(pid) {
+        return false;
+    }
     let quarantine_socket = quarantine_slot.join("socket");
     match std::fs::rename(path, &quarantine_socket) {
         Ok(()) => {
             let moved_matches = quarantine_socket
                 .symlink_metadata()
-                .is_ok_and(|moved| socket_identity_matches(initial, &moved));
+                // A successful rename changes ctime on Unix. The full lease
+                // incarnation was revalidated immediately before the move;
+                // afterwards the stable object identity proves that the
+                // admitted socket is the one retained in quarantine.
+                .is_ok_and(|moved| socket_object_matches(initial, &moved));
             if !moved_matches {
                 log::error!(
                     "stale GUI socket quarantine identity changed unexpectedly at {}",
@@ -308,7 +318,6 @@ fn quarantine_proven_stale_socket(
                 quarantine_slot.display()
             );
             true
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
         }
         Err(error) => {
             log::debug!(
@@ -661,12 +670,6 @@ pub fn resolve_gui_sock_path(class_name: &str) -> anyhow::Result<PathBuf> {
 pub fn discover_gui_socks() -> Vec<PathBuf> {
     discover_gui_socks_in(config::RUNTIME_DIR.as_path())
 }
-<<<<<<< HEAD
-
-fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
-    let mut socks = vec![];
-=======
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
 
 fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
     #[derive(Debug)]
@@ -748,6 +751,29 @@ fn is_definitive_dead_socket_error(error: &std::io::Error) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn proven_absent_test_pid() -> u32 {
+        (1_000_000..1_001_000)
+            .find(|pid| process_is_proven_absent(*pid))
+            .expect("the test host must expose one absent PID in the reserved high range")
+    }
+
+    #[cfg(unix)]
+    fn write_socket_lease_record(lock_file: &mut std::fs::File, socket: &Path, publisher_pid: u32) {
+        use std::io::{Seek as _, Write as _};
+
+        let metadata = socket
+            .symlink_metadata()
+            .expect("inspect socket before writing lease record");
+        let record = canonical_socket_lease_record(&metadata, publisher_pid);
+        lock_file.set_len(0).expect("truncate socket lease record");
+        lock_file.rewind().expect("rewind socket lease record");
+        lock_file
+            .write_all(record.as_bytes())
+            .expect("write socket lease record");
+        lock_file.sync_all().expect("sync socket lease record");
+    }
+
     #[test]
     fn canonical_gui_socket_path_uses_frankenterm_prefix() {
         let path = gui_socket_path_for_pid(42);
@@ -766,6 +792,14 @@ mod tests {
         assert!(!is_gui_socket_name("frankenterm-gui-sock-0"));
         assert!(!is_gui_socket_name("frankenterm-gui-sock-00042"));
         assert!(!is_gui_socket_name("frankenterm-gui-sock-4294967296"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_process_is_never_classified_as_proven_absent() {
+        assert!(!process_is_proven_absent(std::process::id()));
+        assert!(!process_is_proven_absent(0));
+        assert!(!process_is_proven_absent(u32::MAX));
     }
 
     #[cfg(unix)]
@@ -816,9 +850,7 @@ mod tests {
             std::io::ErrorKind::ConnectionRefused,
             std::io::ErrorKind::NotFound,
         ] {
-            assert!(is_definitive_dead_socket_error(&std::io::Error::from(
-                kind
-            )));
+            assert!(is_definitive_dead_socket_error(&std::io::Error::from(kind)));
         }
     }
 
@@ -828,9 +860,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let runtime = tempfile::tempdir().expect("stale socket runtime");
-        let socket = runtime.path().join("frankenterm-gui-sock-73");
+        let pid = proven_absent_test_pid();
+        let socket = runtime.path().join(format!("frankenterm-gui-sock-{pid}"));
         let lock = socket_lock_path(&socket);
-        let lock_file = std::fs::OpenOptions::new()
+        let mut lock_file = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
@@ -838,14 +871,16 @@ mod tests {
             .expect("create stale socket lease");
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
             .expect("make stale socket lease private");
-        drop(lock_file);
-        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+        write_socket_lease_record(&mut lock_file, &socket, pid);
         let metadata = socket.symlink_metadata().expect("inspect stale socket");
+        drop(listener);
+        drop(lock_file);
 
         assert!(quarantine_proven_stale_socket(
             runtime.path(),
             &socket,
-            73,
+            pid,
             &metadata,
         ));
         assert!(!socket.exists());
@@ -861,9 +896,89 @@ mod tests {
         assert!(!quarantine_proven_stale_socket(
             runtime.path(),
             &socket,
-            73,
+            pid,
             &metadata,
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_lease_record_cannot_quarantine_a_rebound_socket_incarnation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = tempfile::tempdir().expect("rebound socket runtime");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make runtime private");
+        let pid = proven_absent_test_pid();
+        let socket = runtime.path().join(format!("frankenterm-gui-sock-{pid}"));
+        let lock = socket_lock_path(&socket);
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .expect("create original socket lease");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
+            .expect("make original socket lease private");
+        let original_listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind original socket");
+        write_socket_lease_record(&mut lock_file, &socket, pid);
+        drop(original_listener);
+        drop(lock_file);
+
+        let retained_original = runtime.path().join("retained-original-socket");
+        std::fs::rename(&socket, &retained_original).expect("retain original socket incarnation");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind replacement socket"));
+        let replacement_metadata = socket
+            .symlink_metadata()
+            .expect("inspect replacement socket incarnation");
+
+        assert!(!quarantine_proven_stale_socket(
+            runtime.path(),
+            &socket,
+            pid,
+            &replacement_metadata,
+        ));
+        assert!(socket.exists());
+        assert!(retained_original.exists());
+        assert!(lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_or_malformed_lease_record_refuses_quarantine() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for record in [b"".as_slice(), b"not-a-socket-lease\n".as_slice()] {
+            let runtime = tempfile::tempdir().expect("invalid lease runtime");
+            std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make runtime private");
+            let pid = proven_absent_test_pid();
+            let socket = runtime.path().join(format!("frankenterm-gui-sock-{pid}"));
+            drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
+            let lock = socket_lock_path(&socket);
+            let mut lock_file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&lock)
+                .expect("create invalid socket lease");
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
+                .expect("make invalid socket lease private");
+            lock_file.write_all(record).expect("write invalid lease");
+            lock_file.sync_all().expect("sync invalid lease");
+            drop(lock_file);
+            let metadata = socket.symlink_metadata().expect("inspect stale socket");
+
+            assert!(!quarantine_proven_stale_socket(
+                runtime.path(),
+                &socket,
+                pid,
+                &metadata,
+            ));
+            assert!(socket.exists());
+        }
     }
 
     #[cfg(unix)]
@@ -920,6 +1035,5 @@ mod tests {
             ));
             assert!(socket.exists());
         }
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
     }
 }

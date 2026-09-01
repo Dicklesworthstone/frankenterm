@@ -6,7 +6,6 @@ use luahelper::ValuePrinter;
 use mlua::Value;
 use mux::termwiztermtab::TermWizTerminal;
 use promise::spawn::block_on;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use termwiz::cell::{AttributeChange, CellAttributes, Intensity};

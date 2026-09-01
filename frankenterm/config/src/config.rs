@@ -3902,7 +3902,6 @@ mod tests {
                 "ambiguous or unknown legacy artifact must never be copied: {path}"
             );
         }
->>>>>>> 2304d09bb (feat(config,client,window): enhance config loading, discovery, and macos window connections)
     }
 
     #[test]

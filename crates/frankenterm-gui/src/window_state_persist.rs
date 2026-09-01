@@ -3144,9 +3144,9 @@ fn validate_state_file_descriptor(
 ) -> Result<std::fs::Metadata, PersistenceFailure> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    let parent = path.parent().ok_or_else(|| {
-        PersistenceFailure::invalid("window-state file has no parent directory")
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| PersistenceFailure::invalid("window-state file has no parent directory"))?;
     let directory = parent
         .symlink_metadata()
         .map_err(|error| PersistenceFailure::io("inspect state directory", error))?;
@@ -3911,20 +3911,12 @@ fn validate_existing_corrupt_evidence(
     path: &Path,
     expected: &[u8],
 ) -> Result<(), PersistenceFailure> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| PersistenceFailure::io("inspect corrupt-state evidence", error))?;
-    if !metadata.file_type().is_file()
-        || metadata.len() != u64::try_from(expected.len()).unwrap_or(u64::MAX)
-    {
+    let (mut file, metadata) = open_state_file(path, true, false, "open corrupt-state evidence")?;
+    if metadata.len() != u64::try_from(expected.len()).unwrap_or(u64::MAX) {
         return Err(PersistenceFailure::corrupt(
             "existing corrupt-state evidence does not match its digest identity",
         ));
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| PersistenceFailure::io("open corrupt-state evidence", error))?;
     let read_limit = u64::try_from(expected.len())
         .unwrap_or(u64::MAX)
         .saturating_add(1);
@@ -3940,6 +3932,7 @@ fn validate_existing_corrupt_evidence(
     }
     file.sync_all()
         .map_err(|error| PersistenceFailure::io("sync corrupt-state evidence", error))?;
+    validate_state_file_descriptor(path, &file, false)?;
     sync_parent_directory(path)
 }
 
@@ -3977,11 +3970,17 @@ fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), Persist
             )));
         }
     }
-    let mut file = match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&quarantine)
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(&quarantine) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return validate_existing_corrupt_evidence(&quarantine, &evidence.bytes);
@@ -3993,10 +3992,12 @@ fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), Persist
             ));
         }
     };
+    validate_state_file_descriptor(&quarantine, &file, true)?;
     file.write_all(&evidence.bytes)
         .map_err(|error| PersistenceFailure::io("write corrupt-state evidence", error))?;
     file.sync_all()
         .map_err(|error| PersistenceFailure::io("sync corrupt-state evidence", error))?;
+    validate_state_file_descriptor(&quarantine, &file, false)?;
     sync_parent_directory(&quarantine)
 }
 
@@ -6514,8 +6515,7 @@ fn choose_initial_attempt_slot(
 }
 
 fn read_initial_attempt_bytes(path: &Path) -> Result<Vec<u8>, PersistenceFailure> {
-    let (mut file, metadata) =
-        open_state_file(path, false, false, "open retired initial attempt")?;
+    let (mut file, metadata) = open_state_file(path, false, false, "open retired initial attempt")?;
     if metadata.len() > MAX_STATE_FILE_BYTES {
         return Err(PersistenceFailure::Oversized {
             actual: metadata.len(),
@@ -6610,11 +6610,9 @@ fn write_initial_slot(
     }
     let mut options = OpenOptions::new();
     options.read(true).write(true);
-    if choice.occupied {
-        // Open without truncating so alias, ownership, and link-count checks
-        // run against the exact descriptor before any retained evidence is
-        // mutated.
-    } else {
+    // Open an occupied candidate without truncating so alias, ownership, and
+    // link-count checks run before any retained evidence is mutated.
+    if !choice.occupied {
         options.create_new(true);
     }
     #[cfg(unix)]
@@ -6689,12 +6687,62 @@ fn sync_authoritative_slot(path: &Path) -> Result<(), PersistenceFailure> {
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<(), PersistenceFailure> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| PersistenceFailure::io("sync state directory", error))
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let directory = options
+        .open(parent)
+        .map_err(|error| PersistenceFailure::io("open state directory for sync", error))?;
+    let opened = directory
+        .metadata()
+        .map_err(|error| PersistenceFailure::io("inspect open state directory", error))?;
+    let named = parent
+        .symlink_metadata()
+        .map_err(|error| PersistenceFailure::io("revalidate named state directory", error))?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if !opened.is_dir()
+        || named.file_type().is_symlink()
+        || !named.is_dir()
+        || opened.uid() != expected_uid
+        || named.uid() != expected_uid
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.permissions().mode() & 0o7777 != 0o700
+        || named.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(PersistenceFailure::invalid(
+            "window-state directory changed identity before durability sync",
+        ));
+    }
+    directory
+        .sync_all()
+        .map_err(|error| PersistenceFailure::io("sync state directory", error))?;
+    let opened_after = directory
+        .metadata()
+        .map_err(|error| PersistenceFailure::io("re-inspect state directory", error))?;
+    let named_after = parent
+        .symlink_metadata()
+        .map_err(|error| PersistenceFailure::io("revalidate state directory after sync", error))?;
+    if opened.dev() != opened_after.dev()
+        || opened.ino() != opened_after.ino()
+        || opened.dev() != named_after.dev()
+        || opened.ino() != named_after.ino()
+        || named_after.file_type().is_symlink()
+        || !named_after.is_dir()
+        || named_after.uid() != expected_uid
+        || named_after.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(PersistenceFailure::invalid(
+            "window-state directory changed identity during durability sync",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -6969,7 +7017,15 @@ fn commit_batch_with_byte_limit(
 
 static GLOBAL_WRITER: OnceLock<Result<PersistenceWriter, PersistenceFailure>> = OnceLock::new();
 static STARTUP_SNAPSHOT: OnceLock<StartupRestoreCache> = OnceLock::new();
-static NAMESPACE_MIGRATION: OnceLock<Result<(), PersistenceFailure>> = OnceLock::new();
+static NAMESPACE_MIGRATION_FAILURE: OnceLock<PersistenceFailure> = OnceLock::new();
+
+fn same_window_state_payload(left: &PersistedState, right: &PersistedState) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.store_revision = 0;
+    right.store_revision = 0;
+    left == right
+}
 
 fn migrate_legacy_window_state_at(
     legacy_primary: &Path,
@@ -6990,9 +7046,8 @@ fn migrate_legacy_window_state_at_with_interruption(
     if legacy_primary == canonical_primary {
         return Ok(false);
     }
-    if config::legacy_data_artifact_treatment(Path::new(
-        config::DATA_ARTIFACT_WINDOW_STATE,
-    )) != config::LegacyDataArtifactTreatment::MigrateValidatedState
+    if config::legacy_data_artifact_treatment(Path::new(config::DATA_ARTIFACT_WINDOW_STATE))
+        != config::LegacyDataArtifactTreatment::MigrateValidatedState
         || config::legacy_data_artifact_treatment(Path::new("window-state.json.shadow"))
             != config::LegacyDataArtifactTreatment::MigrateValidatedState
     {
@@ -7047,6 +7102,14 @@ fn migrate_legacy_window_state_at_with_interruption(
     };
     let canonical = load_authoritative_unlocked(canonical_primary)?;
     if canonical.source != StoreSource::Empty {
+        let legacy = load_authoritative_unlocked(legacy_primary)?;
+        if legacy.source != StoreSource::Empty
+            && !same_window_state_payload(&canonical.state, &legacy.state)
+        {
+            return Err(PersistenceFailure::corrupt(
+                "canonical and legacy window-state authorities diverge",
+            ));
+        }
         return Ok(false);
     }
 
@@ -7102,27 +7165,37 @@ fn migrate_legacy_window_state_if_needed() -> Result<(), PersistenceFailure> {
 }
 
 fn migration_result_from<F>(
-    fence: &OnceLock<Result<(), PersistenceFailure>>,
+    failure_fence: &OnceLock<PersistenceFailure>,
     migrate: F,
 ) -> Result<(), PersistenceFailure>
 where
     F: FnOnce() -> Result<(), PersistenceFailure>,
 {
-    match fence.get_or_init(migrate) {
-        Ok(()) => Ok(()),
-        Err(failure) => Err(failure.clone()),
+    if let Some(failure) = failure_fence.get() {
+        return Err(failure.clone());
+    }
+    match migrate() {
+        Ok(()) => match failure_fence.get() {
+            Some(failure) => Err(failure.clone()),
+            None => Ok(()),
+        },
+        Err(failure) => {
+            let _ = failure_fence.set(failure.clone());
+            Err(failure_fence.get().cloned().unwrap_or(failure))
+        }
     }
 }
 
 fn ensure_legacy_window_state_migrated() -> Result<(), PersistenceFailure> {
-    migration_result_from(&NAMESPACE_MIGRATION, migrate_legacy_window_state_if_needed)
+    migration_result_from(
+        &NAMESPACE_MIGRATION_FAILURE,
+        migrate_legacy_window_state_if_needed,
+    )
 }
 
 fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
-    match GLOBAL_WRITER.get_or_init(|| {
-        ensure_legacy_window_state_migrated()?;
-        PersistenceWriter::open(state_file_name())
-    }) {
+    ensure_legacy_window_state_migrated()?;
+    match GLOBAL_WRITER.get_or_init(|| PersistenceWriter::open(state_file_name())) {
         Ok(writer) => Ok(writer),
         Err(failure) => Err(failure.clone()),
     }
@@ -7373,6 +7446,20 @@ mod tests {
     }
 
     #[test]
+    fn namespace_migration_success_is_rechecked_until_a_failure_is_pinned() {
+        let fence = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            migration_result_from(&fence, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("successful namespace checks remain live");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn legacy_namespace_migration_preserves_validated_state_and_source_evidence() {
         let fixture = tempfile::tempdir().expect("window-state migration fixture");
         let legacy = fixture.path().join("wezterm").join("window-state.json");
@@ -7430,7 +7517,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_window_state_authority_is_never_overwritten_by_legacy_migration() {
+    fn divergent_window_state_authorities_fail_closed_without_overwrite() {
         let fixture = tempfile::tempdir().expect("window-state divergence fixture");
         let legacy = fixture.path().join("wezterm").join("window-state.json");
         let canonical = fixture.path().join("frankenterm").join("window-state.json");
@@ -7449,13 +7536,54 @@ mod tests {
                 .expect("publish divergent authority");
         }
 
-        assert!(
-            !migrate_legacy_window_state_at(&legacy, &canonical)
-                .expect("canonical authority wins without overwrite")
-        );
+        assert!(migrate_legacy_window_state_at(&legacy, &canonical).is_err());
         let canonical_after = load_snapshot_at(&canonical).expect("load canonical authority");
         assert!(canonical_after.window_states.contains_key("canonical"));
         assert!(!canonical_after.window_states.contains_key("legacy"));
+    }
+
+    #[test]
+    fn completed_window_state_migration_rejects_later_legacy_divergence() {
+        let fixture = tempfile::tempdir().expect("window-state late divergence fixture");
+        let legacy = fixture.path().join("wezterm").join("window-state.json");
+        let canonical = fixture.path().join("frankenterm").join("window-state.json");
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_window_state(
+                "shared-before-migration".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue initial legacy state");
+        commit_for_test(&legacy, &initial, WriteInterruption::None)
+            .expect("publish initial legacy authority");
+        assert!(
+            migrate_legacy_window_state_at(&legacy, &canonical)
+                .expect("perform initial namespace migration")
+        );
+
+        let mut later = PendingBatch::default();
+        later
+            .queue_window_state(
+                "legacy-writer-after-migration".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue later legacy state");
+        commit_for_test(&legacy, &later, WriteInterruption::None)
+            .expect("publish later legacy divergence");
+
+        assert!(migrate_legacy_window_state_at(&legacy, &canonical).is_err());
+        let canonical_after = load_snapshot_at(&canonical).expect("load retained canonical state");
+        assert!(
+            !canonical_after
+                .window_states
+                .contains_key("legacy-writer-after-migration")
+        );
     }
 
     #[test]
