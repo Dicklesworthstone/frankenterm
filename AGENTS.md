@@ -291,7 +291,7 @@ supported paths. (3) `crates/frankenterm-core/tests/common/asupersync_test.rs`
 and the LabRuntime helpers — the supported async-test substrate. (4)
 `dependency_eradication.rs` / `forbidden_dep_guards.rs` — source-level grep
 guards for `use tokio::` and friends. (5) `deny.toml` `[bans]` rule + the
-`Cargo-deny tokio ban (ft-i2eni.3)` CI step — fails the build if any
+`cargo deny check bans` release gate (ft-i2eni.3; DSR quality, no GitHub workflow) — fails the build if any
 first-party `Cargo.toml` declares `tokio` as a direct dependency. The
 classification and release-bundle evidence live at
 `docs/tokio-test-classification.md` and

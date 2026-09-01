@@ -1732,7 +1732,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 2. **Leaf type crates declare zero first-party deps.** They depend only on external libs (serde, etc.).
 3. **Cluster sub-crates depend on `frankenterm-core` only.** They don't depend on each other (except for the leaf type crates they import).
 4. **`tokio` ban** at the `cargo-deny` layer fails the build if any first-party `Cargo.toml` declares `tokio` directly.
-5. **Cycle detection** runs in CI via `cargo-deny` + the workspace-topology crate (`frankenterm-topo`).
+5. **Cycle detection** runs in the release gate (`scripts/release-gates.sh`, DSR quality) via `cargo-deny` + the workspace-topology crate (`frankenterm-topo`).
 
 Practical consequence: reading code in a sub-crate, you can be sure it doesn't reach back into `frankenterm-core`. Reading code in a leaf type crate, you can be sure it doesn't reach anywhere else in the first-party graph. The compile-time graph is the documentation.
 
@@ -3014,7 +3014,7 @@ The project uses formal methods where they earn their keep, typically on invaria
 
 ### The "proof gauntlet" path
 
-The current reality-check round (ft-tf6g3) is wiring the formal-methods substrate into the attestation graph. The intent is that every formal proof produces a per-release artifact slot; release CI runs the model checker and verifies the slot. Where proofs are vacuous (e.g., the current semantic-search PAC-Bayes bound until production data lands), the artifact says so explicitly rather than overstating coverage.
+The current reality-check round (ft-tf6g3) is wiring the formal-methods substrate into the attestation graph. The intent is that every formal proof produces a per-release artifact slot; the DSR release gate runs the model checker and verifies the slot. Where proofs are vacuous (e.g., the current semantic-search PAC-Bayes bound until production data lands), the artifact says so explicitly rather than overstating coverage.
 
 ### Methodology playbooks
 
@@ -3771,9 +3771,9 @@ When agent output patterns change (new versions, updated prompts), follow this f
 
 The project uses **asupersync** exclusively. Direct `tokio` usage is forbidden at three layers:
 
-1. **Dependency layer.** `deny.toml` declares a `[bans]` entry for `tokio`; the `Cargo-deny tokio ban` CI step fails the build if any first-party `Cargo.toml` declares `tokio` as a direct dependency.
+1. **Dependency layer.** `deny.toml` declares a `[bans]` entry for `tokio`; the `cargo deny check bans` release gate fails the build if any first-party `Cargo.toml` declares `tokio` as a direct dependency.
 2. **Type layer.** The `RuntimeProof` sealed trait makes `tokio::sync::*` types fail to compile in `RuntimeProof`-bounded API surfaces. The sealed-trait soundness argument is modeled in [`docs/proofs/runtime-proof-soundness.lean`](docs/proofs/runtime-proof-soundness.lean) and checked by `scripts/check-runtime-proof-soundness.sh`.
-3. **Test layer.** `scripts/check_asupersync_test_only.sh` plus `tests/wa_22x4r_no_tokio_test_in_supported_paths.rs` are CI and cargo-test-time checks that no active `#[tokio::test]` attribute lands in supported paths. The supported async-test substrate is the `asupersync_test!` declarative macro and the `LabRuntime` helpers in `crates/frankenterm-core/tests/common/asupersync_test.rs`.
+3. **Test layer.** `scripts/check_asupersync_test_only.sh` (run by `scripts/release-gates.sh`) plus `tests/wa_22x4r_no_tokio_test_in_supported_paths.rs` are release-gate and cargo-test-time checks that no active `#[tokio::test]` attribute lands in supported paths. The supported async-test substrate is the `asupersync_test!` declarative macro and the `LabRuntime` helpers in `crates/frankenterm-core/tests/common/asupersync_test.rs`.
 
 `runtime_async` is the canonical asupersync wrapper API surface, exposing `Mutex`, `RwLock`, `Semaphore`, `mpsc`, `watch`, `broadcast`, `oneshot`, plus project-curated ergonomic helpers (`sleep_with_cx`, `timeout_with_cx`, `RuntimeBuilder`).
 
