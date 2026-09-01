@@ -74,6 +74,7 @@ pub mod detection;
 mod exec_domain;
 mod font;
 mod frontend;
+pub mod gui_socket;
 pub mod keyassignment;
 mod keys;
 #[cfg(feature = "lua")]

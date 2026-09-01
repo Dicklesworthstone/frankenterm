@@ -9242,6 +9242,10 @@ pub struct BackendSelection {
 pub struct UnifiedClient {
     inner: WeztermHandle,
     selection: BackendSelection,
+    /// The mux socket discovery outcome that fed backend selection, so
+    /// `ft doctor` can say *which* socket the vendored client will dial and
+    /// where that path came from.
+    mux_socket: Option<DiscoveredMuxSocket>,
 }
 
 impl UnifiedClient {
@@ -9255,6 +9259,7 @@ impl UnifiedClient {
                 reason: "explicit CLI backend".to_string(),
                 compatibility: None,
             },
+            mux_socket: None,
         }
     }
 
@@ -9264,6 +9269,7 @@ impl UnifiedClient {
         Self {
             inner: handle,
             selection,
+            mux_socket: None,
         }
     }
 
@@ -9271,6 +9277,16 @@ impl UnifiedClient {
     #[must_use]
     pub fn selection(&self) -> &BackendSelection {
         &self.selection
+    }
+
+    /// The mux socket discovered while building this client, if any.
+    ///
+    /// `None` means no listening socket was found by any source (or the
+    /// client was built from an explicit handle); the vendored backend then
+    /// falls back to the CLI path or to its own last-resort resolution.
+    #[must_use]
+    pub fn discovered_socket(&self) -> Option<&DiscoveredMuxSocket> {
+        self.mux_socket.as_ref()
     }
 
     /// Return the inner handle.

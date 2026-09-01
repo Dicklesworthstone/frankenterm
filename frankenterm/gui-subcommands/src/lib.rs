@@ -4,7 +4,10 @@ use config::{GuiPosition, SshParameters};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const DEFAULT_WINDOW_CLASS: &str = "com.dicklesworthstone.frankenterm";
+/// The window class the GUI publishes its mux socket under. Owned by the
+/// `config` crate so the GUI, the client library, and `frankenterm-core`
+/// discovery all agree on it.
+pub use config::gui_socket::DEFAULT_WINDOW_CLASS;
 
 /// Helper for parsing config overrides
 pub fn name_equals_value(arg: &str) -> Result<(String, String), String> {

@@ -6,27 +6,13 @@ use std::time::{Duration, SystemTime};
 #[cfg(unix)]
 use wezterm_uds::UnixStream;
 
-/// Canonical filename prefix for per-process FrankenTerm GUI mux sockets.
-pub const GUI_SOCKET_PREFIX: &str = "frankenterm-gui-sock-";
-
-/// Return the canonical runtime path for a FrankenTerm GUI mux socket.
-#[must_use]
-pub fn gui_socket_path_for_pid(pid: u32) -> PathBuf {
-    config::RUNTIME_DIR.join(format!("{GUI_SOCKET_PREFIX}{pid}"))
-}
+// Socket naming is owned by the `config` crate so the GUI (publisher), this
+// client library, and `frankenterm-core` discovery cannot drift apart.
+pub use config::gui_socket::{GUI_SOCKET_PREFIX, gui_socket_path_for_pid, parse_gui_socket_pid};
 
 #[cfg(test)]
 fn is_gui_socket_name(name: &str) -> bool {
     parse_gui_socket_pid(name).is_some()
-}
-
-fn parse_gui_socket_pid(name: &str) -> Option<u32> {
-    let pid = name.strip_prefix(GUI_SOCKET_PREFIX)?;
-    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let parsed = pid.parse::<u32>().ok()?;
-    (parsed != 0 && parsed.to_string() == pid).then_some(parsed)
 }
 
 #[cfg(unix)]
@@ -595,34 +581,8 @@ mod unix {
     }
 
     impl NameHolder {
-        fn compute_name(class_name: &str) -> String {
-            #[cfg(not(target_os = "macos"))]
-            {
-                let config = config::configuration();
-                if config.enable_wayland {
-                    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
-                        return format!("wayland-{}-{}", wayland, class_name);
-                    }
-                    // We don't assume a default WAYLAND_DISPLAY here because
-                    // we don't know if the default should be used or if we
-                    // should fall back to X11 without connecting to wayland.
-                    // We cannot introduce a dep on a wayland client library
-                    // here, but we could potentially try to construct a
-                    // unix domain socket client to see if our assumed default
-                    // is a working unix socket.
-                    // Something to fill in later as/when that question arises!
-                }
-                let x11 = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-                format!("x11-{}-{}", x11, class_name)
-            }
-            #[cfg(target_os = "macos")]
-            {
-                format!("default-{}", class_name)
-            }
-        }
-
         fn compute_path(class_name: &str) -> PathBuf {
-            config::RUNTIME_DIR.join(Self::compute_name(class_name))
+            config::gui_socket::published_gui_sock_path(class_name)
         }
 
         pub fn new(path: &Path, class_name: &str) -> anyhow::Result<Self> {
