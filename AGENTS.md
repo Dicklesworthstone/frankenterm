@@ -10,6 +10,46 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE NUMBER 0.1: DSR-ONLY RELEASES — NEVER USE GITHUB ACTIONS
+
+**FRANKENTERM USES DOODLESTEIN SELF-RELEASER (`dsr`) AS ITS PRIMARY AND
+EXCLUSIVE RELEASE SYSTEM. GITHUB ACTIONS MUST NEVER BE USED FOR ANYTHING.**
+
+This is an absolute repository rule, not a fallback policy and not a queue-time
+optimization. The generic `dsr` skill may describe DSR as a fallback after an
+Actions delay; that wording does not apply here. For FrankenTerm, start with
+DSR and stay with DSR.
+
+**ABSOLUTE PROHIBITIONS:**
+- Do NOT inspect, monitor, wait on, trigger, rerun, enable, repair, or debug a
+  GitHub Actions workflow or job.
+- Do NOT run `gh run ...`, use workflow-dispatch APIs, open the Actions UI, or
+  query Actions status as part of implementation, testing, release, or triage.
+- Do NOT treat an Actions result, artifact, log, badge, queue state, or lack of
+  runner assignment as evidence for any FrankenTerm claim.
+- Do NOT recommend GitHub Actions as a next step, fallback, independent check,
+  native-build lane, or release gate.
+- Do NOT delay work while waiting for GitHub Actions. Its state is irrelevant
+  to this project.
+
+**REQUIRED RELEASE PATH:**
+1. Use `dsr doctor`, `dsr health all`, and `dsr repos info frankenterm` for
+   release-system and native-host readiness.
+2. Use `dsr quality frankenterm` for the configured pre-release quality gate.
+3. Use `dsr build frankenterm --version <version>` for cross-platform release
+   artifacts, including the native macOS application family.
+4. Use `dsr release frankenterm <version>` to publish, then
+   `dsr release verify frankenterm <version>` and the configured DSR canary and
+   upgrade verification commands for closeout.
+5. Retain DSR manifests, checksums, signatures, SBOM/provenance, host receipts,
+   installer/canary evidence, and release-verification results.
+
+RCH remains the required development-time Cargo offload and proof mechanism
+described elsewhere in this file. It does not replace DSR for release
+orchestration, native release builds, publication, or release verification.
+
+---
+
 ## RULE NUMBER 0.5: NEVER REMOVE crates/frankenterm-core
 
 **THE crates/frankenterm-core CRATE IS A PERMANENT PART OF THIS WORKSPACE. REMOVING IT IS FORBIDDEN.**
