@@ -74,9 +74,11 @@ cargo_gate "ftui tests"                          "scripts/check_ftui_tests.sh"
 cargo_gate "ftui docs"                           "scripts/check_ftui_docs.sh"
 gate "reality-check bead structure"              "scripts/check-reality-check-bead-structure.sh"
 # --- Attestation and contract verifiers ------------------------------------
-# Verifies the newest bundle in docs/attestations/ (today only the unsigned
-# dev-channel bundle exists; the first signed release bundle is ft-xxfwy.15).
-gate "attestation bundle verify"                 "bash scripts/attestation-verify.sh \"\$(ls -t docs/attestations/[0-9]*.json | head -1)\""
+# Rebuilds the dev-channel bundle from the current tree (it is a generated
+# artifact, like PROVENANCE.json) and verifies it. A stale committed bundle
+# therefore surfaces as generated-artifact drift, not as a hash mismatch
+# against history. The first signed release bundle is ft-xxfwy.15.
+gate "attestation dev bundle build+verify"       "bash scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned --allow-partial >/dev/null && bash scripts/attestation-verify.sh docs/attestations/0.0.0-dev.json"
 gate "deferred proof family integrity"           "tests/e2e/test_deferred_proof_family_integrity.sh"
 gate "deferred proof family conformance"         "tests/e2e/test_deferred_proof_family_conformance.sh"
 gate "deferred proof comment extractor contract" "tests/e2e/test_deferred_proof_comment_extractor_contract.sh"
