@@ -752,6 +752,7 @@ What it does:
 | `--no-app` / `--with-app` / `--app-dest DIR` | macOS GUI-app control (skip / force / relocate) |
 | `--from-source` | Build from source instead of downloading (needs Rust + git) |
 | `--offline TARBALL` | Install from a local tarball; no network |
+| `--activate ID --idle-host-confirmed` | Promote the published candidate generation `ID` (printed in the install receipt) to the current authority so `ft`, the mux server, and the PTY guardian resolve on `PATH`. The installer never does this automatically; it refuses while its process census sees a running FrankenTerm launcher |
 | `--no-verify` | Skip the DSR minisign signature check only; SHA-256 remains mandatory (testing only) |
 | `--verify` | Run `ft doctor` after install |
 
