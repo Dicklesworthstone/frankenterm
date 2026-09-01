@@ -7115,9 +7115,7 @@ fn atomic_path_transition_is_after(
     let equivalent = |observed: Option<&AtomicPathObjectIdentity>,
                       before: Option<&AtomicPathObjectIdentity>| {
         match (observed, before) {
-            (Some(observed), Some(before)) => {
-                observed.equivalent_after_namespace_rename(before)
-            }
+            (Some(observed), Some(before)) => observed.equivalent_after_namespace_rename(before),
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         }
@@ -7217,8 +7215,12 @@ where
         read_atomic_path_transition_json::<AtomicPathTransitionClaim>(&parent_dir, &claim_name)?;
     let (claim, claim_bytes) = if let Some((claim, bytes)) = stored_claim {
         anyhow::ensure!(
-            claim.schema_version == "frankenterm.atomic-path-transition-claim.v4"
-                && claim.transaction_id == transaction_id
+            claim.schema_version == "frankenterm.atomic-path-transition-claim.v5",
+            "unsupported atomic path transition claim schema {}; retained pre-v5 journals require explicit operator resolution",
+            claim.schema_version
+        );
+        anyhow::ensure!(
+            claim.transaction_id == transaction_id
                 && claim.parent_device == parent_opened.dev()
                 && claim.parent_inode == parent_opened.ino()
                 && claim.operation == operation.as_str()
@@ -7273,7 +7275,7 @@ where
             }
         }
         let claim = AtomicPathTransitionClaim {
-            schema_version: "frankenterm.atomic-path-transition-claim.v4".to_string(),
+            schema_version: "frankenterm.atomic-path-transition-claim.v5".to_string(),
             transaction_id: transaction_id.to_string(),
             parent_device: parent_opened.dev(),
             parent_inode: parent_opened.ino(),
@@ -7293,10 +7295,20 @@ where
 
     let validate_ack = |ack: &AtomicPathTransitionAck| -> anyhow::Result<()> {
         anyhow::ensure!(
-            ack.schema_version == "frankenterm.atomic-path-transition-ack.v4"
-                && ack.transaction_id == transaction_id
+            ack.schema_version == "frankenterm.atomic-path-transition-ack.v5",
+            "unsupported atomic path transition acknowledgement schema {}; retained pre-v5 journals require explicit operator resolution",
+            ack.schema_version
+        );
+        anyhow::ensure!(
+            ack.transaction_id == transaction_id
                 && ack.claim_sha256 == claim_sha256
-                && ack.outcome == "applied",
+                && ack.outcome == "applied"
+                && atomic_path_transition_is_after(
+                    &claim,
+                    ack.stage_after.as_ref(),
+                    ack.target_after.as_ref(),
+                    operation,
+                ),
             "atomic path transition acknowledgement conflicts with its durable claim"
         );
         Ok(())
@@ -7312,7 +7324,7 @@ where
     if let Some((ack, _)) = ack {
         validate_ack(&ack)?;
         anyhow::ensure!(
-            is_after,
+            stage_now == ack.stage_after && target_now == ack.target_after,
             "acknowledged atomic path transition no longer has its exact post-effect authority"
         );
         parent_file.sync_all()?;
@@ -7381,10 +7393,12 @@ where
     );
 
     let ack = AtomicPathTransitionAck {
-        schema_version: "frankenterm.atomic-path-transition-ack.v4".to_string(),
+        schema_version: "frankenterm.atomic-path-transition-ack.v5".to_string(),
         transaction_id: transaction_id.to_string(),
         claim_sha256,
         outcome: "applied".to_string(),
+        stage_after,
+        target_after,
     };
     write_atomic_path_transition_json(&parent_dir, &parent_file, &ack_name, &ack)?;
     let parent_after = fs::symlink_metadata(parent)?;
@@ -15470,7 +15484,7 @@ fn apply_prepared_agent_config(
     frankenterm_core::robot_types::AgentConfigureResultItem,
     AgentConfigApplyError,
 > {
-    apply_prepared_agent_config_with_writer(prepared, fs::write)
+    apply_prepared_agent_config_with_writer(prepared, |path, bytes| fs::write(path, bytes))
 }
 
 fn apply_prepared_agent_config_with_writer<F>(
@@ -63776,7 +63790,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             operation,
                         )?;
                         println!(
-                            "FT_ATOMIC_PATH_TRANSITION_V4={}:{}:{}:{}:{}",
+                            "FT_ATOMIC_PATH_TRANSITION_V5={}:{}:{}:{}:{}",
                             transaction_id,
                             operation.as_str(),
                             stage_name,
@@ -63786,7 +63800,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
                     SetupCommands::AtomicPathContentId { parent, name } => {
                         let content_id = inspect_atomic_path_content_id(&parent, &name)?;
-                        println!("FT_ATOMIC_PATH_CONTENT_ID_V2={content_id}");
+                        println!("FT_ATOMIC_PATH_CONTENT_ID_V3={content_id}");
                     }
                     SetupCommands::Config => {
                         use frankenterm_core::setup;
@@ -86871,6 +86885,41 @@ fn verify_remote_generation_directory(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+const REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(10), Duration::from_millis(50)];
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn retry_remote_generation_exec_busy<T, F>(timeout: Duration, mut attempt: F) -> std::io::Result<T>
+where
+    F: FnMut(Duration) -> std::io::Result<T>,
+{
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "timeout overflow"))?;
+    for retry_index in 0..=REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "descriptor-pinned generation version probe timed out",
+            ));
+        }
+        match attempt(remaining) {
+            Ok(output) => return Ok(output),
+            Err(error)
+                if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+                    && retry_index < REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS.len() =>
+            {
+                let delay = REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS[retry_index];
+                std::thread::sleep(delay.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded exec-busy retry loop always returns")
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn run_descriptor_pinned_remote_generation_component_version(
     executable: &impl std::os::fd::AsFd,
     role: &str,
@@ -86895,9 +86944,11 @@ fn run_descriptor_pinned_remote_generation_component_version(
     );
     let inherited_number = inherited.as_raw_fd();
     let executable_path = PathBuf::from("/proc/self/fd").join(inherited_number.to_string());
-    let mut command = std::process::Command::new(&executable_path);
-    command.arg("--version");
-    let output = run_cmd_with_timeout(&mut command, Duration::from_secs(10), 64 * 1024, 64 * 1024)?;
+    let output = retry_remote_generation_exec_busy(Duration::from_secs(10), |remaining| {
+        let mut command = std::process::Command::new(&executable_path);
+        command.arg("--version");
+        run_cmd_with_timeout(&mut command, remaining, 64 * 1024, 64 * 1024)
+    })?;
     anyhow::ensure!(
         !output.stdout.overflowed && !output.stderr.overflowed,
         "{role} version probe output exceeded its bounded capture"
@@ -103212,19 +103263,20 @@ recorder_backend = "rusqlite"
                 );
             }
 
-            // Attack B: an over-i64-range seq_after cannot be persisted, so the
-            // Gap branch returns an Err — but the caller (the listener loop)
-            // handles that with `if let Err(err) = …` and continues. Crucially,
-            // the frontier is STILL untouched, so the pane is not silenced even
-            // when the forged gap is rejected at the storage layer.
-            let over_range_result = distributed_persist_payload(
+            // Attack B: wire validation now rejects an over-i64-range
+            // seq_after before persistence. Drive the internal persistence
+            // helper directly as a defense-in-depth check: storage must also
+            // reject the first value above its durable range, and that failure
+            // must still leave the delta frontier untouched.
+            let over_range_seq_after = i64::MAX as u64 + 1;
+            let over_range_error = distributed_persist_payload(
                 sender,
                 None,
-                    frankenterm_core::wire_protocol::WirePayload::Gap(
-                        frankenterm_core::wire_protocol::GapNotice {
-                            pane_id: source_pane_id,
-                            seq_before: 0,
-                            seq_after: i64::MAX as u64,
+                frankenterm_core::wire_protocol::WirePayload::Gap(
+                    frankenterm_core::wire_protocol::GapNotice {
+                        pane_id: source_pane_id,
+                        seq_before: 0,
+                        seq_after: over_range_seq_after,
                         reason: "forged-overflow".to_string(),
                         detected_at_ms: now_ms(),
                     },
@@ -103233,10 +103285,13 @@ recorder_backend = "rusqlite"
                 &event_bus,
                 &pane_seq_by_sender,
             )
-            .await;
+            .await
+            .expect_err("the first sequence above i64::MAX must not reach durable storage");
+            let over_range_diagnostic = format!("{over_range_error:#}");
             assert!(
-                over_range_result.is_err(),
-                "ft-6k5gh: an over-i64 seq_after gap is rejected at persist, not silently applied"
+                over_range_diagnostic.contains("seq_after value")
+                    && over_range_diagnostic.contains("exceeds i64 range"),
+                "ft-6k5gh: over-range persistence rejection lost its durable-range diagnosis: {over_range_error:#}"
             );
             {
                 let shared = pane_seq_by_sender.shared.lock().await;
@@ -103895,6 +103950,7 @@ recorder_backend = "rusqlite"
             let sender = "agent-gap-tracker";
             let source_pane_id = 51_u64;
             let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let forged_high_gap_seq_after = i64::MAX as u64;
 
             distributed_persist_payload(
                 sender,
@@ -103922,7 +103978,7 @@ recorder_backend = "rusqlite"
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
                         seq_before: 0,
-                        seq_after: u64::MAX,
+                        seq_after: forged_high_gap_seq_after,
                         reason: "forged-high-gap".to_string(),
                         detected_at_ms: now_ms_i64(),
                     },
@@ -103961,9 +104017,11 @@ recorder_backend = "rusqlite"
                     .filter(|gap| gap.pane_id == remote_pane_id)
                     .collect();
                 assert_eq!(pane_gaps.len(), 1);
+                let expected_gap_reason =
+                    format!("distributed_gap:forged-high-gap:0:{forged_high_gap_seq_after}");
                 assert_eq!(
                     pane_gaps.first().map(|gap| gap.reason.as_str()),
-                    Some("distributed_gap:forged-high-gap:0:9223372036854775807")
+                    Some(expected_gap_reason.as_str())
                 );
 
                 let segments = storage_handle
@@ -108523,6 +108581,58 @@ log_level = "debug"
         assert_eq!(ambient_status.code(), Some(73));
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn remote_generation_exec_busy_retry_is_bounded_and_selective() {
+        let mut eventual_attempts = 0_u8;
+        let value =
+            retry_remote_generation_exec_busy(std::time::Duration::from_secs(1), |_remaining| {
+                eventual_attempts += 1;
+                if eventual_attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(
+                        nix::errno::Errno::ETXTBSY as i32,
+                    ))
+                } else {
+                    Ok("ready")
+                }
+            })
+            .expect("two transient exec-busy results should be retried");
+        assert_eq!(value, "ready");
+        assert_eq!(eventual_attempts, 3);
+
+        let mut exhausted_attempts = 0_u8;
+        let exhausted = retry_remote_generation_exec_busy(
+            std::time::Duration::from_secs(1),
+            |_remaining| -> std::io::Result<()> {
+                exhausted_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::ETXTBSY as i32,
+                ))
+            },
+        )
+        .expect_err("the finite retry schedule must preserve terminal exec-busy");
+        assert_eq!(
+            exhausted.raw_os_error(),
+            Some(nix::errno::Errno::ETXTBSY as i32)
+        );
+        assert_eq!(exhausted_attempts, 3);
+
+        let mut other_attempts = 0_u8;
+        let other = retry_remote_generation_exec_busy(
+            std::time::Duration::from_secs(1),
+            |_remaining| -> std::io::Result<()> {
+                other_attempts += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "not retryable",
+                ))
+            },
+        )
+        .expect_err("non-exec-busy failures must not be retried");
+        assert_eq!(other.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(other_attempts, 1);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn atomic_path_exchange_lost_reply_reconciles_without_toggling_back() {
@@ -108577,6 +108687,157 @@ log_level = "debug"
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn atomic_path_publish_noreplace_lost_reply_reconciles_without_republication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create no-replace reconciliation fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make transition parent private");
+        let stage = fixture.path().join("stage");
+        let target = fixture.path().join("target");
+        std::fs::write(&stage, b"first-generation").expect("write staged generation");
+        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o400))
+            .expect("seal transition member");
+        let stage_id = inspect_atomic_path_content_id(fixture.path(), "stage")
+            .expect("hash staged generation");
+        let transaction_id = "13579bdf2468ace013579bdf2468ace0";
+
+        let error = run_atomic_path_transition_with_post_effect_sync(
+            fixture.path(),
+            "stage",
+            "target",
+            transaction_id,
+            &stage_id,
+            "missing",
+            AtomicPathTransitionOperation::PublishNoreplace,
+            |_| Err(std::io::Error::other("planted lost reply after no-replace")),
+        )
+        .expect_err("post-effect durability failure must withhold acknowledgement");
+        assert!(format!("{error:#}").contains("planted lost reply after no-replace"));
+        assert!(!stage.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"first-generation");
+
+        let recovered = run_atomic_path_transition(
+            fixture.path(),
+            "stage",
+            "target",
+            transaction_id,
+            &stage_id,
+            "missing",
+            AtomicPathTransitionOperation::PublishNoreplace,
+        )
+        .expect("same transaction reconciles exact no-replace post-effect authority");
+        assert_eq!(recovered, AtomicPathTransitionOutcome::AlreadyApplied);
+        assert!(!stage.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"first-generation");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_path_post_effect_equivalence_ignores_only_root_ctime() {
+        let before = AtomicPathObjectIdentity {
+            metadata: AtomicPathObjectMetadata {
+                device: 1,
+                inode: 2,
+                object_kind: "regular-file".to_string(),
+                mode: 0o100400,
+                uid: 3,
+                gid: 4,
+                hard_link_count: 1,
+                byte_len: 5,
+                modified_seconds: 6,
+                modified_nanoseconds: 7,
+                changed_seconds: 8,
+                changed_nanoseconds: 9,
+            },
+            content_id: format!("sha256:{}", "a".repeat(64)),
+            fully_sealed: true,
+        };
+        let mut ctime_only = before.clone();
+        ctime_only.metadata.changed_seconds += 1;
+        ctime_only.metadata.changed_nanoseconds += 1;
+        assert!(ctime_only.equivalent_after_namespace_rename(&before));
+
+        let reject = |label: &str, mutate: fn(&mut AtomicPathObjectIdentity)| {
+            let mut candidate = ctime_only.clone();
+            mutate(&mut candidate);
+            assert!(
+                !candidate.equivalent_after_namespace_rename(&before),
+                "{label} mutation must not be accepted as a namespace rename"
+            );
+        };
+        reject("device", |value| value.metadata.device += 1);
+        reject("inode", |value| value.metadata.inode += 1);
+        reject("kind", |value| {
+            value.metadata.object_kind.push_str("-changed")
+        });
+        reject("mode", |value| value.metadata.mode ^= 0o100);
+        reject("uid", |value| value.metadata.uid += 1);
+        reject("gid", |value| value.metadata.gid += 1);
+        reject("hard-link count", |value| {
+            value.metadata.hard_link_count += 1
+        });
+        reject("length", |value| value.metadata.byte_len += 1);
+        reject("mtime seconds", |value| {
+            value.metadata.modified_seconds += 1
+        });
+        reject("mtime nanoseconds", |value| {
+            value.metadata.modified_nanoseconds += 1;
+        });
+        reject("content", |value| value.content_id.replace_range(7..8, "b"));
+        reject("seal state", |value| value.fully_sealed = false);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_path_ack_replay_rejects_post_ack_metadata_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create acknowledged mutation fixture");
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make transition parent private");
+        let stage = fixture.path().join("stage");
+        let target = fixture.path().join("target");
+        std::fs::write(&stage, b"new-generation").expect("write staged generation");
+        std::fs::write(&target, b"old-generation").expect("write target generation");
+        for path in [&stage, &target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
+                .expect("seal transition member");
+        }
+        let stage_id = inspect_atomic_path_content_id(fixture.path(), "stage")
+            .expect("hash staged generation");
+        let target_id = inspect_atomic_path_content_id(fixture.path(), "target")
+            .expect("hash target generation");
+        let transaction_id = "abcdef0123456789abcdef0123456789";
+        let applied = run_atomic_path_transition(
+            fixture.path(),
+            "stage",
+            "target",
+            transaction_id,
+            &stage_id,
+            &target_id,
+            AtomicPathTransitionOperation::Exchange,
+        )
+        .expect("apply and acknowledge exchange");
+        assert_eq!(applied, AtomicPathTransitionOutcome::Applied);
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("plant post-ack metadata mutation");
+        let error = run_atomic_path_transition(
+            fixture.path(),
+            "stage",
+            "target",
+            transaction_id,
+            &stage_id,
+            &target_id,
+            AtomicPathTransitionOperation::Exchange,
+        )
+        .expect_err("acknowledged post-state mutation must fail closed");
+        assert!(format!("{error:#}").contains("no longer has its exact post-effect authority"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn atomic_path_journal_resumes_one_truncated_deterministic_temp() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -108597,10 +108858,12 @@ log_level = "debug"
         let parent =
             cap_std::fs::Dir::from_std_file(parent_file.try_clone().expect("clone journal parent"));
         let ack = AtomicPathTransitionAck {
-            schema_version: "frankenterm.atomic-path-transition-ack.v4".to_string(),
+            schema_version: "frankenterm.atomic-path-transition-ack.v5".to_string(),
             transaction_id: transaction_id.to_string(),
             claim_sha256: "b".repeat(64),
             outcome: "applied".to_string(),
+            stage_after: None,
+            target_after: None,
         };
         let expected = atomic_path_transition_json(&ack).expect("serialize expected ack");
         let published = write_atomic_path_transition_json(&parent, &parent_file, &name, &ack)
@@ -110447,7 +110710,7 @@ if command == "__atomic-path-content-id":
         payload = f"directory\0{observed.st_dev}\0{observed.st_ino}".encode()
     else:
         raise SystemExit(65)
-    print("FT_ATOMIC_PATH_CONTENT_ID_V2=sha256:" + hashlib.sha256(payload).hexdigest())
+    print("FT_ATOMIC_PATH_CONTENT_ID_V3=sha256:" + hashlib.sha256(payload).hexdigest())
     raise SystemExit(0)
 if command != "__atomic-path-transition":
     raise SystemExit(64)
@@ -110485,7 +110748,7 @@ try:
     os.fsync(parent_fd)
 finally:
     os.close(parent_fd)
-print(f"FT_ATOMIC_PATH_TRANSITION_V4={transaction_id}:{operation}:{stage_name}:{target_name}:{outcome}")
+print(f"FT_ATOMIC_PATH_TRANSITION_V5={transaction_id}:{operation}:{stage_name}:{target_name}:{outcome}")
 "#,
         );
         std::fs::write(path, source).expect("write installer atomic helper fixture");
@@ -114185,8 +114448,7 @@ printf x > "$MINISIGN_MARKER"
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let verifier = repository.join("scripts/atomic-component-manifest.sh");
         let source_revision = "1".repeat(40);
-        let feature_contract =
-            "process-family-ft-mux-server-pty-guardian-default-features-v1";
+        let feature_contract = "process-family-ft-mux-server-pty-guardian-default-features-v1";
         let derived = std::process::Command::new("bash")
             .arg(&verifier)
             .arg("derive-build-id")
@@ -118129,11 +118391,8 @@ printf x > "$MINISIGN_MARKER"
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
             let profiles_root = tmp.path().join("profiles");
 
-            let profile = frankenterm_core::browser::BrowserProfile::new(
-                &profiles_root,
-                "openai",
-                "default",
-            );
+            let profile =
+                frankenterm_core::browser::BrowserProfile::new(&profiles_root, "openai", "default");
             profile
                 .ensure_dir()
                 .expect("create private metadata test profile directory");
@@ -118159,11 +118418,8 @@ printf x > "$MINISIGN_MARKER"
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
             let profiles_root = tmp.path().join("profiles");
 
-            let profile = frankenterm_core::browser::BrowserProfile::new(
-                &profiles_root,
-                "openai",
-                "default",
-            );
+            let profile =
+                frankenterm_core::browser::BrowserProfile::new(&profiles_root, "openai", "default");
             profile
                 .ensure_dir()
                 .expect("create private storage-state test profile directory");
@@ -121339,9 +121595,7 @@ printf x > "$MINISIGN_MARKER"
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with(".cursorrules.") && name.ends_with(".bak")
-                    })
+                    .is_some_and(|name| name.starts_with(".cursorrules.") && name.ends_with(".bak"))
             })
             .collect::<Vec<_>>();
         assert_eq!(backups.len(), 1, "exactly one backup must be published");
