@@ -98771,7 +98771,6 @@ reason = "overly conservative pending threshold"
             vec![
                 "evaluate_gates",
                 "execute_compensations",
-                "evaluate_gates",
                 "execute_compensations",
             ]
         );
@@ -99024,7 +99023,6 @@ reason = "overly conservative pending threshold"
             vec![
                 "evaluate_gates",
                 "execute_compensations",
-                "evaluate_gates",
                 "execute_compensations",
             ]
         );
@@ -99108,7 +99106,6 @@ reason = "overly conservative pending threshold"
             vec![
                 "evaluate_gates",
                 "execute_compensations",
-                "evaluate_gates",
                 "execute_compensations"
             ]
         );
@@ -101672,7 +101669,8 @@ recorder_backend = "rusqlite"
         );
 
         let stage_path = parent.join(&expected_stage);
-        std::fs::write(&stage_path, b"conflicting retained prefix")
+        let conflicting_prefix = b"conflicting";
+        std::fs::write(&stage_path, conflicting_prefix)
             .expect("plant conflicting deterministic stage");
         std::fs::set_permissions(&stage_path, std::fs::Permissions::from_mode(0o600))
             .expect("seal conflicting deterministic stage");
@@ -101680,10 +101678,7 @@ recorder_backend = "rusqlite"
             .expect_err("conflicting retained stage bytes must fail closed");
         assert!(conflict.to_string().contains("conflicts"));
         assert!(!path.exists());
-        assert_eq!(
-            std::fs::read(&stage_path).unwrap(),
-            b"conflicting retained prefix"
-        );
+        assert_eq!(std::fs::read(&stage_path).unwrap(), conflicting_prefix);
 
         for index in 0..PRIVATE_ARTIFACT_MAX_RETAINED_STAGES {
             let residue = parent.join(format!(
