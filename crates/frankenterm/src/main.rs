@@ -102191,7 +102191,7 @@ recorder_backend = "rusqlite"
             .expect("session verify-dump branch follows dump");
         let branch = &source[start..end];
         assert!(
-            branch.contains("publish_mux_dump_payload(&output_path, dump)"),
+            branch.contains("publish_mux_dump_payload(&publication_path, dump)"),
             "live session dump must route through the shared durable publication helper"
         );
         assert!(branch.contains("run_cli_settled_blocking_effect("));
@@ -102210,7 +102210,7 @@ recorder_backend = "rusqlite"
             .expect("compatible-client command follows the publication helper");
         let helper = &source[helper_start..helper_end];
         let write = helper
-            .find("write_new_private_artifact(&output_path, &artifact_bytes)")
+            .find("write_new_private_artifact(output_path, &artifact_bytes)")
             .expect("dump publication remains no-clobber and durable");
         let release_tree = helper
             .find("drop(envelope)")
@@ -102219,7 +102219,7 @@ recorder_backend = "rusqlite"
             .find("drop(artifact_bytes)")
             .expect("the artifact-sized producer buffer must be released before reread");
         let verify = helper
-            .find("verify_mux_dump_artifact(&output_path)")
+            .find("verify_mux_dump_artifact(output_path)")
             .expect("published dumps must pass the offline verifier in-process");
         assert!(
             release_tree < write && write < release_buffer && release_buffer < verify,
