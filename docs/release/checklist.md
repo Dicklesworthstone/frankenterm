@@ -17,13 +17,14 @@ catch common omissions.
    workspace count matches the committed release tree (ft-tf6g3.2), then refresh the
    release-attestation snapshot with
    `bash scripts/stamp-readme-counts.sh --source=head --json > docs/attestations/doctrine/agents-md-counts.json`.
-   CI's drift check will block a divergent release.
+   Retain the stamper output in the DSR release record and block the DSR tag
+   step if the committed tree diverges from the refreshed snapshot.
 4. **Regenerate the vendored-fork provenance manifest.** Run
    `python3 scripts/regen-provenance.py` so
    `frankenterm/PROVENANCE.json` reflects the latest fork-side
-   commits (ft-i2eni.6). CI's
-   `Vendored-fork provenance manifest check` step refuses a
-   release with stale data.
+   commits (ft-i2eni.6). Run `scripts/check-provenance.sh`, retain its output
+   in the DSR release record, and refuse the DSR tag step when the manifest is
+   stale.
 5. **Run the bench-stats verdict in enforce mode.** Ensure
    `bash scripts/check_bench_stats.sh` (with
    `BENCH_STATS_MODE=enforce` set) returns clean against the
@@ -99,10 +100,17 @@ catch common omissions.
     control and the shipped-profile arm through the panic-contract subprocess
     proof with strict remote RCH. Build every packaged artifact with `--locked`;
     unit-profile catch tests do not prove shipped recovery.
-11. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
-   The release workflow at `.github/workflows/release.yml`
-   handles the rest (binaries, checksums, GitHub release notes,
-   sigstore-signed attestation bundle).
+11. **Release only through DSR.** GitHub Actions is not a FrankenTerm release
+    mechanism and must not be invoked, queried, or treated as fallback proof.
+    From the exact clean release commit, run `dsr quality --tool frankenterm`
+    and require a passing receipt whose before/after source identities match.
+    Then use `dsr version tag frankenterm` (add `--push` only when publication
+    is authorized), `dsr build frankenterm --version X.Y.Z`, the DSR signing,
+    checksum, SBOM, and SLSA commands required by the release contract, and
+    `dsr release frankenterm X.Y.Z --verify-tag` followed by
+    `dsr release verify frankenterm X.Y.Z`. Add `--prerelease` for release
+    candidates. Retain the DSR manifests, signatures, checksums, provenance,
+    upload receipt, and public verification output as the release evidence.
 
 ## Recommended
 
@@ -115,10 +123,10 @@ catch common omissions.
   unexplained drift in the 5 SLO claims (ft-syqcz.3 manifest). Retain
   the selected worker, target dir, artifact path, exit code, and any
   failure classification if RCH does not reach the bench binary.
-- **Sanity-check the doctrine guards.** The CI lint job is
-  authoritative, but a local
-  `python3 scripts/check_runtime_proof_coverage.py --summary`
-  spot-check confirms 0 uncovered before tagging.
+- **Sanity-check the doctrine guards.** The strict remote lint lane in the DSR
+  quality receipt is authoritative. A local
+  `python3 scripts/check_runtime_proof_coverage.py --summary` spot-check can
+  confirm 0 uncovered before tagging, but does not replace that DSR/RCH proof.
 - **Smoke-test the installer entrypoint without mutating the host.** Run
   `bash -n install.sh` and `bash install.sh --help >/dev/null` against the
   exact release source to catch shell-syntax and argument-parser drift before
@@ -136,8 +144,9 @@ catch common omissions.
 
 - `docs/release/sub-crate-publish-order.md` — `cargo publish`
   topological order for the 13+ sub-crates.
-- `.github/workflows/release.yml` — automated artifact build +
-  upload on tag push.
+- `~/.config/dsr/repos.d/frankenterm.yaml` and the `frankenterm` quality entry
+  in `~/.config/dsr/repos.yaml` — the sole release build, artifact-contract,
+  signing, and strict remote quality authority.
 - `scripts/stamp-readme-counts.sh` — count-drift stamper
   (ft-tf6g3.2).
 - `scripts/regen-provenance.py` + `scripts/check-provenance.sh`
