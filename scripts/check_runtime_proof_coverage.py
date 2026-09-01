@@ -627,11 +627,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # ergonomic surface.
     ("vendored/mux_client.rs", "resize"),
     ("vendored/mux_client.rs", "adjust_pane_size"),
-    # mcp_helpers.rs:
-    ("mcp_helpers.rs", "derive_osc_state_from_storage"),
-    ("mcp_helpers.rs", "fetch_pane_state_from_ipc"),
-    ("mcp_helpers.rs", "resolve_pane_capabilities"),
-    ("mcp_helpers.rs", "record_mcp_audit"),
     # workflows stragglers (also referenced under ft-k42zv):
     ("workflows/account_steps.rs", "refresh_and_select_account"),
     ("workflows/account_steps.rs", "persist_caut_refresh_accounts"),
