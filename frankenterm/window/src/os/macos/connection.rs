@@ -12,7 +12,10 @@ use crate::os::macos::app::create_app_delegate;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
 use crate::Appearance;
-use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
+use cocoa::appkit::{
+    NSApp, NSApplication, NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyRegular, NSScreen,
+};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSInteger};
 use objc::runtime::{Object, BOOL, YES};
@@ -30,6 +33,20 @@ pub struct Connection {
     pub(crate) gl_connection: RefCell<Option<Rc<crate::egl::GlConnection>>>,
 }
 
+const NONACTIVATING_NATIVE_E2E_ENV: &str = "FRANKENTERM_NATIVE_E2E_NONACTIVATING";
+
+/// Return whether the process is running the native bridge's non-activating
+/// GUI smoke lane.
+///
+/// This is deliberately an exact, opt-in test seam rather than a general GUI
+/// preference. The normal application keeps its regular activation policy;
+/// the hermetic native-event harness uses the accessory policy and presents
+/// its window behind existing windows so it can exercise AppKit without
+/// stealing keyboard focus from the operator.
+pub(super) fn nonactivating_native_e2e_enabled() -> bool {
+    std::env::var_os(NONACTIVATING_NATIVE_E2E_ENV).is_some_and(|value| value == "1")
+}
+
 impl Connection {
     pub(crate) fn create_new() -> anyhow::Result<Self> {
         // Ensure that the SPAWN_QUEUE is created; it will have nothing
@@ -38,7 +55,11 @@ impl Connection {
 
         unsafe {
             let ns_app = NSApp();
-            ns_app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+            ns_app.setActivationPolicy_(if nonactivating_native_e2e_enabled() {
+                NSApplicationActivationPolicyAccessory
+            } else {
+                NSApplicationActivationPolicyRegular
+            });
 
             let delegate = create_app_delegate();
             let () = msg_send![ns_app, setDelegate: delegate];

@@ -2434,19 +2434,30 @@ fn default_font_size() -> f64 {
 }
 
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
-    if let Some(runtime) = dirs_next::cache_dir() {
-        return Ok(runtime.join("wezterm"));
+    if let Some(cache) = dirs_next::cache_dir() {
+        return Ok(cache.join("frankenterm"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/frankenterm"))
 }
 
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
-    if let Some(runtime) = dirs_next::data_dir() {
-        return Ok(runtime.join("wezterm"));
+    if let Some(data) = dirs_next::data_dir() {
+        return Ok(data.join("frankenterm"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/frankenterm"))
+}
+
+/// Return the former shared WezTerm data namespace used by FrankenTerm.
+///
+/// This path is migration input only. New writes must always target
+/// [`DATA_DIR`](crate::DATA_DIR), and migration code must recognize and copy
+/// individual FrankenTerm-owned artifacts without deleting legacy evidence.
+pub fn legacy_data_dir() -> PathBuf {
+    dirs_next::data_dir()
+        .map(|data| data.join("wezterm"))
+        .unwrap_or_else(|| crate::HOME_DIR.join(".local/share/wezterm"))
 }
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
@@ -3719,12 +3730,21 @@ mod tests {
 
     #[test]
     fn compute_cache_dir_returns_ok() {
-        assert!(compute_cache_dir().is_ok());
+        let path = compute_cache_dir().expect("compute cache directory");
+        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("frankenterm"));
     }
 
     #[test]
     fn compute_data_dir_returns_ok() {
-        assert!(compute_data_dir().is_ok());
+        let path = compute_data_dir().expect("compute data directory");
+        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("frankenterm"));
+    }
+
+    #[test]
+    fn legacy_data_dir_is_read_only_wezterm_migration_input() {
+        let path = legacy_data_dir();
+        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("wezterm"));
+        assert_ne!(path, compute_data_dir().expect("compute canonical data directory"));
     }
 
     #[test]

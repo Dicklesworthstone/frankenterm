@@ -6745,6 +6745,98 @@ fn commit_batch_with_byte_limit(
 static GLOBAL_WRITER: OnceLock<Result<PersistenceWriter, PersistenceFailure>> = OnceLock::new();
 static STARTUP_SNAPSHOT: OnceLock<StartupRestoreCache> = OnceLock::new();
 
+fn migrate_legacy_window_state_at(
+    legacy_primary: &Path,
+    canonical_primary: &Path,
+) -> Result<bool, PersistenceFailure> {
+    if legacy_primary == canonical_primary {
+        return Ok(false);
+    }
+
+    let legacy_shadow = shadow_file_name(legacy_primary);
+    if legacy_primary.symlink_metadata().is_err() && legacy_shadow.symlink_metadata().is_err() {
+        return Ok(false);
+    }
+
+    // All FrankenTerm writers use the exact per-authority lock. Hold both in
+    // lexical pathname order so an old binary writing the legacy namespace
+    // and a new binary initializing the canonical namespace cannot create a
+    // cross-root deadlock or a torn snapshot.
+    let canonical_lock_path = lock_file_name(canonical_primary);
+    let legacy_lock_path = lock_file_name(legacy_primary);
+    let (first_path, second_path, canonical_is_first) =
+        if canonical_lock_path <= legacy_lock_path {
+            (canonical_primary, legacy_primary, true)
+        } else {
+            (legacy_primary, canonical_primary, false)
+        };
+    let first_lock = open_lock_file(first_path)?;
+    fs2::FileExt::lock_exclusive(&first_lock)
+        .map_err(|error| PersistenceFailure::io("lock first namespace for migration", error))?;
+    let second_lock = open_lock_file(second_path)?;
+    fs2::FileExt::lock_exclusive(&second_lock)
+        .map_err(|error| PersistenceFailure::io("lock second namespace for migration", error))?;
+
+    let (canonical_lock, _legacy_lock) = if canonical_is_first {
+        (&first_lock, &second_lock)
+    } else {
+        (&second_lock, &first_lock)
+    };
+    let canonical = load_authoritative_unlocked(canonical_primary)?;
+    if canonical.source != StoreSource::Empty {
+        return Ok(false);
+    }
+
+    let legacy = load_authoritative_unlocked(legacy_primary)?;
+    if legacy.source == StoreSource::Empty {
+        return Ok(false);
+    }
+
+    let mut state = legacy.state;
+    state.store_revision = state
+        .store_revision
+        .checked_add(1)
+        .ok_or(PersistenceFailure::RevisionExhausted)?;
+    canonicalize_state(&mut state);
+    validate_state(&state)?;
+    let encoded = encode_disk_slot(&state)?;
+    let mut telemetry = PersistenceLockTelemetry::begin();
+    telemetry.acquired();
+    write_initial_slot(
+        canonical_primary,
+        &encoded,
+        WriteInterruption::None,
+        &mut telemetry,
+    )?;
+    canonical_lock
+        .sync_all()
+        .map_err(|error| PersistenceFailure::io("sync canonical migration lock", error))?;
+    let migrated = load_authoritative_unlocked(canonical_primary)?;
+    if migrated.source == StoreSource::Empty || migrated.state != state {
+        return Err(PersistenceFailure::corrupt(
+            "canonical window-state migration did not publish the validated legacy snapshot",
+        ));
+    }
+    Ok(true)
+}
+
+fn migrate_legacy_window_state_if_needed() {
+    let legacy_primary = config::legacy_data_dir().join("window-state.json");
+    let canonical_primary = state_file_name();
+    match migrate_legacy_window_state_at(&legacy_primary, &canonical_primary) {
+        Ok(true) => log::info!(
+            "window-state: migrated validated legacy authority from {} to {} without removing legacy evidence",
+            legacy_primary.display(),
+            canonical_primary.display()
+        ),
+        Ok(false) => {}
+        Err(failure) => log::warn!(
+            "window-state: legacy namespace was not migrated ({:?}); starting only from canonical authority",
+            failure.code()
+        ),
+    }
+}
+
 fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
     match GLOBAL_WRITER.get_or_init(|| PersistenceWriter::open(state_file_name())) {
         Ok(writer) => Ok(writer),
@@ -6760,6 +6852,7 @@ fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
 /// attempted independently and retain distinct finite diagnostics; per-window
 /// lookups then remain silent and allocation-bounded.
 pub fn initialize() -> Result<(), PersistenceFailure> {
+    migrate_legacy_window_state_if_needed();
     let writer_failure = global_writer().err();
     let snapshot_failure =
         cached_startup_snapshot(&STARTUP_SNAPSHOT, load_layout_state).snapshot_failure();
@@ -6887,6 +6980,82 @@ mod tests {
             0o700,
             "window-state startup must not make reconnect authority unreadable"
         );
+    }
+
+    #[test]
+    fn legacy_namespace_migration_preserves_validated_state_and_source_evidence() {
+        let fixture = tempfile::tempdir().expect("window-state migration fixture");
+        let legacy = fixture.path().join("wezterm").join("window-state.json");
+        let canonical = fixture
+            .path()
+            .join("frankenterm")
+            .join("window-state.json");
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_window_state(
+                "migration-workspace".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue legacy state");
+        commit_for_test(&legacy, &batch, WriteInterruption::None)
+            .expect("publish validated legacy authority");
+        let legacy_before = load_snapshot_at(&legacy).expect("load legacy authority");
+
+        assert!(
+            migrate_legacy_window_state_at(&legacy, &canonical)
+                .expect("migrate validated legacy authority")
+        );
+        let canonical_after = load_snapshot_at(&canonical).expect("load canonical authority");
+        assert_eq!(
+            canonical_after.window_states,
+            legacy_before.window_states
+        );
+        assert!(canonical_after.store_revision > legacy_before.store_revision);
+        assert_eq!(
+            load_snapshot_at(&legacy)
+                .expect("legacy evidence remains readable")
+                .window_states,
+            legacy_before.window_states
+        );
+        assert!(
+            !migrate_legacy_window_state_at(&legacy, &canonical)
+                .expect("repeated migration is idempotent")
+        );
+    }
+
+    #[test]
+    fn canonical_window_state_authority_is_never_overwritten_by_legacy_migration() {
+        let fixture = tempfile::tempdir().expect("window-state divergence fixture");
+        let legacy = fixture.path().join("wezterm").join("window-state.json");
+        let canonical = fixture
+            .path()
+            .join("frankenterm")
+            .join("window-state.json");
+        for (path, workspace) in [(&legacy, "legacy"), (&canonical, "canonical")] {
+            let mut batch = PendingBatch::default();
+            batch
+                .queue_window_state(
+                    workspace.to_string(),
+                    PersistedWindowState {
+                        maximized: true,
+                        fullscreen: false,
+                    },
+                )
+                .expect("queue divergent authority");
+            commit_for_test(path, &batch, WriteInterruption::None)
+                .expect("publish divergent authority");
+        }
+
+        assert!(
+            !migrate_legacy_window_state_at(&legacy, &canonical)
+                .expect("canonical authority wins without overwrite")
+        );
+        let canonical_after = load_snapshot_at(&canonical).expect("load canonical authority");
+        assert!(canonical_after.window_states.contains_key("canonical"));
+        assert!(!canonical_after.window_states.contains_key("legacy"));
     }
 
     struct ControlledPersistenceWorker {

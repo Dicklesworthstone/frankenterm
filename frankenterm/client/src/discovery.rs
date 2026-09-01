@@ -1,6 +1,7 @@
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+#[cfg(unix)]
 use wezterm_uds::UnixStream;
 
 /// Canonical filename prefix for per-process FrankenTerm GUI mux sockets.
@@ -12,9 +13,18 @@ pub fn gui_socket_path_for_pid(pid: u32) -> PathBuf {
     config::RUNTIME_DIR.join(format!("{GUI_SOCKET_PREFIX}{pid}"))
 }
 
+#[cfg(test)]
 fn is_gui_socket_name(name: &str) -> bool {
-    name.strip_prefix(GUI_SOCKET_PREFIX)
-        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+    parse_gui_socket_pid(name).is_some()
+}
+
+fn parse_gui_socket_pid(name: &str) -> Option<u32> {
+    let pid = name.strip_prefix(GUI_SOCKET_PREFIX)?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid.parse::<u32>().ok()?;
+    (pid != 0).then_some(pid)
 }
 
 #[cfg(unix)]
@@ -29,6 +39,101 @@ fn is_socket_entry(entry: &std::fs::DirEntry) -> bool {
 #[cfg(not(unix))]
 fn is_socket_entry(_entry: &std::fs::DirEntry) -> bool {
     true
+}
+
+#[cfg(unix)]
+const STALE_GUI_SOCKET_QUARANTINE: &str = ".stale-gui-sockets";
+
+#[cfg(unix)]
+fn process_is_proven_absent(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal zero performs existence/permission validation only. A
+    // strictly positive, range-checked pid prevents process-group semantics.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn socket_identity_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    left.file_type().is_socket()
+        && right.file_type().is_socket()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.uid() == right.uid()
+        && left.nlink() == 1
+        && right.nlink() == 1
+}
+
+#[cfg(unix)]
+fn quarantine_proven_stale_socket(
+    runtime_dir: &Path,
+    path: &Path,
+    pid: u32,
+    initial: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    if !initial.file_type().is_socket()
+        || initial.uid() != unsafe { libc::geteuid() }
+        || initial.nlink() != 1
+        || !process_is_proven_absent(pid)
+    {
+        return false;
+    }
+
+    let quarantine_dir = runtime_dir.join(STALE_GUI_SOCKET_QUARANTINE);
+    if config::create_user_owned_dirs(&quarantine_dir).is_err() {
+        return false;
+    }
+    let quarantine_name = format!(
+        "{GUI_SOCKET_PREFIX}{pid}.dev-{}.ino-{}",
+        initial.dev(),
+        initial.ino()
+    );
+    let quarantine_path = quarantine_dir.join(quarantine_name);
+    if quarantine_path.exists() || quarantine_path.symlink_metadata().is_ok() {
+        return false;
+    }
+
+    let Ok(revalidated) = path.symlink_metadata() else {
+        return false;
+    };
+    if !socket_identity_matches(initial, &revalidated) || !process_is_proven_absent(pid) {
+        return false;
+    }
+
+    match std::fs::rename(path, &quarantine_path) {
+        Ok(()) => {
+            let moved_matches = quarantine_path
+                .symlink_metadata()
+                .is_ok_and(|moved| socket_identity_matches(initial, &moved));
+            if moved_matches {
+                log::info!(
+                    "quarantined stale GUI socket {} as {}",
+                    path.display(),
+                    quarantine_path.display()
+                );
+                true
+            } else {
+                log::error!(
+                    "stale GUI socket quarantine identity changed unexpectedly at {}",
+                    quarantine_path.display()
+                );
+                false
+            }
+        }
+        Err(error) => {
+            log::debug!(
+                "could not quarantine stale GUI socket {}: {error}",
+                path.display()
+            );
+            false
+        }
+    }
 }
 
 /// There's a lot more code in this windows module than I thought I would need
@@ -370,6 +475,10 @@ pub fn resolve_gui_sock_path(class_name: &str) -> anyhow::Result<PathBuf> {
 /// The list is pruned of any entries that are not live
 /// and then sorted with the eldest instance first.
 pub fn discover_gui_socks() -> Vec<PathBuf> {
+    discover_gui_socks_in(config::RUNTIME_DIR.as_path())
+}
+
+fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
     let mut socks = vec![];
 
     #[derive(Debug)]
@@ -396,16 +505,31 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) {
+    if config::create_user_owned_dirs(runtime_dir).is_err() {
+        return socks;
+    }
+    if let Ok(dir) = std::fs::read_dir(runtime_dir) {
         for entry in dir.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if is_gui_socket_name(name) && is_socket_entry(&entry) {
+                if let Some(pid) = parse_gui_socket_pid(name)
+                    && is_socket_entry(&entry)
+                {
                     let path = entry.path();
-                    if let Ok(meta) = entry.metadata() {
+                    if let Ok(meta) = path.symlink_metadata() {
                         let age = meta_age(&meta);
-                        if is_sock_dead(&path) && age > Duration::from_secs(1) {
-                            let _ = std::fs::remove_file(&path);
-                        } else {
+                        #[cfg(unix)]
+                        let quarantined = is_sock_dead(&path)
+                            && age > Duration::from_secs(1)
+                            && quarantine_proven_stale_socket(
+                                runtime_dir,
+                                &path,
+                                pid,
+                                &meta,
+                            );
+                        #[cfg(not(unix))]
+                        let quarantined = false;
+
+                        if !quarantined {
                             socks.push(Entry { path, age });
                         }
                     }
@@ -419,6 +543,7 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
     socks.into_iter().map(|e| e.path).collect()
 }
 
+#[cfg(unix)]
 fn is_sock_dead(sock: &std::path::Path) -> bool {
     UnixStream::connect(sock).is_err()
 }
@@ -442,5 +567,15 @@ mod tests {
         assert!(!is_gui_socket_name("gui-sock-42"));
         assert!(!is_gui_socket_name("frankenterm-gui-sock-"));
         assert!(!is_gui_socket_name("frankenterm-gui-sock-not-a-pid"));
+        assert!(!is_gui_socket_name("frankenterm-gui-sock-0"));
+        assert!(!is_gui_socket_name("frankenterm-gui-sock-4294967296"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_process_is_never_classified_as_proven_absent() {
+        assert!(!process_is_proven_absent(std::process::id()));
+        assert!(!process_is_proven_absent(0));
+        assert!(!process_is_proven_absent(u32::MAX));
     }
 }

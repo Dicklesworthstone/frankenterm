@@ -1256,8 +1256,12 @@ impl WindowInner {
 impl WindowInner {
     fn show(&mut self) {
         unsafe {
-            let current_app = NSRunningApplication::currentApplication(nil);
-            current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);
+            let nonactivating_native_e2e =
+                super::connection::nonactivating_native_e2e_enabled();
+            if !nonactivating_native_e2e {
+                let current_app = NSRunningApplication::currentApplication(nil);
+                current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);
+            }
 
             // Stupid hack: adjust the window style mask and set it back
             // to what it was.
@@ -1274,7 +1278,11 @@ impl WindowInner {
 
             self.update_titlebar_background();
 
-            self.window.makeKeyAndOrderFront_(nil)
+            if nonactivating_native_e2e {
+                self.window.orderBack_(nil);
+            } else {
+                self.window.makeKeyAndOrderFront_(nil);
+            }
         }
     }
 

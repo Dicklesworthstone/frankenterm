@@ -10,12 +10,12 @@
 #   - Their common candidate root in FRANKENTERM_CANDIDATE_ROOT
 #   - Its detached atomic manifest in FRANKENTERM_COMPONENT_MANIFEST
 #   - Full source SHA/profile metadata for the retained artifact manifest
-#   - A graphical session in which launching the GUI is acceptable
+#   - A graphical session in which launching a non-activating GUI is acceptable
 #
-# This test opens a real GUI window and may take focus. It is deliberately
-# guarded against accidental/agent execution.
-# Usage requires BOTH disruptive-interaction acknowledgements; see the checks
-# below. Automation must never manufacture those acknowledgements.
+# By default this test opens a real AppKit window behind existing windows and
+# verifies that the frontmost application did not change. The explicit focus
+# acknowledgement selects the separate focus-disrupting lane; automation must
+# never manufacture that acknowledgement.
 #
 # Exit codes:
 #   0 = all checks passed
@@ -32,10 +32,17 @@ if [[ ${FRANKENTERM_ALLOW_GUI_E2E:-} != "1" ]]; then
         'refusing to launch FrankenTerm GUI without FRANKENTERM_ALLOW_GUI_E2E=1' >&2
     builtin exit 2
 fi
-if [[ ${FRANKENTERM_GUI_E2E_FOCUS_ACK:-} != "I_ACCEPT_FOCUS_DISRUPTION" ]]; then
+GUI_E2E_MODE=focus-disrupting
+if [[ $(uname -s) == Darwin && \
+      ${FRANKENTERM_GUI_E2E_FOCUS_ACK:-} != "I_ACCEPT_FOCUS_DISRUPTION" ]]; then
+    GUI_E2E_MODE=nonactivating
+elif [[ ${FRANKENTERM_GUI_E2E_FOCUS_ACK:-} != "I_ACCEPT_FOCUS_DISRUPTION" ]]; then
     builtin printf '%s\n' \
-        'refusing GUI launch without FRANKENTERM_GUI_E2E_FOCUS_ACK=I_ACCEPT_FOCUS_DISRUPTION' >&2
+        'non-macOS GUI launch still requires FRANKENTERM_GUI_E2E_FOCUS_ACK=I_ACCEPT_FOCUS_DISRUPTION' >&2
     builtin exit 2
+fi
+if [[ ${FRANKENTERM_GUI_E2E_FOCUS_ACK:-} == "I_ACCEPT_FOCUS_DISRUPTION" ]]; then
+    GUI_E2E_MODE=focus-disrupting
 fi
 
 # Exported Bash functions must not be able to shadow `env`, `grep`, `cp`, or
@@ -138,6 +145,7 @@ WATCH_PID=''
 GUI_LAUNCHED=0
 WATCH_LAUNCHED=0
 CANDIDATE_IDENTITY_SHA256=''
+FRONTMOST_PID_BEFORE=''
 
 case "$(uname -s)" in
     Darwin|Linux|FreeBSD|DragonFly) ;;
@@ -146,6 +154,25 @@ case "$(uname -s)" in
         exit 1
         ;;
 esac
+
+frontmost_application_pid() {
+    local app_identity app_info pid
+    app_identity=$(/usr/bin/lsappinfo front 2>/dev/null) || return 1
+    [ -n "$app_identity" ] || return 1
+    app_info=$(/usr/bin/lsappinfo info -only pid "$app_identity" 2>/dev/null) || return 1
+    pid=${app_info#*=}
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$pid"
+}
+
+if [ "$GUI_E2E_MODE" = nonactivating ]; then
+    if [ ! -x /usr/bin/lsappinfo ]; then
+        echo "non-activating GUI proof requires /usr/bin/lsappinfo" >&2
+        exit 2
+    fi
+fi
 
 for candidate_path in "$FT_GUI" "$FT_CLI" "$CANDIDATE_ROOT" "$CANDIDATE_MANIFEST"; do
     case "$candidate_path" in
@@ -518,6 +545,9 @@ GUI_HERMETIC_ENV=(
     "${BASE_HERMETIC_ENV[@]}"
     "CFFIXED_USER_HOME=$HERMETIC_HOME"
 )
+if [ "$GUI_E2E_MODE" = nonactivating ]; then
+    GUI_HERMETIC_ENV+=("FRANKENTERM_NATIVE_E2E_NONACTIVATING=1")
+fi
 if [ -n "${DISPLAY:-}" ]; then
     GUI_HERMETIC_ENV+=("DISPLAY=$DISPLAY")
 fi
@@ -775,6 +805,11 @@ wait_for_bridge_handshake() {
     local attempts=600
     local gui_connected_marker="Native event bridge: authenticated socket connected at $SOCKET_PATH"
     while [ "$attempts" -gt 0 ]; do
+        if [ "$GUI_E2E_MODE" = nonactivating ]; then
+            local observed_frontmost_pid
+            observed_frontmost_pid=$(frontmost_application_pid) || return 4
+            [ "$observed_frontmost_pid" = "$FRONTMOST_PID_BEFORE" ] || return 4
+        fi
         if ! harness_job_is_active "$WATCH_PID"; then
             builtin wait "$WATCH_PID" 2>/dev/null || true
             WATCH_PID=''
@@ -1051,6 +1086,12 @@ if ! verify_execution_snapshot_integrity before-gui; then
     echo "candidate snapshot changed before GUI launch; refusing process launch" >&2
     exit 2
 fi
+if [ "$GUI_E2E_MODE" = nonactivating ]; then
+    FRONTMOST_PID_BEFORE=$(frontmost_application_pid) || {
+        echo "could not resolve the frontmost application immediately before GUI launch" >&2
+        exit 2
+    }
+fi
 (
     cd "$WORKSPACE_DIR"
     exec "$ENV_BIN" -i "${GUI_HERMETIC_ENV[@]}" \
@@ -1070,10 +1111,26 @@ else
         1) echo "ft watch exited while waiting for the authenticated GUI handshake" >&2 ;;
         2) echo "GUI exited before completing the authenticated native-event handshake" >&2 ;;
         3) echo "GUI/server handshake did not complete before the bounded deadline" >&2 ;;
+        4) echo "frontmost application changed during the non-activating GUI smoke" >&2 ;;
         *) echo "unexpected bridge readiness failure: $bridge_status" >&2 ;;
     esac
     echo "Check $LOG_DIR/gui-stderr.log and $LOG_DIR/watch-stderr.log" >&2
     exit 1
+fi
+
+if [ "$GUI_E2E_MODE" = nonactivating ]; then
+    FRONTMOST_PID_AFTER=$(frontmost_application_pid) || {
+        check "native GUI preserved frontmost application" "fail"
+        echo "could not resolve the frontmost application after GUI launch" >&2
+        exit 1
+    }
+    if [ "$FRONTMOST_PID_AFTER" = "$FRONTMOST_PID_BEFORE" ]; then
+        check "native GUI preserved frontmost application" "pass"
+    else
+        check "native GUI preserved frontmost application" "fail"
+        echo "frontmost application changed from pid $FRONTMOST_PID_BEFORE to $FRONTMOST_PID_AFTER" >&2
+        exit 1
+    fi
 fi
 
 # Step 3: Check that the authenticated native event bridge connected.

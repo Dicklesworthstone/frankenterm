@@ -47,6 +47,7 @@ const SLOT_NAMES: [&str; 3] = [
 ];
 const LOCK_NAME: &str = "domain-reconnect-manifest.lock";
 const PRIVATE_AUTHORITY_DIRECTORY: &str = "frankenterm-domain-reconnect-private-v1";
+const NAMESPACE_MIGRATION_INTENT_NAME: &str = "namespace-migration-intent-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1314,7 +1315,136 @@ fn load_production_from(
     Ok(loaded.manifest)
 }
 
+fn read_namespace_migration_intent(
+    directory: &CapDir,
+) -> Result<Option<DomainReconnectManifest>, DomainReconnectManifestError> {
+    match read_slot(directory, OsStr::new(NAMESPACE_MIGRATION_INTENT_NAME))? {
+        SlotRead::Missing => Ok(None),
+        SlotRead::Valid(decoded) if decoded.schema_version == SCHEMA_VERSION => {
+            Ok(Some(decoded.manifest))
+        }
+        SlotRead::Invalid(error) => Err(error),
+        SlotRead::Empty | SlotRead::Valid(_) => Err(DomainReconnectManifestError::Invalid {
+            reason: "namespace migration intent is not a complete current-schema manifest",
+        }),
+    }
+}
+
+fn canonical_slots_admit_migration(
+    directory: &CapDir,
+    intended: &DomainReconnectManifest,
+) -> Result<(), DomainReconnectManifestError> {
+    for name in SLOT_NAMES {
+        match read_slot(directory, OsStr::new(name))? {
+            SlotRead::Missing | SlotRead::Empty => {}
+            SlotRead::Valid(decoded)
+                if decoded.schema_version == SCHEMA_VERSION
+                    && decoded.manifest == *intended => {}
+            SlotRead::Invalid(error) => return Err(error),
+            SlotRead::Valid(_) => {
+                return Err(DomainReconnectManifestError::NamespaceDivergence);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_data_namespace_at(
+    legacy_data_directory: &Path,
+    canonical_data_directory: &Path,
+) -> Result<bool, DomainReconnectManifestError> {
+    if legacy_data_directory == canonical_data_directory {
+        return Ok(false);
+    }
+
+    let legacy_root = probe_namespace_slot_evidence(legacy_data_directory)?;
+    let legacy_private =
+        probe_namespace_slot_evidence(&private_manifest_directory(legacy_data_directory))?;
+    if legacy_root == NamespaceSlotEvidence::None
+        && legacy_private == NamespaceSlotEvidence::None
+    {
+        return Ok(false);
+    }
+    // Reject a divergent legacy namespace before creating canonical state.
+    select_production_namespace(legacy_root, legacy_private)?;
+
+    // Both roots use the same ProductionManifestLease protocol. Acquire them
+    // in lexical order so concurrent old/new launchers cannot deadlock while
+    // the validated snapshot crosses namespaces.
+    let (first_path, second_path, canonical_is_first) =
+        if canonical_data_directory <= legacy_data_directory {
+            (canonical_data_directory, legacy_data_directory, true)
+        } else {
+            (legacy_data_directory, canonical_data_directory, false)
+        };
+    let first = ProductionManifestLease::acquire(first_path)?;
+    let second = ProductionManifestLease::acquire(second_path)?;
+    let (canonical, legacy) = if canonical_is_first {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+
+    let retained_intent = read_namespace_migration_intent(&canonical.authority.directory)?;
+    let intended = match retained_intent {
+        Some(intent) => {
+            // A prior process may have stopped after any individual replica
+            // write. Validate every surviving byte against the durable intent
+            // before repairing; never ask the ordinary quorum selector to
+            // interpret a deliberately incomplete migration publication.
+            canonical_slots_admit_migration(&canonical.authority.directory, &intent)?;
+            intent
+        }
+        None => {
+            let canonical_loaded = load_locked(&canonical.authority.directory, None)?;
+            if canonical_loaded.manifest.generation > 0 {
+                canonical.validate()?;
+                legacy.validate()?;
+                return Ok(false);
+            }
+            let legacy_loaded = load_locked(&legacy.authority.directory, None)?;
+            if legacy_loaded.manifest.generation == 0 {
+                canonical.validate()?;
+                legacy.validate()?;
+                return Ok(false);
+            }
+            write_slot(
+                &canonical.authority.directory,
+                OsStr::new(NAMESPACE_MIGRATION_INTENT_NAME),
+                &legacy_loaded.manifest,
+            )?;
+            legacy_loaded.manifest
+        }
+    };
+
+    // The durable intent is recovery authority for interruption after any
+    // individual replica write. It is retained permanently; neither a retry
+    // nor a successful migration deletes legacy or intent evidence.
+    canonical_slots_admit_migration(&canonical.authority.directory, &intended)?;
+    for name in SLOT_NAMES {
+        write_slot(
+            &canonical.authority.directory,
+            OsStr::new(name),
+            &intended,
+        )?;
+    }
+    verify_fully_replicated(&canonical.authority.directory, &intended)?;
+    canonical.validate()?;
+    legacy.validate()?;
+    Ok(true)
+}
+
+fn migrate_legacy_data_namespace() -> Result<bool, DomainReconnectManifestError> {
+    migrate_legacy_data_namespace_at(&config::legacy_data_dir(), config::DATA_DIR.as_path())
+}
+
 pub fn load() -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    if migrate_legacy_data_namespace()? {
+        log::info!(
+            "domain reconnect: migrated validated legacy authority into {} without removing legacy evidence",
+            config::DATA_DIR.display()
+        );
+    }
     load_production_from(config::DATA_DIR.as_path(), None)
 }
 
@@ -1324,6 +1454,7 @@ pub fn load() -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
 pub fn load_fenced(
     retained: Option<&DomainReconnectManifest>,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    migrate_legacy_data_namespace()?;
     load_production_from(config::DATA_DIR.as_path(), retained)
 }
 
@@ -1477,6 +1608,7 @@ pub fn set_intent(
     domain_name: &str,
     intent: DomainAttachmentIntent,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    migrate_legacy_data_namespace()?;
     set_intent_production_at(config::DATA_DIR.as_path(), domain_name, intent, None)
 }
 
@@ -1488,6 +1620,7 @@ pub fn set_intent_fenced(
     intent: DomainAttachmentIntent,
     retained: Option<&DomainReconnectManifest>,
 ) -> Result<DomainReconnectManifest, DomainReconnectManifestError> {
+    migrate_legacy_data_namespace()?;
     set_intent_production_at(config::DATA_DIR.as_path(), domain_name, intent, retained)
 }
 
@@ -1500,6 +1633,114 @@ mod tests {
         #[cfg(unix)]
         let _ = std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700));
         temp
+    }
+
+    #[test]
+    fn cross_namespace_migration_preserves_remembered_domains_and_legacy_evidence() {
+        let fixture = tempfile::tempdir().expect("domain namespace migration fixture");
+        let legacy = fixture.path().join("wezterm");
+        let canonical = fixture.path().join("frankenterm");
+        let legacy_manifest = set_intent_production_at(
+            &legacy,
+            "migration-domain",
+            DomainAttachmentIntent::Attached,
+            None,
+        )
+        .expect("publish legacy remembered-domain authority");
+
+        assert!(
+            migrate_legacy_data_namespace_at(&legacy, &canonical)
+                .expect("migrate remembered-domain authority")
+        );
+        let canonical_manifest =
+            load_production_from(&canonical, None).expect("load canonical migrated authority");
+        assert_eq!(canonical_manifest, legacy_manifest);
+        assert_eq!(
+            canonical_manifest.intent_for_name("migration-domain"),
+            Some(DomainAttachmentIntent::Attached)
+        );
+        assert_eq!(
+            load_production_from(&legacy, None).expect("legacy evidence remains readable"),
+            legacy_manifest
+        );
+        assert!(
+            private_manifest_directory(&canonical)
+                .join(NAMESPACE_MIGRATION_INTENT_NAME)
+                .is_file()
+        );
+        assert!(
+            !migrate_legacy_data_namespace_at(&legacy, &canonical)
+                .expect("repeated namespace migration is idempotent")
+        );
+    }
+
+    #[test]
+    fn canonical_remembered_domain_authority_is_never_overwritten() {
+        let fixture = tempfile::tempdir().expect("domain namespace divergence fixture");
+        let legacy = fixture.path().join("wezterm");
+        let canonical = fixture.path().join("frankenterm");
+        set_intent_production_at(
+            &legacy,
+            "legacy-domain",
+            DomainAttachmentIntent::Attached,
+            None,
+        )
+        .expect("publish legacy authority");
+        let canonical_before = set_intent_production_at(
+            &canonical,
+            "canonical-domain",
+            DomainAttachmentIntent::Detached,
+            None,
+        )
+        .expect("publish canonical authority");
+
+        assert!(
+            !migrate_legacy_data_namespace_at(&legacy, &canonical)
+                .expect("canonical authority wins without overwrite")
+        );
+        assert_eq!(
+            load_production_from(&canonical, None).expect("reload canonical authority"),
+            canonical_before
+        );
+    }
+
+    #[test]
+    fn namespace_migration_resumes_from_durable_intent_and_one_replica() {
+        let fixture = tempfile::tempdir().expect("domain namespace resume fixture");
+        let legacy = fixture.path().join("wezterm");
+        let canonical = fixture.path().join("frankenterm");
+        let intended = set_intent_production_at(
+            &legacy,
+            "resume-domain",
+            DomainAttachmentIntent::Attached,
+            None,
+        )
+        .expect("publish legacy resume authority");
+        {
+            let interrupted =
+                ProductionManifestLease::acquire(&canonical).expect("lock canonical namespace");
+            write_slot(
+                &interrupted.authority.directory,
+                OsStr::new(NAMESPACE_MIGRATION_INTENT_NAME),
+                &intended,
+            )
+            .expect("publish durable migration intent");
+            write_slot(
+                &interrupted.authority.directory,
+                OsStr::new(SLOT_NAMES[0]),
+                &intended,
+            )
+            .expect("publish first interrupted replica");
+        }
+
+        assert!(
+            migrate_legacy_data_namespace_at(&legacy, &canonical)
+                .expect("resume interrupted namespace migration")
+        );
+        assert_eq!(
+            load_production_from(&canonical, None).expect("load resumed authority"),
+            intended
+        );
     }
 
     #[test]
