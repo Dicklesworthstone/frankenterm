@@ -11,7 +11,7 @@ file is the focused closer for `BR-RC-ATTESTATION-CLOSURE`
 - **Before** tagging `vX.Y.0`. If the bundle is incomplete,
   fix the gap before tagging — the CI lane refuses to sign
   partial bundles.
-- **After** the release CI workflow lands the signed bundle —
+- **After** the DSR release path lands the signed bundle —
   re-verify offline as a third party would.
 
 ## Producing-bead closing convention
@@ -121,24 +121,21 @@ the build script) or claim coverage that doesn't exist.
 ## Build: assemble the bundle
 
 ```sh
-scripts/attestation-build.sh --version 0.X.0 --channel stable --sign cosign
-```
-
-Offline fallback when keyless sigstore is unavailable:
-
-```sh
 ED25519_PRIVATE_KEY_PATH=release-ed25519.pem \
   scripts/attestation-build.sh --version 0.X.0 --channel stable --sign ed25519
 ```
 
+Run this as a retained DSR quality/release step. A DSR installation with an
+explicitly configured non-GitHub OIDC issuer may instead select `--sign
+cosign`; GitHub Actions identities and workflow refs are forbidden.
+
 Outputs:
 - `docs/attestations/0.X.0.json` — the signed bundle
   (artifact paths + SHA-256 + size + producing-bead pointer).
-- `docs/attestations/0.X.0.sigstore` — the cosign sigstore
-  bundle (cert chain + signature over the canonical signing
-  payload).
 - `docs/attestations/0.X.0.ed25519.sig.hex` — the Ed25519
-  fallback signature when using `--sign ed25519`.
+  signature when using the default DSR attestation path.
+- `docs/attestations/0.X.0.sigstore` — an optional cosign sigstore
+  bundle when DSR is configured with an explicit non-GitHub OIDC issuer.
 
 The build script **fails loudly** on:
 - Any required-category slot with `path: null`.
@@ -163,12 +160,12 @@ The verifier:
 3. Recomputes the canonical signing payload.
 4. Checks the `taxonomy_coverage` summary from
    `docs/proof-taxonomy.json`.
-5. Verifies the sigstore signature against
-   `COSIGN_IDENTITY` (the expected workflow ref), or verifies the
+5. Verifies the optional sigstore signature against the DSR-configured
+   `COSIGN_IDENTITY`, or verifies the
    Ed25519 signature against the bundle's `signature.public_key`.
 6. Exits 0 on full pass; non-zero on any check failure.
 
-For machine-readable output (CI gates):
+For machine-readable output (DSR quality gates):
 
 ```sh
 scripts/attestation-verify.sh docs/attestations/0.X.0.json --json
@@ -176,17 +173,21 @@ scripts/attestation-verify.sh docs/attestations/0.X.0.json --json
 
 The `--strict-required` flag adds: fail if the bundle's
 `required_categories` list doesn't match the canonical
-manifest. Use this in release CI.
+manifest. Use this in the DSR release gate.
 
-## Tag + push: trigger the signed-build workflow
+## Tag + publish: DSR only
 
 ```sh
-git tag v0.X.0 && git push origin v0.X.0
+dsr version tag frankenterm
+dsr build frankenterm --version 0.X.0
+dsr release frankenterm 0.X.0 --verify-tag
+dsr release verify frankenterm 0.X.0
 ```
 
-The release workflow at
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml)
-handles cosign keyless signing on tagged builds.
+Use `--push` on the DSR tag command only when publication is explicitly
+authorized. DSR owns the build, signing, checksum, provenance, publication,
+and verification receipts. Do not invoke, inspect, or depend on a GitHub
+Actions workflow at any point in this process.
 
 ## Post-tag: third-party offline verification
 
@@ -241,7 +242,7 @@ this checklist:
 Net: a bundle that passes this checklist is **complete**
 (every required category present), **content-addressed**
 (every artifact's hash baked in), and **signed**
-(cosign keyless via the GitHub Actions workflow ref).
+(through the retained DSR signing path).
 
 ## Cross-references
 

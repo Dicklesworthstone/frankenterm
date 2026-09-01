@@ -8,8 +8,8 @@
 #
 # Usage:
 #   scripts/attestation-build.sh --version 0.2.0
-#   scripts/attestation-build.sh --version 0.2.0 --channel stable --sign cosign
 #   ED25519_PRIVATE_KEY_PATH=release-ed25519.pem scripts/attestation-build.sh --version 0.2.0 --sign ed25519
+#   COSIGN_IDENTITY=... COSIGN_OIDC_ISSUER=https://issuer.example scripts/attestation-build.sh --version 0.2.0 --channel stable --sign cosign
 #   scripts/attestation-build.sh --version 0.2.0 --channel dev   --sign unsigned --allow-partial
 #
 # Required tools: bash, jq, git, sha256sum (or shasum -a 256). cosign required for --sign cosign.
@@ -32,7 +32,7 @@ SIGN_METHOD="unsigned"
 ALLOW_PARTIAL=0
 STRICT_DEFERRED=0
 COSIGN_IDENTITY="${COSIGN_IDENTITY:-}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-}"
 ED25519_PRIVATE_KEY_PATH="${ED25519_PRIVATE_KEY_PATH:-}"
 FT_BEAD_ID="${FT_BEAD_ID:-ft-e87u6.2}"
 FT_SCENARIO_ID="${FT_SCENARIO_ID:-attestation_build}"
@@ -44,17 +44,18 @@ Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|
 
   --version       Required. Semver, no leading 'v'.
   --channel       Release channel. Default: dev.
-  --sign          Signature method. Default: unsigned. cosign requires \$COSIGN_IDENTITY
-                  (e.g. the GHA workflow ref); ed25519 requires \$ED25519_PRIVATE_KEY_PATH.
+  --sign          Signature method. Default: unsigned. cosign requires a DSR-configured
+                  \$COSIGN_IDENTITY and non-GitHub \$COSIGN_OIDC_ISSUER; ed25519 requires
+                  \$ED25519_PRIVATE_KEY_PATH.
   --allow-partial Permit missing artifact paths in the manifest. Without this the build fails on any null path,
-                  which is the desired CI behavior (bridge plan: "CI fails any release that omits a required artifact").
+                  which is the desired release-gate behavior.
   --strict-deferred
                   Treat any deferred slot as an error. Use for release gates that must not ship a deferred set.
   -h, --help      Show this message.
 
 Environment:
   COSIGN_IDENTITY        Expected SAN/identity for cosign keyless. Required when --sign cosign.
-  COSIGN_OIDC_ISSUER     Override OIDC issuer. Default: https://token.actions.githubusercontent.com
+  COSIGN_OIDC_ISSUER     Expected non-GitHub OIDC issuer. Required when --sign cosign.
   ED25519_PRIVATE_KEY_PATH  PEM-encoded Ed25519 private key for --sign ed25519.
   FT_ATTESTATION_MANIFEST   Override manifest path for tests.
   FT_ATTESTATION_OUT_DIR    Override output directory for tests.
@@ -658,12 +659,17 @@ mkdir -p "$OUT_DIR"
 case "$SIGN_METHOD" in
   cosign)
     command -v cosign >/dev/null 2>&1 || { echo "error: cosign not installed; pass --sign unsigned or install sigstore/cosign" >&2; exit 1; }
-    [[ -n "$COSIGN_IDENTITY" ]] || { echo "error: COSIGN_IDENTITY env var required for --sign cosign (e.g. the GHA workflow ref)" >&2; exit 1; }
+    [[ -n "$COSIGN_IDENTITY" ]] || { echo "error: COSIGN_IDENTITY env var required for --sign cosign" >&2; exit 1; }
+    [[ -n "$COSIGN_OIDC_ISSUER" ]] || { echo "error: COSIGN_OIDC_ISSUER env var required for --sign cosign" >&2; exit 1; }
+    [[ "$COSIGN_OIDC_ISSUER" != "https://token.actions.githubusercontent.com" ]] || {
+      echo "error: GitHub Actions OIDC is forbidden; use the DSR-configured signing identity" >&2
+      exit 1
+    }
 
     canon_path="$OUT_DIR/${VERSION}.canonical.json"
     sig_path="$OUT_DIR/${VERSION}.sigstore"
     printf '%s' "$canonical_payload" > "$canon_path"
-    # Cosign keyless requires GHA OIDC. Outputs a sigstore bundle.
+    # DSR may supply a non-GitHub keyless OIDC identity. Outputs a sigstore bundle.
     cosign sign-blob \
       --yes \
       --bundle "$sig_path" \

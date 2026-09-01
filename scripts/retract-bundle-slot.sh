@@ -12,7 +12,7 @@ CORRECTED_CLAIM_FILE=""
 RETRACTED_BY_RELEASE=""
 SIGN_METHOD="ed25519"
 COSIGN_IDENTITY="${COSIGN_IDENTITY:-}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-}"
 ED25519_PRIVATE_KEY_PATH="${ED25519_PRIVATE_KEY_PATH:-}"
 
 usage() {
@@ -26,7 +26,7 @@ Environment:
   FT_ATTESTATION_RETRACTIONS_ROOT  Override output root. Defaults to docs/attestations/retractions.
   ED25519_PRIVATE_KEY_PATH         PEM Ed25519 private key for --sign ed25519.
   COSIGN_IDENTITY                  Expected certificate identity for --sign cosign.
-  COSIGN_OIDC_ISSUER               OIDC issuer for --sign cosign. Defaults to GitHub Actions.
+  COSIGN_OIDC_ISSUER               Expected non-GitHub OIDC issuer for --sign cosign.
 EOF
 }
 
@@ -183,6 +183,11 @@ case "$SIGN_METHOD" in
   cosign)
     command -v cosign >/dev/null 2>&1 || { echo "error: cosign is required for --sign cosign" >&2; exit 1; }
     [[ -n "$COSIGN_IDENTITY" ]] || { echo "error: COSIGN_IDENTITY is required for --sign cosign" >&2; exit 1; }
+    [[ -n "$COSIGN_OIDC_ISSUER" ]] || { echo "error: COSIGN_OIDC_ISSUER is required for --sign cosign" >&2; exit 1; }
+    [[ "$COSIGN_OIDC_ISSUER" != "https://token.actions.githubusercontent.com" ]] || {
+      echo "error: GitHub Actions OIDC is forbidden; use the DSR-configured signing identity" >&2
+      exit 1
+    }
     canonical_path="$out_dir/${safe_slot}.canonical.payload"
     sigstore_path="$out_dir/${safe_slot}.sigstore"
     printf '%s' "$canonical_payload" > "$canonical_path"
