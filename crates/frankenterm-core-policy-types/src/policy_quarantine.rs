@@ -973,6 +973,15 @@ impl QuarantineRegistry {
         &self.kill_switch
     }
 
+    /// Install a persisted kill-switch state (ft-xxfwy.14).
+    ///
+    /// Persistence rehydration only: no audit event, no telemetry counter.
+    /// The state was audited when it was originally tripped or reset in the
+    /// process that persisted it.
+    pub fn restore_kill_switch(&mut self, state: KillSwitch) {
+        self.kill_switch = state;
+    }
+
     /// Get the audit log.
     #[must_use]
     pub fn audit_log(&self) -> &VecDeque<QuarantineAuditEvent> {

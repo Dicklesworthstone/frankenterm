@@ -4177,6 +4177,14 @@ enum RobotCommands {
         command: RobotConnectorCommands,
     },
 
+    /// Operator kill switch (status/trip/reset), persisted in the workspace
+    /// database and restored by every ft process — ft-xxfwy.14; contract at
+    /// docs/robot-contracts/kill-switch.md
+    KillSwitch {
+        #[command(subcommand)]
+        command: RobotKillSwitchCommands,
+    },
+
     /// Explain proof-lane command intent without executing it
     ProofDoctor {
         /// Bead whose proof lane is being inspected
@@ -5618,6 +5626,54 @@ enum RobotProfileCommands {
 /// the policy engine's gated production boundary (emergency kill switch
 /// fails closed). Non-dry-run uninstall/rollback are approval-blocked in
 /// this slice.
+/// Tier for `ft robot kill-switch trip` (ft-xxfwy.14). `disarmed` is not a
+/// trip target; use `reset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RobotKillSwitchLevelArg {
+    /// Pause new workflow launches; in-flight work completes.
+    SoftStop,
+    /// Block every new non-read action.
+    HardStop,
+    /// Block everything, reads included.
+    EmergencyHalt,
+}
+
+impl From<RobotKillSwitchLevelArg> for frankenterm_core::policy_quarantine::KillSwitchLevel {
+    fn from(value: RobotKillSwitchLevelArg) -> Self {
+        match value {
+            RobotKillSwitchLevelArg::SoftStop => Self::SoftStop,
+            RobotKillSwitchLevelArg::HardStop => Self::HardStop,
+            RobotKillSwitchLevelArg::EmergencyHalt => Self::EmergencyHalt,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum RobotKillSwitchCommands {
+    /// Show the persisted kill switch as every ft process will restore it
+    Status,
+    /// Arm the kill switch at a tier (recorded in the policy audit chain)
+    Trip {
+        /// Tier to arm
+        #[arg(long, value_enum)]
+        level: RobotKillSwitchLevelArg,
+
+        /// Reason recorded with the trip
+        #[arg(long)]
+        reason: String,
+
+        /// Actor recorded with the trip (default: operator)
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Disarm the kill switch
+    Reset {
+        /// Actor recorded with the reset (default: operator)
+        #[arg(long)]
+        by: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum RobotConnectorCommands {
     /// Show managed connectors (all, or one by id)
@@ -39274,6 +39330,45 @@ fn now_ms() -> u64 {
 }
 
 /// Return current epoch in milliseconds as i64 (for storage queries).
+/// ft-xxfwy.14: install the persisted operator kill switch
+/// (`ft robot kill-switch`, workspace DB `config` row) into a freshly built
+/// policy engine before it authorizes anything. A missing row keeps the
+/// engine disarmed; an unreadable or corrupt row arms HardStop (fail closed)
+/// and is logged. Contract: docs/robot-contracts/kill-switch.md.
+async fn with_persisted_kill_switch(
+    mut engine: frankenterm_core::policy::PolicyEngine,
+    storage: &frankenterm_core::storage::StorageHandle,
+    surface: &'static str,
+) -> frankenterm_core::policy::PolicyEngine {
+    use frankenterm_core::policy_kill_switch_state::{
+        KillSwitchRestore, restore_kill_switch_from_storage_with_cx,
+    };
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let now = u64::try_from(now_epoch_ms()).unwrap_or_default();
+    match restore_kill_switch_from_storage_with_cx(&cx, &mut engine, storage, now).await {
+        KillSwitchRestore::FailedClosed { error } => {
+            tracing::warn!(
+                %error,
+                surface,
+                "persisted kill switch unreadable; this command runs under HardStop"
+            );
+        }
+        KillSwitchRestore::Restored { state, .. }
+            if state.level != frankenterm_core::policy_quarantine::KillSwitchLevel::Disarmed =>
+        {
+            tracing::info!(
+                level = %state.level,
+                changed_by = %state.changed_by,
+                reason = %state.reason,
+                surface,
+                "operator kill switch is armed"
+            );
+        }
+        KillSwitchRestore::Restored { .. } | KillSwitchRestore::Absent => {}
+    }
+    engine
+}
+
 fn now_epoch_ms() -> i64 {
     i64::try_from(now_ms()).unwrap_or(i64::MAX)
 }
@@ -46383,8 +46478,15 @@ async fn run_watcher(
                 .await?,
         );
 
-        // Create policy engine (permissive defaults for auto-handling)
-        let policy_engine = PolicyEngine::permissive();
+        // Create policy engine (permissive defaults for auto-handling). The
+        // persisted operator kill switch still applies (ft-xxfwy.14): it is
+        // restored here once, at watcher start.
+        let policy_engine = with_persisted_kill_switch(
+            PolicyEngine::permissive(),
+            &storage_for_workflows,
+            "watcher auto-handle",
+        )
+        .await;
         let wezterm_handle = wezterm_handle.clone();
         let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
             policy_engine,
@@ -49899,7 +50001,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 let outbound_submit_text =
                                     verified_submit_text.as_deref().unwrap_or(&text);
 
-                                let mut engine = PolicyEngine::new(
+                                let engine = PolicyEngine::new(
                                     config.safety.rate_limit_per_pane,
                                     config.safety.rate_limit_global,
                                     config.safety.require_prompt_active,
@@ -49907,6 +50009,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 .with_tuning(&config.tuning)
                                 .with_command_gate_config(config.safety.command_gate.clone())
                                 .with_policy_rules(config.safety.rules.clone());
+                                let mut engine =
+                                    with_persisted_kill_switch(engine, &storage, "robot send")
+                                        .await;
 
                                 let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
                                 let resolution = resolve_pane_capabilities(
@@ -54319,6 +54424,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     .with_tuning(&config.tuning)
                                     .with_command_gate_config(config.safety.command_gate.clone())
                                     .with_policy_rules(config.safety.rules.clone());
+                                    let policy_engine = with_persisted_kill_switch(
+                                        policy_engine,
+                                        &storage,
+                                        "robot workflow run",
+                                    )
+                                    .await;
 
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_handle =
@@ -55045,6 +55156,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     .with_tuning(&config.tuning)
                                     .with_command_gate_config(config.safety.command_gate.clone())
                                     .with_policy_rules(config.safety.rules.clone());
+                                    let policy_engine = with_persisted_kill_switch(
+                                        policy_engine,
+                                        &storage,
+                                        "robot workflow abort",
+                                    )
+                                    .await;
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::wezterm_handle_from_config(
                                             &config,
@@ -56050,16 +56167,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     );
                                     let data = if let Some((storage, wezterm)) = real_runtime {
                                         let policy_engine = std::cell::RefCell::new(
-                                            frankenterm_core::policy::PolicyEngine::new(
-                                                config.safety.rate_limit_per_pane,
-                                                config.safety.rate_limit_global,
-                                                config.safety.require_prompt_active,
+                                            with_persisted_kill_switch(
+                                                frankenterm_core::policy::PolicyEngine::new(
+                                                    config.safety.rate_limit_per_pane,
+                                                    config.safety.rate_limit_global,
+                                                    config.safety.require_prompt_active,
+                                                )
+                                                .with_tuning(&config.tuning)
+                                                .with_command_gate_config(
+                                                    config.safety.command_gate.clone(),
+                                                )
+                                                .with_policy_rules(config.safety.rules.clone()),
+                                                &storage,
+                                                "robot tx",
                                             )
-                                            .with_tuning(&config.tuning)
-                                            .with_command_gate_config(
-                                                config.safety.command_gate.clone(),
-                                            )
-                                            .with_policy_rules(config.safety.rules.clone()),
+                                            .await,
                                         );
                                         let approvals =
                                             frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
@@ -56295,16 +56417,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     );
                                     let data = if let Some((storage, wezterm)) = real_runtime {
                                         let policy_engine = std::cell::RefCell::new(
-                                            frankenterm_core::policy::PolicyEngine::new(
-                                                config.safety.rate_limit_per_pane,
-                                                config.safety.rate_limit_global,
-                                                config.safety.require_prompt_active,
+                                            with_persisted_kill_switch(
+                                                frankenterm_core::policy::PolicyEngine::new(
+                                                    config.safety.rate_limit_per_pane,
+                                                    config.safety.rate_limit_global,
+                                                    config.safety.require_prompt_active,
+                                                )
+                                                .with_tuning(&config.tuning)
+                                                .with_command_gate_config(
+                                                    config.safety.command_gate.clone(),
+                                                )
+                                                .with_policy_rules(config.safety.rules.clone()),
+                                                &storage,
+                                                "robot tx",
                                             )
-                                            .with_tuning(&config.tuning)
-                                            .with_command_gate_config(
-                                                config.safety.command_gate.clone(),
-                                            )
-                                            .with_policy_rules(config.safety.rules.clone()),
+                                            .await,
                                         );
                                         let approvals =
                                             frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
@@ -57916,6 +58043,174 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             .await;
                             print_robot_response(&response, format, stats)?;
                         }
+                        RobotCommands::KillSwitch { command } => {
+                            // ft-xxfwy.14: the operator kill switch lives in
+                            // the workspace DB `config` KV row and is
+                            // restored by every policy engine at
+                            // construction. Contract:
+                            // docs/robot-contracts/kill-switch.md.
+                            use frankenterm_core::policy_kill_switch_state::{
+                                KILL_SWITCH_STATE_KEY, KillSwitchRestore,
+                                persist_kill_switch_state, restore_kill_switch_from_backend,
+                            };
+                            use frankenterm_core::policy_quarantine::KillSwitchLevel;
+
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to resolve workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE.".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let backend = match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
+                                &layout.db_path,
+                                &frankenterm_core::storage_backend_trait::OpenConfig {
+                                    wal_mode: false,
+                                    ..frankenterm_core::storage_backend_trait::OpenConfig::default()
+                                },
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!(
+                                                "Failed to open workspace DB at {}: {e}",
+                                                layout.db_path.display()
+                                            ),
+                                            Some(
+                                                "Is the database initialized? Run 'ft watch' first."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let now = u64::try_from(now_epoch_ms()).unwrap_or_default();
+                            let mut engine =
+                                frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                    &config.safety,
+                                );
+                            let restore =
+                                restore_kill_switch_from_backend(&mut engine, &backend, now);
+                            let restore_label = restore.label();
+                            let restore_error = match &restore {
+                                KillSwitchRestore::FailedClosed { error } => {
+                                    Some(error.to_string())
+                                }
+                                _ => None,
+                            };
+                            let envelope = |engine: &frankenterm_core::policy::PolicyEngine,
+                                            action: &str,
+                                            persisted: bool|
+                             -> serde_json::Value {
+                                let ks = engine.kill_switch_state();
+                                serde_json::json!({
+                                    "action": action,
+                                    "level": ks.level,
+                                    "changed_at_ms": ks.changed_at_ms,
+                                    "changed_by": ks.changed_by,
+                                    "reason": ks.reason,
+                                    "auto_disarm_at_ms": ks.auto_disarm_at_ms,
+                                    "persisted": persisted,
+                                    "restore": restore_label,
+                                    "restore_error": restore_error,
+                                    "state_key": KILL_SWITCH_STATE_KEY,
+                                })
+                            };
+                            let persist = |engine: &frankenterm_core::policy::PolicyEngine| {
+                                persist_kill_switch_state(
+                                    &backend,
+                                    engine.kill_switch_state(),
+                                    now_epoch_ms(),
+                                )
+                            };
+                            let save_failed = |engine: &frankenterm_core::policy::PolicyEngine,
+                                               action: &str,
+                                               err: frankenterm_core::policy_kill_switch_state::KillSwitchStateError| {
+                                RobotResponse::<serde_json::Value>::error_with_code(
+                                    err.code(),
+                                    format!(
+                                        "kill switch {action} applied in this process but not persisted: {}",
+                                        err.detail()
+                                    ),
+                                    Some(format!(
+                                        "Other ft processes still see the previous state; retry. Envelope: {}",
+                                        envelope(engine, action, false)
+                                    )),
+                                    elapsed_ms(start),
+                                )
+                            };
+
+                            let response = match command {
+                                RobotKillSwitchCommands::Status => {
+                                    // A lapsed auto-disarm observed during
+                                    // restore is written back so every other
+                                    // process agrees with what this one saw.
+                                    let persisted = match &restore {
+                                        KillSwitchRestore::Restored {
+                                            auto_disarmed: true,
+                                            ..
+                                        } => persist(&engine).is_ok(),
+                                        KillSwitchRestore::Restored { .. } => true,
+                                        KillSwitchRestore::Absent
+                                        | KillSwitchRestore::FailedClosed { .. } => false,
+                                    };
+                                    RobotResponse::<serde_json::Value>::success(
+                                        envelope(&engine, "status", persisted),
+                                        elapsed_ms(start),
+                                    )
+                                }
+                                RobotKillSwitchCommands::Trip { level, reason, by } => {
+                                    let by = by.unwrap_or_else(|| "operator".to_string());
+                                    let level: KillSwitchLevel = level.into();
+                                    if !engine.trip_kill_switch(level, &by, &reason, now) {
+                                        let current = engine.kill_switch_state().level;
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            "robot.kill_switch.trip_rejected",
+                                            format!(
+                                                "kill switch is already at {current}; a trip must raise the tier ({level} does not)"
+                                            ),
+                                            Some(
+                                                "Use 'ft robot kill-switch reset' to disarm, then trip the wanted tier."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        )
+                                    } else {
+                                        match persist(&engine) {
+                                            Ok(()) => RobotResponse::<serde_json::Value>::success(
+                                                envelope(&engine, "trip", true),
+                                                elapsed_ms(start),
+                                            ),
+                                            Err(err) => save_failed(&engine, "trip", err),
+                                        }
+                                    }
+                                }
+                                RobotKillSwitchCommands::Reset { by } => {
+                                    let by = by.unwrap_or_else(|| "operator".to_string());
+                                    engine.quarantine_registry_mut().reset_kill_switch(&by, now);
+                                    match persist(&engine) {
+                                        Ok(()) => RobotResponse::<serde_json::Value>::success(
+                                            envelope(&engine, "reset", true),
+                                            elapsed_ms(start),
+                                        ),
+                                        Err(err) => save_failed(&engine, "reset", err),
+                                    }
+                                }
+                            };
+                            print_robot_response(&response, format, stats)?;
+                        }
                         RobotCommands::Connector { command } => {
                             // ft-pohny: connector lifecycle administration.
                             // Contract: docs/robot-contracts/connector.md.
@@ -58116,6 +58411,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             engine.lifecycle_manager_mut().restore_connectors(restored);
 
                             let now = u64::try_from(now_epoch_ms()).unwrap_or_default();
+                            // ft-xxfwy.14: the persisted operator kill switch
+                            // gates this one-shot engine too (a corrupt row
+                            // fails closed to HardStop).
+                            if let frankenterm_core::policy_kill_switch_state::KillSwitchRestore::FailedClosed { error } =
+                                frankenterm_core::policy_kill_switch_state::restore_kill_switch_from_backend(
+                                    &mut engine,
+                                    &backend,
+                                    now,
+                                )
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    "persisted kill switch unreadable; connector actions run under HardStop"
+                                );
+                            }
                             let response = match handle_connector_action(&mut engine, action, now) {
                                 Ok(ConnectorActionOutcome::Status(mut data)) => {
                                     data.state_persisted = state_present;
@@ -60258,7 +60568,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     });
                 let outbound_submit_text = verified_submit_text.as_deref().unwrap_or(&text);
 
-                let mut engine = frankenterm_core::policy::PolicyEngine::new(
+                let engine = frankenterm_core::policy::PolicyEngine::new(
                     config.safety.rate_limit_per_pane,
                     config.safety.rate_limit_global,
                     config.safety.require_prompt_active,
@@ -60266,6 +60576,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .with_tuning(&config.tuning)
                 .with_command_gate_config(config.safety.command_gate.clone())
                 .with_policy_rules(config.safety.rules.clone());
+                let mut engine =
+                    with_persisted_kill_switch(engine, &storage, "panes bookmark").await;
 
                 let resolution = resolve_pane_capabilities(
                     pane_id,
@@ -60803,6 +61115,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             true, // Require prompt active for human mode
                         )
                         .with_tuning(&config.tuning);
+                        let policy_engine =
+                            with_persisted_kill_switch(policy_engine, &storage, "workflow run")
+                                .await;
 
                         let wezterm_handle =
                             frankenterm_core::wezterm::wezterm_handle_from_config(&config);
@@ -62671,14 +62986,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 };
                 let data = if let Some((storage, wezterm)) = real_runtime {
                     let policy_engine = std::cell::RefCell::new(
-                        frankenterm_core::policy::PolicyEngine::new(
-                            config.safety.rate_limit_per_pane,
-                            config.safety.rate_limit_global,
-                            config.safety.require_prompt_active,
+                        with_persisted_kill_switch(
+                            frankenterm_core::policy::PolicyEngine::new(
+                                config.safety.rate_limit_per_pane,
+                                config.safety.rate_limit_global,
+                                config.safety.require_prompt_active,
+                            )
+                            .with_tuning(&config.tuning)
+                            .with_command_gate_config(config.safety.command_gate.clone())
+                            .with_policy_rules(config.safety.rules.clone()),
+                            &storage,
+                            "steer run",
                         )
-                        .with_tuning(&config.tuning)
-                        .with_command_gate_config(config.safety.command_gate.clone())
-                        .with_policy_rules(config.safety.rules.clone()),
+                        .await,
                     );
                     let approvals =
                         frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(Some(
@@ -63655,7 +63975,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         .flatten()
                         .and_then(|record| record.pane_uuid);
 
-                    let mut engine = frankenterm_core::policy::PolicyEngine::new(
+                    let engine = frankenterm_core::policy::PolicyEngine::new(
                         config.safety.rate_limit_per_pane,
                         config.safety.rate_limit_global,
                         config.safety.require_prompt_active,
@@ -63663,6 +63983,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .with_tuning(&config.tuning)
                     .with_command_gate_config(config.safety.command_gate.clone())
                     .with_policy_rules(config.safety.rules.clone());
+                    let mut engine =
+                        with_persisted_kill_switch(engine, &storage, "prepare workflow run").await;
 
                     let input = workflow_run_policy_input(pane_id, &name);
 
@@ -64275,7 +64597,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         exit_on_commit_validation_error(err, &plan_id);
                     }
 
-                    let mut engine = frankenterm_core::policy::PolicyEngine::new(
+                    let engine = frankenterm_core::policy::PolicyEngine::new(
                         config.safety.rate_limit_per_pane,
                         config.safety.rate_limit_global,
                         config.safety.require_prompt_active,
@@ -64283,6 +64605,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .with_tuning(&config.tuning)
                     .with_command_gate_config(config.safety.command_gate.clone())
                     .with_policy_rules(config.safety.rules.clone());
+                    let mut engine = with_persisted_kill_switch(
+                        engine,
+                        &storage,
+                        "prepare workflow run (approval)",
+                    )
+                    .await;
 
                     let input = workflow_run_policy_input(pane_id, &workflow_name);
 
@@ -64368,6 +64696,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         true,
                     )
                     .with_tuning(&config.tuning);
+                    let policy_engine = with_persisted_kill_switch(
+                        policy_engine,
+                        &storage,
+                        "prepare workflow run (inject)",
+                    )
+                    .await;
                     let wezterm_handle =
                         frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                     let injector = frankenterm_core::workflows::CxPolicyInjector::new(
@@ -64864,7 +65198,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             .await
             .capabilities;
 
-            let mut engine = frankenterm_core::policy::PolicyEngine::new(
+            let engine = frankenterm_core::policy::PolicyEngine::new(
                 config.safety.rate_limit_per_pane,
                 config.safety.rate_limit_global,
                 config.safety.require_prompt_active,
@@ -64872,6 +65206,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             .with_tuning(&config.tuning)
             .with_command_gate_config(config.safety.command_gate.clone())
             .with_policy_rules(config.safety.rules.clone());
+            let mut engine = with_persisted_kill_switch(engine, &storage, "intervene").await;
             let raw_summary = format!(
                 "ft intervene {} pane={} reason={}",
                 verb.as_str(),
@@ -77027,14 +77362,19 @@ async fn handle_tx_command(
             );
             let data = if let Some((storage, wezterm)) = real_runtime {
                 let policy_engine = std::cell::RefCell::new(
-                    frankenterm_core::policy::PolicyEngine::new(
-                        config.safety.rate_limit_per_pane,
-                        config.safety.rate_limit_global,
-                        config.safety.require_prompt_active,
+                    with_persisted_kill_switch(
+                        frankenterm_core::policy::PolicyEngine::new(
+                            config.safety.rate_limit_per_pane,
+                            config.safety.rate_limit_global,
+                            config.safety.require_prompt_active,
+                        )
+                        .with_tuning(&config.tuning)
+                        .with_command_gate_config(config.safety.command_gate.clone())
+                        .with_policy_rules(config.safety.rules.clone()),
+                        &storage,
+                        "tx",
                     )
-                    .with_tuning(&config.tuning)
-                    .with_command_gate_config(config.safety.command_gate.clone())
-                    .with_policy_rules(config.safety.rules.clone()),
+                    .await,
                 );
                 let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
                     Some(&storage),
@@ -77233,14 +77573,19 @@ async fn handle_tx_command(
             );
             let data = if let Some((storage, wezterm)) = real_runtime {
                 let policy_engine = std::cell::RefCell::new(
-                    frankenterm_core::policy::PolicyEngine::new(
-                        config.safety.rate_limit_per_pane,
-                        config.safety.rate_limit_global,
-                        config.safety.require_prompt_active,
+                    with_persisted_kill_switch(
+                        frankenterm_core::policy::PolicyEngine::new(
+                            config.safety.rate_limit_per_pane,
+                            config.safety.rate_limit_global,
+                            config.safety.require_prompt_active,
+                        )
+                        .with_tuning(&config.tuning)
+                        .with_command_gate_config(config.safety.command_gate.clone())
+                        .with_policy_rules(config.safety.rules.clone()),
+                        &storage,
+                        "tx",
                     )
-                    .with_tuning(&config.tuning)
-                    .with_command_gate_config(config.safety.command_gate.clone())
-                    .with_policy_rules(config.safety.rules.clone()),
+                    .await,
                 );
                 let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
                     Some(&storage),
@@ -96237,20 +96582,52 @@ async fn run_diagnostics(
     let mut policy_engine =
         frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
             .with_tuning(&config.tuning);
+    // ft-xxfwy.14: the operator kill switch is persisted in the workspace DB
+    // and restored here exactly the way every ft process restores it, so the
+    // "Quarantine & Kill Switch" row describes the shared operator state.
+    // Quarantines, approvals and the audit chain are still process-local.
+    // The DB is only opened when it already exists: doctor must not create
+    // one as a side effect.
+    let kill_switch_note = if layout.db_path.exists() {
+        match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
+            &layout.db_path,
+            &frankenterm_core::storage_backend_trait::OpenConfig {
+                wal_mode: false,
+                ..frankenterm_core::storage_backend_trait::OpenConfig::default()
+            },
+        ) {
+            Ok(backend) => {
+                use frankenterm_core::policy_kill_switch_state::KillSwitchRestore;
+                match frankenterm_core::policy_kill_switch_state::restore_kill_switch_from_backend(
+                    &mut policy_engine,
+                    &backend,
+                    u64::try_from(now_epoch_ms()).unwrap_or_default(),
+                ) {
+                    KillSwitchRestore::Absent => {
+                        "persisted operator kill switch: never armed".to_string()
+                    }
+                    KillSwitchRestore::Restored { state, .. } => format!(
+                        "persisted operator kill switch: {} (by {}, reason: {}, changed_at_ms={})",
+                        state.level, state.changed_by, state.reason, state.changed_at_ms
+                    ),
+                    KillSwitchRestore::FailedClosed { error } => format!(
+                        "persisted operator kill switch unreadable, HardStop assumed: {error}"
+                    ),
+                }
+            }
+            Err(e) => format!("persisted operator kill switch not read (DB open failed: {e})"),
+        }
+    } else {
+        "persisted operator kill switch not read (no workspace DB yet)".to_string()
+    };
     let policy_checks = frankenterm_core::policy_diagnostics::check_policy_engine_health(
         &mut policy_engine,
         now_ms(),
     );
-    // These rows describe the engine built for THIS doctor run. Policy state
-    // (kill switch, quarantines, audit chain, approvals, ...) lives in the
-    // watcher process and is not persisted, so the counters here are always
-    // those of a fresh engine. Say so, rather than letting "0 quarantines,
-    // kill switch disarmed" read as a statement about the running watcher
-    // (ft-xxfwy.14).
     checks.extend(policy_checks.iter().map(|check| {
         let mut diagnostic = diagnostic_check_from_runtime_health(check);
         diagnostic.detail = Some(format!(
-            "{} [process-local: fresh engine for this doctor run; the watcher's live policy state is not persisted]",
+            "{} [{kill_switch_note}; quarantines, approvals and the audit chain are process-local to this doctor run]",
             diagnostic.detail.unwrap_or_default()
         ));
         diagnostic

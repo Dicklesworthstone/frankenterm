@@ -1,0 +1,1587 @@
+{
+  "schema": "ft.proof.killswitch-tier-enforcement.v1",
+  "produced_by_bead": "ft-xxfwy.14",
+  "closes": [
+    "ft-l59nq"
+  ],
+  "generator": "crates/frankenterm-core/tests/killswitch_tier_matrix.rs",
+  "rule_id": "policy.kill_switch",
+  "tiers": [
+    "disarmed",
+    "soft_stop",
+    "hard_stop",
+    "emergency_halt"
+  ],
+  "action_kinds": [
+    "SendText",
+    "SendCtrlC",
+    "SendCtrlD",
+    "SendCtrlZ",
+    "SendControl",
+    "Spawn",
+    "Split",
+    "Activate",
+    "Close",
+    "BrowserAuth",
+    "WorkflowRun",
+    "ReservePane",
+    "ReleasePane",
+    "ReadOutput",
+    "SearchOutput",
+    "WriteFile",
+    "DeleteFile",
+    "ExecCommand",
+    "ConnectorNotify",
+    "ConnectorTicket",
+    "ConnectorTriggerWorkflow",
+    "ConnectorAuditLog",
+    "ConnectorInvoke",
+    "ConnectorCredentialAction"
+  ],
+  "row_count": 192,
+  "verdict": {
+    "disarmed_gates_nothing": true,
+    "soft_stop_denies_only_workflow_launches": true,
+    "hard_stop_denies_every_non_read": true,
+    "emergency_halt_denies_everything": true,
+    "pane_presence_never_changes_the_gate": true
+  },
+  "rows": [
+    {
+      "tier": "disarmed",
+      "action": "SendText",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendText",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendCtrlC",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendCtrlC",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendCtrlD",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendCtrlD",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendCtrlZ",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendCtrlZ",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendControl",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "SendControl",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "disarmed",
+      "action": "Spawn",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "Spawn",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "Split",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "Split",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "Activate",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "Activate",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "Close",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "disarmed",
+      "action": "Close",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "disarmed",
+      "action": "BrowserAuth",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "BrowserAuth",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "WorkflowRun",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "WorkflowRun",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ReservePane",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ReservePane",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ReleasePane",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ReleasePane",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ReadOutput",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ReadOutput",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "SearchOutput",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "SearchOutput",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "WriteFile",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "WriteFile",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "DeleteFile",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "disarmed",
+      "action": "DeleteFile",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "disarmed",
+      "action": "ExecCommand",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ExecCommand",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorNotify",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorNotify",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorTicket",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorTicket",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorAuditLog",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorAuditLog",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorInvoke",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorInvoke",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorCredentialAction",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.credential_broker"
+    },
+    {
+      "tier": "disarmed",
+      "action": "ConnectorCredentialAction",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.credential_broker"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendText",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendText",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendCtrlC",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendCtrlC",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendCtrlD",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendCtrlD",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendCtrlZ",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendCtrlZ",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendControl",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.alt_screen_unknown"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SendControl",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Spawn",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Spawn",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Split",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Split",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Activate",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Activate",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Close",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "Close",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.quarantine"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "BrowserAuth",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "BrowserAuth",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "WorkflowRun",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "WorkflowRun",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ReservePane",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ReservePane",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ReleasePane",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ReleasePane",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ReadOutput",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ReadOutput",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SearchOutput",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "SearchOutput",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "WriteFile",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "WriteFile",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "DeleteFile",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "DeleteFile",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "approval",
+      "rule_id": "policy.destructive_action"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ExecCommand",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ExecCommand",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorNotify",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorNotify",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorTicket",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorTicket",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorAuditLog",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorAuditLog",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorInvoke",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorInvoke",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorCredentialAction",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.credential_broker"
+    },
+    {
+      "tier": "soft_stop",
+      "action": "ConnectorCredentialAction",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "deny",
+      "rule_id": "policy.credential_broker"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendText",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendText",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendCtrlC",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendCtrlC",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendCtrlD",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendCtrlD",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendCtrlZ",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendCtrlZ",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendControl",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SendControl",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Spawn",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Spawn",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Split",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Split",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Activate",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Activate",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Close",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "Close",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "BrowserAuth",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "BrowserAuth",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "WorkflowRun",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "WorkflowRun",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ReservePane",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ReservePane",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ReleasePane",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ReleasePane",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ReadOutput",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ReadOutput",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SearchOutput",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "hard_stop",
+      "action": "SearchOutput",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "hard_stop",
+      "action": "WriteFile",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "WriteFile",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "DeleteFile",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "DeleteFile",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ExecCommand",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ExecCommand",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorNotify",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorNotify",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorTicket",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorTicket",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorAuditLog",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorAuditLog",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorInvoke",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorInvoke",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorCredentialAction",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "ConnectorCredentialAction",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendText",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendText",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendCtrlC",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendCtrlC",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendCtrlD",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendCtrlD",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendCtrlZ",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendCtrlZ",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendControl",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SendControl",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Spawn",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Spawn",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Split",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Split",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Activate",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Activate",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Close",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "Close",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "BrowserAuth",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "BrowserAuth",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "WorkflowRun",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "WorkflowRun",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ReservePane",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ReservePane",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ReleasePane",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ReleasePane",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ReadOutput",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ReadOutput",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SearchOutput",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "SearchOutput",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "WriteFile",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "WriteFile",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "DeleteFile",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "DeleteFile",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ExecCommand",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ExecCommand",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorNotify",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorNotify",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorTicket",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorTicket",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorTriggerWorkflow",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorAuditLog",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorAuditLog",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorInvoke",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorInvoke",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorCredentialAction",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "ConnectorCredentialAction",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    }
+  ]
+}

@@ -6142,6 +6142,18 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Current kill-switch state (tier, actor, reason, auto-disarm deadline).
+    #[must_use]
+    pub fn kill_switch_state(&self) -> &crate::policy_quarantine::KillSwitch {
+        self.quarantine_registry.kill_switch()
+    }
+
+    /// Install a persisted kill-switch state without auditing it again
+    /// (ft-xxfwy.14). See `crate::policy_kill_switch_state`.
+    pub fn restore_kill_switch(&mut self, state: crate::policy_quarantine::KillSwitch) {
+        self.quarantine_registry.restore_kill_switch(state);
+    }
+
     /// Trip the kill switch and record in the audit chain.
     pub fn trip_kill_switch(
         &mut self,

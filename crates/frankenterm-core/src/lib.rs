@@ -509,6 +509,7 @@ pub use frankenterm_core_policy_types::{
 pub mod policy_decision_log;
 pub mod policy_diagnostics;
 pub mod policy_dsl;
+pub mod policy_kill_switch_state;
 pub mod pool;
 pub mod priority;
 pub mod process_tree;
