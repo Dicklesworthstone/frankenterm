@@ -399,7 +399,14 @@ impl OrphanCandidate {
             &self.path,
             limits.record_read_limits(),
         )?;
-        if self.header_ok().copied() != Some(snapshot.header)
+        // The record reader reconciles `write_cursor_bytes` from the recovered
+        // tail (a SIGKILLed writer never flushes the cursor), so the snapshot
+        // header legitimately differs from the raw header the scan decoded in
+        // exactly the mutable fields. Only the file's identity may not change
+        // between classification and read.
+        if !self
+            .header_ok()
+            .is_some_and(|scanned| scrollback_identity_matches(scanned, &snapshot.header))
             || !header_matches_filename(leaf, &snapshot.header)
             || snapshot.source_identity != expected_identity
         {
@@ -1979,6 +1986,18 @@ fn read_header_in_directory(
     Ok((decoded, metadata_identity(&opened), opened.len()))
 }
 
+/// The immutable identity of a scrollback file: format version, capacity, pane
+/// and creation time. Cursor, msync time, redaction count and byte totals are
+/// writer progress and are reconciled by the record reader for crash-orphaned
+/// files, so they must not take part in identity comparisons (ft-xxfwy.32
+/// follow-up found by `session recover` of a SIGKILLed writer).
+fn scrollback_identity_matches(a: &ScrollbackHeader, b: &ScrollbackHeader) -> bool {
+    a.version == b.version
+        && a.capacity_bytes == b.capacity_bytes
+        && a.pane_uuid == b.pane_uuid
+        && a.created_at_epoch_ms == b.created_at_epoch_ms
+}
+
 fn header_matches_filename(leaf: &Path, header: &ScrollbackHeader) -> bool {
     let Some(stem) = leaf.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
@@ -2101,6 +2120,41 @@ mod tests {
         options.mode(0o600);
         let mut file = options.open(path).unwrap();
         file.write_all(bytes).unwrap();
+    }
+
+    /// A SIGKILLed writer leaves `write_cursor_bytes` unflushed; the record
+    /// reader reconciles it from the recovered tail. That must not read as an
+    /// identity change, while a different pane, creation time, capacity or
+    /// format version must.
+    #[test]
+    fn scrollback_identity_ignores_writer_progress_fields() {
+        let scanned = ScrollbackHeader {
+            version: FormatVersion::V1,
+            flags: HeaderFlags::empty(),
+            capacity_bytes: 4096,
+            write_cursor_bytes: 0,
+            pane_uuid: [0xc3; 32],
+            created_at_epoch_ms: 1_000,
+            last_msync_at_epoch_ms: 1_100,
+            redactions_applied: 0,
+            total_bytes_written: 126,
+        };
+        let mut reconciled = scanned;
+        reconciled.write_cursor_bytes = 126;
+        reconciled.last_msync_at_epoch_ms = 5_000;
+        reconciled.redactions_applied = 2;
+        reconciled.total_bytes_written = 400;
+        assert!(scrollback_identity_matches(&scanned, &reconciled));
+
+        let mut other_pane = scanned;
+        other_pane.pane_uuid = [0xd4; 32];
+        assert!(!scrollback_identity_matches(&scanned, &other_pane));
+        let mut other_epoch = scanned;
+        other_epoch.created_at_epoch_ms = 2_000;
+        assert!(!scrollback_identity_matches(&scanned, &other_epoch));
+        let mut other_capacity = scanned;
+        other_capacity.capacity_bytes = 8192;
+        assert!(!scrollback_identity_matches(&scanned, &other_capacity));
     }
 
     fn write_valid_scrollback(dir: &Path, uuid_byte: u8) -> PathBuf {
