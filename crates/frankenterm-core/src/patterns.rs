@@ -4590,7 +4590,7 @@ impl PatternEngine {
             if let Some(regex) = compiled.regex.as_ref() {
                 saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
 
-                for capture_result in regex.captures_iter(&input_text) {
+                for capture_result in regex.captures_iter(&*input_text) {
                     let captures = match capture_result {
                         Ok(captures) => captures,
                         Err(error) => {
@@ -5182,7 +5182,7 @@ impl PatternEngine {
 
     fn extract_captures(
         compiled: &CompiledRule,
-        captures: &fancy_regex::Captures<'_>,
+        captures: &fancy_regex::Captures<'_, str>,
     ) -> serde_json::Map<String, serde_json::Value> {
         let mut extracted = serde_json::Map::new();
         for name in &compiled.capture_names {
@@ -5203,7 +5203,7 @@ impl PatternEngine {
     fn dedup_key_from_captures(
         rule_id: &str,
         compiled: &CompiledRule,
-        captures: &fancy_regex::Captures<'_>,
+        captures: &fancy_regex::Captures<'_, str>,
     ) -> String {
         let mut parts = Vec::with_capacity(compiled.capture_names.len());
         for name in &compiled.capture_names {
@@ -5220,7 +5220,7 @@ impl PatternEngine {
     fn dedup_fingerprint_from_captures(
         rule_id: &str,
         compiled: &CompiledRule,
-        captures: &fancy_regex::Captures<'_>,
+        captures: &fancy_regex::Captures<'_, str>,
     ) -> u128 {
         let mut parts = Vec::with_capacity(compiled.capture_names.len());
         for name in &compiled.capture_names {
@@ -5337,7 +5337,7 @@ impl PatternEngine {
         eligible: bool,
         mut gates: Vec<TraceGate>,
         anchor_evidence: Option<&TraceEvidence>,
-        regex_context: Option<(&fancy_regex::Captures<'_>, &Regex)>,
+        regex_context: Option<(&fancy_regex::Captures<'_, str>, &Regex)>,
         opts: &TraceOptions,
     ) -> MatchTrace {
         // Ensure gate list includes "match" in stable position.
@@ -5944,7 +5944,7 @@ mod tests {
         let start = Instant::now();
         // `captures_iter` returns an iterator of Result; the backtrack
         // limit surfaces as `Err(...)` rather than a hang.
-        let outcome: Vec<_> = regex.captures_iter(&pathological).collect();
+        let outcome: Vec<_> = regex.captures_iter(pathological.as_str()).collect();
         let elapsed = start.elapsed();
 
         assert!(
@@ -6031,7 +6031,7 @@ mod tests {
         // `Err(BacktrackLimitExceeded)` on a `captures_iter` step.
         // The legitimate pattern MUST produce at least one Ok match
         // on this large-but-realistic input.
-        let results: Vec<_> = regex.captures_iter(&padding).collect();
+        let results: Vec<_> = regex.captures_iter(padding.as_str()).collect();
         let ok_count = results.iter().filter(|r| r.is_ok()).count();
         let err_count = results.iter().filter(|r| r.is_err()).count();
         assert!(

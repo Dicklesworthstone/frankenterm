@@ -676,10 +676,13 @@ mod tests {
 
     #[test]
     fn debug_format() {
+        // Debug deliberately redacts the URI (it can carry credentials or
+        // session tokens); only structural metadata may leak into logs.
         let link = Hyperlink::new("https://example.com");
         let dbg = format!("{:?}", link);
         assert!(dbg.contains("Hyperlink"));
-        assert!(dbg.contains("https://example.com"));
+        assert!(dbg.contains("uri_bytes"));
+        assert!(!dbg.contains("https://example.com"), "{dbg}");
     }
 
     #[test]

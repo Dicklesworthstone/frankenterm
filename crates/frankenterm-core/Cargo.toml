@@ -109,7 +109,7 @@ fs2.workspace = true
 flate2.workspace = true
 zstd.workspace = true
 
-base64 = "0.22.1"
+base64 = "0.23.1"
 url.workspace = true
 crossbeam.workspace = true
 shlex.workspace = true
@@ -208,7 +208,7 @@ toon_rust = { workspace = true }
 # ft-5ikbd: runtime JSON Schema validator for robot envelope conformance.
 # Pure-Rust, no system deps, supports Draft 2020-12 (matches the
 # committed wa-robot-*.json header).
-jsonschema = { version = "0.46.5", default-features = false }
+jsonschema = { version = "0.52.1", default-features = false }
 # ft-y0loj.1: integration tests under #![cfg(feature = "recorder-lexical")]
 # import the lexical-search modules from the new sub-crate. This is a
 # dev-only edge — production code does NOT depend on the sub-crate.
