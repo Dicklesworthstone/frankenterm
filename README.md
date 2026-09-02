@@ -51,8 +51,14 @@ launcher and prove PTY handoff, successor readiness, and rollback. When the
 receipt says `activation: pending`, the stable `ft` path intentionally remains
 absent (first install) or points to the prior generation (upgrade); use the
 absolute `Candidate CLI` path printed by the installer to test the new build in
-isolation. Only a `current` receipt authorizes ordinary `ft --version` and
-`ft doctor` through `PATH`.
+isolation. An explicit `--activate ID --idle-host-confirmed` maintenance command
+can promote the process family after the old GUI, mux, guardian, and watchers
+have all stopped; it is crash-resumable and rolls failed readiness back to the
+exact prior selector/entrypoint authority. It does not preserve live panes and,
+for the one-time transition from a legacy binary that predates the lifecycle
+protocol, the operator must also ensure that old binary is not relaunched during
+the bounded activation. Only a `current` receipt authorizes ordinary
+`ft --version` and `ft doctor` through `PATH`.
 Pane/session operations require a reachable FrankenTerm/WezTerm-fork mux
 endpoint. Native vendored builds prefer the direct pooled mux protocol; the
 external `wezterm` CLI is a compatibility fallback, not a universal
@@ -752,9 +758,9 @@ What it does:
 | `--no-app` / `--with-app` / `--app-dest DIR` | macOS GUI-app control (skip / force / relocate) |
 | `--from-source` | Build from source instead of downloading (needs Rust + git) |
 | `--offline TARBALL` | Install from a local tarball; no network |
-| `--activate ID --idle-host-confirmed` | Promote the published candidate generation `ID` (printed in the install receipt) to the current authority so `ft`, the mux server, and the PTY guardian resolve on `PATH`. The installer never does this automatically; it refuses while its process census sees a running FrankenTerm launcher |
+| `--activate ID --idle-host-confirmed` | Promote the published candidate generation `ID` (printed in the install receipt) to the current authority so `ft`, the mux server, and the PTY guardian resolve on `PATH`. The installer never does this automatically. It takes the permanent installer lock, refuses while its process census sees a running FrankenTerm launcher, commits the shared selector last, and restores the exact prior authority if readiness fails. This is an idle maintenance operation, not live-pane handoff. |
 | `--no-verify` | Skip the DSR minisign signature check only; SHA-256 remains mandatory (testing only) |
-| `--verify` | Run `ft doctor` after install |
+| `--verify` | Run the published generation's `ft doctor --json` by immutable path; fail installation verification on a non-zero exit or malformed/oversized JSON. A passing pending-candidate self-test does not activate it. |
 
 The bundled GUI app is **ad-hoc signed** (not Developer-ID notarized). A curl/terminal-placed bundle isn't Gatekeeper-quarantined, so it launches normally; if you instead fetch the `.app` asset through a browser, clear the quarantine flag with `xattr -dr com.apple.quarantine /Applications/FrankenTerm.app` before first launch.
 
@@ -781,10 +787,12 @@ for development.
 git clone https://github.com/Dicklesworthstone/frankenterm.git
 cd frankenterm
 bash scripts/install-hooks.sh
-cargo build --locked --profile release-interactive \
-  -p frankenterm --bin ft \
-  -p frankenterm-mux-server --bin frankenterm-mux-server \
-  -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-readme-release-interactive \
+  cargo build --locked --profile release-interactive \
+    -p frankenterm --bin ft \
+    -p frankenterm-mux-server --bin frankenterm-mux-server \
+    -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
 ```
 
 This produces an uninstalled candidate process family under

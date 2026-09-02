@@ -1294,10 +1294,12 @@ PY
 }
 
 inspect_installer_process_family_authority() {
-  python3 - "$DEST" <<'PY'
+  local allow_activation_recovery="${1:-0}"
+  python3 - "$DEST" "$allow_activation_recovery" <<'PY'
 import os, re, stat, sys
 
 destination = os.path.abspath(sys.argv[1])
+allow_activation_recovery = sys.argv[2] == "1"
 nofollow = getattr(os, "O_NOFOLLOW", 0)
 directory = getattr(os, "O_DIRECTORY", 0)
 cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -1381,9 +1383,19 @@ try:
     )
     kinds = tuple(entry[0] for entry in entries)
     if current_target:
-        if kinds != ("managed", "managed", "managed"):
+        if kinds == ("managed", "managed", "managed"):
+            result = f"managed\t{current_target}"
+        elif (allow_activation_recovery and
+              current_target.startswith("generations/legacy-") and
+              all(kind in ("direct", "managed") for kind in kinds)):
+            # A legacy activation publishes a selector for the exact retained
+            # legacy generation before replacing direct entrypoints with
+            # byte-equivalent managed links. A crash between those exchanges
+            # is safe but intentionally rejected by ordinary inspection; only
+            # the explicit activation recovery path may resume it.
+            result = f"transitioning-legacy\t{current_target}"
+        else:
             raise SystemExit("selected process family lacks three exact managed entrypoints")
-        result = f"managed\t{current_target}"
     elif all(kind in ("missing", "managed") for kind in kinds):
         result = "initial"
     elif kinds == ("direct", "direct", "direct"):
@@ -1429,6 +1441,8 @@ installer_mux_ownership_state() {
 import os, pathlib, subprocess, sys
 
 names = {
+    "ft",
+    "frankenterm-pty-guardian",
     "frankenterm-mux-server",
     "wezterm-mux-server",
     "frankenterm-gui",
@@ -1806,13 +1820,32 @@ install_process_family() {
 # that no FrankenTerm GUI, mux server, PTY guardian, or watcher is running
 # (--idle-host-confirmed) AND the census agrees it cannot see one. Every
 # mutation reuses the descriptor-pinned atomic transitions that candidate
-# publication uses, so a crash leaves either the previous authority or the
-# new one, never a torn triplet.
+# publication uses. Stable entrypoints are made uniformly indirect while they
+# still resolve to the exact prior bytes (or remain uniformly unavailable on a
+# first install), and the selector is committed last. A crash can therefore be
+# resumed without exposing a mixed-version triplet. This idle-host transaction
+# does not claim to serialize a concurrently launched legacy binary that
+# predates FrankenTerm's lifecycle protocol; the operator's bounded
+# --idle-host-confirmed maintenance window is an explicit one-time prerequisite.
 #
 # Failpoints (FT_INSTALL_TEST_ENABLE_FAILPOINTS=1 FT_INSTALL_TEST_FAILPOINT=...):
 #   before-selector-activation, after-selector-activation,
-#   before-entrypoint-activation:<name>
+#   before-entrypoint-activation:<name>, after-entrypoint-activation:<name>,
+#   after-selector-rollback, after-entrypoint-rollback:<name>,
+#   after-legacy-selector-rollback
 # ───────────────────────────────────────────────────────────────────────────
+probe_activated_process_family() {
+  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] && \
+     [ "${FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES:-0}" = 1 ] && \
+     [ "${FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL:-0}" = 1 ]; then
+    return 1
+  fi
+  local name
+  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+    "$DEST/$name" --version >/dev/null 2>&1 || return 1
+  done
+}
+
 activate_process_family_generation() {
   local generation_id="$1"
   local managed="$DEST/.frankenterm-process-family"
@@ -1820,8 +1853,12 @@ activate_process_family_generation() {
   local generation="$generations/$generation_id"
   local helper verifier manifest metadata manifest_id build_id source_revision
   local version target profile feature_contract inventory_bytes
-  local census authority_state txid stage stage_id target_id operation name
-  local legacy_root candidate
+  local census authority_state authority_kind current_target selected_generation
+  local txid stage stage_id target_id operation name
+  local legacy_root candidate candidate_matches rollback_txid rollback_stage_id
+  local rollback_target_id restored_id rollback_prior_kind rollback_stage_target
+  local entrypoint_txid entrypoint_stage entrypoint_id entrypoint_stage_id
+  local selector_committed_here=0
 
   command -v python3 >/dev/null 2>&1 || {
     err "python3 is required for crash-atomic activation"
@@ -1858,16 +1895,159 @@ activate_process_family_generation() {
   metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
   IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
 
-  authority_state=$(inspect_installer_process_family_authority) || {
+  authority_state=$(inspect_installer_process_family_authority 1) || {
     err "Process-family selector authority is ambiguous or unsafe"
     return 1
   }
+  authority_kind="${authority_state%%$'\t'*}"
+  current_target=""
+  if [[ "$authority_state" == *$'\t'* ]]; then
+    current_target="${authority_state#*$'\t'}"
+  fi
+
   if [ "$authority_state" = $'managed\t'"generations/$generation_id" ]; then
     info "Generation $generation_id is already the current selector target"
   else
-    # 1. Point the selector at the candidate: publish when absent, exchange
-    #    when a previous generation is current. Both are single atomic
-    #    transitions performed by the candidate's own ft helper.
+    selected_generation=""
+    case "$authority_kind" in
+      initial)
+        ;;
+      legacy)
+        # First make the captured legacy bytes addressable through `current`.
+        # Direct and managed entrypoints can then coexist during a crash while
+        # still executing the exact same retained bytes. The candidate selector
+        # is deliberately the final authority mutation.
+        legacy_root=""
+        for candidate in "$generations"/legacy-*/; do
+          [ -d "$candidate" ] || continue
+          candidate="${candidate%/}"
+          candidate_matches=1
+          for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+            if ! cmp "$DEST/$name" "$candidate/$name" >/dev/null 2>&1; then
+              candidate_matches=0
+              break
+            fi
+          done
+          if [ "$candidate_matches" -eq 1 ]; then
+            [ -z "$legacy_root" ] || {
+              err "More than one retained legacy generation matches the direct entrypoints"
+              return 1
+            }
+            legacy_root="$candidate"
+          fi
+        done
+        [ -n "$legacy_root" ] || {
+          err "Direct process-family entrypoints match no exact retained legacy generation"
+          return 1
+        }
+        current_target="generations/$(basename "$legacy_root")"
+        txid=$(atomic_transition_txid "legacy-selector:$DEST:$current_target") || return 1
+        stage=".current.${txid}"
+        ensure_staged_symlink "$current_target" "$managed/$stage" || return 1
+        stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
+        atomic_path_transition "$helper" "$managed" "$stage" current "$txid" \
+          "$stage_id" missing publish-noreplace || {
+          err "Failed to publish the byte-equivalent retained legacy selector"
+          return 1
+        }
+        selected_generation="$legacy_root"
+        ;;
+      transitioning-legacy|managed)
+        selected_generation="$managed/$current_target"
+        [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || {
+          err "Existing selector does not resolve to one retained process-family generation"
+          return 1
+        }
+        if [[ "$current_target" == generations/legacy-* ]]; then
+          [ "$(legacy_process_family_manifest "$selected_generation" -)" = \
+            "sha256:${current_target##*legacy-}" ] || {
+            err "Retained legacy selector failed exact manifest verification"
+            return 1
+          }
+        else
+          verify_canonical_generation "$selected_generation" "" \
+            "$verifier" || {
+            err "Existing managed selector failed canonical verification"
+            return 1
+          }
+        fi
+        ;;
+      *)
+        err "Process-family activation observed an unsupported authority state"
+        return 1
+        ;;
+    esac
+
+    # Publish all three stable entrypoints while they still resolve either to
+    # no authority (first install) or to the exact prior generation. This
+    # ordering makes the selector the sole commit point: no crash can expose a
+    # mixture of old and candidate bytes.
+    for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+      installer_failpoint "before-entrypoint-activation:$name"
+      if stable_entrypoint_is_managed "$name"; then
+        if [ -n "$selected_generation" ]; then
+          publish_stable_entrypoint "$helper" "$name" missing \
+            "$selected_generation" || {
+            err "Managed entrypoint $name does not resolve to the prior generation"
+            return 1
+          }
+        else
+          publish_stable_entrypoint "$helper" "$name" missing "$generation" || {
+            err "First-install entrypoint $name is not the exact pending managed link"
+            return 1
+          }
+        fi
+      elif [ -e "$DEST/$name" ] || [ -L "$DEST/$name" ]; then
+        if [ -z "$selected_generation" ] || [ ! -f "$DEST/$name" ] || \
+           [ -L "$DEST/$name" ] || \
+           ! cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1; then
+          err "Direct entrypoint $name is not the exact retained prior-generation file"
+          return 1
+        fi
+        publish_stable_entrypoint "$helper" "$name" exchange \
+          "$selected_generation" || {
+          err "Failed to exchange legacy entrypoint $name for its byte-equivalent managed link"
+          return 1
+        }
+      else
+        [ -z "$selected_generation" ] || {
+          err "Prior process-family authority is missing entrypoint $name"
+          return 1
+        }
+        publish_stable_entrypoint "$helper" "$name" missing "$generation" || {
+          err "Failed to publish first-install managed entrypoint $name"
+          return 1
+        }
+      fi
+      installer_failpoint "after-entrypoint-activation:$name"
+    done
+
+    if [ -n "$selected_generation" ]; then
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        if ! stable_entrypoint_is_managed "$name" || \
+           ! cmp "$DEST/$name" "$selected_generation/$name" >/dev/null 2>&1; then
+          err "Pre-commit entrypoint $name no longer resolves to the exact prior generation"
+          return 1
+        fi
+      done
+    else
+      for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        if ! stable_entrypoint_is_managed "$name" || [ -e "$DEST/$name" ]; then
+          err "First-install entrypoint $name became executable before selector commit"
+          return 1
+        fi
+      done
+    fi
+
+    # The verified candidate executes successfully by its immutable path before
+    # the one selector commit can expose it through any stable entrypoint.
+    "$generation/ft" --version >/dev/null 2>&1 || {
+      err "Candidate ft failed its exact pre-activation readiness probe"
+      return 1
+    }
+
+    # Commit last. `current` is the only object all three stable links consult,
+    # so one atomic transition activates the whole family at once.
     txid=$(atomic_transition_txid "selector:$DEST:$generation_id") || return 1
     stage=".current.${txid}"
     ensure_staged_symlink "generations/$generation_id" "$managed/$stage" || return 1
@@ -1885,67 +2065,158 @@ activate_process_family_generation() {
       err "Selector activation failed; the previous authority is unchanged"
       return 1
     }
+    selector_committed_here=1
     installer_failpoint after-selector-activation
   fi
 
-  # 2. Publish the three stable entrypoints as managed symlinks. A legacy
-  #    direct-install binary is exchanged only when a retained legacy
-  #    generation proves it is the exact file the installer captured.
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    installer_failpoint "before-entrypoint-activation:$name"
-    if stable_entrypoint_is_managed "$name"; then
-      publish_stable_entrypoint "$helper" "$name" missing "$generation" || {
-        err "Managed entrypoint $name does not resolve to generation $generation_id"
+  # Prove the exact post-commit authority and executable readiness. If any
+  # proof fails, atomically restore the previous selector (or prior absence).
+  if [ "$(inspect_installer_process_family_authority 2>/dev/null || true)" != \
+       $'managed\t'"generations/$generation_id" ] || \
+     ! stable_entrypoint_is_managed ft || \
+     ! stable_entrypoint_is_managed frankenterm-mux-server || \
+     ! stable_entrypoint_is_managed frankenterm-pty-guardian || \
+     ! cmp "$DEST/ft" "$generation/ft" >/dev/null 2>&1 || \
+     ! cmp "$DEST/frankenterm-mux-server" \
+       "$generation/frankenterm-mux-server" >/dev/null 2>&1 || \
+     ! cmp "$DEST/frankenterm-pty-guardian" \
+       "$generation/frankenterm-pty-guardian" >/dev/null 2>&1 || \
+     ! probe_activated_process_family; then
+    if [ "$selector_committed_here" -ne 1 ]; then
+      err "Already-current generation failed verification; leaving its authority unchanged because this invocation has no prior-selector rollback claim"
+      return 1
+    fi
+    warn "Post-commit process-family verification failed; restoring the prior selector authority"
+    txid=$(atomic_transition_txid "selector:$DEST:$generation_id") || return 1
+    stage=".current.${txid}"
+    rollback_target_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+    rollback_txid=$(atomic_transition_txid "selector-rollback:$DEST:$generation_id") || return 1
+    rollback_prior_kind=initial
+    if [ -L "$managed/$stage" ] || [ -e "$managed/$stage" ]; then
+      [ -L "$managed/$stage" ] || {
+        err "Prior selector rollback authority is not one exact symlink"
         return 1
       }
-    elif [ -e "$DEST/$name" ] || [ -L "$DEST/$name" ]; then
-      [ -f "$DEST/$name" ] && [ ! -L "$DEST/$name" ] || {
-        err "Refusing to replace unmanaged entrypoint $DEST/$name (not a regular file)"
-        return 1
-      }
-      legacy_root=""
-      for candidate in "$generations"/legacy-*/; do
-        [ -d "$candidate" ] || continue
-        if cmp "$DEST/$name" "${candidate%/}/$name" >/dev/null 2>&1; then
-          legacy_root="${candidate%/}"
-          break
-        fi
-      done
-      [ -n "$legacy_root" ] || {
-        err "Direct-install entrypoint $DEST/$name matches no retained legacy generation; rerun the installer to capture it before activating"
-        return 1
-      }
-      publish_stable_entrypoint "$helper" "$name" exchange "$legacy_root" || {
-        err "Failed to exchange legacy entrypoint $name for the managed selector"
+      rollback_stage_target=$(readlink "$managed/$stage") || return 1
+      if [[ "$rollback_stage_target" == generations/legacy-* ]]; then
+        rollback_prior_kind=legacy
+      else
+        rollback_prior_kind=managed
+      fi
+      rollback_stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
+      atomic_path_transition "$helper" "$managed" "$stage" current \
+        "$rollback_txid" "$rollback_stage_id" "$rollback_target_id" exchange || return 1
+      restored_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+      [ "$restored_id" = "$rollback_stage_id" ] || {
+        err "Selector rollback did not restore the exact prior authority"
         return 1
       }
     else
-      publish_stable_entrypoint "$helper" "$name" missing "$generation" || {
-        err "Failed to publish managed entrypoint $name"
+      atomic_path_transition "$helper" "$managed" current "$stage" \
+        "$rollback_txid" "$rollback_target_id" missing publish-noreplace || return 1
+      if [ -e "$managed/current" ] || [ -L "$managed/current" ]; then
+        err "First-install rollback did not restore the prior absent selector"
+        return 1
+      fi
+      restored_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
+      [ "$restored_id" = "$rollback_target_id" ] || {
+        err "Rolled-back candidate selector differs from the failed authority"
         return 1
       }
     fi
-  done
+    installer_failpoint after-selector-rollback
 
-  # 3. Prove the result before claiming it.
-  [ "$(inspect_installer_process_family_authority)" = $'managed\t'"generations/$generation_id" ] || {
-    err "Selector authority did not settle on generation $generation_id"
+    # Restore the exact pre-activation entrypoint authority as well as the
+    # selector. Initial installs return to three absent stable paths. A legacy
+    # direct install returns to its three retained regular files and an absent
+    # selector. Managed upgrades keep their stable links and restored selector.
+    case "$rollback_prior_kind" in
+      initial)
+        for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+          stable_entrypoint_is_managed "$name" || {
+            err "First-install rollback found a non-managed stable entrypoint"
+            return 1
+          }
+          entrypoint_txid=$(atomic_transition_txid \
+            "entrypoint:$DEST:$name:$generation") || return 1
+          entrypoint_stage=".ft-entrypoint-${name}-${entrypoint_txid}"
+          entrypoint_id=$(atomic_path_content_id "$helper" "$DEST" "$name") || return 1
+          rollback_txid=$(atomic_transition_txid \
+            "entrypoint-rollback-absent:$DEST:$name:$generation_id") || return 1
+          atomic_path_transition "$helper" "$DEST" "$name" "$entrypoint_stage" \
+            "$rollback_txid" "$entrypoint_id" missing publish-noreplace || return 1
+          installer_failpoint "after-entrypoint-rollback:$name"
+        done
+        ;;
+      legacy)
+        selected_generation="$managed/$rollback_stage_target"
+        [ -d "$selected_generation" ] && [ ! -L "$selected_generation" ] || {
+          err "Legacy rollback selector does not resolve to one retained generation"
+          return 1
+        }
+        for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+          entrypoint_txid=$(atomic_transition_txid \
+            "entrypoint:$DEST:$name:$selected_generation") || return 1
+          entrypoint_stage=".ft-entrypoint-${name}-${entrypoint_txid}"
+          [ -f "$DEST/$entrypoint_stage" ] && [ ! -L "$DEST/$entrypoint_stage" ] || {
+            err "Legacy rollback lacks the exact retained direct entrypoint $name"
+            return 1
+          }
+          cmp "$DEST/$entrypoint_stage" "$selected_generation/$name" >/dev/null 2>&1 || {
+            err "Legacy rollback entrypoint $name differs from the retained prior bytes"
+            return 1
+          }
+          entrypoint_stage_id=$(atomic_path_content_id \
+            "$helper" "$DEST" "$entrypoint_stage") || return 1
+          entrypoint_id=$(atomic_path_content_id "$helper" "$DEST" "$name") || return 1
+          rollback_txid=$(atomic_transition_txid \
+            "entrypoint-rollback-legacy:$DEST:$name:$generation_id") || return 1
+          atomic_path_transition "$helper" "$DEST" "$entrypoint_stage" "$name" \
+            "$rollback_txid" "$entrypoint_stage_id" "$entrypoint_id" exchange || return 1
+          installer_failpoint "after-entrypoint-rollback:$name"
+        done
+        txid=$(atomic_transition_txid \
+          "legacy-selector:$DEST:$rollback_stage_target") || return 1
+        stage=".current.${txid}"
+        target_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+        rollback_txid=$(atomic_transition_txid \
+          "legacy-selector-rollback:$DEST:$generation_id") || return 1
+        atomic_path_transition "$helper" "$managed" current "$stage" \
+          "$rollback_txid" "$target_id" missing publish-noreplace || return 1
+        installer_failpoint after-legacy-selector-rollback
+        ;;
+      managed)
+        ;;
+      *)
+        err "Unsupported rollback authority classification"
+        return 1
+        ;;
+    esac
+
+    case "$rollback_prior_kind" in
+      initial)
+        [ "$(inspect_installer_process_family_authority)" = initial ] || {
+          err "First-install rollback did not restore the exact absent authority"
+          return 1
+        }
+        ;;
+      legacy)
+        [ "$(inspect_installer_process_family_authority)" = legacy ] || {
+          err "Legacy rollback did not restore the exact direct authority"
+          return 1
+        }
+        ;;
+      managed)
+        [ "$(inspect_installer_process_family_authority)" = \
+          $'managed\t'"$rollback_stage_target" ] || {
+          err "Managed rollback did not restore the exact prior selector"
+          return 1
+        }
+        ;;
+    esac
+    err "Candidate activation failed readiness verification; prior process-family authority restored"
     return 1
-  }
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    stable_entrypoint_is_managed "$name" || {
-      err "Stable entrypoint $name is not a managed selector link"
-      return 1
-    }
-    cmp "$DEST/$name" "$generation/$name" >/dev/null 2>&1 || {
-      err "Stable entrypoint $name does not resolve to generation $generation_id"
-      return 1
-    }
-  done
-  "$DEST/ft" --version >/dev/null 2>&1 || {
-    err "Activated ft does not execute from $DEST"
-    return 1
-  }
+  fi
 
   PROCESS_FAMILY_ACTIVATION_STATE="current"
   PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
@@ -4628,14 +4899,15 @@ fi
 # install_pragmasevka even when the main download path is bypassed.
 # ───────────────────────────────────────────────────────────────────────────
 # --activate is a self-contained subcommand: it needs only python3 and the
-# already-published candidate under $DEST, never the network.
+# already-published candidate under $DEST, never the network. It still enters
+# the same permanent installer lock below before inspecting or mutating any
+# selector authority.
 if [ -n "$ACTIVATE_GENERATION" ]; then
-  activate_process_family_generation "$ACTIVATE_GENERATION" || exit 1
-  emit_process_family_receipt || exit 1
-  exit 0
+  required_tools=(python3)
+else
+  required_tools=(curl tar python3)
 fi
-
-for required in curl tar python3; do
+for required in "${required_tools[@]}"; do
   if ! command -v "$required" >/dev/null 2>&1; then
     err "Required tool not found: $required"
     err "Install $required via your package manager:"
@@ -4650,32 +4922,34 @@ done
 # ───────────────────────────────────────────────────────────────────────────
 # Resolve, detect, preflight
 # ───────────────────────────────────────────────────────────────────────────
-setup_proxy
-if [ -n "$OFFLINE_TARBALL" ]; then
-  [ -f "$OFFLINE_TARBALL" ] || { err "Offline tarball not found: $OFFLINE_TARBALL"; exit 1; }
-  # --offline takes precedence over --from-source: the user explicitly
-  # supplied a binary tarball, so use that even if they also passed
-  # --from-source (which detect_platform may also auto-set on Intel Mac
-  # or unknown platforms). Without this override the offline tarball
-  # would be cp'd then ignored when the FROM_SOURCE branch runs cargo.
-  FROM_SOURCE=0
-  # In offline mode we still need to know the platform/asset name for extraction
-  detect_platform
-  # detect_platform may have set FROM_SOURCE=1 for Intel Mac / unknown
-  # platforms; offline tarball still wins. Clear it again post-detect.
-  FROM_SOURCE=0
-  TAR=$(basename "$OFFLINE_TARBALL")
-  URL=""
-else
-  resolve_version
-  detect_platform
-  set_artifact_url
+if [ -z "$ACTIVATE_GENERATION" ]; then
+  setup_proxy
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    [ -f "$OFFLINE_TARBALL" ] || { err "Offline tarball not found: $OFFLINE_TARBALL"; exit 1; }
+    # --offline takes precedence over --from-source: the user explicitly
+    # supplied a binary tarball, so use that even if they also passed
+    # --from-source (which detect_platform may also auto-set on Intel Mac
+    # or unknown platforms). Without this override the offline tarball
+    # would be cp'd then ignored when the FROM_SOURCE branch runs cargo.
+    FROM_SOURCE=0
+    # In offline mode we still need to know the platform/asset name for extraction
+    detect_platform
+    # detect_platform may have set FROM_SOURCE=1 for Intel Mac / unknown
+    # platforms; offline tarball still wins. Clear it again post-detect.
+    FROM_SOURCE=0
+    TAR=$(basename "$OFFLINE_TARBALL")
+    URL=""
+  else
+    resolve_version
+    detect_platform
+    set_artifact_url
+  fi
+
+  require_release_minisign || exit 1
+
+  mkdir -p "$DEST" 2>/dev/null || true
+  preflight_checks
 fi
-
-require_release_minisign || exit 1
-
-mkdir -p "$DEST" 2>/dev/null || true
-preflight_checks
 
 # ───────────────────────────────────────────────────────────────────────────
 # Kernel advisory lock held on one permanent, descriptor-pinned inode.
@@ -4737,6 +5011,15 @@ done
 if [ "$LOCKED" -ne 1 ]; then
   err "Another installer owns the kernel lock at $LOCK_FILE, or the lock inode is unsafe"
   exit 1
+fi
+
+# Activation must be mutually exclusive with publication and with another
+# activation. It intentionally runs only after the permanent installer lock is
+# held, but before any network or release-resolution work.
+if [ -n "$ACTIVATE_GENERATION" ]; then
+  activate_process_family_generation "$ACTIVATE_GENERATION" || exit 1
+  emit_process_family_receipt || exit 1
+  exit 0
 fi
 
 # Already at target version short-circuit (unless --force or offline). This
@@ -4930,21 +5213,55 @@ if should_install_app; then
 fi
 
 if [ "$VERIFY" -eq 1 ]; then
+  self_test_root="$PUBLISHED_PROCESS_FAMILY_ROOT"
+  [ -n "$self_test_root" ] && [ -d "$self_test_root" ] && [ ! -L "$self_test_root" ] || {
+    err "Cannot verify the published process family: immutable candidate root is absent"
+    exit 1
+  }
   if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
-    warn "Skipping candidate self-test because the candidate is not activated"
+    info "Running pending candidate \`ft doctor --json\` by immutable path"
   else
-    info "Running \`ft doctor --json\` (informational; non-zero exit is OK on first install)"
-    set +e
-    if [ "$QUIET" -eq 1 ]; then
-      # In quiet mode we just want a yes/no on "did the binary launch and emit
-      # parseable JSON?" — don't dump the doctor body to stdout.
-      "$DEST/ft" doctor --json >/dev/null 2>&1
-    else
-      "$DEST/ft" doctor --json 2>/dev/null | head -40
-    fi
-    set -e
-    ok "Self-test invoked"
+    info "Running activated \`ft doctor --json\` by immutable generation path"
   fi
+  doctor_output="$TMP/ft-doctor.json"
+  doctor_error="$TMP/ft-doctor.stderr"
+  if ! "$self_test_root/ft" doctor --json >"$doctor_output" 2>"$doctor_error"; then
+    if [ "$QUIET" -ne 1 ]; then
+      head -40 "$doctor_output" >&2
+      head -40 "$doctor_error" >&2
+    fi
+    err "Published process-family self-test failed; installation verification did not pass"
+    exit 1
+  fi
+  if ! python3 - "$doctor_output" <<'PY'
+import json, os, stat, sys
+
+path = sys.argv[1]
+before = os.stat(path, follow_symlinks=False)
+if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 16 * 1024 * 1024:
+    raise SystemExit("doctor output is not one bounded regular file")
+with open(path, "rb") as stream:
+    payload = stream.read(16 * 1024 * 1024 + 1)
+if len(payload) > 16 * 1024 * 1024:
+    raise SystemExit("doctor output exceeds its verification bound")
+json.loads(payload)
+after = os.stat(path, follow_symlinks=False)
+if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != \
+   (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+    raise SystemExit("doctor output changed while it was verified")
+PY
+  then
+    if [ "$QUIET" -ne 1 ]; then
+      head -40 "$doctor_output" >&2
+      head -40 "$doctor_error" >&2
+    fi
+    err "Published process-family self-test did not emit one bounded JSON document"
+    exit 1
+  fi
+  if [ "$QUIET" -ne 1 ]; then
+    head -40 "$doctor_output"
+  fi
+  ok "Published process-family self-test passed"
 fi
 
 # The candidate manifest came from the externally authenticated archive (or

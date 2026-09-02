@@ -17214,7 +17214,7 @@ fn validate_agent_config_transaction_claim(
                 && backup_leaf == &expected_backup
                 && backup_sha256 == &before.sha256
                 && valid_hash(&before.sha256)
-                && before.metadata.object_kind == "regular_file"
+                && before.metadata.object_kind == "regular-file"
                 && before.metadata.hard_link_count == 1
                 && before.metadata.uid == claim.requested_final_metadata.uid
                 && before.metadata.gid == claim.requested_final_metadata.gid
@@ -114845,6 +114845,37 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V5={transaction_id}:{operation}:{stage_name}:{
     }
 
     #[cfg(unix)]
+    fn run_installer_activation_function(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        scratch: &Path,
+        failpoint: Option<&str>,
+        mux_state: &str,
+        readiness_failure: bool,
+    ) -> std::process::Output {
+        std::fs::create_dir_all(scratch).expect("create installer activation scratch");
+        let failpoint = failpoint.unwrap_or("");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES={}\nexport FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nIDLE_HOST_CONFIRMED=1\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nactivate_process_family_generation {}\nemit_process_family_receipt\n",
+            shell_single_quote(mux_state),
+            if readiness_failure { "1" } else { "0" },
+            if readiness_failure { "1" } else { "0" },
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&destination.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            if failpoint.is_empty() { "0" } else { "1" },
+            shell_single_quote(failpoint),
+            shell_single_quote(&family.generation_id),
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute production installer activation function")
+    }
+
+    #[cfg(unix)]
     fn parse_installer_process_family_receipt(stdout: &[u8]) -> serde_json::Value {
         let stdout = std::str::from_utf8(stdout).expect("installer receipt is UTF-8");
         let prefix = "FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=";
@@ -115923,6 +115954,51 @@ cat "$FAKE_FONT_ARCHIVE"
             .find("&& check_installed_version \"$VERSION\"")
             .expect("installed-version refresh boundary");
         assert!(lock_acquired < installed_version_check);
+        let activation_dispatch = installer
+            .rfind("activate_process_family_generation \"$ACTIVATE_GENERATION\"")
+            .expect("top-level activation dispatch");
+        assert!(
+            lock_acquired < activation_dispatch && activation_dispatch < installed_version_check,
+            "activation must enter the permanent installer lock before any selector mutation"
+        );
+        let activation_start = installer
+            .find("activate_process_family_generation() {")
+            .expect("idle-host activation function");
+        let activation_end = installer[activation_start..]
+            .find("\n}\n\nemit_process_family_receipt()")
+            .map(|offset| activation_start + offset)
+            .expect("idle-host activation function end");
+        let activation = &installer[activation_start..activation_end];
+        let last_entrypoint = activation
+            .find("after-entrypoint-activation:$name")
+            .expect("entrypoint activation boundary");
+        let selector_commit = activation
+            .find("installer_failpoint before-selector-activation")
+            .expect("single selector commit boundary");
+        assert!(last_entrypoint < selector_commit);
+        assert!(activation.contains("installer_failpoint after-selector-rollback"));
+        assert!(activation.contains("installer_failpoint \"after-entrypoint-rollback:$name\""));
+        assert!(activation.contains("installer_failpoint after-legacy-selector-rollback"));
+        assert!(installer.contains("\"frankenterm-pty-guardian\","));
+        assert!(installer.contains("\"ft\","));
+        assert!(
+            activation
+                .contains("for name in ft frankenterm-mux-server frankenterm-pty-guardian; do")
+        );
+        assert!(activation.contains("\"$DEST/$name\" --version >/dev/null 2>&1 || return 1"));
+        assert!(
+            installer
+                .contains("Running pending candidate \\`ft doctor --json\\` by immutable path")
+        );
+        assert!(installer.contains(
+            "Published process-family self-test failed; installation verification did not pass"
+        ));
+        assert!(installer.contains("json.loads(payload)"));
+        assert!(!installer.contains("non-zero exit is OK on first install"));
+        assert!(
+            !installer
+                .contains("Skipping candidate self-test because the candidate is not activated")
+        );
         assert!(!installer.contains("sort -u"));
         assert!(installer.contains("GUARDIAN_BIN=\"$PACKAGE_ROOT/frankenterm-pty-guardian\""));
         assert!(installer.contains("-name \"frankenterm-pty-guardian\" -perm -111"));
@@ -117426,6 +117502,532 @@ printf x > "$MINISIGN_MARKER"
                 assert!(installer_residue_count(&destination) <= 4);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_idle_activation_has_one_commit_point_and_recovers_every_crash_prefix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let fixture = tempfile::tempdir().expect("create activation crash fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"c".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        for (index, failpoint) in [
+            "after-entrypoint-activation:ft",
+            "after-entrypoint-activation:frankenterm-mux-server",
+            "after-entrypoint-activation:frankenterm-pty-guardian",
+            "after-selector-activation",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = fixture.path().join(format!("initial-{index}"));
+            std::fs::create_dir(&destination).expect("create activation destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make activation destination private");
+            let staged = run_installer_family_function(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join(format!("stage-{index}")),
+                None,
+            );
+            assert!(
+                staged.status.success(),
+                "candidate staging failed: {}",
+                String::from_utf8_lossy(&staged.stderr)
+            );
+
+            let interrupted = run_installer_activation_function(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join(format!("interrupt-{index}")),
+                Some(failpoint),
+                "inactive",
+                false,
+            );
+            assert_eq!(
+                interrupted.status.signal(),
+                Some(9),
+                "activation failpoint {failpoint} did not kill its shell: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            if failpoint == "after-selector-activation" {
+                assert!(
+                    family_bytes_match(&destination, &family),
+                    "the single selector commit must expose all three candidate members"
+                );
+            } else {
+                assert_initial_family_is_uniformly_unavailable(&destination);
+            }
+
+            let recovered = run_installer_activation_function(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join(format!("recover-{index}")),
+                None,
+                "inactive",
+                false,
+            );
+            assert!(
+                recovered.status.success(),
+                "activation recovery after {failpoint} failed: {}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            let receipt = parse_installer_process_family_receipt(&recovered.stdout);
+            assert_eq!(receipt["activation"], "current");
+            assert_eq!(receipt["active_authority"], "managed-selector");
+            assert_eq!(receipt["candidate_generation"], serde_json::Value::Null);
+            assert!(family_bytes_match(&destination, &family));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_legacy_activation_recovery_never_exposes_mixed_generation_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let fixture = tempfile::tempdir().expect("create legacy activation fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"d".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"e".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let destination = fixture.path().join("bin");
+        std::fs::create_dir(&destination).expect("create legacy destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make legacy destination private");
+        for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+            std::fs::copy(old_family.root.join(name), destination.join(name))
+                .expect("plant legacy family member");
+            std::fs::set_permissions(
+                destination.join(name),
+                std::fs::Permissions::from_mode(0o555),
+            )
+            .expect("seal legacy family member");
+        }
+        let staged = run_installer_family_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("stage"),
+            None,
+        );
+        assert!(staged.status.success());
+
+        let interrupted = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("interrupt"),
+            Some("after-entrypoint-activation:ft"),
+            "inactive",
+            false,
+        );
+        assert_eq!(interrupted.status.signal(), Some(9));
+        assert!(
+            family_bytes_match(&destination, &old_family),
+            "a partial legacy-link conversion must keep every stable path on old bytes"
+        );
+
+        let recovered = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("recover"),
+            None,
+            "inactive",
+            false,
+        );
+        assert!(
+            recovered.status.success(),
+            "legacy activation recovery failed: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert!(family_bytes_match(&destination, &candidate_family));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_activation_readiness_failure_restores_prior_selector_or_absence() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create activation rollback fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"1".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"2".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+
+        let initial_destination = fixture.path().join("initial-bin");
+        std::fs::create_dir(&initial_destination).expect("create initial rollback destination");
+        std::fs::set_permissions(&initial_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make initial rollback destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &initial_destination,
+                &fixture.path().join("initial-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let initial_failure = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &initial_destination,
+            &fixture.path().join("initial-failure"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!initial_failure.status.success());
+        assert_initial_family_is_uniformly_unavailable(&initial_destination);
+        assert!(
+            !initial_destination
+                .join(".frankenterm-process-family/current")
+                .exists()
+        );
+
+        let managed_destination = fixture.path().join("managed-bin");
+        std::fs::create_dir(&managed_destination).expect("create managed rollback destination");
+        std::fs::set_permissions(&managed_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make managed rollback destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &old_family,
+                &managed_destination,
+                &fixture.path().join("old-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        activate_installer_test_generation(&managed_destination, &old_family);
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &managed_destination,
+                &fixture.path().join("candidate-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let managed_failure = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &managed_destination,
+            &fixture.path().join("managed-failure"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!managed_failure.status.success());
+        assert!(family_bytes_match(&managed_destination, &old_family));
+        assert_eq!(
+            std::fs::read_link(managed_destination.join(".frankenterm-process-family/current"))
+                .expect("read restored managed selector"),
+            Path::new("generations").join(&old_family.generation_id)
+        );
+
+        let current_destination = fixture.path().join("current-bin");
+        std::fs::create_dir(&current_destination).expect("create current rollback destination");
+        std::fs::set_permissions(&current_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make current rollback destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &current_destination,
+                &fixture.path().join("current-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let activation = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &current_destination,
+            &fixture.path().join("current-activation"),
+            None,
+            "inactive",
+            false,
+        );
+        assert!(activation.status.success());
+        let repeated_failure = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &current_destination,
+            &fixture.path().join("current-repeat-failure"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!repeated_failure.status.success());
+        assert!(
+            String::from_utf8_lossy(&repeated_failure.stderr)
+                .contains("this invocation has no prior-selector rollback claim")
+        );
+        assert!(
+            family_bytes_match(&current_destination, &candidate_family),
+            "a repeat verification failure must not invent a prior authority"
+        );
+        assert_eq!(
+            std::fs::read_link(current_destination.join(".frankenterm-process-family/current"))
+                .expect("read unchanged current selector"),
+            Path::new("generations").join(&candidate_family.generation_id)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_activation_rollback_recovers_every_crash_prefix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let fixture = tempfile::tempdir().expect("create activation rollback crash fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"3".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"4".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+
+        for (index, failpoint) in [
+            "after-selector-rollback",
+            "after-entrypoint-rollback:ft",
+            "after-entrypoint-rollback:frankenterm-mux-server",
+            "after-entrypoint-rollback:frankenterm-pty-guardian",
+            "after-legacy-selector-rollback",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = fixture.path().join(format!("legacy-{index}"));
+            std::fs::create_dir(&destination).expect("create legacy rollback destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make legacy rollback destination private");
+            for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+                std::fs::copy(old_family.root.join(name), destination.join(name))
+                    .expect("plant rollback legacy family member");
+                std::fs::set_permissions(
+                    destination.join(name),
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .expect("seal rollback legacy family member");
+            }
+            assert!(
+                run_installer_family_function(
+                    &installer,
+                    &candidate_family,
+                    &destination,
+                    &fixture.path().join(format!("legacy-stage-{index}")),
+                    None,
+                )
+                .status
+                .success()
+            );
+
+            let interrupted = run_installer_activation_function(
+                &installer,
+                &candidate_family,
+                &destination,
+                &fixture.path().join(format!("legacy-interrupt-{index}")),
+                Some(failpoint),
+                "inactive",
+                true,
+            );
+            assert_eq!(
+                interrupted.status.signal(),
+                Some(9),
+                "legacy rollback failpoint {failpoint} did not kill its shell: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            assert!(
+                family_bytes_match(&destination, &old_family),
+                "legacy rollback prefix {failpoint} exposed candidate or mixed bytes"
+            );
+
+            let recovered = run_installer_activation_function(
+                &installer,
+                &candidate_family,
+                &destination,
+                &fixture.path().join(format!("legacy-recover-{index}")),
+                None,
+                "inactive",
+                true,
+            );
+            assert!(
+                !recovered.status.success(),
+                "forced readiness failure unexpectedly activated after {failpoint}"
+            );
+            assert!(family_bytes_match(&destination, &old_family));
+            assert!(
+                std::fs::symlink_metadata(destination.join(".frankenterm-process-family/current"))
+                    .is_err(),
+                "legacy rollback must restore the originally absent selector"
+            );
+            for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+                assert!(
+                    std::fs::symlink_metadata(destination.join(name))
+                        .expect("restored legacy entrypoint")
+                        .file_type()
+                        .is_file(),
+                    "legacy rollback must restore direct entrypoint {name}"
+                );
+            }
+        }
+
+        for (index, failpoint) in [
+            "after-selector-rollback",
+            "after-entrypoint-rollback:ft",
+            "after-entrypoint-rollback:frankenterm-mux-server",
+            "after-entrypoint-rollback:frankenterm-pty-guardian",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = fixture.path().join(format!("initial-{index}"));
+            std::fs::create_dir(&destination).expect("create initial rollback destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make initial rollback destination private");
+            assert!(
+                run_installer_family_function(
+                    &installer,
+                    &candidate_family,
+                    &destination,
+                    &fixture.path().join(format!("initial-stage-{index}")),
+                    None,
+                )
+                .status
+                .success()
+            );
+            let interrupted = run_installer_activation_function(
+                &installer,
+                &candidate_family,
+                &destination,
+                &fixture.path().join(format!("initial-interrupt-{index}")),
+                Some(failpoint),
+                "inactive",
+                true,
+            );
+            assert_eq!(interrupted.status.signal(), Some(9));
+            assert_initial_family_is_uniformly_unavailable(&destination);
+
+            let recovered = run_installer_activation_function(
+                &installer,
+                &candidate_family,
+                &destination,
+                &fixture.path().join(format!("initial-recover-{index}")),
+                None,
+                "inactive",
+                true,
+            );
+            assert!(!recovered.status.success());
+            assert!(
+                std::fs::symlink_metadata(destination.join(".frankenterm-process-family/current"))
+                    .is_err()
+            );
+            for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+                assert!(
+                    std::fs::symlink_metadata(destination.join(name)).is_err(),
+                    "initial rollback must restore absent entrypoint {name}"
+                );
+            }
+        }
+
+        let managed_destination = fixture.path().join("managed");
+        std::fs::create_dir(&managed_destination).expect("create managed rollback destination");
+        std::fs::set_permissions(&managed_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make managed rollback destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &old_family,
+                &managed_destination,
+                &fixture.path().join("managed-old-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        activate_installer_test_generation(&managed_destination, &old_family);
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &managed_destination,
+                &fixture.path().join("managed-candidate-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let interrupted = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &managed_destination,
+            &fixture.path().join("managed-interrupt"),
+            Some("after-selector-rollback"),
+            "inactive",
+            true,
+        );
+        assert_eq!(interrupted.status.signal(), Some(9));
+        assert!(family_bytes_match(&managed_destination, &old_family));
+        let recovered = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &managed_destination,
+            &fixture.path().join("managed-recover"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!recovered.status.success());
+        assert!(family_bytes_match(&managed_destination, &old_family));
+        assert_eq!(
+            std::fs::read_link(managed_destination.join(".frankenterm-process-family/current"))
+                .expect("read recovered managed selector"),
+            Path::new("generations").join(&old_family.generation_id)
+        );
     }
 
     #[cfg(unix)]
@@ -125779,6 +126381,22 @@ printf x > "$MINISIGN_MARKER"
         let updated = std::fs::read_to_string(&target).unwrap();
         assert!(updated.contains("existing cursor rules"));
         assert!(updated.contains("FrankenTerm Integration"));
+
+        let prepared_again =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        assert_eq!(
+            prepared_again.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Skip
+        );
+        let skipped = apply_prepared_agent_config(&prepared_again).unwrap();
+        assert_eq!(skipped.action, "skip");
+        assert!(!skipped.backup_created);
+        assert_eq!(
+            skipped.transactions.len(),
+            1,
+            "a repeated update must reconcile its retained claim and acknowledgement"
+        );
+        assert_eq!(skipped.transactions[0].outcome, "applied");
 
         let backups: Vec<_> = std::fs::read_dir(&global_root)
             .unwrap()

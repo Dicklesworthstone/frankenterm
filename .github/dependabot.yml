@@ -1,19 +1,5 @@
 version: 2
 updates:
-  # GitHub Actions - keep CI infrastructure current
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/New_York"
-    groups:
-      actions:
-        patterns: ["*"]
-    commit-message:
-      prefix: "ci"
-
   # Rust dependencies
   - package-ecosystem: "cargo"
     directory: "/"
