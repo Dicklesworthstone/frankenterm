@@ -2269,7 +2269,10 @@ payload = {
     "activation": activation,
     "active_authority": active_authority,
     "active_root": active_root_value,
-    "candidate_generation": generation or os.path.basename(candidate_root),
+    # This field names only a generation still awaiting activation.  A current
+    # receipt already identifies its authority through active_root and must not
+    # simultaneously describe that same generation as a pending candidate.
+    "candidate_generation": generation or None,
     "candidate_root": candidate_root,
     "candidate_version": version,
     "pending_reason": pending_reason or None,
