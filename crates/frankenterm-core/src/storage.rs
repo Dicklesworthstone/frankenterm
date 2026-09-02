@@ -15499,7 +15499,7 @@ mod writer_io_scheduler_tests {
             let executed = backend.executed();
             assert_eq!(
                 executed,
-                vec!["BEGIN".to_string(), "COMMIT".to_string()],
+                vec!["BEGIN IMMEDIATE".to_string(), "COMMIT".to_string()],
                 "grouped append dispatch must use one explicit transaction"
             );
             let writer_queries = backend.observed_queries();
@@ -15885,7 +15885,7 @@ mod writer_io_scheduler_tests {
             assert_eq!(storage_writer_panics_total(), 1);
             assert_eq!(
                 backend.executed(),
-                vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+                vec!["BEGIN IMMEDIATE".to_string(), "ROLLBACK".to_string()],
                 "append-group panic recovery must close the open transaction"
             );
 
@@ -16245,7 +16245,7 @@ mod writer_io_scheduler_tests {
 
             assert_eq!(
                 backend.executed(),
-                vec!["BEGIN".to_string(), "COMMIT".to_string()],
+                vec!["BEGIN IMMEDIATE".to_string(), "COMMIT".to_string()],
                 "grouped events must use exactly one explicit transaction"
             );
             let insert_count = backend
@@ -16323,7 +16323,7 @@ mod writer_io_scheduler_tests {
             assert!(queries[2].0.contains("SELECT id FROM events"));
             assert_eq!(
                 backend.executed(),
-                vec!["BEGIN".to_string(), "COMMIT".to_string()]
+                vec!["BEGIN IMMEDIATE".to_string(), "COMMIT".to_string()]
             );
         });
     }
@@ -16393,7 +16393,7 @@ mod writer_io_scheduler_tests {
 
             assert_eq!(
                 backend.executed(),
-                vec!["BEGIN".to_string(), "COMMIT".to_string()],
+                vec!["BEGIN IMMEDIATE".to_string(), "COMMIT".to_string()],
                 "interleaved events+gaps share one transaction"
             );
         });
@@ -16432,7 +16432,7 @@ mod writer_io_scheduler_tests {
             assert!(result.is_err(), "a failed insert must abort the group");
             assert_eq!(
                 backend.executed(),
-                vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+                vec!["BEGIN IMMEDIATE".to_string(), "ROLLBACK".to_string()],
                 "a mid-group failure must roll the whole transaction back"
             );
             dispatch_event_gap_group_commit_result(result, group);
@@ -16493,7 +16493,7 @@ mod writer_io_scheduler_tests {
         );
         assert_eq!(
             backend.executed(),
-            vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+            vec!["BEGIN IMMEDIATE".to_string(), "ROLLBACK".to_string()],
             "the gap SQL and later mutation share one proven ordinary rollback"
         );
         assert_eq!(
@@ -16632,7 +16632,7 @@ mod writer_io_scheduler_tests {
             assert!(result.is_err(), "a COMMIT failure must surface as Err");
             assert_eq!(
                 backend.executed(),
-                vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+                vec!["BEGIN IMMEDIATE".to_string(), "ROLLBACK".to_string()],
                 "a failed COMMIT must be followed by ROLLBACK, never a silent partial commit"
             );
             assert!(take_writer_backend_epoch_poisoned_signal());
@@ -16754,7 +16754,7 @@ mod writer_io_scheduler_tests {
             assert_eq!(ids, vec![701, 702, 703], "every event durably committed");
 
             let executed = backend.executed();
-            let begins = executed.iter().filter(|s| *s == "BEGIN").count();
+            let begins = executed.iter().filter(|s| s.starts_with("BEGIN")).count();
             let commits = executed.iter().filter(|s| *s == "COMMIT").count();
             assert_eq!(begins, commits, "transactions stay balanced");
             assert!(begins >= 1, "the event run coalesced into a transaction");
