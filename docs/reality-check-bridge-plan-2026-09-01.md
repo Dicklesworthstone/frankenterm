@@ -639,6 +639,8 @@ Only one suggestion touched this epic: `ft-xxfwy.17` "may depend on ft-nam3s" (0
 
 **Lane 8 (remote, hz3, 2026-09-02T00:22–01:10 Z, final tree fdd7e0c07):** filtered core-lib set → 1000 passed / 1 failed (`retry::tests::retry_runs_deterministically_under_labruntime_with_cx`, 5.4 s wall on a loaded worker; passes locally in 0.19 s); `no_orphan_source_files` → failed on four pre-existing orphans (now baselined); `cargo check -p frankenterm --bin ft` → pass (hz4).
 
+**Lanes 11–12 (remote, hz4, 2026-09-02T01:51–03:16 Z):** `retry::tests` + `patterns::tests::detect_codex_usage*` → 103 passed / 0 failed (the lane-8 retry failure was worker load); `no_orphan_source_files` → pass with the `KNOWN_ORPHANS` baseline; `frankenterm-mux-server-impl local::tests` → 7 / 0 (listener abort regression test included); `vendored::mux_client::tests` → 170 / 0 (unilateral-handshake regression test included). Lane 13 (storage writer scheduler/epoch tests after the `BEGIN IMMEDIATE` change) is recorded below when it finishes.
+
 **Dev signals (maintainer Mac, not proof):** `scripts/smoke/headless-mux-observe.sh /tmp/ft-rc20260901-native/debug` → PASS (event `codex.usage.reached`, `reset_time: 3:00 PM`, dropped segments 0, sequence resyncs 0 on the second run); local core tests: the new unilateral-handshake test, the codex casing test, the retry test, and the 48 writer-scheduler/epoch tests green after the `BEGIN IMMEDIATE` expectation update.
 
 ## 11. Execution log — same day (2026-09-01/02)
