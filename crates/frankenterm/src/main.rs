@@ -429,7 +429,12 @@ SEE ALSO:
         /// Text to send
         text: String,
 
-        /// Send character by character (no paste mode)
+        /// Type the text character by character instead of the default
+        /// bracketed paste. The default is right for agent TUIs (Claude Code,
+        /// Codex, Gemini treat a paste as one input); a shell prompt inserts a
+        /// bracketed paste into its line editor WITHOUT executing it, so use
+        /// --no-paste to run commands in a shell pane. The receipt reports the
+        /// mode as `no_paste`.
         #[arg(long)]
         no_paste: bool,
 

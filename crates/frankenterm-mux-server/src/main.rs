@@ -228,6 +228,12 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
 
     let opts = Opt::parse();
 
+    // The headless server had no logger at all until 2026-09-02, so config
+    // load errors and the bound socket paths were invisible (ft-xxfwy.35).
+    // Default to `info` so the ready/socket lines print without any env;
+    // `RUST_LOG` still overrides.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     // The daemonizing parent never owns mux state. Every foreground process
     // and daemon re-exec child acquires before configuration or any other
     // fallible initialization, then transfers the guard into `main`'s scope.
@@ -846,6 +852,35 @@ mod tests {
         stop_mux_domain_config_admission_retry();
         remove_process_env_for_mux_server_startup("WEZTERM_UNIX_SOCKET");
         remove_process_env_for_mux_server_startup("FRANKENTERM_UNIX_SOCKET");
+    }
+
+    /// An explicit `--config-file` that fails to load must stop the server
+    /// instead of silently running on defaults (ft-xxfwy.35).
+    #[test]
+    fn explicit_config_file_that_does_not_load_fails_closed() {
+        let _guard = lock_test_state();
+        let path = std::env::temp_dir().join(format!(
+            "frankenterm-mux-server-bad-config-{}.lua",
+            std::process::id()
+        ));
+        std::fs::write(&path, "this is not lua {{{\n").expect("write fixture config");
+        let as_os = path.clone().into_os_string();
+        config::common_init(Some(&as_os), &[], false).expect("common_init records the load error");
+
+        let err = validate_explicit_config_file(Some(path.as_os_str()))
+            .expect_err("a broken explicit config must fail closed");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "error must name the file: {message}"
+        );
+        assert!(
+            validate_explicit_config_file(None).is_ok(),
+            "no explicit file means the default search path keeps its fallback semantics"
+        );
+
+        config::use_default_configuration();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

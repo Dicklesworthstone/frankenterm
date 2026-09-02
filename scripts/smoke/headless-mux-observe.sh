@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # Headless observe smoke: the real vendored `frankenterm-mux-server` plus `ft`
 # from the SAME build, no GUI. Proves discover -> attach -> list -> send ->
-# observe -> detect on one machine and prints the evidence.
+# observe -> detect on one machine and writes a JSON receipt plus a log.
 #
-# This is a dev signal, not a release gate: it runs whatever binaries you point
-# it at. It exists because the first time it was run (2026-09-02) it found that
-# every client connect aborted the mux server (fixed in 647d87fd6), so run it
-# after touching mux-server-impl/local.rs, promise/spawn.rs, the vendored
-# streaming client, or the pattern engine.
+# This is a dev signal, not a release gate by itself: it runs whatever binaries
+# you point it at. It exists because the first time it was run (2026-09-02) it
+# found that every client connect aborted the mux server (fixed in 647d87fd6),
+# so run it after touching mux-server-impl/local.rs, promise/spawn.rs, the
+# vendored streaming client, or the pattern engine.
 #
 # Usage:
-#   scripts/smoke/headless-mux-observe.sh [BIN_DIR]
+#   scripts/smoke/headless-mux-observe.sh [BIN_DIR] [OUT_DIR]
 #   BIN_DIR defaults to target/debug; needs `ft` and `frankenterm-mux-server`.
+#   OUT_DIR defaults to a fresh mktemp dir; receives receipt.json and smoke.log.
+#
+# Receipt schema (ft.smoke.headless-mux-observe.v1): generated_at, host, commit,
+# cli_version, mux_version, bin_dir, status (pass|fail), steps[] of
+# {name, status (pass|fail), detail}. A receipt is `pass` only when every step
+# passed; there is no skipped state.
 #
 # Known limits of the dev mux-server (recorded, not worked around):
-#   - `--config-file` is silently ignored (no logger is installed), so the
+#   - Before ft-xxfwy.35 lands, `--config-file` is silently ignored and the
 #     server always binds RUNTIME_DIR/sock (~/.local/share/frankenterm/sock on
 #     macOS). The script therefore refuses to run if that socket is live.
 #   - Sends use --no-paste: the default bracketed paste is not executed by zsh.
@@ -33,57 +39,94 @@ if [ -S "$SOCK" ] && lsof -U 2>/dev/null | grep -q -- "$SOCK"; then
   exit 2
 fi
 
-D=$(mktemp -d "${TMPDIR:-/tmp}/ft-smoke-XXXXXX")
+D="${2:-$(mktemp -d "${TMPDIR:-/tmp}/ft-smoke-XXXXXX")}"
 mkdir -p "$D/.ft"
 chmod 700 "$D/.ft"
 printf '[storage]\ndb_path = "ft.db"\n' > "$D/ft.toml"
 chmod 600 "$D/ft.toml"
+LOG="$D/smoke.log"
+RECEIPT="$D/receipt.json"
+STEPS="$D/steps.jsonl"
+: > "$STEPS"
 echo "smoke dir: $D"
 
-fail() { echo "FAIL: $*" >&2; kill "${WATCH:-0}" "${MUX_PID:-0}" 2>/dev/null; exit 1; }
+log() { printf '%s %s\n' "$(date -u +%FT%T.%3NZ 2>/dev/null || date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+step() { # name status detail
+  jq -cn --arg n "$1" --arg s "$2" --arg d "$3" '{name:$n,status:$s,detail:$d}' >> "$STEPS"
+  log "step $1: $2 ($3)"
+}
+finish() { # status
+  local status="$1"
+  jq -n \
+    --arg schema "ft.smoke.headless-mux-observe.v1" \
+    --arg generated_at "$(date -u +%FT%TZ)" \
+    --arg host "$(hostname)" \
+    --arg commit "$(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    --arg cli_version "$("$FT" --version 2>/dev/null | head -1)" \
+    --arg mux_version "$("$MUX" --version 2>/dev/null | head -1)" \
+    --arg bin_dir "$BIN_DIR" \
+    --arg status "$status" \
+    --slurpfile steps "$STEPS" \
+    '{schema:$schema,generated_at:$generated_at,host:$host,commit:$commit,cli_version:$cli_version,mux_version:$mux_version,bin_dir:$bin_dir,status:$status,steps:$steps}' \
+    > "$RECEIPT"
+  log "receipt: $RECEIPT (status=$status)"
+}
+fail() { # step-name detail
+  step "$1" fail "$2"
+  kill "${WATCH:-0}" "${MUX_PID:-0}" 2>/dev/null
+  finish fail
+  exit 1
+}
 
 # Bare zsh: nothing rewrites the pane title after we set it.
 "$MUX" --daemonize=false --cwd "$D" -- /bin/zsh -f > "$D/mux.log" 2>&1 &
 MUX_PID=$!
 for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done
-[ -S "$SOCK" ] || fail "mux socket never appeared ($(cat "$D/mux.log"))"
-echo "mux-server pid $MUX_PID on $SOCK"
+[ -S "$SOCK" ] || fail mux_start "socket never appeared: $(tail -3 "$D/mux.log" | tr '\n' ' ')"
+step mux_start pass "pid $MUX_PID on $SOCK"
 
 export WEZTERM_UNIX_SOCKET="$SOCK" FT_WORKSPACE="$D"
 ft() { "$FT" -c "$D/ft.toml" "$@"; }
 
-echo "=== doctor"
 ft doctor --json > "$D/doctor.json" 2> "$D/doctor.err"
-jq -c '.checks[] | select(.name=="mux socket" or .name=="WezTerm connection")' "$D/doctor.json"
+SOCK_ROW=$(jq -c '.checks[] | select(.name=="mux socket")' "$D/doctor.json" 2>/dev/null)
+CONN_ROW=$(jq -c '.checks[] | select(.name=="WezTerm connection")' "$D/doctor.json" 2>/dev/null)
+log "$SOCK_ROW"; log "$CONN_ROW"
 jq -e '.checks[] | select(.name=="WezTerm connection") | .status == "ok"' "$D/doctor.json" > /dev/null \
-  || fail "doctor did not reach the mux ($(cat "$D/doctor.err" | tail -3))"
+  || fail doctor "did not reach the mux: $(tail -3 "$D/doctor.err" | tr '\n' ' ')"
+step doctor pass "$(jq -r '.checks[] | select(.name=="WezTerm connection") | .detail' "$D/doctor.json")"
 
-echo "=== list"
 ft list --json > "$D/list.json" 2> "$D/list.err"
 PANE=$(jq -r '.[0].pane_id' "$D/list.json" 2>/dev/null)
-[ -n "$PANE" ] && [ "$PANE" != "null" ] || fail "no pane listed ($(tail -3 "$D/list.err"))"
-echo "pane id: $PANE"
+[ -n "$PANE" ] && [ "$PANE" != "null" ] || fail list "no pane listed: $(tail -3 "$D/list.err" | tr '\n' ' ')"
+step list pass "pane $PANE"
 
-echo "=== watch"
 ft watch --foreground --poll-interval 1000 > "$D/watch.log" 2>&1 &
 WATCH=$!
 sleep 5
+grep -a -q 'Started vendored pane streaming subscription' "$D/watch.log" \
+  || fail watch "no streaming subscription within 5 s: $(tail -3 "$D/watch.log" | tr '\n' ' ')"
+step watch pass "streaming subscription for pane $PANE"
 
-echo "=== send (title -> codex, then the codex usage-limit message)"
-ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$D/send1.log" 2>&1 || fail "send 1 ($(tail -2 "$D/send1.log"))"
+ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$D/send1.log" 2>&1 || fail send_title "$(tail -2 "$D/send1.log" | tr '\n' ' ')"
 sleep 3
-ft send --no-paste "$PANE" "echo \"You've reached your usage limit. try again at 3:00 PM.\"" > "$D/send2.log" 2>&1 || fail "send 2"
+ft send --no-paste "$PANE" "echo \"You've reached your usage limit. try again at 3:00 PM.\"" > "$D/send2.log" 2>&1 || fail send_limit "$(tail -2 "$D/send2.log" | tr '\n' ' ')"
+step send pass "title set to codex; usage-limit line sent"
 sleep 10
 
-echo "=== events"
 ft events -f json -l 5 > "$D/events.json" 2> "$D/events.err"
-jq -c '.[] | {id, rule_id, agent_type, severity, extracted, matched_text}' "$D/events.json" 2>/dev/null
+jq -c '.[] | {id, rule_id, agent_type, severity, extracted, matched_text}' "$D/events.json" 2>/dev/null | tee -a "$LOG"
 jq -e 'any(.[]; .rule_id == "codex.usage.reached")' "$D/events.json" > /dev/null \
-  || fail "no codex.usage.reached event (watch log: $(grep -c . "$D/watch.log") lines in $D/watch.log)"
+  || fail detect "no codex.usage.reached event ($(grep -c . "$D/watch.log") watch log lines in $D)"
+step detect pass "$(jq -c '[.[] | select(.rule_id=="codex.usage.reached")][0] | {id, extracted}' "$D/events.json")"
 
-echo "=== watcher warnings (informational)"
-grep -a -c 'Failed to persist segment' "$D/watch.log" | sed 's/^/dropped segments: /'
-grep -a -c 'Sequence discontinuity' "$D/watch.log" | sed 's/^/sequence resyncs: /'
+DROPPED=$(grep -a -c 'Failed to persist segment' "$D/watch.log")
+RESYNCS=$(grep -a -c 'Sequence discontinuity' "$D/watch.log")
+if [ "$DROPPED" != "0" ] || [ "$RESYNCS" != "0" ]; then
+  fail durability "dropped segments: $DROPPED, sequence resyncs: $RESYNCS (ft-xxfwy.32)"
+fi
+step durability pass "dropped segments 0, sequence resyncs 0"
 
 kill "$WATCH" 2>/dev/null; sleep 1; kill "$MUX_PID" 2>/dev/null
+finish pass
 echo "PASS: observe->detect on a real headless mux (evidence in $D)"

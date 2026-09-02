@@ -812,9 +812,16 @@ mod tests {
             report.oracle_report.all_passed(),
             "LabRuntime oracles must all pass: {report:?}"
         );
+        // Hang guard only. The three virtual sleeps total 70 ms, so a tight
+        // wall-clock bound cannot tell virtual from real sleeping; what it can
+        // catch is a real-time wait that never returns or a step explosion.
+        // A 1 s bound tripped at 5.4 s on a loaded RCH worker (2026-09-02,
+        // lane 8) while the same test ran in 0.19 s on an idle host, so the
+        // guard is generous. Determinism itself is proven by the attempt
+        // counts and the LabRuntime oracles above.
         assert!(
-            wall_start.elapsed() < Duration::from_secs(1),
-            "virtual-time retry sleeps must not consume real time; elapsed {:?}",
+            wall_start.elapsed() < Duration::from_secs(30),
+            "virtual-time retry run appears to be hanging on real time; elapsed {:?}",
             wall_start.elapsed()
         );
     }

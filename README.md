@@ -941,6 +941,9 @@ ft send <pane_id> "<text>"                  # send input (policy-gated)
 ft send <pane_id> "<text>" --dry-run        # preview without executing
 ft send <pane_id> "<text>" --wait-for "ok"  # verify via wait-for
 ft send <pane_id> "<text>" --no-paste --no-newline
+# Default = bracketed paste (right for agent TUIs). A shell prompt inserts a paste
+# without executing it: use --no-paste to run commands in a shell pane. The receipt
+# reports the mode as "no_paste".
 ```
 
 ### Search
