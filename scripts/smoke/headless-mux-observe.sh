@@ -50,10 +50,20 @@ STEPS="$D/steps.jsonl"
 : > "$STEPS"
 echo "smoke dir: $D"
 
-log() { printf '%s %s\n' "$(date -u +%FT%T.%3NZ 2>/dev/null || date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+plain() { printf '%s' "$1" | sed -E $'s/\x1b\\[[0-9;]*m//g' | tr -s '\n' ' '; }
 step() { # name status detail
-  jq -cn --arg n "$1" --arg s "$2" --arg d "$3" '{name:$n,status:$s,detail:$d}' >> "$STEPS"
-  log "step $1: $2 ($3)"
+  local detail
+  detail=$(plain "$3")
+  jq -cn --arg n "$1" --arg s "$2" --arg d "$detail" '{name:$n,status:$s,detail:$d}' >> "$STEPS"
+  log "step $1: $2 ($detail)"
+}
+stop_children() {
+  # Never `kill 0`: an unset pid would signal the whole process group (the
+  # script included) before the receipt is written.
+  [ -n "${WATCH:-}" ] && kill "$WATCH" 2>/dev/null
+  [ -n "${MUX_PID:-}" ] && kill "$MUX_PID" 2>/dev/null
+  return 0
 }
 finish() { # status
   local status="$1"
@@ -73,7 +83,7 @@ finish() { # status
 }
 fail() { # step-name detail
   step "$1" fail "$2"
-  kill "${WATCH:-0}" "${MUX_PID:-0}" 2>/dev/null
+  stop_children
   finish fail
   exit 1
 }
@@ -127,6 +137,6 @@ if [ "$DROPPED" != "0" ] || [ "$RESYNCS" != "0" ]; then
 fi
 step durability pass "dropped segments 0, sequence resyncs 0"
 
-kill "$WATCH" 2>/dev/null; sleep 1; kill "$MUX_PID" 2>/dev/null
+stop_children
 finish pass
 echo "PASS: observe->detect on a real headless mux (evidence in $D)"
