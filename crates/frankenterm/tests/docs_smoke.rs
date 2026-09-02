@@ -245,6 +245,11 @@ fn smoke_ft_robot_quick_start() {
     );
 }
 
+/// Since 52a033878 the README deliberately does not offer `cargo install` as
+/// an installation path (a lone `ft` binary can pair with an older mux
+/// server, guardian or GUI); it explains why and points at the release
+/// installer. The remote-setup spec still names the explicit package+bin
+/// form where a remote must be built from a checkout.
 #[test]
 fn install_docs_use_package_name_and_bin() {
     let readme = read_repo_doc("README.md");
@@ -258,8 +263,13 @@ fn install_docs_use_package_name_and_bin() {
         "README must not advertise the binary name as the cargo package"
     );
     assert!(
-        readme.contains(correct),
-        "README should advertise the explicit package+bin cargo install command"
+        !readme
+            .contains("cargo install --git https://github.com/Dicklesworthstone/frankenterm.git"),
+        "README must not advertise cargo install as an installation path"
+    );
+    assert!(
+        readme.contains("### Why direct `cargo install` is not an installation path"),
+        "README should explain why cargo install is not an installation path"
     );
     assert!(
         remote_setup.contains(correct),

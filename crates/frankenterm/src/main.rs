@@ -114402,6 +114402,14 @@ log_level = "debug"
         );
         let family = validate_local_process_family(&ft_path, &mux_path, &guardian_path).unwrap();
         let byte_receipt = ProcessFamilyByteReceipt::from(&family);
+        // The byte receipt is what remote publication verifies against: it
+        // must carry exactly the validated family's digests and lengths.
+        assert_eq!(byte_receipt.ft.sha256, family.ft.sha256);
+        assert_eq!(byte_receipt.ft.byte_len, family.ft.byte_len);
+        assert_eq!(byte_receipt.mux_server.sha256, family.mux_server.sha256);
+        assert_eq!(byte_receipt.mux_server.byte_len, family.mux_server.byte_len);
+        assert_eq!(byte_receipt.guardian.sha256, family.guardian.sha256);
+        assert_eq!(byte_receipt.guardian.byte_len, family.guardian.byte_len);
         assert_eq!(&family.ft.identity, &family.mux_server.identity);
         assert_eq!(&family.ft.identity, &family.guardian.identity);
         assert_eq!(family.ft.sha256.len(), 64);
@@ -126836,7 +126844,9 @@ printf x > "$MINISIGN_MARKER"
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Linux only: `nix::unistd::getgroups` is not provided on macOS, so this
+    // test target did not compile there (`cargo test -p frankenterm` on a Mac).
+    #[cfg(target_os = "linux")]
     #[test]
     fn global_scope_agent_config_preserves_a_supplementary_source_gid() {
         use std::os::fd::AsFd as _;
@@ -126904,7 +126914,8 @@ printf x > "$MINISIGN_MARKER"
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Linux only for the same `getgroups` reason as the test above.
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_scope_agent_config_corrects_setgid_inheritance_to_claimed_gid() {
         use std::os::fd::AsFd as _;
