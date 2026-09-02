@@ -1813,17 +1813,19 @@ STREAMING ENDPOINTS:
     GET /stream/deltas                Output deltas + gaps SSE (`pane_id`, `max_hz`). Served
                                       from periodic DB scans, so it works for a standalone
                                       `ft web`.
-    GET /stream/events                EventBus SSE (`channel`, `pane_id`, `max_hz`). Carries
-                                      live events ONLY when an in-process producer shares the
-                                      bus. A standalone `ft web` runs no capture/watch
-                                      pipeline, so it emits the `ready` frame then keepalives.
+    GET /stream/events                EventBus SSE (`channel`, `pane_id`, `max_hz`). A
+                                      standalone `ft web` feeds its bus from a storage tail
+                                      (events persisted by a separate `ft watch`, polled
+                                      every 250 ms), so detections reach subscribers after
+                                      the `ready` frame; `FT_WEB_STORAGE_TAIL=0` disables
+                                      the tail and leaves keepalives only.
 
 NOTE:
-    `ft web` is a read-only view over the capture DB; it does not run a watcher,
-    so the in-memory EventBus has no in-process publisher. An EventBus cannot be
-    shared across processes either, so a separate `ft watch` does NOT feed this
-    server's /stream/events. Use /stream/deltas (DB-backed) for standalone live
-    output, or run the web server inside a process that also captures. (ft-zeo5o)
+    `ft web` is a read-only view over the capture DB; it does not run a watcher.
+    Its in-memory EventBus has no in-process publisher, so live events come from
+    the storage tail (rows a separate `ft watch` persisted after this server
+    started) with the tail's poll latency, not from a shared bus. Use
+    /stream/deltas (DB-backed) for standalone live output. (ft-zeo5o, ft-xxfwy.19)
 
 SEE ALSO:
     ft status     CLI status overview
@@ -96582,12 +96584,15 @@ async fn run_diagnostics(
     let mut policy_engine =
         frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
             .with_tuning(&config.tuning);
-    // ft-xxfwy.14: the operator kill switch is persisted in the workspace DB
-    // and restored here exactly the way every ft process restores it, so the
+    // ft-xxfwy.14: the operator kill switch is persisted in the workspace DB.
+    // A readable row is installed into this diagnostic engine so the
     // "Quarantine & Kill Switch" row describes the shared operator state.
-    // Quarantines, approvals and the audit chain are still process-local.
-    // The DB is only opened when it already exists: doctor must not create
-    // one as a side effect.
+    // Unlike an action engine, doctor authorizes nothing, so an unreadable
+    // row is REPORTED (with the fail-closed consequence for action engines)
+    // rather than armed here: a diagnostic must not manufacture an ERROR
+    // row out of its own read failure. Quarantines, approvals and the audit
+    // chain are still process-local. The DB is only opened when it already
+    // exists: doctor must not create one as a side effect.
     let kill_switch_note = if layout.db_path.exists() {
         match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
             &layout.db_path,
@@ -96597,21 +96602,36 @@ async fn run_diagnostics(
             },
         ) {
             Ok(backend) => {
-                use frankenterm_core::policy_kill_switch_state::KillSwitchRestore;
-                match frankenterm_core::policy_kill_switch_state::restore_kill_switch_from_backend(
-                    &mut policy_engine,
-                    &backend,
-                    u64::try_from(now_epoch_ms()).unwrap_or_default(),
-                ) {
-                    KillSwitchRestore::Absent => {
-                        "persisted operator kill switch: never armed".to_string()
+                use frankenterm_core::policy_kill_switch_state::{
+                    decode_kill_switch_state, load_kill_switch_state,
+                };
+                match load_kill_switch_state(&backend) {
+                    Ok(None) => "persisted operator kill switch: never armed".to_string(),
+                    Ok(Some(raw)) => match decode_kill_switch_state(&raw) {
+                        Ok(mut state) => {
+                            let lapsed =
+                                state.tick(u64::try_from(now_epoch_ms()).unwrap_or_default());
+                            let note = format!(
+                                "persisted operator kill switch: {} (by {}, reason: {}, changed_at_ms={}{})",
+                                state.level,
+                                state.changed_by,
+                                state.reason,
+                                state.changed_at_ms,
+                                if lapsed { ", auto-disarm lapsed" } else { "" }
+                            );
+                            policy_engine.restore_kill_switch(state);
+                            note
+                        }
+                        Err(error) => format!(
+                            "persisted operator kill switch row is corrupt ({error}); action engines fail closed to HardStop until `ft robot kill-switch reset` rewrites it"
+                        ),
+                    },
+                    Err(error) if error.detail().contains("no such table") => {
+                        "persisted operator kill switch: not present (this DB has no config table)"
+                            .to_string()
                     }
-                    KillSwitchRestore::Restored { state, .. } => format!(
-                        "persisted operator kill switch: {} (by {}, reason: {}, changed_at_ms={})",
-                        state.level, state.changed_by, state.reason, state.changed_at_ms
-                    ),
-                    KillSwitchRestore::FailedClosed { error } => format!(
-                        "persisted operator kill switch unreadable, HardStop assumed: {error}"
+                    Err(error) => format!(
+                        "persisted operator kill switch unreadable ({error}); action engines fail closed to HardStop"
                     ),
                 }
             }
@@ -116302,8 +116322,12 @@ cat "$FAKE_FONT_ARCHIVE"
         let active_start = installer
             .find("install_process_family() {")
             .expect("atomic process-family installer");
+        // The function ends at its own column-0 closing brace. Anchoring on the
+        // next function's name broke once the activation transaction helpers
+        // were inserted between the two (they legitimately publish entrypoints;
+        // the atomic installer itself must not).
         let active_end = installer[active_start..]
-            .find("\n}\n\nemit_process_family_receipt()")
+            .find("\n}\n")
             .map(|offset| active_start + offset)
             .expect("atomic process-family installer end");
         let active = &installer[active_start..active_end];
@@ -116405,7 +116429,18 @@ cat "$FAKE_FONT_ARCHIVE"
             activation
                 .contains("for name in ft frankenterm-mux-server frankenterm-pty-guardian; do")
         );
-        assert!(activation.contains("\"$DEST/$name\" --version >/dev/null 2>&1 || return 1"));
+        // The per-entrypoint `--version` probe moved into
+        // probe_activated_process_family(); activation must still run it after
+        // the selector commit, and it must still probe every stable link.
+        assert!(activation.contains("! probe_activated_process_family; then"));
+        let probe_start = installer
+            .find("probe_activated_process_family() {")
+            .expect("activated process-family probe helper");
+        let probe = &installer[probe_start..probe_start + 800];
+        assert!(
+            probe.contains("for name in ft frankenterm-mux-server frankenterm-pty-guardian; do")
+        );
+        assert!(probe.contains("\"$DEST/$name\" --version >/dev/null 2>&1 || return 1"));
         assert!(
             installer
                 .contains("Running pending candidate \\`ft doctor --json\\` by immutable path")
