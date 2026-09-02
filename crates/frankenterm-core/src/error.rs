@@ -1126,6 +1126,7 @@ impl WeztermError {
             | Self::SocketNotFound(_)
             | Self::ParseError(_)
             | Self::OutputTooLarge { .. }
+            | Self::VersionSkew { .. }
             | Self::PaneNotFound(_)
             | Self::IndeterminateMutation { .. } => NetworkErrorKind::Permanent,
             Self::CircuitOpen { .. } => NetworkErrorKind::Degraded,

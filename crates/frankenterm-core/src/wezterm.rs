@@ -9614,7 +9614,10 @@ fn gather_mux_socket_candidates(config_socket_path: Option<&str>) -> MuxSocketCa
 /// resolves to a listening socket) and every live per-process GUI socket,
 /// oldest instance first. A socket whose owner has exited (connect refused)
 /// is never advertised, even if its file lingers.
-#[cfg(unix)]
+///
+/// Needs the vendored `config` crate for the socket naming contract, so it
+/// exists only in `vendored` builds (the same builds that can dial the socket).
+#[cfg(all(feature = "vendored", unix))]
 #[must_use]
 pub fn gui_socket_candidates_in(
     runtime_dir: &std::path::Path,
@@ -9655,7 +9658,7 @@ pub fn gui_socket_candidates_in(
 ///
 /// A refused or missing socket means its owner is gone; the connection is
 /// dropped immediately, which the mux listener treats as an idle client.
-#[cfg(unix)]
+#[cfg(all(feature = "vendored", unix))]
 fn unix_socket_accepts_connections(path: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
