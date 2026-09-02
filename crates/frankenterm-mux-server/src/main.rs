@@ -242,6 +242,15 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         &opts.config_override,
         opts.skip_config,
     )?;
+    validate_explicit_config_file(opts.config_file.as_deref())?;
+    match opts.config_file.as_deref() {
+        Some(path) => log::info!(
+            "frankenterm-mux-server-config source=explicit path={}",
+            std::path::Path::new(path).display()
+        ),
+        None if opts.skip_config => log::info!("frankenterm-mux-server-config source=skip_config"),
+        None => log::info!("frankenterm-mux-server-config source=default_search"),
+    }
 
     let config = config::configuration();
 
@@ -698,6 +707,26 @@ fn set_mux_socket_environment(config: &config::ConfigHandle) {
     }
 }
 
+/// An explicit `--config-file` that does not load must stop the server.
+///
+/// `config::common_init` keeps the last good configuration (the defaults on a
+/// fresh process) and only records the load error, which is the right
+/// behaviour for the GUI's default search path but wrong for an operator who
+/// named a file: the server would silently run with defaults and bind
+/// `RUNTIME_DIR/sock` instead of the configured socket (ft-xxfwy.35).
+fn validate_explicit_config_file(config_file: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
+    let Some(path) = config_file else {
+        return Ok(());
+    };
+    match config::configuration_result() {
+        Ok(_) => Ok(()),
+        Err(err) => Err(anyhow::anyhow!(
+            "refusing to start: --config-file {} did not load: {err:#}",
+            std::path::Path::new(path).display()
+        )),
+    }
+}
+
 fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--daemonize=false"),
@@ -739,6 +768,11 @@ pub fn spawn_listener(
     set_mux_socket_environment(&config);
 
     for unix_dom in &config.unix_domains {
+        log::info!(
+            "frankenterm-mux-server-listener domain={} socket={}",
+            unix_dom.name,
+            unix_dom.socket_path().display()
+        );
         let mut listener = frankenterm_mux_server_impl::local::LocalListener::with_domain(
             unix_dom,
             dispatch_config.clone(),

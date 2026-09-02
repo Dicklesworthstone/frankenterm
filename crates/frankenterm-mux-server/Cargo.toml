@@ -27,6 +27,7 @@ anyhow.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
 clap.workspace = true
 config.workspace = true
+env_logger.workspace = true
 frankenterm-alloc = { workspace = true, optional = true }
 libc.workspace = true
 log.workspace = true

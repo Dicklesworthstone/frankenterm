@@ -527,6 +527,39 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Source guard: the only `spawn_local` in this file must be the one inside
+    /// `admit_connection`'s main-thread handoff closure. A direct
+    /// `reservation.spawn_local` in the accept loop aborts the server on the
+    /// first connect (see `admit_connection`).
+    #[test]
+    fn spawn_local_is_only_used_inside_the_main_thread_handoff() {
+        let source = include_str!("local.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production half of local.rs");
+        let occurrences: Vec<usize> = production
+            .match_indices(".spawn_local(")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "exactly one spawn_local call is allowed in local.rs (inside admit_connection)"
+        );
+        let admit_start = production
+            .find("fn admit_connection<")
+            .expect("admit_connection must exist");
+        let handoff = production[admit_start..]
+            .find(".handoff_to_main_thread_local(")
+            .map(|rel| admit_start + rel)
+            .expect("admit_connection must hand off to the main thread");
+        assert!(
+            occurrences[0] > handoff,
+            "spawn_local must be created inside the handoff closure, never on the listener thread"
+        );
+    }
+
     /// Regression guard for the accept-loop abort: admitting a connection from
     /// a non-main thread must create the session future on the main thread.
     /// Under the old direct `spawn_local` the first `try_tick` below panicked
