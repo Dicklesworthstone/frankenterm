@@ -70012,7 +70012,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     web_tuning,
                 )))
                 .with_storage(storage)
-                .with_event_bus(event_bus);
+                .with_event_bus(event_bus)
+                // Operator escape hatch while the storage tail is young:
+                // FT_WEB_STORAGE_TAIL=0 runs the server bus-only.
+                .with_storage_event_tail(
+                    std::env::var("FT_WEB_STORAGE_TAIL").map_or(true, |value| value != "0"),
+                );
             frankenterm_core::web::run_web_server_with_cx(&web_cx, web_config).await?;
         }
 
