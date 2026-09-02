@@ -214,7 +214,7 @@ $ ft robot send 1 "/compact" --verify-submit --wait-for "compaction complete" --
 }
 ```
 
-Notice three things: (1) **`ft robot send` is policy-gated** — if you try to send something that violates a policy rule, you get a structured `RequireApproval` envelope with an 8-char approval code, not a silent error. (2) **`--wait-for` is condition-based**, not `sleep`-based — it polls until the pattern shows up or the timeout fires. (3) The response is **structured JSON** the calling agent can route on.
+Notice three things: (1) **`ft robot send` is policy-gated** — if you try to send something that violates a policy rule, you get a structured `RequireApproval` envelope with an 8-char approval code, not a silent error. (2) **`--wait-for` is condition-based**, not `sleep`-based — it polls until the pattern shows up or the timeout fires. (3) The response is **structured JSON** the calling agent can route on. Prompt-active evidence comes from OSC 133 markers emitted by the pane's shell: until you run `ft setup shell` (bash, zsh, or fish; idempotent, `--dry-run` to preview) in the shells you want to drive, an untrusted caller's first send to a pane returns `RequireApproval` with rule `policy.prompt_unknown` rather than `ok: true`.
 
 When `ok=false`, the error fields live at the top level of the envelope (not nested under `error`):
 
@@ -1504,7 +1504,7 @@ enabled = ["handle_compaction"]   # empty = all built-in workflows
 max_concurrent = 10
 
 [safety]
-require_prompt_active = true
+require_prompt_active = true      # needs OSC 133 prompt markers in the pane's shell: run `ft setup shell` (bash/zsh/fish, idempotent)
 block_alt_screen = true
 rate_limit_per_pane = 30
 rate_limit_global = 100

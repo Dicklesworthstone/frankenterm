@@ -337,7 +337,7 @@ Conventions used throughout:
 
 ### G55 — Prompt-active evidence everywhere; the tour is honest
 
-**Status now.** Five CLI tx sites call `resolve_tx_contract_capabilities` so PromptActive preconditions can pass when OSC-133 evidence exists; the robot/MCP paths already pre-resolve (ft-g2ari). Missing: `ft setup shell-integration`, per-pane doctor row, honest README tour.
+**Status now.** Five CLI tx sites call `resolve_tx_contract_capabilities` so PromptActive preconditions can pass when OSC-133 evidence exists; the robot/MCP paths already pre-resolve (ft-g2ari). **Correction 2026-09-02:** the shell-integration installer already exists as `ft setup shell` (bash/zsh/fish, `--dry-run`, `--apply`, `--remove`, `--rc-path`, idempotent managed block); the 2026-09-01 plan wrongly listed it as missing. What is actually missing: the README never mentions `ft setup shell`, `policy.prompt_unknown` carries no hint pointing at it, and there is no per-pane evidence row in doctor.
 
 **Target state.** A pane with shell integration sends `ok: true`; a pane without it gets `policy.prompt_unknown` with `hint: "run ft setup shell-integration"`; `ft doctor --json` lists per-pane `prompt_evidence: osc133|none|stale` with age; the README tour shows the RequireApproval path for the first send unless integration is present.
 

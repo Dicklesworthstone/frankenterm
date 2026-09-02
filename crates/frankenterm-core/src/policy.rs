@@ -7165,7 +7165,7 @@ impl PolicyEngine {
                 );
                 context.set_determining_rule("policy.prompt_unknown");
                 return PolicyDecision::require_approval_with_rule(
-                    "Pane state unknown - approval required before sending",
+                    "Pane state unknown - approval required before sending (no OSC 133 prompt evidence for this pane; run `ft setup shell` in the pane's shell to publish prompt markers)",
                     "policy.prompt_unknown",
                 )
                 .with_context(context);
