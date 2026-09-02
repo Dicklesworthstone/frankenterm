@@ -3724,10 +3724,11 @@ mod tests {
             .clone()
             .expect("the future must have captured its waker");
 
-        let replacement =
-            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
-                .unwrap();
-        assert!(old.queue_snapshot().retired);
+        // Dropping the executor retires its queue state (replacing it only
+        // retires the binding). The runnable's schedule closure still holds
+        // the queue through its Arc, exactly like a live connection task at
+        // mux-server shutdown.
+        drop(old);
         let before = RETIRED_RUNNABLES_LEAKED_OFF_THREAD.load(Ordering::Relaxed);
 
         std::thread::spawn(move || waker.wake())
@@ -3739,9 +3740,7 @@ mod tests {
             before + 1,
             "the off-thread wake must be leaked, never dropped off-thread"
         );
-        assert_eq!(replacement.queue_snapshot().depth, 0);
         task.detach();
-        drop(old);
     }
 
     #[test]
