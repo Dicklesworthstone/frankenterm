@@ -300,13 +300,13 @@ tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 # Pattern matching
 aho-corasick = "1.1.4"
 memchr = "2.8.2"
-fancy-regex = { version = "0.18.0", default-features = false }
+fancy-regex = { version = "0.19.0", default-features = false }
 regex = "1.12.4"
 bloomfilter = "3.0.1"
 
 # Crypto / randomness
-chacha20poly1305 = "0.10.1"
-ed25519-dalek = { version = "2.2.0", default-features = false }
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = { version = "3.0.0", default-features = false }
 hmac = "0.13.0"
 rand = "0.10.1"
 sha2 = "0.11.0"
@@ -380,12 +380,12 @@ async-executor = "1.14.0"
 async-io = "2.6.0"
 async-task = "4.7.1"
 async-trait = "0.1.89"
-base64 = { version = "0.22.1", default-features = false }
+base64 = { version = "0.23.1", default-features = false }
 bitflags = { version = "2.13.0", features = ["serde"] }
 bstr = "1.12.1"
 camino = "1.2.2"
-cap-fs-ext = "3.4.5"
-cap-std = "3.4.5"
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 cassowary = "0.3"
 colorgrad = { version = "0.8.0", features = ["named-colors", "preset"] }
 crossbeam = "0.8.4"
@@ -421,12 +421,12 @@ maplit = "1.0.2"
 memmem = "0.1.1"
 metrics = "0.24.6"
 miniz_oxide = "0.9.1"
-mlua = "0.11.6"
+mlua = "0.12.1"
 names = { version = "0.14.0", default-features = false }
 nix = "0.31.3"
 ntapi = "0.4.3"
 num = "0.4.3"
-num-derive = "0.4.2"
+num-derive = "0.5.1"
 num-traits = { version = "0.2", default-features = false }
 openssl = "0.10.81"
 ordered-float = { version = "5.3.0", default-features = false }
@@ -435,7 +435,7 @@ passfd = "0.1.6"
 percent-encoding = "2.3.2"
 pest = "2.8.6"
 pest_derive = "2.8.6"
-phf = { version = "0.13.1", default-features = false }
+phf = { version = "0.14.0", default-features = false }
 predicates = "3.1.4"
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
@@ -451,7 +451,7 @@ smol = "2.0.2"
 socket2 = "0.6.4"
 ssh2 = "0.9.5"
 strsim = "0.11.1"
-syn = "2.0.117"
+syn = "3.0.4"
 tempfile = "3.27.0"
 terminfo = "0.9"
 termios = "0.3.3"
@@ -522,7 +522,7 @@ xcb-imdkit = { version = "0.3", git = "https://github.com/wezterm/xcb-imdkit-rs.
 xkbcommon = "0.9.0"
 zbus = "5.16.0"
 zvariant = "5.12.0"
-smithay-client-toolkit = { version = "0.20.0", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false }
 wayland-backend = "0.3.15"
 wayland-protocols = "0.32.12"
 wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
@@ -534,16 +534,16 @@ windows = "0.62.2"
 dwrote = "0.11.5"
 # Other GUI-layer deps
 xml-rs = "1.0.0"
-dns-lookup = "3.0.1"
+dns-lookup = "4.0.1"
 rcgen = "0.14.8"
 # GUI binary deps (wezterm-gui, ft-1memj.3)
-emojis = "0.8.2"
+emojis = "0.9.0"
 fastrand = "2.4.1"
 hdrhistogram = "7.5.4"
 http_req = "0.14.6"
 nucleo-matcher = "0.3"
 rayon = "1.12.0"
-wgpu = "29.0.3"
+wgpu = "30.0.1"
 # Additional GUI-layer workspace aliases
 wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
 wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
@@ -574,15 +574,15 @@ ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankent
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
-wasmtime = { version = "45.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "45.0.1", default-features = false, features = ["p1"] }
+wasmtime = { version = "48.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "48.0.1", default-features = false, features = ["p1"] }
 
 # Benchmarking
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.3.10" }
-asupersync-macros = { version = "0.3.10" }
+asupersync = { version = "0.4.9" }
+asupersync-macros = { version = "0.4.9" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3.3"
@@ -610,7 +610,7 @@ frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", re
 # Keep this isolated from the existing full-stack FrankenSearch git pin above.
 frankensearch-index-acl = { package = "frankensearch-index", version = "=0.2.3", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
-franken-agent-detection = "0.1.8"
+franken-agent-detection = "0.2.2"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core", default-features = false }

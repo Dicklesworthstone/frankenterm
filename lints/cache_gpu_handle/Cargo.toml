@@ -15,10 +15,10 @@ name = "cache-gpu-handle-lint"
 path = "src/main.rs"
 
 [dependencies]
-syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
+syn = { version = "3.0.4", features = ["full", "visit", "extra-traits"] }
 walkdir = "2"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 quote = "1.0"
 
 [dev-dependencies]
-syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
+syn = { version = "3.0.4", features = ["full", "visit", "extra-traits"] }

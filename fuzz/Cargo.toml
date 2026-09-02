@@ -51,7 +51,7 @@ tempfile = "3.27.0"
 # ft-ul4vi: jsonschema fuzz target. Same version pinned in
 # crates/frankenterm-core dev-deps so the harness exercises the
 # crate the conformance gates use.
-jsonschema = { version = "0.46.5", default-features = false }
+jsonschema = { version = "0.52.1", default-features = false }
 # ft-s96ej: ft argv fuzz target. Same version pinned in the workspace
 # so the parser surface matches what `ft` itself uses at runtime.
 clap = { version = "4.6.1", features = ["derive", "env"] }
