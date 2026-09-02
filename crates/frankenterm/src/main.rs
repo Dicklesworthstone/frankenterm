@@ -17296,6 +17296,31 @@ fn agent_config_observation_matches_before(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_config_observation_matches_backup(
+    observation: &AgentConfigNamespaceObservation,
+    claim: &AgentConfigTransactionClaim,
+    before: &AgentConfigClaimFileIdentity,
+) -> bool {
+    // The backup is a byte-for-byte copy, not a namespace rename of the
+    // original target. It must therefore have a distinct inode and may have a
+    // different timestamp while retaining the authenticated bytes, ownership,
+    // mode, size, and single-link contract.
+    observation.state == "regular_file"
+        && observation.sha256.as_deref() == claim.backup_sha256.as_deref()
+        && observation.sha256.as_deref() == Some(before.sha256.as_str())
+        && observation.metadata.as_ref().is_some_and(|metadata| {
+            metadata.object_kind == "regular-file"
+                && metadata.device == before.metadata.device
+                && metadata.inode != before.metadata.inode
+                && metadata.uid == before.metadata.uid
+                && metadata.gid == before.metadata.gid
+                && (metadata.mode & 0o7777) == (before.metadata.mode & 0o7777)
+                && metadata.hard_link_count == 1
+                && metadata.byte_len == before.metadata.byte_len
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn agent_config_observation_matches_candidate(
     observation: &AgentConfigNamespaceObservation,
     claim: &AgentConfigTransactionClaim,
@@ -17466,7 +17491,7 @@ fn classify_unacknowledged_agent_config_transaction(
                 &parent.path.join(&transaction.backup_leaf),
                 &transaction.backup_leaf,
             )?;
-            let backup_before = agent_config_observation_matches_before(&backup, before);
+            let backup_before = agent_config_observation_matches_backup(&backup, claim, before);
             if target_after && candidate_before && backup_before {
                 Ok(AgentConfigTransactionOutcome::AlreadyApplied)
             } else if target_before
@@ -17531,7 +17556,7 @@ fn validate_agent_config_transaction_ack_semantics(
             let candidate_before =
                 agent_config_observation_matches_before(&ack.observed_candidate, before);
             let backup_before =
-                agent_config_observation_matches_before(&ack.observed_backup, before);
+                agent_config_observation_matches_backup(&ack.observed_backup, claim, before);
             match ack.outcome {
                 AgentConfigTransactionOutcome::Applied
                 | AgentConfigTransactionOutcome::AlreadyApplied => {
@@ -125792,9 +125817,9 @@ printf x > "$MINISIGN_MARKER"
 
         let at_last_slot = AgentConfigTransactionInventory {
             families: AGENT_CONFIG_MAX_TRANSACTION_FAMILIES - 1,
-            artifacts: AGENT_CONFIG_MAX_TRANSACTION_ARTIFACTS - 2,
+            artifacts: AGENT_CONFIG_MAX_TRANSACTION_ARTIFACTS - 4,
             artifact_bytes: AGENT_CONFIG_MAX_TRANSACTION_ARTIFACT_BYTES
-                - (2 * AGENT_CONFIG_MAX_BYTES),
+                - (2 * AGENT_CONFIG_MAX_BYTES + 2 * 64 * 1024),
             ..AgentConfigTransactionInventory::default()
         };
         assert!(
@@ -126416,6 +126441,12 @@ printf x > "$MINISIGN_MARKER"
             assert_eq!(metadata.gid(), source_metadata.gid());
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
         }
+        #[cfg(unix)]
+        assert_ne!(
+            std::fs::metadata(&backups[0]).unwrap().ino(),
+            source_metadata.ino(),
+            "the retained backup must be a distinct single-link byte copy"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -127368,13 +127399,10 @@ printf x > "$MINISIGN_MARKER"
             version: None,
         };
 
-        let prepared =
-            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
-        let error = apply_prepared_agent_config(&prepared)
-            .expect_err("a symlinked parent must fail closed before publication");
+        let error = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
+            .expect_err("a symlinked parent must fail closed during preflight");
 
-        assert!(!error.backup_created);
-        assert!(error.message.contains("direct non-symlink directory"));
+        assert!(error.contains("direct non-symlink directory"));
         assert!(!real_global_root.join(".cursorrules").exists());
     }
 
