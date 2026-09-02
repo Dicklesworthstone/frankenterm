@@ -383,6 +383,28 @@ Only one suggestion touched this epic: `ft-xxfwy.17` "may depend on ft-nam3s" (0
 
 **Test-lane result (remote, hz2, 2026-09-01T19:0x–19:3x Z):** `frankenterm-core --lib` → 31,256 passed / 4 failed / 2 ignored, 130.68 s. Failures: `api_schema::tests::current_version_parses`, `snapshot_engine::tests::intelligent_exact_threshold_boundary`, `snapshot_engine::tests::periodic_mode_ignores_triggers`, `snapshot_engine::tests::run_periodic_with_cx_mid_flight_cancel_exits_quickly`. This is the first retained post-July full core-lib result; the July baseline (85 failures) is stale and the remaining four are recorded on `ft-xxfwy.17`. Log retained in the session scratchpad (`core-lib-test.log`); a copy is attached to the bead comment.
 
+## 11. Execution log — same day (2026-09-01/02)
+
+Work started on the entry ramp immediately after the plan was published. Everything below is committed on `main`; "proof" means a retained remote RCH lane transcript, "native" means a dev build run on the maintainer's Mac (a signal, not proof).
+
+| Gap | Landed (commit) | Proof state |
+|---|---|---|
+| G51 socket discovery | `config::gui_socket` shared naming; ranked `discover_mux_socket_ranked` + `MuxSocketSource`; client/GUI re-exports; `build_unified_client` dials the discovered path; doctor `mux socket` row (f862716ce, 002df4c37, 3ae637088, b02802df5, 82b91e9b4, cbb0a396f) | client discovery 10 pass, core `wezterm::tests` 197 pass, config `gui_socket` 4 pass (hz2); native doctor shows `source: gui_published` against the running app |
+| G51/G66 version skew | `WeztermError::VersionSkew`, `robot.mux_version_skew`, FT-1025, doctor pairing recommendation (0f64ca942, b02802df5) | consolidated lane pending (lanes-6) |
+| G55 prompt evidence (CLI half) | five CLI tx sites resolve pane capabilities (`resolve_tx_contract_capabilities`) | `cargo check -p frankenterm --bin ft` pass (hz2) |
+| G57 web SSE | storage → bus tail (`StorageEventTail`) in `ft web`; default on (a950faf99, 744e52729) | `web::` lane pending (lanes-6) |
+| G50 signing/activation | `scripts/release/verify-release.sh` (exits 1 on v0.15.1); `install.sh --activate <gen> --idle-host-confirmed` (da3b0e1fd) | verifier exercised against the real release; activation refusal paths smoke-tested; end-to-end activation NOT tested (ft-xxfwy.4) |
+| G53 dogfood | `scripts/dogfood-status.sh` (83e55a72c) | run: stale, newest capture 4793 h |
+| G54 gates | 25 workflow files retired; `scripts/release-gates.sh` (static + `--cargo`); tests/artifacts repointed; attestation gate builds then verifies the dev bundle | 28 of 28 static gates pass after fixes (bead-structure, runtime-proof census, coupling baseline) — final rerun pending |
+| G56 doctor honesty | policy rows labelled process-local (784bb8870); persistence gap recorded on ft-xxfwy.14 | kill-switch tests on lanes-6 |
+| G61 docs | README/AGENTS truth sweep (schema v45, `<version>.json`, DSR wording, detector, metrics row, Stateright wording, FAQ path, demo embeds removed) | `stamp-readme-counts.sh --check` pass |
+| G63 program health | 606 P0/P1 → P2; 71 stale claims released; 26 broadcast; open P0 = 25 | — |
+| G64 orphan | `mcp_helpers.rs` removed (authorized); `no_orphan_source_files` guard test; census re-blessed | guard test lane pending (lanes-6) |
+| G68/G69 sweep | finding: no production path created agent profiles → `ft robot profile create` added (5945f1127) | handler tests on lanes-7 |
+| test baseline | fresh core-lib run 31,256 pass / 4 fail → 1 fixed (f494eb398), 3 snapshot timing fixes | lanes-6 |
+
+Not done today: signed release (needs an operator-driven `dsr build/release` with signing on), same-generation app for the native attach e2e, live-loop tier 1, `ft setup shell-integration`, kill-switch persistence.
+
 ## 10. Successor note
 
 The next full reality-check must cross-link this plan, `docs/reality-check-bridge-plan-2026-05-12.md`, and `docs/reality-check-bridge-plan.md`, and must start from `ft-xxfwy`'s terminal state. It becomes due per `docs/process/reality-check-discipline.md` (90 days, minor-version change, ≥ 50 open beads, contract churn, or headline-claim growth). Do not overwrite this file; revise it in place only within this run.
