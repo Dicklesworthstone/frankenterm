@@ -4,7 +4,7 @@ use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use wezterm_uds::UnixListener;
+use wezterm_uds::{UnixListener, UnixStream};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 #[cfg(unix)]
@@ -62,19 +62,13 @@ impl LocalListener {
                         4 * 1024,
                     ) {
                         promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                            reservation
-                                .spawn_local(async move {
-                                    if let Err(error) =
-                                        crate::dispatch::process_unix_auto_with_config(
-                                            stream,
-                                            dispatch_config,
-                                        )
-                                        .await
-                                    {
-                                        log::error!("{error:#}");
-                                    }
-                                })
-                                .detach();
+                            admit_connection(
+                                reservation,
+                                stream,
+                                dispatch_config,
+                                crate::dispatch::process_unix_auto_with_config,
+                            )
+                            .detach();
                         }
                         rejected => {
                             metrics::counter!(
@@ -102,6 +96,38 @@ impl LocalListener {
 /// we need to be sure that the directory that we create it in
 /// is owned by the user and has appropriate file permissions
 /// that prevent other users from manipulating its contents.
+/// Admit an accepted connection under a main-thread reservation and run
+/// `session` for it as a main-thread-local future.
+///
+/// This is called from the listener thread, never the main thread.
+/// `spawn_local` binds a runnable to the thread that creates it, so spawning
+/// the session future directly from here makes the main-thread executor's
+/// first poll panic ("local task polled by a thread that didn't spawn it"),
+/// the unwind-time drop panics again, and the whole mux server aborts the
+/// moment any client connects (observed 2026-09-02 with `ft list` against a
+/// headless `frankenterm-mux-server`). The admission is therefore handed to
+/// the main thread first and the local future is created there.
+fn admit_connection<S, Fut>(
+    reservation: promise::spawn::MainThreadSpawnReservation,
+    stream: UnixStream,
+    dispatch_config: crate::dispatch::DispatchRuntimeConfig,
+    session: S,
+) -> promise::spawn::MainThreadSpawnedTask<()>
+where
+    S: FnOnce(UnixStream, crate::dispatch::DispatchRuntimeConfig) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + 'static,
+{
+    reservation.handoff_to_main_thread_local(move |reservation| {
+        reservation
+            .spawn_local(async move {
+                if let Err(error) = session(stream, dispatch_config).await {
+                    log::error!("{error:#}");
+                }
+            })
+            .detach();
+    })
+}
+
 fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<(UnixListener, File)> {
     let sock_path = &unix_dom.socket_path();
     log::trace!("setting up {}", sock_path.display());
@@ -500,6 +526,61 @@ fn validate_socket_lock_identity(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Regression guard for the accept-loop abort: admitting a connection from
+    /// a non-main thread must create the session future on the main thread.
+    /// Under the old direct `spawn_local` the first `try_tick` below panicked
+    /// inside async_task's thread check and the process aborted.
+    #[cfg(unix)]
+    #[test]
+    fn accepted_connection_is_admitted_on_the_main_thread_from_the_listener_thread() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let exec = promise::spawn::SimpleExecutor::new();
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected a reserved admission, got {other:?}"),
+        };
+        let main_thread = std::thread::current().id();
+        let session_thread = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let session_thread_in_task = std::sync::Arc::clone(&session_thread);
+
+        std::thread::spawn(move || {
+            assert_ne!(std::thread::current().id(), main_thread);
+            admit_connection(
+                reservation,
+                server,
+                crate::dispatch::DispatchRuntimeConfig::default(),
+                move |_stream, _config| async move {
+                    *session_thread_in_task.lock().unwrap() = Some(std::thread::current().id());
+                    Ok(())
+                },
+            )
+            .detach();
+        })
+        .join()
+        .expect("listener-side admission must not panic");
+
+        assert!(
+            exec.try_tick().expect("bootstrap must be queued"),
+            "the handoff bootstrap must be queued for the main thread"
+        );
+        assert!(
+            exec.try_tick().expect("session future must be queued"),
+            "the local session future must be queued after the bootstrap"
+        );
+        assert_eq!(
+            *session_thread.lock().unwrap(),
+            Some(main_thread),
+            "the session future must run on the main thread"
+        );
+        drop(client);
+    }
 
     #[cfg(unix)]
     fn proven_absent_test_pid() -> u32 {

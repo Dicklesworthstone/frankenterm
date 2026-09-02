@@ -149,9 +149,37 @@ fn every_source_file_is_declared_as_a_module() {
         }
     }
 
+    // Ratchet: entries that no longer show up as orphans must be removed from
+    // the baseline, so the list can only shrink.
+    let stale_baseline: Vec<&str> = KNOWN_ORPHANS
+        .iter()
+        .copied()
+        .filter(|known| !orphans.contains(Path::new(known)))
+        .collect();
+    assert!(
+        stale_baseline.is_empty(),
+        "KNOWN_ORPHANS entries are no longer orphaned; delete them from the baseline: {stale_baseline:?}"
+    );
+    orphans.retain(|path| {
+        !KNOWN_ORPHANS
+            .iter()
+            .any(|known| Path::new(known) == path.as_path())
+    });
+
     assert!(
         orphans.is_empty(),
         "orphaned source files (not declared by any `mod` or `#[path]`): {orphans:#?}\n\
          Either declare the module or remove the file (removal requires owner authorization per AGENTS.md Rule 1)."
     );
 }
+
+/// Orphans that pre-date this guard. Each is tracked dead code that the guard
+/// found on its first remote run (2026-09-02); deleting them needs owner
+/// authorization (AGENTS.md Rule 1), tracked on ft-xxfwy.31. New orphans are
+/// never added here; fix them instead.
+const KNOWN_ORPHANS: &[&str] = &[
+    "cx_stub.rs",
+    "search/model2vec_embedder.rs",
+    "storage/handle/mod.rs",
+    "test_subprocess_deadlock.rs",
+];

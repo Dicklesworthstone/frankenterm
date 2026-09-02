@@ -403,6 +403,10 @@ Work started on the entry ramp immediately after the plan was published. Everyth
 | G68/G69 sweep | finding: no production path created agent profiles → `ft robot profile create` added (5945f1127) | handler tests on lanes-7 |
 | test baseline | fresh core-lib run 31,256 pass / 4 fail → 1 fixed (f494eb398), 3 snapshot timing fixes | lanes-6 |
 
+**Headless attach smoke (2026-09-02, dev build, same generation).** A dev `frankenterm-mux-server` plus the dev `ft` from the same build were run on the maintainer's Mac to get a same-codec attach without the 0.13.0 app. Result: the mux server aborted (SIGABRT) on the first client connect. Root cause: `LocalListener::run` (shared by the headless server and the GUI's published-socket listener) called `reservation.spawn_local` from the listener thread; async_task's thread check panicked on the main thread's first poll and again during drop, so the whole server died and the client only saw "codec_version_handshake: response read EOF". The promise crate documents this exact hazard and ships `handoff_to_main_thread_local`; the listener now uses it (`admit_connection`) with a regression test that aborted under the old code. This is the concrete mechanism behind G51 for same-generation pairs on HEAD; it is invisible against the 0.13.0 app because that build pre-dates the admission refactor. Proof lane pending at the time of writing; the smoke rerun is recorded below once it passes.
+
+Two smaller findings from the same run: `frankenterm-mux-server --config-file` is silently ignored (the server installs no logger, so a config load error prints nothing and it falls back to `RUNTIME_DIR/sock`), and the orphan guard found four more tracked orphan files in frankenterm-core (ft-xxfwy.31; baselined, deletion needs owner authorization).
+
 Not done today: signed release (needs an operator-driven `dsr build/release` with signing on), same-generation app for the native attach e2e, live-loop tier 1, `ft setup shell-integration`, kill-switch persistence.
 
 ## 10. Successor note
