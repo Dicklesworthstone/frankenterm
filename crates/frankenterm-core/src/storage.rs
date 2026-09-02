@@ -12471,9 +12471,13 @@ fn event_gap_group_commit_backend(
         }
     }
 
+    // IMMEDIATE for the same reason as the append segment group: gap records
+    // read per-pane state before they write, and a deferred snapshot upgrade
+    // fails instantly under concurrent writers instead of honouring
+    // busy_timeout (ft-xxfwy.32).
     let result = run_writer_transaction(
         backend,
-        WriterTransactionBeginMode::Deferred,
+        WriterTransactionBeginMode::Immediate,
         "event/gap group commit",
         || event_gap_group_commit_inner(backend, group, mmap_mirror, segment_redactors),
     );
@@ -19239,9 +19243,17 @@ fn append_segment_group_commit_backend(
     }
 
     let snapshots = snapshot_segment_redactors_for_appends(writes, segment_redactors);
+    // IMMEDIATE, not DEFERRED: the group reads `MAX(seq)+1` per pane before it
+    // inserts. Under a deferred `BEGIN` that SELECT pins a read snapshot, and
+    // if any other connection (snapshot engine checkpoint, retention cleanup,
+    // a CLI process) commits in between, SQLite refuses the read-to-write
+    // upgrade with SQLITE_BUSY *immediately*, bypassing busy_timeout, and the
+    // whole segment group is dropped ("Failed to insert segment: ... database
+    // is locked" within 350 ms of watcher start, ft-xxfwy.32). Taking the
+    // write lock up front makes the writer wait instead.
     let result = run_writer_transaction(
         backend,
-        WriterTransactionBeginMode::Deferred,
+        WriterTransactionBeginMode::Immediate,
         "append segment group commit",
         || append_segment_group_commit_inner(backend, writes, segment_redactors),
     );
