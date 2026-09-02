@@ -15,7 +15,8 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main) | HEAD | — | Next release |
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main) | HEAD | — | Next release |
+| [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) | Release | 2026-09-02 | Entry ramp: CLI finds the GUI, mux survives connects, `ft web` answers, signed assets |
 | [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
 | [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
@@ -25,9 +26,33 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- development on `main` since [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1)
+## [Unreleased] -- development on `main` since [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2)
 
-Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main>
+
+---
+
+## [0.15.2] -- 2026-09-02 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.15.2>
+
+### Entry ramp: attach, observe, and serve on the shipped binaries (2026-09-01/02 reality check, epic ft-xxfwy)
+
+- `ft` finds the running FrankenTerm GUI's mux socket: ranked discovery (explicit config → `WEZTERM_UNIX_SOCKET` → GUI-published `default-<class>` symlink → live `frankenterm-gui-sock-<pid>` entries → config unix domains → `RUNTIME_DIR/sock`) shared with the GUI through `config::gui_socket`; `ft doctor` reports the chosen socket and its source.
+- Version skew between CLI and mux is a typed error: `robot.mux_version_skew` (FT-1025) names both codec generations and the pairing command instead of an opaque transport failure.
+- The mux listener no longer aborts on the first client connect (the accept loop spawned the session future from the listener thread; `admit_connection` hands it to the main thread), and no longer aborts at shutdown when a waker fires from the uds rewake thread after the executor generation retired. Both bugs killed every HEAD-built GUI or headless server the moment a client connected or disconnected.
+- The direct mux client tolerates unilateral notifications (`TabResized` from a pane spawning) during codec negotiation and registration instead of poisoning the connection.
+- `ft web` answers requests again. fastapi-http judged its 50 ms accept timeout against a private clock that started at its first call, while the asupersync runtime judges deadlines against the process epoch and does so before polling the inner future; once process uptime passed 50 ms every accept timeout was born expired and `accept` was never polled, so the server bound its port and answered nothing (v0.15.1 shipped this way). The dependency now uses the runtime clock (fastapi_rust `fix/http-clock-process-epoch-0.3` @ 1718091b); a release gate starts the real web runtime after the clock has advanced and requires an HTTP 200.
+- `/stream/events` no longer aborts `ft web` on its first client: the SSE handler runs on a connection task that fastapi-http spawns itself, and the runtime wrapper's `task::spawn*` now fall back to asupersync's current scheduler handle instead of panicking. A standalone `ft web` feeds the stream from a storage tail (250 ms poll) so a watcher in another process reaches SSE clients (`FT_WEB_STORAGE_TAIL=0` disables it); the live SSE e2e (`tests/e2e/test_web_sse_live_events.sh`) passes with a real detection frame.
+- Operator kill switch with a production trigger: `ft robot kill-switch status|trip|reset` persists the tier in the workspace database, every `ft` policy engine (watcher auto-handler, `robot send`, workflow run/abort, tx, steer, intervene, connector, …) restores it at construction, an unreadable or corrupt row fails closed to HardStop, and `ft doctor` reports the persisted tier. The June tier gate (SoftStop pauses workflow launches, HardStop blocks every non-read action, EmergencyHalt blocks reads too) was correct but unreachable before this. Contract: `docs/robot-contracts/kill-switch.md`; conformance matrix `docs/attestations/proofs/killswitch-tier-enforcement.json`.
+- Writer durability: segment and event/gap group commits begin `IMMEDIATE`, so a concurrent commit makes the writer wait instead of dropping the segment with "database is locked".
+- `codex.usage.reached` matches the shipped Codex binary's message casing ("Try again at …").
+- `ft tx run`/`ft tx rollback` resolve pane capabilities so `PromptActive` preconditions can pass from the CLI; `ft robot profile create` makes `profile apply` reachable; `policy.prompt_unknown` names `ft setup shell`.
+- `frankenterm-mux-server` installs a logger, logs its config source and bound sockets, and refuses an explicit `--config-file` that the config layer would silently skip (Lua files need `FRANKENTERM_LUA_CONFIG=1`; `frankenterm.toml` loads without it).
+- Installer: `--activate <generation> --idle-host-confirmed` promotes a candidate generation on an idle host; `scripts/release/verify-release.sh <tag>` verifies every asset's minisign signature and fails on unsigned artifacts (v0.15.1 fails it).
+- Release gates moved from the retired GitHub workflows to `scripts/release-gates.sh`; the orphan-source guard, `ft robot profile create` contract, and the headless observe smoke (`scripts/smoke/headless-mux-observe.sh`, JSON receipt) are new proof surfaces.
+- Docs: README truth sweep (schema v45, attestation path, DSR-only release wording, `metrics` feature, explicit-state-model wording, paste-vs-typed `ft send` contract, `ft setup shell`).
 
 ### Reconnect and process-family deployment safety
 
