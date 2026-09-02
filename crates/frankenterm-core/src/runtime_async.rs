@@ -624,6 +624,22 @@ pub fn current_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
     ASUPERSYNC_HANDLE.with(|cell| cell.borrow().as_ref().cloned())
 }
 
+/// The scheduler's own handle for the task currently being polled on this
+/// thread, if asupersync is polling one.
+///
+/// `Runtime::block_on` and every wrapper-spawned task install
+/// `ASUPERSYNC_HANDLE`; a task spawned by a foreign asupersync user (the
+/// fastapi-http accept loop spawns its per-connection tasks itself) is polled
+/// on a worker thread where that thread-local is empty, so `task::spawn*`
+/// from inside such a task used to panic ("called outside of
+/// Runtime::block_on context"). `ft web` hit this on every `/stream/events`
+/// request (ft-xxfwy.19). The scheduler still knows which runtime is polling,
+/// so fall back to it: the spawned child lands on the same runtime it would
+/// have landed on from `block_on`.
+fn scheduler_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
+    asupersync::runtime::Runtime::current_handle()
+}
+
 /// Remove the asupersync `RuntimeHandle` from thread-local storage.
 pub fn clear_runtime_handle() {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
@@ -3117,6 +3133,7 @@ pub mod task {
             borrow
                 .as_ref()
                 .cloned()
+                .or_else(super::scheduler_runtime_handle)
                 .expect("task::spawn called outside of Runtime::block_on context")
         });
         // RuntimeHandle::spawn admits a root scheduler Cx. Capture the ambient
@@ -3159,6 +3176,7 @@ pub mod task {
             borrow
                 .as_ref()
                 .cloned()
+                .or_else(super::scheduler_runtime_handle)
                 .expect("task::spawn_with_cx called outside of Runtime::block_on context")
         });
         let child_cx = cx.clone();
@@ -3204,6 +3222,7 @@ pub mod task {
     {
         let handle = super::ASUPERSYNC_HANDLE
             .with(|cell| cell.borrow().as_ref().cloned())
+            .or_else(super::scheduler_runtime_handle)
             .ok_or(SpawnError::RuntimeUnavailable)?;
         let child_cx = cx.clone();
         let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);

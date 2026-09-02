@@ -94,6 +94,14 @@ gate "Robot/MCP Contract Doctor static verdict"  "bash scripts/check-contract-do
 gate "Robot/MCP Contract Doctor attestation slot" "jq -e '.slots[] | select(.category == \"proofs/robot-contracts\") | select((.path == \"docs/attestations/proofs/robot-contract-doctor.json\" and .produced_by_bead == \"ft-7h5da.13.7\") or (.path == null and .deferred_to_bead == \"ft-7h5da.13.7\")) | select(.proof_categories | index(4))' docs/attestations/manifest.json"
 gate "Robot/MCP Contract Doctor verdict contract" "tests/e2e/test_robot_contract_doctor_verdict_contract.sh"
 cargo_gate "Robot/MCP Contract Doctor cargo verdict" "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
+# --- Web API liveness ------------------------------------------------------
+# v0.15.1 shipped an `ft web` that bound its port and never answered a single
+# request (ft-xxfwy.38 / plan G80): fastapi-http's accept timeout was judged
+# against a different clock than the runtime's, so once process uptime passed
+# the 50 ms accept interval every accept future was born expired. This test
+# starts the real FrameworkWebRuntime after the runtime clock has advanced
+# past that interval and requires an HTTP 200 over a plain TCP socket.
+cargo_gate "web api liveness after clock skew"  "cargo test -p frankenterm-core --lib web_framework::tests::server_started_after_runtime_clock_skew_answers_requests"
 
 if [[ $LIST_ONLY -eq 1 ]]; then
   for i in "${!GATE_NAMES[@]}"; do

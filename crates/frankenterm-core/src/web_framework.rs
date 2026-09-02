@@ -732,6 +732,73 @@ mod tests {
             assert!(reply.contains("\"ok\":true"), "{reply:?}");
         });
     }
+
+    /// fastapi-http spawns each connection task itself, so a handler runs on
+    /// a worker thread where the wrapper's `ASUPERSYNC_HANDLE` thread-local is
+    /// empty. `/stream/events` spawns its frame pump from exactly there and
+    /// aborted the whole `ft web` process with "task::spawn_with_cx called
+    /// outside of Runtime::block_on context" the moment the first SSE client
+    /// connected (ft-xxfwy.19). The handler below performs the same nested
+    /// spawn and must get an answer.
+    #[test]
+    fn handler_on_a_fastapi_connection_task_can_spawn_a_child_task() {
+        use super::{App, FrameworkWebRuntime, Method, Request, RequestContext, Response};
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let runtime = RuntimeBuilder::multi_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let app = App::builder()
+                .route(
+                    "/spawned",
+                    Method::Get,
+                    |_ctx: &RequestContext, _req: &mut Request| async {
+                        let cx =
+                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                        let child = crate::runtime_async::task::spawn_with_cx(
+                            &cx,
+                            |_child_cx| async { 41_u32 + 1 },
+                        );
+                        match child.await {
+                            Ok(value) => Response::json(&serde_json::json!({ "child": value }))
+                                .unwrap_or_else(|_| Response::internal_error()),
+                            Err(_) => Response::internal_error(),
+                        }
+                    },
+                )
+                .build();
+            let (addr, mut server) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("start web runtime");
+
+            let reply = std::thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                stream
+                    .write_all(
+                        b"GET /spawned HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("write request");
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+            .join()
+            .expect("client thread");
+
+            server.signal_shutdown();
+            assert!(
+                reply.starts_with("HTTP/1.1 200"),
+                "a handler running on fastapi's own connection task must be able to spawn; got {reply:?}"
+            );
+            assert!(reply.contains("\"child\":42"), "{reply:?}");
+        });
+    }
     use crate::error::RuntimeOperationSource;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::cell::Cell;

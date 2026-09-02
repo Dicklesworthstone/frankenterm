@@ -2981,7 +2981,7 @@ dependencies = [
 [[package]]
 name = "fastapi-core"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "asupersync 0.3.10",
  "fastapi-openapi",
@@ -2997,7 +2997,7 @@ dependencies = [
 [[package]]
 name = "fastapi-http"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "asupersync 0.3.10",
  "fastapi-core",
@@ -3006,7 +3006,7 @@ dependencies = [
 [[package]]
 name = "fastapi-macros"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3018,7 +3018,7 @@ dependencies = [
 [[package]]
 name = "fastapi-openapi"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "fastapi-router",
  "fastapi-types",
@@ -3029,7 +3029,7 @@ dependencies = [
 [[package]]
 name = "fastapi-output"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "crossterm",
  "parking_lot",
@@ -3041,7 +3041,7 @@ dependencies = [
 [[package]]
 name = "fastapi-router"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "fastapi-types",
  "serde_json",
@@ -3050,7 +3050,7 @@ dependencies = [
 [[package]]
 name = "fastapi-rust"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 dependencies = [
  "fastapi-core",
  "fastapi-http",
@@ -3065,7 +3065,7 @@ dependencies = [
 [[package]]
 name = "fastapi-types"
 version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2#dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=1718091b6bbb14279a20a8a49f020010fb4fc338#1718091b6bbb14279a20a8a49f020010fb4fc338"
 
 [[package]]
 name = "fastdivide"

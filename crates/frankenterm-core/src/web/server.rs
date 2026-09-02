@@ -25,9 +25,8 @@ const STORAGE_TAIL_BATCH: usize = 256;
 /// variants instead of dropping the event, so a malformed row is still
 /// visible to stream consumers.
 fn stored_event_to_bus_event(stored: StoredEvent) -> Event {
-    let agent_type =
-        serde_json::from_value(serde_json::Value::String(stored.agent_type.clone()))
-            .unwrap_or(AgentType::Unknown);
+    let agent_type = serde_json::from_value(serde_json::Value::String(stored.agent_type.clone()))
+        .unwrap_or(AgentType::Unknown);
     let severity = serde_json::from_value(serde_json::Value::String(stored.severity.clone()))
         .unwrap_or(Severity::Info);
     let detection = Detection {
@@ -165,8 +164,14 @@ pub async fn start_web_server_with_cx(
 
     let storage_tail = match tail_inputs {
         Some((storage, bus)) => Some(
-            spawn_storage_event_tail(cx, storage, bus, STORAGE_TAIL_POLL_INTERVAL, STORAGE_TAIL_BATCH)
-                .await,
+            spawn_storage_event_tail(
+                cx,
+                storage,
+                bus,
+                STORAGE_TAIL_POLL_INTERVAL,
+                STORAGE_TAIL_BATCH,
+            )
+            .await,
         ),
         None => None,
     };

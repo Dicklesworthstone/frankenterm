@@ -4,10 +4,12 @@
 # seconds. Reuses the headless observe smoke as the event producer so the event
 # comes from the real capture -> detect pipeline, not a synthetic insert.
 #
-# STATUS 2026-09-02: fails on HEAD at the stream step with 0 frames because
-# `ft web` answers no HTTP request at all (ft-xxfwy.38, G80); the producer half
-# passes. This script is the acceptance test for ft-xxfwy.19 and stays red
-# until .38 lands.
+# This script is the acceptance test for ft-xxfwy.19 (all-events mode). It was
+# red until ft-xxfwy.38 landed: `ft web` answered no request at all (fastapi
+# accept timeouts born expired), and then the first SSE client aborted the
+# process (handler spawn from fastapi's own connection task). Both are fixed
+# and regression-tested in frankenterm-core::web_framework; on the dev build
+# this script passes with the ready frame plus the live detection frame.
 #
 # Usage: tests/e2e/test_web_sse_live_events.sh [BIN_DIR] [PORT]
 #   BIN_DIR defaults to target/debug (needs ft + frankenterm-mux-server, built

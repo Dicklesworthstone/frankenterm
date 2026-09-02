@@ -706,19 +706,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 8,
-        "fix": 17,
+        "fix": 19,
         "other": 5,
         "refactor": 3,
         "runtime-swap": 4,
         "test": 7
       },
-      "fork_side_commit_count": 49,
+      "fork_side_commit_count": 51,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-25T01:45:04-04:00",
-        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
-        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
+        "classification": "fix",
+        "committed_at": "2026-09-02T00:47:12-04:00",
+        "sha": "0d3378eacf0ed370f62df3026f88317a297fb0aa",
+        "subject": "fix(promise): never drop a retired-generation local runnable off the owner thread"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -1057,8 +1057,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2368,
-  "generated_at": "2026-09-01T23:43:06.483356Z",
+  "fork_side_commit_total": 2370,
+  "generated_at": "2026-09-02T07:40:21.378065Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
