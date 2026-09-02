@@ -110,6 +110,8 @@ pub enum ProfileHandlerError {
     /// Profile lookup returned `None` for a name the action requires
     /// to exist.
     NotFound { name: String },
+    /// `create` refused to overwrite a profile with the same bounded name.
+    AlreadyExists { name: String },
     /// Underlying SQL primitive failed (schema, deserialization,
     /// duplicate constraint, …).
     Storage(AgentProfileSqlError),
