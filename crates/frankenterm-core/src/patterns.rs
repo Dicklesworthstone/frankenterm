@@ -3399,7 +3399,12 @@ fn builtin_codex_pack() -> PatternPack {
                     "You've hit your usage limit".to_string(),
                     "You've reached your usage limit".to_string(),
                 ],
-                regex: Some(r"try again at (?P<reset_time>[^.]+)".to_string()),
+                // Case-insensitive: the shipped Codex binary (0.133) prints
+                // "You've hit your usage limit. Try again at 4:32 PM." (capital T
+                // at sentence start) and "... or try again at ..." mid-sentence;
+                // a case-sensitive regex missed the primary form (found by the
+                // headless-mux observe smoke, 2026-09-02).
+                regex: Some(r"(?i)try again at (?P<reset_time>[^.]+)".to_string()),
                 description: "Codex usage limit reached".to_string(),
                 remediation: Some("Wait for reset or switch account".to_string()),
                 workflow: Some("handle_usage_limits".to_string()),
@@ -7439,6 +7444,28 @@ rules:
         assert_eq!(
             d.extracted.get("reset_time").and_then(|v| v.as_str()),
             Some("2:30 PM")
+        );
+    }
+
+    /// The shipped Codex binary prints the limit message with a capital "Try"
+    /// at sentence start ("You've hit your usage limit. Try again at 4:32 PM.");
+    /// the rule regex must be case-insensitive or the primary real-world form
+    /// is missed (observed on the headless-mux observe smoke, 2026-09-02).
+    #[test]
+    fn detect_codex_usage_reached_real_binary_casing() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit. Try again at 4:32 PM.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.reached")
+            .expect("capitalized 'Try again at' must match codex.usage.reached");
+        assert_eq!(
+            detection
+                .extracted
+                .get("reset_time")
+                .and_then(|v| v.as_str()),
+            Some("4:32 PM")
         );
     }
 
