@@ -26,6 +26,7 @@ live `ntm profiles` subprocess parity.
 | `show` | Idempotent | MustNotPartiallyMutate | (read-only) |
 | `apply` | Idempotent on identical input | MustNotPartiallyMutate | tables: `agent_profiles`; mux: spawns `count` panes |
 | `validate` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `create` | Non-idempotent: a second call with the same `name` fails with `robot.profile.already_exists` and mutates nothing | MustNotPartiallyMutate (validate-then-single-insert) | tables: `agent_profiles` (one row) |
 
 Concurrency: **Serializable per profile name**. Two `apply`
 actions on the same `(name, count, env_overrides, dry_run)`
@@ -210,6 +211,27 @@ Specific failure envelopes:
 2. `validate_response_shape`.
 3. `validate_does_not_mutate` — verified at the state-machine
    level.
+
+### `create`
+
+`ft robot profile create <name> [--role R] [--shell S] [--command C] [--cwd DIR] [--description TEXT] [--tag T]... [--env KEY=VALUE]... [--bootstrap CMD]...`
+
+- **Why it exists:** before 2026-09-01 nothing outside the test suite inserted an
+  `agent_profiles` row, so `apply` was unreachable for operators (reality
+  check ft-xxfwy.28). `create` is the only production writer of that table.
+- **Params:** `name` (required; substrate `AgentProfile::validate` rules),
+  `role` (default `agent`), `shell` (default empty = mux default), `command`,
+  `working_directory`, `description`, `layout_template`, `tags[]`, `env{}`,
+  `bootstrap_commands[]`. The CLI passes malformed `--env` entries as
+  `malformed_env[]` and the handler rejects the whole request.
+- **Ordering:** validate the full row → refuse an existing name → one insert.
+  A rejected request writes nothing.
+- **Response:** the `show` shape for the new row plus `created: true`.
+- **Errors:** `robot.profile.bad_params` (shape / env / missing name),
+  `robot.profile.storage` wrapping `Invalid(..)` for substrate invariants,
+  `robot.profile.already_exists` for a duplicate name.
+- **Idempotency:** not idempotent by design; repeat calls fail closed and
+  change nothing. Use `show` to read back.
 
 ## State-space proof
 

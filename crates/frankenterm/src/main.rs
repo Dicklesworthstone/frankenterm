@@ -5568,6 +5568,43 @@ enum RobotProfileCommands {
         /// Profile name to validate
         name: String,
     },
+    /// Create (persist) a profile so `apply` can spawn panes from it
+    Create {
+        /// Profile name (unique; letters, digits, `-`, `_`, `.`)
+        name: String,
+
+        /// Role label used by `list --role` (e.g. `agent`, `build`)
+        #[arg(long, default_value = "agent")]
+        role: String,
+
+        /// Shell to launch the pane with (empty = the mux default)
+        #[arg(long, default_value = "")]
+        shell: String,
+
+        /// Command to run inside the spawned pane (e.g. `claude`, `codex`)
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Working directory for spawned panes (must stay inside the workspace)
+        #[arg(long)]
+        cwd: Option<String>,
+
+        /// Human-readable description
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Tag for `list --tag` (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+
+        /// Environment override as KEY=VALUE (repeatable)
+        #[arg(long = "env")]
+        env: Vec<String>,
+
+        /// Bootstrap command sent to the pane after spawn (repeatable, in order)
+        #[arg(long = "bootstrap")]
+        bootstrap: Vec<String>,
+    },
 }
 
 /// Connector lifecycle administration verbs (ft-pohny).
@@ -58146,6 +58183,50 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     ),
                                     RobotProfileCommands::Validate { name } => {
                                         ("validate", serde_json::json!({ "name": name }))
+                                    }
+                                    RobotProfileCommands::Create {
+                                        name,
+                                        role,
+                                        shell,
+                                        command,
+                                        cwd,
+                                        description,
+                                        tags,
+                                        env,
+                                        bootstrap,
+                                    } => {
+                                        // KEY=VALUE pairs; the handler rejects
+                                        // malformed entries with robot.profile.bad_params.
+                                        let env_map: serde_json::Map<String, serde_json::Value> =
+                                            env.iter()
+                                                .filter_map(|pair| {
+                                                    pair.split_once('=').map(|(key, value)| {
+                                                        (
+                                                            key.to_string(),
+                                                            serde_json::Value::String(
+                                                                value.to_string(),
+                                                            ),
+                                                        )
+                                                    })
+                                                })
+                                                .collect();
+                                        let malformed_env: Vec<&String> =
+                                            env.iter().filter(|pair| !pair.contains('=')).collect();
+                                        (
+                                            "create",
+                                            serde_json::json!({
+                                                "name": name,
+                                                "role": role,
+                                                "shell": shell,
+                                                "command": command,
+                                                "working_directory": cwd,
+                                                "description": description,
+                                                "tags": tags,
+                                                "env": env_map,
+                                                "malformed_env": malformed_env,
+                                                "bootstrap_commands": bootstrap,
+                                            }),
+                                        )
                                     }
                                 };
 

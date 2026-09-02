@@ -1344,7 +1344,11 @@ ft robot profile show codex_ws
 ft robot profile apply codex_ws --count 3
 ft robot profile apply codex_ws --count 3 --dry-run
 ft robot profile validate codex_ws
+ft robot profile create codex_ws --role agent --command codex --cwd . \
+    --tag codex --env OPENAI_LOG=warn --bootstrap "/status"   # persist a profile so apply can spawn it
 ```
+
+Profiles live in the `agent_profiles` table and are created with `ft robot profile create` (nothing else defines them; the name must be unique).
 
 **Family contract:**
 
@@ -1354,6 +1358,7 @@ ft robot profile validate codex_ws
 | `show` | Idempotent | MustNotPartiallyMutate | read-only |
 | `apply` | Idempotent on identical input | MustNotPartiallyMutate | tables: `agent_profiles`; mux: spawns `count` panes |
 | `validate` | Idempotent | MustNotPartiallyMutate | read-only |
+| `create` | Not idempotent: a repeated name fails with `robot.profile.already_exists` and changes nothing | MustNotPartiallyMutate | tables: `agent_profiles` (one row) |
 
 **Concurrency:** serializable per profile name. Two `apply` calls on the same `(name, count, env_overrides, dry_run)` tuple are observationally equivalent; concurrent applies on different names are independent.
 

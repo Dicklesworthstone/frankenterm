@@ -85,7 +85,7 @@ use crate::robot_ntm_surface::{
     ProfileApplyData, ProfileListData, ProfileShowData, ProfileSummary, ProfileValidateData,
 };
 use crate::storage::agent_profiles_sql::{
-    AgentProfileSqlError, get_agent_profile, list_agent_profiles,
+    AgentProfileSqlError, get_agent_profile, insert_agent_profile, list_agent_profiles,
 };
 use crate::storage::profiles_applied_log_sql::{
     ProfilesAppliedLogSqlError, get_apply_receipt, insert_apply_receipt,
@@ -140,6 +140,7 @@ impl std::fmt::Display for ProfileHandlerError {
             Self::UnknownAction(a) => write!(f, "unknown profile action `{a}`"),
             Self::BadParams(msg) => write!(f, "invalid profile request: {msg}"),
             Self::NotFound { name } => write!(f, "profile `{name}` not found"),
+            Self::AlreadyExists { name } => write!(f, "profile `{name}` already exists"),
             Self::Storage(e) => write!(f, "profile storage error: {e}"),
             Self::SpawnFailed { reason } => write!(f, "profile apply spawn failed: {reason}"),
             Self::ValidationFailed { name, issues } => {
@@ -176,6 +177,7 @@ impl ProfileHandlerError {
             Self::UnknownAction(_) => "robot.profile.unknown_action",
             Self::BadParams(_) => "robot.profile.bad_params",
             Self::NotFound { .. } => "robot.profile.not_found",
+            Self::AlreadyExists { .. } => "robot.profile.already_exists",
             Self::Storage(_) => "robot.profile.storage",
             Self::SpawnFailed { .. } => "robot.profile.spawn_failed",
             Self::ValidationFailed { .. } => "robot.profile.validation_failed",
@@ -221,8 +223,134 @@ pub fn handle_profile_command(
         "show" => handle_show(params, backend),
         "apply" => handle_apply(params, backend),
         "validate" => handle_validate(params, backend),
+        "create" => handle_create(params, backend),
         other => Err(ProfileHandlerError::UnknownAction(other.to_string())),
     }
+}
+
+fn opt_str_vec(params: &Value, key: &str) -> Result<Vec<String>, ProfileHandlerError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    ProfileHandlerError::BadParams(format!("`{key}` entries must be strings"))
+                })
+            })
+            .collect(),
+        Some(_) => Err(ProfileHandlerError::BadParams(format!(
+            "`{key}` must be an array of strings"
+        ))),
+    }
+}
+
+fn opt_str_map(params: &Value, key: &str) -> Result<HashMap<String, String>, ProfileHandlerError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(HashMap::new()),
+        Some(Value::Object(entries)) => entries
+            .iter()
+            .map(|(entry_key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (entry_key.clone(), value.to_string()))
+                    .ok_or_else(|| {
+                        ProfileHandlerError::BadParams(format!(
+                            "`{key}.{entry_key}` must be a string"
+                        ))
+                    })
+            })
+            .collect(),
+        Some(_) => Err(ProfileHandlerError::BadParams(format!(
+            "`{key}` must be an object of string values"
+        ))),
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// `create`: persist a new profile so `apply` has something to spawn.
+///
+/// Until this action existed nothing outside the test suite inserted an
+/// `agent_profiles` row, so `apply` was unreachable for operators
+/// (reality check 2026-09-01, ft-xxfwy.28). Semantics: validate the full
+/// row first (the substrate `AgentProfile::validate` invariants), refuse a
+/// name that already exists without touching storage, then perform exactly
+/// one insert. The response is the same shape `show` returns plus
+/// `created: true`, so callers can hand it straight to `apply`.
+fn handle_create(
+    params: &Value,
+    backend: &dyn StorageBackend,
+) -> Result<Value, ProfileHandlerError> {
+    let name = require_str(params, "name")?;
+    let malformed_env = opt_str_vec(params, "malformed_env")?;
+    if !malformed_env.is_empty() {
+        return Err(ProfileHandlerError::BadParams(format!(
+            "env entries must be KEY=VALUE; rejected: {}",
+            malformed_env.join(", ")
+        )));
+    }
+    let role = opt_str(params, "role")?.unwrap_or("agent").to_string();
+    let shell = opt_str(params, "shell")?.unwrap_or_default().to_string();
+    let command = opt_str(params, "command")?
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let tags = opt_str_vec(params, "tags")?;
+    let env = opt_str_map(params, "env")?;
+
+    let mut metadata = HashMap::new();
+    for key in ["description", "working_directory", "layout_template"] {
+        if let Some(value) = opt_str(params, key)?.filter(|value| !value.trim().is_empty()) {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+    }
+    let bootstrap_commands = opt_str_vec(params, "bootstrap_commands")?;
+    if !bootstrap_commands.is_empty() {
+        metadata.insert(
+            "bootstrap_commands".to_string(),
+            serde_json::to_string(&bootstrap_commands)
+                .map_err(|err| ProfileHandlerError::BadParams(err.to_string()))?,
+        );
+    }
+
+    let now = unix_now_ms();
+    let profile = AgentProfile {
+        name: name.to_string(),
+        role,
+        tags,
+        shell,
+        command,
+        env,
+        metadata,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    // Validate before touching storage so a bad request never reaches the
+    // insert (the insert validates again; that is the fail-closed floor).
+    profile
+        .validate()
+        .map_err(|err| ProfileHandlerError::Storage(AgentProfileSqlError::Invalid(err)))?;
+
+    if get_agent_profile(backend, name)
+        .map_err(ProfileHandlerError::Storage)?
+        .is_some()
+    {
+        return Err(ProfileHandlerError::AlreadyExists {
+            name: name.to_string(),
+        });
+    }
+    insert_agent_profile(backend, &profile).map_err(ProfileHandlerError::Storage)?;
+
+    let mut shown = handle_show(&serde_json::json!({ "name": name }), backend)?;
+    if let Value::Object(map) = &mut shown {
+        map.insert("created".to_string(), Value::Bool(true));
+    }
+    Ok(shown)
 }
 
 fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, ProfileHandlerError> {
@@ -1381,6 +1509,121 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    // ── ft-xxfwy.28: `create` makes `apply` reachable for operators ──
+
+    #[test]
+    fn create_persists_profile_and_returns_show_shape() {
+        let backend = fresh_conn();
+        let params = json!({
+            "name": "codex_ws",
+            "role": "agent",
+            "shell": "/bin/zsh",
+            "command": "codex",
+            "working_directory": "/repo",
+            "description": "codex worker",
+            "tags": ["codex", "worker"],
+            "env": {"OPENAI_LOG": "warn"},
+            "bootstrap_commands": ["/status", "/model"],
+        });
+        let created = handle_profile_command("create", &params, &backend).expect("create");
+        assert_eq!(created["created"], json!(true));
+        assert_eq!(created["name"], json!("codex_ws"));
+        assert_eq!(created["role"], json!("agent"));
+        assert_eq!(created["spawn_command"], json!("codex"));
+        assert_eq!(created["working_directory"], json!("/repo"));
+        assert_eq!(created["description"], json!("codex worker"));
+        assert_eq!(created["tags"], json!(["codex", "worker"]));
+        assert_eq!(created["environment"]["OPENAI_LOG"], json!("warn"));
+        assert_eq!(created["bootstrap_commands"], json!(["/status", "/model"]));
+
+        // The row is durable and visible to the read paths.
+        let shown =
+            handle_profile_command("show", &json!({ "name": "codex_ws" }), &backend).expect("show");
+        assert_eq!(shown["spawn_command"], json!("codex"));
+        assert!(shown.get("created").is_none(), "show never claims creation");
+        let listed = handle_profile_command("list", &json!({ "role_filter": "agent" }), &backend)
+            .expect("list");
+        assert_eq!(listed["profiles"][0]["name"], json!("codex_ws"));
+        let stored = get_agent_profile(&backend, "codex_ws")
+            .expect("query")
+            .expect("row");
+        assert!(stored.created_at_ms > 0);
+        assert_eq!(stored.created_at_ms, stored.updated_at_ms);
+    }
+
+    #[test]
+    fn create_refuses_duplicate_name_without_mutating() {
+        let backend = fresh_conn();
+        insert_agent_profile(&backend, &synth("alpha", "agent", vec!["x"])).unwrap();
+        let err = handle_profile_command(
+            "create",
+            &json!({ "name": "alpha", "role": "other", "command": "different" }),
+            &backend,
+        )
+        .expect_err("duplicate must fail");
+        assert!(matches!(err, ProfileHandlerError::AlreadyExists { ref name } if name == "alpha"));
+        assert_eq!(err.error_code(), "robot.profile.already_exists");
+        let stored = get_agent_profile(&backend, "alpha").unwrap().unwrap();
+        assert_eq!(stored.role, "agent", "existing row must be untouched");
+        assert_eq!(stored.command.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn create_rejects_invalid_rows_before_storage() {
+        let backend = fresh_conn();
+        let bad_name = handle_profile_command(
+            "create",
+            &json!({ "name": "has space", "role": "agent" }),
+            &backend,
+        )
+        .expect_err("invalid name");
+        assert!(matches!(
+            bad_name,
+            ProfileHandlerError::Storage(AgentProfileSqlError::Invalid(_))
+        ));
+        let bad_env = handle_profile_command(
+            "create",
+            &json!({ "name": "ok", "malformed_env": ["NOEQUALS"] }),
+            &backend,
+        )
+        .expect_err("malformed env");
+        assert!(
+            matches!(bad_env, ProfileHandlerError::BadParams(ref msg) if msg.contains("NOEQUALS"))
+        );
+        let bad_tags = handle_profile_command(
+            "create",
+            &json!({ "name": "ok", "tags": "not-an-array" }),
+            &backend,
+        )
+        .expect_err("tags shape");
+        assert!(matches!(bad_tags, ProfileHandlerError::BadParams(_)));
+        assert!(
+            get_agent_profile(&backend, "ok").unwrap().is_none(),
+            "no row may be written for a rejected request"
+        );
+        let missing = handle_profile_command("create", &json!({}), &backend).expect_err("no name");
+        assert!(matches!(missing, ProfileHandlerError::BadParams(_)));
+    }
+
+    #[test]
+    fn create_defaults_are_minimal_and_apply_can_see_the_profile() {
+        let backend = fresh_conn();
+        let created =
+            handle_profile_command("create", &json!({ "name": "bare" }), &backend).expect("create");
+        assert_eq!(created["role"], json!("agent"));
+        assert!(created.get("spawn_command").is_none());
+        assert!(created.get("bootstrap_commands").is_some());
+        // The dry-run apply path resolves the profile it just created.
+        let planned = handle_profile_command(
+            "apply",
+            &json!({ "name": "bare", "count": 1, "dry_run": true }),
+            &backend,
+        )
+        .expect("dry-run apply");
+        assert_eq!(planned["profile_name"], json!("bare"));
+        assert_eq!(planned["dry_run"], json!(true));
     }
 
     fn fresh_conn_with_apply_log() -> RusqliteBackend {
