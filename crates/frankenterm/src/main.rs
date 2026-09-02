@@ -16846,7 +16846,7 @@ fn create_agent_config_backup(
                 message,
                 backup_created: true,
             })?;
-        return Ok(backup_path);
+        Ok(backup_path)
     }
 }
 
@@ -17891,13 +17891,13 @@ fn create_agent_config_candidate(
         validate_fresh_agent_config_security(initial_security, source_security, &path)?;
         let security = source_security.unwrap_or(initial_security);
         parent.revalidate()?;
-        return Ok(StagedAgentConfig {
+        Ok(StagedAgentConfig {
             file,
             leaf,
             path,
             identity: opened.identity,
             security,
-        });
+        })
     }
 }
 
@@ -17925,7 +17925,7 @@ fn verify_named_agent_config(
         path,
     )?;
     let named_before = agent_config_regular_file_observation(
-        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+        &parent.directory.symlink_metadata(leaf).map_err(|err| {
             format!(
                 "Failed to inspect named written agent config '{}': {err}",
                 path.display()
@@ -17969,7 +17969,7 @@ fn verify_named_agent_config(
         path,
     )?;
     let named_after = agent_config_regular_file_observation(
-        &parent.directory.symlink_metadata(&leaf).map_err(|err| {
+        &parent.directory.symlink_metadata(leaf).map_err(|err| {
             format!(
                 "Failed to re-inspect named written agent config '{}': {err}",
                 path.display()
@@ -18833,7 +18833,7 @@ where
             backup_created: false,
         })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let requested_final_metadata = source_security.unwrap_or(AgentConfigSecuritySnapshot {
+    let requested_final_metadata = source_security.unwrap_or_else(|| AgentConfigSecuritySnapshot {
         uid: nix::unistd::geteuid().as_raw(),
         gid: nix::unistd::getegid().as_raw(),
         mode: 0o600,
@@ -90522,7 +90522,8 @@ where
     let deadline = std::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "timeout overflow"))?;
-    for retry_index in 0..=REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS.len() {
+    let mut retry_delays = REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS.into_iter();
+    loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(std::io::Error::new(
@@ -90532,11 +90533,10 @@ where
         }
         match attempt(remaining) {
             Ok(output) => return Ok(output),
-            Err(error)
-                if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
-                    && retry_index < REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS.len() =>
-            {
-                let delay = REMOTE_GENERATION_EXEC_BUSY_RETRY_DELAYS[retry_index];
+            Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32) => {
+                let Some(delay) = retry_delays.next() else {
+                    return Err(error);
+                };
                 std::thread::sleep(delay.min(remaining));
             }
             Err(error) => return Err(error),
@@ -112633,17 +112633,17 @@ log_level = "debug"
         reject("device", |value| value.metadata.device += 1);
         reject("inode", |value| value.metadata.inode += 1);
         reject("kind", |value| {
-            value.metadata.object_kind.push_str("-changed")
+            value.metadata.object_kind.push_str("-changed");
         });
         reject("mode", |value| value.metadata.mode ^= 0o100);
         reject("uid", |value| value.metadata.uid += 1);
         reject("gid", |value| value.metadata.gid += 1);
         reject("hard-link count", |value| {
-            value.metadata.hard_link_count += 1
+            value.metadata.hard_link_count += 1;
         });
         reject("length", |value| value.metadata.byte_len += 1);
         reject("mtime seconds", |value| {
-            value.metadata.modified_seconds += 1
+            value.metadata.modified_seconds += 1;
         });
         reject("mtime nanoseconds", |value| {
             value.metadata.modified_nanoseconds += 1;
