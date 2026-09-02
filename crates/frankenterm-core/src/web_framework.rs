@@ -702,7 +702,7 @@ mod tests {
                     },
                 )
                 .build();
-            let (addr, mut server) =
+            let (addr, server) =
                 FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
                     .await
                     .expect("start web runtime");
@@ -769,7 +769,7 @@ mod tests {
                     },
                 )
                 .build();
-            let (addr, mut server) =
+            let (addr, server) =
                 FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
                     .await
                     .expect("start web runtime");

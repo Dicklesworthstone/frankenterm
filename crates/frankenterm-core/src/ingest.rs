@@ -782,6 +782,10 @@ pub struct PaneCursor {
     /// caller that could overwrite it after capture started would silently
     /// re-anchor mid-stream. Set it with [`Self::with_resume_anchor`].
     resume_anchor: Option<String>,
+    /// Offset currently applied between this producer's numbering and the
+    /// sequence storage actually assigns (`storage_seq - captured_seq` at the
+    /// last correction). See [`Self::realign_next_seq`] (ft-xxfwy.32).
+    seq_correction: i64,
 }
 
 /// The capture-advanced fields of a [`PaneCursor`], lifted out so the
@@ -823,6 +827,7 @@ impl PaneCursor {
             in_gap: false,
             in_alt_screen: false,
             resume_anchor: None,
+            seq_correction: 0,
         }
     }
 
@@ -837,6 +842,7 @@ impl PaneCursor {
             in_gap: false,
             in_alt_screen: false,
             resume_anchor: None,
+            seq_correction: 0,
         }
     }
 
@@ -1093,6 +1099,50 @@ impl PaneCursor {
             }
         };
         self.in_gap = true;
+    }
+
+    /// Realign this producer's numbering with storage after a persisted
+    /// segment came back with a different `seq` than it was captured with
+    /// (ft-xxfwy.32).
+    ///
+    /// The cursor is shared with an asynchronous persistence loop: by the
+    /// time a mismatch is observed, later segments have usually already been
+    /// captured and queued with the old numbering. [`Self::resync_seq`]
+    /// resets `next_seq` to `storage_seq + 1` regardless, so the next capture
+    /// reuses a number that is still in flight and the mismatch reappears on
+    /// every segment forever (12 of 12 in the first real observe run). This
+    /// method instead treats the mismatch as an *offset* between the two
+    /// numberings and shifts `next_seq` by however much that offset changed
+    /// since the last correction: a single dropped segment shifts once, the
+    /// queued backlog drains with the already-known offset, and every capture
+    /// after the shift lines up with storage. Returns the shift applied
+    /// (0 when the offset was already known).
+    pub fn realign_next_seq(&mut self, captured_seq: u64, storage_seq: u64) -> i64 {
+        let observed = i128::from(storage_seq) - i128::from(captured_seq);
+        let shift = observed - i128::from(self.seq_correction);
+        let shift = i64::try_from(shift).unwrap_or(if shift < 0 { i64::MIN } else { i64::MAX });
+        if shift != 0 {
+            let shifted = i128::from(self.next_seq) + i128::from(shift);
+            self.next_seq = if shifted <= 0 {
+                // Never allocate at or below what storage already holds.
+                storage_seq.saturating_add(1)
+            } else if shifted > i128::from(u64::MAX) {
+                record_pane_cursor_seq_saturation();
+                u64::MAX
+            } else {
+                u64::try_from(shifted).unwrap_or(u64::MAX)
+            };
+            self.seq_correction = i64::try_from(observed).unwrap_or(self.seq_correction);
+        }
+        self.in_gap = true;
+        shift
+    }
+
+    /// Offset currently applied between this producer's numbering and
+    /// storage's (`0` until a mismatch was observed).
+    #[must_use]
+    pub fn seq_correction(&self) -> i64 {
+        self.seq_correction
     }
 
     /// Create a captured delta segment from raw content (native event path).
@@ -5356,6 +5406,85 @@ mod tests {
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
         });
+    }
+
+    #[test]
+    fn realign_after_one_dropped_segment_converges_with_a_single_shift() {
+        // Storage assigns seqs densely; a dropped persist leaves it one behind
+        // the producer. Sequential case: no segment is in flight at realign.
+        let mut cursor = PaneCursor::from_seq(1, 5);
+        let mut storage_next = 5_u64;
+        let mut assign = |captured: u64| -> (u64, bool) {
+            let s = storage_next;
+            storage_next += 1;
+            (s, s != captured)
+        };
+        let dropped = cursor.capture_delta("a".into(), 1);
+        assert_eq!(dropped.seq, 5); // persist fails: storage stays at 5
+        let seg = cursor.capture_delta("b".into(), 2);
+        assert_eq!(seg.seq, 6);
+        let (storage_seq, mismatch) = assign(seg.seq);
+        assert!(mismatch, "storage assigned {storage_seq} for captured 6");
+        assert_eq!(cursor.realign_next_seq(seg.seq, storage_seq), -1);
+        assert_eq!(cursor.seq_correction(), -1);
+        assert!(cursor.in_gap);
+        // Every capture after the shift lines up with storage.
+        for i in 0..5_i64 {
+            let seg = cursor.capture_delta(format!("c{i}"), 3 + i);
+            let (storage_seq, mismatch) = assign(seg.seq);
+            assert!(
+                !mismatch,
+                "captured {} but storage assigned {storage_seq}",
+                seg.seq
+            );
+        }
+    }
+
+    #[test]
+    fn realign_applies_the_offset_once_while_a_queued_backlog_drains() {
+        // Pipelined case: three segments were captured (5, 6, 7) before the
+        // persistence loop noticed that 5 was dropped. Old behaviour
+        // (`resync_seq`) reset next_seq to storage+1 on each mismatch and the
+        // producer kept colliding with in-flight numbering; the offset must
+        // be applied exactly once and later queued segments must not move it.
+        let mut cursor = PaneCursor::from_seq(1, 5);
+        let queued: Vec<u64> = (0..3)
+            .map(|i| cursor.capture_delta(format!("q{i}"), i64::from(i)).seq)
+            .collect();
+        assert_eq!(queued, vec![5, 6, 7]);
+        assert_eq!(cursor.next_seq, 8);
+        // persist(5) failed; storage assigns 5 to captured 6 and 6 to captured 7
+        assert_eq!(cursor.realign_next_seq(6, 5), -1);
+        assert_eq!(cursor.next_seq, 7, "one shift for the backlog");
+        assert_eq!(
+            cursor.realign_next_seq(7, 6),
+            0,
+            "same offset: no second shift"
+        );
+        assert_eq!(cursor.next_seq, 7);
+        // The next fresh capture is numbered 7 and storage's next slot is 7.
+        let fresh = cursor.capture_delta("fresh".into(), 10);
+        assert_eq!(fresh.seq, 7);
+    }
+
+    #[test]
+    fn realign_handles_storage_ahead_of_the_producer_and_never_underflows() {
+        // A cursor resumed from a stale checkpoint numbers below what storage
+        // already holds: the shift is positive.
+        let mut cursor = PaneCursor::from_seq(1, 10);
+        let seg = cursor.capture_delta("x".into(), 1);
+        assert_eq!(seg.seq, 10);
+        assert_eq!(cursor.realign_next_seq(seg.seq, 15), 5);
+        assert_eq!(cursor.next_seq, 16);
+        assert_eq!(cursor.seq_correction(), 5);
+        // A shift that would push next_seq to or below zero clamps to the
+        // slot after what storage assigned instead of wrapping.
+        let mut low = PaneCursor::from_seq(2, 1);
+        let seg = low.capture_delta("y".into(), 1);
+        assert_eq!(seg.seq, 1);
+        assert_eq!(low.next_seq, 2);
+        assert_eq!(low.realign_next_seq(seg.seq, 0), -1);
+        assert_eq!(low.next_seq, 1);
     }
 
     #[test]

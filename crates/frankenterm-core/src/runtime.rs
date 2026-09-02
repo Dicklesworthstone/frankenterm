@@ -9234,14 +9234,15 @@ impl ObservationRuntime {
                             persisted.segment.seq,
                             &bounded_segment.content,
                         );
-                        // Check for sequence discontinuity and resync cursor if needed
+                        // Check for sequence discontinuity and realign the
+                        // shared producer cursor. The correction is an
+                        // offset applied once, not a reset to storage's seq:
+                        // segments already captured and queued keep their
+                        // numbering and drain with the known offset, so one
+                        // dropped segment produces a bounded run of these
+                        // warnings instead of one per segment forever
+                        // (ft-xxfwy.32).
                         if persisted.segment.seq != captured_seq {
-                            warn!(
-                                pane_id,
-                                expected_seq = captured_seq,
-                                actual_seq = persisted.segment.seq,
-                                "Sequence discontinuity detected, resyncing cursor"
-                            );
                             let mut cursors_guard = cursors.write().await;
                             let Some(cursor) = cursors_guard.get_mut(&pane_id) else {
                                 let error = runtime_backend_error(
@@ -9260,7 +9261,26 @@ impl ObservationRuntime {
                                 }
                                 continue;
                             };
-                            cursor.resync_seq(persisted.segment.seq);
+                            let shift =
+                                cursor.realign_next_seq(captured_seq, persisted.segment.seq);
+                            if shift != 0 {
+                                warn!(
+                                    pane_id,
+                                    expected_seq = captured_seq,
+                                    actual_seq = persisted.segment.seq,
+                                    shift,
+                                    next_seq = cursor.next_seq,
+                                    "Sequence discontinuity detected, realigned producer cursor"
+                                );
+                            } else {
+                                debug!(
+                                    pane_id,
+                                    expected_seq = captured_seq,
+                                    actual_seq = persisted.segment.seq,
+                                    correction = cursor.seq_correction(),
+                                    "Sequence discontinuity from a segment queued before the last realignment; offset already applied"
+                                );
+                            }
                         }
 
                         if let Some(ref recorder) = recorder_persistence
