@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_executor::Executor;
 use flume::bounded;
 #[cfg(test)]
@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll};
 use std::thread::ThreadId;
@@ -1848,8 +1848,8 @@ lazy_static::lazy_static! {
 /// GUI queue replacing a headless executor (or the reverse) must not be able
 /// to reuse the retired queue/generation pair and make stale receipts appear
 /// current again.
-pub fn try_allocate_main_thread_scheduler_identity(
-) -> std::result::Result<MainThreadSchedulerIdentity, MainThreadSchedulerIdentityExhausted> {
+pub fn try_allocate_main_thread_scheduler_identity()
+-> std::result::Result<MainThreadSchedulerIdentity, MainThreadSchedulerIdentityExhausted> {
     MAIN_THREAD_SCHEDULER_IDENTITIES.try_allocate()
 }
 
@@ -1858,6 +1858,10 @@ struct SimpleExecutorBoundedItem {
     enqueued_at: Instant,
     estimated_bytes: NonZeroUsize,
 }
+
+/// Count of retired-generation runnables that were leaked instead of dropped
+/// because the waker fired off the owner thread (see `enqueue_admitted`).
+pub static RETIRED_RUNNABLES_LEAKED_OFF_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 struct SimpleExecutorQueueState {
     admitted_high: VecDeque<SimpleExecutorBoundedItem>,
@@ -1875,6 +1879,10 @@ struct SimpleExecutorQueue {
     identity: MainThreadSchedulerIdentity,
     task_capacity: usize,
     estimated_byte_capacity: usize,
+    /// Thread that created this queue. Local runnables are thread-affine:
+    /// dropping one anywhere else panics inside async_task's thread check, so
+    /// a retired queue must never drop a runnable delivered by a waker thread.
+    owner_thread: ThreadId,
     state: Mutex<SimpleExecutorQueueState>,
     available: Condvar,
 }
@@ -1883,6 +1891,7 @@ impl SimpleExecutorQueue {
     fn new(identity: MainThreadSchedulerIdentity, limits: MainThreadAdmissionLimits) -> Self {
         Self {
             identity,
+            owner_thread: std::thread::current().id(),
             task_capacity: limits.task_capacity(),
             estimated_byte_capacity: limits.estimated_byte_capacity(),
             state: Mutex::new(SimpleExecutorQueueState {
@@ -1946,7 +1955,21 @@ impl SimpleExecutorQueue {
             )
             .expect("retired SimpleExecutor queue accounting must remain internally consistent");
             drop(state);
-            drop(runnable);
+            // Dropping a `spawn_local` runnable cancels its task, which is the
+            // right disposal for a retired generation, but only on the thread
+            // that created it. A waker firing from any other thread (a uds
+            // rewake thread, a listener thread) after the generation retired
+            // used to drop here and abort the whole process through
+            // async_task's thread check ("local task dropped by a thread that
+            // didn't spawn it", seen 2026-09-02 as a mux-server SIGABRT at
+            // shutdown). Off-thread, the runnable is leaked instead: the task
+            // stays pending for the retired generation, which is inert anyway.
+            if std::thread::current().id() == self.owner_thread {
+                drop(runnable);
+            } else {
+                RETIRED_RUNNABLES_LEAKED_OFF_THREAD.fetch_add(1, Ordering::Relaxed);
+                std::mem::forget(runnable);
+            }
             return MainThreadEnqueueReceipt {
                 queue_id: admission.queue_id,
                 scheduler_generation: admission.scheduler_generation,
@@ -2987,9 +3010,11 @@ mod tests {
             NonZeroU64::new(18).unwrap(),
             MainThreadAdmissionLimits::new(2, 32, 0, 0).unwrap(),
         );
-        assert!(replacement
-            .try_admit(MainThreadServiceClass::Input, 8)
-            .is_ok());
+        assert!(
+            replacement
+                .try_admit(MainThreadServiceClass::Input, 8)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3663,6 +3688,60 @@ mod tests {
         assert_eq!(old.admission_snapshot().active_tasks, 0);
         assert_eq!(replacement.queue_snapshot().depth, 0);
         assert!(!replacement.queue_snapshot().retired);
+    }
+
+    /// A waker firing from another thread after the generation retired used to
+    /// drop the local runnable on that thread and abort the process.
+    #[test]
+    fn retired_generation_wake_from_another_thread_does_not_drop_local_runnable_off_thread() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        struct ExposeWaker(Arc<StdMutex<Option<Waker>>>);
+        impl Future for ExposeWaker {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                *self.0.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+
+        let _lock = TEST_LOCK.lock().unwrap();
+        let old =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        let waker_slot = Arc::new(StdMutex::new(None));
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected a reserved admission, got {:?}", outcome),
+        };
+        let task = reservation.spawn_local(ExposeWaker(Arc::clone(&waker_slot)));
+        assert!(old.try_tick().unwrap(), "first poll registers the waker");
+        let waker = waker_slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the future must have captured its waker");
+
+        let replacement =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        assert!(old.queue_snapshot().retired);
+        let before = RETIRED_RUNNABLES_LEAKED_OFF_THREAD.load(Ordering::Relaxed);
+
+        std::thread::spawn(move || waker.wake())
+            .join()
+            .expect("waking a retired-generation local task from another thread must not panic");
+
+        assert_eq!(
+            RETIRED_RUNNABLES_LEAKED_OFF_THREAD.load(Ordering::Relaxed),
+            before + 1,
+            "the off-thread wake must be leaked, never dropped off-thread"
+        );
+        assert_eq!(replacement.queue_snapshot().depth, 0);
+        task.detach();
+        drop(old);
     }
 
     #[test]
