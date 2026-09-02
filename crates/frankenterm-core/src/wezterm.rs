@@ -5399,10 +5399,6 @@ fn ms_u64(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
     use std::sync::Arc;
 
     fn isolated_cli_client() -> WeztermClient {
