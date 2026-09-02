@@ -120,14 +120,23 @@ fn every_source_file_is_declared_as_a_module() {
                 .expect("module dir name")
                 .to_string();
             let grandparent = dir.parent().expect("module dir parent");
-            (
-                module_dir_name.clone(),
-                vec![
-                    grandparent.join(format!("{module_dir_name}.rs")),
-                    grandparent.join("mod.rs"),
-                    grandparent.join("lib.rs"),
-                ],
-            )
+            // `dir/name/mod.rs` is declared by `dir/name.rs`, `dir/mod.rs`,
+            // `dir/lib.rs`, or (2018-style) by the file that owns `dir`
+            // itself: `<dir's parent>/<dir>.rs`. The last form is how
+            // `storage.rs` declares `storage/handle/mod.rs`; omitting it made
+            // the guard report a live module as an orphan on 2026-09-02.
+            let mut candidates = vec![
+                grandparent.join(format!("{module_dir_name}.rs")),
+                grandparent.join("mod.rs"),
+                grandparent.join("lib.rs"),
+            ];
+            if let (Some(grandparent_name), Some(great_grandparent)) = (
+                grandparent.file_name().and_then(|s| s.to_str()),
+                grandparent.parent(),
+            ) {
+                candidates.push(great_grandparent.join(format!("{grandparent_name}.rs")));
+            }
+            (module_dir_name.clone(), candidates)
         } else {
             let dir_name = dir
                 .file_name()
@@ -173,13 +182,8 @@ fn every_source_file_is_declared_as_a_module() {
     );
 }
 
-/// Orphans that pre-date this guard. Each is tracked dead code that the guard
-/// found on its first remote run (2026-09-02); deleting them needs owner
-/// authorization (AGENTS.md Rule 1), tracked on ft-xxfwy.31. New orphans are
-/// never added here; fix them instead.
-const KNOWN_ORPHANS: &[&str] = &[
-    "cx_stub.rs",
-    "search/model2vec_embedder.rs",
-    "storage/handle/mod.rs",
-    "test_subprocess_deadlock.rs",
-];
+/// Orphans that pre-date this guard. The four found on the guard's first remote
+/// run (2026-09-02) were deleted under written owner authorization the same
+/// day (ft-xxfwy.31), so the baseline is empty. New orphans are never added
+/// here; fix them instead. The ratchet stays so a future entry can only shrink.
+const KNOWN_ORPHANS: &[&str] = &[];

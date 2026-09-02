@@ -36,7 +36,6 @@ pub const EXEMPT_FILES: &[&str] = &[
     "runtime_async.rs", // wrapper module — primitives sealed elsewhere
     "runtime_proof.rs", // defines the seal itself
     "cx.rs",            // the canonical structured-async witness
-    "cx_stub.rs",       // build-time stub of cx.rs (no-op shim)
 ];
 
 /// Ergonomic wrappers around a `_with_cx` / `_cx` sibling.

@@ -41,7 +41,7 @@
 //! Two carve-outs, both load-bearing:
 //!
 //! 1. **EXEMPT_FILES** — runtime-layer modules that *are* the seal
-//!    (`runtime_async.rs`, `runtime_proof.rs`, `cx.rs`, `cx_stub.rs`).
+//!    (`runtime_async.rs`, `runtime_proof.rs`, `cx.rs`).
 //!    They define `Cx` and `RuntimeProof` themselves, so requiring
 //!    them to take a `Cx` parameter on themselves is circular.
 //! 2. **WRAPPER_EXEMPTIONS** — ergonomic wrappers that construct a

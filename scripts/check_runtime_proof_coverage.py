@@ -77,7 +77,6 @@ EXEMPT_FILES: set[str] = {
     "runtime_async.rs",       # the wrapper module — primitives are sealed elsewhere
     "runtime_proof.rs",       # defines the seal itself
     "cx.rs",                  # Cx is the canonical structured-async witness; sealed in runtime_proof.rs
-    "cx_stub.rs",             # build-time stub of cx.rs (no-op shim)
 }
 
 # Public Cx-aware APIs whose contract intentionally performs synchronous work
