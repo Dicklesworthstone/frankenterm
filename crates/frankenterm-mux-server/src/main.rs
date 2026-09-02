@@ -248,7 +248,7 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         &opts.config_override,
         opts.skip_config,
     )?;
-    validate_explicit_config_file(opts.config_file.as_deref())?;
+    validate_explicit_config_file(opts.config_file.as_deref(), lua_config_enabled_from_env())?;
     match opts.config_file.as_deref() {
         Some(path) => log::info!(
             "frankenterm-mux-server-config source=explicit path={}",
@@ -720,17 +720,39 @@ fn set_mux_socket_environment(config: &config::ConfigHandle) {
 /// behaviour for the GUI's default search path but wrong for an operator who
 /// named a file: the server would silently run with defaults and bind
 /// `RUNTIME_DIR/sock` instead of the configured socket (ft-xxfwy.35).
-fn validate_explicit_config_file(config_file: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
+///
+/// Two ways an explicit file is silently not loaded: the config layer only
+/// loads `frankenterm.toml` files unless `FRANKENTERM_LUA_CONFIG=1` (a `.lua`
+/// path is skipped without an error), and a file that does load with an error
+/// is only recorded, not surfaced. Both must stop the server.
+fn validate_explicit_config_file(
+    config_file: Option<&std::ffi::OsStr>,
+    lua_config_enabled: bool,
+) -> anyhow::Result<()> {
     let Some(path) = config_file else {
         return Ok(());
     };
+    let path = std::path::Path::new(path);
+    let is_toml = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+    if !is_toml && !lua_config_enabled {
+        anyhow::bail!(
+            "refusing to start: --config-file {} is not a frankenterm.toml and Lua config is disabled in this build (set FRANKENTERM_LUA_CONFIG=1 to load Lua files); the server would otherwise run on defaults and bind RUNTIME_DIR/sock",
+            path.display()
+        );
+    }
     match config::configuration_result() {
         Ok(_) => Ok(()),
         Err(err) => Err(anyhow::anyhow!(
             "refusing to start: --config-file {} did not load: {err:#}",
-            std::path::Path::new(path).display()
+            path.display()
         )),
     }
+}
+
+fn lua_config_enabled_from_env() -> bool {
+    std::env::var("FRANKENTERM_LUA_CONFIG").is_ok_and(|value| value == "1")
 }
 
 fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
@@ -859,23 +881,35 @@ mod tests {
     #[test]
     fn explicit_config_file_that_does_not_load_fails_closed() {
         let _guard = lock_test_state();
+
+        // A Lua file while Lua config is disabled: skipped by the loader, so
+        // it must be refused up front.
+        let lua = std::path::PathBuf::from("/nonexistent/frankenterm-mux-server.lua");
+        let err = validate_explicit_config_file(Some(lua.as_os_str()), false)
+            .expect_err("a .lua file with Lua config disabled must fail closed");
+        let message = format!("{err:#}");
+        assert!(message.contains("FRANKENTERM_LUA_CONFIG"), "{message}");
+        assert!(message.contains(&lua.display().to_string()), "{message}");
+
+        // A TOML file that exists but does not parse: the loader records the
+        // error; the validator must surface it.
         let path = std::env::temp_dir().join(format!(
-            "frankenterm-mux-server-bad-config-{}.lua",
+            "frankenterm-mux-server-bad-config-{}.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "this is not lua {{{\n").expect("write fixture config");
+        std::fs::write(&path, "this = = is not toml\n").expect("write fixture config");
         let as_os = path.clone().into_os_string();
         config::common_init(Some(&as_os), &[], false).expect("common_init records the load error");
-
-        let err = validate_explicit_config_file(Some(path.as_os_str()))
-            .expect_err("a broken explicit config must fail closed");
+        let err = validate_explicit_config_file(Some(path.as_os_str()), false)
+            .expect_err("a broken explicit toml must fail closed");
         let message = format!("{err:#}");
         assert!(
             message.contains(&path.display().to_string()),
             "error must name the file: {message}"
         );
+
         assert!(
-            validate_explicit_config_file(None).is_ok(),
+            validate_explicit_config_file(None, false).is_ok(),
             "no explicit file means the default search path keeps its fallback semantics"
         );
 

@@ -91,8 +91,10 @@ fail() { # step-name detail
 # Bare zsh: nothing rewrites the pane title after we set it.
 "$MUX" --daemonize=false --cwd "$D" -- /bin/zsh -f > "$D/mux.log" 2>&1 &
 MUX_PID=$!
-for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done
-[ -S "$SOCK" ] || fail mux_start "socket never appeared: $(tail -3 "$D/mux.log" | tr '\n' ' ')"
+# A stale socket file from an earlier server satisfies `-S`; wait for the lease
+# file to name THIS server's pid so a client never dials a dead socket.
+for _ in $(seq 1 150); do grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null && [ -S "$SOCK" ] && break; sleep 0.2; done
+grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null || fail mux_start "server pid $MUX_PID never took the socket lease: $(tail -3 "$D/mux.log" | tr '\n' ' ')"
 step mux_start pass "pid $MUX_PID on $SOCK"
 
 export WEZTERM_UNIX_SOCKET="$SOCK" FT_WORKSPACE="$D"
