@@ -666,6 +666,72 @@ mod tests {
         resolve_unauthenticated_bind_addr, validate_unauthenticated_bind_candidates,
         validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with, web_cx_error,
     };
+
+    /// Liveness when the server starts a while after the runtime clock began,
+    /// which is what every real `ft web` does (storage opens first).
+    ///
+    /// Reproduces ft-xxfwy.38: fastapi's accept loop wraps `accept` in a 50 ms
+    /// `timeout` whose deadline comes from fastapi's own clock (started at its
+    /// first call), while asupersync's `timeout` compares that deadline against
+    /// the runtime's process-epoch clock *before* polling the inner future. Once
+    /// the two clocks differ by more than the poll interval every accept is
+    /// born expired and the kernel backlog is never drained. The runtime is
+    /// built first (claiming the process epoch), then the test waits longer
+    /// than the poll interval before starting the server.
+    #[test]
+    fn server_started_after_runtime_clock_skew_answers_requests() {
+        use super::{App, FrameworkWebRuntime, Method, Request, RequestContext, Response};
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let runtime = RuntimeBuilder::multi_thread().build().expect("runtime");
+        // Claim asupersync's process epoch now, then let real time pass beyond
+        // fastapi's 50 ms accept poll interval before the server exists.
+        let _ = asupersync::time::wall_now();
+        std::thread::sleep(Duration::from_millis(250));
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let app = App::builder()
+                .route(
+                    "/ping",
+                    Method::Get,
+                    |_ctx: &RequestContext, _req: &mut Request| async {
+                        Response::json(&serde_json::json!({ "ok": true }))
+                            .unwrap_or_else(|_| Response::internal_error())
+                    },
+                )
+                .build();
+            let (addr, mut server) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("start web runtime");
+
+            let reply = std::thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                stream
+                    .write_all(
+                        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("write request");
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+            .join()
+            .expect("client thread");
+
+            server.signal_shutdown();
+            assert!(
+                reply.starts_with("HTTP/1.1 200"),
+                "the server must answer a GET even when it starts after the runtime clock began; got {reply:?}"
+            );
+            assert!(reply.contains("\"ok\":true"), "{reply:?}");
+        });
+    }
     use crate::error::RuntimeOperationSource;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::cell::Cell;
