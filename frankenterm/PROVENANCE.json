@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 51,
-        "fix": 68,
+        "fix": 69,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 23
       },
-      "fork_side_commit_count": 193,
+      "fork_side_commit_count": 194,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-01T19:03:22-04:00",
-        "sha": "3ae6370884db2d459e31f95a9f5b2c078dd19873",
-        "subject": "feat(diagnostics,socket): add mux socket diagnostic check in ft doctor and add no-orphan source tests"
+        "classification": "fix",
+        "committed_at": "2026-09-03T15:52:30-04:00",
+        "sha": "651dde23ca329a4b3728413813eec2f567b8b5bd",
+        "subject": "fix(proof-doctor): accept the RCH proof command shape the blockers prescribe"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -706,19 +706,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 8,
-        "fix": 19,
+        "fix": 20,
         "other": 5,
         "refactor": 3,
         "runtime-swap": 4,
         "test": 7
       },
-      "fork_side_commit_count": 51,
+      "fork_side_commit_count": 52,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-02T00:47:12-04:00",
-        "sha": "0d3378eacf0ed370f62df3026f88317a297fb0aa",
-        "subject": "fix(promise): never drop a retired-generation local runnable off the owner thread"
+        "committed_at": "2026-09-03T15:52:30-04:00",
+        "sha": "651dde23ca329a4b3728413813eec2f567b8b5bd",
+        "subject": "fix(proof-doctor): accept the RCH proof command shape the blockers prescribe"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -1058,8 +1058,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2373,
-  "generated_at": "2026-09-03T19:44:41.424455Z",
+  "fork_side_commit_total": 2375,
+  "generated_at": "2026-09-03T19:52:48.300453Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
