@@ -217,6 +217,21 @@ SEE ALSO:
         #[arg(long)]
         metrics_prefix: Option<String>,
 
+        /// Also serve the read-only web API from this process
+        ///
+        /// The server shares the watcher's live EventBus, so a detection
+        /// reaches `/stream/events` when it is published rather than after the
+        /// storage tail's next poll. The tail is off in this mode: the
+        /// in-process publisher is the watcher itself.
+        #[cfg(feature = "web")]
+        #[arg(long)]
+        web: bool,
+
+        /// Port for `--web`; defaults to [tuning.web] default_port
+        #[cfg(feature = "web")]
+        #[arg(long, requires = "web")]
+        web_port: Option<u16>,
+
         /// Disable single-instance lock (DANGEROUS: may corrupt data)
         #[arg(long)]
         dangerous_disable_lock: bool,
@@ -45730,6 +45745,18 @@ async fn run_distributed_agent(
 }
 
 /// Run the observation watcher daemon with crash-loop backoff.
+/// How `ft watch` should serve the read-only web API, if at all.
+///
+/// In-process serving is the only way a client sees an event at publish time:
+/// a standalone `ft web` has no in-process publisher and can only replay rows
+/// the watcher already persisted, at the storage tail's poll latency
+/// (ft-xxfwy.19).
+#[derive(Debug, Clone, Copy, Default)]
+struct WatcherWebOptions {
+    enabled: bool,
+    port: Option<u16>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher_with_backoff(
     cx: &frankenterm_core::cx::Cx,
@@ -45743,6 +45770,7 @@ async fn run_watcher_with_backoff(
     notify_only: bool,
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
+    web: WatcherWebOptions,
     disable_lock: bool,
     dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
@@ -45762,6 +45790,7 @@ async fn run_watcher_with_backoff(
             notify_only,
             notify_filter.clone(),
             notify_via.clone(),
+            web,
             disable_lock,
             dangerous_bind_any,
         ))
@@ -46121,6 +46150,7 @@ async fn run_watcher(
     notify_only: bool,
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
+    web: WatcherWebOptions,
     disable_lock: bool,
     dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
@@ -46760,6 +46790,47 @@ async fn run_watcher(
         None
     };
 
+    // Read-only web API, served from this process when `--web` was passed.
+    //
+    // Sharing the watcher's EventBus is the whole point: a standalone `ft web`
+    // has no in-process publisher, so it can only replay rows this watcher
+    // already persisted, at the storage tail's poll latency. Here the tail is
+    // off and `/stream/events` carries events at publish time (ft-xxfwy.19).
+    //
+    // The operator asked for the API explicitly, so a bind failure fails the
+    // watcher rather than leaving a silently absent endpoint.
+    #[cfg(feature = "web")]
+    let web_server_handle = if web.enabled {
+        let web_tuning = &config.tuning.web;
+        let resolved_port = web
+            .port
+            .unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
+        let web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+            .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
+            .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
+                web_tuning,
+            )))
+            .with_storage(handle.storage.clone())
+            .with_event_bus(Arc::clone(&event_bus))
+            .with_storage_event_tail(false);
+        let web_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        let server = frankenterm_core::web::start_web_server_with_cx(&web_cx, web_config)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to start the in-process web API on port {resolved_port}: {error}"
+                )
+            })?;
+        tracing::info!(
+            address = %server.bound_addr(),
+            "Watcher web API listening (shared event bus, storage tail disabled)"
+        );
+        Some(server)
+    } else {
+        None
+    };
+
     // Background scheduler for saved searches (scheduled alerts).
     //
     // Runs inside the watcher process and publishes synthetic PatternDetected
@@ -47213,6 +47284,17 @@ async fn run_watcher(
                 .await
         {
             shutdown_failures.push(error);
+        }
+    }
+
+    #[cfg(feature = "web")]
+    if let Some(server) = web_server_handle {
+        let address = server.bound_addr();
+        match server.shutdown_with_cx(&background_shutdown_cx).await {
+            Ok(()) => tracing::info!(%address, "Watcher web API stopped"),
+            Err(error) => shutdown_failures.push(anyhow::anyhow!(
+                "in-process web API on {address} did not shut down cleanly: {error}"
+            )),
         }
     }
 
@@ -48763,6 +48845,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             metrics: _metrics,
             metrics_bind: _metrics_bind,
             metrics_prefix: _metrics_prefix,
+            #[cfg(feature = "web")]
+            web,
+            #[cfg(feature = "web")]
+            web_port,
             dangerous_disable_lock,
             dangerous_bind_any,
         }) => {
@@ -48772,6 +48858,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 crash_dir: Some(layout.crash_dir.clone()),
                 include_backtrace: true,
             });
+
+            #[cfg(feature = "web")]
+            let web_options = WatcherWebOptions {
+                enabled: web,
+                port: web_port,
+            };
+            #[cfg(not(feature = "web"))]
+            let web_options = WatcherWebOptions::default();
 
             Box::pin(run_watcher_with_backoff(
                 cx,
@@ -48785,6 +48879,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 notify_only,
                 notify_filter,
                 notify_via,
+                web_options,
                 dangerous_disable_lock,
                 dangerous_bind_any,
             ))
