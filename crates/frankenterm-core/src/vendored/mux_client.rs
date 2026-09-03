@@ -5844,6 +5844,76 @@ mod tests {
         });
     }
 
+    /// Planted negative for the phase gate (ft-xxfwy.34): a reply that is
+    /// *correlated* with the registration request but carries the wrong PDU
+    /// type must still be refused as `InboundPduInvalidForPhase`. Only
+    /// unilateral notifications (serial 0) are tolerated during registration.
+    #[test]
+    fn correlated_wrong_pdu_during_registration_is_still_a_phase_violation() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux-wrong-pdu.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = StreamingPduBuffer::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "wezterm-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            // Wrong type on the registration request's own
+                            // serial: not a broadcast, so not tolerated.
+                            Pdu::SetClientId(_) => Pdu::TabResized(codec::TabResized { tab_id: 0 }),
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        if stream.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = direct_mux_client_config(socket_path);
+            let error = match DirectMuxClient::connect(config).await {
+                Ok(_) => {
+                    panic!("a correlated wrong-type reply during registration must not connect")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    DirectMuxError::InboundPduInvalidForPhase {
+                        pdu: "TabResized",
+                        ..
+                    }
+                ),
+                "expected InboundPduInvalidForPhase for TabResized, got {error:?}"
+            );
+        });
+    }
+
     #[test]
     fn list_panes_with_cx_roundtrip() {
         run_async_test(async {

@@ -13437,6 +13437,41 @@ struct RobotSendData {
     verification_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     submit: Option<frankenterm_core::robot_types::SubmitReceipt>,
+    /// Paste mode the send ran in (ft-xxfwy.36): `false` is bracketed paste
+    /// (the default, right for agent TUIs), `true` means the text was typed
+    /// with `--no-paste` (right for shells).
+    no_paste: bool,
+    /// `true` when `--no-newline` suppressed the trailing newline.
+    no_newline: bool,
+}
+
+#[cfg(test)]
+mod robot_send_receipt_tests {
+    use super::RobotSendData;
+
+    /// ft-xxfwy.36 contract: a robot caller can see which paste mode ran.
+    #[test]
+    fn robot_send_receipt_reports_paste_mode() {
+        let data = RobotSendData {
+            pane_id: 7,
+            injection: frankenterm_core::policy::InjectionResult::Denied {
+                decision: frankenterm_core::policy::PolicyDecision::deny("contract test"),
+                summary: "contract test".to_string(),
+                pane_id: 7,
+                action: frankenterm_core::policy::ActionKind::SendText,
+                audit_action_id: None,
+            },
+            wait_for: None,
+            verification_error: None,
+            submit: None,
+            no_paste: true,
+            no_newline: false,
+        };
+        let json = serde_json::to_value(&data).expect("serialize robot send receipt");
+        assert_eq!(json["no_paste"], serde_json::Value::Bool(true));
+        assert_eq!(json["no_newline"], serde_json::Value::Bool(false));
+        assert_eq!(json["pane_id"], serde_json::Value::from(7));
+    }
 }
 
 /// Human send response data (stable JSON when non-TTY)
@@ -50317,6 +50352,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     wait_for: wait_for_data,
                                     verification_error,
                                     submit,
+                                    no_paste,
+                                    no_newline,
                                 };
                                 if stats {
                                     if let Some(receipt) = data.submit.as_ref() {
