@@ -45773,6 +45773,13 @@ async fn run_watcher_with_backoff(
                 if watcher_error_is_non_retryable(&err) {
                     return Err(err);
                 }
+                if WATCHER_STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::error!(
+                        error = %err,
+                        "Watcher stop was requested; reporting the unclean shutdown without restarting"
+                    );
+                    return Err(err);
+                }
 
                 let runtime = started_at.elapsed();
                 let status = crash_loop.register_crash(runtime);
@@ -45799,8 +45806,8 @@ async fn run_watcher_with_backoff(
 
                 frankenterm_core::runtime_async::select! {
                     () = frankenterm_core::runtime_async::sleep(backoff) => {}
-                    _ = frankenterm_core::runtime_async::signal::ctrl_c() => {
-                        tracing::info!("Watcher restart cancelled by Ctrl-C");
+                    () = wait_for_watcher_stop_signal() => {
+                        tracing::info!("Watcher restart cancelled by a stop signal");
                         return Ok(());
                     }
                 }
@@ -45970,6 +45977,37 @@ fn coalesce_watcher_control_action(
     selected
 }
 
+/// Set once an operator has asked the watcher to stop: a signal, or a
+/// cooperative control action over IPC.
+///
+/// The crash-loop supervisor restarts a watcher whose run returned an error,
+/// and a shutdown that could not publish its terminal checkpoint returns one.
+/// A watcher whose mux backend has already exited cannot publish that
+/// checkpoint, so `ft watch` answered every SIGTERM by shutting down and
+/// immediately coming back -- indistinguishable, from outside, from ignoring
+/// the signal (ft-yykm1). A requested stop is terminal: the unclean shutdown
+/// is still reported, and still sets the exit status, but nothing restarts.
+static WATCHER_STOP_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Wait for any signal that means "stop", so a stop during the crash-loop
+/// backoff window is honoured instead of being swallowed until the next run
+/// re-registers its handlers.
+async fn wait_for_watcher_stop_signal() {
+    #[cfg(unix)]
+    {
+        use frankenterm_core::runtime_async::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            frankenterm_core::runtime_async::select! {
+                _ = frankenterm_core::runtime_async::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = frankenterm_core::runtime_async::signal::ctrl_c().await;
+}
+
 /// Wall-clock bound on the terminal pane listing taken during watcher
 /// shutdown.
 ///
@@ -46048,12 +46086,14 @@ async fn wait_for_ctrl_c_or_watcher_control(
             WatcherWaitEvent::Interrupt(ctrl_c_result) => {
                 ctrl_c_result?;
                 tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+                WATCHER_STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
             WatcherWaitEvent::Control(control_result) => match control_result {
                 Ok(first) => {
                     let action = coalesce_watcher_control_action(first, control_receiver);
                     if process_watcher_control_action(action, config_path, current_config, handle) {
+                        WATCHER_STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                 }
@@ -47080,6 +47120,8 @@ async fn run_watcher(
                                     &mut current_config,
                                     handle.as_ref(),
                                 ) {
+                                    WATCHER_STOP_REQUESTED
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
                                     break;
                                 }
                             }
@@ -47091,10 +47133,14 @@ async fn run_watcher(
                         WatcherUnixEvent::Signal(signal_kind) => match signal_kind {
                             WatcherUnixSignal::Interrupt => {
                                 tracing::info!("Received SIGINT, initiating graceful shutdown");
+                                WATCHER_STOP_REQUESTED
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
                                 break;
                             }
                             WatcherUnixSignal::Terminate => {
                                 tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                                WATCHER_STOP_REQUESTED
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
                                 break;
                             }
                             WatcherUnixSignal::Hangup => {
