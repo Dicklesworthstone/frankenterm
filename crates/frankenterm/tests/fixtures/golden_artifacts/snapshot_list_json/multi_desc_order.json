@@ -1,33 +1,54 @@
 {
   "count": 3,
+  "has_more": false,
+  "limit": 10,
+  "offset": 0,
   "ok": true,
+  "projection_scope": "checkpoint_summary",
+  "projection_verification": "unchecked_projection",
   "snapshots": [
     {
       "checkpoint_at": 0,
       "checkpoint_id": 2,
+      "checkpoint_role": "snapshot",
       "checkpoint_type": "startup",
+      "label": null,
       "pane_count": 4,
+      "pane_state_estimate_bytes": 4096,
+      "projection_scope": "checkpoint_summary",
+      "projection_verification": "unchecked_projection",
       "session_id": "alpha-session",
       "state_hash": "hash-new",
-      "total_bytes": 4096
+      "verification": "not_computed"
     },
     {
       "checkpoint_at": 0,
       "checkpoint_id": 3,
+      "checkpoint_role": "snapshot",
       "checkpoint_type": "shutdown",
+      "label": null,
       "pane_count": 1,
+      "pane_state_estimate_bytes": 128,
+      "projection_scope": "checkpoint_summary",
+      "projection_verification": "unchecked_projection",
       "session_id": "beta-session",
       "state_hash": "hash-mid",
-      "total_bytes": 128
+      "verification": "not_computed"
     },
     {
       "checkpoint_at": 0,
       "checkpoint_id": 1,
+      "checkpoint_role": "snapshot",
       "checkpoint_type": "periodic",
+      "label": null,
       "pane_count": 2,
+      "pane_state_estimate_bytes": 512,
+      "projection_scope": "checkpoint_summary",
+      "projection_verification": "unchecked_projection",
       "session_id": "alpha-session",
       "state_hash": "hash-old",
-      "total_bytes": 512
+      "verification": "not_computed"
     }
-  ]
+  ],
+  "verification": "not_computed"
 }

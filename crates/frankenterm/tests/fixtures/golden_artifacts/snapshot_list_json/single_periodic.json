@@ -1,15 +1,26 @@
 {
   "count": 1,
+  "has_more": false,
+  "limit": 10,
+  "offset": 0,
   "ok": true,
+  "projection_scope": "checkpoint_summary",
+  "projection_verification": "unchecked_projection",
   "snapshots": [
     {
       "checkpoint_at": 0,
       "checkpoint_id": 1,
+      "checkpoint_role": "snapshot",
       "checkpoint_type": "periodic",
+      "label": null,
       "pane_count": 3,
+      "pane_state_estimate_bytes": 2048,
+      "projection_scope": "checkpoint_summary",
+      "projection_verification": "unchecked_projection",
       "session_id": "<uuid-session>",
       "state_hash": "hash-single",
-      "total_bytes": 2048
+      "verification": "not_computed"
     }
-  ]
+  ],
+  "verification": "not_computed"
 }

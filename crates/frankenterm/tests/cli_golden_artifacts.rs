@@ -36,6 +36,20 @@ fn setup_workspace() -> (TempDir, String) {
     frankenterm_core::storage::initialize_schema(&conn).expect("init schema");
     drop(conn);
 
+    // Private per-test homes for the isolation env below, so ft never
+    // consults the host's runtime dir (where a live GUI publishes its socket)
+    // or the host's config.
+    for sub in [".runtime", ".data", ".config"] {
+        let path = dir.path().join(sub);
+        fs::create_dir_all(&path).expect("create isolated env dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("harden isolated env dir");
+        }
+    }
+
     let ws = dir.path().to_string_lossy().to_string();
     (dir, ws)
 }
@@ -105,6 +119,10 @@ fn scrub_dynamic(value: &mut Value, parent_key: Option<&str>) {
                 *text = "<uuid-session>".to_string();
             } else if is_uuid_like(text) {
                 *text = "<uuid>".to_string();
+            } else if matches!(parent_key, Some("version")) && text == env!("CARGO_PKG_VERSION") {
+                // The envelope reports the crate version; goldens must not
+                // drift on every release bump (they were pinned at 0.3.0).
+                *text = "<version>".to_string();
             }
         }
         Value::Number(_) => {
@@ -178,6 +196,18 @@ fn write_wezterm_stub(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("wezterm-stub.sh");
     let script = r#"#!/bin/sh
 set -eu
+
+# The unified client probes the CLI's version before using it (ft-xxfwy.7)
+# and passes --no-auto-start before the subcommand; a stub that answers
+# neither makes every pane operation a backend_failure.
+if [ "${1:-}" = "--version" ]; then
+  echo "wezterm 20240203-110809-5046fc22"
+  exit 0
+fi
+if [ "${1:-}" = "cli" ] && [ "${2:-}" = "--no-auto-start" ]; then
+  shift 2
+  set -- cli "$@"
+fi
 
 if [ "${1:-}" = "cli" ] && [ "${2:-}" = "list" ]; then
   cat "$FT_TEST_WEZTERM_LIST_JSON"
@@ -314,6 +344,17 @@ fn run_robot_state_toon(case_name: &str, fixture_name: &str) -> String {
     let output = Command::cargo_bin("ft")
         .expect("locate ft binary")
         .env("FT_WORKSPACE", &workspace)
+        // Isolate from the host: ranked mux-socket discovery (ft-xxfwy.5)
+        // would otherwise find a running FrankenTerm GUI's socket and answer
+        // with a version-skew error instead of the stubbed WezTerm CLI.
+        .env("HOME", &workspace)
+        .env("XDG_RUNTIME_DIR", format!("{workspace}/.runtime"))
+        .env("XDG_DATA_HOME", format!("{workspace}/.data"))
+        .env("XDG_CONFIG_HOME", format!("{workspace}/.config"))
+        .env_remove("WEZTERM_UNIX_SOCKET")
+        .env_remove("FRANKENTERM_CONFIG_FILE")
+        .env_remove("FRANKENTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_FT_SOCKET")
         .env("FT_WEZTERM_CLI", &stub_path)
         .env("FT_TEST_WEZTERM_LIST_JSON", &wezterm_json)
         .args(["robot", "--format", "toon", "state"])
@@ -350,6 +391,17 @@ fn run_robot_state_toon_from_json(case_name: &str, panes_json: &Value) -> String
     let output = Command::cargo_bin("ft")
         .expect("locate ft binary")
         .env("FT_WORKSPACE", &workspace)
+        // Isolate from the host: ranked mux-socket discovery (ft-xxfwy.5)
+        // would otherwise find a running FrankenTerm GUI's socket and answer
+        // with a version-skew error instead of the stubbed WezTerm CLI.
+        .env("HOME", &workspace)
+        .env("XDG_RUNTIME_DIR", format!("{workspace}/.runtime"))
+        .env("XDG_DATA_HOME", format!("{workspace}/.data"))
+        .env("XDG_CONFIG_HOME", format!("{workspace}/.config"))
+        .env_remove("WEZTERM_UNIX_SOCKET")
+        .env_remove("FRANKENTERM_CONFIG_FILE")
+        .env_remove("FRANKENTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_FT_SOCKET")
         .env("FT_WEZTERM_CLI", &stub_path)
         .env("FT_TEST_WEZTERM_LIST_JSON", &wezterm_json)
         .args(["robot", "--format", "toon", "state"])
@@ -409,6 +461,17 @@ fn run_snapshot_list_json(case_name: &str, rows: &[SnapshotRow], args: &[&str]) 
     let output = Command::cargo_bin("ft")
         .expect("locate ft binary")
         .env("FT_WORKSPACE", &workspace)
+        // Isolate from the host: ranked mux-socket discovery (ft-xxfwy.5)
+        // would otherwise find a running FrankenTerm GUI's socket and answer
+        // with a version-skew error instead of the stubbed WezTerm CLI.
+        .env("HOME", &workspace)
+        .env("XDG_RUNTIME_DIR", format!("{workspace}/.runtime"))
+        .env("XDG_DATA_HOME", format!("{workspace}/.data"))
+        .env("XDG_CONFIG_HOME", format!("{workspace}/.config"))
+        .env_remove("WEZTERM_UNIX_SOCKET")
+        .env_remove("FRANKENTERM_CONFIG_FILE")
+        .env_remove("FRANKENTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_FT_SOCKET")
         .args(args)
         .assert()
         .success()
@@ -540,6 +603,17 @@ fn robot_get_text_and_search_redact_incident_secrets() {
     let get_text_stdout = Command::cargo_bin("ft")
         .expect("locate ft binary")
         .env("FT_WORKSPACE", &workspace)
+        // Isolate from the host: ranked mux-socket discovery (ft-xxfwy.5)
+        // would otherwise find a running FrankenTerm GUI's socket and answer
+        // with a version-skew error instead of the stubbed WezTerm CLI.
+        .env("HOME", &workspace)
+        .env("XDG_RUNTIME_DIR", format!("{workspace}/.runtime"))
+        .env("XDG_DATA_HOME", format!("{workspace}/.data"))
+        .env("XDG_CONFIG_HOME", format!("{workspace}/.config"))
+        .env_remove("WEZTERM_UNIX_SOCKET")
+        .env_remove("FRANKENTERM_CONFIG_FILE")
+        .env_remove("FRANKENTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_FT_SOCKET")
         .env("FT_WEZTERM_CLI", &stub_path)
         .env("FT_TEST_WEZTERM_LIST_JSON", &wezterm_json)
         .env("FT_TEST_WEZTERM_TEXT_DIR", &text_dir)
@@ -579,6 +653,17 @@ fn robot_get_text_and_search_redact_incident_secrets() {
     let search_stdout = Command::cargo_bin("ft")
         .expect("locate ft binary")
         .env("FT_WORKSPACE", &workspace)
+        // Isolate from the host: ranked mux-socket discovery (ft-xxfwy.5)
+        // would otherwise find a running FrankenTerm GUI's socket and answer
+        // with a version-skew error instead of the stubbed WezTerm CLI.
+        .env("HOME", &workspace)
+        .env("XDG_RUNTIME_DIR", format!("{workspace}/.runtime"))
+        .env("XDG_DATA_HOME", format!("{workspace}/.data"))
+        .env("XDG_CONFIG_HOME", format!("{workspace}/.config"))
+        .env_remove("WEZTERM_UNIX_SOCKET")
+        .env_remove("FRANKENTERM_CONFIG_FILE")
+        .env_remove("FRANKENTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_FT_SOCKET")
         .args(search_command)
         .assert()
         .success()

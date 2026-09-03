@@ -1,24 +1,40 @@
 {
   "count": 2,
+  "has_more": true,
+  "limit": 2,
+  "offset": 0,
   "ok": true,
+  "projection_scope": "checkpoint_summary",
+  "projection_verification": "unchecked_projection",
   "snapshots": [
     {
       "checkpoint_at": 0,
       "checkpoint_id": 3,
+      "checkpoint_role": "snapshot",
       "checkpoint_type": "shutdown",
+      "label": null,
       "pane_count": 3,
+      "pane_state_estimate_bytes": 300,
+      "projection_scope": "checkpoint_summary",
+      "projection_verification": "unchecked_projection",
       "session_id": "limit-c",
       "state_hash": "hash-c",
-      "total_bytes": 300
+      "verification": "not_computed"
     },
     {
       "checkpoint_at": 0,
       "checkpoint_id": 2,
+      "checkpoint_role": "snapshot",
       "checkpoint_type": "periodic",
+      "label": null,
       "pane_count": 2,
+      "pane_state_estimate_bytes": 200,
+      "projection_scope": "checkpoint_summary",
+      "projection_verification": "unchecked_projection",
       "session_id": "limit-b",
       "state_hash": "hash-b",
-      "total_bytes": 200
+      "verification": "not_computed"
     }
-  ]
+  ],
+  "verification": "not_computed"
 }

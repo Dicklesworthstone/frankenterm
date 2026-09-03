@@ -1,5 +1,11 @@
 {
   "count": 0,
+  "has_more": false,
+  "limit": 10,
+  "offset": 0,
   "ok": true,
-  "snapshots": []
+  "projection_scope": "checkpoint_summary",
+  "projection_verification": "unchecked_projection",
+  "snapshots": [],
+  "verification": "not_computed"
 }
