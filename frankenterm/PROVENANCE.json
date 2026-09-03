@@ -394,7 +394,7 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "chore": 1,
+        "chore": 2,
         "cosmetic": 5,
         "docs": 1,
         "feat": 7,
@@ -405,13 +405,13 @@
         "security-fix": 49,
         "test": 6
       },
-      "fork_side_commit_count": 95,
+      "fork_side_commit_count": 96,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-25T01:47:10-04:00",
-        "sha": "8e68db4acc7254b13cd94389d8e6f871ec963a81",
-        "subject": "style: format workspace files per rustfmt contract"
+        "classification": "chore",
+        "committed_at": "2026-09-02T15:16:08-04:00",
+        "sha": "e856ee829d32ae8a8f8b43e238f5d6522fade9cd",
+        "subject": "chore(deps): apply the safe half of the rust-deps group bump (Refs PR #86)"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -632,7 +632,7 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "chore": 7,
+        "chore": 8,
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
@@ -645,13 +645,13 @@
         "security-fix": 7,
         "test": 68
       },
-      "fork_side_commit_count": 540,
+      "fork_side_commit_count": 541,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-31T07:58:50-04:00",
-        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
-        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
+        "classification": "chore",
+        "committed_at": "2026-09-02T15:16:08-04:00",
+        "sha": "e856ee829d32ae8a8f8b43e238f5d6522fade9cd",
+        "subject": "chore(deps): apply the safe half of the rust-deps group bump (Refs PR #86)"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -842,6 +842,7 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
+        "chore": 1,
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 12,
@@ -852,13 +853,13 @@
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 83,
+      "fork_side_commit_count": 84,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-31T07:58:50-04:00",
-        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
-        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
+        "classification": "chore",
+        "committed_at": "2026-09-02T15:16:08-04:00",
+        "sha": "e856ee829d32ae8a8f8b43e238f5d6522fade9cd",
+        "subject": "chore(deps): apply the safe half of the rust-deps group bump (Refs PR #86)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1057,8 +1058,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2370,
-  "generated_at": "2026-09-02T07:40:21.378065Z",
+  "fork_side_commit_total": 2373,
+  "generated_at": "2026-09-03T19:44:41.424455Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
