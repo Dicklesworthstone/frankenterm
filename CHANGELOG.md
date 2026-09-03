@@ -30,6 +30,11 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main>
 
+### Robot contracts
+
+- `ft robot send` receipts report the paste mode that ran (`no_paste`) and whether the trailing newline was suppressed (`no_newline`), matching the human `ft send` receipt (ft-xxfwy.36).
+- Direct mux client: a reply correlated with the registration request but carrying the wrong PDU type is still refused as `InboundPduInvalidForPhase`; only serial-0 notifications are tolerated during registration (planted negative for ft-xxfwy.34).
+
 ---
 
 ## [0.15.2] -- 2026-09-02 (GitHub Release)
