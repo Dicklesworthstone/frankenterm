@@ -992,7 +992,10 @@ fn classify_command_shape(
         return;
     }
 
-    if input.evidence.local_cargo_detected || is_local_cargo_command(&input.intended_command) {
+    if input.evidence.local_cargo_detected
+        || is_local_cargo_command(&input.intended_command)
+        || forces_local_execution(&input.intended_command)
+    {
         blockers.push(
             ProofDoctorBlocker::block(
                 ProofDoctorBlockerKind::CommandShape,
@@ -1794,8 +1797,67 @@ fn verdict_id(input: &ProofDoctorPreflightInput, reason_code: &str) -> String {
     format!("proof-doctor:{bead}:{reason_code}")
 }
 
-fn is_local_cargo_command(command: &[String]) -> bool {
+/// Splits a leading `NAME=VALUE` token into its parts.
+///
+/// Only the shell's own assignment syntax counts: the name must be a valid
+/// environment-variable identifier, so a path or a flag that happens to
+/// contain `=` is never mistaken for an assignment.
+fn env_assignment(token: &str) -> Option<(&str, &str)> {
+    let (name, value) = token.split_once('=')?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut characters = name.chars();
+    let first = characters.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !characters.all(|character| character.is_ascii_alphanumeric() || character == '_') {
+        return None;
+    }
+    Some((name, value))
+}
+
+/// The command with its leading environment assignments removed.
+///
+/// The canonical proof command documented by this module's own blockers is
+/// `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --
+/// env CARGO_TARGET_DIR=... cargo ...`, so the program that actually runs is
+/// never argv[0]. Classifying argv[0] directly rejected the exact shape the
+/// blocker text prescribes (ft-yykm1: the proof-doctor handoff E2E had never
+/// been run end to end and this fired on its very first step).
+fn command_after_env_assignments(command: &[String]) -> &[String] {
+    let program = command
+        .iter()
+        .position(|token| env_assignment(token).is_none())
+        .unwrap_or(command.len());
+    &command[program..]
+}
+
+/// Environment assignments in the command's own prefix that make the Cargo
+/// invocation run on this machine even though `rch` appears in the argv.
+///
+/// These are exactly the escape hatches this repository uses when the fleet is
+/// unusable; they are dev signals, never proof, so a proof command carrying one
+/// is local Cargo wearing a remote shape.
+fn forces_local_execution(command: &[String]) -> bool {
+    const LOCAL_FORCING_VARIABLES: [&str; 3] = [
+        "RCH_FORCE_LOCAL",
+        "RCH_DISABLED",
+        "RCH_CARGO_WRAPPER_BYPASS",
+    ];
+
     command
+        .iter()
+        .map_while(|token| env_assignment(token))
+        .any(|(name, value)| {
+            LOCAL_FORCING_VARIABLES.contains(&name)
+                && !matches!(value, "" | "0" | "false" | "no" | "off")
+        })
+}
+
+fn is_local_cargo_command(command: &[String]) -> bool {
+    command_after_env_assignments(command)
         .first()
         .is_some_and(|first| command_token_is(first, "cargo"))
 }
@@ -1813,6 +1875,7 @@ fn is_shell_wrapped_cargo(command: &[String]) -> bool {
 }
 
 fn is_direct_rch_cargo_command(command: &[String]) -> bool {
+    let command = command_after_env_assignments(command);
     command
         .first()
         .is_some_and(|first| command_token_is(first, "rch"))
@@ -2550,6 +2613,125 @@ mod tests {
                 .map(|projection| projection.state),
             Some(ProofState::LocalInvalid)
         );
+    }
+
+    #[test]
+    fn documented_env_prefixed_rch_shape_is_runnable() {
+        // The blocker text prescribes exactly this argv. Classifying argv[0]
+        // rejected it, so the canonical command was unusable as proof
+        // (ft-yykm1).
+        let mut input = base_input();
+        input.intended_command = vec![
+            "RCH_REQUIRE_REMOTE=1".to_string(),
+            "RCH_NO_SELF_HEALING=1".to_string(),
+            "rch".to_string(),
+            "--no-self-healing".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "env".to_string(),
+            "CARGO_TARGET_DIR=/tmp/ft-wik9p3-target".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+        ];
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
+        assert_eq!(verdict.blockers.len(), 0);
+    }
+
+    #[test]
+    fn env_prefixed_local_cargo_is_still_local_cargo() {
+        let mut input = base_input();
+        input.intended_command = vec![
+            "CARGO_TARGET_DIR=/tmp/ft-local".to_string(),
+            "RUST_BACKTRACE=1".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+        ];
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Invalid);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.command.local_cargo_invalid"
+        );
+    }
+
+    #[test]
+    fn rch_command_forced_local_by_its_env_prefix_is_local_cargo() {
+        // `RCH_FORCE_LOCAL=1` builds on this machine; the `rch` token in the
+        // argv must not launder it into a remote proof claim.
+        for forcing in [
+            "RCH_FORCE_LOCAL=1",
+            "RCH_DISABLED=true",
+            "RCH_CARGO_WRAPPER_BYPASS=1",
+        ] {
+            let mut input = base_input();
+            input.intended_command = vec![
+                forcing.to_string(),
+                "rch".to_string(),
+                "--no-self-healing".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+            ];
+
+            let verdict = classify_proof_doctor(&input);
+
+            assert_eq!(
+                verdict.status,
+                ProofDoctorStatus::Invalid,
+                "{forcing} must not be claimable as remote proof"
+            );
+            assert_eq!(
+                verdict.blockers[0].reason_code, "proof.command.local_cargo_invalid",
+                "{forcing} must classify as local Cargo"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_local_forcing_variable_does_not_invalidate_the_lane() {
+        let mut input = base_input();
+        input.intended_command = vec![
+            "RCH_FORCE_LOCAL=0".to_string(),
+            "rch".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "env".to_string(),
+            "CARGO_TARGET_DIR=/tmp/ft-wik9p3-target".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+        ];
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
+    }
+
+    #[test]
+    fn only_shell_assignment_syntax_counts_as_an_env_prefix() {
+        assert_eq!(
+            env_assignment("CARGO_TARGET_DIR=/tmp/x"),
+            Some(("CARGO_TARGET_DIR", "/tmp/x"))
+        );
+        assert_eq!(env_assignment("A=1"), Some(("A", "1")));
+        assert_eq!(env_assignment("EMPTY="), Some(("EMPTY", "")));
+        assert_eq!(env_assignment("cargo"), None);
+        assert_eq!(env_assignment("=1"), None);
+        assert_eq!(env_assignment("--target=x86_64"), None);
+        assert_eq!(env_assignment("/usr/bin/env"), None);
+        assert_eq!(env_assignment("1BAD=x"), None);
+        assert_eq!(env_assignment("has space=x"), None);
+
+        // A command that is only assignments has no program to classify.
+        let only_env = vec!["A=1".to_string(), "B=2".to_string()];
+        assert!(command_after_env_assignments(&only_env).is_empty());
+        assert!(!is_local_cargo_command(&only_env));
+        assert!(!is_direct_rch_cargo_command(&only_env));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use wezterm_uds::UnixStream;
 
 // Socket naming is owned by the `config` crate so the GUI (publisher), this
 // client library, and `frankenterm-core` discovery cannot drift apart.
-pub use config::gui_socket::{GUI_SOCKET_PREFIX, gui_socket_path_for_pid, parse_gui_socket_pid};
+pub use config::gui_socket::{gui_socket_path_for_pid, parse_gui_socket_pid, GUI_SOCKET_PREFIX};
 
 #[cfg(test)]
 fn is_gui_socket_name(name: &str) -> bool {
@@ -334,7 +334,7 @@ mod windows {
     use std::io::Error as IoError;
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
     use winapi::um::memoryapi::{
-        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
+        CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     };
     use winapi::um::synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
     use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
@@ -967,7 +967,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_or_hardlinked_lease_refuses_quarantine() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         for hardlink in [false, true] {
             let runtime = tempfile::tempdir().expect("unsafe lease runtime");
