@@ -63,6 +63,19 @@ stop_children() {
   # script included) before the receipt is written.
   [ -n "${WATCH:-}" ] && kill "$WATCH" 2>/dev/null
   [ -n "${MUX_PID:-}" ] && kill "$MUX_PID" 2>/dev/null
+  # A watcher whose mux is already gone does not honour SIGTERM (ft-yykm1)
+  # and keeps polling, leaking a defunct child per poll; nine such orphans
+  # once exhausted the maintainer Mac's process limit. Escalate to SIGKILL
+  # after a short grace and report what was left behind.
+  local pid deadline
+  for pid in ${WATCH:-} ${MUX_PID:-}; do
+    deadline=$((SECONDS + 5))
+    while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "child $pid ignored SIGTERM for 5s; sending SIGKILL"
+      kill -9 "$pid" 2>/dev/null
+    fi
+  done
   return 0
 }
 finish() { # status
