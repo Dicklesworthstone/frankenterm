@@ -2681,10 +2681,11 @@ impl WeztermClient {
 
     /// Run a WezTerm CLI command with an explicit capability context. Binds
     /// the subprocess timeout to the provided `Cx` via
-    /// [`crate::runtime_async::timeout_with_cx`] so budget deadlines and
-    /// virtual time bound `wezterm cli` invocations. Direct cancellation is
-    /// propagated by `output_with_cx` and is re-checked immediately after the
-    /// await before subprocess output is admitted.
+    /// `Command::output_with_cx_timeout`, so the deadline is owned by the
+    /// process supervisor and a timeout cannot return before the child has
+    /// been terminated and reaped. Direct cancellation is propagated by the
+    /// same call and is re-checked immediately after the await before
+    /// subprocess output is admitted.
     ///
     /// Mirrors the pattern in [`crate::cass::CassClient::run_with_cx`] and
     /// [`crate::caut::CautClient::run_with_cx`]. Pre-flight socket-path
@@ -2810,15 +2811,16 @@ impl WeztermClient {
         }
 
         let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let output = match crate::runtime_async::timeout_with_cx(
-            cx,
-            timeout_duration,
-            cmd.output_with_cx(cx),
-        )
-        .await
-        {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
+        // The deadline belongs to the process supervisor, not to an outer
+        // timeout. An outer timeout returns as soon as the future is dropped,
+        // which leaves the terminate-and-reap to a best-effort cleanup that can
+        // give up with the leader unreaped: every timed-out `wezterm cli` call
+        // then left a defunct child behind. A watcher whose mux has exited
+        // times one out per poll, and nine of them once exhausted the process
+        // table on a developer machine (ft-yykm1).
+        let output = match cmd.output_with_cx_timeout(cx, timeout_duration).await {
+            Ok(output) => output,
+            Err(error) if error.kind() != std::io::ErrorKind::TimedOut => {
                 if effect.is_mutation() {
                     // NotFound/PermissionDenied are spawn-time failures for
                     // this command surface and prove no backend mutation ran.
@@ -2868,6 +2870,8 @@ impl WeztermClient {
                 );
             }
             Err(_) => {
+                // Timed out: the supervisor has already terminated the process
+                // group and settled its cleanup before returning here.
                 if effect.is_mutation() {
                     let circuit_evidence = if cx.checkpoint().is_ok() {
                         CliMutationCircuitEvidence::BackendFailure
@@ -11381,6 +11385,40 @@ impl WeztermInterface for FailingMockWezterm {
 #[must_use]
 pub fn mock_wezterm_handle_failing() -> WeztermHandle {
     Arc::new(FailingMockWezterm)
+}
+
+#[cfg(test)]
+mod cli_supervisor_source_contract {
+    /// The CLI subprocess must own its deadline inside the process supervisor.
+    ///
+    /// Wrapping `output_with_cx` in an outer timeout returns as soon as the
+    /// future is dropped and leaves the terminate-and-reap to a best-effort
+    /// cleanup that can give up with the child unreaped; the watcher then
+    /// leaked one defunct process per poll against a dead mux (ft-yykm1).
+    /// `output_with_cx_timeout` terminates the process group, drains the
+    /// pipes, and reaps the leader before it settles. This mirrors the guard
+    /// on the compatible-client subprocess helper in the `ft` binary.
+    #[test]
+    fn cli_subprocess_uses_the_cleanup_settled_deadline_api() {
+        let source = include_str!("wezterm.rs");
+        let start = source
+            .find("    async fn run_cli_effect_with_cx(")
+            .expect("CLI effect supervisor remains present");
+        let end = source[start..]
+            .find("    fn cli_effect_result(")
+            .map(|offset| start + offset)
+            .expect("cli_effect_result follows the CLI effect supervisor");
+        let supervisor = &source[start..end];
+
+        assert!(
+            supervisor.contains("cmd.output_with_cx_timeout(cx, timeout_duration)"),
+            "the CLI subprocess deadline must be owned by the process supervisor"
+        );
+        assert!(
+            !supervisor.contains("timeout_with_cx("),
+            "an outer timeout around the subprocess can return with the child unreaped"
+        );
+    }
 }
 
 #[cfg(test)]

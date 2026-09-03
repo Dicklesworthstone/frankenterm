@@ -6349,6 +6349,7 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut current_interval = initial_interval;
+            let mut consecutive_discovery_failures = 0_u32;
             let mut first_tick = true;
             let mut last_discovery_revision = 0_u64;
             let mut last_publication_epoch = 0_u64;
@@ -6367,8 +6368,11 @@ impl ObservationRuntime {
                     first_tick = false;
                 } else {
                     // Wait for interval, checking shutdown periodically to ensure responsiveness
-                    let deadline =
-                        crate::runtime_async::timer_now_with_cx(&loop_cx) + current_interval;
+                    let deadline = crate::runtime_async::timer_now_with_cx(&loop_cx)
+                        + discovery_backoff_interval(
+                            current_interval,
+                            consecutive_discovery_failures,
+                        );
                     loop {
                         if shutdown_flag.load(Ordering::SeqCst) {
                             break;
@@ -6414,6 +6418,7 @@ impl ObservationRuntime {
                 match wezterm.list_panes().await {
                     Ok(panes) => {
                         heartbeats.record_discovery();
+                        consecutive_discovery_failures = 0;
                         // This must be the first operation after the listing:
                         // do not cross even a contended async registry lock
                         // while an identity contradicted by the fresh mux view
@@ -6973,7 +6978,18 @@ impl ObservationRuntime {
                     }
                     Err(e) => {
                         heartbeats.record_discovery();
-                        warn!(error = %e, "Failed to list panes");
+                        consecutive_discovery_failures =
+                            consecutive_discovery_failures.saturating_add(1);
+                        let next_interval = discovery_backoff_interval(
+                            current_interval,
+                            consecutive_discovery_failures,
+                        );
+                        warn!(
+                            error = %e,
+                            consecutive_failures = consecutive_discovery_failures,
+                            next_poll_ms = duration_ms_u64(next_interval),
+                            "Failed to list panes"
+                        );
                     }
                 }
             }
@@ -12181,6 +12197,29 @@ fn epoch_ms_u64() -> u64 {
 
 fn duration_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How long discovery waits before its next poll after `consecutive_failures`
+/// failed listings in a row.
+///
+/// Without this the loop re-issues `list_panes` at the configured rate for as
+/// long as the process lives, so a watcher whose mux server has exited pays a
+/// full subprocess timeout every interval and learns nothing (ft-yykm1). The
+/// first retry still happens at the configured interval, so a single dropped
+/// listing is invisible; a backend that stays down settles at two polls a
+/// minute. A configured interval slower than the ceiling is never sped up.
+fn discovery_backoff_interval(configured: Duration, consecutive_failures: u32) -> Duration {
+    const MAX_DISCOVERY_BACKOFF: Duration = Duration::from_secs(30);
+
+    if consecutive_failures == 0 {
+        return configured;
+    }
+    let doublings = consecutive_failures.saturating_sub(1).min(16);
+    let factor = 1_u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    configured
+        .saturating_mul(factor)
+        .min(MAX_DISCOVERY_BACKOFF)
+        .max(configured)
 }
 
 fn event_counts_as_activity(event: &Event) -> bool {
@@ -20528,6 +20567,57 @@ mod tests {
     fn duration_ms_u64_sub_millisecond() {
         // 500 microseconds = 0 milliseconds (truncated)
         assert_eq!(duration_ms_u64(Duration::from_micros(500)), 0);
+    }
+
+    // =========================================================================
+    // discovery_backoff_interval (ft-yykm1)
+    // =========================================================================
+
+    #[test]
+    fn discovery_backoff_keeps_the_configured_interval_while_healthy() {
+        let configured = Duration::from_millis(1000);
+        assert_eq!(discovery_backoff_interval(configured, 0), configured);
+        // The first failure retries at the configured rate: one dropped
+        // listing must not slow a healthy watcher down.
+        assert_eq!(discovery_backoff_interval(configured, 1), configured);
+    }
+
+    #[test]
+    fn discovery_backoff_doubles_and_settles_at_the_ceiling() {
+        let configured = Duration::from_millis(1000);
+        assert_eq!(
+            discovery_backoff_interval(configured, 2),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            discovery_backoff_interval(configured, 3),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            discovery_backoff_interval(configured, 6),
+            Duration::from_secs(30)
+        );
+        // A backend that has been down for hours must not overflow or grow
+        // without bound.
+        assert_eq!(
+            discovery_backoff_interval(configured, u32::MAX),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn discovery_backoff_never_speeds_up_a_slow_configured_interval() {
+        let configured = Duration::from_secs(120);
+        assert_eq!(discovery_backoff_interval(configured, 0), configured);
+        assert_eq!(discovery_backoff_interval(configured, 9), configured);
+    }
+
+    #[test]
+    fn discovery_backoff_handles_a_zero_interval() {
+        assert_eq!(
+            discovery_backoff_interval(Duration::ZERO, 5),
+            Duration::ZERO
+        );
     }
 
     // =========================================================================

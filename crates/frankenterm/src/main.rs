@@ -45970,6 +45970,14 @@ fn coalesce_watcher_control_action(
     selected
 }
 
+/// Wall-clock bound on the terminal pane listing taken during watcher
+/// shutdown.
+///
+/// The listing runs after the signal that asked the watcher to stop, against a
+/// backend that is frequently the reason the watcher is stopping at all. It is
+/// worth a short wait for a real terminal snapshot and nothing more (ft-yykm1).
+const SHUTDOWN_TERMINAL_SNAPSHOT_LISTING_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatcherControlReceiveFailure {
     ContextCancelled,
@@ -47306,8 +47314,20 @@ async fn run_watcher(
         let wez = wezterm_handle.clone();
         let shutdown_snap_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        match wez.list_panes_with_cx(&shutdown_snap_cx).await {
-            Ok(panes) => match engine
+        // SIGTERM arrives most often because the backend this listing talks to
+        // is already gone, and the listing then costs a full retry ladder of
+        // subprocess timeouts before it fails. Bound it so `ft watch` exits on
+        // the signal instead of appearing to ignore it (ft-yykm1). Timing out
+        // is a listing failure, not evidence of an empty session, so the clean
+        // mark is withheld exactly as it is for any other listing error.
+        match frankenterm_core::runtime_async::timeout_with_cx(
+            &shutdown_snap_cx,
+            SHUTDOWN_TERMINAL_SNAPSHOT_LISTING_TIMEOUT,
+            wez.list_panes_with_cx(&shutdown_snap_cx),
+        )
+        .await
+        {
+            Ok(Ok(panes)) => match engine
                 .shutdown_checkpoint_with_cx(&shutdown_snap_cx, &panes, Duration::from_secs(5))
                 .await
             {
@@ -47334,13 +47354,23 @@ async fn run_watcher(
                     shutdown_failures.push(anyhow::anyhow!(detail));
                 }
             },
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(
                     %error,
                     "Failed to list panes for shutdown checkpoint; snapshot session remains unclean"
                 );
                 shutdown_failures.push(anyhow::anyhow!(
                     "failed to list panes for the shutdown checkpoint: {error}"
+                ));
+            }
+            Err(_) => {
+                let seconds = SHUTDOWN_TERMINAL_SNAPSHOT_LISTING_TIMEOUT.as_secs();
+                tracing::warn!(
+                    timeout_secs = seconds,
+                    "Timed out listing panes for the shutdown checkpoint; snapshot session remains unclean"
+                );
+                shutdown_failures.push(anyhow::anyhow!(
+                    "timed out after {seconds}s listing panes for the shutdown checkpoint"
                 ));
             }
         }
