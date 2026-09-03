@@ -1059,7 +1059,7 @@
   },
   "fork_repo": "frankenterm",
   "fork_side_commit_total": 2375,
-  "generated_at": "2026-09-03T19:52:48.300453Z",
+  "generated_at": "2026-09-03T20:12:28.484628Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

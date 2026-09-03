@@ -239,6 +239,19 @@ def main() -> int:
         return 1
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # A rerun that finds no drift keeps the committed timestamp. The gate
+    # already treats generated_at as insignificant, so rewriting it only
+    # dirties the working tree -- which matters, because a release lane
+    # refuses to build from a dirty checkout.
+    if out_path.is_file():
+        existing = out_path.read_text()
+        stripped = r'"generated_at": "<stripped>"'
+        pattern = r'"generated_at":\s*"[^"]*"'
+        if re.sub(pattern, stripped, existing) == re.sub(pattern, stripped, payload):
+            print(f"ft-i2eni.6: {out_path} already current ({manifest['vendored_crate_count']} "
+                  f"crates, {manifest['fork_side_commit_total']} fork-side commits); "
+                  "timestamp left as committed.")
+            return 0
     out_path.write_text(payload)
     print(f"ft-i2eni.6: wrote {out_path}: {manifest['vendored_crate_count']} crates, "
           f"{manifest['fork_side_commit_total']} fork-side commits, divergence "
