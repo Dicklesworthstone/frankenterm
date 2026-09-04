@@ -14914,7 +14914,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_outbound_runtime_event_dispatches_through_mesh_and_host_runtime() {
+    fn connector_outbound_runtime_event_refuses_missing_transport_without_success_or_retry() {
         let mut bridge = crate::connector_outbound_bridge::ConnectorOutboundBridge::new(
             crate::connector_outbound_bridge::ConnectorOutboundBridgeConfig::default(),
         );
@@ -14950,35 +14950,52 @@ mod tests {
         process_connector_outbound_runtime_event(&mut bridge, &event, 5_000);
 
         assert_eq!(bridge.pending_action_count(), 0);
+        // This existing bridge counter counts queue admission, not delivery.
         assert_eq!(bridge.telemetry().actions_dispatched, 1);
         let policy = bridge.policy_engine();
         let mesh = policy.connector_mesh().telemetry().snapshot();
-        assert_eq!(mesh.zones_created, 1);
-        assert_eq!(mesh.hosts_registered, 1);
-        assert_eq!(mesh.heartbeats_received, 1);
-        assert_eq!(mesh.routing_requests, 1);
-        assert_eq!(mesh.routing_successes, 1);
+        assert_eq!(mesh.zones_created, 0);
+        assert_eq!(mesh.hosts_registered, 0);
+        assert_eq!(mesh.heartbeats_received, 0);
+        assert_eq!(mesh.routing_requests, 0);
+        assert_eq!(mesh.routing_successes, 0);
         assert_eq!(policy.connector_mesh().health_snapshot().total_active, 0);
-        assert_eq!(
-            policy.connector_host_runtime().state().phase(),
-            crate::connector_host_runtime::ConnectorLifecyclePhase::Running
-        );
         assert_eq!(
             policy
                 .connector_host_runtime()
                 .sandbox_decision_history()
                 .len(),
-            1,
-            "runtime dispatch must authorize through the policy-owned host runtime"
+            0,
+            "unavailable transport must not synthesize a running host or admission receipt"
         );
         assert_eq!(
             policy.reliability_registry().total_dlq_depth(),
             0,
-            "mesh-routed runtime dispatch should complete without DLQ feedback"
+            "missing implementation cannot recover by retrying"
         );
-        assert!(
-            policy.reliability_registry().get("worker").is_some(),
-            "successful dispatch should feed reliability success for the target connector"
+        let feedback = policy
+            .reliability_registry()
+            .get("worker")
+            .unwrap()
+            .telemetry_snapshot();
+        assert_eq!(feedback.operations_succeeded, 0);
+        assert_eq!(feedback.operations_failed, 1);
+        process_connector_outbound_runtime_event(&mut bridge, &event, 5_001);
+        assert_eq!(bridge.pending_action_count(), 0);
+        assert_eq!(
+            bridge.policy_engine().reliability_registry().total_dlq_depth(),
+            0
+        );
+        assert_eq!(
+            bridge
+                .policy_engine()
+                .reliability_registry()
+                .get("worker")
+                .unwrap()
+                .telemetry_snapshot()
+                .operations_failed,
+            1,
+            "replaying the same event does not retry an unavailable transport"
         );
     }
 

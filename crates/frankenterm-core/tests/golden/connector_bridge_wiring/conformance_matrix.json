@@ -10,7 +10,7 @@
   {
     "bead": "ft-7h5da.5.10",
     "bridge": "outbound",
-    "contract": "runtime EventBus subscriber feeds ConnectorOutboundBridge and host-runtime feedback",
+    "contract": "runtime EventBus feeds outbound admission; unavailable delivery fails closed without success or retry",
     "production_caller_wired": true,
     "fail_closed": true,
     "no_silent_drop": true
@@ -18,7 +18,7 @@
   {
     "bead": "ft-7h5da.5.11",
     "bridge": "lifecycle_mesh",
-    "contract": "lifecycle mutations and connector actions route through PolicyEngine lifecycle/mesh boundaries",
+    "contract": "PolicyEngine exposes lifecycle/mesh admission models; runtime refuses delivery without transport",
     "production_caller_wired": true,
     "fail_closed": true,
     "no_silent_drop": true

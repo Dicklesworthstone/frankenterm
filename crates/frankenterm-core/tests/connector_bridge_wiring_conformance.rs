@@ -160,7 +160,7 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
         {
             "bead": "ft-7h5da.5.10",
             "bridge": "outbound",
-            "contract": "runtime EventBus subscriber feeds ConnectorOutboundBridge and host-runtime feedback",
+            "contract": "runtime EventBus feeds outbound admission; unavailable delivery fails closed without success or retry",
             "production_caller_wired": contains_all(
                 &runtime,
                 &[
@@ -185,9 +185,9 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
             ) && contains_all(
                 &runtime,
                 &[
-                    "record_action_success(action, now_ms)",
-                    "record_action_failure(action, err.to_string(), kind, now_ms)",
-                    "ConnectorErrorKind::ServiceUnavailable",
+                    "ConnectorOutboundDeliveryError::TransportUnavailable",
+                    "record_action_failure(action, error.code(), ConnectorErrorKind::Permanent, now_ms)",
+                    "delivered = false",
                 ],
             ),
             "no_silent_drop": contains_all(
@@ -204,7 +204,7 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
         {
             "bead": "ft-7h5da.5.11",
             "bridge": "lifecycle_mesh",
-            "contract": "lifecycle mutations and connector actions route through PolicyEngine lifecycle/mesh boundaries",
+            "contract": "PolicyEngine exposes lifecycle/mesh admission models; runtime refuses delivery without transport",
             "production_caller_wired": contains_all(
                 &policy,
                 &[
@@ -217,7 +217,7 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
             ) && contains_all(
                 &runtime,
                 &[
-                    ".route_connector_operation_through_mesh(",
+                    "ConnectorOutboundDeliveryError::TransportUnavailable",
                     "dispatch_connector_outbound_action",
                 ],
             ),
@@ -235,8 +235,8 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
             ) && contains_all(
                 &runtime,
                 &[
-                    "connector_operation_dispatch_error_kind",
-                    "ConnectorErrorKind::ServiceUnavailable",
+                    "ConnectorOutboundDeliveryError::TransportUnavailable",
+                    "delivered = false",
                     "ConnectorErrorKind::Permanent",
                 ],
             ),
@@ -253,8 +253,8 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
             ) && contains_all(
                 &runtime,
                 &[
-                    "record_action_success(action, now_ms)",
-                    "record_action_failure(action, err.to_string(), kind, now_ms)",
+                    "connector outbound action was not dispatched",
+                    "record_action_failure(action, error.code(), ConnectorErrorKind::Permanent, now_ms)",
                 ],
             ),
         },
@@ -381,10 +381,10 @@ fn outbound_bridge_has_runtime_production_dispatch() -> TestResult {
          (ft-7h5da.5.10)"
     );
     assert!(
-        src.contains("record_action_success(action, now_ms)")
-            && src.contains("record_action_failure(action, err.to_string(), kind, now_ms)"),
-        "runtime.rs must feed host-runtime success/failure back into ConnectorOutboundBridge \
-         (ft-7h5da.5.10)"
+        src.contains("ConnectorOutboundDeliveryError::TransportUnavailable")
+            && src.contains("ConnectorErrorKind::Permanent")
+            && !src.contains("record_action_success(action, now_ms)"),
+        "runtime.rs must refuse unavailable transport without recording delivery success"
     );
     Ok(())
 }
@@ -467,11 +467,11 @@ fn lifecycle_routes_through_policy_engine_boundary() -> TestResult {
     );
     let runtime = core_src("runtime.rs")?;
     assert!(
-        runtime.contains(".route_connector_operation_through_mesh(")
-            && runtime.contains("record_action_success(action, now_ms)")
-            && runtime.contains("record_action_failure(action, err.to_string(), kind, now_ms)"),
-        "runtime outbound dispatch must call the policy-owned mesh boundary and feed \
-         success/failure back into the connector bridge (ft-7h5da.5.11)"
+        runtime.contains("ConnectorOutboundDeliveryError::TransportUnavailable")
+            && runtime.contains("ConnectorErrorKind::Permanent")
+            && !runtime.contains(".route_connector_operation_through_mesh(")
+            && !runtime.contains("record_action_success(action, now_ms)"),
+        "runtime outbound delivery must fail closed; mesh admission is not transport execution"
     );
     Ok(())
 }
