@@ -46170,7 +46170,7 @@ async fn run_watcher(
     use frankenterm_core::lock::WatcherLock;
     use frankenterm_core::notifications::NotificationPipeline;
     use frankenterm_core::patterns::PatternEngine;
-    use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
+    use frankenterm_core::policy::PolicyGatedInjector;
     use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
     use frankenterm_core::runtime_async::{mpsc, watch};
     use frankenterm_core::storage::StorageHandle;
@@ -121669,6 +121669,215 @@ printf x > "$MINISIGN_MARKER"
             "ft-4z7vh: workflow PolicyEngine built with require_prompt_active=true \
              must deny SendText when a command is running; got {decision:?}"
         );
+    }
+
+    #[test]
+    fn watcher_policy_configured_rule_denies_without_input_and_audits() {
+        use frankenterm_core::config::{Config, PolicyRule, PolicyRuleDecision, PolicyRuleMatch};
+        use frankenterm_core::policy::{
+            ActorKind, InjectionResult, PaneCapabilities, PolicyGatedInjector,
+        };
+        use frankenterm_core::storage::AuditQuery;
+        use frankenterm_core::wezterm::{MockWezterm, MuxInterface, WeztermHandle};
+
+        run_async_test(async {
+            let cx = frankenterm_core::cx::for_request();
+            let (storage, _) = setup_storage("watcher_configured_policy").await;
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane_with_cx(&cx, 42).await.unwrap();
+            let before = mock.get_text_with_cx(&cx, 42, false).await.unwrap();
+            let mut config = Config::default();
+            config.safety.rules.rules.push(PolicyRule {
+                id: "operator.deny_workflow_send".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    actions: vec!["send_text".to_string()],
+                    actors: vec!["workflow".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: Some("Workflow sends disabled by operator".to_string()),
+            });
+            // This is the same assembly function called by run_watcher.
+            let engine = build_watcher_policy_engine(&config, &storage).await;
+            let handle: WeztermHandle = mock.clone();
+            let mut injector = PolicyGatedInjector::with_storage(engine, handle, storage.clone());
+            let result = injector
+                .send_text_with_cx(
+                    &cx,
+                    42,
+                    "echo watcher-policy-probe\n",
+                    ActorKind::Workflow,
+                    &PaneCapabilities::prompt(),
+                    None,
+                )
+                .await;
+            let InjectionResult::Denied {
+                decision,
+                audit_action_id,
+                ..
+            } = result
+            else {
+                panic!("configured watcher rule must deny, got {result:?}");
+            };
+            assert_eq!(decision.rule_id(), Some("config.rule.operator.deny_workflow_send"));
+            let audit_id = audit_action_id.expect("denial must reach real SQLite audit storage");
+            assert_eq!(mock.get_text_with_cx(&cx, 42, false).await.unwrap(), before);
+            let audit = storage
+                .get_audit_actions_with_cx(
+                    &cx,
+                    AuditQuery {
+                        pane_id: Some(42),
+                        action_kind: Some("send_text".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].id, audit_id);
+            assert_eq!(audit[0].actor_kind, "workflow");
+            assert_eq!(audit[0].policy_decision, "deny");
+            assert_eq!(audit[0].result, "denied");
+            assert_eq!(
+                audit[0].rule_id.as_deref(),
+                Some("config.rule.operator.deny_workflow_send")
+            );
+
+            // Positive control: removing the configured deny permits exactly
+            // the requested input through the same injector and pane handle.
+            config.safety.rules.rules.clear();
+            let engine = build_watcher_policy_engine(&config, &storage).await;
+            let handle: WeztermHandle = mock.clone();
+            let mut injector = PolicyGatedInjector::with_storage(engine, handle, storage.clone());
+            let result = injector
+                .send_text_with_cx(
+                    &cx,
+                    42,
+                    "echo watcher-policy-probe\n",
+                    ActorKind::Workflow,
+                    &PaneCapabilities::prompt(),
+                    None,
+                )
+                .await;
+            assert!(result.is_allowed(), "allow control failed: {result:?}");
+            assert!(result.audit_action_id().is_some());
+            assert_eq!(
+                mock.get_text_with_cx(&cx, 42, false).await.unwrap(),
+                format!("{before}echo watcher-policy-probe\n")
+            );
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn watcher_policy_assembly_honors_safety_and_tuning() {
+        use frankenterm_core::config::Config;
+        use frankenterm_core::policy::{ActionKind, ActorKind, PaneCapabilities, PolicyInput};
+
+        run_async_test(async {
+            let (storage, _) = setup_storage("watcher_safety_tuning").await;
+            let mut config = Config::default();
+            let input = |capabilities| {
+                PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+                    .with_pane(42)
+                    .with_capabilities(capabilities)
+                    .with_command_text("echo watcher-policy-probe")
+            };
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            let denied = engine.authorize(&input(PaneCapabilities::running()));
+            assert!(denied.is_denied());
+            assert_eq!(denied.rule_id(), Some("policy.prompt_required"));
+
+            config.safety.require_prompt_active = false;
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert!(engine.authorize(&input(PaneCapabilities::running())).is_allowed());
+
+            let mut alt_screen = PaneCapabilities::prompt();
+            alt_screen.alt_screen = Some(true);
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            let approval = engine.authorize(&input(alt_screen.clone()));
+            assert!(approval.requires_approval());
+            assert_eq!(approval.rule_id(), Some("policy.block_alt_screen"));
+            config.safety.block_alt_screen = false;
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            let denied = engine.authorize(&input(alt_screen));
+            assert!(denied.is_denied());
+            assert_eq!(denied.rule_id(), Some("policy.alt_screen"));
+
+            let mut after_gap = PaneCapabilities::prompt();
+            after_gap.has_recent_gap = true;
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            let approval = engine.authorize(&input(after_gap.clone()));
+            assert_eq!(approval.rule_id(), Some("policy.recent_gap"));
+            config.safety.block_recent_gap = false;
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert!(engine.authorize(&input(after_gap)).is_allowed());
+
+            config.safety.rate_limit_per_pane = 1;
+            config.safety.rate_limit_global = 100;
+            config.tuning.policy.rate_limit_window_secs = 17;
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert!(engine.authorize(&input(PaneCapabilities::prompt())).is_allowed());
+            let limited = engine.authorize(&input(PaneCapabilities::prompt()));
+            assert_eq!(limited.rule_id(), Some("policy.rate_limit"));
+            assert!(limited.reason().unwrap().contains("1/1 in 17s window"));
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn watcher_policy_assembly_restores_switch_and_fails_closed() {
+        use frankenterm_core::config::Config;
+        use frankenterm_core::policy::{ActionKind, ActorKind, PaneCapabilities, PolicyInput};
+        use frankenterm_core::policy_kill_switch_state::{
+            FAIL_CLOSED_ACTOR, KILL_SWITCH_STATE_KEY, persist_kill_switch_to_storage_with_cx,
+        };
+        use frankenterm_core::policy_quarantine::{KillSwitch, KillSwitchLevel};
+
+        run_async_test(async {
+            let cx = frankenterm_core::cx::for_request();
+            let (storage, db_path) = setup_storage("watcher_switch_restore").await;
+            let config = Config::default();
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+                .with_pane(42)
+                .with_capabilities(PaneCapabilities::prompt())
+                .with_command_text("echo watcher-policy-probe");
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::Disarmed);
+            assert!(engine.authorize(&input).is_allowed());
+
+            let mut switch = KillSwitch::disarmed();
+            switch.trip(KillSwitchLevel::HardStop, "operator", "test", 1);
+            persist_kill_switch_to_storage_with_cx(&cx, &storage, &switch)
+                .await
+                .unwrap();
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert_eq!(engine.kill_switch_state().changed_by, "operator");
+            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+
+            storage
+                .set_config_value_with_cx(&cx, KILL_SWITCH_STATE_KEY, "{invalid-json")
+                .await
+                .unwrap();
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::HardStop);
+            assert_eq!(engine.kill_switch_state().changed_by, FAIL_CLOSED_ACTOR);
+            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+
+            // A missing table is a real storage-read failure, distinct from a
+            // missing row. Preserve this test database for failure inspection.
+            storage.shutdown_with_cx(&cx).await.unwrap();
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .execute_batch("ALTER TABLE config RENAME TO unavailable_config_fixture")
+                .unwrap();
+            let mut engine = build_watcher_policy_engine(&config, &storage).await;
+            assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::HardStop);
+            assert_eq!(engine.kill_switch_state().changed_by, FAIL_CLOSED_ACTOR);
+            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+        });
     }
 
     #[cfg(feature = "distributed")]
