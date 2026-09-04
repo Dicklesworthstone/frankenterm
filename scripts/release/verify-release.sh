@@ -53,11 +53,13 @@ note() { printf '%s\n' "$*"; }
 bad() { printf 'FAIL %s\n' "$*"; fail=$((fail + 1)); }
 good() { printf 'ok   %s\n' "$*"; }
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/ft-verify-release.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
-
 declare -a published=()
 if [[ -n "$VERSION" ]]; then
+  # Retain the bounded public release metadata as closeout evidence.  Apart
+  # from making a failed verification diagnosable, this avoids a recursive
+  # cleanup command that is forbidden by the repository safety contract.
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/ft-verify-release.XXXXXX")"
+  note "release verification evidence: $tmp"
   tag="v${VERSION#v}"
   command -v gh >/dev/null 2>&1 || { echo "gh is required for online verification" >&2; exit 2; }
   if ! gh release view "$tag" -R "$OWNER_REPO" --json assets -q '.assets[].name' > "$tmp/assets.txt" 2>"$tmp/gh.err"; then
@@ -67,7 +69,7 @@ if [[ -n "$VERSION" ]]; then
   mapfile -t published < "$tmp/assets.txt"
   manifest_name="frankenterm-${tag}-manifest.json"
   if printf '%s\n' "${published[@]}" | grep -qx "$manifest_name"; then
-    if gh release download "$tag" -R "$OWNER_REPO" -p "$manifest_name" -D "$tmp" --clobber >/dev/null 2>&1; then
+    if gh release download "$tag" -R "$OWNER_REPO" -p "$manifest_name" -D "$tmp" >/dev/null 2>&1; then
       MANIFEST="$tmp/$manifest_name"
       good "manifest $manifest_name downloaded"
     else

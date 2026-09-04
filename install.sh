@@ -24,6 +24,7 @@
 #   --no-verify        Skip DSR minisign verification (SHA-256 remains required)
 #   --offline TARBALL  Skip network entirely; install from local tarball
 #   --force            Force reinstall even if same version is installed
+#   --activate-if-idle Promote a published candidate when no live process owns state
 #   --help             Show this message
 #
 # Environment overrides:
@@ -71,6 +72,10 @@ FORCE_INSTALL=0
 # process-family authority; requires --idle-host-confirmed (ft-xxfwy.3).
 ACTIVATE_GENERATION=""
 IDLE_HOST_CONFIRMED=0
+# --activate-if-idle: after publishing a candidate, promote it only when the
+# bounded process census is inactive. First installs take this path by default
+# because there is no prior stable process-family authority to preserve.
+ACTIVATE_IF_IDLE=0
 # macOS GUI app (.app) install. -1 = auto (on for darwin-arm64 prebuilt
 # installs), 0 = disabled (--no-app), 1 = forced (--with-app). APP_DEST
 # overrides the install directory (default /Applications, fallback
@@ -96,6 +101,8 @@ PROCESS_FAMILY_ACTIVATION_STATE=""
 PROCESS_FAMILY_ACTIVE_AUTHORITY=""
 PROCESS_FAMILY_ACTIVE_ROOT=""
 PROCESS_FAMILY_PENDING_REASON=""
+PROCESS_FAMILY_VERIFICATION_STATE="not-run"
+PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="not-observed"
 INITIAL_SELECTOR_HOLD_REASON=""
 VERIFIED_ARCHIVE_IDENTITY=""
 FONT_INSTALLED_PATH=""
@@ -1540,9 +1547,10 @@ require_no_live_mux_for_initial_selector() {
       err "Mux ownership could not be proven inactive; refusing initial selector creation"
       ;;
   esac
-  # A process census is evidence, not an exclusion primitive. Until every GUI,
-  # CLI, and mux launcher participates in one lease, this function must never
-  # authorize selector publication, including after an inactive observation.
+  # A process census is evidence, not an exclusion primitive. Candidate
+  # publication never treats it as activation authority; the top-level idle
+  # orchestration repeats the census immediately before the existing atomic
+  # selector transaction.
   return 1
 }
 
@@ -1604,6 +1612,7 @@ install_process_family() {
   PROCESS_FAMILY_ACTIVE_AUTHORITY=""
   PROCESS_FAMILY_ACTIVE_ROOT=""
   PROCESS_FAMILY_PENDING_REASON=""
+  PROCESS_FAMILY_VERIFICATION_STATE="not-run"
   INITIAL_SELECTOR_HOLD_REASON=""
 
   command -v python3 >/dev/null 2>&1 || {
@@ -1682,6 +1691,7 @@ install_process_family() {
     err "Process-family selector authority is ambiguous or unsafe"
     return 1
   }
+  PROCESS_FAMILY_VERIFICATION_STATE="component-manifest-verified"
   case "$authority_state" in
     initial)
       initial_install=1
@@ -1810,23 +1820,20 @@ install_process_family() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Explicit activation of a published candidate generation (ft-xxfwy.3).
+# Activation of a published candidate generation (ft-xxfwy.3).
 #
-# The automatic install path never publishes the selector: a process census
-# is evidence, not exclusion (see require_no_live_mux_for_initial_selector),
-# so every fresh candidate is left `pending` and the stable `ft` path stays
-# absent. This subcommand is the documented way to finish the job. It moves
-# the live authority to a verified candidate only when the operator attests
-# that no FrankenTerm GUI, mux server, PTY guardian, or watcher is running
-# (--idle-host-confirmed) AND the census agrees it cannot see one. Every
-# mutation reuses the descriptor-pinned atomic transitions that candidate
-# publication uses. Stable entrypoints are made uniformly indirect while they
-# still resolve to the exact prior bytes (or remain uniformly unavailable on a
-# first install), and the selector is committed last. A crash can therefore be
-# resumed without exposing a mixed-version triplet. This idle-host transaction
-# does not claim to serialize a concurrently launched legacy binary that
-# predates FrankenTerm's lifecycle protocol; the operator's bounded
-# --idle-host-confirmed maintenance window is an explicit one-time prerequisite.
+# Candidate publication and selector activation remain separate operations.
+# A first install, or an upgrade requested with --activate-if-idle, may enter
+# through the `if-idle` admission mode after an inactive census. An explicit
+# --activate invocation enters through `manual-confirmed` and additionally
+# requires --idle-host-confirmed. Both modes repeat the census immediately
+# before mutation and reuse the same descriptor-pinned atomic transitions.
+# Stable entrypoints are made uniformly indirect while they still resolve to
+# the exact prior bytes (or remain uniformly unavailable on a first install),
+# and the selector is committed last. A crash can therefore be resumed without
+# exposing a mixed-version triplet. This bounded transaction does not claim to
+# serialize a concurrently launched legacy binary that predates FrankenTerm's
+# lifecycle protocol.
 #
 # Failpoints (FT_INSTALL_TEST_ENABLE_FAILPOINTS=1 FT_INSTALL_TEST_FAILPOINT=...):
 #   before-selector-activation, after-selector-activation,
@@ -1844,10 +1851,26 @@ probe_activated_process_family() {
   for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
     "$DEST/$name" --version >/dev/null 2>&1 || return 1
   done
+  "$DEST/ft" doctor --json 2>/dev/null | python3 -c '
+import json
+import sys
+
+limit = 1024 * 1024
+payload = sys.stdin.buffer.read(limit + 1)
+if len(payload) > limit:
+    raise SystemExit(1)
+try:
+    report = json.loads(payload)
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(report, dict) or report.get("ok") is not True:
+    raise SystemExit(1)
+' >/dev/null
 }
 
 activate_process_family_generation() {
   local generation_id="$1"
+  local admission_mode="${2:-manual-confirmed}"
   local managed="$DEST/.frankenterm-process-family"
   local generations="$managed/generations"
   local generation="$generations/$generation_id"
@@ -1873,12 +1896,22 @@ activate_process_family_generation() {
     err "Run the installer first; it publishes the candidate and prints its id"
     return 1
   }
-  if [ "$IDLE_HOST_CONFIRMED" -ne 1 ]; then
-    err "Activation replaces the live process-family authority under $DEST."
-    err "Quit every FrankenTerm window, frankenterm-mux-server, PTY guardian, and ft watcher,"
-    err "then rerun with --idle-host-confirmed to attest that the host is idle."
-    return 1
-  fi
+  case "$admission_mode" in
+    manual-confirmed)
+      if [ "$IDLE_HOST_CONFIRMED" -ne 1 ]; then
+        err "Activation replaces the live process-family authority under $DEST."
+        err "Quit every FrankenTerm window, frankenterm-mux-server, PTY guardian, and ft watcher,"
+        err "then rerun with --idle-host-confirmed to attest that the host is idle."
+        return 1
+      fi
+      ;;
+    if-idle)
+      ;;
+    *)
+      err "Unsupported process-family activation admission mode: $admission_mode"
+      return 2
+      ;;
+  esac
   census=$(installer_mux_ownership_state) || census=ambiguous
   if [ "$census" != inactive ]; then
     err "Mux ownership census reports '$census'; refusing activation while a FrankenTerm/WezTerm launcher may own session state"
@@ -2222,6 +2255,7 @@ activate_process_family_generation() {
   PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
   PROCESS_FAMILY_ACTIVE_ROOT="$generation"
   PROCESS_FAMILY_PENDING_REASON=""
+  PROCESS_FAMILY_VERIFICATION_STATE="activated-doctor-passed"
   PENDING_PROCESS_FAMILY_GENERATION=""
   PUBLISHED_PROCESS_FAMILY_ROOT="$generation"
   PUBLISHED_PROCESS_FAMILY_VERSION="$version"
@@ -2229,16 +2263,67 @@ activate_process_family_generation() {
   return 0
 }
 
+activate_published_generation_if_idle() {
+  local census generation_id
+
+  [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ] || return 0
+  if [ "$PROCESS_FAMILY_ACTIVE_AUTHORITY" != none ] && \
+     [ "$ACTIVATE_IF_IDLE" -ne 1 ]; then
+    return 0
+  fi
+
+  census=$(installer_mux_ownership_state) || census=ambiguous
+  case "$census" in
+    inactive)
+      generation_id="$PENDING_PROCESS_FAMILY_GENERATION"
+      if ! activate_process_family_generation "$generation_id" if-idle; then
+        err "Idle-host activation failed; the verified candidate remains available by immutable path"
+        return 1
+      fi
+      ;;
+    active)
+      PROCESS_FAMILY_PENDING_REASON="active-mux-owns-session-state"
+      warn "A live FrankenTerm process owns session state; the verified candidate remains pending"
+      ;;
+    *)
+      PROCESS_FAMILY_PENDING_REASON="ambiguous-mux-ownership"
+      warn "FrankenTerm process ownership is ambiguous; the verified candidate remains pending"
+      ;;
+  esac
+}
+
+process_family_next_action() {
+  python3 - "$DEST" "$PENDING_PROCESS_FAMILY_GENERATION" \
+    "$PUBLISHED_PROCESS_FAMILY_VERSION" "$OWNER" "$REPO" <<'PY'
+import shlex, sys
+
+destination, generation, version, owner, repository = sys.argv[1:]
+tag = version if version.startswith("v") else "v" + version
+installer_url = f"https://raw.githubusercontent.com/{owner}/{repository}/{tag}/install.sh"
+words = [
+    "curl", "-fsSL", installer_url, "|", "bash", "-s", "--",
+    "--dest", destination, "--activate", generation, "--idle-host-confirmed",
+]
+print(" ".join(word if word == "|" else shlex.quote(word) for word in words))
+PY
+}
+
 emit_process_family_receipt() {
+  local next_action=""
+  if [ "$PROCESS_FAMILY_ACTIVATION_STATE" = pending ]; then
+    next_action=$(process_family_next_action) || return 1
+  fi
   python3 - "$PROCESS_FAMILY_ACTIVATION_STATE" "$PROCESS_FAMILY_ACTIVE_AUTHORITY" \
     "$PROCESS_FAMILY_ACTIVE_ROOT" "$PROCESS_FAMILY_PENDING_REASON" \
     "$PENDING_PROCESS_FAMILY_GENERATION" "$PUBLISHED_PROCESS_FAMILY_ROOT" \
-    "$PUBLISHED_PROCESS_FAMILY_VERSION" <<'PY'
-import json, os, re, sys
+    "$PUBLISHED_PROCESS_FAMILY_VERSION" "$PROCESS_FAMILY_VERIFICATION_STATE" \
+    "$PROCESS_FAMILY_RELEASE_VERIFICATION_STATE" "$DEST" "$next_action" <<'PY'
+import hashlib, json, os, re, stat, sys
 
 (
     activation, active_authority, active_root, pending_reason,
-    generation, candidate_root, version,
+    generation, candidate_root, version, verification, release_verification,
+    destination, next_action,
 ) = sys.argv[1:]
 if activation not in ("current", "pending"):
     raise SystemExit("process-family activation receipt has an invalid state")
@@ -2264,7 +2349,23 @@ else:
     active_root_value = os.path.abspath(active_root)
 if not version or any(ord(character) < 0x20 for character in version):
     raise SystemExit("process-family activation receipt has an invalid version")
+if verification not in ("component-manifest-verified", "activated-doctor-passed"):
+    raise SystemExit("process-family activation receipt has an invalid verification state")
+if release_verification not in (
+    "not-observed", "source-build", "checksum-only", "minisign-verified",
+):
+    raise SystemExit("process-family activation receipt has an invalid release verification state")
 candidate_root = os.path.abspath(candidate_root)
+destination = os.path.abspath(destination)
+selector_path = os.path.join(destination, ".frankenterm-process-family", "current")
+current_generation = None
+if active_authority == "managed-selector":
+    candidate = os.path.basename(os.path.normpath(active_root))
+    if re.fullmatch(r"[0-9a-f]{64}", candidate):
+        current_generation = candidate
+receipt_generation = generation or current_generation
+if (activation == "pending") != bool(next_action):
+    raise SystemExit("process-family activation receipt has an invalid next action")
 payload = {
     "activation": activation,
     "active_authority": active_authority,
@@ -2275,12 +2376,53 @@ payload = {
     "candidate_generation": generation or None,
     "candidate_root": candidate_root,
     "candidate_version": version,
+    "generation": receipt_generation,
+    "next_action": next_action or None,
     "pending_reason": pending_reason or None,
     "schema_version": "frankenterm.install.process-family-receipt.v1",
+    "selector_path": selector_path,
+    "verification": {
+        "activation_readiness": (
+            "passed" if verification == "activated-doctor-passed" else "not-run"
+        ),
+        "component_manifest": "verified",
+        "release": release_verification,
+    },
 }
-print("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=" + json.dumps(
+serialized = json.dumps(
     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-))
+)
+receipt_parent = os.path.join(destination, ".frankenterm-process-family")
+observed_parent = os.lstat(receipt_parent)
+if not stat.S_ISDIR(observed_parent.st_mode):
+    raise SystemExit("process-family receipt parent is not a real directory")
+receipt_name = "install-receipt.json"
+stage_name = ".install-receipt." + hashlib.sha256(serialized.encode()).hexdigest() + ".writing"
+stage_path = os.path.join(receipt_parent, stage_name)
+receipt_path = os.path.join(receipt_parent, receipt_name)
+encoded = (serialized + "\n").encode("ascii")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(stage_path, flags, 0o400)
+except FileExistsError:
+    with open(stage_path, "rb") as existing:
+        if existing.read(len(encoded) + 1) != encoded:
+            raise SystemExit("process-family receipt stage conflicts with another transaction")
+else:
+    try:
+        offset = 0
+        while offset < len(encoded):
+            offset += os.write(descriptor, encoded[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+os.replace(stage_path, receipt_path)
+parent_descriptor = os.open(receipt_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(parent_descriptor)
+finally:
+    os.close(parent_descriptor)
+print("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=" + serialized)
 PY
 }
 
@@ -4801,6 +4943,7 @@ Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode]
                   [--app-dest DIR] [--from-source] [--quiet]
                   [--no-gum] [--no-verify] [--offline TARBALL] [--force]
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL]
+                  [--activate-if-idle]
                   [--activate ID --idle-host-confirmed] [--help]
 
 Options:
@@ -4824,6 +4967,9 @@ Options:
                      from the install receipt) to the current authority so
                      the stable ft / mux-server / pty-guardian paths resolve
                      to it. Requires --idle-host-confirmed.
+  --activate-if-idle Promote a newly published candidate when the bounded
+                     process census is inactive. Active or ambiguous hosts
+                     retain the candidate and emit one exact next action.
   --idle-host-confirmed
                      Attest that no FrankenTerm window, mux server, PTY
                      guardian, or ft watcher is running on this host; the
@@ -4864,15 +5010,25 @@ while [ $# -gt 0 ]; do
     --no-verify) NO_MINISIGN=1; shift ;;
     --offline) require_option_value "$1" "${2:-}"; OFFLINE_TARBALL="$2"; shift 2 ;;
     --force) FORCE_INSTALL=1; shift ;;
+    --activate-if-idle) ACTIVATE_IF_IDLE=1; shift ;;
     --activate) require_option_value "$1" "${2:-}"; ACTIVATE_GENERATION="$2"; shift 2 ;;
     --idle-host-confirmed) IDLE_HOST_CONFIRMED=1; shift ;;
     --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2 ;;
     --checksum) require_option_value "$1" "${2:-}"; CHECKSUM="$2"; shift 2 ;;
     --checksum-url) require_option_value "$1" "${2:-}"; CHECKSUM_URL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) warn "Unknown option: $1 (ignored)"; shift ;;
+    *) err "Unknown option: $1"; usage >&2; exit 2 ;;
   esac
 done
+
+if [ -n "$ACTIVATE_GENERATION" ] && [ "$ACTIVATE_IF_IDLE" -eq 1 ]; then
+  err "--activate and --activate-if-idle are mutually exclusive"
+  exit 2
+fi
+if [ -z "$ACTIVATE_GENERATION" ] && [ "$IDLE_HOST_CONFIRMED" -eq 1 ]; then
+  err "--idle-host-confirmed is valid only with --activate ID"
+  exit 2
+fi
 
 # ───────────────────────────────────────────────────────────────────────────
 # Header banner
@@ -5095,6 +5251,7 @@ elif [ "$FROM_SOURCE" -eq 0 ]; then
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
+  PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="source-build"
   build_from_source
 else
   # The archive-provided verifier is executable code, so one externally
@@ -5124,6 +5281,11 @@ else
     }
   elif [ "$NO_MINISIGN" -eq 1 ]; then
     warn "DSR minisign verification skipped (--no-verify); SHA-256 was still verified"
+  fi
+  if [ "$NO_MINISIGN" -eq 0 ]; then
+    PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="minisign-verified"
+  else
+    PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="checksum-only"
   fi
 
   # Extract into an otherwise-empty private package root with a two-pass
@@ -5193,6 +5355,11 @@ else
   }
   install_process_family "$BIN" "$MUX_BIN" "$GUARDIAN_BIN" \
     "$COMPONENT_MANIFEST" "$COMPONENT_VERIFIER"
+fi
+
+if ! activate_published_generation_if_idle; then
+  emit_process_family_receipt || true
+  exit 1
 fi
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -5326,9 +5493,9 @@ if [ "$QUIET" -eq 0 ]; then
   fi
   summary_lines+=("")
   if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
-    summary_lines+=("Candidate publication is complete; the installer never activates it automatically.")
-    summary_lines+=("To activate on an idle host (no FrankenTerm window, mux server, guardian, or watcher running):")
-    summary_lines+=("  install.sh --dest $DEST --activate $PENDING_PROCESS_FAMILY_GENERATION --idle-host-confirmed")
+    summary_lines+=("Candidate publication is complete; this host was not safe to activate automatically.")
+    summary_lines+=("After every FrankenTerm window, mux server, guardian, and watcher has stopped, run:")
+    summary_lines+=("  $(process_family_next_action)")
   else
     summary_lines+=("Quick start:")
     summary_lines+=("  ft --help               Show all subcommands")

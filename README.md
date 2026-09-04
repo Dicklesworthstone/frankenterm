@@ -45,20 +45,20 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/
 
 The installer verifies the DSR-published checksum and minisign signature, then
 publishes `ft`, the mux server, the PTY guardian, and (on Apple-Silicon macOS)
-a verified `FrankenTerm.app` candidate as one manifest-bound generation. Live
-activation remains pending until the lifecycle transaction can serialize every
-launcher and prove PTY handoff, successor readiness, and rollback. When the
-receipt says `activation: pending`, the stable `ft` path intentionally remains
-absent (first install) or points to the prior generation (upgrade); use the
-absolute `Candidate CLI` path printed by the installer to test the new build in
-isolation. An explicit `--activate ID --idle-host-confirmed` maintenance command
-can promote the process family after the old GUI, mux, guardian, and watchers
-have all stopped; it is crash-resumable and rolls failed readiness back to the
-exact prior selector/entrypoint authority. It does not preserve live panes and,
-for the one-time transition from a legacy binary that predates the lifecycle
-protocol, the operator must also ensure that old binary is not relaunched during
-the bounded activation. Only a `current` receipt authorizes ordinary
-`ft --version` and `ft doctor` through `PATH`.
+a verified `FrankenTerm.app` candidate as one manifest-bound generation. On an
+idle first install, the standalone process family is promoted automatically
+through a selector-last transaction and must pass `ft doctor --json`; otherwise
+the transaction rolls back. Active or ambiguous hosts retain a pending
+candidate, as do upgrades unless `--activate-if-idle` is requested. In that
+case, use the receipt's exact `next_action` command after every old GUI, mux,
+guardian, and watcher has stopped. This maintenance activation is
+crash-resumable, but it does not preserve live panes. The macOS GUI app remains
+a separately verified candidate until its cross-launcher lifecycle and PTY
+handoff transaction is production-proven. Only a `current` process-family
+receipt authorizes ordinary `ft --version` and `ft doctor` through `PATH`; the
+same JSON is retained at
+`~/.local/bin/.frankenterm-process-family/install-receipt.json` for audit and
+automation.
 Pane/session operations require a reachable FrankenTerm/WezTerm-fork mux
 endpoint. Native vendored builds prefer the direct pooled mux protocol; the
 external `wezterm` CLI is a compatibility fallback, not a universal
@@ -97,14 +97,17 @@ A guided walkthrough from "I cloned this" to "I have an AI driving an AI." Each 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
 
-# If the receipt is pending, copy the printed absolute "Candidate CLI" path:
+# An idle first install should report activation=current. If it is pending,
+# use the printed absolute "Candidate CLI" path without changing live authority:
 /absolute/candidate/generation/ft --version
 /absolute/candidate/generation/ft doctor
 ```
 
 The installer selects one DSR release generation and verifies its checksum and
-minisign signature before publication. It never treats a standalone `ft`
-binary as a complete installation. `ft` talks to a live
+minisign signature before publication. It automatically activates a first
+process-family generation only when two bounded censuses report the host idle
+and the stable paths pass `--version` plus `ft doctor --json`. It never treats a
+standalone `ft` binary as a complete installation. `ft` talks to a live
 FrankenTerm/WezTerm-fork mux. Native vendored builds can use the direct pooled
 mux protocol; compatibility configurations may instead require the external
 `wezterm` CLI in `PATH`. `ft doctor` reports the available backend
@@ -394,7 +397,7 @@ No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wa
 
 ### 3. Delta Extraction Over Full Capture
 
-Instead of repeatedly capturing entire scrollback buffers, `ft` uses 4 KB overlap matching to extract only new content. This produces efficient storage, minimal latency, and explicit gap markers for discontinuities. When the overlap match fails (terminal reset, scrollback clear), the gap is recorded as an explicit event rather than silently dropped.
+Instead of repeatedly persisting entire scrollback buffers, `ft` uses a bounded 1 MiB overlap window to extract only new content. The larger default can match retained prefixes after realistic scrolls without turning routine polls into false full-snapshot gaps. When overlap still cannot be established (terminal reset, scrollback clear, or a shift beyond the bound), the discontinuity is recorded as an explicit event rather than silently dropped.
 
 ### 4. Single-Writer Integrity
 
@@ -440,7 +443,7 @@ Terminology used throughout this document and the codebase. Reading these once s
 | **Checkpoint** | A persisted session-progress marker; checkpoints accumulate within a session. |
 | **Backup** | A portable archive of the entire `ft` database, separate from snapshots. |
 | **Capture** | The act of reading current scrollback from a pane and persisting any new bytes. |
-| **Delta** | The new bytes a capture produced after the 4 KB overlap match. |
+| **Delta** | The new bytes a capture produced after the bounded 1 MiB overlap match. |
 | **Gap** | Captured discontinuity (the previous tail didn't match anywhere in the new capture). Recorded as an event. |
 | **Rule** | A pattern with stable ID, anchor strings, regex, severity, and agent type. |
 | **Rule pack** | A versioned collection of rules; the default is `builtin:core`. |
@@ -758,7 +761,8 @@ What it does:
 | `--no-app` / `--with-app` / `--app-dest DIR` | macOS GUI-app control (skip / force / relocate) |
 | `--from-source` | Build from source instead of downloading (needs Rust + git) |
 | `--offline TARBALL` | Install from a local tarball; no network |
-| `--activate ID --idle-host-confirmed` | Promote the published candidate generation `ID` (printed in the install receipt) to the current authority so `ft`, the mux server, and the PTY guardian resolve on `PATH`. The installer never does this automatically. It takes the permanent installer lock, refuses while its process census sees a running FrankenTerm launcher, commits the shared selector last, and restores the exact prior authority if readiness fails. This is an idle maintenance operation, not live-pane handoff. |
+| `--activate-if-idle` | After publishing an upgrade, promote it only when the bounded process census remains inactive at the activation boundary. First installs use this safe-idle path by default. Active or ambiguous hosts retain the verified candidate without changing authority. |
+| `--activate ID --idle-host-confirmed` | Promote the published candidate generation `ID` (printed in the install receipt) to the current authority so `ft`, the mux server, and the PTY guardian resolve on `PATH`. It takes the permanent installer lock, requires explicit idle-host confirmation, repeats the process census, commits the shared selector last, runs stable-path readiness plus `ft doctor --json`, and restores the exact prior authority if readiness fails. This is an idle maintenance operation, not live-pane handoff. |
 | `--no-verify` | Skip the DSR minisign signature check only; SHA-256 remains mandatory (testing only) |
 | `--verify` | Run the published generation's `ft doctor --json` by immutable path; fail installation verification on a non-zero exit or malformed/oversized JSON. A passing pending-candidate self-test does not activate it. |
 
@@ -1676,7 +1680,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 
 | Subsystem | Algorithm / technique | Purpose |
 |---|---|---|
-| Delta extraction | 4 KB overlap matching with gap semantics | Efficient incremental capture without full-buffer re-reads |
+| Delta extraction | Bounded 1 MiB overlap matching with gap semantics | Efficient incremental capture without persisting full-buffer re-reads |
 | Pattern detection | Aho-Corasick multi-pattern + anchor filtering + Bloom prefilter | Fast multi-agent pattern matching with probabilistic pre-rejection |
 | Scan pipeline | SIMD newline/ANSI density scan + batch trigger + zstd | Three-stage pipeline for raw pane output |
 | Search | FTS5 lexical + Tantivy + optional ML embeddings (fastembed) | Lexical, semantic, and hybrid modes via FrankenSearch RRF fusion |
@@ -1698,7 +1702,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 
 1. **Discovery** — enumerate pane/session resources via active backend adapters
 2. **Capture** — stream output and state deltas from adapters / runtime hooks
-3. **Delta** — compare with previous capture using 4 KB overlap matching
+3. **Delta** — compare with the previous capture using the bounded 1 MiB overlap window
 4. **Scan** — run three-stage pipeline (SIMD metrics → pattern trigger → compression)
 5. **Store** — append new segments to SQLite with FTS5 indexing
 6. **Detect** — run pattern engine (anchored + Bloom-prefiltered + BOCPD) against new content
@@ -2515,7 +2519,7 @@ Retractions are append-only and visible to anyone who verifies the bundle; this 
                                           │
                                           ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ 4. Delta extraction — 4 KB overlap match vs. last capture            │
+│ 4. Delta extraction — bounded 1 MiB overlap vs. last capture         │
 │    - On match: append the new tail to the segment buffer             │
 │    - On miss: emit explicit Gap event (never silent)                 │
 └──────────────────────────────────────────────────────────────────────┘
@@ -3986,11 +3990,11 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **Bloom prefilter rejects in O(k)** with k small (8 hashes typical). False positives gracefully fall through to AC + regex; false negatives are forbidden (the filter is built from rule anchors, so a chunk that *could* match always passes).
 - **Result**: 10–100× CPU reduction for typical rule packs.
 
-### Why a 4 KB overlap window for delta extraction?
+### Why a 1 MiB overlap window for delta extraction?
 
-- **Termcap state can change in ~1 KB.** Cursor moves, alt-screen toggle, scrollback shifts. 4 KB is enough overlap to detect those without consuming too much memory per pane.
-- **Larger overlap doesn't help.** If the window is wider than the longest reasonable state-change burst, the extra is just RAM cost per pane.
-- **Smaller overlap misses gaps.** Below 4 KB, brief stream stalls + reconnects can produce false gap markers.
+- **Scrollback capture is a sliding snapshot.** Matching may need to reach through a large retained prefix after scrolling; a tiny fixed border turns ordinary polls into false gaps.
+- **The window remains bounded.** One MiB caps per-pane matching work and memory while covering realistic shifts in retained terminal history.
+- **Misses stay explicit.** A reset, clear, or shift beyond the bound produces a gap event instead of silently inventing continuity.
 
 ### Why prepare/commit/compensate for multi-pane ops?
 
@@ -4136,7 +4140,7 @@ When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 
 | Operation | Target | Notes |
 |---|---|---|
-| Delta capture latency | <50 ms benchmark lane | 4 KB overlap matching; 200-pane / target-class claims must cite the capture fairness proof artifact |
+| Delta capture latency | <50 ms benchmark lane | Bounded 1 MiB overlap matching; 200-pane / target-class claims must cite the capture fairness proof artifact |
 | Pattern detection | <1 ms per rule pack | Bloom prefilter rejection |
 | FTS5 query | <10 ms | SQLite full-text search |
 | Robot Mode response | <5 ms | JSON envelope generation |

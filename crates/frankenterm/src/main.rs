@@ -115247,11 +115247,20 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "#!/usr/bin/env python3\n# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:ft:{target}:release-interactive:0.15.2;\n"
         );
         source.push_str(
-            r#"import hashlib, os, sys
+            r#"import hashlib, json, os, sys
 
 arguments = sys.argv[1:]
 if arguments == ["--version"]:
     print("ft 0.15.2")
+    raise SystemExit(0)
+if arguments == ["doctor", "--json"]:
+    mode = os.environ.get("FT_INSTALL_TEST_DOCTOR_MODE", "pass")
+    if mode == "nonzero":
+        raise SystemExit(70)
+    if mode == "malformed":
+        print("{")
+        raise SystemExit(0)
+    print(json.dumps({"ok": mode != "not-ok"}, separators=(",", ":")))
     raise SystemExit(0)
 if len(arguments) < 2 or arguments[0] != "setup":
     raise SystemExit(64)
@@ -115517,13 +115526,37 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V5={transaction_id}:{operation}:{stage_name}:{
         mux_state: &str,
         readiness_failure: bool,
     ) -> std::process::Output {
+        run_installer_activation_function_with_doctor_mode(
+            installer,
+            family,
+            destination,
+            scratch,
+            failpoint,
+            mux_state,
+            readiness_failure,
+            "pass",
+        )
+    }
+
+    #[cfg(unix)]
+    fn run_installer_activation_function_with_doctor_mode(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        scratch: &Path,
+        failpoint: Option<&str>,
+        mux_state: &str,
+        readiness_failure: bool,
+        doctor_mode: &str,
+    ) -> std::process::Output {
         std::fs::create_dir_all(scratch).expect("create installer activation scratch");
         let failpoint = failpoint.unwrap_or("");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES={}\nexport FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nIDLE_HOST_CONFIRMED=1\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nactivate_process_family_generation {}\nemit_process_family_receipt\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES={}\nexport FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL={}\nexport FT_INSTALL_TEST_DOCTOR_MODE={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nIDLE_HOST_CONFIRMED=1\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nactivate_process_family_generation {}\nemit_process_family_receipt\n",
             shell_single_quote(mux_state),
             if readiness_failure { "1" } else { "0" },
             if readiness_failure { "1" } else { "0" },
+            shell_single_quote(doctor_mode),
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&destination.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
@@ -115536,6 +115569,42 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V5={transaction_id}:{operation}:{stage_name}:{
             .arg(script)
             .output()
             .expect("execute production installer activation function")
+    }
+
+    #[cfg(unix)]
+    fn run_installer_publish_and_idle_activation(
+        installer: &Path,
+        family: &InstallerTestFamily,
+        destination: &Path,
+        scratch: &Path,
+        mux_state: &str,
+        activate_if_idle: bool,
+    ) -> std::process::Output {
+        std::fs::create_dir_all(destination).expect("create installer destination");
+        std::fs::create_dir_all(scratch).expect("create installer shell scratch");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nACTIVATE_IF_IDLE={}\ninstall_process_family {} {} {} {} {}\nactivate_published_generation_if_idle\nemit_process_family_receipt\n",
+            shell_single_quote(mux_state),
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&destination.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            if activate_if_idle { "1" } else { "0" },
+            shell_single_quote(&family.root.join("ft").to_string_lossy()),
+            shell_single_quote(&family.root.join("frankenterm-mux-server").to_string_lossy()),
+            shell_single_quote(
+                &family
+                    .root
+                    .join("frankenterm-pty-guardian")
+                    .to_string_lossy()
+            ),
+            shell_single_quote(&family.manifest.to_string_lossy()),
+            shell_single_quote(&family.verifier.to_string_lossy()),
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute installer publish plus idle activation orchestration")
     }
 
     #[cfg(unix)]
@@ -116632,7 +116701,7 @@ cat "$FAKE_FONT_ARCHIVE"
             .find("activate_process_family_generation() {")
             .expect("idle-host activation function");
         let activation_end = installer[activation_start..]
-            .find("\n}\n\nemit_process_family_receipt()")
+            .find("\n}\n\nactivate_published_generation_if_idle()")
             .map(|offset| activation_start + offset)
             .expect("idle-host activation function end");
         let activation = &installer[activation_start..activation_end];
@@ -116659,11 +116728,17 @@ cat "$FAKE_FONT_ARCHIVE"
         let probe_start = installer
             .find("probe_activated_process_family() {")
             .expect("activated process-family probe helper");
-        let probe = &installer[probe_start..probe_start + 800];
+        let probe_end = installer[probe_start..]
+            .find("\n}\n\nactivate_process_family_generation()")
+            .map(|offset| probe_start + offset)
+            .expect("activated process-family probe helper end");
+        let probe = &installer[probe_start..probe_end];
         assert!(
             probe.contains("for name in ft frankenterm-mux-server frankenterm-pty-guardian; do")
         );
         assert!(probe.contains("\"$DEST/$name\" --version >/dev/null 2>&1 || return 1"));
+        assert!(probe.contains("\"$DEST/ft\" doctor --json"));
+        assert!(probe.contains("report.get(\"ok\") is not True"));
         assert!(
             installer
                 .contains("Running pending candidate \\`ft doctor --json\\` by immutable path")
@@ -118490,6 +118565,64 @@ printf x > "$MINISIGN_MARKER"
 
     #[cfg(unix)]
     #[test]
+    fn installer_activation_rolls_back_each_invalid_doctor_result() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create doctor rollback fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"9".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+
+        for (index, doctor_mode) in ["nonzero", "malformed", "not-ok"]
+            .into_iter()
+            .enumerate()
+        {
+            let destination = fixture.path().join(format!("destination-{index}"));
+            std::fs::create_dir(&destination).expect("create doctor rollback destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make doctor rollback destination private");
+            assert!(
+                run_installer_family_function(
+                    &installer,
+                    &family,
+                    &destination,
+                    &fixture.path().join(format!("stage-{index}")),
+                    None,
+                )
+                .status
+                .success()
+            );
+            let failed = run_installer_activation_function_with_doctor_mode(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join(format!("activation-{index}")),
+                None,
+                "inactive",
+                false,
+                doctor_mode,
+            );
+            assert!(
+                !failed.status.success(),
+                "doctor mode {doctor_mode} unexpectedly activated the candidate"
+            );
+            assert_initial_family_is_uniformly_unavailable(&destination);
+            assert!(
+                std::fs::symlink_metadata(
+                    destination.join(".frankenterm-process-family/current")
+                )
+                .is_err(),
+                "doctor mode {doctor_mode} did not restore the absent selector"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installer_activation_rollback_recovers_every_crash_prefix() {
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
@@ -118759,6 +118892,189 @@ printf x > "$MINISIGN_MARKER"
             );
             assert_initial_family_is_uniformly_unavailable(&destination);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_top_level_idle_orchestration_activates_only_an_inactive_first_install() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create idle orchestration fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"a".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+
+        for (index, (mux_state, pending_reason)) in [
+            ("active", "active-mux-owns-session-state"),
+            ("ambiguous", "ambiguous-mux-ownership"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = fixture.path().join(format!("pending-{index}"));
+            std::fs::create_dir(&destination).expect("create pending destination");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+                .expect("make pending destination private");
+            let output = run_installer_publish_and_idle_activation(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join(format!("pending-scratch-{index}")),
+                mux_state,
+                false,
+            );
+            assert!(
+                output.status.success(),
+                "{mux_state} orchestration failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt = parse_installer_process_family_receipt(&output.stdout);
+            assert_eq!(receipt["activation"], "pending");
+            assert_eq!(receipt["pending_reason"], pending_reason);
+            assert_initial_family_is_uniformly_unavailable(&destination);
+        }
+
+        let destination = fixture.path().join("inactive-current");
+        std::fs::create_dir(&destination).expect("create inactive destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make inactive destination private");
+        let output = run_installer_publish_and_idle_activation(
+            &installer,
+            &family,
+            &destination,
+            &fixture.path().join("inactive-scratch"),
+            "inactive",
+            false,
+        );
+        assert!(
+            output.status.success(),
+            "inactive first-install activation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt = parse_installer_process_family_receipt(&output.stdout);
+        assert_eq!(receipt["activation"], "current");
+        assert_eq!(receipt["active_authority"], "managed-selector");
+        assert!(receipt["candidate_generation"].is_null());
+        assert!(receipt["pending_reason"].is_null());
+        assert!(family_bytes_match(&destination, &family));
+        assert_eq!(
+            std::fs::read_link(destination.join(".frankenterm-process-family/current"))
+                .expect("read first-install selector"),
+            Path::new("generations").join(&family.generation_id)
+        );
+        assert_eq!(receipt["generation"], family.generation_id.as_str());
+        assert_eq!(receipt["verification"]["activation_readiness"], "passed");
+        assert_eq!(receipt["verification"]["component_manifest"], "verified");
+        assert_eq!(receipt["verification"]["release"], "not-observed");
+        assert!(receipt["next_action"].is_null());
+        assert_eq!(
+            receipt["selector_path"],
+            destination
+                .join(".frankenterm-process-family/current")
+                .to_string_lossy()
+                .as_ref()
+        );
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                destination.join(".frankenterm-process-family/install-receipt.json"),
+            )
+            .expect("read persisted install receipt"),
+        )
+        .expect("parse persisted install receipt");
+        assert_eq!(persisted, receipt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_upgrade_activates_only_when_activate_if_idle_is_requested() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create idle upgrade fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"b".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"c".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let destination = fixture.path().join("bin");
+        std::fs::create_dir(&destination).expect("create upgrade destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make upgrade destination private");
+
+        let initial = run_installer_publish_and_idle_activation(
+            &installer,
+            &old_family,
+            &destination,
+            &fixture.path().join("initial-scratch"),
+            "inactive",
+            false,
+        );
+        assert!(initial.status.success());
+        assert!(family_bytes_match(&destination, &old_family));
+
+        let pending = run_installer_publish_and_idle_activation(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("pending-scratch"),
+            "inactive",
+            false,
+        );
+        assert!(pending.status.success());
+        let pending_receipt = parse_installer_process_family_receipt(&pending.stdout);
+        assert_eq!(pending_receipt["activation"], "pending");
+        assert_eq!(
+            pending_receipt["pending_reason"],
+            "cross-launcher-lease-required"
+        );
+        assert_eq!(
+            pending_receipt["verification"]["activation_readiness"],
+            "not-run"
+        );
+        assert_eq!(
+            pending_receipt["verification"]["component_manifest"],
+            "verified"
+        );
+        assert!(pending_receipt["next_action"]
+            .as_str()
+            .is_some_and(|command| command.contains("--idle-host-confirmed")));
+        assert!(family_bytes_match(&destination, &old_family));
+
+        let activated = run_installer_publish_and_idle_activation(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("activation-scratch"),
+            "inactive",
+            true,
+        );
+        assert!(
+            activated.status.success(),
+            "idle upgrade activation failed: {}",
+            String::from_utf8_lossy(&activated.stderr)
+        );
+        let activated_receipt = parse_installer_process_family_receipt(&activated.stdout);
+        assert_eq!(activated_receipt["activation"], "current");
+        assert_eq!(
+            activated_receipt["generation"],
+            candidate_family.generation_id.as_str()
+        );
+        assert_eq!(
+            activated_receipt["verification"]["activation_readiness"],
+            "passed"
+        );
+        assert!(family_bytes_match(&destination, &candidate_family));
     }
 
     #[cfg(unix)]
