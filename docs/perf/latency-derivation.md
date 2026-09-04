@@ -14,10 +14,13 @@ For the currently published headline benchmark pipeline
 
 - **Analytical bound**: 8.067ms (Lindley `h(alpha, beta) = T + b/R`).
 - **Empirical p99**: 8.5ms (measured on the bench corpus).
-- **Verdict**: within the substrate's 20% agreement tolerance.
+- **Verdict**: the empirical value exceeds the analytical bound by about
+  5.37%. It meets a 20% model-agreement tolerance but does **not** satisfy
+  the asserted upper bound.
 
-The release attestation publishes both numbers and asserts the bound
-holds. Cross-link
+The checked-in artifact publishes both numbers and `within_tolerance=true`.
+That field cannot certify the bound. These are retained historical model
+inputs, not fresh measurements of this source revision. Cross-link
 [`bench_stats.md`](../methodology/statistics.md) for the
 concentration-of-measure background and
 [`network_calculus_bound.rs`](../../crates/frankenterm-core/src/network_calculus_bound.rs)
@@ -42,8 +45,10 @@ h(α, β) = T + b / R
 ```
 
 This is the **horizontal distance** between the curves at the burst
-limit — provably the maximum end-to-end delay regardless of how the
-arrivals interleave.
+limit, provided arrivals actually obey the envelope, each stage supplies
+the stated service curve, and the stability condition holds. Estimated
+p99 stage latencies or a statement-count speedup are not deterministic
+service guarantees. Without those assumptions this is a model prediction.
 
 For a pipeline of stages 1..N:
 
@@ -54,7 +59,7 @@ For a pipeline of stages 1..N:
 
 Pay-Bursts-Only-Once (PBOO): the burst latency is paid ONCE for the
 entire pipeline, not per-stage. The substrate's `compose_pipeline`
-implements this; the headline 50ms bound is the result.
+implements this composition; it does not itself prove the headline 50ms SLO.
 
 ---
 
@@ -67,7 +72,7 @@ and backed by the checked-in `lindley-bounds.json` artifact today.
 
 | Claim surface | `LatencyStage` leaves involved | Current status |
 |---------------|--------------------------------|----------------|
-| `<50ms` capture benchmark | `PtyCapture`, `DeltaExtraction`, `StorageWrite` | Covered by `docs/attestations/perf/lindley-bounds.json`. |
+| `<50ms` capture benchmark | `PtyCapture`, `DeltaExtraction`, `StorageWrite` | Historical artifact models this slice; its 8.5ms empirical value exceeds its 8.067ms bound. No bound-validity claim follows. |
 | End-to-end capture path | `PtyCapture`, `DeltaExtraction`, `StorageWrite`, `PatternDetection`, `EventEmission` | Modeled, pending empirical: `LindleyTelemetryModel::documented_end_to_end_capture_default()` now covers all five leaves with a 23.1ms budget-backed bound, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path. |
 | Renderer input-to-photon SLOs | Renderer-specific classified-input proxy stages in `crates/frankenterm-gui/src/renderer_slo.rs` | Proxy substrate wired, physical claim unproven: v2 emits content-free classified-input stage telemetry and `tests/input_to_photon_bound.rs` checks internal Lindley agreement, but it omits native input, mux/PTY, production-window presentation, scan-out, and photons. The release artifact must keep the physical claim non-covered until correlated live-path evidence is retained. |
 | Robot Mode response `<5ms` | `ApiResponse` plus handler-specific read/query work | Gap: G19/G54 evidence streams include `robot.p95`, but there is no `LatencyStage` telemetry model for the handler path yet. |
@@ -75,7 +80,7 @@ and backed by the checked-in `lindley-bounds.json` artifact today.
 
 The unresolved evidence gaps above are tracked in `ft-tf6g3.51` rather
 than being folded into this artifact with invented numbers. The release
-bundle can use the current artifact for the 4KB overlap benchmark, and
+bundle can retain the current artifact as historical model evidence for the 4KB overlap benchmark, and
 it can cite the end-to-end capture chain only as `modeled_pending_empirical`
 until a real PTY-to-event empirical row lands. It can cite renderer
 input-to-photon only as `proxy_only_stage_telemetry_physical_path_unproven`.
@@ -176,8 +181,8 @@ events
   |   T
 ```
 
-The horizontal distance between α and β at the burst limit IS the
-end-to-end delay. PBOO collapses the burst into a single latency
+The horizontal distance bounds the delay under the stated envelopes;
+it is not the observed delay of every event. PBOO collapses the burst into a single latency
 penalty.
 
 ---
@@ -197,11 +202,12 @@ Substrate predicates:
 - `within_tolerance()` — `|empirical - analytical| / analytical ≤ 20%`
 - `exceeds_bound()` — `empirical > analytical` (release blocker)
 
-For the current modeled slice: empirical (8.5) and analytical
-(8.0666666667) are within the 20% agreement tolerance. If a release
-violates either predicate, the substrate
-emits a regression event and the integration's release CI files a
-P1 bead via `br create`.
+For the current modeled slice, `within_tolerance()` is true and
+`exceeds_bound()` is also true. The former measures model agreement;
+the latter invalidates the proposed upper-bound claim. No production
+DSR caller that automatically files a regression bead is established by
+these library predicates. A release gate must validate finite inputs
+and reject an exceeded bound before making that claim.
 
 ---
 
@@ -238,20 +244,24 @@ Per release, the substrate's
 }
 ```
 
-Written to `docs/attestations/perf/lindley-bounds.json`, with one
+The example reproduces the legacy artifact's fields; `covered` and
+`within_tolerance` are not proof of the exceeded bound. The artifact is
+written to `docs/attestations/perf/lindley-bounds.json`, with one
 content hash for each published stage row and explicit coverage status
-for adjacent latency surfaces, then sigstore-signed per
-BR-RC-FOUNDATION.G3.1.
+for adjacent latency surfaces. Signing and trusted release validation
+require the actual DSR bundle path and `ft-xxfwy.15`/`.49`; this document
+does not establish that the checked-in file is signed.
 
-The integration's release script:
+Required release integration (not a claim of a completed script):
 1. Runs `pipeline_delay_bound(arrival, &stages)` to get
    `analytical_bound_ms`.
 2. Runs the headline-claim bench corpus to get `empirical_p99_ms`.
 3. Composes a `LindleyBoundsArtifact`.
 4. Calls `render_attestation_json` and writes the file.
 5. Sigstore-signs.
-6. Asserts `comparison().within_tolerance()` — fails the release on
-   violation.
+6. Validates finite/nonnegative measurements and admitted envelope
+   assumptions, then requires `!comparison().exceeds_bound()` for any
+   upper-bound claim. Record tolerance agreement separately.
 
 ---
 

@@ -28,11 +28,10 @@
 //! - [`mann_whitney_u`] — non-parametric two-sample test for "did the
 //!   release-vs-previous distributions diverge?" with normal-approximation
 //!   p-value (correct asymptotic behaviour for sample sizes ≥ ~20).
-//! - [`empirical_bernstein_ci`] — anytime-valid (Howard & Ramdas 2021)
-//!   one-sided upper-CI for the running mean, sound under repeated peeking.
-//!   This is the per-PR-gate primitive: at any time during a release-soak
-//!   period, you can read the current EBCI bound and decide
-//!   regression / no-regression without paying a multiple-comparison tax.
+//! - [`empirical_bernstein_ci`] — one-sided confidence sequence for one
+//!   bounded i.i.d. stream, using summable confidence spending. Separate
+//!   benchmarks and changing commit populations still need their own error
+//!   allocation; this primitive does not supply a family-wide gate.
 //!
 //! # Follow-on beads
 //!
@@ -48,9 +47,10 @@ use std::path::Path;
 
 /// Number of bootstrap resamples used for confidence intervals.
 ///
-/// 2 000 is the smallest value that still gives a stable p99.9 CI for the
-/// sample sizes we run benches at (typically 100–1 000). Bumped to 10 000
-/// for release-attestation runs by the caller.
+/// Default Monte Carlo resampling budget. More resamples reduce simulation
+/// noise; they do not supply missing tail observations or establish p99.9
+/// coverage from a small original sample. Callers choose the experimental
+/// sample size and may increase this budget for retained reports.
 pub const DEFAULT_BOOTSTRAP_RESAMPLES: usize = 2_000;
 
 /// Confidence level used for `Distribution::from_samples` bootstrap CIs.
@@ -455,26 +455,28 @@ pub fn criterion_group_and_bench_id(
     }
 }
 
-/// Anytime-valid (Howard & Ramdas 2021, "Time-uniform, nonparametric,
-/// nonasymptotic confidence sequences") *upper* confidence bound on the
-/// running mean of bounded samples.
+/// Upper confidence sequence for the mean of one bounded i.i.d. stream.
 ///
-/// Sound under repeated peeking — a CI gate that calls this primitive
-/// every commit does NOT pay a multiple-comparison tax. The bridge plan's
-/// "Lai-Robbins SPRT or always-valid CI" requirement is satisfied here by
-/// the empirical-Bernstein curve in the line family.
+/// Apply Maurer & Pontil (2009), Theorem 4, at sample size `n >= 2` with
+/// `delta_n = alpha / (n * (n - 1))`. The sum of these failure budgets is
+/// `alpha`, so a union bound covers every prefix of that same stream.
+/// This conservative construction is not a log-log stitched boundary.
+/// Separate benchmarks or changing commit populations require separate
+/// confidence allocation; repeated peeking does not remove that obligation.
 ///
 /// Returns the upper bound `μ̂ + δ` such that with probability `≥ 1-α`,
 /// the true mean is below the bound at every sample size simultaneously.
 ///
 /// Inputs:
-/// - `samples` — observations, all assumed bounded by `[0, range]`.
+/// - `samples` — i.i.d. observations, validated to lie in `[0, range]`.
 /// - `range` — known a-priori upper bound on each observation. For
 ///   wall-time benches, this is the per-iteration timeout ceiling.
 /// - `alpha` — overall failure probability, e.g. 0.05.
 ///
 /// Returns `None` if `samples` has fewer than 2 observations, `range <= 0`,
-/// `range` is non-finite, or `alpha` is outside `[0.0, 1.0)`.
+/// `range` is non-finite, `alpha` is outside `(0.0, 1.0)`, or any sample
+/// is non-finite or outside the declared support. Independence and a stable
+/// distribution are caller obligations that values alone cannot establish.
 ///
 /// Per ft-eebc9 fix: previously `range <= 0.0` accepted NaN
 /// (NaN comparisons all return false), and the function would
@@ -491,25 +493,30 @@ pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option
         || !range.is_finite()
         || range <= 0.0
         || !alpha.is_finite()
+        || alpha <= 0.0
         || !(0.0..1.0).contains(&alpha)
     {
         return None;
     }
-    if !samples.iter().all(|x| x.is_finite()) {
+    if !samples
+        .iter()
+        .all(|x| x.is_finite() && (0.0..=range).contains(x))
+    {
         return None;
     }
     let n = samples.len() as f64;
-    let mean = samples.iter().sum::<f64>() / n;
+    // Normalize first: finite observations near f64::MAX must not overflow
+    // the sum/variance or silently produce an infinite confidence bound.
+    let mean = samples.iter().map(|x| x / range).sum::<f64>() / n;
     // `n >= 2` is guaranteed by the guard above, so `n - 1.0 >= 1.0`.
-    let var = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let var = samples.iter().map(|x| (x / range - mean).powi(2)).sum::<f64>() / (n - 1.0);
 
-    // Howard & Ramdas (2021), Eq. 11 — empirical Bernstein style. The
-    // log term `log(1/α)` becomes `log(2/α) + log(log_2(2n))` in the
-    // time-uniform regime to spend confidence over an unbounded number
-    // of looks. The `+ ln(2)` keeps the constant well-behaved for n=1.
-    let log_term = (2.0_f64 / alpha).ln() + ((2.0 * n).log2().max(1.0)).ln() + 2.0_f64.ln();
-    let bernstein = (2.0 * var * log_term / n).sqrt() + 7.0 / 3.0 * range * log_term / (n - 1.0);
-    Some(mean + bernstein)
+    // ln(2 / delta_n), evaluated without division by tiny alpha or a
+    // potentially overflowing n*(n-1) product.
+    let log_term = 2.0_f64.ln() - alpha.ln() + n.ln() + (n - 1.0).ln();
+    let bernstein = (2.0 * var * log_term / n).sqrt() + 7.0 / 3.0 * log_term / (n - 1.0);
+    // The known support itself is an upper bound on the mean.
+    Some((mean + bernstein).min(1.0) * range)
 }
 
 // ============================================================================
@@ -632,11 +639,10 @@ pub fn min_sample_size_for_regression(
 /// Conformal-prediction-interval band over a sample distribution.
 ///
 /// Conformal bands give a **distribution-free** SLO interval: with
-/// probability `1 - alpha`, a future observation drawn from the
-/// same distribution lies within `[lower, upper]`. The substrate
-/// uses the split-conformal nonconformity-score recipe applied to
-/// observation magnitudes (no separate calibration set —
-/// substrate uses leave-one-out via empirical quantiles).
+/// marginal probability at least `1 - alpha`, an observation exchangeable
+/// with the calibration sample lies within `[lower, upper]`. The bound
+/// follows from order-statistic ranks; arbitrary distribution drift is not
+/// covered. Requests needing infinite endpoints return `None`.
 ///
 /// Returns `None` when:
 /// - `samples` is empty.
@@ -648,10 +654,9 @@ pub fn min_sample_size_for_regression(
 pub struct ConformalBand {
     pub lower: f64,
     pub upper: f64,
-    /// Realised confidence (≥ `1 - alpha` due to integer-quantile
-    /// rounding). Useful when comparing across different sample
-    /// sizes.
-    pub realised_confidence: f64,
+    /// Conservative marginal coverage under exchangeability, derived from
+    /// future ranks. This is not the in-sample fraction inside the band.
+    pub coverage_lower_bound: f64,
 }
 
 /// Compute a conformal-prediction band for `samples` at miscoverage
@@ -661,7 +666,9 @@ pub struct ConformalBand {
 ///
 /// Empirically: with `samples.len() = 100` and `alpha = 0.10`, the
 /// band is roughly `[5th percentile, 95th percentile]` with the
-/// correction; finite-sample-valid for any distribution.
+/// correction; marginally valid for exchangeable data. Insufficient
+/// calibration for finite endpoints is an explicit `None`, not a clamped
+/// interval with an overstated guarantee.
 #[must_use]
 pub fn conformal_band(samples: &[f64], alpha: f64) -> Option<ConformalBand> {
     const MIN_SAMPLES: usize = 4;
@@ -683,19 +690,22 @@ pub fn conformal_band(samples: &[f64], alpha: f64) -> Option<ConformalBand> {
     let n_plus_1 = (sorted.len() + 1) as f64;
     let lower_q_idx_f = (half * n_plus_1).floor() as usize;
     let upper_q_idx_f = ((1.0 - half) * n_plus_1).ceil() as usize;
-    // Clamp to valid index range.
-    let lo_idx = lower_q_idx_f.saturating_sub(1).min(sorted.len() - 1);
-    let hi_idx = upper_q_idx_f.saturating_sub(1).min(sorted.len() - 1);
+    // Rank 0 and rank n+1 need infinite endpoints. Clamping them to sample
+    // extrema would under-cover (e.g. n=4, alpha=.05 gives only 3/5).
+    if lower_q_idx_f == 0 || upper_q_idx_f > sorted.len() {
+        return None;
+    }
+    let lo_idx = lower_q_idx_f - 1;
+    let hi_idx = upper_q_idx_f - 1;
     let lower = sorted[lo_idx];
     let upper = sorted[hi_idx];
-    // Realised confidence: count of samples inside the band /
-    // total. With the finite-sample correction this is ≥ 1-α.
-    let inside = sorted.iter().filter(|&&x| x >= lower && x <= upper).count() as f64;
-    let realised_confidence = inside / sorted.len() as f64;
+    // Among n+1 exchangeable ranks, b-a future ranks lie between training
+    // order statistics a and b. Ties can only increase closed-band coverage.
+    let coverage_lower_bound = (upper_q_idx_f - lower_q_idx_f) as f64 / n_plus_1;
     Some(ConformalBand {
         lower,
         upper,
-        realised_confidence,
+        coverage_lower_bound,
     })
 }
 
@@ -832,6 +842,35 @@ mod tests {
         assert!(empirical_bernstein_ci(&[], 1.0, 0.05).is_none());
         assert!(empirical_bernstein_ci(&[0.5], 0.0, 0.05).is_none());
         assert!(empirical_bernstein_ci(&[0.5], 1.0, 1.0).is_none());
+        for alpha in [0.0, -0.1, 1.0, f64::NAN, f64::INFINITY] {
+            assert!(empirical_bernstein_ci(&[0.0, 1.0], 1.0, alpha).is_none());
+        }
+        for invalid in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(empirical_bernstein_ci(&[0.5, invalid], 1.0, 0.05).is_none());
+        }
+    }
+
+    #[test]
+    fn empirical_bernstein_matches_independent_confidence_spending_reference() {
+        // Balanced Bernoulli data: mean=1/2, unbiased variance=250/999.
+        // Theorem 4 with delta_1000=.05/(1000*999), independently evaluated.
+        let samples: Vec<f64> = (0..1000).map(|i| f64::from(i % 2)).collect();
+        let upper = empirical_bernstein_ci(&samples, 1.0, 0.05).unwrap();
+        assert!((upper - 0.6344794277575556).abs() < 1e-12);
+        let scaled: Vec<f64> = samples.iter().map(|x| x * 1024.0).collect();
+        let scaled_upper = empirical_bernstein_ci(&scaled, 1024.0, 0.05).unwrap();
+        assert!((scaled_upper / 1024.0 - upper).abs() < 1e-12);
+        assert!(empirical_bernstein_ci(&samples, 1.0, 0.01).unwrap() > upper);
+    }
+
+    #[test]
+    fn empirical_bernstein_finite_extremes_use_the_known_support() {
+        let samples = [f64::MAX, f64::MAX];
+        assert_eq!(empirical_bernstein_ci(&samples, f64::MAX, 0.05), Some(f64::MAX));
+        assert_eq!(
+            empirical_bernstein_ci(&[0.0, 1.0], 1.0, f64::from_bits(1)),
+            Some(1.0)
+        );
     }
 
     /// Regression: a single observation with VALID range/alpha previously
@@ -1062,11 +1101,11 @@ mod tests {
         // Band should be within input range.
         assert!(band.lower >= 1.0);
         assert!(band.upper <= 100.0);
-        // Realised confidence should be ≥ 1 - alpha = 0.90.
+        // Marginal rank coverage should be ≥ 1 - alpha = 0.90.
         assert!(
-            band.realised_confidence >= 0.90,
-            "realised confidence = {}, expected >= 0.90",
-            band.realised_confidence,
+            band.coverage_lower_bound >= 0.90,
+            "coverage lower bound = {}, expected >= 0.90",
+            band.coverage_lower_bound,
         );
     }
 
@@ -1102,17 +1141,49 @@ mod tests {
         let samples = vec![1.0, 2.0, 3.0, 4.0];
         let band = conformal_band(&samples, 0.50).unwrap();
         assert!(band.lower <= band.upper);
-        assert!(band.realised_confidence > 0.0);
+        assert_eq!(band.coverage_lower_bound, 0.6);
+        assert!(conformal_band(&samples, 0.05).is_none());
     }
 
     #[test]
     fn conformal_band_handles_uniform_samples() {
-        // All-equal samples: lower == upper, realised
-        // confidence = 1.0.
+        // Equal samples do not let calibration certify probability one.
         let samples = vec![42.0; 100];
         let band = conformal_band(&samples, 0.10).unwrap();
         assert_eq!(band.lower.to_bits(), 42.0_f64.to_bits());
         assert_eq!(band.upper.to_bits(), 42.0_f64.to_bits());
-        assert_eq!(band.realised_confidence.to_bits(), 1.0_f64.to_bits());
+        assert!((band.coverage_lower_bound - 91.0 / 101.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn conformal_band_matches_exhaustive_future_rank_coverage() {
+        // Every held-out rank is equally likely for continuous exchangeable
+        // data. This oracle measures actual coverage, not training inclusion.
+        for n in 4..40 {
+            for alpha in [0.05, 0.1, 0.2, 0.5, 0.8] {
+                let mut covered = 0;
+                let mut admitted = 0;
+                let mut reported = 0.0;
+                for future in 0..=n {
+                    let calibration: Vec<f64> = (0..=n)
+                        .filter(|rank| *rank != future)
+                        .map(f64::from)
+                        .collect();
+                    if let Some(band) = conformal_band(&calibration, alpha) {
+                        admitted += 1;
+                        reported = band.coverage_lower_bound;
+                        if (band.lower..=band.upper).contains(&f64::from(future)) {
+                            covered += 1;
+                        }
+                    }
+                }
+                if admitted != 0 {
+                    assert_eq!(admitted, n + 1);
+                    let actual = f64::from(covered) / f64::from(n + 1);
+                    assert!((actual - reported).abs() < 1e-12);
+                    assert!(actual + 1e-12 >= 1.0 - alpha);
+                }
+            }
+        }
     }
 }

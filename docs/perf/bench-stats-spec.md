@@ -89,17 +89,24 @@ Why MWU and not Welch's t? The bench distributions are heavy-tailed
 (syscall jitter, GC pauses, thermal effects) and not normal.
 Distribution-free tests do not assume normality.
 
-### 3. Empirical-Bernstein anytime-valid CI (`empirical_bernstein_ci`)
+### 3. Empirical-Bernstein confidence sequence (`empirical_bernstein_ci`)
 
-- Howard & Ramdas (2021), *"Time-uniform, nonparametric, nonasymptotic
-  confidence sequences"* — empirical-Bernstein style upper bound on the
-  running mean.
-- **Sound under repeated peeking.** A CI gate that calls this primitive
-  every commit does NOT pay a multiple-comparison tax. This is what
-  fixes "5 false positives per CI run."
+- Maurer & Pontil (2009), Theorem 4, supplies the fixed-sample bound.
+  At prefix length `n >= 2`, allocate `delta_n = alpha / (n*(n-1))`.
+  These budgets sum to `alpha`, so a union bound covers every prefix
+  of one fixed i.i.d. stream. This replaces an unsupported handwritten
+  log-log term; it is a conservative construction, not Howard's stitched
+  boundary. See [the primary derivation](https://arxiv.org/pdf/0907.3740).
+- **Repeated observations and multiple benchmarks are different.**
+  For 100 streams and family error budget 0.05, an equal allocation uses
+  `alpha_i=0.0005`; unequal prespecified allocations may also sum to 0.05.
+  Reusing 0.05 in every stream does not solve the multiple-comparison
+  problem. Changing code versions or populations does not extend one
+  stationary stream; it requires a separate experimental/error budget.
 - Inputs: bounded samples in `[0, range]`, overall failure probability
-  `α`. Returns `μ̂ + δ` such that `Pr(true mean ≤ μ̂ + δ at every n) ≥
-  1 − α`.
+  `α` in `(0,1)`. Returns the upper bound, capped by the known support,
+  such that `Pr(true mean <= upper at every n >= 2) >= 1-alpha` under
+  those sampling assumptions. Out-of-support/non-finite values are refused.
 - Unit tests cover known-mean bounding, tightening with sample size,
   and invalid-input rejection.
 
@@ -116,12 +123,14 @@ PR opens
   ├─ run all bench groups → emit Distribution per bench
   ├─ for each headline-claim bench:
   │    fetch baseline distribution from main HEAD
-  │    EBCI upper-bound on (release - baseline) deltas
-  │    if upper_bound > baseline_p50 * (1 + threshold_relative): fail
+  │    allocate this stream's alpha from the family budget
+  │    bound the candidate mean; account separately for baseline uncertainty
+  │    compare mean with a prespecified mean budget in the same units
+  │    upper <= budget: qualify; lower > budget: regression; else inconclusive
   └─ comparison verdict written into wa-bench-meta.jsonl
 ```
 
-The CI script that drives this lives separately
+This is a proposed DSR/RCH gate workflow. The script that would drive it lives separately
 ([`scripts/check_bench_stats.sh`](../../scripts/check_bench_stats.sh) —
 not yet shipped, tracked as a follow-on bead).
 
@@ -150,8 +159,15 @@ follow-on beads:
    reproducible.
 3. **Bounded sample assumption for EBCI.** Every bench MUST declare
    its `range` (a-priori upper bound on per-iteration time).
-   `range = 10 × p99.9_target` is a safe default. Wall-clock benches
-   without a documented timeout are not eligible for EBCI gating.
+   A multiple of a percentile target is not a proven upper bound.
+   Record every timeout/support violation and refuse the bound; dropping
+   slow observations or clipping them changes the estimand. Wall-clock
+   benches without a justified bound are not eligible for this gate.
+4. **Match the statistic.** A mean confidence bound does not certify p99
+   or p99.9. Signed candidate-minus-baseline deltas need a declared shift
+   and support, and uncertainty in an estimated baseline must be included.
+   Failure to certify with an upper bound alone is inconclusive, not proof
+   of regression. Sparse tail samples remain sparse after bootstrapping.
 
 ## See also
 

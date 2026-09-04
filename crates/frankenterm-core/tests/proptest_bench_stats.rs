@@ -148,20 +148,22 @@ proptest! {
     }
 
     #[test]
-    fn proptest_bench_stats_conformal_band_contains_realised_confidence(
+    fn proptest_bench_stats_conformal_band_requires_admitted_future_rank_coverage(
         samples in prop::collection::vec(0.0f64..=1_000_000.0, 4..128),
         alpha in 0.001f64..0.999,
     ) {
-        let band = conformal_band(&samples, alpha).expect("valid conformal inputs");
+        let Some(band) = conformal_band(&samples, alpha) else {
+            prop_assert!(alpha * (samples.len() + 1) as f64 / 2.0 < 1.0);
+            return Ok(());
+        };
         prop_assert!(band.lower <= band.upper);
-        prop_assert!((0.0..=1.0).contains(&band.realised_confidence));
-        prop_assert!(band.realised_confidence + 1e-12 >= 1.0 - alpha);
-
-        let inside = samples
-            .iter()
-            .filter(|value| **value >= band.lower && **value <= band.upper)
-            .count();
-        let realised = inside as f64 / samples.len() as f64;
-        prop_assert!(approx_eq(band.realised_confidence, realised));
+        prop_assert!((0.0..=1.0).contains(&band.coverage_lower_bound));
+        prop_assert!(band.coverage_lower_bound + 1e-12 >= 1.0 - alpha);
+        // Increasing confidence either widens this finite band or correctly
+        // refuses because a distribution-free finite endpoint is unavailable.
+        if let Some(stricter) = conformal_band(&samples, alpha / 2.0) {
+            prop_assert!(stricter.lower <= band.lower);
+            prop_assert!(stricter.upper >= band.upper);
+        }
     }
 }

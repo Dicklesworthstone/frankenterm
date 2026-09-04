@@ -49,9 +49,22 @@ where:
 - `KL(Q || P)` is measured in nats.
 - `delta = 0.01` for a 99% confidence statement.
 
-For a release gate, compute the smallest `r` in `[r_hat, 1]` whose
-Bernoulli KL divergence from `r_hat` satisfies the inequality. The
-published recall lower bound is `max(0, 1 - r)`.
+For a release gate, compute the **largest** admissible `r` in `[r_hat, 1]`
+(the supremum) whose Bernoulli KL divergence from `r_hat` satisfies the
+inequality. The smallest admissible value is always `r_hat`, which would
+incorrectly erase uncertainty. The published lower bound is `max(0, 1 - r)`.
+On the upper branch, KL is monotone: bisect with the admissible endpoint
+below and the inadmissible endpoint above, and round the reported risk
+upward. Handle `r_hat=0` with `r=1-exp(-epsilon)`, `r_hat=1` with `r=1`,
+and `epsilon=0` with `r=r_hat`. Reject invalid probabilities, non-finite
+inputs, and `n=0`; the explicit blocked artifact below is not an inversion.
+
+With this all-relevant-items-present loss, `1-R(Q)` bounds the probability
+of complete top-k retrieval. It is also a conservative lower bound on
+expected per-query recall when each admitted query has a nonempty judged
+relevant set. It does not directly bound a weighted micro-average across
+queries with different numbers of relevant segments. Record that metric
+definition and the posterior sampling semantics in the release artifact.
 
 The checked artifact also records the conservative square-root
 relaxation already used by existing FrankenTerm PAC-Bayes code:

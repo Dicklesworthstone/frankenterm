@@ -27,8 +27,11 @@ contracts as samples arrive, but it always covers the true mean with
 
 **Implementation in this repo**:
 - `bench_stats::empirical_bernstein_ci(samples, range, alpha)` ships
-  the time-uniform Bernstein bound (Howard & Ramdas 2021). Safe to
-  call at any stopping time.
+  a confidence sequence for one bounded i.i.d. stream: the Maurer–Pontil
+  fixed-sample bound with summable `alpha/(n*(n-1))` confidence spending.
+  It can be inspected at arbitrary prefix lengths under those assumptions.
+  Separate benchmarks and changed code populations need separate error
+  budgets. See [the implementation derivation](../perf/bench-stats-spec.md).
 - See `crates/frankenterm-core/src/bench_stats.rs:464` —
   `empirical_bernstein_ci`'s docstring + worked example.
 
@@ -63,20 +66,21 @@ Solving for n: `n ≥ range² · ln(2/α) / (2 · ε²)`.
   both available; falls back to Hoeffding when `var_bound` is
   `None`.
 
-**Worked example**: detect a 10% regression on a 100ns p99 SLO at
+**Worked example**: bound mean estimation error by 10ns at
 α=0.05, observations bounded in [0, 1ms]:
 - threshold = 10ns
 - range = 1_000_000ns (1ms)
 - α = 0.05
 - Without variance prior:
   `min_sample_size_hoeffding(10.0, 0.05, 1_000_000.0)` ≈ 1.84e10.
-  Hoeffding says you'd need 18 billion samples to *guarantee*
-  detection of a 10ns shift on a 1ms-bounded observation. That's
+  Hoeffding requires about 18 billion samples for that error bound at
+  the stated confidence. This is neither a p99 bound nor a test-power
+  guarantee for detecting a 10ns shift against an uncertain baseline. That's
   unreasonable, so:
 - With variance prior (e.g., var ≈ 100ns² from prior runs):
   `min_sample_size_bernstein(10.0, 0.05, 1_000_000.0, 100.0)` ≈
-  1.6e6. Bernstein leverages the var bound → 4 orders of
-  magnitude tighter.
+  2.46e5. This improvement requires an actual variance upper bound;
+  a prior empirical estimate alone does not provide one.
 
 This is why the bench harness must track per-bench variance budgets:
 without them, Hoeffding-only sample sizing is impractical for
@@ -97,8 +101,9 @@ distribution-free prediction intervals. For a target miscoverage α:
 1. Sort historical observations.
 2. Quantile-pick lower and upper bounds with the (n+1) finite-sample
    correction.
-3. With probability ≥ 1-α, a future observation lies within the
-   resulting band — regardless of underlying distribution.
+3. Under exchangeability of calibration and future observations, the
+   rank construction provides marginal coverage. It does not guarantee
+   conditional coverage or preserve nominal coverage through arbitrary drift.
 
 **When to use**:
 - SLO bands that adapt to drift (regime shift between releases).
@@ -109,18 +114,19 @@ distribution-free prediction intervals. For a target miscoverage α:
   pick a fixed cutoff (e.g., 100ns for p99 lock-wait).
 
 **Implementation in this repo**:
-- `bench_stats::ConformalBand { lower, upper, realised_confidence }`.
+- `bench_stats::ConformalBand { lower, upper, coverage_lower_bound }`.
 - `bench_stats::conformal_band(samples, alpha)` — two-tailed split
-  conformal with (n+1) correction. Floors at 4 samples; rejects
-  non-finite inputs.
+  order-statistic band with (n+1) correction. Floors at 4 samples; rejects
+  non-finite inputs and insufficient calibration for finite endpoints.
+  Coverage is derived from future ranks, not training-point inclusion.
 - See `crates/frankenterm-core/src/bench_stats.rs` for the
   implementation + 5 regression tests.
 
 **Operator value**: bench harness reports per-bench distribution
 "the band shifted from [50ns, 150ns] to [80ns, 250ns] across the
 last 30 builds — investigate". Hand-tuned thresholds can't surface
-this without manual recalibration; conformal bands track drift
-automatically.
+  this without manual recalibration. Bands can reveal a changing distribution,
+but coverage across a regime shift needs separate validation.
 
 ---
 
@@ -154,9 +160,10 @@ distribution-shape differences (location AND shape).
 Bench B (post-change) measures p99 = 110ns. Is the difference real,
 or noise?
 - `mann_whitney_u(&samples_a, &samples_b)` returns p-value.
-- p < 0.05 → statistically significant difference.
-- Combine with Bernstein CI on the *magnitude* of the shift to
-  decide if the shift is *meaningful*.
+- Interpret the p-value under the sampling assumptions and the experiment's
+  multiplicity budget. A rank comparison does not itself establish a p99 shift.
+- Use a confidence interval for the actual statistic of interest to quantify
+  practical effect; a mean Bernstein bound does not certify a tail quantile.
 
 ---
 
