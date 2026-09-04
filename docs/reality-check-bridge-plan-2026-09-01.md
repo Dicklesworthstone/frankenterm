@@ -877,3 +877,64 @@ A list of independent passing component tests cannot satisfy this conjunction.
 Natural provider output, deliberately injected detection text on a real mux,
 and fake adapters are three different evidence classes. Never force a paid
 account to exhaustion merely to obtain a rate-limit trace.
+
+**Ambition round 2 — adversarial correctness and statistical meaning.** Add
+exact failure cutpoints to every effectful slice: before authorization, after
+authorization/before effect, after possible effect/before acknowledgement, and
+after acknowledgement/before durable completion. Cancellation, retries, restarts,
+and concurrent requests must preserve a legal history and expose ambiguous
+outcomes. A persisted kill switch read only at construction does not stop an
+already-running watcher; connector lifecycle's emergency-only guard also does
+not implement graduated HardStop. Keep startup proof separate from these gaps.
+
+New G88: `audit_erasure_spec.rs` puts identity rows above untransformed
+Vandermonde parity, so its claimed any-k recovery is false. With k=4,n=7 and
+surviving indices [2,4,5,6], the matrix is singular and decode's `expect` panics.
+Use a genuinely systematic MDS construction, return typed decode errors, and
+exercise every small admitted survivor subset plus this counterexample. This
+is a P2 experimental-library defect, not evidence of a deployed audit outage.
+
+New G89: performance explanations need valid proof boundaries. PAC-Bayes risk
+upper inversion takes the largest admissible risk, not the smallest (which is
+the empirical risk itself). Anytime validity over time does not eliminate
+multiple-comparison correction across benchmarks. An empirical latency above
+the stated bound cannot be described as satisfying that bound by inventing a
+tolerance. Correct derivations in place and inspect the actual consumers;
+preserve empirical distributions, assumptions, confidence, failure cases, and
+the distinction between probabilistic prediction and a hard deadline. Native
+present-call return, GPU completion, compositor presentation, and photon
+measurement remain separate clocks and evidence boundaries.
+
+**Ambition round 3 — complete useful routes with bounded scope.** Full plan
+intake adds three more accepted integration gaps: recorder events must actually
+convert to CASR conversations (wrapping supplied CanonicalMessage values is
+not conversion); process triage must execute the intended provider adapter
+with policy/approval/apply/verify (the current heuristic provider is narrower);
+and planned authenticated HTTP mutation, terminal WebSocket, and OpenAPI
+surfaces are not delivered by the current localhost read/SSE server. Preserve
+them in separate P2 slices with clear authority prerequisites. Never enable a
+remote mutation server before authentication, capability checks, origin/bind
+policy, cancellation, replay protection, and audit are executable.
+
+Organize closure into useful milestones, without claiming calendar ETAs:
+
+1. **Safe implementation:** constructor/clipboard/gate/false-success/erasure
+   repairs, regression proof, precise docs. No new generic framework.
+2. **Useful installed product:** signed matching family, clean first hour,
+   shell capability, two-agent everyday work and a three-provider reaction
+   scenario, including denial and safe pause. Exact 2-pane product qualification
+   and 3-provider compatibility are separate tests, not conflicting fleet sizes.
+3. **Reliable operations:** live cancellation/fencing, concurrent mission state,
+   real connector roundtrip, recorder/replay/retention, learned search and
+   explicitly optional integration routes. No success from admitted metadata.
+4. **Qualified scale and release:** exact persona/topology/target/size journeys,
+   native visual/accessibility review, measured long-session envelopes, trusted
+   per-release verification and DSR canary/upgrade results.
+
+Each leaf can be implemented and tested without looking up this plan: its bead
+must contain the reproduction, causal seam, inputs/outputs, constraints,
+positive and negative controls, failure disposition, artifact contract, and
+dependency rationale. Shared qualification contracts are strengthened rather
+than duplicated. Capability advertising must depend on reachable configured
+providers; feature unification in a workspace build cannot stand in for the
+actual shipped binary's feature set.
