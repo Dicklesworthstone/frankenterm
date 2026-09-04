@@ -1,3 +1,10 @@
+// The Send proof for this file's async fixture walks the telemetry collector
+// task through asupersync's runtime wrappers and, on nightly-2026-08-31,
+// exhausts the default 128-step solver budget. The same pattern in the other
+// LabRuntime integration crates uses this bounded increase; this is not a
+// recursive type cycle.
+#![recursion_limit = "256"]
+
 //! LabRuntime-ported telemetry tests for deterministic async testing.
 //!
 //! Bead: ft-22x4r

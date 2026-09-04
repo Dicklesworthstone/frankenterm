@@ -104369,6 +104369,7 @@ recorder_backend = "rusqlite"
         use frankenterm_core::scrollback_mmap_writer::{MmapScrollback, MmapScrollbackConfig};
 
         let dir = tempfile::tempdir().expect("create scrollback tempdir");
+        harden_test_dir(dir.path());
         let pane_uuid = "ab".repeat(32);
         let writer = MmapScrollback::open(
             MmapScrollbackConfig::new(dir.path(), pane_uuid.clone()).with_cap_bytes(1024),
@@ -128735,6 +128736,7 @@ printf x > "$MINISIGN_MARKER"
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
         make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         make_test_dir(&global_root.join(".cursorrules"));
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "cursor".to_string(),
