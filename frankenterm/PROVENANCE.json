@@ -231,7 +231,7 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 3,
+        "cosmetic": 4,
         "feat": 41,
         "fix": 41,
         "other": 10,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 129,
+      "fork_side_commit_count": 130,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-04T10:37:32-04:00",
-        "sha": "9eeb5390fb030325c1ae3824d0682c224153c857",
-        "subject": "fix(config-derive): stabilize type diagnostic punctuation"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-04T12:21:37-04:00",
+        "sha": "5871557dbe67f26cf5efc98fbde7809d9f686109",
+        "subject": "style(config-derive): satisfy release rustfmt proof"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -256,19 +256,20 @@
     {
       "authors_raw": null,
       "classification_summary": {
+        "cosmetic": 1,
         "feat": 1,
         "fix": 5,
         "other": 3,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 12,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-04T10:37:32-04:00",
-        "sha": "9eeb5390fb030325c1ae3824d0682c224153c857",
-        "subject": "fix(config-derive): stabilize type diagnostic punctuation"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-04T12:21:37-04:00",
+        "sha": "5871557dbe67f26cf5efc98fbde7809d9f686109",
+        "subject": "style(config-derive): satisfy release rustfmt proof"
       },
       "name": "frankenterm-config-derive",
       "path": "frankenterm/config/derive",
@@ -1058,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2384,
-  "generated_at": "2026-09-04T14:37:44.891751Z",
+  "fork_side_commit_total": 2386,
+  "generated_at": "2026-09-04T16:21:50.462704Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
