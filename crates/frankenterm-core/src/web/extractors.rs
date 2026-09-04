@@ -173,6 +173,50 @@ pub(super) fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
 // JSON redaction
 // =============================================================================
 
+/// Largest base64 string this module will decode while looking for secrets.
+///
+/// A response may legitimately carry a big encoded blob (a screenshot, a
+/// capture chunk); decoding every one of those on the way out would cost more
+/// than the redaction is worth. Payloads that signal events are far smaller
+/// than this.
+const MAX_BASE64_REDACT_INPUT_BYTES: usize = 16 * 1024;
+
+/// If `candidate` is base64 whose decoded text carries a secret, return the
+/// re-encoded redacted text; otherwise `None`.
+///
+/// The field keeps its shape -- still base64, still decodable by the same
+/// consumer -- but what it decodes to is the redacted view. Anything that is
+/// not base64 of valid UTF-8, or that decodes to text with nothing to redact,
+/// is left for the ordinary string path.
+fn redact_base64_payload(candidate: &str, redactor: &Redactor) -> Option<String> {
+    use base64::Engine as _;
+
+    if candidate.len() < 8 || candidate.len() > MAX_BASE64_REDACT_INPUT_BYTES {
+        return None;
+    }
+    // Cheap rejection before any allocation: standard base64 is a multiple of
+    // four characters drawn from a fixed alphabet.
+    if !candidate.len().is_multiple_of(4) {
+        return None;
+    }
+    if !candidate
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return None;
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(candidate)
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let redacted = redactor.redact(&text);
+    if redacted == text {
+        return None;
+    }
+    Some(base64::engine::general_purpose::STANDARD.encode(redacted))
+}
+
 /// Recursively redact string values in a JSON tree using the given [`Redactor`].
 ///
 /// br-ft-10i8s: descent is bounded by [`MAX_REDACT_RECURSION_DEPTH`]
@@ -196,7 +240,22 @@ fn redact_json_value_with_depth(value: &mut serde_json::Value, redactor: &Redact
     }
     match value {
         serde_json::Value::String(s) => {
-            *s = redactor.redact(s);
+            let redacted = redactor.redact(s);
+            if redacted == *s {
+                // The pattern matcher only sees the encoded form of a base64
+                // field, so a secret inside one is served verbatim: a reader
+                // decodes it and the redaction never happened. A user-var
+                // event carries exactly this shape -- `event_data` redacted
+                // beside a raw `value` that decodes to the same secret
+                // (ft-xxfwy.19 probe).
+                if let Some(reencoded) = redact_base64_payload(s, redactor) {
+                    *s = reencoded;
+                } else {
+                    *s = redacted;
+                }
+            } else {
+                *s = redacted;
+            }
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -376,10 +435,94 @@ mod tests {
         assert_eq!(value["outer"]["inner"], "text");
     }
 
+    // ── ft-xxfwy.19: base64 fields cannot smuggle a secret past redaction ──
+
+    #[test]
+    fn a_secret_inside_a_base64_field_is_redacted_in_place() {
+        use base64::Engine as _;
+
+        // The shape a user-var event actually streams: the decoded view beside
+        // the raw encoded value it came from.
+        let plaintext =
+            r#"{"kind":"note","message":"a token sk-livetest1234567890abcdefghij trails here"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext);
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!({
+            "payload": {
+                "value": encoded,
+                "event_data": serde_json::from_str::<serde_json::Value>(plaintext).unwrap(),
+            }
+        });
+
+        redact_json_value(&mut value, &redactor);
+
+        let served = value["payload"]["value"]
+            .as_str()
+            .expect("value stays a string");
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(served)
+                .expect("the field is still base64 a consumer can decode"),
+        )
+        .expect("still UTF-8");
+        assert!(
+            !decoded.contains("sk-livetest1234567890abcdefghij"),
+            "a reader who decodes the field must not get the secret back: {decoded}"
+        );
+        assert!(
+            !value["payload"]["event_data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("sk-livetest1234567890abcdefghij"),
+            "the decoded view must stay redacted too"
+        );
+    }
+
+    #[test]
+    fn base64_without_a_secret_is_left_exactly_as_it_was() {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(r#"{"kind":"note"}"#);
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!({ "value": encoded.clone() });
+        redact_json_value(&mut value, &redactor);
+        assert_eq!(value["value"], encoded);
+    }
+
+    #[test]
+    fn base64_lookalikes_and_oversize_blobs_are_not_decoded() {
+        let redactor = Redactor::new();
+        // Not base64: wrong length, and characters outside the alphabet.
+        for candidate in ["hello world", "abc", "not-base64-!!", "AAAA AAAA"] {
+            let mut value = serde_json::json!({ "field": candidate });
+            redact_json_value(&mut value, &redactor);
+            assert_eq!(value["field"], candidate, "{candidate} must pass through");
+        }
+        // Valid base64 of non-UTF-8 bytes is left alone rather than mangled.
+        use base64::Engine as _;
+        let binary = base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe, 0xfd, 0xfc]);
+        let mut value = serde_json::json!({ "field": binary.clone() });
+        redact_json_value(&mut value, &redactor);
+        assert_eq!(value["field"], binary);
+    }
+
     // ── br-ft-10i8s: depth cap ──
+
+    /// The depth-cap tests reset and then read a process-wide counter, so they
+    /// cannot run beside each other: one test's bump lands after another's
+    /// reset and the assertion reads a stranger's count. That was latent until
+    /// this module gained more tests and the scheduling changed.
+    static DEPTH_COUNTER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_depth_counter() -> std::sync::MutexGuard<'static, ()> {
+        DEPTH_COUNTER_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn redact_depth_cap_stops_at_max_depth_ft_10i8s() {
+        let _serialized = lock_depth_counter();
         // br-ft-10i8s: deeply nested arrays past the cap leave the
         // remaining subtree un-redacted but DO NOT stack-overflow.
         // Pre-fix this would have caused a SIGSEGV on most
@@ -408,6 +551,7 @@ mod tests {
     fn redact_depth_cap_under_limit_does_not_bump_counter_ft_10i8s() {
         // Sanity: realistic event-payload depth (5 levels) does not
         // bump the cap counter.
+        let _serialized = lock_depth_counter();
         super::reset_redact_depth_limit_hit_count_for_test();
         let redactor = Redactor::new();
         let mut value = serde_json::json!({
@@ -431,6 +575,7 @@ mod tests {
         // levels deep should fully redact (no off-by-one
         // truncation). MAX is 64, so we build a 60-level tree to
         // stay safely under.
+        let _serialized = lock_depth_counter();
         super::reset_redact_depth_limit_hit_count_for_test();
         let redactor = Redactor::new();
         let mut value = serde_json::json!("leaf");
