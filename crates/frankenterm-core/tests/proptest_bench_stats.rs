@@ -19,7 +19,16 @@ fn approx_eq(a: f64, b: f64) -> bool {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(96))]
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/proptest-regressions/bench_stats.txt"
+            )),
+        )),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn proptest_bench_stats_distribution_summary_preserves_order_statistics(

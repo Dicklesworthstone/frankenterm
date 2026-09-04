@@ -180,7 +180,9 @@ fn classify_replacement_spans(
     }
     for (index, (_, start, end)) in replacements.iter().enumerate() {
         if !valid_span(*start, *end) {
-            validation_errors.push(format!("replacements[{index}] has an invalid byte interval"));
+            validation_errors.push(format!(
+                "replacements[{index}] has an invalid byte interval"
+            ));
         }
     }
     if !validation_errors.is_empty() {
@@ -1758,7 +1760,10 @@ mod tests {
     #[test]
     fn coverage_checks_actual_output_for_surviving_secret_fragments() {
         let key = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        for input in [format!("private_prefix|{key}"), format!("{key}|private_suffix")] {
+        for input in [
+            format!("private_prefix|{key}"),
+            format!("{key}|private_suffix"),
+        ] {
             let vector = pos(
                 "partial_real_redaction",
                 "test",

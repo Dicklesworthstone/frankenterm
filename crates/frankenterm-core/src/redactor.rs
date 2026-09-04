@@ -1963,7 +1963,10 @@ mod tests {
         let bytes = redactor.redact_bytes_with_evidence(text.as_bytes());
         assert_eq!(bytes.bytes, REDACTED_MARKER.as_bytes());
         assert_eq!(bytes.evidence.replacement_count, 2);
-        assert_eq!(bytes.evidence.secret_input_bytes_replaced, text.len() as u64);
+        assert_eq!(
+            bytes.evidence.secret_input_bytes_replaced,
+            text.len() as u64
+        );
     }
 
     #[test]

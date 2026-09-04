@@ -5318,9 +5318,9 @@ impl ObservationRuntime {
     ///
     /// The task is intentionally separated from capture/persistence: it listens
     /// to already-redacted EventBus traffic, routes eligible events through
-    /// `ConnectorOutboundBridge`, drains queued connector actions into the
-    /// connector host runtime, and feeds completion status back into the
-    /// bridge's governor/reliability controllers.
+    /// `ConnectorOutboundBridge`, and drains queued connector actions. Until a
+    /// host transport is wired, dispatch records a permanent unavailable failure
+    /// in the bridge's governor/reliability controllers, never delivery success.
     fn spawn_connector_outbound_task(&self) -> Option<JoinHandle<()>> {
         let event_bus = self.event_bus.clone()?;
         let bridge = self.connector_outbound_bridge.clone()?;
@@ -14983,7 +14983,10 @@ mod tests {
         process_connector_outbound_runtime_event(&mut bridge, &event, 5_001);
         assert_eq!(bridge.pending_action_count(), 0);
         assert_eq!(
-            bridge.policy_engine().reliability_registry().total_dlq_depth(),
+            bridge
+                .policy_engine()
+                .reliability_registry()
+                .total_dlq_depth(),
             0
         );
         assert_eq!(

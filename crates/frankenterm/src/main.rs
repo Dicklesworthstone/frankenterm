@@ -121745,7 +121745,10 @@ printf x > "$MINISIGN_MARKER"
             else {
                 panic!("configured watcher rule must deny, got {result:?}");
             };
-            assert_eq!(decision.rule_id(), Some("config.rule.operator.deny_workflow_send"));
+            assert_eq!(
+                decision.rule_id(),
+                Some("config.rule.operator.deny_workflow_send")
+            );
             let audit_id = audit_action_id.expect("denial must reach real SQLite audit storage");
             assert_eq!(mock.get_text_with_cx(&cx, 42, false).await.unwrap(), before);
             let audit = storage
@@ -121816,7 +121819,11 @@ printf x > "$MINISIGN_MARKER"
 
             config.safety.require_prompt_active = false;
             let mut engine = build_watcher_policy_engine(&config, &storage).await;
-            assert!(engine.authorize(&input(PaneCapabilities::running())).is_allowed());
+            assert!(
+                engine
+                    .authorize(&input(PaneCapabilities::running()))
+                    .is_allowed()
+            );
 
             let mut alt_screen = PaneCapabilities::prompt();
             alt_screen.alt_screen = Some(true);
@@ -121843,7 +121850,11 @@ printf x > "$MINISIGN_MARKER"
             config.safety.rate_limit_global = 100;
             config.tuning.policy.rate_limit_window_secs = 17;
             let mut engine = build_watcher_policy_engine(&config, &storage).await;
-            assert!(engine.authorize(&input(PaneCapabilities::prompt())).is_allowed());
+            assert!(
+                engine
+                    .authorize(&input(PaneCapabilities::prompt()))
+                    .is_allowed()
+            );
             let limited = engine.authorize(&input(PaneCapabilities::prompt()));
             assert_eq!(limited.rule_id(), Some("policy.rate_limit"));
             assert!(limited.reason().unwrap().contains("1/1 in 17s window"));
@@ -121879,7 +121890,10 @@ printf x > "$MINISIGN_MARKER"
                 .unwrap();
             let mut engine = build_watcher_policy_engine(&config, &storage).await;
             assert_eq!(engine.kill_switch_state().changed_by, "operator");
-            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+            assert_eq!(
+                engine.authorize(&input).rule_id(),
+                Some("policy.kill_switch")
+            );
 
             storage
                 .set_config_value_with_cx(&cx, KILL_SWITCH_STATE_KEY, "{invalid-json")
@@ -121888,7 +121902,10 @@ printf x > "$MINISIGN_MARKER"
             let mut engine = build_watcher_policy_engine(&config, &storage).await;
             assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::HardStop);
             assert_eq!(engine.kill_switch_state().changed_by, FAIL_CLOSED_ACTOR);
-            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+            assert_eq!(
+                engine.authorize(&input).rule_id(),
+                Some("policy.kill_switch")
+            );
 
             // A missing table is a real storage-read failure, distinct from a
             // missing row. Preserve this test database for failure inspection.
@@ -121900,7 +121917,10 @@ printf x > "$MINISIGN_MARKER"
             let mut engine = build_watcher_policy_engine(&config, &storage).await;
             assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::HardStop);
             assert_eq!(engine.kill_switch_state().changed_by, FAIL_CLOSED_ACTOR);
-            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+            assert_eq!(
+                engine.authorize(&input).rule_id(),
+                Some("policy.kill_switch")
+            );
         });
     }
 

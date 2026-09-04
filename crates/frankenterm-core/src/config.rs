@@ -4795,9 +4795,8 @@ impl NotificationConfig {
                     "notifications.webhooks[{idx}].url must not be empty"
                 ));
             }
-            let parsed_url = url::Url::parse(url).map_err(|_| {
-                format!("notifications.webhooks[{idx}].url must be a valid URL")
-            })?;
+            let parsed_url = url::Url::parse(url)
+                .map_err(|_| format!("notifications.webhooks[{idx}].url must be a valid URL"))?;
             if !matches!(parsed_url.scheme(), "http" | "https") {
                 return Err(format!(
                     "notifications.webhooks[{idx}].url must use http or https"
@@ -4813,9 +4812,7 @@ impl NotificationConfig {
             // transport deliberately does not support. Its errors may contain
             // credentials, so expose only the indexed configuration field.
             crate::runtime_async::http::ParsedUrl::parse(url).map_err(|_| {
-                format!(
-                    "notifications.webhooks[{idx}].url must be supported by the HTTP transport"
-                )
+                format!("notifications.webhooks[{idx}].url must be supported by the HTTP transport")
             })?;
 
             for (event_idx, pattern) in webhook.events.iter().enumerate() {
@@ -8992,7 +8989,9 @@ log_level = "debug"
                     headers: std::collections::HashMap::new(),
                     enabled: true,
                 });
-            config.validate().expect("accept supported parsed webhook URL");
+            config
+                .validate()
+                .expect("accept supported parsed webhook URL");
         }
     }
 

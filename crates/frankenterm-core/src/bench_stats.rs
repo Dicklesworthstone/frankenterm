@@ -509,7 +509,11 @@ pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option
     // the sum/variance or silently produce an infinite confidence bound.
     let mean = samples.iter().map(|x| x / range).sum::<f64>() / n;
     // `n >= 2` is guaranteed by the guard above, so `n - 1.0 >= 1.0`.
-    let var = samples.iter().map(|x| (x / range - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let var = samples
+        .iter()
+        .map(|x| (x / range - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
 
     // ln(2 / delta_n), evaluated without division by tiny alpha or a
     // potentially overflowing n*(n-1) product.
@@ -866,7 +870,10 @@ mod tests {
     #[test]
     fn empirical_bernstein_finite_extremes_use_the_known_support() {
         let samples = [f64::MAX, f64::MAX];
-        assert_eq!(empirical_bernstein_ci(&samples, f64::MAX, 0.05), Some(f64::MAX));
+        assert_eq!(
+            empirical_bernstein_ci(&samples, f64::MAX, 0.05),
+            Some(f64::MAX)
+        );
         assert_eq!(
             empirical_bernstein_ci(&[0.0, 1.0], 1.0, f64::from_bits(1)),
             Some(1.0)

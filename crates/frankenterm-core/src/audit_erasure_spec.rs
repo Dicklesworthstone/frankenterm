@@ -420,8 +420,8 @@ fn generator_matrix(cfg: ErasureConfig) -> Vec<Vec<u8>> {
 /// fit the 4-byte length prefix and platform allocation envelope.
 pub fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Result<Vec<ErasureShard>, ErasureError> {
     ErasureConfig::new(cfg.k, cfg.n)?;
-    let original_len = u32::try_from(data.len())
-        .map_err(|_| ErasureError::PayloadTooLarge { len: data.len() })?;
+    let original_len =
+        u32::try_from(data.len()).map_err(|_| ErasureError::PayloadTooLarge { len: data.len() })?;
     let payload_len = data
         .len()
         .checked_add(4)
