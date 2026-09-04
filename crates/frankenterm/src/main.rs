@@ -114653,7 +114653,7 @@ log_level = "debug"
     fn local_remote_setup_components_require_one_sealed_build_identity() {
         use sha2::Digest as _;
 
-        let dir = tempfile::tempdir().expect("create component fixture directory");
+        let dir = InstallerTestDir::new("create component fixture directory");
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
         let guardian_path = dir.path().join("frankenterm-pty-guardian");
@@ -115153,7 +115153,7 @@ log_level = "debug"
     fn remote_release_installer_resumes_partial_destination_and_fast_paths_exact_retry() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create release retry fixture");
+        let fixture = InstallerTestDir::new("create release retry fixture");
         let home = fixture.path().join("home");
         let fake_bin = fixture.path().join("fake-bin");
         std::fs::create_dir_all(&fake_bin).expect("create fake command directory");
@@ -115265,6 +115265,76 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
         manifest: std::path::PathBuf,
         verifier: std::path::PathBuf,
         generation_id: String,
+    }
+
+    struct InstallerTestDir {
+        inner: tempfile::TempDir,
+    }
+
+    impl InstallerTestDir {
+        fn new(expect_message: &str) -> Self {
+            Self {
+                inner: tempfile::tempdir().expect(expect_message),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.inner.path()
+        }
+    }
+
+    impl Drop for InstallerTestDir {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            fn restore_owner_directory_access(path: &Path) {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let Ok(metadata) = std::fs::symlink_metadata(path) else {
+                    return;
+                };
+                if !metadata.is_dir() {
+                    return;
+                }
+                let owner_access = metadata.permissions().mode() | 0o700;
+                let _ =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(owner_access));
+                let Ok(entries) = std::fs::read_dir(path) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        restore_owner_directory_access(&entry.path());
+                    }
+                }
+            }
+
+            #[cfg(unix)]
+            restore_owner_directory_access(self.inner.path());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_test_directory_cleanup_restores_sealed_tree_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture_path;
+        {
+            let fixture = InstallerTestDir::new("create sealed cleanup fixture");
+            fixture_path = fixture.path().to_path_buf();
+            let sealed = fixture.path().join("sealed/nested");
+            std::fs::create_dir_all(&sealed).expect("create sealed fixture directories");
+            std::fs::write(sealed.join("artifact"), b"sealed")
+                .expect("write sealed fixture artifact");
+            for path in [sealed.as_path(), sealed.parent().expect("sealed parent")] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+                    .expect("seal fixture directory");
+            }
+        }
+        assert!(
+            !fixture_path.exists(),
+            "installer fixture cleanup left a sealed temporary tree behind"
+        );
     }
 
     #[cfg(unix)]
@@ -117054,7 +117124,7 @@ cat "$FAKE_FONT_ARCHIVE"
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create archive replacement fixture");
+        let fixture = InstallerTestDir::new("create archive replacement fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let archive = fixture.path().join("authenticated.tar");
         let replacement = fixture.path().join("replacement.tar");
@@ -117126,7 +117196,7 @@ fi
     fn installer_authenticated_extractor_rejects_adversarial_archive_names_and_links() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create adversarial extractor fixture");
+        let fixture = InstallerTestDir::new("create adversarial extractor fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         for (index, (case_name, expected_error)) in [
             ("traversal", "archive contains an unsafe member name"),
@@ -117192,7 +117262,7 @@ fi
     fn installer_macos_accepts_a_valid_bounded_process_family_xz_archive() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create macOS extractor success fixture");
+        let fixture = InstallerTestDir::new("create macOS extractor success fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let manifest_name = "fixture.component-manifest.json";
         let archive = fixture.path().join("fixture-process-family.tar.xz");
@@ -117236,7 +117306,7 @@ fi
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create tar trailer fixture");
+        let fixture = InstallerTestDir::new("create tar trailer fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let archive = fixture.path().join("app-with-trailer.tar");
         let extraction_root = fixture.path().join("extract");
@@ -117274,7 +117344,7 @@ fi
     fn installer_streaming_tar_bounds_retained_member_metadata_before_extraction() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create retained-metadata fixture");
+        let fixture = InstallerTestDir::new("create retained-metadata fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let archive = fixture.path().join("many-members.tar");
         let extraction_root = fixture.path().join("extract");
@@ -117312,7 +117382,7 @@ fi
     fn installer_streaming_tar_clears_parser_member_cache_across_high_entry_archive() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create high-entry extractor fixture");
+        let fixture = InstallerTestDir::new("create high-entry extractor fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let archive = fixture.path().join("high-entry-app.tar");
         let extraction_root = fixture.path().join("extract");
@@ -117341,7 +117411,7 @@ fi
     fn installer_xz_decoder_rejects_oversized_dictionary_declarations_before_extraction() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create xz decoder-bound fixture");
+        let fixture = InstallerTestDir::new("create xz decoder-bound fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let archive = fixture.path().join("oversized-dictionary.tar.xz");
         let extraction_root = fixture.path().join("extract");
@@ -117378,7 +117448,7 @@ fi
         if !installer_test_command_exists("zstd") {
             return;
         }
-        let fixture = tempfile::tempdir().expect("create font archive-attack fixture");
+        let fixture = InstallerTestDir::new("create font archive-attack fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
         std::fs::create_dir(&fake_tools).expect("create fake font tool directory");
@@ -117442,7 +117512,7 @@ fi
         if !installer_test_command_exists("zstd") {
             return;
         }
-        let fixture = tempfile::tempdir().expect("create font descriptor-race fixture");
+        let fixture = InstallerTestDir::new("create font descriptor-race fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
         std::fs::create_dir(&fake_tools).expect("create descriptor-race fake tools");
@@ -117507,7 +117577,7 @@ fi
         if !installer_test_command_exists("zstd") {
             return;
         }
-        let fixture = tempfile::tempdir().expect("create real-zstd font fixture");
+        let fixture = InstallerTestDir::new("create real-zstd font fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
@@ -117640,7 +117710,7 @@ fi
         if !installer_test_command_exists("zstd") {
             return;
         }
-        let fixture = tempfile::tempdir().expect("create font replacement fixture");
+        let fixture = InstallerTestDir::new("create font replacement fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let font_archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
@@ -117710,7 +117780,7 @@ fi
         if !installer_test_command_exists("zstd") {
             return;
         }
-        let fixture = tempfile::tempdir().expect("create font mutation fixture");
+        let fixture = InstallerTestDir::new("create font mutation fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let font_archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
@@ -117765,7 +117835,7 @@ fi
         if !installer_test_command_exists("zstd") {
             return;
         }
-        let fixture = tempfile::tempdir().expect("create font crash fixture");
+        let fixture = InstallerTestDir::new("create font crash fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let font_archive = repository.join("crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
@@ -117837,7 +117907,7 @@ fi
     fn installer_bounded_download_refuses_open_time_symlink_replacement_without_overwrite() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create bounded-download race fixture");
+        let fixture = InstallerTestDir::new("create bounded-download race fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
         std::fs::create_dir(&fake_tools).expect("create bounded-download fake tools");
@@ -117907,7 +117977,7 @@ printf '%s' 'attacker-controlled download bytes'
     #[cfg(unix)]
     #[test]
     fn installer_requires_minisign_unless_the_operator_explicitly_disables_release_signatures() {
-        let fixture = tempfile::tempdir().expect("create missing-minisign fixture");
+        let fixture = InstallerTestDir::new("create missing-minisign fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let empty_path = fixture.path().join("empty-path");
         std::fs::create_dir(&empty_path).expect("create empty executable search path");
@@ -117940,7 +118010,7 @@ printf '%s' 'attacker-controlled download bytes'
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create minisign descriptor-race fixture");
+        let fixture = InstallerTestDir::new("create minisign descriptor-race fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
         std::fs::create_dir(&fake_tools).expect("create minisign fake tools");
@@ -118073,7 +118143,7 @@ printf x > "$MINISIGN_MARKER"
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create minisign timeout fixture");
+        let fixture = InstallerTestDir::new("create minisign timeout fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_tools = fixture.path().join("tools");
         std::fs::create_dir(&fake_tools).expect("create minisign timeout fake tools");
@@ -118134,7 +118204,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create installer failpoint matrix fixture");
+        let fixture = InstallerTestDir::new("create installer failpoint matrix fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let new_family = create_installer_test_family(
             &fixture.path().join("new-family"),
@@ -118303,7 +118373,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create activation crash fixture");
+        let fixture = InstallerTestDir::new("create activation crash fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let family = create_installer_test_family(
             &fixture.path().join("family"),
@@ -118405,7 +118475,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create legacy activation fixture");
+        let fixture = InstallerTestDir::new("create legacy activation fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let old_family = create_installer_test_family(
             &fixture.path().join("old-family"),
@@ -118480,7 +118550,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create post-commit recovery fixture");
+        let fixture = InstallerTestDir::new("create post-commit recovery fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let old_family = create_installer_test_family(
             &fixture.path().join("old-family"),
@@ -118752,7 +118822,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_activation_readiness_failure_restores_prior_selector_or_absence() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create activation rollback fixture");
+        let fixture = InstallerTestDir::new("create activation rollback fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let old_family = create_installer_test_family(
             &fixture.path().join("old-family"),
@@ -118898,7 +118968,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_activation_rolls_back_each_invalid_doctor_result() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create doctor rollback fixture");
+        let fixture = InstallerTestDir::new("create doctor rollback fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let family = create_installer_test_family(
             &fixture.path().join("family"),
@@ -118965,7 +119035,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_auto_activation_receipt_reports_component_reverification_failure() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create component failure fixture");
+        let fixture = InstallerTestDir::new("create component failure fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let family = create_installer_test_family(
             &fixture.path().join("family"),
@@ -119032,7 +119102,7 @@ printf x > "$MINISIGN_MARKER"
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create explicit activation fixture");
+        let fixture = InstallerTestDir::new("create explicit activation fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let family = create_installer_test_family(
             &fixture.path().join("family"),
@@ -119102,7 +119172,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_system_process_census_scans_all_users() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create system census fixture");
+        let fixture = InstallerTestDir::new("create system census fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let fake_bin = fixture.path().join("fake-bin");
         std::fs::create_dir(&fake_bin).expect("create fake census tool directory");
@@ -119142,7 +119212,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create activation rollback crash fixture");
+        let fixture = InstallerTestDir::new("create activation rollback crash fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let old_family = create_installer_test_family(
             &fixture.path().join("old-family"),
@@ -119361,7 +119431,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_initial_selector_refuses_active_ambiguous_and_unleased_inactive_states() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create mux-state refusal fixture");
+        let fixture = InstallerTestDir::new("create mux-state refusal fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let family = create_installer_test_family(
             &fixture.path().join("family"),
@@ -119414,7 +119484,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_top_level_idle_orchestration_activates_only_an_inactive_first_install() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create idle orchestration fixture");
+        let fixture = InstallerTestDir::new("create idle orchestration fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let family = create_installer_test_family(
             &fixture.path().join("family"),
@@ -119544,7 +119614,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_upgrade_activates_only_when_activate_if_idle_is_requested() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create idle upgrade fixture");
+        let fixture = InstallerTestDir::new("create idle upgrade fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let old_family = create_installer_test_family(
             &fixture.path().join("old-family"),
@@ -119636,7 +119706,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create managed-selector fixture");
+        let fixture = InstallerTestDir::new("create managed-selector fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let old_family = create_installer_test_family(
             &fixture.path().join("old-family"),
@@ -119741,7 +119811,7 @@ printf x > "$MINISIGN_MARKER"
     fn installer_staged_file_resumes_only_zero_or_exact_prefix_residue() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create staged-file recovery fixture");
+        let fixture = InstallerTestDir::new("create staged-file recovery fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let source = fixture.path().join("source");
         let expected = b"one exact resumable staged file\n";
@@ -119801,7 +119871,7 @@ printf x > "$MINISIGN_MARKER"
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let fixture = tempfile::tempdir().expect("create app failpoint fixture");
+        let fixture = InstallerTestDir::new("create app failpoint fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let build_id = "c".repeat(64);
         let target = "aarch64-apple-darwin";
@@ -120304,7 +120374,7 @@ printf x > "$MINISIGN_MARKER"
         assert!(function_source.contains("outer-checksum-authenticated release package"));
         assert!(function_source.contains("return 1"));
 
-        let dir = tempfile::tempdir().expect("create installed process-family fixture");
+        let dir = InstallerTestDir::new("create installed process-family fixture");
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
         let guardian_path = dir.path().join("frankenterm-pty-guardian");
@@ -120439,7 +120509,7 @@ printf x > "$MINISIGN_MARKER"
 
     #[test]
     fn atomic_component_manifest_rejects_all_zero_build_identity() {
-        let fixture = tempfile::tempdir().expect("create zero-identity fixture");
+        let fixture = InstallerTestDir::new("create zero-identity fixture");
         let package = fixture.path().join("package");
         std::fs::create_dir(&package).expect("create package root");
         std::fs::write(package.join("payload"), b"sealed payload").expect("write package payload");
@@ -120493,7 +120563,7 @@ printf x > "$MINISIGN_MARKER"
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let fixture = tempfile::tempdir().expect("create duplicate-marker fixture");
+        let fixture = InstallerTestDir::new("create duplicate-marker fixture");
         let package = fixture.path().join("package");
         std::fs::create_dir(&package).expect("create duplicate-marker package root");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
