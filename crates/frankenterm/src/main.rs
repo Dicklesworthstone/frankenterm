@@ -47292,6 +47292,21 @@ async fn run_watcher(
         let address = server.bound_addr();
         match server.shutdown_with_cx(&background_shutdown_cx).await {
             Ok(()) => tracing::info!(%address, "Watcher web API stopped"),
+            // A client holding an SSE stream open is the normal state of this
+            // server when the watcher stops, and the framework says plainly
+            // that FastAPI exposes no handle to cancel a surviving connection
+            // task. Reporting it is right; failing the watcher's authority
+            // boundary on it is not -- it would make every stop with a live
+            // stream reader look like a crash to a supervisor. Every other
+            // shutdown error still fails the boundary.
+            Err(frankenterm_core::error::Error::RuntimeOperation {
+                operation: "web server drain",
+                source,
+            }) => tracing::warn!(
+                %address,
+                detail = %source,
+                "Watcher web API stopped with client connections still open"
+            ),
             Err(error) => shutdown_failures.push(anyhow::anyhow!(
                 "in-process web API on {address} did not shut down cleanly: {error}"
             )),
