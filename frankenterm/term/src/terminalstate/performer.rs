@@ -1087,8 +1087,13 @@ impl<'a> Performer<'a> {
         match outcome {
             crate::config::Osc52WriteOutcome::Allow { .. } => {
                 let selection = selection_to_selection(selection);
-                if let Err(err) = self.set_clipboard_contents(selection, selection_data) {
-                    error!("failed to set clipboard in response to OSC 52: {:#?}", err);
+                if self
+                    .set_clipboard_contents(selection, selection_data)
+                    .is_err()
+                {
+                    // Callback errors may embed clipboard data. Only the
+                    // finite selection target belongs in this diagnostic.
+                    error!("OSC 52 clipboard callback failed (selection={selection:?})");
                 }
             }
             crate::config::Osc52WriteOutcome::Prompt { .. } => {
