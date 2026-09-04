@@ -11,6 +11,17 @@ cold-tier pipeline (write/retry driver) per the bead's spec
 ("Integrate Disk-tier handoff with the cold-disk eviction
 infrastructure").
 
+**Source status (2026-09-04):** `DiskTierHandoffQueue` is not consumed by
+the reviewed production renderer/cold-tier paths. The sketches below are
+not a safe copy-and-paste implementation: a handoff descriptor carries
+metadata, not ownership of captured pixels. A real driver must retain the
+bytes and preserve staging ownership until the required durable-write
+acknowledgement, then release or retry with an explicit bounded disposition.
+Enqueueing alone must never free the only copy. This driver and its I/O,
+failure, and allocation evidence are owned by
+`ft-interactive-systems-performance-4tenz.8.8.3`; the narrower queue proof
+is `ft-prove-disk-handoff-batching-hk39c`.
+
 ## Substrate-pass commit table
 
 | Slice | Commit | What ships |
@@ -66,9 +77,10 @@ impl AtlasContext {
                     frame_id,
                 });
 
-                // Release the cold region from staging (the
-                // cold-tier driver has captured its bytes via
-                // the handoff). Then retry the original request.
+                // Conceptual completion phase only: execute these
+                // calls after a real driver has retained the bytes
+                // and acknowledged the required durable write.
+                // Queueing metadata above does NOT establish that.
                 self.driver.release_region(evict_region, frame_id)?;
                 self.driver.stage_region(region_id, bytes, frame_id)
             }

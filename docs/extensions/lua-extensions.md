@@ -1,5 +1,11 @@
 # Writing Lua Extensions
 
+> **Experimental scripting design (ft-rxk40).** The package loader and shared
+> Native → WASM → Lua event dispatch described here have no production
+> consumer. Existing terminal Lua configuration is a separate integration;
+> it does not prove `.ftx` loading, sandboxing, or action execution. Current
+> `ft ext` operates on pattern packs.
+
 Lua extensions run in the existing WezTerm-compatible Lua 5.4 runtime.
 They have full access to the `wezterm` module and can use all existing
 WezTerm callbacks.

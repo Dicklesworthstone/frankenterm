@@ -105,20 +105,19 @@ events into the asupersync log path.
 
 ## "DO NOT BREAK" rules
 
-The bead names three constraints; foundation slice
-preserves each:
+The bead names three integration constraints. The foundation emits metadata;
+the live consumer must satisfy the additional requirements below:
 
 - **A11Y announcements for group ops** — `GroupChangeEvent`
   emission is unconditional (not gated on `is_safe()`); the
-  GUI integration consumes events to drive AT
-  announcements.
+  GUI integration must consume these events to drive AT announcements.
 - **Privacy via redactor** — `bytes_len` is recorded, *not*
-  the payload itself. Send-text-to-all calls the existing
-  redactor on each pane separately; the registry never
-  stores the bytes.
+  the payload itself. The pure `apply_group_op` reducer never receives or
+  stores send bytes. A future live send-to-all consumer must apply policy and
+  redaction per pane; the metadata event does not prove that wiring exists.
 - **TX engine for cross-pane mutations** — bulk ops emit
-  `op_slug = "kill_all"` / `"close_all"` events the TX
-  layer captures + sequences. The registry's pure-logic
+  `op_slug = "kill_all"` / `"close_all"` events that a live TX
+  consumer must capture and sequence. The registry's pure-logic
   reducer does not perform side effects; it only emits
   events.
 

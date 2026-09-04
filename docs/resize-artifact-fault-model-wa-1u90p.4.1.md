@@ -5,6 +5,15 @@ Author: `LavenderCastle`
 Parent track: `wa-1u90p.4`
 Related: ADR-0011 (two-phase resize transactions), `wa-1u90p.5.7` (lock graph)
 
+**Historical scope (2026-09-04):** the fault classes below record the
+February analysis and mitigation hypotheses, with line references from
+that source state. Simulation timing and watcher-lock telemetry do not
+prove these causes in the current native renderer. Revalidate each claimed
+ordering against current source and correlate a reproduced native artifact
+before treating it as a causal diagnosis. Current acceptance lives in
+[the performance campaign](perf/mux-long-session-performance-campaign.md)
+and [renderer scenario contract](design/renderer-scenario-contract.md).
+
 ## Scope
 
 Root-cause analysis of stretched-text and transient invalid-frame artifacts during resize, producing a concrete fault model with identified race conditions, ordering violations, and mitigation design.

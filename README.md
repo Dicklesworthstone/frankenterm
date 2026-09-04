@@ -582,32 +582,21 @@ These are the workloads `ft` was built for. Each scenario describes the operator
 
 **Without `ft`:** You're driving 50 Codex/Claude Code panes in parallel. One agent hits its usage limit and silently stops making progress. You don't notice for 30 minutes. The other 49 agents continue burning tokens until they hit *their* limits.
 
-**With `ft`:** the native rule packs detect every form of "usage reached" / "rate limit" output across all three CLIs without operator config. The matched event includes the originating `pane_id` and the `rule_id`. Two approaches:
+**With `ft`:** the native rule packs recognize supported usage-limit output and record the originating `pane_id` and `rule_id`. Provider wording changes and unknown forms still require detection updates; the 50-pane journey needs target-class qualification. Two approaches:
 
 ```bash
 # A) Let the built-in workflow handle it (preferred)
 ft watch --foreground --auto-handle    # registers handle_usage_limits, handle_compaction, …
 
-# B) Poll the unhandled-events queue and react in shell
-while sleep 5; do
-  ft robot --format json events --unhandled --limit 50 | \
-    jq -c '.data[]' | while read -r event; do
-      pane=$(echo "$event" | jq -r .pane_id)
-      rule=$(echo "$event" | jq -r .rule_id)
-      case "$rule" in
-        codex.usage.reached)        ft robot send "$pane" "/compact" ;;
-        claude_code.usage.reached)  ft robot send "$pane" "/clear" ;;
-        gemini.usage.reached)       ft robot send "$pane" "/reset" ;;
-      esac
-    done
-done
+# B) Inspect detected events before choosing a provider-specific recovery
+ft robot --format json events --unhandled --limit 50 | \
+  jq -c '.data.events[] | {id, pane_id, rule_id}'
 
-# C) Block on a single pane until a specific rule fires (good for tight feedback loops)
-ft robot wait-for 7 "codex.usage.reached" --timeout-secs 3600 && \
-  ft robot send 7 "/compact"
+# Wait for literal output on one pane (this does not subscribe to a rule ID)
+ft robot wait-for 7 "Usage limit" --timeout-secs 3600
 ```
 
-`ft robot wait-for` takes a single `pane_id` and a substring (or regex with `--regex`). For fleet-wide reactions, poll `ft robot events --unhandled` or use `--auto-handle`.
+`ft robot wait-for` takes a single `pane_id` and a substring (or regex with `--regex`). For fleet-wide reactions, inspect `ft robot events --unhandled` or use `--auto-handle`. Context compaction does not reset an account quota. A custom consumer must deduplicate and acknowledge events after an observed outcome, and pause when recovery needs operator approval.
 
 ### Scenario 2 — Coordinate a multi-pane mission with safe rollback
 
@@ -622,13 +611,13 @@ ft tx run --contract-file refactor-tx.json      # prepare + commit deterministic
 ft tx show --include-contract                   # see the receipt + per-step audit
 ```
 
-The tx engine uses prepare/commit/compensate phases with an idempotency ledger. A mid-flight crash can be safely resumed; a mid-flight failure runs compensation automatically.
+The tx engine uses prepare/commit/compensate phases with an idempotency ledger. Compensation can fail, and an interrupted external effect can remain indeterminate; inspect the receipt before retrying. Mission planning and lifecycle metadata do not yet drive or cancel running agent tasks (`ft-majms`, `ft-xxfwy.48`). This scenario remains a product goal until that driver and crash/recovery path are qualified.
 
 ### Scenario 3 — Reconstruct what an agent did six hours ago
 
 **Without `ft`:** A coding agent did something destructive at 02:14 AM and you find out at 08:00. The terminal scrollback rolled. The pane process exited. You have no record.
 
-**With `ft`:** every byte of pane output is delta-extracted and stored in SQLite with FTS5 indexing. The audit trail records every action that went through the Policy Engine, including denials, approvals, and rate-limited blocks.
+**With `ft`:** captured pane deltas are redacted and stored in SQLite with FTS5 indexing. Capture gaps, truncation, retention, and periods without a running watcher limit the history; it is not a byte-perfect record of all terminal activity. Policy audit records cover instrumented action and denial paths; the supported-surface audit tracks the remaining coverage gaps.
 
 ```bash
 # Search captured output for the timeframe (--since takes epoch ms)
@@ -650,7 +639,7 @@ ft robot get-text 7 --tail 5000
 
 **Without `ft`:** You provision a new VPS, install your CLI tools, kick off 100 agents, and the box OOMs at 87. You have no model of what "safe" capacity is for this hardware.
 
-**With `ft`:** The operating-envelope planner reads RCH cluster pressure, network pressure, process snapshots, fleet memory tier, and SQLite write-queue depth. When the planner admits N panes, you know the platform has *agreed* that N is safe. If you ask for more than the envelope allows, the planner returns `envelope.shed` with `capacity.red` / `capacity.black` reason codes citing the responsible input.
+**With `ft`:** The operating-envelope planner evaluates available pressure snapshots and configured bounds. Admission is a model decision, not a hardware safety guarantee. Target-class resource evidence remains unproven, and authenticated receipt consumption is tracked in `ft-7h5da.10.4.4`. Inspect the evidence state and limiting inputs before starting a large fleet.
 
 ```bash
 ft mission objective-plan --objective "spawn 100 codex panes" --strictness strict
@@ -674,11 +663,11 @@ ft robot send 7 ""    # respond
 
 # Pull unhandled events across the fleet, react per rule_id
 ft robot --format json events --unhandled --limit 50 | \
-  jq -c '.data[]' | while read -r e; do
+  jq -c '.data.events[]' | while read -r e; do
     rule=$(echo "$e" | jq -r .rule_id); pane=$(echo "$e" | jq -r .pane_id)
     case "$rule" in
-      *.usage.reached) ft robot send "$pane" "/compact" ;;
-      *.approval_needed) ft approve "$(echo "$e" | jq -r .approval_code)" ;;
+      *.usage.reached) printf 'Review provider recovery for pane %s\n' "$pane" ;;
+      *.approval_needed) printf 'Operator approval required for pane %s\n' "$pane" ;;
     esac
   done
 ```
@@ -899,7 +888,7 @@ ft robot search "compilation failed" --limit 20
 ### 6. React to events
 
 ```bash
-ft robot wait-for 0 "codex.usage.reached"
+ft robot wait-for 0 "Usage limit"
 ft robot send 0 "/compact"
 ```
 
@@ -1297,7 +1286,7 @@ ft robot send 1 "/compact" --submit-level working   # require working/output evi
 ### Pattern waiting
 
 ```bash
-ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
+ft robot wait-for 0 "Usage limit" --timeout-secs 3600
 ft robot wait-for 0 "Done" --timeout-secs 60
 ```
 
@@ -1371,11 +1360,11 @@ Profiles live in the `agent_profiles` table and are created with `ft robot profi
 |---|---|---|---|
 | `list` | Idempotent | MustNotPartiallyMutate | read-only |
 | `show` | Idempotent | MustNotPartiallyMutate | read-only |
-| `apply` | Idempotent on identical input | MustNotPartiallyMutate | tables: `agent_profiles`; mux: spawns `count` panes |
+| `apply` | Receipt-based replay for the same request | Live compensation can fail; inspect rollback and per-pane effects | tables: `agent_profiles`; mux: spawns `count` panes |
 | `validate` | Idempotent | MustNotPartiallyMutate | read-only |
 | `create` | Not idempotent: a repeated name fails with `robot.profile.already_exists` and changes nothing | MustNotPartiallyMutate | tables: `agent_profiles` (one row) |
 
-**Concurrency:** serializable per profile name. Two `apply` calls on the same `(name, count, env_overrides, dry_run)` tuple are observationally equivalent; concurrent applies on different names are independent.
+**Concurrency:** the model's intended contract is serialization per profile name. Live requests also share mux capacity and mutation state; cross-process serialization, retries, and compensation require their own proof. A saved idempotency receipt does not make arbitrary concurrent external effects atomic.
 
 ```json
 $ ft robot --format json profile apply codex_ws --count 3
@@ -3951,7 +3940,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 43` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Versioned storage**: schema migrations are versioned (`SCHEMA_VERSION = 45` at this source revision; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?

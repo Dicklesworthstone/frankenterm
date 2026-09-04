@@ -1,11 +1,26 @@
 # Proposal: Codec Versioning for Rolling Upgrades
 
-**Status:** Draft
+**Status:** Historical design analysis (2026-04-25); Path B implemented
 **Tracking bead:** ft-kuxho ([STRATEGIC/HIGH])
 **Author:** strategic-analysis pane (cod), 2026-04-25
 **Scope:** `frankenterm/codec/`, `frankenterm-mux-server*`, `frankenterm/client/`
 
-## Problem
+## Current source boundary (2026-09-04)
+
+The strict-equality/v46 analysis below records the original baseline.
+Current `frankenterm/codec/src/lib.rs` defines `CODEC_VERSION` and
+`CODEC_VERSION_MIN_SUPPORTED`; the client negotiates an admissible window.
+Use those source constants for current values, and the
+[Path B schema-evolution erratum](ft-kuxho-B-codec-version-min-supported-window.md)
+for positional encoding constraints. The original alternatives and proposed
+children below are history, not an instruction to reimplement the window.
+
+Codec compatibility does not preserve running processes during server
+replacement. Lossless live upgrade remains a separate session-continuity
+capability. A version-check bypass is not a supported option: read-only
+traffic still requires compatible decoding.
+
+## Original problem
 
 The mux wire protocol has two coupled rigidity sources that compound:
 
@@ -54,9 +69,9 @@ Cheapest. We accept that the protocol is atomic-redeploy and:
 
 * Add a doc page under `docs/architecture/` describing the constraint and
   the deploy procedure (drain → upgrade both halves → reopen).
-* Improve `IncompatibleVersionError` to print the exact field-shape diff
-  hint and a `--ignore-codec-version` escape hatch for read-only ops on
-  mismatched fleets.
+* Improve `IncompatibleVersionError` to print an actionable incompatibility
+  hint. The originally suggested version-check escape hatch is rejected:
+  positional decoding must fail closed even for read-only operations.
 * Add a test that fails CI when `CODEC_VERSION` bumps without a release
   note row.
 
@@ -99,7 +114,7 @@ Largest. Break the positional constraint:
 This unlocks evolving existing PDUs without breaking the wire. It is
 also a multi-month project and is the hardest to land safely.
 
-## Recommendation
+## Original recommendation (superseded by Path B implementation)
 
 Land **A immediately** (docs + better error + CI guard) so operators can
 plan around the current constraint.
@@ -120,7 +135,7 @@ high-traffic PDU. Track that signal explicitly rather than pre-solving.
   surface. Different protocol, different file.
 * Migrating `varbincode` to async-aware streaming codecs.
 
-## Child beads (proposed)
+## Original proposed child breakdown (historical)
 
 To be filed under ft-kuxho once this proposal lands:
 

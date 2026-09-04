@@ -271,7 +271,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` via `[workspace.lints.rust]`)
+- **Unsafe code:** The workspace lint forbids unsafe code for crates that inherit it. Native/FFI crates have separately audited exceptions; this is not a claim that every vendored crate contains zero unsafe code. Do not introduce new unsafe code without the applicable audited contract.
 
 ### Async Runtime: asupersync
 
@@ -532,7 +532,8 @@ frankenterm/
 │   │   # Hand-edited stat figures here drift fast (ft-d3awp / ft-1b0rn /
 │   │   # ft-f1vcd); the commands above are the source of truth.
 │   │   # Type-only leaves have zero first-party deps; cluster sub-crates depend on
-│   │   # frankenterm-core. No core → sub-crate edges (extraction is one-way).
+│   │   # frankenterm-core. Core depends on type-only leaves; cluster crates
+│   │   # depend on core. Normal/build dependency cycles are forbidden.
 │   │   # See docs/proposals/ft-l3tfo-cold-build-measurements.md for the cold-build ADR
 │   │   # and docs/proposals/ft-t2d70-mcp-connector-extraction-feasibility.md for the
 │   │   # tier-2 PARK ADR (mcp/connector cycle blockers).
@@ -695,7 +696,7 @@ ft robot send 1 "y" --wait-for "confirmed"
 
 ```bash
 # Wait for pattern with timeout (seconds)
-ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
+ft robot wait-for 0 "Usage limit" --timeout-secs 3600
 
 # Wait for completion marker
 ft robot wait-for 0 "Done" --timeout-secs 60
@@ -778,9 +779,11 @@ through the NTM-gap fallback.
 
 `ft robot profile` shipped under ft-b0g7g and is no longer in this table:
 read paths (`List` / `Show` / `Validate`) and dry-run `Apply` route through
-`crates/frankenterm-core/src/robot_profile_handler.rs`. Only non-dry-run
-`Apply` (which requires daemon-side pane spawning) still returns a typed
-`robot.profile.spawn_failed` envelope, tracked under ft-b0g7g.cont.apply_spawn.
+`crates/frankenterm-core/src/robot_profile_handler.rs`. Non-dry-run `Apply`
+now reaches the mux-backed fleet mutation path. It can spawn panes and
+return durable mutation receipts; failed compensation may leave partial
+effects. Inspect receipt/rollback status before retrying instead of treating
+the model's all-or-none contract as a guarantee of live external atomicity.
 
 See README.md's supported-surface table for the user-facing status. The epic
 tracking the remaining fleet mutation implementation is `ft-bs9uh` (Robot
@@ -801,7 +804,7 @@ NTM-gap implementation).
 | `ft watch` | Startup detection + restore prompt for unclean shutdowns |
 
 Notes:
-- `ft snapshot restore` and `ft restart` are wired. Use `--layout-only` to skip scrollback replay, and use `ft watch` when you want restore-on-startup behavior after an unclean shutdown.
+- `ft snapshot restore` and `ft restart` currently return typed refusal for live execution. Saved snapshots, recovery planning, and scrollback salvage do not establish process continuity or lossless upgrade. The product continuity campaign owns live restore and guardian handoff.
 - Most snapshot/session commands accept `-f json` (auto/plain/json) for machine-friendly output.
 
 ### Pattern Rules Tooling
@@ -901,7 +904,7 @@ ft watch --foreground
 ft robot state
 
 # Wait for any rate limit
-ft robot wait-for 0 "usage_reached" --timeout-secs 3600
+ft robot wait-for 0 "Usage limit" --timeout-secs 3600
 ```
 
 #### 2. Orchestrate Agent Swarm
@@ -934,11 +937,9 @@ Robot mode returns structured errors:
 ```json
 {
   "ok": false,
-  "error": {
-    "code": "robot.pane_not_found",
-    "message": "Pane 99 not found",
-    "hint": "Use 'ft robot state' to list available panes"
-  }
+  "error": "Pane 99 not found",
+  "error_code": "robot.pane_not_found",
+  "hint": "Use 'ft robot state' to list available panes"
 }
 ```
 

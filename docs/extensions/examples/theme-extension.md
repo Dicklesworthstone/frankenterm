@@ -1,5 +1,10 @@
 # Example: Theme Extension
 
+> **Experimental package example (ft-rxk40).** No production `.ftx` loader
+> applies these assets. Theme settings supported by the existing terminal
+> configuration remain a separate surface; `ft ext` installs pattern packs,
+> not this theme package.
+
 A theme-only extension that applies a custom color scheme. No code needed --
 just a manifest and a colors file.
 
@@ -72,15 +77,16 @@ white = "#ffffff"
 -- Theme-only extension: no runtime behavior needed
 ```
 
-## Package and install
+## Experimental package artifact
 
 ```bash
 cd dracula-plus
 zip -r ../dracula-plus.ftx extension.toml assets/ noop.lua
-ft ext install ../dracula-plus.ftx
+# Production installation is unavailable (ft-rxk40).
 ```
 
-Then in your `frankenterm.toml`:
+The proposed package would expose this theme setting after loader integration;
+the package currently registers no color scheme:
 
 ```toml
 color_scheme = "dracula-plus"

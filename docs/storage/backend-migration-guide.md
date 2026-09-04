@@ -241,58 +241,29 @@ backend.execute_many(
 )?;
 ```
 
-For atomic-batch semantics (rollback on any error), wrap the
-`execute_many` call between explicit `BEGIN`/`COMMIT`:
+For atomic operations supported by `StorageTransaction`, use its exclusive
+scope. For example, with a parameter-free statement:
 
 ```rust
-backend.execute("BEGIN")?;
-match backend.execute_many(sql, &rows) {
-    Ok(count) => match backend.execute("COMMIT") {
-        Ok(_) => Ok(count),
-        Err(commit_err) => {
-            // COMMIT can fail without auto-rolling back. The
-            // canonical case is SQLITE_BUSY: another connection
-            // holds a SHARED lock so this writer can't elevate
-            // to EXCLUSIVE for the commit. Per SQLite docs the
-            // transaction stays open in that case (and in
-            // SQLITE_FULL / SQLITE_IOERR the post-COMMIT state
-            // is indeterminate). Attempt ROLLBACK to release
-            // locks for the next writer, but suppress its error
-            // so the ORIGINAL commit failure surfaces.
-            let _ = backend.execute("ROLLBACK");
-            Err(commit_err)
-        }
-    },
-    Err(batch_err) => {
-        // execute_many error: the offending statement is
-        // statement-level rolled back by SQLite, but the
-        // surrounding transaction stays open (constraint
-        // violations end the statement, not the transaction).
-        // The explicit ROLLBACK closes the transaction. Same
-        // suppress-and-propagate pattern: ROLLBACK is
-        // best-effort and must not mask the batch failure.
-        let _ = backend.execute("ROLLBACK");
-        Err(batch_err)
-    }
-}
+backend.with_transaction(|tx| {
+    tx.execute("UPDATE usage_metrics SET count = 0")
+})?;
 ```
 
 Notes:
 
-- **Do NOT propagate ROLLBACK errors with `?`** — that masks the
-  original failure. ROLLBACK is best-effort; the caller cares
-  about the operation that failed, not the cleanup.
-- **Do NOT skip the COMMIT error path** — a failed COMMIT means
-  the data was NOT persisted, AND (per SQLite) the transaction
-  may still be open. Both pieces of state matter to the caller.
-- **Wrap bulk batches in BEGIN/COMMIT even when `execute_many`
-  is the only DML.** This is a real performance fix, not just an
-  atomicity nicety. Without the wrapper each per-row `execute`
-  is its own autocommit transaction → one fsync (or WAL frame
-  flush) per row. For a 1 000-row bulk insert that's 1 000
-  syncs against the disk vs. exactly one with BEGIN/COMMIT
-  around the call. The atomicity benefit (whole-batch rollback
-  on any per-row failure) is icing on top.
+- Use the supplied transaction handle throughout the closure. Calling the
+  parent backend after transaction admission is rejected rather than allowed
+  to interleave or deadlock.
+- The backend owns commit, rollback, autocommit verification, and poisoning
+  when cleanup cannot establish reusable connection state. Do not suppress a
+  rollback failure or implement a second raw SQL transaction lifecycle.
+- Grouping the batch in one transaction also avoids per-row autocommit work.
+  For a trait object, use `with_transaction_dyn` with its callback form.
+- `StorageTransaction` currently has no `execute_many` method. Do not assume
+  the parameterized batch example above is atomic or call the parent backend
+  inside the scope. That migration needs an appropriate transaction-local
+  typed execution API; do not emulate it with raw `BEGIN`/`COMMIT` calls.
 
 The trait substrate landed under [`ft-qgj81`][qgj81] slice 5.
 
@@ -319,11 +290,11 @@ let user_version: i64 = pragma_value(backend, "user_version")?
 
 ### Transactions (`conn.transaction()`)
 
-**Currently blocked.** Trait surface includes transaction lifecycle
-methods, but the call-site borrowing pattern (`Transaction` as a
-typed value held across the closure) needs a closure-based helper
-the substrate has not yet shipped. Track this under [`ft-qgj81`'s
-follow-on slices][qgj81]. Defer migration of these call sites.
+The closure-based helper has shipped. Use `with_transaction` on a concrete
+backend or `with_transaction_dyn` on `dyn StorageBackend`; both supply an
+exclusive `StorageTransaction`. See [the current contract](storage-backend-trait.md)
+for admission, rollback, panic, and poison semantics. Backend implementation
+availability is separate: FrankenSQLite remains deferred under ft-kcdqp.
 
 ### Parameter binding (`rusqlite::params!` / `params_from_iter`)
 

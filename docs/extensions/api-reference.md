@@ -1,5 +1,12 @@
 # API Reference
 
+> **Experimental API reference (ft-rxk40).** No production terminal loads
+> `frankenterm/scripting` extensions. Its WasmEngine currently links WASI,
+> but does not register the `ft_*` host functions below. The host registration
+> helper uses the import module `frankenterm`; declaring imports alone does
+> not make them callable. Lua/WASM action dispatch and storage are library
+> surfaces, not available through the pattern-pack `ft ext` command.
+
 This document covers all host functions available to FrankenTerm extensions.
 
 ## WASM host functions
@@ -10,6 +17,7 @@ WASM extension via `extern "C"` declarations.
 ### ft_log
 
 ```rust
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     fn ft_log(level: i32, msg_ptr: *const u8, msg_len: u32);
 }
@@ -28,6 +36,7 @@ Emit a log message. Level values:
 ### ft_get_env
 
 ```rust
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     fn ft_get_env(key_ptr: *const u8, key_len: u32) -> i32;
 }
@@ -43,6 +52,7 @@ wildcard pattern).
 ### ft_return_buffer_read
 
 ```rust
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     fn ft_return_buffer_read(out_ptr: *mut u8, out_len: u32) -> i32;
 }

@@ -1531,9 +1531,11 @@ impl SessionResumer {
         }
     }
 
-    /// Export recorder data as a CASR-compatible session.
+    /// Package already-converted canonical messages as a CASR-compatible session.
     ///
-    /// Converts recorder events into the canonical IR format for portability.
+    /// This does not read recorder events, infer roles, redact content, or split
+    /// sessions. The caller owns those steps and supplies authorized messages;
+    /// `events_processed` is the number of supplied messages, not captured events.
     pub fn export_for_recorder(
         &self,
         session_id: &str,

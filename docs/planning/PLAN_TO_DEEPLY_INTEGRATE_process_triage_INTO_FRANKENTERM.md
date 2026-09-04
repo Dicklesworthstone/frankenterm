@@ -1,5 +1,13 @@
 # PLAN_TO_DEEPLY_INTEGRATE_process_triage_INTO_FRANKENTERM
 
+> **Product scope (2026-09-04):** `process_triage.rs` currently provides a local
+> `HeuristicProcessTriageProvider`, consumed by `pane_lifecycle`. It does not
+> implement `PtCliProvider`, `PtEmbeddedProvider`, or the upstream
+> snapshot/plan/apply/verify/session-artifact integration below. An installed
+> `pt` development tool is not this native product integration. The plan remains
+> a proposed expansion; any future effects must retain policy, protected-process,
+> process-identity, cancellation, and observed-outcome checks.
+
 Status: `draft`  
 Track: `ft-2vuw7.5.3`  
 Current slice completed in this revision: `ft-2vuw7.5.3.1`..`ft-2vuw7.5.3.8` (P1-P8), including detailed testing/logging scope `ft-2vuw7.5.3.6.1`..`ft-2vuw7.5.3.6.6` (T1-T6).
@@ -400,4 +408,3 @@ Completed by this plan document:
 - `ft-2vuw7.5.3.7` P7 rollout/rollback/risk gates
 - `ft-2vuw7.5.3.8` P8 finalized target architecture and roadmap
 - `ft-2vuw7.5.3` parent integration-plan task
-

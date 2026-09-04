@@ -3,8 +3,8 @@
 **Bead:** [BR-TERM-EMULATOR-UPLIFT.2.5] / `ft-mpc9b.2.5`
 **Status:** Prototype shipped. Rubric **FAILS**. Recommendation: **archive
 prototype + keep flat-grid as default** + document the constructive
-alternative (TripleBuffer<Arc<FlatGrid>>) that captures the rope's
-snapshot win without the reflow cost.
+alternative (TripleBuffer<Arc<FlatGrid>>) for a future snapshot integration.
+This prototype result does not establish a live renderer cutover or gain.
 
 ## Decision rubric (from the bead)
 
@@ -76,10 +76,11 @@ expected use case (resize reflow) hits this path on every line.
 
 ### Gate 3: Render thread unaffected
 
-**PASS.** Both implementations expose `line(idx) -> Option<&Line>`.
+**Model-level only; native render-thread acceptance remains unproven.**
+Both implementations expose `line(idx) -> Option<&Line>`.
 Rope's read is O(log n) ≈ 5 hops at 1000 lines; flat's is O(1)
-indexing. The 5-hop overhead is sub-100ns at terminal sizes —
-unmeasurable against any frame budget.
+indexing. That access-shape comparison is not a substitute for measured
+render-thread tails under the target workload.
 
 ## Verdict
 
@@ -98,21 +99,23 @@ The mixed-workload bench's ~1.4× rope win is real: snapshots are
 **so much cheaper** (3.5ns vs 55µs) that the rope amortizes its
 21× reflow cost when snapshots fire frequently.
 
-But the snapshot win can be captured WITHOUT the reflow cost via
-`TripleBuffer<Arc<FlatGrid>>` (already shipped in `ft-d0ol8`):
+The `TripleBuffer` substrate shipped in `ft-d0ol8` suggests a separate
+snapshot experiment with `Arc<FlatGrid>` payloads:
 
 - `Arc<FlatGrid>` clone is O(1) — same Arc-bump as the rope.
-- The TripleBuffer publishes a fresh `Arc<FlatGrid>` per frame.
+- A proposed integration would publish a fresh `Arc<FlatGrid>` per frame.
   The publish path's per-frame O(N) clone is the only flat-grid
   cost relative to rope-snapshot.
-- The render thread reads via `acquire() -> Arc<FlatGrid>` —
-  wait-free, identical to rope's `Arc::clone(&root)`.
+- The substrate returns a stable `Arc` from `acquire()`, but its slot
+  operations use mutexes and are not wait-free. Payload copying, allocation,
+  publication, and retained-snapshot memory must all be measured.
 
-**Conclusion:** the `TripleBuffer<T>` foundation already shipped
-gives ft the rope's snapshot semantics for free. The rope's
-reflow penalty isn't a tradeoff worth taking; the prototype's
-mixed-workload win is a measurement of the *snapshot* benefit
-that the orthogonal triple-buffer architecture already captures.
+The rope's measured reflow penalty supports keeping the production grid.
+The snapshot alternative remains unqualified: live paint still holds the
+terminal lock through visible-row work. The coherent short-lock snapshot
+cutover and causal native A/B proof belong to
+`ft-interactive-systems-performance-4tenz.6.3`; the substrate alone does not
+provide that improvement for free.
 
 ## Negative-result archive
 
@@ -140,9 +143,8 @@ frankenterm-core --bench persistent_rope_grid` invocation.
 
 ## Cross-references
 
-- **Snapshot semantics shipped via:** `ft-d0ol8` (TripleBuffer<T>
-  Petersen 2005 mailbox) — captures the rope's load-bearing
-  snapshot-O(1) win without the reflow penalty.
+- **Snapshot substrate:** `ft-d0ol8` (TripleBuffer<T> mailbox).
+  Production integration and performance proof remain separate.
 - **Reflow algorithm:** `ft-mpc9b.2.3` (incremental wrap-set
   reflow) — operates on `Cell` slices regardless of underlying
   grid storage; both `FlatGrid` and `RopeGrid` would consume it

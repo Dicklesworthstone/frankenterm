@@ -4,9 +4,14 @@
 **Status:** Foundation slice shipped. Flag taxonomy + bitset
 + stack with overflow guard + CSI parser + per-mode encoder
 + health snapshot + 36 lib tests all live. Production
-wiring (per-pane stack storage, IME composition pipeline,
-input thread integration, PTY query response) is the
-integration follow-on.
+wiring must be checked separately from this core model.
+
+**Native source boundary (2026-09-04):** `frankenterm/term/src/terminalstate/performer.rs`
+already handles Kitty Set/Push/Pop/Query, stores flags on the terminal
+screen stack, and writes query replies. That native stack has a 128-frame
+bound; the 16-frame stack and parser below are a distinct core model.
+These unit contracts do not establish native IME, accessibility, or editor
+integration evidence.
 
 ## Headline rule
 
@@ -15,8 +20,8 @@ integration follow-on.
 > Tab from Ctrl-I, report event types (press/release/
 > repeat), report alternate keys, escape all keys, report
 > associated IME text. Stack-based: nested apps push/pop
-> without affecting outer scope. Stack capped at 16
-> frames; overflow rejected.
+> without affecting outer scope. The core model stack is capped at 16
+> frames; its overflow is rejected. This is not the native stack bound.
 
 ## Flag taxonomy (5 flags, bits 1/2/4/8/16)
 
@@ -135,7 +140,7 @@ preserves each:
   collapses again).
 - 1 stack serde roundtrip test.
 
-## Bead acceptance status
+## Foundation-model acceptance status
 
 | Item | Status |
 |---|---|
@@ -145,7 +150,7 @@ preserves each:
 | Mode query response | ✓ `render_query_response` |
 | Stack overflow protection | ✓ rejects beyond 16 |
 | Telemetry: pushes / pops / max_depth / events_by_mode | ✓ `KittyKbdHealth` |
-| Per-pane mode stack | ⏳ wiring (foundation ships the contract) |
+| Per-pane mode stack | Native terminal screen stack exists; this model's 16-frame tests do not exercise it |
 | IME composition integration (flag 16) | ✓ encoder shape, ⏳ pipeline wiring |
 | Vim/emacs/helix integration tests | ⏳ E2E follow-on |
 | `--features kitty-keyboard` gating | ⏳ Cargo wiring follow-on |

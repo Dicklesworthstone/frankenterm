@@ -1,5 +1,10 @@
 # Example: Keybinding Helper (WASM/Rust)
 
+> **Experimental example (ft-rxk40).** The registry calls below are host-side
+> library examples, not keybindings installed by this WASM module in the running
+> terminal. Scripting dispatch/host linking remains unwired; `ft ext` manages
+> pattern packs and cannot install `.ftx` packages.
+
 A WASM extension that registers custom keybindings for common actions
 like toggling the tab bar or opening a quick command palette.
 
@@ -49,6 +54,7 @@ crate-type = ["cdylib"]
 ## src/lib.rs
 
 ```rust
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     fn ft_log(level: i32, msg_ptr: *const u8, msg_len: u32);
 }

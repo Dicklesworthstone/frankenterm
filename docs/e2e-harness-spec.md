@@ -26,7 +26,7 @@ This document specifies the end-to-end test harness for `ft`. The harness valida
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--verbose`, `-v` | Enable verbose output (debug-level logs) | off |
-| `--keep-artifacts` | Always keep artifacts (even on success) | delete on success |
+| `--keep-artifacts` | Retain artifacts on success and failure; required for this repository's proof runs | pass explicitly; do not rely on historical cleanup defaults |
 | `--artifacts-dir DIR` | Override artifacts directory | `./e2e-artifacts/<timestamp>` |
 | `--timeout SECS` | Global timeout per scenario | 120 |
 | `--retries N` | Retry each scenario up to `N` times on failure | 0 |
@@ -39,6 +39,11 @@ This document specifies the end-to-end test harness for `ft`. The harness valida
 | `--default-only` | Run only scenarios marked `default=true` in registry | off |
 
 ### Arguments
+
+Retain artifacts and use an isolated test workspace. AGENTS.md requires
+explicit authorization before deleting files; this specification does not
+authorize automatic artifact or workspace deletion. Inspect the chosen
+scenario's cleanup behavior before running it against any existing workspace.
 
 - `SCENARIO...` - One or more scenario names to run. If omitted, runs all scenarios.
 
@@ -585,26 +590,22 @@ fixtures/e2e/
 
 ---
 
-## CI Integration
+## DSR proof integration
 
-GitHub Actions workflow should:
+DSR is the exclusive release orchestrator. Development Cargo and Rust test
+execution require remote RCH admission; a local fallback is not proof.
 
-1. Run `--self-check` first
-2. Run all scenarios with `--verbose --keep-artifacts`
-3. Upload artifacts directory on failure
-4. Parse `summary.json` for status
+1. Run the harness self-check and retain the result.
+2. Run the admitted scenarios with `--verbose --keep-artifacts` in their
+   isolated test workspace.
+3. Retain artifacts on success and failure, including source identity,
+   executed scenario count, command transcript, and `summary.json`.
+4. Include the resulting manifest/checksums and relevant receipts in the
+   configured DSR release evidence. Count actual scenario results, not an
+   exit-zero invocation that selected no scenarios.
 
-```yaml
-- name: E2E Tests
-  run: ./scripts/e2e_test.sh --verbose --keep-artifacts
-
-- name: Upload artifacts on failure
-  if: failure()
-  uses: actions/upload-artifact@v4
-  with:
-    name: e2e-artifacts
-    path: ./e2e-artifacts/
-```
+This is the integration requirement; it does not assert that every scenario
+is already configured in DSR or proved on native target hardware.
 
 ---
 

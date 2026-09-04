@@ -652,7 +652,7 @@ Only one suggestion touched this epic: `ft-xxfwy.17` "may depend on ft-nam3s" (0
 
 **Dev signals (maintainer Mac, not proof):** `scripts/smoke/headless-mux-observe.sh /tmp/ft-rc20260901-native/debug` → PASS (event `codex.usage.reached`, `reset_time: 3:00 PM`, dropped segments 0, sequence resyncs 0 on the second run); local core tests: the new unilateral-handshake test, the codex casing test, the retry test, and the 48 writer-scheduler/epoch tests green after the `BEGIN IMMEDIATE` expectation update.
 
-## 11. Execution log — same day (2026-09-01/02)
+## Historical execution log — September 1/2
 
 Work started on the entry ramp immediately after the plan was published. Everything below is committed on `main`; "proof" means a retained remote RCH lane transcript, "native" means a dev build run on the maintainer's Mac (a signal, not proof).
 
@@ -705,7 +705,7 @@ Not done today: signed release (needs an operator-driven `dsr build/release` wit
 
 The next full reality-check must cross-link this plan, `docs/reality-check-bridge-plan-2026-05-12.md`, and `docs/reality-check-bridge-plan.md`, and must start from `ft-xxfwy`'s terminal state. It becomes due per `docs/process/reality-check-discipline.md` (90 days, minor-version change, ≥ 50 open beads, contract churn, or headline-claim growth). Do not overwrite this file; revise it in place only within this run.
 
-## 11. September 4 comprehensive continuation
+## 11. September 4 comprehensive reality-check refresh
 
 ### 11.1 Scope, evidence, and answer
 
@@ -826,6 +826,9 @@ Existing G50–G80 remain in the graph; this map does not retire any capability.
 | G85 | Mission pause/resume/abort update JSON/assignment metadata without running-task cancellation; concurrent load→modify→rename can overwrite another process. | Serialize or CAS revisioned lifecycle transitions durably; reject stale updates; crash/parallel-process tests; production driver maps requested state to acknowledged task outcomes and preserves indeterminate effects. |
 | G86 | Release verifier accepts unsigned dev bundles and verifies Ed25519 against a key supplied by that bundle; operating-envelope reader trusts status/ready_to_sign flags without authenticated source/target/outcome. | Preserve dev inspection but add externally pinned trust and exact release mode; reject arbitrary keys/unsigned/deferred stable claims; promote envelope only from validated, fresh, passed, exact-candidate/target receipts. |
 | G87 | Active docs describe missing extension dispatch, stale policy/runtime/storage/search behavior, and unsupported commands; historical plans still read as current instructions. | Correct each demonstrated contradiction in place, preserve aspirational goals and historical evidence, link current code/owner, and check runnable examples against CLI/source. |
+| G88 | Identity rows stacked above raw Vandermonde parity are singular for a valid 4-of-7 survivor set; reconstruction panics. | Use one systematic MDS generator, version incompatible parity explicitly, validate every shard and framing field, and test every small survivor subset plus the admitted 31-of-32 boundary. `ft-xxfwy.58`. |
+| G89 | Statistical documentation overstates tail, family-wise, and runtime guarantees; the empirical Bernstein implementation uses an unsupported curve, and conformal bands report training inclusion as future coverage. | Derive a valid per-stream confidence sequence, validate support/finite arithmetic, refuse unavailable finite conformal endpoints, and test independent numerical and future-rank oracles. `ft-xxfwy.59`. |
+| G90 | Redactor evidence scans original input rather than actual sequential replacements; any overlap receives full secret-removal credit. | Observe production replacements with source-byte provenance; require complete union coverage and reject invalid intervals; plant prefix/suffix/one-byte misses and verify actual output. `ft-xxfwy.60`. |
 
 ### 11.4 Execution ordering and proof contract
 
@@ -991,6 +994,98 @@ connector tiers; `.43` clipboard clear; `.44` native clipboard configuration;
 `.48` mission persistence; `.49` attestation trust; `.50` Redis; `.51` VC export;
 `.52` UBS; `.53` graph scoring; `.54` Mermaid; `.55` future web routes;
 `.56` CASR recorder conversion; `.57` process-triage provider; `.58` erasure;
-`.59` statistical explanations; `.60` redactor oracle. All use prefix `ft-xxfwy`.
+`.59` statistical implementation and explanations; `.60` redactor oracle. All use prefix `ft-xxfwy`.
 Existing extension, target-envelope, release, live-loop and surface-verification
 owners were revised rather than duplicated.
+
+### 11.6 Implementation follow-through and evidence ledger
+
+The three ambition rounds and six refinement rounds above are actual in-place
+plan/Bead passes. The frozen generation and refinement prompts are retained
+verbatim in `ft-xxfwy.40` comments. Source follow-through then exposed additional
+details within the accepted seams: malformed erasure framing, conformal
+undercoverage, sequential-redaction provenance, and transitive local-Cargo
+bypasses. Their parent contracts were expanded before those corrections.
+Companion verification children preserve each leaf's distinct regression and
+end-to-end acceptance; a parent-child relationship is not an executable
+dependency on its own parent.
+
+The intake was divided into disjoint product families. The root read all of
+AGENTS.md (1,756 lines at intake), README.md (4,462), PLAN.md (4,868), PLAN_CODEX.md
+(1,083), the three bridge plans, and the 963-line product journey contract,
+plus the relevant governing proof/release documents. Native intake covered
+81 files / 20,049 lines; control intake covered 102 documents; integration
+intake covered 69 canonical project/product documents. Twelve external-library
+research dossiers were explicitly excluded from the latter scope. These are
+read-coverage counts, not claims to have audited every source line or every
+Markdown file in the repository. Exact local inventories and source findings:
+
+- `/tmp/ft-reality-native-read-inventory.tsv` and
+  `/tmp/ft-reality-native-report.md`.
+- `/tmp/ft-reality-control-report.md` (including its full intake ledger and
+  implementation handoff).
+- `/tmp/ft-reality-integrations-report.md` and
+  `/tmp/ft-reality-integration-changes.md`.
+
+Durable behavioral findings and acceptance live in this plan and the Beads;
+the `/tmp` reports are session evidence and are not portable release artifacts.
+
+**Implemented changes and their limits:**
+
+| Producer | Source result | Qualification that remains separate |
+|---|---|---|
+| `.41` | Watcher construction consumes operator safety/tuning and restores the persisted switch through the production factory. | Freshness/fencing after a different process trips the switch is `.42`; the complete real-agent loop is `.9`. |
+| `.43` | OSC 52 clear and set use the same clipboard write policy, preserving `None` versus empty text and decoded-byte limits. | Native user configuration/prompt plumbing and actual GUI clipboard qualification remain `.44`. |
+| `.45` | Unknown/empty/missing release selections fail closed; recorder/shared/GPU wrappers cannot opt into local Cargo; ordinary GPU success needs nonzero matching fixture records. | Shell boundary fixtures prove wrapper decisions, not actual GPU parity, RCH admission, or release execution. Diagnostic GPU modes emit a different evidence scope. |
+| `.46` | An outbound action reaching unavailable transport records permanent failure, zero delivery success, and no pointless retry/DLQ loop. | Actual authenticated ingress/egress is `.47`; this repair intentionally does not claim service delivery. |
+| `.58` | Version-2 systematic erasure, typed malformed/singular failures, full metadata/framing checks, and adversarial survivor tests. | No production distributed codec consumer was found. Authentication, durable replication, and recovery are separate requirements. Public `n <= 32` remains unchanged. |
+| `.59` | Summable confidence spending replaces the unsupported bound; support and finite arithmetic are checked. Conformal bands report future-rank coverage and refuse insufficient finite calibration. | IID/exchangeability assumptions, separate benchmark-family error budgets, and real performance experiments remain caller obligations. No p99 or hardware claim follows from a mean bound. |
+| `.60` | Redaction evidence follows actual sequential replacements and original byte provenance; every expected byte must be covered. | This repairs the oracle; it neither establishes a particular prior production secret leak nor substitutes for an external corpus and live read-path qualification. |
+
+The initial OSC 52 remote compile exposed an ambiguous test macro import; the
+explicit import was repaired. The retained rerun on worker `vmi1227854`, job
+`j-30004650170122889`, passed **4/4 named parser-to-clipboard regressions** at
+baseline `f216535c56994cd756f420e6be8b145f78ab6c82` plus overlay fingerprint
+`6f5d94cf95aaa5c568f21ee8f01f33a2d76c9741ff67d40fe13c99709a998436`.
+Transcript: `/tmp/ft-reality-20260904-term-rch-attempt3.log`. No operator
+clipboard or running GUI was touched.
+
+The release selector suite passed 23 adversarial cases and its actual static
+profile control. The complete isolated RCH/GPU wrapper suite passed, including
+11 GPU summary cases, environment forwarding, disabled-remote rejection,
+empty arguments, and unadmitted custom-fixture-root refusal. It used fake RCH
+and a sentinel Cargo, with no real Cargo, GPU, service call, or network action.
+Retained wrapper transcript:
+`/tmp/ft-reality-20260904-rch-gpu-guard-final.log`; detailed handoff:
+`/tmp/ft-reality-native-rule01-handoff.md`.
+
+The first watcher source-content attempt failed admission on the generated
+`.doctor/latest` symlink (exit 103); it was not a test result. The subsequent
+clean-baseline remote run at `7d5e50d08cdd78b136cf0ab76455bc8ef02a3554`, worker
+`ovh-a`, job `j-30004650170122895`, compiled and ran three tests: two passed,
+one failed because the fixture omitted the discovered pane's SQLite row.
+The audit table correctly rejected that foreign key. The fixture now persists
+the pane before injection; the mandatory audit-row and zero-input assertions
+remain intact. Its rerun and the core/workspace proof results are recorded
+below when complete; the failed run is not counted as a pass.
+
+**Task graph accounting:** the post-refinement BR/JSONL snapshot at 21:55 UTC
+contains 5,010 records: 4,013 closed, 702 open, 172 in progress, 118 blocked,
+and five deferred (997 unfinished). Installed BV v0.12.0 rejects `test`, `docs`,
+and `question` issue types and the `deferred` status. It drops 78 records,
+including 26 unfinished, hence its 971 unfinished view. BR and JSONL agree;
+this is a BV population filter, not database corruption. Later companion
+creation and proof closeout naturally change the final totals. BR remains the
+inventory authority. All 20 proposed BV dependency endpoints were inspected;
+none of the 50 advisory suggestions was automatically applied. Actual causal
+edges were added from the reviewed contracts, and the active graph has no
+cycles. The BV forecast remains unsuitable as a release date.
+
+Two larger follow-ups found during documentation validation remain explicit.
+`ft-fytns` is reopened with a complete DSR publishing-graph contract: the old
+ten-crate list does not describe the current 19-subcrate graph, and direct
+local Cargo publication is not the project's release path. `ft-xxfwy.9` also
+records that `scripts/e2e_test.sh` contains cleanup paths that delete artifacts
+despite retention options. Repair those paths before executing the retained
+live-loop experiment under this repository's no-deletion rule. Neither
+problem is dismissed as pre-existing or silently represented as fixed.

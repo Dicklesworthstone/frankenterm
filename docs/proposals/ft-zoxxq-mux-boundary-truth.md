@@ -1,10 +1,20 @@
 # Proposal: stop pretending `crate::wezterm` is a backend abstraction
 
 **Bead:** [ft-zoxxq](../../.beads/issues.jsonl) — `crate::wezterm pseudo-boundary`
-**Status:** draft
+**Status:** Accepted identity decision; historical importer audit
 **Related:** ft-y0loj (monolith split), ft-7iof6 (runtime_compat reframe)
 
-## Stance
+## Current source boundary (2026-09-04)
+
+The trait is now `MuxInterface`; the canonical async API is `runtime_async`.
+The concrete mux adapter still lives in `crates/frankenterm-core/src/wezterm.rs`.
+The renamed trait and fork identity are implemented; the relocation/shim
+sketch below is historical, not the current module layout. Compatibility
+aliases and re-export shims are not required or permitted by the current
+repository policy. Importer counts below are the original audit snapshot;
+the workspace manifest supplies the live vendored-member count.
+
+## Stance at the original audit
 
 **Stance (b): commit to the wezterm-fork identity. Drop the abstraction theatre.**
 
@@ -83,8 +93,8 @@ type erasure — the work would have to:
 
 For stance (b) — commit to the wezterm-fork identity — the work is:
 
-1. Rename `WeztermInterface` → `MuxInterface` (+ alias for one release
-   so external imports don't break).
+1. Rename `WeztermInterface` → `MuxInterface` (implemented directly;
+   the originally suggested compatibility alias was not retained).
 2. Relocate `WeztermClient` and the concrete data types into a
    `mux_client` module (or `mux/`) so the file:purpose mapping reads
    cleanly. `wezterm.rs` shrinks to a thin re-export shim that
@@ -135,7 +145,7 @@ makes the contract enforcement match the contract description.
    already describe what they do. The fork-vs-upstream relationship is
    a `PROVENANCE.md` concern, not a name-of-crate concern.
 
-## Acceptance criteria for this proposal
+## Original acceptance criteria (historical)
 
 - [ ] Stance (b) is recorded; AGENTS.md is updated to match.
 - [ ] Child beads filed under ft-zoxxq for the renaming sweep, the
@@ -143,13 +153,11 @@ makes the contract enforcement match the contract description.
 - [ ] `WeztermInterface` trait gains a deprecation note pointing at
       `MuxInterface` once the rename lands.
 
-## Child beads to file
+## Original child breakdown (historical)
 
-The next commit on this thread should be the bead-creation pass.
-Proposed beads:
+This records the initial breakdown, not current work instructions:
 
-1. `ft-zoxxq.1` — rename `WeztermInterface` → `MuxInterface` with a
-   one-release type alias for backward compat.
+1. `ft-zoxxq.1` — rename `WeztermInterface` → `MuxInterface` directly.
 2. `ft-zoxxq.2` — relocate `WeztermClient` and its concrete data types
    out of `wezterm.rs` into `mux_client.rs`; leave `wezterm.rs` as a
    re-export shim.

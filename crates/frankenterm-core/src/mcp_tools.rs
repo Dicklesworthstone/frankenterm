@@ -13284,7 +13284,8 @@ impl ToolHandler for WaMissionAbortTool {
         Tool {
             name: "wa.mission_abort".to_string(),
             description: Some(
-                "Abort a mission, cancelling all in-flight assignments (robot parity)".to_string(),
+                "Persist an aborted mission and cancelled assignment outcomes; does not cancel live tasks"
+                    .to_string(),
             ),
             input_schema: serde_json::json!({
                 "type": "object",

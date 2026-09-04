@@ -6,7 +6,20 @@ contract, state-space proof, TLA+ spec, and conformance harness remain the
 proof substrate; live `RobotCommands::Checkpoint` dispatches to
 `handle_robot_checkpoint_command`, backed by the snapshot/session storage
 surface. `rollback --dry-run` emits a restore plan; non-dry-run rollback is
-approval-blocked until the robot policy gate lands.
+currently unavailable. Passing a token does not enable it.
+
+## Current CLI boundary
+
+`handle_robot_checkpoint_command` accepts positive decimal snapshot IDs or
+`latest` for show/delete/rollback. The live adapter does not expose the BLAKE3
+ID and `approval_token` request schema below. Its non-dry-run rollback branch
+returns the unavailable-policy-gate error before restoration.
+
+The family table, content-addressing guarantees, concurrency assertions, and
+request examples below describe the **target/model contract**. They are not
+a wire reference for the current CLI and do not prove live restore atomicity.
+Promotion requires the real handler to implement the schema and policy gate,
+then pass actual restore, denied-token, and failure-compensation tests.
 
 ## Family overview
 
@@ -20,7 +33,7 @@ approval-blocked until the robot policy gate lands.
 
 Concurrency: **Serializable** per session.
 
-## Contract semantics
+## Target/model contract semantics
 
 ### `save`
 

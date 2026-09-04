@@ -7,7 +7,7 @@ golden/e2e proof is pinned by `ft-9ntud.4`.
 This document defines the first operator-facing contract for a read-only
 blocker radar: a deterministic summary of whether a FrankenTerm swarm lane is
 actionable, waiting on another owner, or blocked by an external substrate such
-as RCH, GitHub Actions, Agent Mail, Beads state, or dirty-tree overlap.
+as RCH, DSR, Agent Mail, Beads state, or dirty-tree overlap.
 
 The JSON schema lives at `docs/json-schema/ft-blocker-radar.json`.
 Operator interpretation and Beads handoff examples live in
@@ -24,7 +24,7 @@ The blocker radar is grounded in surfaces that agents already use by hand:
 | `bv --robot-triage` | Ranked work graph and blocked/ready recommendations | Prioritization hint, never the only source of truth. |
 | `git status --short --branch` | Dirty tracked paths and branch state | Dirty-overlap and staging-risk rows. |
 | `rch status`, `rch diagnose`, retained RCH metadata | Queue state, selected worker, local-fallback refusal, Cargo/rustc/test reachability | Proof-substrate blocker classification. |
-| `gh run view`, `gh run download`, PR/check-suite views | Queued CI, zero-job suites, missing artifacts, current-head status | External CI and package-artifact blocker classification. |
+| `dsr doctor`, `dsr health all`, `dsr repos info frankenterm`, retained DSR receipts | Release-host readiness, missing artifacts, source identity, build/verification outcome | Release-substrate and package-artifact blocker classification. |
 
 This contract does not replace proof-doctor verdicts, proof-ledger records,
 incident bundles, resource-pressure cockpit output, context-horizon prediction,
@@ -78,8 +78,8 @@ The blocker radar must not collapse all blockers into a single vague state.
 | `stale_possible` | A bead may be stale, but ownership or dirty overlap is not proven clear. | Comment or gather more evidence before reopening. |
 | `dirty_overlap` | Dirty tracked files overlap the intended work or ownership is unclear. | Avoid staging/touching those paths until ownership is clear. |
 | `rch_substrate_blocked` | RCH failed before a trustworthy source verdict could be reached. | Do not count setup/sync chatter as proof. |
-| `ci_queued` | GitHub Actions or similar CI is queued with jobs waiting. | Wait or inspect current-head status; do not infer pass/fail. |
-| `ci_zero_jobs` | A check suite exists but has not materialized jobs. | Treat as external scheduling/materialization blocker. |
+| `ci_queued` | Legacy fixture vocabulary for queued CI. | Not current FrankenTerm evidence; inspect retained DSR/RCH receipts instead. |
+| `ci_zero_jobs` | Legacy fixture vocabulary for unmaterialized jobs. | Not current FrankenTerm evidence; it supplies no source verdict. |
 | `artifact_missing` | A required package or proof artifact is absent. | Do not unblock downstream rollout/proof beads. |
 | `mail_unavailable` | Agent Mail is unavailable or degraded. | Use Beads/git fallback; do not repair or restart the service. |
 | `degraded` | One or more sources failed, timed out, or returned partial data. | Surface the degradation and fail closed. |
@@ -95,7 +95,7 @@ claimability reconciliation vocabulary. This is stricter than the root
 `actionable` state: a high graph score or unblock count is never enough to
 claim a bead. The claimability check compares the ready queue, the individual
 Beads record, BV's ranked recommendation, degraded-mail fallback state,
-dirty-tree risk, and optional GitHub/RCH evidence before it returns a final
+dirty-tree risk, and admitted DSR/RCH evidence before it returns a final
 answer.
 
 The claimability check must treat `bv --robot-triage` and `bv --robot-next` as
@@ -153,7 +153,7 @@ Each `sources` row describes one read-only observation:
 | Field | Meaning |
 | --- | --- |
 | `source_id` | Stable id within this radar snapshot. |
-| `source_kind` | `rch`, `github_actions`, `agent_mail`, `beads`, `git`, `manual`, or `fixture`. |
+| `source_kind` | Current sources use `rch`, `agent_mail`, `beads`, `git`, `manual`, or `fixture`; retain DSR evidence as `manual` until a typed DSR adapter exists. The legacy `github_actions` fixture tag is not a live evidence source. |
 | `evidence_state` | One of the blocker-radar states above. |
 | `collected_at_ms` | Collection timestamp when live evidence exists. |
 | `freshness_ms` | Age budget or age of the observed source. |
@@ -184,7 +184,7 @@ Each `blockers` entry describes one reason the lane is or is not actionable:
 Examples:
 
 - RCH package rollout blocked because `dist-macos-aarch64` is missing.
-- GitHub Actions suite is queued or has zero jobs materialized.
+- A required DSR build/verification receipt is unavailable or does not match the source being assessed.
 - Agent Mail is unavailable, so Beads-only coordination is active.
 - A bead is inside the stale threshold and should not be reopened.
 - Dirty tracked files overlap another agent's active terminal-conformance lane.
@@ -206,6 +206,8 @@ Required fields:
 | `citation_ids` | Evidence references. |
 
 Suggested commands must be safe read-only commands or no-op planning commands.
+GitHub Actions must never be inspected, monitored, executed, or used as
+FrankenTerm evidence, including through old serialized `ci_*` fixtures.
 They must not restart services, repair Agent Mail, update RCH, cancel CI runs,
 push commits, delete files, reset git state, or mutate panes.
 

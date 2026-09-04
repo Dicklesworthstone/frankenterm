@@ -1,10 +1,28 @@
 # Policy-denial audit wiring matrix
 
-**Bead:** ft-hg6io — wire `StorageHandle::record_policy_denial_audit`
-(infra landed in ft-h90rh / 4595cc0e) into every `PolicyEngine::authorize`
-call site so a denied or approval-gated action lands a row in
-`policy_denied_audit` in addition to the existing `tracing::warn!`
-emission from `mcp_authorize_mcp_mutation` (ft-6mmyp / 02988c16).
+**Source audit:** 2026-09-04, updating the original `ft-hg6io` inventory.
+MCP denial persistence is implemented. The synchronous
+`mcp_authorize_mcp_mutation` and asynchronous
+`mcp_authorize_mcp_mutation_async` helpers in `mcp_tools.rs` call the shared
+denial-record persistence path before returning a denial envelope.
+
+Persistence is **best effort**: a storage failure is logged and the action
+stays denied, but no durable audit row may be claimed for that failure.
+`PolicyGatedInjector` also writes denied, approval-required, successful, and
+failed sends to `audit_actions`; that table is distinct from
+`policy_denied_audit`.
+
+| Source path | Current behavior | Proof still required |
+|---|---|---|
+| `mcp_authorize_mcp_mutation` | Restores policy state, authorizes, constructs a denial record, and attempts synchronous persistence. | Invoke each registered tool with deny/approval policies and verify its real DB row. |
+| `mcp_authorize_mcp_mutation_async` | Uses the caller's async storage path for denial persistence. | Cancellation and storage-failure negatives must preserve denial without inventing a row. |
+| Direct read/send/workflow/reservation/account gates in `mcp_tools.rs` | Explicit denial persistence calls are present; send injection also records `audit_actions`. | Match the current dispatch inventory, including dry-run branches, against per-tool evidence. |
+| `PolicyGatedInjector::inject_with_cx` | Authorizes before ordinary pane input and attempts an audit write for each returned result. | A custom deny must leave pane input unchanged; an unavailable audit store must be reported as missing evidence. |
+
+The inventory below is the **historical pre-wiring snapshot**, retained to
+explain `ft-hg6io`. Its missing/partial cells and coordination notes do not
+describe the current implementation. Use source dispatch and retained tests
+for present coverage; do not execute its obsolete suggested work sequence.
 
 ## Every authorize deny path in `crates/frankenterm-core/src/mcp_tools.rs`
 

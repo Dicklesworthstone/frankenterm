@@ -1,6 +1,9 @@
 # Recorder Validation Gates (wa-oegrb.7.5)
 
-This document defines the CI/nightly quality gates for the recorder validation track.
+This document defines recorder validation requirements. FrankenTerm uses DSR
+for release orchestration and remote RCH for development Cargo proof; GitHub
+Actions is prohibited by AGENTS.md. Historical workflow names are not evidence
+that a gate is configured or passing.
 
 ## Scope
 
@@ -11,7 +14,7 @@ The gate bundles these validation surfaces:
 3. Recorder correctness invariants
 4. Semantic quality regression harness
 5. Hybrid fusion correctness tests
-6. Load harness check (`storage_regression` bench compile in CI, optional run in nightly)
+6. Load harness check (`storage_regression` compile, with a separate measured run)
 
 ## Gate Entrypoint
 
@@ -33,10 +36,11 @@ Primary report:
 target/recorder-validation-gates/recorder-validation-report.json
 ```
 
-## CI vs Nightly Modes
+## Compile and measured modes
 
-- CI mode (default): compile-checks load harness (`cargo bench --no-run`) and enforces deterministic test gates.
-- Nightly mode: sets `FT_RECORDER_GATE_RUN_LOAD_BENCH=1` to run the recorder swarm-load benchmark path.
+- Default mode: compile-checks the load harness and runs deterministic gates.
+- Measured mode: sets `FT_RECORDER_GATE_RUN_LOAD_BENCH=1` to execute the benchmark.
+  A successful compile is not a performance result.
 
 Environment toggles:
 
@@ -58,23 +62,29 @@ The script enforces:
 
 Any threshold miss fails the job.
 
-## Local Reproduction
+## Development reproduction through RCH
 
-Run the exact CI gate locally:
+The script delegates Cargo to RCH. Retain the remote worker identity and
+transcripts, require nonzero named tests, and reject local fallback or an
+unavailable worker as blocked proof. Never enable an Actions/local-Cargo bypass.
 
 ```bash
-scripts/check_recorder_validation_gates.sh
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 scripts/check_recorder_validation_gates.sh
 ```
 
-Run full nightly-equivalent mode locally:
+Run measured mode through the same remote boundary:
 
 ```bash
-FT_RECORDER_GATE_RUN_LOAD_BENCH=1 scripts/check_recorder_validation_gates.sh
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
+  FT_RECORDER_GATE_RUN_LOAD_BENCH=1 scripts/check_recorder_validation_gates.sh
 ```
 
-Targeted repro commands (individual legs):
+For an individual leg, pass the Cargo arguments below through the required
+`RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`
+prefix with a bounded job count, `--locked`, and a task-specific target directory.
+These are argument lists, not local execution instructions:
 
-```bash
+```text
 cargo test -p frankenterm-core --test recorder_tantivy_integration \
   chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss -- --nocapture
 
@@ -86,7 +96,9 @@ cargo test -p frankenterm-core --test hybrid_fusion_tests -- --nocapture
 cargo bench -p frankenterm-core --bench storage_regression --no-run
 ```
 
-## Workflow Wiring
+## Release wiring and evidence
 
-- PR/push gate job: `.github/workflows/ci.yml` (`recorder-validation-gates`)
-- Scheduled nightly gate: `.github/workflows/nightly-recorder-validation.yml`
+Use `scripts/release-gates.sh --list` and the configured DSR quality lane to
+inspect current gate wiring. Record the exact source, enabled features, remote
+or DSR host, test counts, artifact paths, and outcomes. This document alone does
+not establish that recorder validation is included in a release or has passed.

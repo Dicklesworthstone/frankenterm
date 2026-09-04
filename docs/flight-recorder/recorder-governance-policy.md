@@ -2,7 +2,7 @@
 
 Date: 2026-02-12
 Beads: `wa-oegrb.8.3`, `ft-oegrb.8.3`
-Status: Accepted policy baseline
+Status: Accepted policy baseline; requirements are not a completed implementation claim
 Extends: `capture-redaction-policy.md` (wa-oegrb.2.5)
 
 ## Purpose
@@ -14,6 +14,15 @@ workflows. This document is the implementation contract for:
 - `wa-oegrb.3.5` (retention/partitioning/archival lifecycle)
 - `wa-oegrb.6.5` (policy-aware access control in recorder/search interfaces)
 - `wa-oegrb.7.6` (security/privacy validation suite)
+
+Implementation boundary (2026-09-04): the policy below states the required end
+state. The nested `[recorder.*]` configuration in section 6.2 is proposed;
+current backend selection uses `storage.recorder_backend` in `config.rs`.
+Recorder segment retention has a library implementation, but its production
+scheduler remains open under `ft-y7x56`. Existing SQLite retention settings do
+not establish the hot/warm/cold recorder lifecycle or T3 purge deadlines defined
+here. Each access, audit, and retention requirement needs evidence from its
+actual runtime path before being described as enforced.
 
 ## Scope
 
@@ -301,7 +310,10 @@ All policy-relevant operations emit structured audit events:
 
 ### 6.2 Configuration Surface
 
-All governance-related configuration keys:
+Proposed governance configuration, not currently accepted TOML keys. This example
+does not enable these controls in a running watch daemon. Use the actual config
+schema for supported settings, and keep the missing controls as implementation
+and rollout prerequisites:
 
 ```toml
 [recorder.redaction]
@@ -331,11 +343,13 @@ hash_chain_enabled = true               # Tamper-evidence hash chain
 
 ## 7. Compliance and Data-Handling Rationale
 
-### 7.1 Why Always-On Capture is Acceptable
+### 7.1 Requirements Before Claiming Always-On Capture Meets This Policy
 
 1. **Redaction by default**: Secrets are scrubbed before persistence. The
    stored data is operationally useful but not a credential store.
-2. **Bounded retention**: Data expires automatically. No unbounded accumulation.
+2. **Bounded retention**: Automatic recorder expiry must be wired and verified
+   before claiming bounded accumulation. `ft-y7x56` remains the production
+   retention scheduling gap.
 3. **Access control**: Raw data (if captured) requires explicit approval with
    audit trail and time limits.
 4. **Operator control**: Capture can be disabled entirely, scoped to specific
@@ -348,9 +362,11 @@ hash_chain_enabled = true               # Tamper-evidence hash chain
 2. **Purpose limitation**: Recorder data is for operational diagnostics,
    incident response, and workflow replay. Not for surveillance or performance
    monitoring of individuals.
-3. **Transparency**: Operators can see what is being captured (`ft status`),
-   what is being retained (`ft recorder stats`), and who accessed what
-   (`ft recorder audit`).
+3. **Transparency**: Operators must be able to inspect capture, retained data,
+   and access history. `ft status` provides current watch status; the proposed
+   `ft recorder stats` and `ft recorder audit` commands are not implemented.
+   Status output alone does not prove the retained-data or access-history
+   requirements.
 4. **Accountability**: Every access and policy change is audited.
    Privileged access requires justification.
 

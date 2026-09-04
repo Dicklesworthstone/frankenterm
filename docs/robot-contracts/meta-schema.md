@@ -194,9 +194,13 @@ naming the receipt fields).
 
 ## 10. Wiring
 
-The MCP server seam in `mcp_framework.rs` consumes
-`FamilyContract::mcp_tool_descriptors()` to register all of a family's
-actions in one call. The conformance harness in
+The intended MCP seam would consume `FamilyContract::mcp_tool_descriptors()`
+to register a family's actions. As of the 2026-09-04 source audit,
+`mcp_framework.rs` does not call that method; its repository callers are
+declarations/tests, not production registration. Existing `ft-og9pc` tracks
+the family mirror integration gap. Enumerate the actual tool dispatch registry
+when assessing shipped MCP coverage; descriptor generation alone is insufficient.
+The conformance harness in
 `tests/robot_family_conformance/` consumes the contract directly. The
 JSON Schema produced by `FamilyContract::json_schema()` is committed
 under `docs/json-schema/robot-family-<family>.json` so client codegen

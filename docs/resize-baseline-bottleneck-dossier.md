@@ -6,8 +6,17 @@ Finalized by: `LavenderCastle` (2026-02-14)
 Parent track: `wa-1u90p.1`
 Status: **Closed.** All dependency beads (wa-1u90p.1.2, 1.3, 1.4, 1.6) are closed. Timeline rollups, stage percentiles, and active-pane lock/memory telemetry baselines are complete. Ranked intervention table is finalized. Downstream beads (wa-1u90p.2, 2.1, 4.1) are unblocked.
 
+## Evidence boundary (2026-09-04)
+
+This is a dated simulation/watcher dossier. `Scenario`/MockWezterm stages
+do not measure native `TermWindow` presentation; runtime storage-lock
+metrics do not measure terminal-lock contention. The rankings below are
+historical hypotheses, not current native causal evidence. Use
+[the performance campaign](perf/mux-long-session-performance-campaign.md)
+and its trace/scenario contracts for present optimization decisions.
+
 ## Scope
-This dossier is the source of truth for ranking and sequencing resize/reflow interventions.  
+This dossier records the original ranking and sequencing of resize/reflow interventions.
 It translates baseline instrumentation, SLO contracts, and known lock/render behavior into an implementation order with explicit dependency and risk accounting.
 
 ## Inputs and Evidence Surfaces

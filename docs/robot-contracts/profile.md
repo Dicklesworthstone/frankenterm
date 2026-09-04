@@ -24,7 +24,7 @@ live `ntm profiles` subprocess parity.
 |---|---|---|---|
 | `list` | Idempotent | MustNotPartiallyMutate | (read-only) |
 | `show` | Idempotent | MustNotPartiallyMutate | (read-only) |
-| `apply` | Idempotent on identical input | MustNotPartiallyMutate | tables: `agent_profiles`; mux: spawns `count` panes |
+| `apply` | Idempotent on identical input | Model: MustNotPartiallyMutate; live executor: compensated mutation with partial-effect receipt | tables: `agent_profiles`; mux: spawns `count` panes |
 | `validate` | Idempotent | MustNotPartiallyMutate | (read-only) |
 | `create` | Non-idempotent: a second call with the same `name` fails with `robot.profile.already_exists` and mutates nothing | MustNotPartiallyMutate (validate-then-single-insert) | tables: `agent_profiles` (one row) |
 
@@ -153,9 +153,11 @@ different names are independent.
    `(name, count, env_overrides, dry_run)` against the same
    starting state produces the same observable outcome.
 2. `apply_response_shape`.
-3. `apply_atomic_on_failure` — a failed apply does not leave
-   half the panes spawned. Either all `count` panes spawn or
-   none do; intermediate failures roll back.
+3. `apply_atomic_on_failure` is a **state-machine model invariant**.
+   The live executor attempts to close panes spawned before a later failure.
+   That compensation can fail; `robot.profile.compensation_failed` and the
+   mutation receipt must identify remaining effects. External pane processes
+   are not an all-or-none database transaction.
 4. `apply_idempotent_on_duplicate_input` (Custom) — the
    second apply with identical input returns
    `is_duplicate: true` with the same `panes_spawned` list and

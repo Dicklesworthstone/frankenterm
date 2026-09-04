@@ -1,5 +1,13 @@
 # ft-3681t Execution Plan: Critical Path, Tracks, and Success Gates
 
+> **Current acceptance boundary (2026-09-04):** the dated tracker counts and
+> sequencing below are historical. Closed child beads and exported types do
+> not establish M2 operational readiness: the connector host is an admission
+> model, and runtime delivery refuses missing transport under ft-xxfwy.46.
+> M2 still requires a real signed connector execution/receipt (ft-xxfwy.47),
+> live fleet behavior and retained target-class performance evidence. Use the
+> current Beads graph and source-bound artifacts for scheduling and completion.
+
 > **Bead**: ft-3681t.1.4
 > **Author**: RusticDeer
 > **Date**: 2026-03-02
@@ -308,10 +316,10 @@ before the epic itself can be marked CLOSED.
 |------|-----------|--------|------------|
 | ft-3681t.2.1 takes longer than expected | Medium | Critical | Assign additional agent support; decompose into smaller PRs |
 | Policy DSL (6.1) creates cross-cutting blocks | High | High | Start DSL design doc in parallel with Track 1; prototype evaluator early |
-| Connector host runtime has deep tokio deps | Medium | Medium | Assess asupersync compat early; use compat shim if needed |
+| Connector runtime dependency cohort is incompatible | Medium | Medium | Require one Asupersync runtime cohort; no direct Tokio or compatibility shim |
 | NTM parity gap discovered late | Low | Critical | Start parity corpus (8.1) draft now, before Track 2 completes |
 | Agent availability drops during long program | Medium | Medium | Document state thoroughly; beads are fungible across agents |
-| rch worker availability for heavy validation | High | Medium | Queue validation runs; use local builds as fallback |
+| rch worker availability for heavy validation | High | Medium | Retain the remote refusal as blocked proof; no local Cargo fallback; releases use DSR |
 
 ## 8. Immediate Actions (Next 48 Hours)
 

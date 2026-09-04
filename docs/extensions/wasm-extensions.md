@@ -1,5 +1,12 @@
 # Writing WASM Extensions
 
+> **Experimental SDK (ft-rxk40).** These modules cannot currently be installed
+> into the running terminal. WasmEngine links WASI but not the `ft_*` host API;
+> its registration helper uses the import module `frankenterm`, not `env`.
+> Module compilation, fuel limits, and library tests do not establish native
+> event dispatch or permission/audit enforcement in production. `ft ext`
+> manages pattern packs and does not install `.ftx` packages.
+
 WASM extensions compile to `wasm32-wasip1` and run inside a Wasmtime
 sandbox. They offer strong isolation, predictable resource usage, and
 support for any language that compiles to WASM.
@@ -58,6 +65,7 @@ WASM extensions communicate with FrankenTerm through imported host
 functions. Declare them as `extern "C"`:
 
 ```rust
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     /// Emit a log message.
     /// level: 0=Trace, 1=Debug, 2=Info, 3=Warn, 4=Error
@@ -161,7 +169,7 @@ Go can target WASM via TinyGo:
 ```go
 package main
 
-//go:wasmimport env ft_log
+//go:wasmimport frankenterm ft_log
 func ftLog(level int32, msgPtr *byte, msgLen uint32)
 
 func logInfo(msg string) {

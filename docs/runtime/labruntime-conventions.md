@@ -283,11 +283,13 @@ matrix) and ft-t9a6q.1 (cx-propagation lint):
   the fixture as a demonstrative pattern. Each migration is a
   separate commit so the diff shows the boilerplate-deletion
   delta cleanly.
-- **ft-t9a6q.3.cont.ci**: nightly CI lane that runs every
+- **ft-t9a6q.3.cont.ci**: retained RCH/DSR lane that runs every
   `lab_runtime_test`-marked test under both the default seed
   and a deterministic-multi-seed sweep so the fixture's
   determinism contract is regression-guarded across the full
-  test corpus.
+  test corpus. The former nightly-lane plan is historical; no current
+  scheduler is asserted here. Rust test execution requires remote RCH
+  admission, and DSR exclusively owns release orchestration.
 - ~~**ft-t9a6q.3.cont.time**: time-advancement helpers for
   deadline tests~~ — **shipped via ft-dgj2e** (`ManualTimeHarness`
   in the fixture).
@@ -296,7 +298,10 @@ matrix) and ft-t9a6q.1 (cx-propagation lint):
 
 - [`crates/frankenterm-core/src/test_fixtures/lab_runtime.rs`](../../crates/frankenterm-core/src/test_fixtures/lab_runtime.rs) — the fixture.
 - [`crates/frankenterm-core/src/cx.rs`](../../crates/frankenterm-core/src/cx.rs) — `Cx::for_testing()`.
-- [`asupersync/src/lab/runtime.rs`](https://example.invalid/asupersync) — `LabRuntime` itself (vendored under `/Users/jemanuel/projects/asupersync/`).
+- `asupersync` dependency's `src/lab/runtime.rs` — `LabRuntime` implementation;
+  resolve the version selected by `Cargo.lock` rather than assuming a local
+  checkout or vendored path.
 - ft-t9a6q parent epic.
 - ft-t9a6q.1 (closed) — cx-propagation analyzer; the static-analysis enforcer that complements LabRuntime's runtime enforcer.
-- ft-t9a6q.2 — burn-down dashboard; consumes both this fixture's nightly-lane output and the cx-propagation analyzer's `--json`.
+- ft-t9a6q.2 — burn-down dashboard; consumes retained fixture evidence and the
+  cx-propagation analyzer's `--json`.

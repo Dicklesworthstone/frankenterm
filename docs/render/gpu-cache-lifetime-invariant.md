@@ -6,7 +6,9 @@
 > re-resolve it from its real owner each use.
 
 This is the standing rule that prevents the "cache pins an atlas generation" class
-of GPU-memory leak. It is enforced statically (CI lint) and proven at test time.
+of GPU-memory leak. A standalone source lint and targeted behavior tests exist.
+As of 2026-09-04, the lint is not listed in `scripts/release-gates.sh` or the
+dynamic finish-line manifest; its existence is not automatic DSR enforcement.
 
 ---
 
@@ -72,13 +74,13 @@ more bug surface, negative EV.
 1. **Static lint — make the bug class unrepresentable.**
    `lints/cache_gpu_handle/` is a `syn`-based source analyzer (same stable-Rust
    pattern as `lints/cx_propagation`). It builds a type-reachability graph and
-   fails CI if any process-global container's type transitively reaches a forbidden
+   fails when run if any process-global container's type transitively reaches a forbidden
    GPU-handle leaf (`Sprite`, `CachedGlyph`, `Texture2d`, `WebGpuTexture`,
    `wgpu::Texture`/`TextureView`). It correctly spares legitimate ownership (the
    real `GlyphCache`/atlas owner is a *field* of `TermWindow`/`RenderState`, never a
    process-global). Run:
-   `cargo run -q --release -p cache_gpu_handle_lint -- crates/frankenterm-gui/src frankenterm/window/src`
-   (wired into `.github/workflows/finish-line-guards.yml`).
+   `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-cache-gpu-lint cargo run --locked -q --release -p cache_gpu_handle_lint -- crates/frankenterm-gui/src frankenterm/window/src`.
+   Release gate wiring and a retained successful run must be verified separately.
 
 2. **Behavior proof + leak guard (tests).** In `shapecache.rs`:
    - `interner_does_not_pin_glyphs_atlas_generation_leak_guard` — asserts
@@ -88,6 +90,11 @@ more bug surface, negative EV.
      (the leak would keep all of them alive).
    - `interned_run_matches_fresh_shape_for_same_font_and_attrs` — the cache still
      produces output identical to fresh shaping (the decoupling is isomorphic).
+
+   The GUI binary has `test = false`; ordinary library tests do not run its
+   binary-owned modules. Use the opt-in `glyphcache_unit` harness for its
+   included modules and retain named, nonzero test results. Native memory
+   and rendering qualification remain separate.
 
 3. **Runtime signal.** `gui.shaped_run_interner.clear_evictions` (emitted only on
    the rare 8192-entry cap, never per frame) surfaces cache thrashing in `ft`'s
@@ -104,5 +111,5 @@ When you add a cache that *needs* to reference a resource it does not own:
 - **Otherwise**: hold a `Weak<_>` to the resource and treat a failed upgrade as a
   cache miss. Never an owning `Rc`/`Arc` to a `Sprite`/texture/atlas/render-target
   in a long-lived/global cache.
-- The `cache_gpu_handle` lint will reject a violation at CI time; do not add an
+- The `cache_gpu_handle` lint rejects a violation when run; do not add an
   allow-list entry to silence it without decomposing the lifetime first.

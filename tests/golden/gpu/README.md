@@ -51,8 +51,12 @@ CI and local pilot lanes can narrow or relocate the fixture set:
 - `FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING=llvmpipe` pins a pilot lane to a
   specific adapter marker.
 
-CI exposes `GPU Regression Required` as the stable branch-protection check. It
-depends on the macOS 15 Metal reference job and the Linux llvmpipe pilot job.
+Development Cargo proof uses strict remote RCH; release orchestration and
+qualification use DSR exclusively. Retain source identity, fixture counts,
+adapter/backend, and the complete run artifacts. No Actions branch-protection
+check is a qualification surface for FrankenTerm. A static PNG roundtrip,
+software-adapter render, or offscreen Metal render establishes only that
+recorded path; native presentation uses the separate renderer scenario contract.
 
 The harness emits JSON-line events to stderr:
 
@@ -85,7 +89,7 @@ If no usable GPU backend is available, the harness exits with code `2`
 and reports the init failure as infrastructure, not as a golden
 regression.
 
-For the full local/CI-style run, use the E2E wrapper:
+For the retained wrapper run on an authorized RCH/DSR execution host:
 
 ```bash
 scripts/test-gpu-harness.sh

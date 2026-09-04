@@ -11,6 +11,13 @@ transfer-event queue + frame-budget deferrer) plugs into the
 wgpu copy-command emitter without coupling the substrate to
 wgpu types.
 
+**Source status (2026-09-04):** the queue/deferrer APIs below are substrate
+and the emitter loops are integration sketches. They do not establish
+production wgpu copies, live frame-budget adherence, or bounded cold-tier
+I/O. Actual driver ownership and retained native evidence belong to
+`ft-interactive-systems-performance-4tenz.8.8.3`; queue-only proof remains
+separate from that acceptance.
+
 ## Substrate surface (shipped under ft-ktd19.1 + ft-ktd19.3)
 
 ```text

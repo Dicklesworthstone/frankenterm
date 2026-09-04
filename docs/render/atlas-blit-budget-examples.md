@@ -7,6 +7,13 @@ JSON for their deployment as part of the renderer's config
 runbook; this page documents the canonical 60fps / 256 KiB-atlas
 profile so the per-deployment delta is easy to spot.
 
+These are calculator outputs under assumed bandwidth and dispatch costs,
+not measured native blit throughput or safe production caps. Driver costs,
+contention, and frame-pacing tails must be measured on the actual target.
+The queue/driver integration is still incomplete; see the
+[integration status](atlas-tiered-swap-wgpu-integration.md). Recommendations
+below are candidate experiments, not qualified hardware settings.
+
 [calc]: ../../scripts/atlas_blit_budget_calculator.py
 
 ## Profile A — Apple Silicon / AMD APU (UMA, 200 GB/s)
@@ -42,7 +49,7 @@ python3 scripts/atlas_blit_budget_calculator.py --bus uma
 
 **Read:** UMA is bandwidth-rich; the calculator's "more than 256
 blits per frame" note is the operator signal that the driver
-command-queue depth is the real ceiling, not bus throughput.
+command-queue depth may become the ceiling; the calculator does not measure it.
 **Operator action:** start with a 256-blit cap empirically; raise
 in 64-blit increments while watching for frame-pacing jitter.
 

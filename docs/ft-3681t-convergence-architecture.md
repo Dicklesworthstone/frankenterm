@@ -1,5 +1,13 @@
 # ft-3681t.1.3 Convergence Architecture Spec
 
+> **Source reality (2026-09-04):** this is a target architecture. Connector
+> host/mesh APIs model admission and envelopes; they do not execute an external
+> FCP transport. Runtime outbound delivery now refuses unavailable transport
+> without recording success or scheduling retries (ft-xxfwy.46); actual host
+> delivery/receipts and live ingress remain ft-xxfwy.47. Search includes a hash
+> semantic/hybrid baseline, while learned orchestration/reranking remains open.
+> Symbol probes below establish traceability only, not live effects or support.
+
 This document defines the target architecture contract for FrankenTerm as the
 single swarm terminal and control-plane runtime. It is intended to unblock:
 
@@ -353,9 +361,9 @@ contract so traceability checks can be performed mechanically.
   work should treat validation and operator integration as the main gap rather
   than greenfield server bootstrapping.
 - Search is already more than plain FTS parity: current storage/search code
-  exposes lexical, semantic, and hybrid retrieval modes, which means most
-  remaining `ft-3681t.4.*` search work is about contract hardening and surface
-  alignment rather than inventing a new retrieval substrate.
+  exposes lexical, hash semantic, and hybrid retrieval modes. Learned model,
+  reranker, and advanced orchestrator production wiring remain implementation
+  work (ft-xx5cl, ft-vyg9y, ft-ottca), alongside contract/surface alignment.
 - Runtime ingestion already contains burst-control primitives such as native
   output coalescing and vendored streaming fallback paths, which should be
   reflected in any observability or scale/degradation design work instead of
@@ -372,5 +380,7 @@ contract so traceability checks can be performed mechanically.
 
 - Run probe commands from repository root (`/Users/jemanuel/projects/frankenterm`).
 - A probe passes when it returns one or more matches for the referenced symbol path.
+- This is a source traceability result. It does not prove a caller is reachable
+  from a shipped binary or that a connector, workflow, or external effect ran.
 - For probes with multiple matches, reviewers should confirm at least one match is
   in the intended implementation function named in the anchor table.

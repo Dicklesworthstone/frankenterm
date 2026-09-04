@@ -1,5 +1,14 @@
 # Plan to Deeply Integrate fastapi_rust into FrankenTerm
 
+> **Product scope (2026-09-04):** the FastAPI framework serves the current
+> nine localhost read/SSE routes in `web/router.rs`. The WebSocket and OpenAPI
+> modules are placeholders; authentication, public binding, readiness and
+> richer agent/workflow/reservation HTTP routes below remain future work.
+> Current startup rejects non-localhost binds because no authentication
+> boundary exists. Framework adoption does not certify the whole plan.
+> Connection ownership/shutdown work remains under
+> ft-interactive-systems-performance-4tenz.33 and its children.
+
 > Integration plan for FrankenTerm bead `ft-2vuw7.25.3`
 > Author: DarkMill (claude-code, opus-4.6)
 > Date: 2026-02-22

@@ -74,3 +74,19 @@ Fixtures live under `fixtures/mission-planner/source-adapters/`:
 
 These fixtures are adapter-contract examples, not evidence that runtime adapter
 code exists.
+
+## Current mission mutation boundary
+
+The existing MCP `wa.mission_pause`, `wa.mission_resume`, and
+`wa.mission_abort` handlers load a mission plan, change its lifecycle/outcomes,
+and save the mission JSON. Abort records unfinished assignments as cancelled;
+it does not locate and cancel live task contexts or acknowledge stopped pane
+effects. A source adapter must report those persisted outcomes as plan state,
+not as proof that a running assignment stopped.
+
+Live cancellation requires a runtime owner/assignment registry, propagation to
+the actual execution context, and an acknowledged no-further-effect boundary;
+the mission driver follow-ups (`ft-majms`, `ft-7c21y`) own that integration.
+Cross-process read/modify/write serialization and crash-durable mission saves
+also require the persistence work tracked in `ft-xxfwy.48`. Atomic file rename
+alone does not prevent lost concurrent lifecycle updates.

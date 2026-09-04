@@ -1,5 +1,14 @@
 # Plan to Deeply Integrate fastmcp_ruse into FrankenTerm
 
+> **Product scope (2026-09-04):** the server and optional `mcp-client` proxy
+> have real executable entry points. `mcp_bridge` composes proxy tools through
+> `FtMcpClient` and a real stdio subprocess transport. Caller-specific deadlines
+> and bounded synchronous receive remain unresolved in ft-bd3vr; strict/fallback
+> combinations are tracked by ft-b877r, and concurrent cancellation/delivery
+> by ft-7h5da.4.10. Source/module presence, estimated boilerplate reduction, and
+> fixture test counts do not prove those operational contracts or inclusion in
+> a particular shipped artifact.
+
 > Integration plan for FrankenTerm bead `ft-2vuw7.26.3`
 > Author: DarkMill (claude-code, opus-4.6)
 > Date: 2026-02-22

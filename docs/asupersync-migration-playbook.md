@@ -1,6 +1,13 @@
 # asupersync Runtime Migration Playbook (ft-e34d9)
 
-This document is an operator/developer playbook for migrating FrankenTerm from `tokio` to `asupersync`.
+This document preserves the historical operator/developer playbook for the
+`ft-e34d9` migration from Tokio to asupersync. Its dual-runtime feature phases
+and direct asupersync rewrite examples are historical design steps, not
+instructions to reintroduce alternate runtimes or bypass `runtime_async`.
+Current code uses `crate::runtime_async` and explicit `Cx` propagation; direct
+Tokio imports/dependencies are forbidden. Follow AGENTS.md for RCH development
+proof and DSR release proof. The phase map below is not a current completion
+scorecard.
 
 It is intentionally **workflow-oriented**: it maps the *bead phases* to concrete code changes, gives safe
 mechanical rewrite patterns, and lists “gotchas” that tend to cause long-tail churn.

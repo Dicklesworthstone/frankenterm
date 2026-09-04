@@ -1,5 +1,9 @@
 # Example: Auto Dark Mode (WASM/Rust)
 
+> **Experimental example (ft-rxk40).** This module logs a proposed theme change;
+> it does not change the running terminal's theme. Native event dispatch and
+> `ft_*` host linking are not integrated, and `ft ext` cannot install `.ftx`.
+
 A WASM extension that detects the OS color scheme and switches the
 terminal theme accordingly on config reload.
 
@@ -53,6 +57,7 @@ crate-type = ["cdylib"]
 use std::slice;
 
 // Host function imports
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     fn ft_log(level: i32, msg_ptr: *const u8, msg_len: u32);
     fn ft_get_env(key_ptr: *const u8, key_len: u32) -> i32;
@@ -106,5 +111,5 @@ cd auto-dark-mode
 cargo build --target wasm32-wasip1 --release
 cp target/wasm32-wasip1/release/auto_dark_mode.wasm main.wasm
 zip auto-dark-mode.ftx extension.toml main.wasm
-ft ext install auto-dark-mode.ftx
+# Production installation is unavailable (ft-rxk40).
 ```

@@ -5,6 +5,11 @@
 **Depends on:** wa-1uqi (FTUI-03.2.a — output sink routing)
 **Blocks:** wa-bjvg (FTUI-06.2.a — command handoff traces), wa-3fed (FTUI-03.4.a — panic teardown)
 
+**Status:** historical implementation proposal, not a shipped capture pipeline.
+The proposed `src/subprocess_capture.rs` is absent in the 2026-09-04 source
+audit. The design below sets future acceptance requirements; it supplies no
+live forwarding, no-leak, or subprocess-cancellation proof.
+
 ## 1  Problem Statement
 
 `command_handoff.rs` currently runs subprocesses with inherited stdio: the child
@@ -74,10 +79,10 @@ loop {
 ```
 
 **Invariants:**
-- CaptureLoop runs on a dedicated tokio task (not the render task)
+- CaptureLoop runs as a session-owned `runtime_async` task with explicit `Cx`
 - Read buffer is 8192 bytes (matches typical PTY read granularity)
 - EOF on master fd means the child process has exited
-- Shutdown signal is a `tokio::sync::watch` from the session lifecycle
+- Shutdown uses `runtime_async::watch` plus the session cancellation context
 
 ### 3.3  Gate Phase Interaction
 
@@ -113,19 +118,23 @@ Strip or normalize control sequences that could corrupt terminal state:
 
 ### 4.2  Secret Redaction
 
-Apply `policy::Redactor::redact()` to each output chunk. The existing redactor
-handles API keys, tokens, passwords, and database URLs.
+Use the production `redactor::StreamingRedactor` withholding/flush boundary
+for chunked output, with typed original-byte evidence. Independent per-chunk
+`Redactor::redact()` calls cannot cover split credentials.
 
 **Redaction boundary:** Redaction is applied to the raw bytes *before* they
-reach either the terminal or the recording engine. This ensures:
+reach either the terminal or the recording engine. Required future acceptance:
 - Live terminal output is redacted in real-time
 - Recorded sessions never contain unredacted secrets
 - No window exists where secrets are written to any persistent store
 
-**Chunk boundary handling:** Secrets may span read boundaries (e.g., a token
-split across two 8192-byte reads). The pipeline maintains a 256-byte overlap
-window: each chunk is scanned as `[overlap][new_bytes]`, and only `new_bytes`
-portion is emitted. The overlap window is retained for the next chunk.
+**Chunk boundary handling:** The former 256-byte overlap proposal emitted
+bytes before a complete credential could be recognized; later rescanning
+cannot retract those bytes. Withhold undecidable suffixes using the production
+streaming boundary and test split points, final flush, and overflow behavior.
+Forced overflow can weaken secrecy, so counters and retained no-leak negative
+controls must accompany any stronger claim. No forwarding implementation is
+established by this proposal.
 
 ### 4.3  Frame Stamping
 
@@ -315,8 +324,9 @@ Modify `crates/frankenterm-core/src/recording.rs`:
 |-------|---------|---------|
 | `nix` | 0.29+ | `openpty(2)`, `SIGTERM`, PTY ioctls |
 
-The `nix` crate is already a transitive dependency via tokio. Direct dependency
-should be feature-gated behind `cfg(unix)` since PTY capture is POSIX-only.
+Resolve PTY dependencies against the current workspace manifest. Do not add
+Tokio or depend on a historical transitive path; any direct POSIX PTY
+dependency belongs behind the relevant Unix target configuration.
 
 ### Internal Dependencies
 

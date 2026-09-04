@@ -1,5 +1,14 @@
 # Plan to Deeply Integrate cross_agent_session_resumer into FrankenTerm
 
+> **Product scope (2026-09-04):** provider discovery and session resume have
+> real CLI callers. The proposed recorder-to-conversation pipeline does not:
+> `recorder_casr_export.rs` is absent, and `SessionResumer::export_for_recorder`
+> only packages caller-supplied canonical messages. It performs no recorder
+> reads, role inference, redaction, session splitting, or cross-provider import.
+> A module/types test does not prove resuming an observed terminal recording.
+> The runtime examples below are historical; current implementation must use
+> `runtime_async`/Cx with bounded subprocess lifetime, never direct Tokio.
+
 > Integration plan for FrankenTerm bead `ft-2vuw7.27.3`
 > Author: DarkMill (claude-code, opus-4.6)
 > Date: 2026-02-22

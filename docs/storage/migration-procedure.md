@@ -136,29 +136,18 @@ validate:
 - Index physical ordering (logical row order via `rowid` is
   the contract).
 
-## Known caveats (substrate-pass)
+## Current converter limits
 
-The substrate uses string-canonical column encoding
-(`encode_sqlite_value_as_string`):
+The converter now uses typed `SqlCell` values and requires lossless cell
+support from both backends. NULL remains NULL, empty text remains empty text,
+and BLOBs retain their bytes. Verification compares types and values, including
+same-length BLOB differences; the old string/placeholder caveat no longer applies.
 
-- **NULL** rounds-trips as the empty string. A column whose
-  source contained NULL becomes empty TEXT in the destination
-  (the wired-pass cont-bead under ft-qgj81 scope item 3 lands
-  the typed Row accessor that distinguishes).
-- **BLOB** rounds-trips as `<blob:N bytes>` placeholder text.
-  Tables with binary blob columns require the wired-pass typed
-  copy path before they can be migrated faithfully — until
-  then, any blob-bearing table is operator-rejected by adding
-  it to the explicit `tables` slice causes the destination to
-  carry the placeholder strings instead of the real bytes.
-
-Tables affected by the blob caveat in the current schema:
-
-- `audit_action_data` — `payload` BLOB
-- `secret_scan_reports` — `serialized_findings` BLOB
-
-For these, defer migration until the wired-pass typed copy
-path lands (tracked under ft-s03ox cont).
+This is a library/example converter, not a shipped `ft storage convert`
+command or a working FrankenSQLite backend. The destination schema must exist,
+the source must be quiescent, and the copy is not one atomic whole-database
+transaction. Table rows are materialized in memory, so callers must account
+for table size. FrankenSQLite conversion remains blocked on ft-kcdqp/ft-eyzv9.
 
 ## Cross-references
 

@@ -9,8 +9,8 @@ properties) all live. The retained backend-driver slice now
 calls the actual ratatui app/views path and the ftui
 `WaModel::view` path with matched deterministic state, then
 normalizes both buffers into `RenderFrame`; the current driver
-evidence reports a backend divergence rather than a clean
-parity pass. vhs/asciinema-derived corpora is sub-bead
+evidence is clean for deterministic Home/Panes state fixtures.
+The full script/corpus parity run remains pending. vhs/asciinema-derived corpora is sub-bead
 `ft-35yac.1.1`; GPU-renderer parity is sub-bead
 `ft-35yac.1.2`.
 
@@ -192,11 +192,10 @@ The retained rollout-gated driver test now:
   any divergence emits an actionable insta-style summary plus
   glyph-vs-style and top/body/last-row buckets.
 
-This changes the honest blocker from "oracle unavailable" to
-"backend-driver divergence." The remaining integration work is
-not availability of a driver; it is making the retained driver
-clean across the full script/corpus set and then publishing the
-release evidence.
+The retained driver is clean for deterministic Home/Panes state fixtures.
+The remaining work is to exercise the full script/corpus set through both
+event loops and retain clean release evidence; these two state fixtures
+do not establish that broader result.
 
 ## What the foundation slice does NOT do
 
@@ -205,7 +204,7 @@ release evidence.
   Home and Panes state fixtures; the follow-on extends that to
   the whole `synthesized_event_corpus()` action stream.
 - Does not yet assert `is_clean()` for all ratatui-vs-ftui
-  frames. Current status is an explicit divergence blocker.
+  frames. Coverage of the full script/corpus remains unproven.
 - Does not record vhs/asciinema corpora — that's
   `ft-35yac.1.1`.
 - Does not assert GPU-renderer parity — that's
@@ -256,7 +255,7 @@ cargo test -p frankenterm-core --test tui_parity_oracle \
 | Property-based parity using keymap | ✓ (32 KeymapAction kinds; full alphabet swept in proptest) |
 | ratatui as reference oracle | ✓ (documented as "always an ftui bug" semantics) |
 | vhs/asciinema corpus from real sessions | ⏳ sub-bead `ft-35yac.1.1` |
-| Headless GPU-renderer parity | ✓ `scripts/test-gpu-harness.sh` runs the headless GPU harness and emits `render-parity-gpu.json`; CI uploads the run directory from the macOS Metal gate and Linux llvmpipe pilot |
+| Headless GPU-renderer parity | Harness/artifact path exists through `scripts/test-gpu-harness.sh`; qualify actual fixture counts and adapter scope under RCH/DSR, with native evidence separate |
 | Per-release render-parity JSON | Partial: GPU visual adjunct is attested by `docs/attestations/tui/render-parity-gpu.json`; the full ratatui<->ftui byte-level report remains `ft-35yac.2` |
 | Backend driver wiring | Partial: retained driver reaches both real backends and reports clean deterministic Home/Panes frames; full clean script/corpus run remains pending |
 

@@ -13,6 +13,20 @@
 > 0.2-era pin, `runtime_compat`, and separate `cx.rs` bridge descriptions in
 > the original February synthesis are no longer live architecture.
 
+> **Product status correction (2026-09-04):** the phases and estimates below
+> are historical plans, not a shipping checklist. Source tracing confirms
+> SQLite capture/search, CLI CASS/CAUT/provider-resume calls, a local read/SSE
+> web service, and a feature-gated MCP subprocess proxy. It does not establish
+> a production scripting loader, external connector delivery, learned search
+> reranking, recorder-to-CASR conversation conversion, browser terminal
+> WebSockets/OpenAPI, a native `pt` provider, or consumers for the Redis session
+> cache, VC export, UBS wrapper, graph scoring, and Mermaid rendering promises.
+> These remain separate implementation decisions/tasks under ft-xxfwy.
+> FrankenSQLite is unavailable under ft-kcdqp/ft-eyzv9. Installed tools and
+> exported modules do not prove product integration; actual shipping features,
+> entry points, effects, and retained evidence govern completion. See the
+> [current status index](../NON_CANONICAL_ANALYSES.md).
+
 ---
 
 ## 1. Executive Summary
@@ -343,7 +357,10 @@ impl FooBridge {
 - Timeout: 10s default, configurable
 - Output parsing: `serde_json::from_str` on stdout
 - Error handling: `Error::Runtime(String)` for subprocess failures
-- Fail-open: if binary unavailable, return sensible defaults (not errors)
+- Unavailable dependency: return an explicit typed unavailable/unknown state.
+  Reads may degrade visibly where their contract permits; policy, delivery,
+  pressure-based admission, and destructive actions must not treat missing
+  evidence as successful execution or safe conditions.
 - Feature-gated: each bridge behind its own feature flag
 
 ### 5.2 Backpressure Integration Contract

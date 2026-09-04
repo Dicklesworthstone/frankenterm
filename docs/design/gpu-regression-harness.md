@@ -1,14 +1,25 @@
 # GPU Regression Harness — Design Decisions
 
-**Status:** Implemented for the `ft-35yac.1.2` visual parity artifact path
+**Status:** Historical design; headless harness/artifact path implemented,
+native renderer qualification incomplete
 **Bead:** ft-ombfl.1 (parent: ft-ombfl)
 **Predecessor:** ft-1memj.28 (divider geometry shipped as bf9db5d5)
 **Date:** 2026-04-28
 
+**Current source boundary (2026-09-04):** the runnable target is
+`crates/frankenterm-gui/tests/gpu_regression.rs`, with fixtures under
+`tests/golden/gpu/`. It supports static PNG roundtrips, feature-gated
+headless rendering, and fuzz runs. These scopes do not establish live
+`TermWindow` equivalence, native presentation, or screen-reader delivery.
+The current coverage and native acceptance authority is
+[renderer-scenario-contract.md](renderer-scenario-contract.md).
+The decisions below retain the original design intent; they are not a
+claim that every extraction, driver, or reproducibility control landed.
+
 ## Purpose
 
 Specify the framework, capture path, on-disk format, comparator, fixture
-layout, and CI strategy for a golden-image regression harness covering
+layout, and verification strategy for a golden-image regression harness covering
 `frankenterm-gui`'s render pipeline. This document is the blocker for
 all ft-ombfl implementation children (ft-ombfl.2 through ft-ombfl.13);
 they may begin once this is accepted.
@@ -41,9 +52,9 @@ have to invoke it from a windowless context.
 
 **Decision.** **Option A.** Reuse `frankenterm-gui`'s production wgpu
 pipeline with an offscreen `wgpu::Texture` (no `wgpu::Surface`) as the
-render target. CI uses Metal on macos-15 and **WebGPU's Vulkan/swiftshader
-fallback on ubuntu-latest**, with a documented "soft" lane for
-ubuntu-without-GPU that runs the harness in non-blocking mode (see §7).
+render target. This is the design target; the current headless path is
+not full production-path equivalence. Metal and software-adapter evidence
+must be identified separately, using the RCH/DSR boundaries in §7.
 
 ## 2. Capture strategy
 
@@ -87,17 +98,11 @@ the workspace, reviewers can drag-and-drop the file into any viewer.
 Size cost is acceptable; 80% of expected fixtures are <300 KB at
 typical terminal resolutions (e.g., 1280×800).
 
-**PNG must be encoded deterministically.** The `image` crate's
-`PngEncoder` writes a `tIME` chunk by default; left unchecked this
-breaks reproducibility. The harness uses `PngEncoder::new_with_quality`
-configured as:
-
-- `CompressionType::Fast` (level 6 equivalent — pinned for stability)
-- `FilterType::Adaptive` is non-deterministic across `image` versions;
-  pin to `FilterType::Paeth` instead
-- No `tEXt`/`iTXt`/`tIME` chunks; encode via the lower-level
-  `png::Encoder` API directly to skip the `image` wrapper's metadata
-  insertion
+**PNG must be encoded deterministically.** Pin the encoder dependency
+and settings, keep run timestamps in sidecar metadata, and verify repeated
+encoding of identical pixels. The original claims about automatic `tIME`
+insertion and compression/filter behavior were not supported by retained
+source evidence and are not part of this contract.
 
 Each fixture has a sidecar `meta.json` capturing reproducibility
 context that the PNG cannot:
@@ -159,8 +164,8 @@ the fixture:
 - `<fixture>.diff.png` — pixel-difference visualization (red = diff)
 - `<fixture>.report.json` — `{ ssim, l_inf, changed_pixels, threshold }`
 
-These are uploaded by CI on failure (see §7) so reviewers see the
-diff without re-running the harness locally.
+Retain these with the RCH/DSR run (see §7) so reviewers can inspect
+the diff without re-running the harness.
 
 **Decision.** **Triple-clause comparator: SSIM ≥ 0.99 AND L∞ ≤ 8 AND
 changed-pixel-fraction ≤ 0.001 (0.1%).** Per-fixture override allowed
@@ -170,46 +175,37 @@ artifacts.
 ## 5. Test directory layout
 
 ```
-crates/frankenterm-gui/tests/
-├── golden/                          # NEW — covered by ft-ombfl.2
-│   ├── fixtures/                    # NEW — covered by ft-ombfl.4
-│   │   ├── cursor_blink_off/
-│   │   │   ├── golden.png
-│   │   │   ├── meta.json
-│   │   │   └── scenario.lua         # how to drive the renderer
-│   │   ├── selection_word_wrap/
-│   │   └── …
-│   ├── fonts/                       # NEW — pinned font set, see §6
-│   │   └── MANIFEST.toml
-│   └── README.md
-├── golden_harness.rs                # NEW — covered by ft-ombfl.2 & .3
-└── existing tests (unchanged)
+tests/golden/gpu/<fixture-name>/
+├── input.json
+├── golden.png
+├── meta.json
+└── expected.json
+
+crates/frankenterm-gui/tests/gpu_regression.rs
 ```
 
-The golden tests live under the `frankenterm-gui` crate (not the
-workspace root) because they exercise that crate's render path. Other
-crates' golden harnesses can mirror this pattern under their own
-`tests/golden/` if needed, but this design only commits the
-gui-renderer slice.
+The harness target belongs to `frankenterm-gui`; its fixture data lives
+at the workspace root. `input.json` declares the actual frame source,
+including renderer-free `static_png_roundtrip` and `headless_terminal`.
 
 A fixture is a directory, not a single file — the renderer driver
-(`scenario.lua` or equivalent) lives next to the golden so a reviewer
+(`input.json`) lives next to the golden so a reviewer
 sees the input and output together.
 
-**Decision.** **Per-fixture directory under
-`crates/frankenterm-gui/tests/golden/fixtures/`** containing
-`golden.png`, `meta.json`, and the scenario driver. Pinned fonts at
-`crates/frankenterm-gui/tests/golden/fonts/`.
+**Current layout.** **Per-fixture directory under `tests/golden/gpu/`**.
+See [the fixture guide](../gpu-harness-fixture-guide.md) for the authoring
+contract. The pinned-font system below is the original design requirement,
+not proof that its proposed paths or fetch commands exist.
 
 ## 6. Reproducibility constraints
 
 | Source of nondeterminism | Mitigation |
 |--------------------------|------------|
 | System fonts vary by OS minor version | Pin font set in `tests/golden/fonts/`; force the harness to load only those |
-| GPU drivers vary by macOS version | Pin CI to `macos-15` runner image; document in this doc + `meta.json` |
+| GPU drivers vary by macOS version | Record and qualify the native DSR host, OS, driver, and adapter in the evidence |
 | Locale (number formatting, calendar) | `LC_ALL=C` enforced by harness setup; reject if env says otherwise |
 | Timezone (timestamp rendering) | `TZ=UTC` enforced by harness setup |
-| `image` crate version | Pin via Cargo.lock; the harness asserts `image::version()` matches a recorded hash at startup |
+| `image` crate version | Pin via Cargo.lock and retain source/dependency identity; startup hash enforcement must be demonstrated separately |
 | Time-of-day cursor blink phase | Disable blink in fixtures (set blink interval to 0 or freeze the clock) |
 | Floating-point rounding across CPU microarchitectures | Tolerated by the §4 comparator (L∞ ≤ 8 ≈ 3% per-channel) |
 
@@ -230,59 +226,31 @@ If upstream URLs become unstable, fall back to font subsetting via
 float drift via the comparator.** Font binaries managed via a
 checksummed manifest + on-demand fetcher (not bundled).
 
-## 7. CI strategy
+## 7. RCH development proof and DSR release qualification
 
-Two CI lanes:
+FrankenTerm prohibits GitHub Actions. Development Cargo checks run through
+strict remote RCH; releases and native release qualification use DSR.
+This document does not establish an automatically configured GPU gate or
+a scheduled fuzz run. Inspect the current DSR configuration and retained
+receipts before attributing any result to a release.
 
-| Lane | Runner | Behavior on diff | Cost |
-|------|--------|------------------|------|
-| Hard gate | `macos-15` (Apple Silicon, Metal) | **Failure blocks merge.** Goldens valid against this image | Standard macOS minutes |
-| Soft lane | `ubuntu-latest` (Vulkan/swiftshader fallback) | **Failure logs an artifact but does NOT block merge.** Used to detect drift between platforms | Cheap; runs in same workflow |
+Retain source identity, host/OS, adapter/backend, fixture inputs and counts,
+`render-parity-gpu.json`, `summary.json`, `events.jsonl`, and every failure
+PNG/report. A missing adapter is infrastructure failure, and an empty or
+skipped fixture set is unproven. Static PNG roundtrips establish comparator
+behavior; headless software and Metal runs establish only their recorded
+paths. Native presentation and full production rendering require the
+separate scenario contract's driver and capture evidence.
 
-Rationale: Apple Silicon is the developer reference platform. Ubuntu
-is for catching cross-platform regressions early without coupling
-release readiness to mesa/swiftshader behavior we don't control.
-
-When `macos-15` retires (GitHub typically pre-announces 6 months in
-advance), a coordinated regen PR re-captures all goldens against the
-new runner. Filed as a follow-on bead at that time.
-
-CI step skeleton (jobs to be implemented in ft-ombfl.5+):
-
-```yaml
-- name: Fetch pinned fonts
-  run: cargo run -p frankenterm-gui --bin fetch-fonts
-
-- name: GPU regression harness (macos-15, hard gate)
-  if: matrix.os == 'macos-15'
-  run: cargo test -p frankenterm-gui --test golden_harness -- --test-threads=1
-
-- name: Upload diff artifacts on failure
-  if: failure()
-  uses: actions/upload-artifact@v4
-  with:
-    name: gpu-harness-diffs-${{ matrix.os }}
-    path: crates/frankenterm-gui/tests/golden/**/*.{actual,diff,report}.*
-```
-
-`--test-threads=1` is **mandatory**: the harness shares one wgpu
-adapter; concurrent invocations will starve each other on the readback
-poll loop.
-
-**Decision.** **Two-lane CI: macos-15 hard-gates, ubuntu-latest
-soft-warns.** Diff artifacts uploaded on failure for review.
-
-The GitHub Actions workflow also has a nightly `schedule` trigger. The
-stable branch-protection surface is `GPU Regression Required`, while
-each lane uploads its full `target/gpu-regression/<runner>/` directory,
-including `render-parity-gpu.json`, `summary.json`, `events.jsonl`, and
-failure PNG/report artifacts.
+**Decision.** Qualify each declared path on its actual RCH/DSR host, with
+nonzero applicable fixtures and retained failure artifacts. Preserve
+reference goldens until an explicitly reviewed recapture is authorized.
 
 ---
 
-## Implementation order
+## Original implementation order (historical)
 
-The decisions above unblock the following implementation chain:
+The original plan used the following implementation chain:
 
 1. **ft-ombfl.2** — Harness scaffold (the wgpu offscreen adapter,
    `golden_harness.rs`, the comparator, fixture loader).
@@ -290,10 +258,11 @@ The decisions above unblock the following implementation chain:
    `frankenterm-gui`'s render path against an offscreen target).
 3. **ft-ombfl.4** — Fixture authoring (one fixture per regression
    class: cursor, selection, scrollback, emoji-fallback, shaping).
-4. **ft-ombfl.5** — CI workflow integration.
+4. **ft-ombfl.5** — Verification integration (historical breakdown;
+   current release orchestration must use DSR).
 5. ft-ombfl.6 onward — fixture growth + lint integration.
 
-A reviewer can begin ft-ombfl.2 the moment this doc is accepted.
+Current work must use the source status and native scenario contract above.
 
 ## Acceptance test for this doc
 
@@ -302,8 +271,9 @@ A fresh reader, after 60 seconds reading, should answer:
 - *What library compares images?* SSIM (custom 100-LOC implementation)
   + L∞ + changed-pixel-count, all in-tree under the harness.
 - *Where do golden files live?*
-  `crates/frankenterm-gui/tests/golden/fixtures/<name>/`.
-- *Which CI lane gates merges?* macos-15.
+  `tests/golden/gpu/<name>/`.
+- *What qualifies a release?* Retained applicable DSR evidence; development
+  Cargo proof uses strict remote RCH. No Actions lane is authoritative.
 - *Why PNG and not QOI?* Tooling: GitHub diff preview + image crate
   already in deps.
 

@@ -8,12 +8,19 @@ production per-platform negotiation (Wayland
 `presentation-time`, X11 `XPresent`, macOS `CADisplayLink`)
 is the integration follow-on.
 
+**Native source boundary (2026-09-04):** this is a negotiation model.
+The reviewed GUI initializes `FrameBudget` at 60 Hz and passes 60 Hz to
+its idle-scheduler model; no live display-link integration or battery
+gain is established here. Native pacing, display changes, input wake,
+fallback behavior, and measured latency/power evidence remain under
+`ft-interactive-systems-performance-4tenz.8.5`.
+
 ## Headline rule
 
-> ft tells the compositor a **desired refresh rate per
+> The proposed integration tells the compositor a **desired refresh rate per
 > frame**. Idle → 30 Hz. Typing → 60 Hz. Live-resize → display
 > max. Battery low → 30 Hz cap. Recording active → fixed
-> rate. Massive battery savings without latency cost.
+> rate. Battery savings and latency costs require native measurement.
 
 ## Decision priority
 

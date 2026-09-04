@@ -5,12 +5,12 @@
 **SLO:** RQ-S4 in
 [`docs/perf/resize-quality-slo.md`](../perf/resize-quality-slo.md)
 — 24h adversarial fuzz, **0 critical artifacts**.
-**Status:** Foundation slice shipped — failure-artifact
-contract + GitHub Actions workflow + scenario manifest + audit
-doc + path consolidation. The GitHub Actions workflow now uses
-the standard `ubuntu-24.04` hosted runner with Mesa llvmpipe
-setup, and it fails fast with a configuration error until the
-production harness CLI wiring lands.
+**Status:** Failure-artifact contract, scenario manifest, and headless
+fuzz CLI are implemented. `crates/frankenterm-gui/tests/gpu_regression.rs`
+parses `--fuzz-seed`, `--fuzz-duration`, `--fuzz-start-at`, and `--runs-dir`
+and runs the fuzz stream with `headless-render`. This is source availability,
+not retained 24-hour native-renderer qualification. FrankenTerm uses RCH
+for development Cargo proof and DSR exclusively for release qualification.
 
 ## Headline rule
 
@@ -43,7 +43,9 @@ The contract layer at
 `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`
 encodes these as `ViolationKind` variants with `is_critical()`
 predicate; the harness binary classifies frames at runtime
-and writes `violations.jsonl` rows the GHA workflow tallies.
+and writes `violations.jsonl`, run metadata, and a summary. Qualification
+must retain and validate the actual duration, event count, seed, adapter,
+source identity, and violation counts.
 
 ## Run artifact layout
 
@@ -75,47 +77,34 @@ the contract module:
 
 | Status | Count |
 |---|---:|
-| Shipped (golden + CI lane) | 4 |
+| Manifest rows labeled shipped (not a native qualification count) | 4 |
 | Partial (related fixture exists, additive needed) | 2 |
 | Gap (`ft-ruona` non-a11y fixture work) | 11 |
 | Headless-shipped (a11y event-stream + native comparator contract) | 1 (`screen-reader-active` — `ft-0q5zm` / `ft-5pk4h`) |
 | **Total** | **18** |
 
-Source of truth:
+Historical scenario catalog:
 [`tests/renderer_golden/SCENARIOS.md`](../../tests/renderer_golden/SCENARIOS.md).
 The on-disk fixtures live at `tests/golden/gpu/` (path
 consolidation resolved — the bead's reference to
 `tests/renderer_golden/scenarios/` is retired).
+The current native coverage and acceptance authority is
+[`renderer-scenario-contract.md`](../design/renderer-scenario-contract.md),
+which separately records fixture completeness and native capture gaps.
 
-## CI cadence
+## Qualification plan
 
-`.github/workflows/renderer-fuzz.yml`:
+No scheduled native fuzz cadence or completed RQ-S4 run is established by
+this document. Release orchestration belongs to DSR; development Cargo
+commands require strict remote RCH. A software-adapter run qualifies only
+the recorded headless path, not the native GUI or display stack.
 
-- **Trigger:** nightly at 03:00 UTC + manual `workflow_dispatch`.
-- **Runner strategy:** standard GitHub-hosted `ubuntu-24.04`
-  with Mesa llvmpipe (`FT_GPU_HARNESS_FORCE_SOFTWARE=1`).
-  The retired custom GPU label is not used because this repository
-  has no provisioned runner for it, and queue-only jobs are not
-  renderer proof.
-- **Readiness gate:** before any Cargo build, the workflow checks
-  that `crates/frankenterm-gui/tests/gpu_regression.rs` accepts
-  `--fuzz-seed`, `--fuzz-duration`, `--fuzz-start-at`, and
-  `--runs-dir`. If the harness regresses and drops one of those
-  flags, the scheduled run exits with a clear "Renderer fuzz
-  harness not wired" error before spending Cargo time.
-- **Matrix:** 8 fixed seeds + 1 date-derived random
-  (`a5a5a5a5`, `deadbeef`, `cafebabe`, `feedface`, `12345678`,
-  `87654321`, `0badc0de`, `f00dface`, plus `random` derived
-  from `date -u +%s ^ 0xc0ffeebabe`). Manual dispatch can
-  set `seed_override` to run exactly one seed for triage.
-- **Per-seed budget:** 3h (configurable via
-  `workflow_dispatch.duration_secs` input). 9 parallel jobs
-  run within a 24h wall-clock window.
-- **Pass criterion:** zero critical violations across all 9
-  seeds. The workflow fails the run on any critical.
-- **Artifacts:** `runs/` tree uploaded per seed (30-day
-  retention). Aggregated summary posted to the next-day
-  commit status.
+The proposed seed set remains eight fixed seeds (`a5a5a5a5`, `deadbeef`,
+`cafebabe`, `feedface`, `12345678`, `87654321`, `0badc0de`, `f00dface`)
+plus a recorded random seed. Retain each complete `runs/` tree and fail
+qualification on any critical violation. Nine three-hour seed runs do
+not establish a continuous 24-hour native run; the artifact must prove
+the duration and execution scope required by RQ-S4.
 
 ## Reproducer ergonomics
 
@@ -123,8 +112,11 @@ Every failure carries enough state for a triager to land
 directly on the offending event:
 
 ```bash
-cargo test \
-    --release \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
+  rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-renderer-fuzz-repro \
+  cargo test --locked \
+    --profile release-interactive \
     -p frankenterm-gui \
     --test gpu_regression \
     --features headless-render \
@@ -163,7 +155,7 @@ the doctor wires it to a WARN-level message when
 | Non-a11y missing/additive scenario fixtures | ⏳ `ft-ruona`; fuzz CLI wiring does not generate golden fixtures |
 | `screen-reader-active` a11y comparator | ✓ `ft-0q5zm` ships the headless a11y event-stream contract (`ScreenReaderSession` / `screen_reader_active_golden` / `screen_reader_active_violations`, built on `a11y_tree`); `ft-5pk4h` adds the native per-platform comparator result contract (`compare_native_screen_reader_events`) with explicit pass/fail/skipped recorder state |
 | Harness CLI flag wiring (`--fuzz-seed`, `--fuzz-duration`, etc.) | ✓ harness binary parses `FuzzCliFlags`, dispatches to `FuzzStream`, and writes `runs/<run_id>/` artifacts |
-| GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` uses `ubuntu-24.04` llvmpipe preflight before the matrix |
+| DSR native fuzz qualification | Pending retained RQ-S4 evidence; CLI wiring alone does not close this gate |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 | Path consolidation (renderer_golden/scenarios → golden/gpu) | ✓ SCENARIOS.md updated |
 | `dead_code` allow removed in `gpu_regression_fuzz.rs` | ✓ removed after `gpu_regression.rs` wired the caller |
@@ -182,7 +174,7 @@ the doctor wires it to a WARN-level message when
   `tests/renderer_golden/SCENARIOS.md`.
 - **Fuzz-lane spec:**
   `tests/renderer_golden/fuzz/README.md`.
-- **GHA workflow:** `.github/workflows/renderer-fuzz.yml`.
+- **Release orchestration:** DSR only, per `AGENTS.md` Rule 0.1.
 - **SLO:** `docs/perf/resize-quality-slo.md` (RQ-S4).
 - **Attestation cross-link:** `BR-RC-FOUNDATION.G3.1`
   (`ft-syqcz.1`).

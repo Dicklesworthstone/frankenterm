@@ -35,16 +35,19 @@ Model crate: `tests/robot_work_atomicity_model`
 | `crash_auto_release_is_reachable` | `tests/robot_work_atomicity_model/src/lib.rs:161` | Positive reachability check for crash/restart auto-release behavior. |
 | Always-on regression test | `tests/robot_work_atomicity_model/src/lib.rs:179` | Runs BFS through Stateright and asserts all properties. |
 
-## CI Configuration
+## Proof execution
 
-Workflow: `.github/workflows/robot-work-atomicity-model.yml`
-
-The workflow is path-scoped to the model crate, robot work state machine,
-robot contract docs, and Stateright mapping files. It runs:
+Run the model through remotely admitted RCH and retain the source identity,
+state counts, assertions, and command result. DSR owns release-bundle
+orchestration; historical workflow wiring is not current evidence.
 
 ```bash
-cargo test --manifest-path tests/robot_work_atomicity_model/Cargo.toml
-cargo run --manifest-path tests/robot_work_atomicity_model/Cargo.toml
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test --manifest-path tests/robot_work_atomicity_model/Cargo.toml --locked
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo run --manifest-path tests/robot_work_atomicity_model/Cargo.toml --locked
 ```
 
 The release-bundle proof slot is `proofs/robot-work-atomicity.json`.
+The model explores `WorkWorld` transitions. It does not by itself prove
+multi-process SQLite claim atomicity or crash recovery of the production CLI.

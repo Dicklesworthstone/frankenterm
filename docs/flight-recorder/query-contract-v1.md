@@ -52,10 +52,14 @@ Each error includes:
 
 ## Current Mode Support
 
-The unified contract accepts `lexical|semantic|hybrid`, but current `ft search` / `ft robot search` /
-`wa.search` execution is lexical-only. Non-lexical modes fail consistently with
-`search.unsupported_mode` plus hints.
+The storage query path implements lexical, semantic, and hybrid retrieval.
+Production segment appends can populate embeddings using the deterministic
+`fnv1a-hash-128` HashEmbedder; semantic queries compare matching vectors and
+hybrid queries fuse those candidates with lexical results. This hash baseline
+does not establish learned semantic relevance or cross-encoder reranking.
 
-This keeps the contract forward-compatible for `wa-oegrb.6.1/.6.2/.6.3` while preserving
-deterministic behavior today.
-
+Available command modes depend on the artifact's compiled features and
+configuration. The advertised `fastembed`/`cross-encoder` tier strings currently
+do not prove those providers execute. Learned search/orchestrator/reranker
+integration remains tracked by ft-xx5cl, ft-ottca, and ft-vyg9y; use the exact
+artifact's response and retained query evidence for support claims.

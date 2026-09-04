@@ -1,5 +1,12 @@
 # Migration Guide: wezterm.lua to frankenterm.toml
 
+> **Experimental migration design (ft-rxk40).** The scripting package/runtime
+> integration described by this documentation is not connected to production.
+> The examples below are not a validated migration of the running terminal's
+> configuration. Preserve the active configuration and use the current CLI's
+> help/configuration reference; `ft ext` manages pattern packs, not Lua/WASM
+> packages or configuration migration.
+
 FrankenTerm supports multiple config formats. This guide explains how to
 migrate from a WezTerm Lua configuration to FrankenTerm's native TOML
 format.

@@ -1,5 +1,10 @@
 # `with_writer_backend` overhead — bench report (br-ft-7yq2z)
 
+> **Historical measurement.** These numbers and implementation descriptions
+> apply to the recorded bab94d08d-era experiment, not the current writer or
+> a release performance claim. New measurements require retained remote RCH
+> evidence for the exact source and workload.
+
 ## TL;DR
 
 The `with_writer_backend(conn, |backend| { ... })` bridge introduced
@@ -70,13 +75,15 @@ the lockstep migration.
 ## Reproduction
 
 ```bash
-RCH_DISABLE=1 \
-CC=/opt/homebrew/opt/llvm/bin/clang \
-CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-CARGO_TARGET_DIR=/tmp/ft-cc2-target \
-cargo bench --bench writer_bridge_overhead \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-writer-bridge-bench \
+  cargo bench --locked --bench writer_bridge_overhead \
   -p frankenterm-core --no-default-features -- --quick
 ```
+
+Reject local fallback or unavailable workers as blocked proof, as required by
+AGENTS.md. A different worker is a different hardware measurement; it does not
+reproduce the historical Apple Silicon result merely by running this command.
 
 The `--quick` flag runs criterion in fast mode (3-second sample
 window per leg instead of the default 5 seconds × 100 samples) and

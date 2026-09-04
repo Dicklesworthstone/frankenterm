@@ -1,5 +1,10 @@
 # Example: Status Bar (WASM/Rust)
 
+> **Experimental example (ft-rxk40).** This module logs status text; it does not
+> update the running terminal's status bar. Native dispatch and `ft_*` host
+> linking remain unwired, and the pattern-pack `ft ext` command cannot install
+> the proposed `.ftx` package.
+
 A WASM extension that updates the terminal status bar with system
 information on pane focus events.
 
@@ -57,6 +62,7 @@ strip = true
 
 ```rust
 mod ft {
+    #[link(wasm_import_module = "frankenterm")]
     extern "C" {
         pub fn ft_log(level: i32, msg_ptr: *const u8, msg_len: u32);
         pub fn ft_get_env(key_ptr: *const u8, key_len: u32) -> i32;
@@ -122,5 +128,5 @@ cd status-bar
 cargo build --target wasm32-wasip1 --release
 cp target/wasm32-wasip1/release/status_bar_info.wasm main.wasm
 zip status-bar-info.ftx extension.toml main.wasm
-ft ext install status-bar-info.ftx
+# Production installation is unavailable (ft-rxk40).
 ```

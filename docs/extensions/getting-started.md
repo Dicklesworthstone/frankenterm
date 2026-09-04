@@ -1,5 +1,12 @@
 # Getting Started with FrankenTerm Extensions
 
+> **Experimental tutorial (ft-rxk40).** These steps describe the proposed
+> scripting package workflow. FrankenTerm does not currently load `.ftx`
+> packages or dispatch terminal events to this runtime. The existing `ft ext`
+> command installs `.toml`, `.yaml`, and `.json` pattern packs; it has no
+> `enable` or `disable` command. Compilation or packaging is not a product
+> integration test. See `ft ext --help` for the available pattern-pack commands.
+
 This guide walks you through creating, packaging, and installing your first
 FrankenTerm extension.
 
@@ -84,6 +91,7 @@ In `src/lib.rs`:
 
 ```rust
 // FrankenTerm host functions (provided by the runtime)
+#[link(wasm_import_module = "frankenterm")]
 extern "C" {
     fn ft_log(level: i32, msg_ptr: *const u8, msg_len: u32);
 }
@@ -129,27 +137,18 @@ zip hello-world.ftx extension.toml main.wasm
 The `.ftx` format is a standard ZIP archive. The manifest must be at the
 top level (not nested in a subdirectory).
 
-## Step 4: Install
+## Step 4: Installation is not implemented
 
-```bash
-# Install from .ftx file
-ft ext install hello-world.ftx
-
-# Verify installation
-ft ext list
-
-# Enable (extensions are enabled on install by default)
-ft ext enable hello-world
-```
-
-Extensions are installed to:
-- Linux: `$XDG_DATA_HOME/frankenterm/extensions/` (default `~/.local/share/frankenterm/extensions/`)
-- macOS: `~/Library/Application Support/frankenterm/extensions/`
+Keep the package as a development artifact. The current `ft ext install`
+accepts pattern-pack files, not `.ftx`; there is no scripting enable command
+or production scripting installation directory. Integration is tracked by
+ft-rxk40.
 
 ## Step 5: Test
 
-Reload your config (or restart FrankenTerm). You should see the log message
-in the debug output.
+Library tests can exercise the experimental engine. Reloading the running
+terminal does not load this package, and no live event/log result is expected
+until the production loader and host API registration are implemented.
 
 ## Extension lifecycle
 

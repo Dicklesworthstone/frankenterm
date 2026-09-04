@@ -1,6 +1,12 @@
 # `runtime_compat` Surface Contract (`ft-e34d9.10.2.3`)
 
-This document records the contraction policy for `crates/frankenterm-core/src/runtime_compat.rs`.
+This is a **historical contraction record** for `ft-e34d9.10.2.3`.
+`runtime_compat.rs` and its alias have since been removed. The current surface
+is `crates/frankenterm-core/src/runtime_async.rs`; direct Tokio imports and
+dependencies are forbidden by the current runtime doctrine. The old module
+names, allowlists, and `tokio::process::Command` examples below describe that
+past migration slice and must not be copied into current code. Current runtime
+support requires current-source RCH evidence and DSR release evidence.
 The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
 
 ## Keep

@@ -4,14 +4,20 @@
 **Parent epic:** [BR-TERM-EMULATOR-UPLIFT-2.3] / `ft-2okh0.3`
 **Source-of-truth pattern:** Petersen 2005, "Three-State Mailbox"
 
+**Source status (2026-09-04):** this mailbox is a core substrate, not the
+live renderer's snapshot cutover. `LocalPane` still holds the terminal
+lock through visible-row callbacks. Production migration and native
+performance/equivalence proof belong to
+`ft-interactive-systems-performance-4tenz.6.3`.
+
 ## Problem
 
-Today the renderer reads terminal state under a mutex held by the
-input thread. A render that fires while the input thread is
-mid-mutation can observe **partial state** — half-drawn text, a
-cursor position that's already moved, a selection range that hasn't
-finished extending. Visual screenshots show the partial state as
-"glitched cells"; the operator sees flicker during heavy bursts.
+The renderer and input/parser paths share terminal state protected by
+a mutex. Correct use of that mutex prevents simultaneous partial-state
+reads, but holding it through visible-row work can block other users.
+A snapshot migration must preserve coherent text, cursor, selection,
+and generation state while shortening this critical section. A screenshot
+alone cannot attribute an artifact to concurrent mutation under that lock.
 
 Beyond rendering correctness, the same lock blocks robot-mode reads:
 an agent calling `ft robot get-text` competes with the renderer for
@@ -47,12 +53,12 @@ permutation of `{0, 1, 2}`.
 - `TripleBuffer<T: Send + Sync + 'static>` — three `Arc<T>` slots in
   a `[Mutex<Arc<T>>; 3]`, plus an `AtomicU8` packing the four state
   values (writer slot, presented slot, reader slot, dirty flag).
-- `publish(T)` — never blocks; if the previous publish was unread,
+- `publish(T)` — acquires a slot mutex and retries a state CAS; if the previous publish was unread,
   increments `writer_overruns_total` and overwrites the *oldest
   unread* slot. The reader's currently-held slot is untouched.
 - `acquire() -> Arc<T>` — returns a stable `Arc<T>` the renderer
-  holds for the duration of the frame. Two atomic ops + one
-  `Arc::clone`.
+  holds for the duration of the frame. Acquires a slot mutex and may
+  retry a state CAS; it is not a wait-free read.
 - `force_recycle()` — watchdog hook. Forces the reader-slot index
   to recycle to the most recently presented slot, regardless of
   the dirty flag. Counts `force_recycles_total`.
@@ -62,20 +68,23 @@ permutation of `{0, 1, 2}`.
   side-by-side.
 
 The implementation is **safe Rust** (`forbid(unsafe_code)` is in
-core's `lib.rs`). The `Mutex<Arc<T>>` is held only for the duration
-of a single `Arc::clone` or `Arc` swap — nanoseconds; not the
-multi-millisecond contention point the bead's "lock-free reads"
-language is about. The Arc is then held outside the lock for the
-entire frame.
+core's `lib.rs`). The `Mutex<Arc<T>>` protects an `Arc::clone` or
+slot replacement; replacement can also drop the previous payload.
+It can block, and neither its hold time nor payload disposal cost is
+bounded by a nanosecond claim. The returned Arc is held outside that
+lock. Measure the complete publication/acquisition path before making
+native latency claims.
+Payloads used as coherent snapshots must also be immutable: `Arc<T>` and
+`Send + Sync` alone do not prohibit interior mutation by other owners.
 
 ## Failure modes
 
 ### Writer outpaces reader
 
 `writer_overruns_total` counts every publish that overwrote an
-unread slot. The renderer sees stale-by-1-frame data, NOT partial
-data — the slot it holds is whatever was published most recently
-before its `acquire`.
+unread slot. A held Arc remains stable, but the mailbox does not impose
+a wall-clock or one-frame freshness bound. Freshness and scheduling
+require separate integration constraints.
 
 The fixture's `writer_outpaces_reader_thousand_to_one_no_panic`
 test pins this: a writer publishing 1000 values while the reader
@@ -84,10 +93,11 @@ distinct, counter is well-formed.
 
 ### Reader holds slot too long
 
-A render thread that crashes mid-frame leaks the slot it held.
-`force_recycle()` rotates the stuck slot out unconditionally;
+A reader can retain an Arc beyond the intended frame. `force_recycle()`
+rotates the reader-slot index;
 the renderer's previously-held `Arc<T>` is harmless afterwards
-(it just continues to exist as long as the renderer holds it).
+(it continues to exist as long as the renderer holds it). Recycling an
+index cannot reclaim a retained Arc or recover a crashed thread.
 
 The watchdog wiring (the 5-second timeout the parent epic specifies)
 is the integration bead's job; this module exposes the API.
@@ -103,9 +113,10 @@ asserts:
 1. **Slot distinctness.** `(writer, presented, reader)` is always a
    permutation of `(0, 1, 2)`. Proven over 256 random op sequences
    via proptest (`slot_distinctness_holds_under_arbitrary_op_sequences`).
-2. **Snapshot immutability.** A renderer that holds an `Arc<T>` from
-   `acquire` MUST see the same value forever, even if the writer
-   floods publishes (`held_snapshot_is_immutable`).
+2. **Snapshot stability under publication.** With immutable payloads,
+   a renderer holding an `Arc<T>` from `acquire` sees the same value
+   while the writer floods publishes (`held_snapshot_is_immutable`).
+   This fixture does not prove arbitrary interior-mutable `T` is immutable.
 3. **Counter monotonicity.** Counters never decrease across an op,
    and `overruns_total <= publishes_total` at all times
    (`counters_monotonic`).

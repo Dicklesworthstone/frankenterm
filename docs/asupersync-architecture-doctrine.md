@@ -126,6 +126,13 @@ asupersync plus curated Cx-aware adapters
 
 ### 2.2 Primitive Coverage Matrix
 
+**Historical 2026-02-22 migration inventory.** The fallback columns and gaps
+below are not the current runtime surface. `runtime_async.rs` now exports
+asupersync-backed broadcast, oneshot, task, network, process, and signal
+adapters. Current source/dependency gates and retained runtime tests establish
+their support; an old inventory percentage cannot establish cancellation or
+shutdown behavior.
+
 | Primitive | asupersync impl | tokio fallback | Gap status |
 |-----------|:-:|:-:|---|
 | `Mutex<T>` | Y | Y | Complete |
@@ -305,6 +312,12 @@ bash tests/e2e/test_asupersync_migration_scoreboard.sh
 
 ### 5.1 Phase Completion
 
+Sections 5.1–5.3 preserve the same **2026-02-22 baseline**, including the old
+0% structured-concurrency figure and 1,104 Tokio tests. They are not current
+progress scores. Use `runtime_async.rs`, `runtime_proof.rs`,
+`scripts/check_asupersync_test_only.sh`, and retained RCH/DSR evidence for
+current implementation and enforcement status.
+
 | Phase | Description | Status | % Complete | Blocking |
 |:---:|---|---|:---:|---|
 | 0 | Epic framing | Done | 100% | -- |
@@ -386,7 +399,8 @@ These can proceed in parallel with the critical path:
 
 1. **All new async code** must use `runtime_async` imports, never direct tokio.
 2. **All new tests** should use `run_async_test()` pattern, not `#[tokio::test]`.
-3. **Never add `tokio` to a crate's direct dependencies** — use workspace dep.
+3. **Never add `tokio` to a first-party crate's direct dependencies**, including
+   `tokio = { workspace = true }`. Use the project-owned `runtime_async` surface.
 4. **Document Cx threading** in function signatures with `/// # Cx` doc comments.
 5. **Prefer `Outcome<T, E>`** at scope boundaries; `Result<T, E>` within scopes.
 6. **File reservations required** before modifying `runtime_async.rs`.

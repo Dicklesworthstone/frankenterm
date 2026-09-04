@@ -1,5 +1,11 @@
 # Extension Permissions
 
+> **Experimental permission model (ft-rxk40).** These are intended scripting
+> contracts and library controls, not a production extension security boundary.
+> The scripting runtime and its `ft_*` host APIs are not wired into the running
+> terminal. Do not treat this page as proof that arbitrary Lua configuration
+> or separate GUI plugins receive these permissions or audit guarantees.
+
 FrankenTerm extensions run in a sandboxed environment. Each extension
 declares the permissions it needs in `extension.toml`, and the runtime
 enforces those boundaries at every host function call.

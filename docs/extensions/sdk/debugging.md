@@ -1,5 +1,11 @@
 # Debugging Extensions
 
+> **Experimental runtime guidance (ft-rxk40).** The logs, audit records, and
+> extension states below belong to the scripting library's intended lifecycle.
+> Production `ft ext list/info` reports pattern packs, not WASM/Lua runtime
+> state; there is no `ft ext enable` or `.ftx` install path. A standalone
+> Wasmtime run proves only that isolated module's behavior.
+
 ## Log output
 
 Extensions emit logs through the `ft_log` host function (WASM) or
@@ -79,18 +85,18 @@ Common traps:
 Check extension state via the CLI:
 
 ```bash
-# List all extensions with state
+# List installed pattern packs (not scripting runtime state)
 ft ext list
 
 # Show details for one extension
 ft ext info my-ext
 ```
 
-States:
+Proposed scripting states, not output of the current pattern-pack commands:
 
 - **Installed**: On disk, waiting to be loaded
 - **Loaded**: Active and responding to events
-- **Disabled**: User disabled; re-enable with `ft ext enable`
+- **Disabled**: Disabled in the experimental lifecycle model
 - **Error(msg)**: Failed to load; check the error message
 
 ## Testing WASM extensions
@@ -115,26 +121,21 @@ Run with `cargo test` (not `--target wasm32-wasip1`).
 
 ### Integration tests
 
-For full integration testing, install the extension in a test
-FrankenTerm instance:
-
-```bash
-ft ext install my-ext.ftx
-RUST_LOG=debug frankenterm
-# Trigger the event your extension handles
-# Check logs for expected output
-```
+Product integration testing is blocked on ft-rxk40: the terminal has no
+loader for these packages. A future test must drive a real native event,
+observe the WASM/Lua effect, and verify denied permissions and traps preserve
+terminal operation. Engine-only tests cannot substitute for that path.
 
 ### Wasmtime standalone
 
 Test that your WASM module loads correctly:
 
 ```bash
-wasmtime run --invoke on_reload main.wasm 2>&1 || echo "Expected: host function trap"
+wasmtime run --invoke on_reload main.wasm
 ```
 
-This will trap on host function calls (they don't exist outside
-FrankenTerm), but confirms the module structure is valid.
+This command can fail because the custom host imports are absent. Preserve
+the actual error; a trap or failed link is not a passing integration test.
 
 ## Performance profiling
 

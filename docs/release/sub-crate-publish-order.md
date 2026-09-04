@@ -1,21 +1,27 @@
 # Sub-crate publish order (ft-fytns)
 
-The ft-y0loj monolith-split work has shipped 10 sub-crates carved out
-of `frankenterm-core`. They publish in a strict topological order:
+This is the historical ft-y0loj ten-sub-crate inventory. The current tree
+has additional extracted crates, so the hard-coded script and levels below
+are not a complete current release plan. Publication is exclusively through
+DSR; do not run this legacy script as an independent release path.
+The required dependency ordering remains:
 **leaves first, then `frankenterm-core`, then mid-tier sub-crates that
 depend back on it.** Skipping the order causes `cargo publish` to fail
 with "no matching package named X found" because the sub-crate's
 versioned dep on a not-yet-published crate cannot resolve from
 crates.io.
 
-The release script `scripts/publish-sub-crates.sh` emits the commands
-in the right order. This doc is the *why*.
+`scripts/publish-sub-crates.sh --dry-run` prints the historical subset only.
+Reconcile the complete package graph, registry versions, and DSR configuration
+before claiming registry publication is ready. This document records the
+original rationale and the current limitations.
 
 ## Dependency graph
 
-Computed from each `Cargo.toml`'s `[dependencies]` (regular only;
-`[dev-dependencies]` are stripped at publish time and don't constrain
-ordering).
+The historical graph used regular dependencies only. Current packaging must
+also inspect build, target-specific, optional, and retained development
+dependencies. Cargo does not strip all dev-dependencies: versioned dev-deps
+are retained. See the [Cargo dependency reference](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#development-dependencies).
 
 ```
 Level 0 — true leaves (no frankenterm-* deps):
@@ -38,8 +44,8 @@ Level 2 — mid-tier (depend on frankenterm-core ± leaves):
 
 `frankenterm-core` itself dev-depends on the 3 of 4 mid-tier crates
 (ars, replay, tantivy) for its integration tests. Cargo allows dev-dep
-cycles in the workspace; at publish time the `[dev-dependencies]`
-section is omitted, so the cycle does not block publishing.
+cycles in the workspace. That fact alone does not prove package verification
+will resolve the required registry versions or succeed in the release lane.
 
 ## Topological order
 
@@ -70,9 +76,10 @@ with a `version = "x.y.z"` field. The release sequence either:
 
 - adds explicit `version = "..."` fields next to every path dep
   before publishing, **or**
-- relies on `cargo publish`'s implicit version-from-workspace
-  inheritance (works only when the dep crate is already on
-  crates.io at the requested version).
+- inherits an explicitly declared dependency version from
+  `[workspace.dependencies]` via `workspace = true`. Cargo does not infer
+  a publishable dependency requirement merely from the target crate's
+  package version or its presence on crates.io.
 
 Practically: bump every workspace-member version in lockstep, push
 them together, and run the publish script in order. Don't try to
@@ -85,8 +92,8 @@ dependencies are already on crates.io at the matching version.
 # Dry-run (prints the cargo commands but does not execute):
 scripts/publish-sub-crates.sh --dry-run
 
-# Actually publish (requires CARGO_REGISTRY_TOKEN):
-scripts/publish-sub-crates.sh
+# Actual publication: use the configured DSR release path after package
+# graph, version, signing, and registry verification gates are complete.
 ```
 
 The script aborts on the first failure so you can re-run from the
@@ -100,8 +107,9 @@ When ft-y0loj.x lands a new sub-crate:
 1. Add it to `scripts/publish-sub-crates.sh` in its correct
    topological slot (see the levels above).
 2. Update the dependency graph in this doc.
-3. Verify `cargo publish --dry-run -p <new-crate>` succeeds in a
-   fresh checkout before claiming the bead complete.
+3. Verify the package in an admissible DSR/RCH lane using the exact source
+   identity and registry dependency cohort. Do not create another checkout;
+   package verification is not permission to publish.
 
 ## Verification
 

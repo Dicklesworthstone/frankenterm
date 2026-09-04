@@ -1,5 +1,10 @@
 # Rust SDK Quick Start
 
+> **Experimental SDK example (ft-rxk40).** Building a module does not load it
+> into FrankenTerm: the scripting crate has no production consumer, and its
+> WasmEngine does not link the `ft_*` host APIs. The intended host import module
+> is `frankenterm`. Current `ft ext` handles pattern packs, not `.ftx` packages.
+
 This guide covers writing FrankenTerm WASM extensions in Rust using
 direct host function imports. A higher-level SDK crate
 (`frankenterm-extension-sdk`) is planned for a future release.
@@ -35,6 +40,7 @@ strip = true
 ```rust
 // FrankenTerm host function imports
 mod ft {
+    #[link(wasm_import_module = "frankenterm")]
     extern "C" {
         pub fn ft_log(level: i32, msg_ptr: *const u8, msg_len: u32);
         pub fn ft_get_env(key_ptr: *const u8, key_len: u32) -> i32;
@@ -104,7 +110,7 @@ zip my-ext.ftx extension.toml main.wasm
 ### 6. Install
 
 ```bash
-ft ext install my-ext.ftx
+# Package retained for library development; production installation is unavailable.
 ```
 
 ## Testing locally

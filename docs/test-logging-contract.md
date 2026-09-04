@@ -375,29 +375,18 @@ CI MUST fail if any of these conditions are met:
 | Redaction verification failed | 1 | "Unredacted secrets detected in artifacts" |
 | Log contains unredacted secret | 1 | "Secret pattern found in {file}" |
 
-### CI Workflow Steps
+### DSR and RCH execution
 
-```yaml
-jobs:
-  test:
-    steps:
-      - name: Run tests
-        run: cargo test --all-features
+Run Rust checks/tests through remotely admitted RCH, using the feature matrix
+appropriate to the changed surface. Retain source identity, command, executed
+test count, and success/failure transcript. Run admitted E2E scenarios with
+`--verbose --keep-artifacts`, then validate their manifests and redaction
+results with `scripts/validate_artifacts.sh`.
 
-      - name: Run E2E tests
-        run: ./scripts/e2e_test.sh --verbose --keep-artifacts
-
-      - name: Validate artifacts
-        run: ./scripts/validate_artifacts.sh e2e-artifacts/
-
-      - name: Upload artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-artifacts
-          path: e2e-artifacts/
-          retention-days: 7
-```
+DSR is the exclusive release orchestrator. Its configured quality/build/release
+lanes must retain and package the relevant artifact manifests, checksums, and
+receipts on success and failure. GitHub Actions must not be used or inspected.
+This contract does not authorize automatic deletion of retained artifacts.
 
 ### Artifact Validation Script
 

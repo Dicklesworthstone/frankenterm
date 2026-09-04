@@ -28,7 +28,7 @@ also handles display-cell conversion, selection state, and fallback paths:
 ```rust
 use frankenterm_core::a11y_tree::{AccessibilityRecorder, AnnouncePriority};
 use frankenterm_core::smart_selection::{
-    pick_click_target, ClickKind, SmartSelectionA11yMessage,
+    pick_click_target, ClickKind, SelectionMatch, SmartSelectionA11yMessage,
 };
 
 fn handle_mouse_click(
@@ -37,7 +37,7 @@ fn handle_mouse_click(
     click_count: u32,        // 1, 2, 3, ... from debouncer
     ts_ms: u64,              // event timestamp
     recorder: &mut dyn AccessibilityRecorder,
-) -> Option<SelectionSpan> {
+) -> Option<SelectionMatch> {
     // Step 1: classify the click. Pure-logic; pulls from the
     // catalog regex + drop_shell_quoted_supersets pre-filter
     // + classify_click dispatcher.
@@ -51,10 +51,7 @@ fn handle_mouse_click(
     let msg = SmartSelectionA11yMessage::new(pick.kind, selected_text);
     recorder.record(msg.to_announcement_event(ts_ms, AnnouncePriority::Polite));
 
-    Some(SelectionSpan {
-        start: pick.span_start,
-        end: pick.span_end,
-    })
+    Some(pick)
 }
 ```
 
@@ -70,7 +67,6 @@ clicks. The browser-style threshold:
 
 ```rust
 const RAPID_CLICK_WINDOW_MS: u64 = 500;
-const MAX_CLICK_COUNT: u32 = 3; // beyond 3 = PlainFallback
 
 struct ClickAccumulator {
     last_click_ms: u64,
@@ -88,8 +84,9 @@ impl ClickAccumulator {
             <= RAPID_CLICK_WINDOW_MS;
         let same_pos = cell_pos == self.last_click_pos;
         if recent && same_pos {
-            self.consecutive_count =
-                (self.consecutive_count + 1).min(MAX_CLICK_COUNT);
+            // Preserve counts beyond three so ClickKind can choose
+            // PlainFallback; saturate only at the integer limit.
+            self.consecutive_count = self.consecutive_count.saturating_add(1);
         } else {
             self.consecutive_count = 1;
         }
@@ -144,15 +141,19 @@ headless contract fixture, not a native mouse or screen-reader test:
 ```rust
 #[test]
 fn double_click_url_emits_announcement() {
-    use frankenterm_core::a11y_tree::{AccessibilityEvent, ContractRecorder};
+    use frankenterm_core::a11y_tree::{
+        AccessibilityEvent, AccessibilityRecorder, AccessibilityScenario,
+        ContractRecorder,
+    };
     use frankenterm_core::smart_selection::*;
 
     let mut recorder = ContractRecorder::new();
+    recorder.start(AccessibilityScenario::SelectionChange);
     let line = "Visit https://example.com today";
     let click_pos = 15; // mid-URL
     handle_mouse_click(line, click_pos, 2, 0, &mut recorder);
 
-    let events = recorder.snapshot();
+    let events = recorder.finish();
     assert_eq!(events.len(), 1);
     assert!(matches!(
         &events[0],

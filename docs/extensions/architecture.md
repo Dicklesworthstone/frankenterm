@@ -1,5 +1,11 @@
 # Extension Architecture
 
+> **Experimental design, not a shipped scripting platform.** The
+> `frankenterm/scripting` crate has no production consumer (ft-rxk40).
+> The dispatch, storage, sandbox, and `.ftx` lifecycle below describe its
+> library/design surface. Native → WASM → Lua dispatch is not connected to
+> the running terminal. Current `ft ext` manages pattern packs only.
+
 ## Overview
 
 FrankenTerm runs a dual-engine scripting runtime: Lua 5.4 for backward

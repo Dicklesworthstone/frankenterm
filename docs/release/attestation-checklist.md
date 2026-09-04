@@ -9,8 +9,8 @@ file is the focused closer for `BR-RC-ATTESTATION-CLOSURE`
 ## When to run
 
 - **Before** tagging `vX.Y.0`. If the bundle is incomplete,
-  fix the gap before tagging — the CI lane refuses to sign
-  partial bundles.
+  fix the gap before tagging. DSR is the exclusive release orchestrator;
+  a successful development-bundle check is not release qualification.
 - **After** the DSR release path lands the signed bundle —
   re-verify offline as a third party would.
 
@@ -49,9 +49,10 @@ that bead, verify:
   `docs/attestations/proofs/deferred-proof-replay.json`.
 - [ ] Operating-envelope wording changes cite
   `docs/attestations/proofs/operating-envelope.json`, preserve the read-only
-  fail-closed admission scope, and keep target-class production capacity blocked
-  unless `docs/attestations/proofs/resource-cockpit-target-class.json` is
-  non-skipped.
+  admission scope, and keep target-class production capacity blocked
+  until `docs/attestations/proofs/resource-cockpit-target-class.json` is
+  non-skipped, passed, fresh, and authenticated for the exact source/target.
+  The consumer's trust enforcement remains `ft-7h5da.10.4.4`.
 - [ ] The closing comment cites the manifest slot category, artifact path,
   build/verify exit codes, and retained RCH artifact bundle path.
 
@@ -171,6 +172,12 @@ For machine-readable output (DSR quality gates):
 scripts/attestation-verify.sh docs/attestations/0.X.0.json --json
 ```
 
+The current verifier accepts unsigned development bundles and uses a
+bundle-supplied Ed25519 key. That proves self-consistency, not release-owner
+identity. Externally pinned trust and strict release verification are
+unfinished in `ft-xxfwy.49`; do not close release integrity using exit zero
+from this development verifier alone.
+
 The `--strict-required` flag adds: fail if the bundle's
 `required_categories` list doesn't match the canonical
 manifest. Use this in the DSR release gate.
@@ -191,21 +198,21 @@ Actions workflow at any point in this process.
 
 ## Post-tag: third-party offline verification
 
-Anyone (operator, security auditor, downstream packager) can
-verify the published bundle without trusting GitHub:
+An operator can recheck artifact hashes in the existing primary checkout
+at the intended release revision. Preserve dirty files and active sessions;
+do not create a parallel checkout for this procedure:
 
 ```sh
-git clone https://github.com/anthropics/frankenterm /tmp/ft-verify
-cd /tmp/ft-verify
-git checkout v0.X.0
+git rev-parse HEAD    # must match the candidate identity in the receipt
 scripts/attestation-verify.sh docs/attestations/0.X.0.json --strict-required
 ```
 
-Exit code 0 means: every required artifact is present, every
-hash matches, and the signature chains to the expected
-identity. Anything non-zero is a release-integrity failure;
-file a P0 bead and roll back if the bundle is in a public
-release.
+Exit zero establishes the implemented structural/hash checks. It does not
+establish external signing authority, current-source runtime proof, or
+passed target qualification. Finish `ft-xxfwy.49` and retain the configured
+DSR release verification before making those claims. A failed verification
+blocks the candidate; investigate the exact artifact and trust failure
+before deciding on any published-release remediation.
 
 ## Demonstration: missing artifact fails the build
 

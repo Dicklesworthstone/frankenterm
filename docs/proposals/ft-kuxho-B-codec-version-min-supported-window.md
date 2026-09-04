@@ -28,7 +28,15 @@ explicit dual-schema decoder needed for its bootstrap role. This erratum
 supersedes every contrary tail-field claim in the historical design discussion
 below.
 
-## 1. Current invariant
+## Current source boundary (2026-09-04)
+
+The window is implemented in `frankenterm/codec/src/lib.rs` and the native
+client handshake. Read `CODEC_VERSION` and `CODEC_VERSION_MIN_SUPPORTED`
+there for current values. The v46 code and strict-equality analysis below
+are the original proposal baseline, not the running protocol. Negotiated
+wire compatibility does not prove lossless live mux/server replacement.
+
+## 1. Original invariant (before the window implementation)
 
 `frankenterm/codec/src/lib.rs:650`:
 

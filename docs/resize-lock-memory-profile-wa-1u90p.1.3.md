@@ -3,6 +3,14 @@
 Date: 2026-02-14  
 Author: `LavenderCastle`
 
+**Evidence boundary (2026-09-04):** this is a historical simulation and
+watcher/storage telemetry record. Named simulation stages do not measure
+native render or presentation work; storage-lock wait/hold and watcher
+cursor snapshots are not native terminal-lock or GUI memory evidence.
+Retain the original results below within that scope. Native attribution
+requires the current
+[performance campaign](perf/mux-long-session-performance-campaign.md).
+
 ## Scope
 
 Produce lock-contention and memory-attribution evidence for resize/reflow paths, with reproducible artifact pointers feeding:

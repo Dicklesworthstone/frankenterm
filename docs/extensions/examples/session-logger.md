@@ -1,5 +1,10 @@
 # Example: Session Logger (Lua)
 
+> **Experimental example (ft-rxk40).** This illustrates proposed scripting
+> callbacks. No production `.ftx` loader dispatches these events; existing Lua
+> configuration is a separate surface. Current `ft ext` installs pattern packs,
+> not this package, so the example is not a live session/audit logger.
+
 A Lua extension that logs session events (pane create/close, tab
 create/close) to a file for audit or debugging.
 
@@ -62,15 +67,16 @@ function on_tab_event(event, payload)
 end
 ```
 
-## Package and install
+## Experimental package artifact
 
 ```bash
 cd session-logger
 zip -r ../session-logger.ftx extension.toml main.lua
-ft ext install ../session-logger.ftx
+# Production installation is unavailable (ft-rxk40).
 ```
 
-Log output appears at `~/.local/share/frankenterm/logs/session.log`:
+Illustrative output for a future connected logger; this file is not produced
+by installing the package in the current terminal:
 
 ```
 2026-02-13T14:30:01 pane.created pane_id=1

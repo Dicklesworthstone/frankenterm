@@ -1,5 +1,14 @@
 # PLAN_CODEX.md — FrankenTerm (`ft`) — End-to-End System Plan (Codex)
 
+> Historical January design baseline. The product owns its WezTerm-fork mux;
+> a second backend and transitional-boundary architecture are not current
+> goals. Source uses canonical `runtime_async`/asupersync, development Cargo
+> proof requires strict remote RCH, and release work requires DSR only.
+> Treat old API/config/build examples below as design history. Use
+> [AGENTS.md](../../AGENTS.md), the [product journey contract](../design/product-journey-contract.md),
+> and the [current reality-check refresh](../reality-check-bridge-plan-2026-09-01.md#11-september-4-comprehensive-reality-check-refresh)
+> for present behavior, outstanding goals, and accepted execution paths.
+
 *Created:* 2026-01-18  
 *Primary spec:* `wezterm_automata_prompt_je.md` (JE; legacy filename)  
 *Background:* `frankenterm_guide.md`, `wezterm_automation_guide_chatgpt.md`, `wezterm_guide_gemini.md`, `PLAN.md`  

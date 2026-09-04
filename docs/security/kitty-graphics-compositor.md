@@ -4,9 +4,17 @@
 **Status:** Foundation slice shipped — layered-compositor
 placement decision tree + query-response builder + base64
 validator + frame-budget op classification + structured-
-log row + 28 lib tests. Integration follow-on: APC parser
-in escape-parser crate, image-crate decode pipeline, GPU
-atlas upload, asupersync wiring, A11Y tree integration.
+log row + 28 lib tests. These core contracts require separate native
+integration and proof.
+
+**Native source boundary (2026-09-04):** Kitty graphics parsing and
+terminal handling already exist in the native parser and
+`frankenterm/term/src/terminalstate/kitty.rs`. The model's
+`DecodeAsync` enum and layer ordering do not prove off-thread decode,
+budgeted uploads, or final native pixels. Track native image/ligature
+visual coverage through the
+[renderer scenario contract](../design/renderer-scenario-contract.md);
+accessibility delivery requires its own native evidence.
 
 The Kitty graphics protocol substrate already lives at
 `kitty_graphics.rs` (`7b050b6db`, 39 tests) + alt-text at

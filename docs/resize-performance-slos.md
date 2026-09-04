@@ -7,7 +7,16 @@
 **Status:** Candidate v1.1 (numeric contract frozen; refresh calibration now pending live percentile capture from `wa-1u90p.1.3` telemetry surfaces)
 
 This document defines hard SLO targets and release gates for resize/reflow behavior.
-It is the authoritative baseline used by CI, soak, and go/no-go review for the zero-hitch resize program.
+It records the historical zero-hitch program's numeric targets and model
+gates. Its simulation timings do not establish native presentation latency.
+
+**Evidence boundary (2026-09-04):** `Scenario`/MockWezterm stage timings
+measure the simulation harness. Runtime storage-lock and cursor-snapshot
+metrics describe the watcher/storage path, not the native terminal lock or
+GPU/display completion. Native timing and keep decisions use
+[the performance campaign](perf/mux-long-session-performance-campaign.md)
+and [renderer scenario contract](design/renderer-scenario-contract.md).
+The targets below remain goals until those real-path measurements qualify them.
 
 ## Scope
 
@@ -45,7 +54,7 @@ Workload classes map directly to deterministic scenarios in `docs/resize-baselin
 | SLO lane | Implemented source | Access path today | Notes |
 |---|---|---|---|
 | Scenario identity and reproducibility | `Scenario::metadata`, `Scenario::reproducibility_key()` in `crates/frankenterm-core/src/simulation.rs` | `ft simulate validate <scenario>.yaml --json`, `ft simulate run <scenario>.yaml --json` | Stable and machine-readable now |
-| Per-event resize latency | `ResizeTimelineEvent.total_duration_ns` from `execute_all_with_resize_timeline` | Programmatic/test harness using `Scenario::execute_all_with_resize_timeline` | Source of truth for M1 p50/p95/p99 |
+| Per-event simulation latency | `ResizeTimelineEvent.total_duration_ns` from `execute_all_with_resize_timeline` | Programmatic/test harness using `Scenario::execute_all_with_resize_timeline` | Model timing only; not native M1 input-to-presentation p50/p95/p99 |
 | Stage latency and queue attribution | `ResizeTimelineStageSample` + `ResizeQueueMetrics` + `ResizeTimeline::stage_summary()` | Programmatic/test harness | Stage names: `input_intent`, `scheduler_queueing`, `logical_reflow`, `render_prep`, `presentation` |
 | Flamegraph rows for attribution | `ResizeTimeline::flame_samples()` | Programmatic/test harness | Used for hotspot inspection and regression triage |
 | Lock contention and hold-time telemetry | `RuntimeMetrics::{avg,p50,p95,max}_storage_lock_wait_ms`, `storage_lock_contention_events`, `RuntimeMetrics::{avg,p50,p95,max}_storage_lock_hold_ms` in `crates/frankenterm-core/src/runtime.rs` | Runtime health snapshot path (`RuntimeHandle::update_health_snapshot`) | Current warning thresholds: wait `15.0ms`, hold `75.0ms` |

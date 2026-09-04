@@ -1,7 +1,7 @@
 # Staged Recorder Rollout Plan (`wa-oegrb.8.1`)
 
 Date: 2026-02-14  
-Status: Baseline rollout contract for rollout-track execution  
+Status: Proposed rollout contract; configuration model is not implemented as written
 Unblocks: `wa-oegrb.8.2`, `wa-oegrb.8.4`
 
 ## Purpose
@@ -24,7 +24,18 @@ with:
 
 ## Rollout Control Surface
 
-The following keys/controls are the rollout levers for this plan.
+The following table describes the proposed control model, not accepted live TOML
+keys. Current backend selection uses `storage.recorder_backend` in `config.rs`;
+`append_log` and `rusqlite` are implemented, while `frankensqlite` is rejected as
+unavailable. The nested `[recorder]` tables below, including `recorder.enabled`,
+are not the current configuration surface. Do not paste this table's keys into an
+operator configuration or treat a proposed phase as a shipped rollout state.
+
+The phase criteria remain acceptance requirements. Before executing a rollout,
+map each proposed control to an implemented, verified runtime setting and retain
+the exact artifact and configuration used. Recorder segment retention scheduling
+remains open under `ft-y7x56`; a retention library alone does not satisfy the
+governance gate.
 
 | Control | Default | Use in rollout decisions |
 |---|---:|---|
@@ -53,7 +64,7 @@ The following keys/controls are the rollout levers for this plan.
 - none (this is the initial safety posture)
 
 **Exit criteria (go/no-go to Phase 1)**
-1. `wa-oegrb.7.5` validation gates passing in CI/nightly.
+1. `wa-oegrb.7.5` validation gates passing through the required RCH/DSR lanes.
 2. `wa-oegrb.7.6` security/privacy suite passing.
 3. Governance policy (`wa-oegrb.8.3`) accepted and referenced by operators.
 
@@ -96,7 +107,7 @@ The following keys/controls are the rollout levers for this plan.
 3. Alert routing and ownership confirmed.
 
 **Exit criteria (go/no-go to Phase 3)**
-1. CI/nightly gates keep passing throughout canary period.
+1. RCH/DSR gates keep passing throughout canary period.
 2. Recovery drill playbooks remain executable without manual invention.
 3. Query quality/latency remains within approved canary budget envelope
    (lexical is always available as safe fallback).
@@ -137,11 +148,12 @@ At any phase, stop rollout progression and rollback if any of the following occu
 
 ## Rollback Procedure (operator-fast path)
 
-1. Set safe config posture:
-   - `recorder.enabled=false` (or previous known-good phase posture)
-   - keep lexical as default query mode
-   - ensure semantic fallback remains `lexical_only`
-2. Restart relevant runtime components (`ft stop`, then `ft watch` / service restart).
+1. Stop the watch daemon with `ft stop` if capture must cease. The proposed
+   `recorder.enabled=false` flag is not an implemented shutdown control.
+2. Restore the previously verified configuration and artifact. Keep lexical search
+   available, and verify any semantic fallback against the actual configuration
+   schema. Restart with `ft watch` or the deployment's service manager only after
+   confirming that the restored posture meets the rollback criteria.
 3. Verify:
    - health/status checks green
    - no fresh critical recorder/audit alerts

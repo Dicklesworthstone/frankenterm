@@ -122,10 +122,11 @@ High-tier panes take the remaining slots first. Unused high-tier capacity spills
 back to the low tier. The selected count is debited from the per-second capture
 budget immediately.
 
-Important limitation: the floor protects the low tier as a whole. It does not
-guarantee equal service across distinct low priority values such as `100` and
-`200`. Equal-priority groups have round-robin protection; different priority
-values still obey numeric priority order.
+The reserved low-tier floor rotates across ready low-priority subtiers, so
+distinct values such as `100` and `200` eventually receive floor service under
+sustained high-priority pressure. This is starvation protection, not a promise
+of equal total service: spillover and single-slot admission retain priority
+semantics. The earlier no-subtier-rotation limitation predates this behavior.
 
 ### Budgets
 
@@ -173,9 +174,12 @@ The current scheduler snapshot exposes:
 - `total_throttle_events`
 - `tracked_panes`
 
-It does not expose per-pane capture lag, skipped-poll reasons, selected/skipped
-counts, starvation warnings, or tier-level fairness counters. Those missing
-fields are the scope of `ft-n447z.3`.
+That budget snapshot is not the whole telemetry surface. `tailer.rs` also
+publishes per-pane `selected_count`, `skipped_count`, lag/reason data, and
+`starvation_warning`, plus tier summaries. The earlier absent-telemetry
+inventory predates those additions. Their existence does not prove live
+50/200-pane fairness; retain the scheduled/observed service evidence required
+by the SLO and target-hardware gates below.
 
 ## SLO Names
 

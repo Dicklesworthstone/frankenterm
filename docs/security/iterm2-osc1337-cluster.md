@@ -10,6 +10,13 @@ rollout staging + audit doc + 29 tests all live; production
 GUI modal + VHS-captured fixtures + parser audit + SetColors
 dispatch are integration follow-ons.
 
+**Native source boundary (2026-09-04):** the terminal performer emits
+`SetProfileRequested`, and the GUI currently ignores that alert. No native
+confirmation modal or profile allowlist consumer is established here.
+The palette, multipart, and rollout tables below describe core models;
+their checked states do not prove native parser-to-renderer behavior or
+captured visual fixtures.
+
 ## Why this matters
 
 iTerm2's `OSC 1337` extension covers a cluster of in-band
@@ -85,9 +92,8 @@ snapshot's `is_safe()` predicate enforces that
 | `setprofile` | Recorded profile-switch attempt; exercises the security gate |
 | `setcolors` | Palette mutation sequence |
 
-Each fixture's bytes get captured via VHS once a Linux GPU CI
-runner is provisioned; the contract layer is the slot they
-fill.
+These are planned corpus slots. Native capture and DSR qualification are
+pending; the descriptor paths do not establish that fixture bytes exist.
 
 ## SetColors privileged-slot rule
 
@@ -105,7 +111,7 @@ break rendering).
 | 29 lib tests | every transition + serde + cap behavior + allowlist + rollout + corpus + privileged slots |
 | `multipart_random_schedule_sweep_no_invariant_violations` | 1024 trials × 16 ops = ~16k ops; asserts state unchanged on every Denial |
 
-## Bead acceptance status
+## Foundation-model acceptance status
 
 | Item | Status |
 |---|---|
@@ -113,7 +119,7 @@ break rendering).
 | File argument matrix completeness audit | ✓ `ItermFileArgument` typed envelope + `is_fully_audited()` predicate; parser audit per-fixture is integration follow-on |
 | SetColors palette mutation | ✓ `SetColorsPaletteEntry` + `is_privileged_slot()` predicate; dispatch wiring is integration follow-on |
 | MultipartFile chunking | ✓ `MultipartFileAccumulator` with 4-reason denial taxonomy + 1024-trial sweep |
-| Conformance corpus | ✓ types + paths shipped; VHS-captured fixtures land on GPU runner |
+| Conformance corpus | Types + path descriptors exist; native captured fixtures remain pending |
 | Feature-flag rollout staging | ✓ `RolloutPhase` enum (AlwaysDeny / PromptEachTime / RememberPerName) |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 

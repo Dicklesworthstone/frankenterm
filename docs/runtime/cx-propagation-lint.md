@@ -129,7 +129,7 @@ under ft-53zsr:
   any drift. Regression test at
   `crates/frankenterm-core/tests/cx_propagation_lockstep_guard.rs`
   shells out to the script and fails the build on drift.
-- `ft-t9a6q.1.cont.ci` (**ft-s2034, closed**): PR-CI YAML
+- `ft-t9a6q.1.cont.ci` (**ft-s2034, closed**): historical PR-CI YAML
   wiring. Landed in two passes per the parent epic's
   warning-then-error cadence:
   1. **Warning mode** at commit `2fdc207a1`: step "Run
@@ -142,14 +142,16 @@ under ft-53zsr:
      `totals.uncovered_sites=0`: `continue-on-error: true`
      removed, step renamed to "Run cx-propagation lint
      (br-ft-s2034)". A reintroduced uncovered `pub async fn`
-     now fails the `cargo-guards` lane on PRs + pushes to
+     then failed the `cargo-guards` lane on PRs + pushes to
      main with a `path:line: reason` line per finding.
   The Python audit at the `shell-guards` job
   (`cx_propagation_burndown.py --check`, br-ft-gsgll) enforces
   the same invariant via regex heuristics; both gates run, and
   the lockstep guard (ft-jbsbx) keeps the two allowlists in
-  sync. Together they cover a strictly wider regression class
-  than either alone.
+  sync. This describes the former integration, not a currently supported
+  proof lane. FrankenTerm's release gates run through configured DSR quality;
+  Rust analyzer/test commands run through remotely admitted RCH. Do not
+  inspect or execute GitHub Actions for this project.
 
 ### Lockstep guard usage
 
@@ -170,10 +172,11 @@ analyzer) must agree on every entry. Adding a new exemption
 requires updating both files in the same commit; the lockstep
 guard catches the case where one half lands without the other.
 
-## Running locally
+## Running through RCH
 
 ```bash
-cargo run -p cx_propagation_lint -- crates/frankenterm-core/src
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo run -p cx_propagation_lint --locked -- crates/frankenterm-core/src
 ```
 
 Exit code 0 = clean. Exit code 1 = at least one finding. Exit
@@ -182,7 +185,8 @@ code 2 = analyzer failure (bad path, walk error).
 JSON output:
 
 ```bash
-cargo run -p cx_propagation_lint -- --json crates/frankenterm-core/src
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo run -p cx_propagation_lint --locked -- --json crates/frankenterm-core/src
 ```
 
 Shape:
@@ -212,7 +216,8 @@ not require rustc-private crates. Build the loadable library with the
 lint crate's pinned nightly:
 
 ```bash
-cargo build -p cx_propagation_lint --lib --features dylint
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo build -p cx_propagation_lint --lib --features dylint --locked
 ```
 
 Once `cargo-dylint` and `dylint-link` are available on the host, the
@@ -221,7 +226,8 @@ the generated cdylib. The expected lint name is `cx_propagation`.
 The stable analyzer remains the count oracle:
 
 ```bash
-cargo run -p cx_propagation_lint -- --json crates/frankenterm-core/src
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo run -p cx_propagation_lint --locked -- --json crates/frankenterm-core/src
 ```
 
 ## Cross-references

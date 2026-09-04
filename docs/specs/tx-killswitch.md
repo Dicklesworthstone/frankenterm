@@ -10,8 +10,9 @@ proptest fuzz.
 Mission/TX is the most dangerous code in ft — multi-pane
 mutations with prepare/commit/compensate. A bug here is
 user-visible damage to other AI agents being orchestrated. The
-README claims *"kill switches and pause controls provide
-emergency intervention."* This bead proves it.
+README describes kill switches and pause controls as emergency intervention.
+This bead proves bounded model properties; production intervention requires
+separate live dispatch, cancellation, persistence, and no-further-effect proof.
 
 ## Proof artifacts
 
@@ -52,8 +53,8 @@ Reachable transitions:
 `kill_switch == HardStop`, all forward-progress actions
 (`Plan`, `Prepare`, `BeginCommit`, `CommitStep`) are disabled;
 recovery actions (`BeginCompensate`, `CompensateStep`,
-`FinishCompensate`, `RollBack`) remain enabled so HardStop
-correctly **drains** the system to a terminal state.
+`FinishCompensate`, `RollBack`) remain enabled where their state preconditions
+hold. That alone does not prove every state drains with HardStop held fixed.
 
 ## Safety invariants (proven)
 
@@ -82,12 +83,12 @@ case: commit fails before any step commits).
 Every step id in `committed_steps ∪ compensated_steps` is
 in `0..step_count`.
 
-## Liveness invariants (proven)
+## Model reachability and liveness limits
 
 ### HardStopAdmitsProgress
 
 > From every reachable state with `kill_switch = HardStop`,
-> there exists a finite path to a drained state.
+> the harness admits recovery progress, including a path that disarms the switch.
 
 Drained = `tx_state ∈ {Committed, Failed, Compensated, RolledBack}`.
 
@@ -96,6 +97,11 @@ Verified by the harness's
 test: walks every reachable state, asserts every one with
 `HardStop` either is drained, or has at least one enabled
 non-flip action that progresses, or admits a flip-back-to-Off.
+Because the test permits flipping back to Off, it is not a proof of drainage
+while HardStop remains armed. Production acceptance must hold the tier fixed,
+stop further forward effects, and observe cancellation/recovery completion.
+The startup-restored operator switch has a separate live refresh/fencing gap
+tracked in `ft-xxfwy.42`.
 
 ### tx-state acyclicity (in projection)
 
@@ -141,10 +147,11 @@ state set.
 | TLC model check | 2 | 258 states / 87 distinct states | <120s budget | 0 invariant violations, 0 deadlocks |
 | Adversarial recovery | 2 | random + flip-Off + greedy | <100ms | Always reaches drained within 100 steps |
 
-Local runs keep the deterministic random corpus at 1000
-schedules. CI sets `FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000`
-in the `formal-methods` workflow job, so the release gate
-executes the bead's explicit ≥1M random schedules per CI run.
+The default deterministic random corpus contains 1000 schedules. The larger
+lane requires an explicit `FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000` run
+through RCH, retained with its source identity and executed schedule count.
+DSR owns release orchestration. The historical run table above is not evidence
+that the million-schedule lane ran for a current release.
 
 ## Bead acceptance status
 
@@ -152,7 +159,7 @@ executes the bead's explicit ≥1M random schedules per CI run.
 |---|---|
 | TLA+ spec at docs/specs/tx-killswitch.tla | ✓ |
 | Stateright-shape harness at crates/frankenterm-core/tests/tx_killswitch_model.rs | ✓ (hand-rolled BFS — same shape Stateright would produce) |
-| Property test ≥1M random schedules per CI run | ✓ via `.github/workflows/ci.yml` `formal-methods` job |
+| Property test ≥1M random schedules per release proof | Requires retained current-source RCH execution and DSR bundle receipt; historical workflow wiring is insufficient. |
 | Attestation entry shipped | ✓ `docs/attestations/proofs/tx-killswitch.json` under required `proofs/tx-killswitch` |
 | TLC checks safety + liveness | ✓ `scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla` |
 | Stateright-in-Rust drives actual tx_execution.rs | ⏳ requires the production engine to be exercised; this bead's Stateright-shape harness drives the model. The integration bead links the harness to the real engine. |
@@ -180,14 +187,13 @@ executes the bead's explicit ≥1M random schedules per CI run.
 
 ```bash
 # Exhaustive BFS + proptest fuzz.
-CARGO_TARGET_DIR=/tmp/ft-pane3-target \
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-cargo test -p frankenterm-core --test tx_killswitch_model \
-    --features asupersync-runtime --no-default-features
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --test tx_killswitch_model --locked
 
 # CI-grade deterministic random corpus.
-FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000 \
-cargo test -p frankenterm-core --test tx_killswitch_model \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000 \
+  cargo test -p frankenterm-core --test tx_killswitch_model --locked \
     random_schedule_never_violates_safety_invariants -- --nocapture
 
 # TLA+ TLC.

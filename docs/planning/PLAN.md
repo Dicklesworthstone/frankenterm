@@ -1,5 +1,16 @@
 # FrankenTerm (ft) — Master Implementation Plan
 
+> Historical design baseline. Read this document for the original product
+> goals, not as current implementation or executable setup instructions.
+> The owned WezTerm-fork mux, canonical `runtime_async`/asupersync surface,
+> strict remote RCH development proof, and DSR-only releases supersede the
+> transitional backend, Tokio, local-Cargo and workflow examples below.
+> Current obligations are in [AGENTS.md](../../AGENTS.md), the
+> [product journey contract](../design/product-journey-contract.md), and the
+> [September reality-check refresh](../reality-check-bridge-plan-2026-09-01.md#11-september-4-comprehensive-reality-check-refresh).
+> Historical goals remain in the vision inventory until explicitly resolved
+> or rejected; this note does not silently discard them.
+
 > **Vision**: Build the central nervous system for AI coding agent fleets—a tool so robust, intelligent, and ergonomic that it enables supersmart swarms of AI agents to coordinate seamlessly and solve humanity's hardest problems.
 
 > **One-sentence mission**: Build ft into a high-reliability, swarm-native terminal platform for agent fleets: *observe everything, understand key events, act safely and reliably, and expose a machine-optimized control surface for agents.*

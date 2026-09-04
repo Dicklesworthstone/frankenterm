@@ -268,8 +268,10 @@ These fields are explicitly excluded from equivalence checking.
 
 **Important:** Excluding timestamps from comparison does NOT mean timestamps
 are irrelevant. The `RecorderMergeKey` uses `recorded_at_ms` as its
-primary sort key. But the ordering itself (verified via merge key comparison)
-is what matters, not the absolute timestamp values.
+primary sort key. Verify the resulting ordered event identities as specified
+in §8.3; do not require equality of the timestamp component of each merge key.
+Optional timestamp-drift warning/failure thresholds are a separate check and
+must not be bypassed or converted into an exact timestamp-equality rule.
 
 ---
 
@@ -358,17 +360,27 @@ Given two event sequences `A` and `B`, merge order equivalence holds if
 and only if:
 
 ```
+len(A) == len(B)
 for all i in 0..len(A):
-    merge_key(A[i]) == merge_key(B[i])
+    ordered_identity(A[i]) == ordered_identity(B[i])
+
+ordered_identity(e) = (e.pane_id, e.stream_kind, e.sequence, e.event_id)
 ```
 
-If `merge_key(A[i]) != merge_key(B[i])` for any `i`, the sequences have
-diverged at position `i`. The divergence report must include:
+Each sequence is sorted by its own complete merge keys before comparison.
+Different timestamps that preserve the same ordered identities do not create
+an order divergence. If identities differ at any position, the sequences have
+diverged there. The report must include:
 
 - Position `i`
 - Both merge keys
 - Both event payloads
 - The last matching position `i-1` (for context)
+
+Conformance requires a uniform timestamp shift within the configured drift
+budget to pass with identities/payloads preserved. An order-changing shift,
+identity change, or broken causality edge must fail. This reconciles the
+normative algorithm; it is not a claim of current production-comparator proof.
 
 ---
 
@@ -396,10 +408,13 @@ function compare(baseline, replay, config) -> EquivalenceReport:
         b = baseline[i]
         r = replay[i]
 
-        // Phase 2: Merge key check
-        if merge_key(b) != merge_key(r):
+        // Phase 2: Resulting order, excluding timestamp equality
+        if ordered_identity(b) != ordered_identity(r):
             divergences.push(MergeOrderDivergence(i, b, r))
             continue  // remaining comparisons meaningless for this pair
+
+        // Separate optional timing guard; use the configured drift budget.
+        compare_timestamp_drift(b, r, config, divergences)
 
         // Phase 3: Exact field check
         for field in EXACT_FIELDS:

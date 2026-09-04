@@ -46,28 +46,30 @@ Plus the existing lock-free / SPSC ring tests:
 | Lock-free counters | `crates/frankenterm-core/tests/loom_lockfree.rs` |
 | SPSC ring buffer | `crates/frankenterm-core/tests/loom_spsc_ring_buffer.rs` |
 
-**Skeleton vs proof:** the files above establish the structural test
-form and exercise a single happy-path interleaving. They are *not*
-exhaustive — that is the deliverable of `ft-syqcz.7` (G8.2), which adds
-the full schedule enumeration and a Mazurkiewicz-trace doc.
+**Contract model vs production proof:** the original `ft-syqcz.6` skeletons
+have been expanded. For example, `loom_mpsc.rs` directly uses Loom primitives
+and `loom::model` to enumerate model schedules. This explores the encoded
+contract within its configured bounds; it does not instrument the production
+asupersync implementation or establish every production cancellation behavior.
 
-## Running Loom tests locally
+## Running Loom tests through RCH
 
-Loom tests *compile* unconditionally because the dev-dep is always
-present, but Loom only performs schedule enumeration when built with the
-`loom` cfg flag:
+The contract tests directly call `loom::model`; they do not require
+`--cfg loom` to switch from ordinary primitives into schedule exploration.
+Use the test's actual model bounds and retain the executed test count.
 
 ```bash
-# Run a single Loom skeleton with full model-checking
-RUSTFLAGS="--cfg loom" cargo test -p frankenterm-core --test loom_mpsc
+# Run the mpsc contract models.
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --test loom_mpsc --locked
 
-# Run every Loom skeleton
-RUSTFLAGS="--cfg loom" cargo test -p frankenterm-core --test 'loom_*'
+# Run all matching Loom test targets; retain each executed target/result.
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --test 'loom_*' --locked
 ```
 
-Without `--cfg loom`, the same tests still run but with std-shaped
-semantics. They serve as a quick smoke test of the model itself rather
-than a concurrency proof.
+No cfg flag can turn a contract model into proof of an uninstrumented
+production primitive.
 
 ### Tuning the explorer
 
@@ -80,32 +82,28 @@ Loom respects two environment knobs that matter for our suite:
 - `LOOM_CHECKPOINT_FILE=…/checkpoint` — saves the failed schedule for
   reproduction; rerun with the same env var to replay.
 
-A pragmatic local invocation:
+A bounded remote invocation:
 
 ```bash
-LOOM_LOG=1 \
-LOOM_MAX_BRANCHES=4000 \
-RUSTFLAGS="--cfg loom" \
-cargo test -p frankenterm-core --test loom_mpsc -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env LOOM_LOG=1 LOOM_MAX_BRANCHES=4000 \
+  cargo test -p frankenterm-core --test loom_mpsc --locked -- --nocapture
 ```
 
-## CI lane
+## DSR and RCH proof lanes
 
-Wired in `ft-93mra`:
+The former scheduled wiring under `ft-93mra` is historical. Current model
+execution requires remote RCH admission; DSR exclusively owns release
+orchestration and retained release evidence. No nightly scheduler is asserted
+here. Set explicit model budgets and retain timeout or incomplete-exploration
+results as such.
 
-- `.github/workflows/loom.yml` runs the Loom skeletons nightly (07:23
-  UTC) under `RUSTFLAGS="--cfg loom"`, plus on PRs that touch the
-  primitive surface or the workflow itself. Each skeleton runs as its
-  own `cargo test --test loom_<primitive>` step so a failure points at
-  exactly one primitive. Loom branch and duration budgets are bounded by
-  workflow env (`LOOM_MAX_BRANCHES=4000`, `LOOM_MAX_DURATION_SECS=1500`)
-  so a runaway model can't burn the whole 30-minute job budget.
 - `scripts/check_loom_skeleton_coverage.sh` is the seal-on-add gate.
   It maintains a manifest of `(primitive, skeleton file)` pairs and
   fails CI if a new `pub struct`/`pub mod` primitive lands in
   `runtime_async.rs` without an accompanying skeleton row. The script
-  runs in the standard CI lint job (`ci.yml`) and as a `needs:`
-  prerequisite of the nightly Loom lane in `loom.yml`. Update the
+  belongs in the configured DSR static quality gates. Verify its actual
+  entry in `scripts/release-gates.sh` before claiming it ran. Update the
   manifest in the same commit that adds (or removes / renames) a
   primitive.
 

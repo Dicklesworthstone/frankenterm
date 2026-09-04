@@ -2,7 +2,7 @@
 
 Operator-facing playbook for running atlases through the
 three-tier (VRAM / HostRam / Disk) cascade. Assembles every
-substrate piece + tooling into a single runtime workflow. Pairs
+substrate piece + tooling into a proposed runtime workflow. Pairs
 with the existing surfaces:
 
 - [`atlas-tiered-swap-wgpu-integration.md`][wgpu] — cc_1's
@@ -13,6 +13,14 @@ with the existing surfaces:
 
 [wgpu]: ./atlas-tiered-swap-wgpu-integration.md
 [storage]: ../storage/backend-migration-guide.md
+
+**Source status (2026-09-04):** these queues, budget decisions, and doctor
+models do not establish a live three-tier renderer. The reviewed production
+paths do not consume `DiskTierHandoffQueue`; the actual cold-tier driver,
+bounded I/O, ownership/disposition, and allocation proof remain under
+`ft-interactive-systems-performance-4tenz.8.8.3`. Treat the loops below as
+integration sketches. The target-class resource artifact remains
+`skipped_not_proven`; no capacity or hardware-budget claim follows here.
 
 ## What's in scope
 
@@ -104,8 +112,8 @@ operator workflow when a row turns Warn or Fail:
 
 | Status | Trigger | Operator action |
 |--------|---------|-----------------|
-| Warn   | pressure_pct > 75 (either tier) OR > 64 swap-out events | Increase host RAM budget if available; raise blit budget for one frame; investigate fragmentation. |
-| Warn   | swap-out > 64 events | Probable demote loop. Check if the eviction policy is misconfigured (oversized atlas vs available VRAM). |
+| Warn   | pressure_pct > 75 (either tier) OR observation-window swap-out delta > 64 | Investigate pressure and fragmentation before changing a measured hardware budget. |
+| Warn   | observation-window swap-out delta > 64 | Possible demote loop. Check the eviction policy and atlas size against available VRAM. |
 | Fail   | any disk_eviction_count > 0 | Cache lost a region — either raise the host RAM budget or accept the redraw cost. The tiered-swap policy already prefers HostRam over Disk on bandwidth-starved buses. |
 | Fail   | pressure_pct > 95 (either tier) | Imminent OOM. Scale atlas tile size down or reduce the active glyph corpus. |
 
@@ -113,6 +121,9 @@ The thresholds live in
 `atlas_tier_doctor::TierSwapDoctorRow::status`'s constants and
 can be tuned per deployment. The status enum is consumed by the
 CLI translator at `crates/frankenterm/src/main.rs::Commands::Doctor`.
+`swap_out_delta()` subtracts the prior observation's total with saturation;
+without a prior snapshot it returns zero. Lifetime swap-out totals alone
+do not trigger the churn warning.
 
 ## Bandwidth-starved deployments
 

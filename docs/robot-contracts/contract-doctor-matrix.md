@@ -79,12 +79,16 @@ apply to this surface · `R`/`M` = read / mutation.
 
 ## GAP SUMMARY (what the join exposes — the Doctor's real value)
 
-### G1 — Policy-denial **audit-row** wiring incomplete on mutations (highest value)
-The policy **gate** returns `MCP_ERR_POLICY` on Deny everywhere, but the
-`policy_denied_audit` row is missing/partial (`docs/security/policy-denial-audit-wiring-matrix.md`, `ft-6mmyp`):
-- `~` (gate ok, no audit row): `tx-run`, `tx-rollback`, `reserve`, `release`, `accounts-refresh`.
-- `~` (audits to a *different* table on success, deny path unaudited): `send-text`, `workflow-run`.
-- `GAP` (not in the matrix at all — verify gating + audit): `events-mutate`, `workflow-abort`, `agent-configure`, `agent-subspace-rpc`, `approve`.
+### G1 — Verify durable denial coverage against current dispatch
+The shared synchronous and asynchronous MCP authorization helpers now attempt
+`policy_denied_audit` persistence. `PolicyGatedInjector` records denied as well
+as successful sends in `audit_actions`. The original table's `~` entries for
+missing writes are historical, not current source findings; see the updated
+[wiring matrix](../security/policy-denial-audit-wiring-matrix.md).
+Audit writes are best effort. Per-tool denial/approval tests and unavailable
+storage tests must distinguish an enforced denial from a durable audit receipt.
+Enumerate direct gates and both shared helpers so the oracle covers every
+registered mutation, including tools absent from `ApiSurface::ALL`.
 
 ### G2 — Robot↔MCP **parity** has no dedicated assertion for several MCP twins
 Dedicated `*_mcp_conformance` proofs exist for core(get-text/send/state/search),
@@ -93,12 +97,12 @@ exists but relies on shared schema with **no dedicated parity test**:
 `workflow-run/list/status/abort`, `rules-lint`, `accounts-list/refresh`, `why`,
 `approve`, `dom`, `agent-subspace-rpc`.
 
-### G3 — `dom` redaction not in the read-path matrix (tracked: `ft-5puf0`)
-`wa.dom` returns OSC-133 semantic zones that can carry pane-sourced text, but
-`dom` is absent from `docs/security/read-path-redaction-matrix.md`. Confirm the
-dom handler runs zone text through `Redactor::redact`, then add the row (or fix).
-Filed as **`ft-5puf0`** (security) — a read surface serving unredacted pane
-content would be a fail-closed redaction violation.
+### G3 — Retain DOM redaction regression evidence
+Both CLI DOM and `wa.dom` are included in
+`docs/security/read-path-redaction-matrix.md`; the former missing-row finding
+under `ft-5puf0` is stale. Keep planted-secret tests for semantic-zone text and
+the actual handler response. A coverage-table entry alone does not establish
+that every returned field was redacted.
 
 ### G4 — Registry completeness: policy-gated MCP mutations absent from `ApiSurface::ALL`
 `wa.mission_pause` / `wa.mission_resume` / `wa.mission_abort` are policy-gated

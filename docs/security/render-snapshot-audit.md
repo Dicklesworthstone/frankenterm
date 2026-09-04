@@ -8,6 +8,14 @@ tests. Integration follow-on: paint.rs editing, actual
 `Instant::now()` probe insertion, E2E heavy-burst test,
 visual-regression test.
 
+**Native source boundary (2026-09-04):** the registry below validates
+declared call-site classifications; it does not inspect or replace the
+live renderer's lock scope. `render/pane.rs` still calls
+`with_lines_mut_and_apply_hyperlinks`, and `LocalPane` holds the terminal
+guard through visible-row work. The actual short-lock snapshot cutover,
+coherence bounds, and native causal A/B proof remain under
+`ft-interactive-systems-performance-4tenz.6.3`.
+
 The render-snapshot substrate already lives at
 `render_snapshot_guard.rs` (`25e095d10`, 31 tests). This
 module ships the **integration substrate** the bead's
