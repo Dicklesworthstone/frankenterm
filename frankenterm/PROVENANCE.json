@@ -131,19 +131,19 @@
       "classification_summary": {
         "docs": 1,
         "feat": 2,
-        "fix": 2,
+        "fix": 3,
         "other": 1,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 15,
+      "fork_side_commit_count": 16,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-07-16T15:25:19-04:00",
-        "sha": "a219e050e95767a97f1b6665032ac55557de34bf",
-        "subject": "refactor(char-props): emit WCWIDTH_TABLE as `static` instead of `const`"
+        "classification": "fix",
+        "committed_at": "2026-09-04T06:21:46-04:00",
+        "sha": "15ed015f97f46c905ffbe3cb29c7fcc1e761f06e",
+        "subject": "fix(char-props): restore generated PHF compatibility"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -1058,8 +1058,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2378,
-  "generated_at": "2026-09-04T07:45:26.877119Z",
+  "fork_side_commit_total": 2379,
+  "generated_at": "2026-09-04T10:22:09.230071Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
