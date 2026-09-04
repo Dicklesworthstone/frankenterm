@@ -3,11 +3,12 @@
 # from the SAME build, no GUI. Proves discover -> attach -> list -> send ->
 # observe -> detect on one machine and writes a JSON receipt plus a log.
 #
-# This is a dev signal, not a release gate by itself: it runs whatever binaries
-# you point it at. It exists because the first time it was run (2026-09-02) it
-# found that every client connect aborted the mux server (fixed in 647d87fd6),
-# so run it after touching mux-server-impl/local.rs, promise/spawn.rs, the
-# vendored streaming client, or the pattern engine.
+# This is a release gate only when DSR invokes it on the native macOS binaries
+# from the exact release build. A standalone invocation remains a dev signal:
+# it runs whatever binaries you point it at. It exists because the first run
+# (2026-09-02) found that every client connect aborted the mux server (fixed in
+# 647d87fd6), so run it after touching mux-server-impl/local.rs,
+# promise/spawn.rs, the vendored streaming client, or the pattern engine.
 #
 # Usage:
 #   scripts/smoke/headless-mux-observe.sh [BIN_DIR] [OUT_DIR]
@@ -15,7 +16,7 @@
 #   OUT_DIR defaults to a fresh mktemp dir; receives receipt.json and smoke.log.
 #
 # Receipt schema (ft.smoke.headless-mux-observe.v1): generated_at, host, commit,
-# cli_version, mux_version, bin_dir, status (pass|fail), steps[] of
+# codec_version, cli_version, mux_version, bin_dir, status (pass|fail), steps[] of
 # {name, status (pass|fail), detail}. A receipt is `pass` only when every step
 # passed; there is no skipped state.
 #
@@ -32,6 +33,18 @@ MUX="$BIN_DIR/frankenterm-mux-server"
 for bin in "$FT" "$MUX"; do
   [ -x "$bin" ] || { echo "missing binary: $bin" >&2; exit 2; }
 done
+
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd -P) || exit 2
+RELEASE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null) || {
+  echo "cannot bind smoke receipt to a release commit" >&2
+  exit 2
+}
+CODEC_VERSION=$(sed -nE \
+  's/^pub const CODEC_VERSION: usize = ([0-9]+);$/\1/p' \
+  "$REPO_ROOT/frankenterm/codec/src/lib.rs")
+case "$CODEC_VERSION" in
+  ''|*[!0-9]*) echo "cannot bind smoke receipt to one codec version" >&2; exit 2 ;;
+esac
 
 SOCK="${SOCK:-$HOME/.local/share/frankenterm/sock}"
 if [ -S "$SOCK" ] && lsof -U 2>/dev/null | grep -q -- "$SOCK"; then
@@ -75,6 +88,7 @@ stop_children() {
       log "child $pid ignored SIGTERM for 5s; sending SIGKILL"
       kill -9 "$pid" 2>/dev/null
     fi
+    wait "$pid" 2>/dev/null || true
   done
   return 0
 }
@@ -84,13 +98,14 @@ finish() { # status
     --arg schema "ft.smoke.headless-mux-observe.v1" \
     --arg generated_at "$(date -u +%FT%TZ)" \
     --arg host "$(hostname)" \
-    --arg commit "$(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    --arg commit "$RELEASE_COMMIT" \
+    --argjson codec_version "$CODEC_VERSION" \
     --arg cli_version "$("$FT" --version 2>/dev/null | head -1)" \
     --arg mux_version "$("$MUX" --version 2>/dev/null | head -1)" \
     --arg bin_dir "$BIN_DIR" \
     --arg status "$status" \
     --slurpfile steps "$STEPS" \
-    '{schema:$schema,generated_at:$generated_at,host:$host,commit:$commit,cli_version:$cli_version,mux_version:$mux_version,bin_dir:$bin_dir,status:$status,steps:$steps}' \
+    '{schema:$schema,generated_at:$generated_at,host:$host,commit:$commit,codec_version:$codec_version,cli_version:$cli_version,mux_version:$mux_version,bin_dir:$bin_dir,status:$status,steps:$steps}' \
     > "$RECEIPT"
   log "receipt: $RECEIPT (status=$status)"
 }
@@ -100,6 +115,8 @@ fail() { # step-name detail
   finish fail
   exit 1
 }
+trap stop_children EXIT
+trap 'exit 1' HUP INT TERM
 
 # Bare zsh: nothing rewrites the pane title after we set it.
 "$MUX" --daemonize=false --cwd "$D" -- /bin/zsh -f > "$D/mux.log" 2>&1 &
