@@ -113,23 +113,26 @@ mod tests {
     fn variation_selector_text() {
         // U+2764 followed by VS15 (text presentation)
         let (default, explicit) = Presentation::for_grapheme("\u{2764}\u{FE0E}");
-        if let Some(exp) = explicit {
-            // If the variation map has this entry, it should specify text
-            assert_eq!(exp, Presentation::Text);
-        } else {
-            // Otherwise just check default isn't panic
-            let _ = default;
-        }
+        assert_eq!(default, Presentation::Text);
+        assert_eq!(explicit, Some(Presentation::Text));
     }
 
     #[test]
     fn variation_selector_emoji() {
         // U+2764 followed by VS16 (emoji presentation)
         let (default, explicit) = Presentation::for_grapheme("\u{2764}\u{FE0F}");
-        if let Some(exp) = explicit {
-            assert_eq!(exp, Presentation::Emoji);
-        } else {
-            let _ = default;
+        assert_eq!(default, Presentation::Text);
+        assert_eq!(explicit, Some(Presentation::Emoji));
+    }
+
+    #[test]
+    fn generated_variation_map_entries_are_lookup_reachable() {
+        for (grapheme, expected) in VARIATION_MAP.entries() {
+            assert_eq!(
+                VARIATION_MAP.get(*grapheme),
+                Some(expected),
+                "generated PHF entry for {grapheme:?} is unreachable"
+            );
         }
     }
 

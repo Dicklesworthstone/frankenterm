@@ -12,7 +12,9 @@ readme = "README.md"
 publish = false
 
 [dependencies]
-phf.workspace = true
+# `emoji_variation.rs` embeds hash state emitted by the excluded codegen crate.
+# Keep its runtime on the same PHF release line or valid keys can silently miss.
+phf = { version = "=0.13.1", default-features = false }
 serde = {workspace=true, optional=true}
 ucd-trie.workspace = true
 
