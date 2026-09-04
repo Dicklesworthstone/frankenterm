@@ -104,6 +104,7 @@ PROCESS_FAMILY_ACTIVE_ROOT=""
 PROCESS_FAMILY_PENDING_REASON=""
 PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
 PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
+PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=0
 PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="not-observed"
 INITIAL_SELECTOR_HOLD_REASON=""
 VERIFIED_ARCHIVE_IDENTITY=""
@@ -1105,6 +1106,65 @@ atomic_path_transition() {
   [ "$output" = "${prefix}applied" ] || [ "$output" = "${prefix}already-applied" ]
 }
 
+atomic_recovery_move_noreplace() {
+  local parent="$1" source="$2" target="$3" expected_link="$4"
+  python3 - "$parent" "$source" "$target" "$expected_link" <<'PY'
+import os, stat, sys
+
+parent_path, source, target, expected_link = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+parent = os.open(parent_path, flags)
+try:
+    observed_parent = os.fstat(parent)
+    if (not stat.S_ISDIR(observed_parent.st_mode) or
+            observed_parent.st_uid != os.geteuid() or
+            observed_parent.st_mode & 0o022):
+        raise SystemExit("recovery transition parent is not private")
+
+    def identity(name):
+        metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISLNK(metadata.st_mode) or
+                metadata.st_uid != os.geteuid() or
+                os.readlink(name, dir_fd=parent) != expected_link):
+            raise SystemExit("recovery transition entry is not the expected symlink")
+        return metadata.st_dev, metadata.st_ino
+
+    try:
+        source_identity = identity(source)
+    except FileNotFoundError:
+        identity(target)
+        os.fsync(parent)
+        raise SystemExit(0)
+    try:
+        target_identity = identity(target)
+    except FileNotFoundError:
+        target_identity = None
+    if target_identity is None:
+        os.link(
+            source, target, src_dir_fd=parent, dst_dir_fd=parent,
+            follow_symlinks=False,
+        )
+        target_identity = identity(target)
+    if target_identity != source_identity:
+        raise SystemExit("recovery transition target conflicts with its pinned source")
+    os.fsync(parent)
+    if identity(source) != source_identity:
+        raise SystemExit("recovery transition source changed before unlink")
+    os.unlink(source, dir_fd=parent)
+    os.fsync(parent)
+    try:
+        os.stat(source, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit("recovery transition source remains published")
+    if identity(target) != source_identity:
+        raise SystemExit("recovery transition target changed after unlink")
+finally:
+    os.close(parent)
+PY
+}
+
 installer_failpoint() {
   local point="$1"
   if [ "${FT_INSTALL_TEST_ENABLE_FAILPOINTS:-0}" = 1 ] && \
@@ -1629,6 +1689,7 @@ install_process_family() {
   PROCESS_FAMILY_PENDING_REASON=""
   PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
   PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
+  PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=0
   INITIAL_SELECTOR_HOLD_REASON=""
 
   command -v python3 >/dev/null 2>&1 || {
@@ -1981,7 +2042,11 @@ activate_process_family_generation() {
   local legacy_root candidate candidate_matches rollback_txid rollback_stage_id
   local rollback_target_id restored_id rollback_prior_kind rollback_stage_target
   local entrypoint_txid entrypoint_stage entrypoint_id entrypoint_stage_id
-  local selector_committed_here=0 recovery_claim=""
+  local selector_committed_here=0 recovery_claim="" recovery_output=""
+  local recovery_version="" recovery_stage_id=""
+  local candidate_verification_failed=0 transition_helper="" prior_root=""
+
+  PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=0
 
   command -v python3 >/dev/null 2>&1 || {
     err "python3 is required for crash-atomic activation"
@@ -2021,18 +2086,6 @@ activate_process_family_generation() {
   helper="$generation/ft"
   verifier="$generation/verify-components.sh"
   manifest="$generation/process-family.component-manifest.json"
-  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
-  PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
-  verify_canonical_generation "$generation" "" "$verifier" || {
-    PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="failed"
-    PROCESS_FAMILY_PENDING_REASON="candidate-component-verification-failed"
-    err "Candidate generation $generation_id failed canonical verification; refusing to activate it"
-    return 1
-  }
-  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="verified"
-  metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
-  IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
-
   authority_state=$(inspect_installer_process_family_authority 1) || {
     err "Process-family selector authority is ambiguous or unsafe"
     return 1
@@ -2050,7 +2103,7 @@ activate_process_family_generation() {
   # receipt and the deterministic selector stage must agree exactly before the
   # retry inherits the interrupted invocation's rollback claim.
   if [ "$authority_state" = $'managed\t'"generations/$generation_id" ]; then
-    recovery_claim=$(python3 - "$DEST" "$generation_id" <<'PY'
+    recovery_output=$(python3 - "$DEST" "$generation_id" <<'PY'
 import json, os, re, stat, sys
 
 destination, generation = os.path.abspath(sys.argv[1]), sys.argv[2]
@@ -2118,6 +2171,10 @@ if not recoverable:
 
 authority = payload.get("active_authority")
 active_root = payload.get("active_root")
+version = payload.get("candidate_version")
+if (not isinstance(version, str) or not version or "\n" in version or
+        "\r" in version or "\t" in version):
+    raise SystemExit("activation recovery receipt has an invalid candidate version")
 if authority == "none" and active_root is None:
     print("initial")
 elif authority == "legacy-direct" and active_root == destination:
@@ -2133,11 +2190,24 @@ elif authority == "managed-selector" and isinstance(active_root, str):
     print("managed\tgenerations/" + prior)
 else:
     raise SystemExit("activation recovery receipt has inconsistent prior authority")
+print(version)
 PY
     ) || {
       err "Failed to validate the interrupted activation recovery receipt"
       return 1
     }
+    if [ -n "$recovery_output" ]; then
+      [[ "$recovery_output" == *$'\n'* ]] || {
+        err "Interrupted activation recovery receipt omitted its candidate version"
+        return 1
+      }
+      recovery_claim="${recovery_output%%$'\n'*}"
+      recovery_version="${recovery_output#*$'\n'}"
+      [ -n "$recovery_version" ] && [[ "$recovery_version" != *$'\n'* ]] || {
+        err "Interrupted activation recovery receipt has an invalid candidate version"
+        return 1
+      }
+    fi
     if [ -n "$recovery_claim" ]; then
       txid=$(atomic_transition_txid "selector:$DEST:$generation_id") || return 1
       stage=".current.${txid}"
@@ -2158,6 +2228,15 @@ PY
             err "Interrupted legacy rollback selector is not a retained legacy generation"
             return 1
           }
+          prior_root="$managed/$rollback_stage_target"
+          [ "$(legacy_process_family_manifest "$prior_root" -)" = \
+            "sha256:${rollback_stage_target##*legacy-}" ] || {
+            err "Interrupted legacy rollback generation failed exact verification"
+            return 1
+          }
+          transition_helper="$prior_root/ft"
+          recovery_stage_id=$(atomic_path_content_id \
+            "$transition_helper" "$managed" "$stage") || return 1
           ;;
         managed$'\t'*)
           rollback_stage_target="${recovery_claim#*$'\t'}"
@@ -2166,6 +2245,15 @@ PY
             err "Interrupted managed rollback selector differs from its durable receipt"
             return 1
           }
+          prior_root="$managed/$rollback_stage_target"
+          verify_canonical_generation "$prior_root" "" \
+            "$prior_root/verify-components.sh" || {
+            err "Interrupted managed rollback generation failed canonical verification"
+            return 1
+          }
+          transition_helper="$prior_root/ft"
+          recovery_stage_id=$(atomic_path_content_id \
+            "$transition_helper" "$managed" "$stage") || return 1
           ;;
         *)
           err "Interrupted activation recovery receipt has an unsupported authority"
@@ -2173,6 +2261,54 @@ PY
           ;;
       esac
       selector_committed_here=1
+    fi
+  fi
+
+  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
+  PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
+  if verify_canonical_generation "$generation" "" "$verifier"; then
+    PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="verified"
+    metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
+    IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
+  else
+    PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="failed"
+    PROCESS_FAMILY_PENDING_REASON="candidate-component-verification-failed"
+    err "Candidate generation $generation_id failed canonical verification; refusing to activate it"
+    if [ -n "$recovery_claim" ]; then
+      version="$recovery_version"
+      candidate_verification_failed=1
+    else
+      metadata=$(process_family_manifest_metadata "$manifest" triplet 2>/dev/null || true)
+      if [ -n "$metadata" ]; then
+        IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
+      else
+        version="unknown"
+      fi
+      PENDING_PROCESS_FAMILY_GENERATION="$generation_id"
+      PUBLISHED_PROCESS_FAMILY_ROOT="$generation"
+      PUBLISHED_PROCESS_FAMILY_VERSION="$version"
+      PROCESS_FAMILY_ACTIVATION_STATE="pending"
+      PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
+      case "$authority_kind" in
+        initial)
+          PROCESS_FAMILY_ACTIVE_AUTHORITY="none"
+          PROCESS_FAMILY_ACTIVE_ROOT=""
+          ;;
+        legacy|transitioning-legacy)
+          PROCESS_FAMILY_ACTIVE_AUTHORITY="legacy-direct"
+          PROCESS_FAMILY_ACTIVE_ROOT="$DEST"
+          ;;
+        managed)
+          PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
+          PROCESS_FAMILY_ACTIVE_ROOT="$managed/$current_target"
+          ;;
+        *)
+          err "Cannot describe authority after candidate verification failure"
+          return 1
+          ;;
+      esac
+      PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=1
+      return 1
     fi
   fi
 
@@ -2224,10 +2360,12 @@ PY
       return 1
       ;;
   esac
-  emit_process_family_receipt silent || {
-    err "Failed to persist the pre-activation transaction receipt"
-    return 1
-  }
+  if [ "$candidate_verification_failed" -eq 0 ]; then
+    emit_process_family_receipt silent || {
+      err "Failed to persist the pre-activation transaction receipt"
+      return 1
+    }
+  fi
 
   if [ "$authority_state" = $'managed\t'"generations/$generation_id" ]; then
     info "Generation $generation_id is already the current selector target"
@@ -2395,7 +2533,8 @@ PY
 
   # Prove the exact post-commit authority and executable readiness. If any
   # proof fails, atomically restore the previous selector (or prior absence).
-  if [ "$(inspect_installer_process_family_authority 2>/dev/null || true)" != \
+  if [ "$candidate_verification_failed" -eq 1 ] || \
+     [ "$(inspect_installer_process_family_authority 2>/dev/null || true)" != \
        $'managed\t'"generations/$generation_id" ] || \
      ! stable_entrypoint_is_managed ft || \
      ! stable_entrypoint_is_managed frankenterm-mux-server || \
@@ -2406,9 +2545,15 @@ PY
      ! cmp "$DEST/frankenterm-pty-guardian" \
        "$generation/frankenterm-pty-guardian" >/dev/null 2>&1 || \
      ! probe_activated_process_family; then
-    PROCESS_FAMILY_ACTIVATION_READINESS_STATE="failed"
-    PROCESS_FAMILY_PENDING_REASON="activation-readiness-failed"
+    if [ "$candidate_verification_failed" -eq 0 ]; then
+      PROCESS_FAMILY_ACTIVATION_READINESS_STATE="failed"
+      PROCESS_FAMILY_PENDING_REASON="activation-readiness-failed"
+    else
+      PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
+      PROCESS_FAMILY_PENDING_REASON="candidate-component-verification-failed"
+    fi
     if [ "$selector_committed_here" -ne 1 ]; then
+      PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=1
       emit_process_family_receipt silent || true
       err "Already-current generation failed verification; leaving its authority unchanged because this invocation has no prior-selector rollback claim"
       return 1
@@ -2416,40 +2561,90 @@ PY
     warn "Post-commit process-family verification failed; restoring the prior selector authority"
     txid=$(atomic_transition_txid "selector:$DEST:$generation_id") || return 1
     stage=".current.${txid}"
-    rollback_target_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
     rollback_txid=$(atomic_transition_txid "selector-rollback:$DEST:$generation_id") || return 1
-    rollback_prior_kind=initial
-    if [ -L "$managed/$stage" ] || [ -e "$managed/$stage" ]; then
-      [ -L "$managed/$stage" ] || {
-        err "Prior selector rollback authority is not one exact symlink"
-        return 1
-      }
-      rollback_stage_target=$(readlink "$managed/$stage") || return 1
-      if [[ "$rollback_stage_target" == generations/legacy-* ]]; then
+    case "$recovery_claim" in
+      initial)
+        rollback_prior_kind=initial
+        [ ! -e "$managed/$stage" ] && [ ! -L "$managed/$stage" ] || {
+          err "Interrupted first-install rollback stage no longer matches its durable claim"
+          return 1
+        }
+        ;;
+      legacy)
         rollback_prior_kind=legacy
-      else
+        [ -L "$managed/$stage" ] && \
+          [ "$(readlink "$managed/$stage")" = "$rollback_stage_target" ] || {
+          err "Interrupted legacy rollback stage no longer matches its durable claim"
+          return 1
+        }
+        ;;
+      managed$'\t'*)
         rollback_prior_kind=managed
+        [ -L "$managed/$stage" ] && \
+          [ "$(readlink "$managed/$stage")" = "$rollback_stage_target" ] || {
+          err "Interrupted managed rollback stage no longer matches its durable claim"
+          return 1
+        }
+        ;;
+      "")
+        rollback_prior_kind=initial
+        if [ -L "$managed/$stage" ] || [ -e "$managed/$stage" ]; then
+          [ -L "$managed/$stage" ] || {
+            err "Prior selector rollback authority is not one exact symlink"
+            return 1
+          }
+          rollback_stage_target=$(readlink "$managed/$stage") || return 1
+          if [[ "$rollback_stage_target" == generations/legacy-* ]]; then
+            rollback_prior_kind=legacy
+          else
+            rollback_prior_kind=managed
+          fi
+          transition_helper="$helper"
+        fi
+        ;;
+      *)
+        err "Interrupted rollback claim has an unsupported authority"
+        return 1
+        ;;
+    esac
+    if [ "$rollback_prior_kind" != initial ]; then
+      rollback_target_id=$(atomic_path_content_id \
+        "$transition_helper" "$managed" current) || return 1
+      if [ -n "$recovery_stage_id" ]; then
+        rollback_stage_id="$recovery_stage_id"
+      else
+        rollback_stage_id=$(atomic_path_content_id \
+          "$transition_helper" "$managed" "$stage") || return 1
       fi
-      rollback_stage_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
-      atomic_path_transition "$helper" "$managed" "$stage" current \
+      atomic_path_transition "$transition_helper" "$managed" "$stage" current \
         "$rollback_txid" "$rollback_stage_id" "$rollback_target_id" exchange || return 1
-      restored_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+      restored_id=$(atomic_path_content_id \
+        "$transition_helper" "$managed" current) || return 1
       [ "$restored_id" = "$rollback_stage_id" ] || {
         err "Selector rollback did not restore the exact prior authority"
         return 1
       }
     else
-      atomic_path_transition "$helper" "$managed" current "$stage" \
-        "$rollback_txid" "$rollback_target_id" missing publish-noreplace || return 1
+      if [ "$candidate_verification_failed" -eq 1 ]; then
+        atomic_recovery_move_noreplace "$managed" current "$stage" \
+          "generations/$generation_id" || return 1
+      else
+        rollback_target_id=$(atomic_path_content_id \
+          "$helper" "$managed" current) || return 1
+        atomic_path_transition "$helper" "$managed" current "$stage" \
+          "$rollback_txid" "$rollback_target_id" missing publish-noreplace || return 1
+      fi
       if [ -e "$managed/current" ] || [ -L "$managed/current" ]; then
         err "First-install rollback did not restore the prior absent selector"
         return 1
       fi
-      restored_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
-      [ "$restored_id" = "$rollback_target_id" ] || {
-        err "Rolled-back candidate selector differs from the failed authority"
-        return 1
-      }
+      if [ "$candidate_verification_failed" -eq 0 ]; then
+        restored_id=$(atomic_path_content_id "$helper" "$managed" "$stage") || return 1
+        [ "$restored_id" = "$rollback_target_id" ] || {
+          err "Rolled-back candidate selector differs from the failed authority"
+          return 1
+        }
+      fi
     fi
     installer_failpoint after-selector-rollback
 
@@ -2467,11 +2662,16 @@ PY
           entrypoint_txid=$(atomic_transition_txid \
             "entrypoint:$DEST:$name:$generation") || return 1
           entrypoint_stage=".ft-entrypoint-${name}-${entrypoint_txid}"
-          entrypoint_id=$(atomic_path_content_id "$helper" "$DEST" "$name") || return 1
-          rollback_txid=$(atomic_transition_txid \
-            "entrypoint-rollback-absent:$DEST:$name:$generation_id") || return 1
-          atomic_path_transition "$helper" "$DEST" "$name" "$entrypoint_stage" \
-            "$rollback_txid" "$entrypoint_id" missing publish-noreplace || return 1
+          if [ "$candidate_verification_failed" -eq 1 ]; then
+            atomic_recovery_move_noreplace "$DEST" "$name" "$entrypoint_stage" \
+              ".frankenterm-process-family/current/$name" || return 1
+          else
+            entrypoint_id=$(atomic_path_content_id "$helper" "$DEST" "$name") || return 1
+            rollback_txid=$(atomic_transition_txid \
+              "entrypoint-rollback-absent:$DEST:$name:$generation_id") || return 1
+            atomic_path_transition "$helper" "$DEST" "$name" "$entrypoint_stage" \
+              "$rollback_txid" "$entrypoint_id" missing publish-noreplace || return 1
+          fi
           installer_failpoint "after-entrypoint-rollback:$name"
         done
         ;;
@@ -2494,21 +2694,24 @@ PY
             return 1
           }
           entrypoint_stage_id=$(atomic_path_content_id \
-            "$helper" "$DEST" "$entrypoint_stage") || return 1
-          entrypoint_id=$(atomic_path_content_id "$helper" "$DEST" "$name") || return 1
+            "$transition_helper" "$DEST" "$entrypoint_stage") || return 1
+          entrypoint_id=$(atomic_path_content_id \
+            "$transition_helper" "$DEST" "$name") || return 1
           rollback_txid=$(atomic_transition_txid \
             "entrypoint-rollback-legacy:$DEST:$name:$generation_id") || return 1
-          atomic_path_transition "$helper" "$DEST" "$entrypoint_stage" "$name" \
+          atomic_path_transition \
+            "$transition_helper" "$DEST" "$entrypoint_stage" "$name" \
             "$rollback_txid" "$entrypoint_stage_id" "$entrypoint_id" exchange || return 1
           installer_failpoint "after-entrypoint-rollback:$name"
         done
         txid=$(atomic_transition_txid \
           "legacy-selector:$DEST:$rollback_stage_target") || return 1
         stage=".current.${txid}"
-        target_id=$(atomic_path_content_id "$helper" "$managed" current) || return 1
+        target_id=$(atomic_path_content_id \
+          "$transition_helper" "$managed" current) || return 1
         rollback_txid=$(atomic_transition_txid \
           "legacy-selector-rollback:$DEST:$generation_id") || return 1
-        atomic_path_transition "$helper" "$managed" current "$stage" \
+        atomic_path_transition "$transition_helper" "$managed" current "$stage" \
           "$rollback_txid" "$target_id" missing publish-noreplace || return 1
         installer_failpoint after-legacy-selector-rollback
         ;;
@@ -2541,6 +2744,7 @@ PY
         }
         ;;
     esac
+    PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=1
     emit_process_family_receipt silent || true
     err "Candidate activation failed readiness verification; prior process-family authority restored"
     return 1
@@ -2730,22 +2934,21 @@ try:
             stage_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_descriptor,
         )
-        try:
-            observed_stage = os.fstat(descriptor)
-            if (not stat.S_ISREG(observed_stage.st_mode) or
-                    observed_stage.st_nlink != 1 or
-                    observed_stage.st_uid != os.geteuid() or
-                    stat.S_IMODE(observed_stage.st_mode) != 0o400 or
-                    observed_stage.st_size != len(encoded)):
-                raise SystemExit("process-family receipt stage is not one exact private file")
-            existing = b""
-            while len(existing) <= len(encoded):
-                chunk = os.read(descriptor, len(encoded) + 1 - len(existing))
-                if not chunk:
-                    break
-                existing += chunk
-            if existing != encoded:
-                raise SystemExit("process-family receipt stage conflicts with another transaction")
+        observed_stage = os.fstat(descriptor)
+        if (not stat.S_ISREG(observed_stage.st_mode) or
+                observed_stage.st_nlink != 1 or
+                observed_stage.st_uid != os.geteuid() or
+                stat.S_IMODE(observed_stage.st_mode) != 0o400 or
+                observed_stage.st_size != len(encoded)):
+            raise SystemExit("process-family receipt stage is not one exact private file")
+        existing = b""
+        while len(existing) <= len(encoded):
+            chunk = os.read(descriptor, len(encoded) + 1 - len(existing))
+            if not chunk:
+                break
+            existing += chunk
+        if existing != encoded:
+            raise SystemExit("process-family receipt stage conflicts with another transaction")
     else:
         offset = 0
         while offset < len(encoded):
@@ -5527,7 +5730,15 @@ fi
 # activation. It intentionally runs only after the permanent installer lock is
 # held, but before any network or release-resolution work.
 if [ -n "$ACTIVATE_GENERATION" ]; then
-  activate_process_family_generation "$ACTIVATE_GENERATION" || exit 1
+  if ! activate_process_family_generation "$ACTIVATE_GENERATION"; then
+    if [ "$PROCESS_FAMILY_FAILURE_RECEIPT_SAFE" -eq 1 ] && \
+       [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ] && \
+       [ -n "$PUBLISHED_PROCESS_FAMILY_ROOT" ] && \
+       [ -n "$PUBLISHED_PROCESS_FAMILY_VERSION" ]; then
+      emit_process_family_receipt || true
+    fi
+    exit 1
+  fi
   emit_process_family_receipt || exit 1
   exit 0
 fi
@@ -5709,7 +5920,9 @@ else
 fi
 
 if ! activate_published_generation_if_idle; then
-  emit_process_family_receipt || true
+  if [ "$PROCESS_FAMILY_FAILURE_RECEIPT_SAFE" -eq 1 ]; then
+    emit_process_family_receipt || true
+  fi
   exit 1
 fi
 

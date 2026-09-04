@@ -118476,6 +118476,7 @@ printf x > "$MINISIGN_MARKER"
     #[cfg(unix)]
     #[test]
     fn installer_post_commit_crash_retry_failure_restores_durable_prior_authority() {
+        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt as _;
 
@@ -118520,6 +118521,21 @@ printf x > "$MINISIGN_MARKER"
         );
         assert_eq!(interrupted.status.signal(), Some(9));
         assert!(family_bytes_match(&initial_destination, &candidate_family));
+        let interrupted_initial_ft = initial_destination
+            .join(".frankenterm-process-family/generations")
+            .join(&candidate_family.generation_id)
+            .join("ft");
+        std::fs::set_permissions(
+            &interrupted_initial_ft,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("make interrupted first-install candidate mutable");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&interrupted_initial_ft)
+            .expect("open interrupted first-install candidate")
+            .write_all(b"component-corruption")
+            .expect("corrupt interrupted first-install candidate");
         let failed_retry = run_installer_activation_function(
             &installer,
             &candidate_family,
@@ -118538,6 +118554,22 @@ printf x > "$MINISIGN_MARKER"
             .is_err(),
             "post-commit first-install recovery did not restore selector absence"
         );
+        let initial_receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                initial_destination.join(".frankenterm-process-family/install-receipt.json"),
+            )
+            .expect("read corrupted first-install recovery receipt"),
+        )
+        .expect("parse corrupted first-install recovery receipt");
+        assert_eq!(
+            initial_receipt["pending_reason"],
+            "candidate-component-verification-failed"
+        );
+        assert_eq!(
+            initial_receipt["verification"]["component_manifest"],
+            "failed"
+        );
+        assert!(initial_receipt["next_action"].is_null());
 
         let managed_destination = fixture.path().join("managed-bin");
         std::fs::create_dir(&managed_destination).expect("create managed destination");
@@ -118577,6 +118609,21 @@ printf x > "$MINISIGN_MARKER"
         );
         assert_eq!(interrupted.status.signal(), Some(9));
         assert!(family_bytes_match(&managed_destination, &candidate_family));
+        let interrupted_managed_ft = managed_destination
+            .join(".frankenterm-process-family/generations")
+            .join(&candidate_family.generation_id)
+            .join("ft");
+        std::fs::set_permissions(
+            &interrupted_managed_ft,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("make interrupted managed candidate mutable");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&interrupted_managed_ft)
+            .expect("open interrupted managed candidate")
+            .write_all(b"component-corruption")
+            .expect("corrupt interrupted managed candidate");
         let failed_retry = run_installer_activation_function(
             &installer,
             &candidate_family,
@@ -118593,6 +118640,111 @@ printf x > "$MINISIGN_MARKER"
                 .expect("read restored managed selector"),
             Path::new("generations").join(&old_family.generation_id)
         );
+        let managed_receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                managed_destination.join(".frankenterm-process-family/install-receipt.json"),
+            )
+            .expect("read corrupted managed recovery receipt"),
+        )
+        .expect("parse corrupted managed recovery receipt");
+        assert_eq!(
+            managed_receipt["pending_reason"],
+            "candidate-component-verification-failed"
+        );
+        assert_eq!(
+            managed_receipt["active_root"],
+            managed_destination
+                .join(".frankenterm-process-family/generations")
+                .join(&old_family.generation_id)
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert!(managed_receipt["next_action"].is_null());
+
+        let legacy_destination = fixture.path().join("legacy-bin");
+        std::fs::create_dir(&legacy_destination).expect("create legacy destination");
+        std::fs::set_permissions(&legacy_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make legacy destination private");
+        for name in ["ft", "frankenterm-mux-server", "frankenterm-pty-guardian"] {
+            std::fs::copy(old_family.root.join(name), legacy_destination.join(name))
+                .expect("plant legacy process-family member");
+            std::fs::set_permissions(
+                legacy_destination.join(name),
+                std::fs::Permissions::from_mode(0o555),
+            )
+            .expect("seal legacy process-family member");
+        }
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &legacy_destination,
+                &fixture.path().join("legacy-candidate-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let interrupted = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &legacy_destination,
+            &fixture.path().join("legacy-interrupt"),
+            Some("after-selector-activation"),
+            "inactive",
+            false,
+        );
+        assert_eq!(interrupted.status.signal(), Some(9));
+        assert!(family_bytes_match(&legacy_destination, &candidate_family));
+        let interrupted_legacy_ft = legacy_destination
+            .join(".frankenterm-process-family/generations")
+            .join(&candidate_family.generation_id)
+            .join("ft");
+        std::fs::set_permissions(
+            &interrupted_legacy_ft,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("make interrupted legacy candidate mutable");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&interrupted_legacy_ft)
+            .expect("open interrupted legacy candidate")
+            .write_all(b"component-corruption")
+            .expect("corrupt interrupted legacy candidate");
+        let failed_retry = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &legacy_destination,
+            &fixture.path().join("legacy-failed-retry"),
+            None,
+            "inactive",
+            false,
+        );
+        assert!(!failed_retry.status.success());
+        assert!(
+            family_bytes_match(&legacy_destination, &old_family),
+            "corrupted post-commit retry did not restore direct legacy authority"
+        );
+        assert!(
+            std::fs::symlink_metadata(
+                legacy_destination.join(".frankenterm-process-family/current")
+            )
+            .is_err(),
+            "legacy recovery left a managed selector authoritative"
+        );
+        let legacy_receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                legacy_destination.join(".frankenterm-process-family/install-receipt.json"),
+            )
+            .expect("read corrupted legacy recovery receipt"),
+        )
+        .expect("parse corrupted legacy recovery receipt");
+        assert_eq!(legacy_receipt["active_authority"], "legacy-direct");
+        assert_eq!(
+            legacy_receipt["pending_reason"],
+            "candidate-component-verification-failed"
+        );
+        assert!(legacy_receipt["next_action"].is_null());
     }
 
     #[cfg(unix)]
@@ -118871,6 +119023,77 @@ printf x > "$MINISIGN_MARKER"
             !String::from_utf8_lossy(&output.stderr).contains("verified candidate remains"),
             "component verification failure must not describe the candidate as verified"
         );
+        assert_initial_family_is_uniformly_unavailable(&destination);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_explicit_activation_dispatch_persists_component_failure_receipt() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create explicit activation fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"7".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let destination = fixture.path().join("bin");
+        std::fs::create_dir(&destination).expect("create explicit activation destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make explicit activation destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &family,
+                &destination,
+                &fixture.path().join("stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let candidate_ft = destination
+            .join(".frankenterm-process-family/generations")
+            .join(&family.generation_id)
+            .join("ft");
+        std::fs::set_permissions(&candidate_ft, std::fs::Permissions::from_mode(0o755))
+            .expect("make explicit activation candidate mutable");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&candidate_ft)
+            .expect("open explicit activation candidate")
+            .write_all(b"component-corruption")
+            .expect("corrupt explicit activation candidate");
+
+        let output = std::process::Command::new("bash")
+            .arg(&installer)
+            .arg("--quiet")
+            .arg("--no-gum")
+            .arg("--dest")
+            .arg(&destination)
+            .arg("--activate")
+            .arg(&family.generation_id)
+            .arg("--idle-host-confirmed")
+            .output()
+            .expect("execute production explicit activation dispatch");
+        assert!(!output.status.success());
+        let receipt = parse_installer_process_family_receipt(&output.stdout);
+        assert_eq!(
+            receipt["pending_reason"],
+            "candidate-component-verification-failed"
+        );
+        assert_eq!(receipt["verification"]["component_manifest"], "failed");
+        assert!(receipt["next_action"].is_null());
+        assert!(receipt["remediation"].is_string());
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(destination.join(".frankenterm-process-family/install-receipt.json"))
+                .expect("read explicit activation failure receipt"),
+        )
+        .expect("parse explicit activation failure receipt");
+        assert_eq!(persisted, receipt);
         assert_initial_family_is_uniformly_unavailable(&destination);
     }
 
