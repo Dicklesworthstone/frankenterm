@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 51,
-        "fix": 69,
+        "fix": 70,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 23
       },
-      "fork_side_commit_count": 194,
+      "fork_side_commit_count": 195,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-03T15:52:30-04:00",
-        "sha": "651dde23ca329a4b3728413813eec2f567b8b5bd",
-        "subject": "fix(proof-doctor): accept the RCH proof command shape the blockers prescribe"
+        "committed_at": "2026-09-04T08:12:55-04:00",
+        "sha": "02bcda4cd80e0413d11e4c416be7f1661ed3f7ac",
+        "subject": "fix(client): classify legacy frames before body admission"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -184,7 +184,7 @@
         "cosmetic": 20,
         "docs": 2,
         "feat": 43,
-        "fix": 54,
+        "fix": 55,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 236,
+      "fork_side_commit_count": 237,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-01T12:05:51-04:00",
-        "sha": "b52dd58d41ec359d56ea72198a1ec85aa2d09936",
-        "subject": "test(codec): bind unknown PDU fixtures to registry gap"
+        "classification": "fix",
+        "committed_at": "2026-09-04T08:12:55-04:00",
+        "sha": "02bcda4cd80e0413d11e4c416be7f1661ed3f7ac",
+        "subject": "fix(client): classify legacy frames before body admission"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -1058,8 +1058,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2379,
-  "generated_at": "2026-09-04T10:22:09.230071Z",
+  "fork_side_commit_total": 2381,
+  "generated_at": "2026-09-04T12:13:16.488850Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
