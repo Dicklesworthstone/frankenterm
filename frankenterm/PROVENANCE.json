@@ -181,7 +181,7 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 1,
-        "cosmetic": 20,
+        "cosmetic": 21,
         "docs": 2,
         "feat": 43,
         "fix": 55,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 237,
+      "fork_side_commit_count": 238,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-04T08:12:55-04:00",
-        "sha": "02bcda4cd80e0413d11e4c416be7f1661ed3f7ac",
-        "subject": "fix(client): classify legacy frames before body admission"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-04T08:27:39-04:00",
+        "sha": "532ff73b5a70e9f269b471bf2b6fd1460f8d4961",
+        "subject": "style(codec): satisfy release rustfmt proof"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -1058,8 +1058,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2381,
-  "generated_at": "2026-09-04T12:13:16.488850Z",
+  "fork_side_commit_total": 2382,
+  "generated_at": "2026-09-04T12:27:57.796573Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
