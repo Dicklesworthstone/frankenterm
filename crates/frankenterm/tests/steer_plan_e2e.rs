@@ -268,13 +268,27 @@ esac
         }
 
         let now_ms = system_now_ms();
+        // A heavily contended remote test worker can take longer than the
+        // production 30-second liveness window to launch the child `ft`
+        // process. Keep this synthetic target authoritatively live for the
+        // bounded duration of the test instead of making scheduler delay a
+        // transaction-policy result.
+        let live_through_ms = now_ms.saturating_add(600_000);
         let db_path = Config::default().effective_db_path(w.path());
         let conn = rusqlite::Connection::open(&db_path).expect("open steering fixture DB");
         conn.execute(
             "INSERT OR REPLACE INTO panes \
              (pane_id, domain, title, cwd, first_seen_at, last_seen_at, observed) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![0i64, "local", "zsh", "/home/user", now_ms, now_ms, true],
+            rusqlite::params![
+                0i64,
+                "local",
+                "zsh",
+                "/home/user",
+                now_ms,
+                live_through_ms,
+                true
+            ],
         )
         .expect("seed live steering target pane");
 
