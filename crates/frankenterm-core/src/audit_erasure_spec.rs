@@ -21,10 +21,9 @@
 //!
 //! 1. **MDS** (Maximum Distance Separable) — any k of n shards
 //!    reconstruct the original. The implementation uses a
-//!    Vandermonde-shape generator over `GF(256)` (the same
-//!    field as raptorq/zfec); the property follows from the
-//!    Vandermonde determinant being nonzero for distinct
-//!    evaluation points.
+//!    systematic evaluation generator over `GF(256)`: each
+//!    data chunk fixes a polynomial value at a distinct point.
+//!    Any k evaluations determine the degree < k polynomial.
 //! 2. **Round-trip** — `decode(encode(data)) == data` for any
 //!    valid k-of-n parameter pair.
 //! 3. **Single-host-loss survives** — the bead's headline
@@ -154,6 +153,7 @@ fn gf_div(a: u8, b: u8) -> u8 {
 }
 
 #[inline]
+#[cfg(test)]
 fn gf_pow(a: u8, n: u32) -> u8 {
     if n == 0 {
         return 1;
@@ -175,6 +175,7 @@ fn gf_pow(a: u8, n: u32) -> u8 {
 /// of shards (data + parity). The system survives `n - k` host
 /// losses without data loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ErasureConfigFields")]
 pub struct ErasureConfig {
     /// **Private** per ft-mpnj3: previously public, allowing
     /// callers to construct `ErasureConfig { k: 0, n: 5 }` /
@@ -186,6 +187,20 @@ pub struct ErasureConfig {
     /// audit ledger.
     k: u8,
     n: u8,
+}
+
+#[derive(Deserialize)]
+struct ErasureConfigFields {
+    k: u8,
+    n: u8,
+}
+
+impl TryFrom<ErasureConfigFields> for ErasureConfig {
+    type Error = ErasureError;
+
+    fn try_from(value: ErasureConfigFields) -> Result<Self, Self::Error> {
+        Self::new(value.k, value.n)
+    }
 }
 
 impl ErasureConfig {
@@ -272,6 +287,10 @@ impl Default for ErasureConfig {
 /// [`Self::for_test`] which is gated to test/integration use.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ErasureShard {
+    /// Version 2 uses a systematic MDS generator. Unversioned shards used a
+    /// different, non-MDS parity matrix and must not be decoded as version 2.
+    #[serde(default)]
+    encoding_version: u8,
     /// Shard index in `0..n`.
     pub(crate) shard_index: u8,
     /// True iff this is a parity shard (`shard_index >= k`).
@@ -308,6 +327,7 @@ impl ErasureShard {
     #[must_use]
     pub fn for_test(shard_index: u8, is_parity: bool, bytes: Vec<u8>) -> Self {
         Self {
+            encoding_version: ERASURE_ENCODING_VERSION,
             shard_index,
             is_parity,
             bytes,
@@ -323,6 +343,18 @@ impl ErasureShard {
 pub enum ErasureError {
     #[error("invalid erasure config: {reason}")]
     InvalidConfig { reason: String },
+    #[error("audit row length {len} exceeds the encoding envelope")]
+    PayloadTooLarge { len: usize },
+    #[error("unsupported erasure encoding version {version}")]
+    UnsupportedEncodingVersion { version: u8 },
+    #[error("invalid parity flag for shard {index}")]
+    InvalidParityFlag { index: u8 },
+    #[error("malformed erasure matrix")]
+    MalformedMatrix,
+    #[error("singular erasure matrix at column {column}")]
+    SingularMatrix { column: usize },
+    #[error("invalid erasure payload padding")]
+    InvalidPadding,
     #[error("not enough shards: have {have}, need {k}")]
     InsufficientShards { have: usize, k: u8 },
     #[error("duplicate shard index {index}")]
@@ -340,33 +372,34 @@ pub enum ErasureError {
 }
 
 // ============================================================================
-// Vandermonde generator
+// Systematic MDS generator
 // ============================================================================
 //
-// The (n × k) generator matrix is the Vandermonde matrix
-// `G[i][j] = i^j` over GF(256), with the first k rows being
-// the identity (so data shards are direct copies of the
-// original chunks). Rows k..n produce parity. Any k rows are
-// invertible (Vandermonde determinant is nonzero for distinct
-// evaluation points), so any k shards reconstruct the
-// original.
+// Lagrange basis at the distinct data points 0..k evaluates a degree < k
+// polynomial at all n distinct points 0..n. This is V * inverse(V[0..k]),
+// so the first k rows are identity WITHOUT replacing arbitrary Vandermonde
+// rows. Every k-row submatrix remains invertible. Version 1 incorrectly
+// spliced identity rows onto raw Vandermonde parity rows; (4,7) survivors
+// [2,4,5,6] were singular. Its parity bytes are not compatible with version 2.
+
+const ERASURE_ENCODING_VERSION: u8 = 2;
 
 /// Build the (n × k) generator matrix in row-major order.
 fn generator_matrix(cfg: ErasureConfig) -> Vec<Vec<u8>> {
     let mut g = vec![vec![0u8; cfg.k as usize]; cfg.n as usize];
 
-    // First k rows: identity.
-    for i in 0..cfg.k {
-        g[i as usize][i as usize] = 1;
-    }
-
-    // Parity rows: Vandermonde over GF(256). Use evaluation
-    // points i = 1..=parity (avoiding 0 which would zero out a
-    // row).
-    for i in cfg.k..cfg.n {
-        let eval = i - cfg.k + 1;
+    for i in 0..cfg.n {
         for j in 0..cfg.k {
-            g[i as usize][j as usize] = gf_pow(eval, j as u32);
+            let mut numerator = 1;
+            let mut denominator = 1;
+            for other in 0..cfg.k {
+                if other != j {
+                    numerator = gf_mul(numerator, gf_add(i, other));
+                    denominator = gf_mul(denominator, gf_add(j, other));
+                }
+            }
+            // Validated k <= 32 makes every denominator factor nonzero.
+            g[i as usize][j as usize] = gf_mul(numerator, gf_inv(denominator));
         }
     }
 
@@ -379,21 +412,31 @@ fn generator_matrix(cfg: ErasureConfig) -> Vec<Vec<u8>> {
 
 /// Encode `data` into n shards under `cfg`. Pads the input
 /// length to a multiple of k bytes so every chunk fits a row.
-/// The pad length is encoded into the first 4 bytes of every
-/// data shard so decode can recover the original length.
+/// The original length is encoded once at the start of the combined data
+/// payload, before it is split into k chunks. Shards carry encoding version 2.
 ///
-/// (The 4-byte length prefix is part of the spec — operators
-/// can pre-strip it if they prefer, but the canonical encoding
-/// includes it for self-describing decode.)
-pub fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Vec<ErasureShard> {
-    let original_len = data.len() as u32;
+/// Returns a typed error for an invalid configuration or an input that cannot
+/// fit the 4-byte length prefix and platform allocation envelope.
+pub fn encode_row(
+    cfg: ErasureConfig,
+    data: &[u8],
+) -> Result<Vec<ErasureShard>, ErasureError> {
+    ErasureConfig::new(cfg.k, cfg.n)?;
+    let original_len = u32::try_from(data.len())
+        .map_err(|_| ErasureError::PayloadTooLarge { len: data.len() })?;
+    let payload_len = data
+        .len()
+        .checked_add(4)
+        .ok_or(ErasureError::PayloadTooLarge { len: data.len() })?;
+    let chunk_size = payload_len.div_ceil(cfg.k as usize);
+    let padded_total = chunk_size
+        .checked_mul(cfg.k as usize)
+        .ok_or(ErasureError::PayloadTooLarge { len: data.len() })?;
     // Build the prefixed payload: 4-byte length + data.
-    let mut payload = Vec::with_capacity(4 + data.len());
+    let mut payload = Vec::with_capacity(padded_total);
     payload.extend_from_slice(&original_len.to_le_bytes());
     payload.extend_from_slice(data);
     // Pad to multiple of k.
-    let chunk_size = payload.len().div_ceil(cfg.k as usize);
-    let padded_total = chunk_size * cfg.k as usize;
     payload.resize(padded_total, 0u8);
 
     let g = generator_matrix(cfg);
@@ -411,13 +454,14 @@ pub fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Vec<ErasureShard> {
             bytes[byte_off] = acc;
         }
         shards.push(ErasureShard {
+            encoding_version: ERASURE_ENCODING_VERSION,
             shard_index: shard_idx,
             is_parity: shard_idx >= cfg.k,
             bytes,
         });
     }
 
-    shards
+    Ok(shards)
 }
 
 /// Reconstruct the original bytes from any `k` of `n`
@@ -432,19 +476,26 @@ pub fn reconstruct(
     cfg: ErasureConfig,
     surviving: &[ErasureShard],
 ) -> Result<Vec<u8>, ErasureError> {
+    ErasureConfig::new(cfg.k, cfg.n)?;
     if surviving.len() < cfg.k as usize {
         return Err(ErasureError::InsufficientShards {
             have: surviving.len(),
             k: cfg.k,
         });
     }
-    // Take the first k.
+    // Solve with the first k, but validate every supplied shard, including
+    // surplus inputs, before selecting them.
     let used = &surviving[..cfg.k as usize];
 
     // Validate shard indices.
     let chunk_size = used[0].bytes.len();
     let mut seen_idx = [false; 256];
-    for s in used {
+    for s in surviving {
+        if s.encoding_version != ERASURE_ENCODING_VERSION {
+            return Err(ErasureError::UnsupportedEncodingVersion {
+                version: s.encoding_version,
+            });
+        }
         if s.shard_index >= cfg.n {
             return Err(ErasureError::ShardIndexOutOfRange {
                 index: s.shard_index,
@@ -457,6 +508,11 @@ pub fn reconstruct(
             });
         }
         seen_idx[s.shard_index as usize] = true;
+        if s.is_parity != (s.shard_index >= cfg.k) {
+            return Err(ErasureError::InvalidParityFlag {
+                index: s.shard_index,
+            });
+        }
         if s.bytes.len() != chunk_size {
             return Err(ErasureError::InconsistentShardSize {
                 index: s.shard_index,
@@ -474,9 +530,52 @@ pub fn reconstruct(
         sub[row].copy_from_slice(&g[shard.shard_index as usize]);
     }
 
-    // Invert sub via Gaussian elimination over GF(256).
-    // Augment with the identity to compute the inverse.
+    let inv_sub = invert_matrix(&sub)?;
     let k = cfg.k as usize;
+    let payload_len = chunk_size
+        .checked_mul(k)
+        .ok_or(ErasureError::PayloadTooLarge { len: chunk_size })?;
+    let mut payload = vec![0u8; payload_len];
+    for byte_off in 0..chunk_size {
+        for orig_chunk in 0..k {
+            let mut acc = 0u8;
+            for src_row in 0..k {
+                let coeff = inv_sub[orig_chunk][src_row];
+                let byte = used[src_row].bytes[byte_off];
+                acc = gf_add(acc, gf_mul(coeff, byte));
+            }
+            payload[orig_chunk * chunk_size + byte_off] = acc;
+        }
+    }
+
+    if payload.len() < 4 {
+        return Err(ErasureError::DecodedLengthMismatch {
+            original: 0,
+            decoded: payload.len(),
+        });
+    }
+    let original_len =
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if original_len > payload.len() - 4 {
+        return Err(ErasureError::DecodedLengthMismatch {
+            original: original_len,
+            decoded: payload.len() - 4,
+        });
+    }
+    let end = 4 + original_len;
+    if payload.len() - end >= k || payload[end..].iter().any(|byte| *byte != 0) {
+        return Err(ErasureError::InvalidPadding);
+    }
+    Ok(payload[4..end].to_vec())
+}
+
+fn invert_matrix(sub: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, ErasureError> {
+    let k = sub.len();
+    if k == 0 || k > 32 || sub.iter().any(|row| row.len() != k) {
+        return Err(ErasureError::MalformedMatrix);
+    }
+    // Invert via Gaussian elimination over GF(256).
+    // Augment with the identity to compute the inverse.
     let mut aug = vec![vec![0u8; 2 * k]; k];
     for i in 0..k {
         for j in 0..k {
@@ -494,7 +593,7 @@ pub fn reconstruct(
             .take(k)
             .skip(col)
             .find_map(|(row, aug_row)| (aug_row[col] != 0).then_some(row))
-            .expect("Vandermonde sub-matrix is invertible — k rows linearly independent");
+            .ok_or(ErasureError::SingularMatrix { column: col })?;
         if pivot != col {
             aug.swap(col, pivot);
         }
@@ -521,39 +620,7 @@ pub fn reconstruct(
     }
 
     // Inverse is the right half.
-    let inv_sub: Vec<Vec<u8>> = aug.into_iter().map(|row| row[k..2 * k].to_vec()).collect();
-
-    // Multiply inv_sub × stacked-shard-bytes to recover the
-    // original payload (chunk-by-chunk).
-    let mut payload = vec![0u8; chunk_size * k];
-    for byte_off in 0..chunk_size {
-        for orig_chunk in 0..k {
-            let mut acc = 0u8;
-            for src_row in 0..k {
-                let coeff = inv_sub[orig_chunk][src_row];
-                let byte = used[src_row].bytes[byte_off];
-                acc = gf_add(acc, gf_mul(coeff, byte));
-            }
-            payload[orig_chunk * chunk_size + byte_off] = acc;
-        }
-    }
-
-    // Strip the 4-byte length prefix.
-    if payload.len() < 4 {
-        return Err(ErasureError::DecodedLengthMismatch {
-            original: 0,
-            decoded: payload.len(),
-        });
-    }
-    let original_len =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    if original_len + 4 > payload.len() {
-        return Err(ErasureError::DecodedLengthMismatch {
-            original: original_len,
-            decoded: payload.len() - 4,
-        });
-    }
-    Ok(payload[4..4 + original_len].to_vec())
+    Ok(aug.into_iter().map(|row| row[k..2 * k].to_vec()).collect())
 }
 
 // ============================================================================

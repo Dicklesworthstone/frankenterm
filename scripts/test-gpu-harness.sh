@@ -7,7 +7,7 @@ set -euo pipefail
 #   scripts/test-gpu-harness.sh
 #   scripts/test-gpu-harness.sh -- --headless-render-self-test
 #
-# The script mirrors the CI entrypoint planned for ft-ombfl.13:
+# The script provides the remote development proof entrypoint for ft-ombfl.13:
 # - creates a per-run artifact directory under /tmp/gpu-harness-<timestamp>
 # - runs the harness through cargo test with headless rendering enabled
 # - captures combined cargo/harness output in run.log
@@ -19,11 +19,7 @@ set -euo pipefail
 #   GPU_HARNESS_RUN_DIR    run artifact directory override
 #   GPU_HARNESS_CARGO_ARGS extra cargo args before "--" (space-separated)
 #   GPU_HARNESS_RCH_TARGET_DIR repo-relative remote CARGO_TARGET_DIR override
-#   GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO
-#                           set to 1 only in GitHub Actions GPU jobs, where the
-#                           GitHub-hosted runner is the CI execution target and
-#                           the local agent/operator RCH offload policy is not
-#                           available.
+# Cargo always uses strict remote RCH. Native release orchestration uses DSR.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -142,45 +138,6 @@ now_ms() {
 import time
 print(int(time.time() * 1000))
 PY
-}
-
-github_actions_local_cargo_enabled() {
-  case "${GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO:-}" in
-    1|true|TRUE|yes|YES) ;;
-    *) return 1 ;;
-  esac
-
-  [[ "${GITHUB_ACTIONS:-}" == "true" ]]
-}
-
-run_github_actions_cargo_logged() {
-  : >"$LOG_FILE"
-  local artifact_dir_abs perf_report_abs fixture_root_abs
-  artifact_dir_abs="$(abs_path "$ARTIFACT_DIR")"
-  perf_report_abs="$(abs_path "$PERF_REPORT")"
-  fixture_root_abs="$(optional_abs_env GPU_HARNESS_FIXTURE_ROOT)"
-  local -a harness_env=(
-    "GPU_HARNESS_ARTIFACT_DIR=$artifact_dir_abs"
-    "GPU_HARNESS_PERF_REPORT=$perf_report_abs"
-  )
-  if [[ -n "$fixture_root_abs" ]]; then
-    harness_env+=("GPU_HARNESS_FIXTURE_ROOT=$fixture_root_abs")
-  fi
-  set +u
-  (
-    cd "$PROJECT_ROOT"
-    env "${harness_env[@]}" \
-      cargo test \
-        -p frankenterm-gui \
-        --features headless-render \
-        --test gpu_regression \
-        "${EXTRA_CARGO_ARGS[@]}" \
-        -- \
-        "${HARNESS_ARGS[@]}"
-  ) >"$LOG_FILE" 2>&1
-  local rc=$?
-  set -u
-  return "$rc"
 }
 
 extract_json_lines() {
@@ -415,12 +372,10 @@ parity_report = {
         "source": "crates/frankenterm-gui/src/gpu_regression.rs::Thresholds::default",
     },
     "threshold_semantics": "pass requires ssim >= min_ssim AND l_inf <= max_l_inf AND changed_pixel_fraction <= max_changed_pixel_fraction; fixture meta.json may tighten or loosen these defaults",
-    "ci_contract": {
-        "nightly_trigger": "manual (DSR-only; no GitHub workflow schedule)",
-        "hard_gate_job": "gpu-regression-macos",
-        "hard_gate_runner": "macos-15",
-        "soft_pilot_job": "gpu-linux-llvmpipe-pilot",
-        "stable_required_check": "GPU Regression Required",
+    "execution_contract": {
+        "development_proof": "strict remote RCH",
+        "release_orchestrator": "DSR",
+        "target_qualification": "requires retained native target receipts",
     },
     "artifacts": {
         "run_dir": run_dir,
@@ -471,10 +426,6 @@ start_ms="$(now_ms)"
 emit_setup
 
 set +e
-if github_actions_local_cargo_enabled; then
-  run_github_actions_cargo_logged
-  run_exit_code=$?
-else
   rch_init "$RUN_DIR" "$RUN_ID" "gpu_harness" "$PROJECT_ROOT"
   ensure_rch_ready
   set +u
@@ -510,7 +461,7 @@ else
 
       set +e
       env GPU_HARNESS_ARTIFACT_DIR="$remote_artifact_dir" GPU_HARNESS_PERF_REPORT="$remote_perf_report" \
-        cargo test \
+        cargo test --locked \
           -p frankenterm-gui \
           --features headless-render \
           --test gpu_regression \
@@ -552,7 +503,6 @@ PY
     ' bash "${EXTRA_CARGO_ARGS[@]}" -- "${HARNESS_ARGS[@]}"
   run_exit_code=$?
   set -u
-fi
 set -e
 
 end_ms="$(now_ms)"

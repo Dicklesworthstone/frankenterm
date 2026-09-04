@@ -15,7 +15,7 @@
 #   scripts/release-gates.sh              # run every gate, report, exit non-zero on any failure
 #   scripts/release-gates.sh --list       # print gate names and commands without running
 #   scripts/release-gates.sh --only NAME  # run one gate (repeatable)
-#   scripts/release-gates.sh --fuzz-campaign SECONDS
+#   scripts/release-gates.sh --cargo --fuzz-campaign SECONDS
 #                                         # additionally run the adversarial contract-fuzz
 #                                         # campaign from docs/security/adversarial-contract-fuzz.json
 #                                         # for SECONDS per target (needs cargo-fuzz; use the
@@ -32,8 +32,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --list) LIST_ONLY=1 ;;
     --cargo) WITH_CARGO=1 ;;
-    --only) shift; ONLY+=("${1:?--only needs a gate name}") ;;
-    --fuzz-campaign) shift; FUZZ_SECONDS="${1:?--fuzz-campaign needs seconds}" ;;
+    --only)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo '--only needs a gate name' >&2; exit 2; }
+      shift; ONLY+=("$1") ;;
+    --fuzz-campaign)
+      [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo '--fuzz-campaign needs a positive integer number of seconds' >&2; exit 2; }
+      shift; FUZZ_SECONDS="$1" ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -73,6 +77,7 @@ cargo_gate "ftui guardrails"                     "scripts/check_ftui_guardrails.
 cargo_gate "ftui tests"                          "scripts/check_ftui_tests.sh"
 cargo_gate "ftui docs"                           "scripts/check_ftui_docs.sh"
 gate "reality-check bead structure"              "scripts/check-reality-check-bead-structure.sh"
+gate "release gate selection"                    "bash tests/e2e/test_release_gate_selection.sh"
 # --- Attestation and contract verifiers ------------------------------------
 # Rebuilds the dev-channel bundle from the current tree (it is a generated
 # artifact, like PROVENANCE.json) and verifies it. A stale committed bundle
@@ -103,13 +108,6 @@ cargo_gate "Robot/MCP Contract Doctor cargo verdict" "cargo test -p frankenterm-
 # past that interval and requires an HTTP 200 over a plain TCP socket.
 cargo_gate "web api liveness after clock skew"  "cargo test -p frankenterm-core --lib web_framework::tests::server_started_after_runtime_clock_skew_answers_requests"
 
-if [[ $LIST_ONLY -eq 1 ]]; then
-  for i in "${!GATE_NAMES[@]}"; do
-    printf '%-7s %-46s %s\n' "[${GATE_KINDS[$i]}]" "${GATE_NAMES[$i]}" "${GATE_CMDS[$i]}"
-  done
-  exit 0
-fi
-
 selected() {
   [[ ${#ONLY[@]} -eq 0 ]] && return 0
   local want
@@ -119,6 +117,79 @@ selected() {
   return 1
 }
 
+# Validate the entire request before any gate can change generated artifacts.
+# In particular, a valid name followed by a typo must not partially execute.
+for want in "${ONLY[@]}"; do
+  found=0
+  for name in "${GATE_NAMES[@]}"; do
+    [[ "$want" != "$name" ]] || found=1
+  done
+  [[ $found -eq 1 ]] || { printf 'unknown gate: %s\n' "$want" >&2; exit 2; }
+done
+
+if [[ $LIST_ONLY -eq 1 ]]; then
+  for i in "${!GATE_NAMES[@]}"; do
+    selected "${GATE_NAMES[$i]}" || continue
+    printf '%-7s %-46s %s\n' "[${GATE_KINDS[$i]}]" "${GATE_NAMES[$i]}" "${GATE_CMDS[$i]}"
+  done
+  exit 0
+fi
+
+eligible=0
+for i in "${!GATE_NAMES[@]}"; do
+  name="${GATE_NAMES[$i]}"; cmd="${GATE_CMDS[$i]}"
+  selected "$name" || continue
+  if [[ "${GATE_KINDS[$i]}" == cargo && $WITH_CARGO -eq 0 ]]; then
+    if [[ ${#ONLY[@]} -gt 0 ]]; then
+      printf 'cargo gate requires --cargo on an admissible host: %s\n' "$name" >&2
+      exit 2
+    fi
+    continue
+  fi
+  read -r first_word second_word rest <<< "$cmd"
+  script=""
+  needs_execute=0
+  case "$first_word" in
+    scripts/*|tests/*) script="$first_word"; needs_execute=1 ;;
+    bash|python3) script="$second_word" ;;
+  esac
+  if [[ -n "$script" ]] && { [[ ! -f "$script" || ! -r "$script" ]] || { [[ $needs_execute -eq 1 && ! -x "$script" ]]; }; }; then
+    printf 'required gate unavailable: %s (%s)\n' "$name" "$script" >&2
+    exit 1
+  fi
+  if [[ $needs_execute -eq 0 ]] && ! command -v "$first_word" >/dev/null 2>&1; then
+    printf 'required gate executable unavailable: %s (%s)\n' "$name" "$first_word" >&2
+    exit 1
+  fi
+  eligible=$((eligible + 1))
+done
+
+FUZZ_TARGETS=""
+if [[ -n "$FUZZ_SECONDS" ]]; then
+  [[ $WITH_CARGO -eq 1 ]] || { echo 'fuzz campaign requires --cargo on an admissible host' >&2; exit 2; }
+  manifest=docs/security/adversarial-contract-fuzz.json
+  # Validate and capture in the parent shell: process substitution would hide
+  # jq failure and could report a successful campaign with zero targets.
+  if ! FUZZ_TARGETS=$(jq -er '
+    .targets | select(type == "array" and length > 0)
+    | select((map(.cargo_fuzz_target) | unique | length) == length)
+    | select(all(.[];
+        (.cargo_fuzz_target | type == "string" and test("^[a-z][a-z0-9_]*$")) and
+        (.seed_corpus | type == "string" and test("^fuzz/([A-Za-z0-9_-]+/)+$"))))
+    | .[] | [.cargo_fuzz_target, .seed_corpus] | @tsv
+  ' "$manifest"); then
+    echo 'invalid or empty adversarial contract-fuzz target manifest' >&2
+    exit 1
+  fi
+  while IFS=$'\t' read -r target corpus; do
+    [[ -d "$corpus" ]] || { printf 'missing fuzz seed corpus: %s\n' "$corpus" >&2; exit 1; }
+  done <<< "$FUZZ_TARGETS"
+  command -v cargo-fuzz >/dev/null 2>&1 || { echo 'cargo-fuzz not installed' >&2; exit 1; }
+fi
+[[ $eligible -gt 0 || -n "$FUZZ_TARGETS" ]] || { echo 'no executable gates selected' >&2; exit 1; }
+
+LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ft-release-gates.XXXXXXXX") || exit 1
+printf 'Retained gate logs: %s\n' "$LOG_DIR"
 pass=0 fail=0 skip=0
 declare -a FAILED=()
 for i in "${!GATE_NAMES[@]}"; do
@@ -129,23 +200,17 @@ for i in "${!GATE_NAMES[@]}"; do
     skip=$((skip + 1))
     continue
   fi
-  first_word="${cmd%% *}"
-  if [[ "$first_word" == scripts/* || "$first_word" == tests/* ]] && [[ ! -x "$first_word" ]]; then
-    printf 'SKIP %-46s (missing or not executable: %s)\n' "$name" "$first_word"
-    skip=$((skip + 1))
-    continue
-  fi
+  log_file="$LOG_DIR/gate-$i.log"
   start=$(date +%s)
-  if bash -c "$cmd" >"/tmp/release-gate.$$.log" 2>&1; then
+  if bash -c "$cmd" >"$log_file" 2>&1; then
     printf 'PASS %-46s (%ss)\n' "$name" "$(( $(date +%s) - start ))"
     pass=$((pass + 1))
   else
     printf 'FAIL %-46s (%ss) — last lines:\n' "$name" "$(( $(date +%s) - start ))"
-    tail -n 8 "/tmp/release-gate.$$.log" | sed 's/^/     | /'
+    tail -n 8 "$log_file" | sed 's/^/     | /'
     fail=$((fail + 1))
     FAILED+=("$name")
   fi
-  rm -f "/tmp/release-gate.$$.log"
 done
 
 # --- Optional adversarial contract-fuzz campaign ---------------------------
@@ -153,28 +218,22 @@ done
 # budget. The manifest declares 1800s (pull-request) and 86400s (release)
 # per target; pass the value for the campaign you are running.
 if [[ -n "$FUZZ_SECONDS" ]]; then
-  manifest=docs/security/adversarial-contract-fuzz.json
-  if ! command -v cargo-fuzz >/dev/null 2>&1 && ! cargo fuzz --version >/dev/null 2>&1; then
-    echo "FAIL adversarial contract-fuzz campaign (cargo-fuzz not installed)"
-    fail=$((fail + 1)); FAILED+=("adversarial contract-fuzz campaign")
-  else
     while IFS=$'\t' read -r target corpus; do
       name="fuzz:${target}"
+      log_file="$LOG_DIR/fuzz-$target.log"
       start=$(date +%s)
-      if (cd fuzz && cargo fuzz run "$target" "${corpus#fuzz/}" -- -max_total_time="$FUZZ_SECONDS") >"/tmp/release-gate.$$.log" 2>&1; then
+      if (cd fuzz && cargo fuzz run "$target" "${corpus#fuzz/}" -- -max_total_time="$FUZZ_SECONDS") >"$log_file" 2>&1; then
         printf 'PASS %-46s (%ss)\n' "$name" "$(( $(date +%s) - start ))"; pass=$((pass + 1))
       else
         printf 'FAIL %-46s (%ss) — last lines:\n' "$name" "$(( $(date +%s) - start ))"
-        tail -n 8 "/tmp/release-gate.$$.log" | sed 's/^/     | /'
+        tail -n 8 "$log_file" | sed 's/^/     | /'
         fail=$((fail + 1)); FAILED+=("$name")
       fi
-      rm -f "/tmp/release-gate.$$.log"
-    done < <(jq -r '.targets[] | [.cargo_fuzz_target, .corpus] | @tsv' "$manifest")
-  fi
+    done <<< "$FUZZ_TARGETS"
 fi
 
 echo "release gates: ${pass} passed, ${fail} failed, ${skip} skipped"
-if [[ $fail -gt 0 ]]; then
+if [[ $fail -gt 0 || $pass -eq 0 ]]; then
   printf '  failed: %s\n' "${FAILED[@]}"
   exit 1
 fi
