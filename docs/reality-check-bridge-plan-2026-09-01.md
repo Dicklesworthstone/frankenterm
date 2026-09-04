@@ -769,6 +769,10 @@ hardware, release, and human-review outcomes.
 
 ### 11.2 Current vision-to-implementation map
 
+This map records the intake boundaries for the numbered vision checklist
+earlier in this plan. Section 11.6 records subsequent repairs and their exact
+verification; fixing one defect does not close the entire product journey.
+
 `PARTIAL` means some real implementation exists; `UNPROVEN` means the claimed
 boundary lacks qualifying execution evidence; `NOT_STARTED` names a missing
 production route. A safe refusal is working refusal behavior, not delivery of
@@ -829,6 +833,8 @@ Existing G50–G80 remain in the graph; this map does not retire any capability.
 | G88 | Identity rows stacked above raw Vandermonde parity are singular for a valid 4-of-7 survivor set; reconstruction panics. | Use one systematic MDS generator, version incompatible parity explicitly, validate every shard and framing field, and test every small survivor subset plus the admitted 31-of-32 boundary. `ft-xxfwy.58`. |
 | G89 | Statistical documentation overstates tail, family-wise, and runtime guarantees; the empirical Bernstein implementation uses an unsupported curve, and conformal bands report training inclusion as future coverage. | Derive a valid per-stream confidence sequence, validate support/finite arithmetic, refuse unavailable finite conformal endpoints, and test independent numerical and future-rank oracles. `ft-xxfwy.59`. |
 | G90 | Redactor evidence scans original input rather than actual sequential replacements; any overlap receives full secret-removal credit. | Observe production replacements with source-byte provenance; require complete union coverage and reject invalid intervals; plant prefix/suffix/one-byte misses and verify actual output. `ft-xxfwy.60`. |
+| G91 | Webhook configuration uses a prefix/length check that admits `https://` without a host. A general URL parser alone also accepts forms the actual HTTP client rejects. | Validate semantic syntax/host and the exact raw bytes with the canonical transport parser; reject unsupported forms before delivery and omit credential-bearing input from errors. `ft-xxfwy.61` and `.61.1`. |
+| G92 | IPC generic Robot RPC accepts unbounded streaming commands and delegates through `spawn_blocking(cmd.output())`; handler execution has no request deadline, output cap, or cancellation/reap ownership. | Integrate IPC request cancellation/deadlines with owned child lifetime, bounded concurrent output drains, and explicit indeterminate mutation outcomes. Prove timeout/disconnect, flood, descendants, reaping, admission and no unsafe retry. `ft-xxfwy.62` and `.62.1`. |
 
 ### 11.4 Execution ordering and proof contract
 
@@ -1041,6 +1047,7 @@ the `/tmp` reports are session evidence and are not portable release artifacts.
 | `.58` | Version-2 systematic erasure, typed malformed/singular failures, full metadata/framing checks, and adversarial survivor tests. | No production distributed codec consumer was found. Authentication, durable replication, and recovery are separate requirements. Public `n <= 32` remains unchanged. |
 | `.59` | Summable confidence spending replaces the unsupported bound; support and finite arithmetic are checked. Conformal bands report future-rank coverage and refuse insufficient finite calibration. | IID/exchangeability assumptions, separate benchmark-family error budgets, and real performance experiments remain caller obligations. No p99 or hardware claim follows from a mean bound. |
 | `.60` | Redaction evidence follows actual sequential replacements and original byte provenance; every expected byte must be covered. | This repairs the oracle; it neither establishes a particular prior production secret leak nor substitutes for an external corpus and live read-path qualification. |
+| `.61` | Configuration checks both URL syntax/host and the actual HTTP client's raw-input parser, exposed through `runtime_async`; failures do not echo credentials. | Three real configuration regressions await strict remote proof. This is configuration admission, not endpoint reachability or an SSRF finding. |
 
 The initial OSC 52 remote compile exposed an ambiguous test macro import; the
 explicit import was repaired. The retained rerun on worker `vmi1227854`, job
@@ -1089,3 +1096,49 @@ records that `scripts/e2e_test.sh` contains cleanup paths that delete artifacts
 despite retention options. Repair those paths before executing the retained
 live-loop experiment under this repository's no-deletion rule. Neither
 problem is dismissed as pre-existing or silently represented as fixed.
+
+The final UBS sample review added G91/G92 after the original 20-leaf planning
+batch. Both received implementation and companion verification contracts before
+source work; `.62` remains open because correct IPC cancellation crosses the
+request handler, subprocess owner, output drains, and effect-outcome contract.
+A timeout around a detached blocking closure would leave the cause intact.
+The 22 new implementation leaves therefore have 22 verification companions.
+
+The first core remote batch passed **106/106 tests**: 41 erasure, 41 statistics,
+20 redactor matrix, three replacement-provenance, and one connector runtime
+regression. Worker `ovh-a`, job `j-30004650170122906`, baseline
+`c74e2dbf11aa52844155a5e3c470df7037a2fd24` plus explicit source overlay
+`60c570d6605e11723112a7469828f7261952132eaaaedae5e9b51ae586ddf9bd`;
+`/tmp/ft-reality-20260904-core-rch-attempt2.log`. The retained command names all
+five filters; individual libtest records were counted, not aggregate summary
+lines. The later webhook change and explicit `n=255` rejection case require
+their subsequent final-source run.
+
+OSC 52 final proof supersedes the earlier four-test receipt: **5/5 passed** on
+`167ba6147b60b187c3f232e4eb460311ff359909`, clean baseline/no overlay, worker
+`vmi1227854`, job `j-30004650170122915`. The new test covers failing callbacks,
+byte-split BEL/ST controls, continued parsing/query handling and callback
+recovery. Production diagnostics now discard arbitrary callback error payloads,
+which can contain clipboard data. Transcript:
+`/tmp/ft-reality-20260904-term-rch-private-errors.log`. `.43` and `.43.1` are
+closed on that scoped receipt; `.44` remains open. `.45` and `.45.1` are closed
+on the shell receipts above.
+
+The installed `ft 0.13.0 (3ebd60566)` also ran offline `rules test` controls.
+Ordinary synthetic output produced zero matches; a rate-limit message with a
+five-minute retry interval produced four matches across the all-pack test
+surface, with the expected extracted duration. An earlier generic rate-limit
+phrase without a duration produced no matches and is retained rather than
+hidden. These controls exercise the installed detector, not a live provider
+or workflow. Artifacts are the `installed-detection-*.json` files under
+`/tmp/ft-reality-20260904-*`.
+
+UBS was run through its Rust module with `--no-cargo`; the frontend does not
+accept that option. Full-file heuristic counts are not defect counts. In
+particular, the large CLI scan returned 515 critical-labelled matches, many
+from test panics, synthetic secret fixtures and intentional process execution.
+Sampled production contexts exposed G91/G92; they did not establish shell
+injection or request-controlled webhook URLs. Source reviews and the retained
+scanner reports do **not** assert that every warning in the whole codebase is
+resolved. The CLI scan's detailed JSON is malformed by unescaped samples;
+its summary and raw findings are retained under `/tmp/ft-reality-ubs-4.*`.
