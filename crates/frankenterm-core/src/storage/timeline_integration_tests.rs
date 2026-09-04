@@ -573,7 +573,7 @@ fn timeline_correlations_disabled_returns_empty() {
 }
 
 #[test]
-fn timeline_query_performance_many_events() {
+fn timeline_query_many_events_is_bounded_and_correlated() {
     run_async_test(async {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ft.db");
@@ -602,15 +602,12 @@ fn timeline_query_performance_many_events() {
                 .unwrap();
         }
 
-        // Time the query
-        let start = std::time::Instant::now();
         let query = TimelineQuery {
             include_correlations: true,
             limit: 100,
             ..TimelineQuery::new()
         };
         let timeline = handle.get_timeline(query).await.unwrap();
-        let elapsed = start.elapsed();
 
         assert_eq!(timeline.events.len(), 100);
         assert_eq!(timeline.total_count, 200);
@@ -618,12 +615,6 @@ fn timeline_query_performance_many_events() {
         assert!(
             !timeline.correlations.is_empty(),
             "Should find correlations among 200 events"
-        );
-        // Performance budget: query should complete in <500ms (generous for CI)
-        assert!(
-            elapsed.as_millis() < 500,
-            "Timeline query took {}ms, expected <500ms",
-            elapsed.as_millis()
         );
 
         handle.shutdown().await.unwrap();

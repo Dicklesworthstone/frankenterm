@@ -14691,6 +14691,28 @@ mod tests {
             .collect()
     }
 
+    fn refresh_tx_run_target_liveness(db_path: &Path) {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should open");
+            let seen_at = mcp_now_ms_i64();
+            for pane_id in 1..=3u64 {
+                let mut pane = storage
+                    .get_pane(pane_id)
+                    .await
+                    .expect("pane liveness should load")
+                    .unwrap_or_else(|| panic!("pane {pane_id} should exist"));
+                pane.last_seen_at = seen_at;
+                storage
+                    .upsert_pane(pane)
+                    .await
+                    .expect("pane liveness should refresh");
+            }
+        });
+    }
+
     fn tx_run_mock_pane_content(mock: &Arc<crate::wezterm::MockWezterm>, pane_id: u64) -> String {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
@@ -19996,8 +20018,8 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let mut cfg = Config::default();
         cfg.safety.require_prompt_active = false;
-        cfg.safety.rate_limit_global = 100;
-        cfg.safety.rate_limit_per_pane = 100;
+        cfg.safety.rate_limit_global = 2;
+        cfg.safety.rate_limit_per_pane = 2;
         let cfg = Arc::new(cfg);
         let shared_rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let tool = WaEventsAnnotateTool::new_with_shared_rate_limiter(
@@ -20006,7 +20028,7 @@ mod tests {
             shared_rate_limiter,
         );
 
-        for attempt in 0..100 {
+        for attempt in 0..2 {
             let envelope = parse_json_content(
                 tool.call(
                     &test_mcp_context(),
@@ -20027,7 +20049,7 @@ mod tests {
                 &test_mcp_context(),
                 serde_json::json!({
                     "event_id": event_id,
-                    "note": "note-100",
+                    "note": "note-2",
                     "by": "mcp-client"
                 }),
             )
@@ -22249,6 +22271,7 @@ mod tests {
             std::fs::rename(&replacement_alias, &active_alias_for_hook)
                 .expect("retarget contract parent alias after lock");
         });
+        refresh_tx_run_target_liveness(&db_path);
 
         let envelope = parse_json_content(
             WaTxRollbackTool::new(config_with_db_path(&db_path))

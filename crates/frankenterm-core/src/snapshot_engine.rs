@@ -13811,6 +13811,7 @@ mod tests {
             });
 
             await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
+            await_capture_successes(&engine, 1, "startup capture settlement").await;
             let owner = engine
                 .try_begin_snapshot_authority(SnapshotAuthorityOperation::CheckpointCleanup)
                 .expect("test authority owner");
@@ -19498,6 +19499,27 @@ mod tests {
         assert_eq!(
             observed, expected,
             "{label}: expected {expected} checkpoint(s) within {WAIT_BUDGET:?}, saw {observed}"
+        );
+    }
+
+    /// Wait for the capture future to publish its post-commit success receipt.
+    /// A checkpoint row is visible to a separate SQLite connection before the
+    /// scheduler has received the blocking result and released mutation
+    /// authority, so database visibility alone is not a settlement signal.
+    async fn await_capture_successes(engine: &SnapshotEngine, expected: u64, label: &str) {
+        const WAIT_BUDGET: Duration = Duration::from_secs(10);
+        const POLL_STEP: Duration = Duration::from_millis(20);
+
+        let deadline = Instant::now() + WAIT_BUDGET;
+        let mut observed = engine.telemetry().snapshot().captures_succeeded;
+        while observed < expected && Instant::now() < deadline {
+            sleep(POLL_STEP).await;
+            observed = engine.telemetry().snapshot().captures_succeeded;
+        }
+
+        assert!(
+            observed >= expected,
+            "{label}: expected at least {expected} settled capture(s) within {WAIT_BUDGET:?}, saw {observed}"
         );
     }
 

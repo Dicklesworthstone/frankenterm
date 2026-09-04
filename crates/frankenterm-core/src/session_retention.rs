@@ -1440,12 +1440,41 @@ fn delete_excess_closed_sessions(
 }
 
 #[cfg(test)]
+fn retention_phase_test_step_budget(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let row_count: i64 = conn.query_row(
+        "SELECT MAX(
+             (SELECT COUNT(*) FROM mux_sessions),
+             (SELECT COUNT(*) FROM session_recovery_usability)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let row_count = usize::try_from(row_count)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, row_count))?;
+
+    // Population, dirty-row reconciliation, and final candidate selection
+    // each make durable progress over a finite row set. Three steps per row
+    // plus terminal empty-batch checks is therefore a deliberately loose but
+    // history-derived upper bound that also covers wall-budget batches that
+    // settle only one canonical recovery candidate at a time.
+    Ok(row_count.saturating_mul(3).saturating_add(6))
+}
+
+#[cfg(test)]
 fn delete_excess_closed_sessions_with_observer(
     conn: &Connection,
     max_count: usize,
     observer: &impl SessionOwnerObserver,
 ) -> Result<usize, rusqlite::Error> {
-    Ok(delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?.value)
+    let step_budget = retention_phase_test_step_budget(conn)?;
+    for _ in 0..step_budget {
+        let outcome =
+            delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?;
+        if !outcome.recovery_reconciliation_pending {
+            return Ok(outcome.value);
+        }
+    }
+    panic!("count retention did not converge within {step_budget} bounded recovery steps");
 }
 
 fn delete_excess_closed_sessions_phase_with_observer(
@@ -1696,7 +1725,15 @@ fn delete_sessions_by_size_with_observer(
     max_total_mb: u64,
     observer: &impl SessionOwnerObserver,
 ) -> Result<SizeCleanupOutcome, rusqlite::Error> {
-    Ok(delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?.value)
+    let step_budget = retention_phase_test_step_budget(conn)?;
+    for _ in 0..step_budget {
+        let outcome =
+            delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?;
+        if !outcome.recovery_reconciliation_pending {
+            return Ok(outcome.value);
+        }
+    }
+    panic!("size retention did not converge within {step_budget} bounded recovery steps");
 }
 
 fn delete_sessions_by_size_phase_with_observer(
@@ -3147,9 +3184,14 @@ mod tests {
         )
         .unwrap();
 
+        let first =
+            delete_excess_closed_sessions_phase_with_observer(&conn, 0, &dead).unwrap();
+        assert!(
+            first.recovery_reconciliation_pending,
+            "the first bounded legacy batch must remain explicitly pending"
+        );
         assert_eq!(
-            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
-            0,
+            first.value, 0,
             "the first bounded legacy batch must never authorize deletion"
         );
         let first_batch: i64 = conn
@@ -3397,21 +3439,18 @@ mod tests {
             .unwrap();
         }
 
+        let first =
+            delete_excess_closed_sessions_phase_with_observer(&conn, 0, &dead).unwrap();
+        assert!(
+            first.recovery_reconciliation_pending,
+            "the first reconciliation batch must remain explicitly pending"
+        );
         assert_eq!(
-            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
-            0,
+            first.value, 0,
             "the first reconciliation batch must commit progress without deleting"
         );
         assert_eq!(count_sessions(&conn), 14);
-        let mut deleted = 0_usize;
-        for _ in 0..8 {
-            deleted = deleted.saturating_add(
-                delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
-            );
-            if deleted == 13 {
-                break;
-            }
-        }
+        let deleted = delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap();
         assert_eq!(deleted, 13);
         assert_eq!(count_sessions(&conn), 1);
         assert_eq!(
