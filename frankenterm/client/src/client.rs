@@ -2350,27 +2350,6 @@ impl RpcTransportState {
             .validate_inbound(spec, role)
     }
 
-    fn validate_inbound_identity(
-        &self,
-        generation: NonZeroU64,
-        serial: u64,
-        ident: u64,
-    ) -> Result<(), OrdinaryMuxProtocolError> {
-        let spec = Pdu::wire_spec_for_ident(ident).ok_or(OrdinaryMuxProtocolError::UnknownPdu {
-            direction: RpcProtocolDirection::Inbound,
-            ident,
-        })?;
-        let role = if serial == 0 {
-            PduWireRole::Unilateral
-        } else {
-            PduWireRole::CorrelatedReply
-        };
-        self.lifecycle
-            .lock()
-            .protocol_for(generation)?
-            .validate_inbound(spec, role)
-    }
-
     fn rollback_unadmitted_outbound(
         &self,
         generation: NonZeroU64,
@@ -6030,33 +6009,6 @@ fn validate_ordinary_mux_inbound_header(
     Ok(())
 }
 
-/// Post-materialization counterpart used only by the exact codec-46 decoder.
-/// Current dialects retain the selector/header path above, including bounded
-/// tombstone drainage.
-#[inline]
-fn validate_legacy_mux_inbound_identity(
-    rpc_transport: &RpcTransportState,
-    generation: NonZeroU64,
-    serial: u64,
-    ident: u64,
-    highest_issued: u64,
-) -> anyhow::Result<()> {
-    if let Err(error) = rpc_transport.validate_inbound_identity(generation, serial, ident) {
-        record_ordinary_mux_protocol_rejection(&error, "inbound", "legacy_materialized");
-        return Err(anyhow::Error::new(
-            NotReconnectableError::ProtocolViolation(error),
-        ));
-    }
-    if serial > highest_issued {
-        return Err(anyhow::Error::new(CorruptResponse::SerialAboveCeiling {
-            serial,
-            max_serial: highest_issued,
-        })
-        .context("decoding a legacy dialect PDU"));
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 struct PendingRpc {
     completion: Sender<anyhow::Result<PendingRpcReply>>,
@@ -7830,21 +7782,22 @@ async fn client_thread_async(
                                 .wire_dialect(generation)
                                 .map_err(NotReconnectableError::ProtocolViolation)?;
                             if dialect.is_legacy46() {
-                                let decoded = Pdu::decode_async_for_dialect(
+                                let decoded = Pdu::decode_async_for_dialect_with_header_validator(
                                     &mut reader,
                                     None,
                                     dialect,
+                                    |header| {
+                                        validate_ordinary_mux_inbound_header(
+                                            &rpc_transport,
+                                            generation,
+                                            header,
+                                            highest_issued,
+                                        )
+                                    },
                                 )
                                 .await?;
                                 let serial = decoded.serial();
                                 let ident = decoded.payload().ident();
-                                validate_legacy_mux_inbound_identity(
-                                    &rpc_transport,
-                                    generation,
-                                    serial,
-                                    ident,
-                                    highest_issued,
-                                )?;
                                 let effect = NonZeroU64::new(serial)
                                     .map(|serial| {
                                         pending.legacy_materialized_response_effect(serial, ident)

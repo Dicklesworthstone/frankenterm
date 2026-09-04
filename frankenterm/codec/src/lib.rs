@@ -1264,12 +1264,13 @@ async fn read_payload_chunked_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     Ok(data)
 }
 
-/// Validated mux frame metadata whose payload has not yet been read.
+/// Structurally validated mux frame metadata whose payload has not yet been read.
 ///
 /// The fields are intentionally private and this type is intentionally neither
-/// `Clone` nor `Copy`. It is exposed only by reference to the synchronous
-/// selector passed to [`Pdu::decode_async_with_selector`], so external callers
-/// cannot leave the ordered stream half-consumed by taking ownership of it.
+/// `Clone` nor `Copy`. It is exposed only by reference to synchronous policy
+/// callbacks, so external callers cannot leave the ordered stream half-consumed
+/// by taking ownership of it. Each decoder documents whether its body ceiling
+/// is applied before or after that callback.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PduFrameHeader {
     frame_len: u64,
@@ -1463,13 +1464,24 @@ async fn decode_raw_header_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
 ) -> anyhow::Result<PduFrameHeader> {
-    decode_raw_header_async_with_dialect(r, max_serial, None).await
+    let header = decode_raw_header_async_unadmitted(r, max_serial).await?;
+    validate_encoded_body_admission(
+        header.data_len,
+        header.serial,
+        header.ident,
+        header.is_compressed,
+    )?;
+    record_decoded_header_size(&header);
+    Ok(header)
 }
 
-async fn decode_raw_header_async_with_dialect<R: Unpin + AsyncRead + std::fmt::Debug>(
+/// Parse and structurally validate one header without admitting its body.
+///
+/// The caller must apply an encoded-body ceiling before allocating, draining,
+/// or materializing the payload bytes described by the returned header.
+async fn decode_raw_header_async_unadmitted<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
-    dialect: Option<MuxWireDialect>,
 ) -> anyhow::Result<PduFrameHeader> {
     let (len, _len_len) = read_u64_async_with_len(r)
         .await
@@ -1499,23 +1511,6 @@ async fn decode_raw_header_async_with_dialect<R: Unpin + AsyncRead + std::fmt::D
         ident_len,
     )?;
 
-    match dialect {
-        Some(dialect) => validate_encoded_body_admission_for_dialect(
-            data_len,
-            serial,
-            ident,
-            is_compressed,
-            dialect,
-        )?,
-        None => validate_encoded_body_admission(data_len, serial, ident, is_compressed)?,
-    }
-
-    if is_compressed {
-        metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
-    } else {
-        metrics::histogram!("pdu.decode.size").record(data_len as f64);
-    }
-
     Ok(PduFrameHeader {
         frame_len: len,
         data_len,
@@ -1523,6 +1518,14 @@ async fn decode_raw_header_async_with_dialect<R: Unpin + AsyncRead + std::fmt::D
         ident,
         is_compressed,
     })
+}
+
+fn record_decoded_header_size(header: &PduFrameHeader) {
+    if header.is_compressed {
+        metrics::histogram!("pdu.decode.compressed.size").record(header.data_len as f64);
+    } else {
+        metrics::histogram!("pdu.decode.size").record(header.data_len as f64);
+    }
 }
 
 async fn decode_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
@@ -5795,9 +5798,45 @@ impl Pdu {
     where
         R: std::marker::Unpin + AsyncRead + std::fmt::Debug,
     {
-        let header = decode_raw_header_async_with_dialect(r, max_serial, Some(dialect))
+        Self::decode_async_for_dialect_with_header_validator(
+            r,
+            max_serial,
+            dialect,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Decode one complete frame under an exact dialect while allowing the
+    /// caller to reject its structural header before dialect body admission.
+    ///
+    /// The callback runs after the length, serial, and identifier are parsed,
+    /// but before the dialect-specific body ceiling is applied and before any
+    /// payload byte is allocated or consumed. A callback error therefore
+    /// requires the caller to retire the ordered stream with its body unread.
+    pub async fn decode_async_for_dialect_with_header_validator<R, F>(
+        r: &mut R,
+        max_serial: Option<u64>,
+        dialect: MuxWireDialect,
+        validate_header: F,
+    ) -> Result<DecodedMuxWirePdu, Error>
+    where
+        R: std::marker::Unpin + AsyncRead + std::fmt::Debug,
+        F: FnOnce(&PduFrameHeader) -> Result<(), Error>,
+    {
+        let header = decode_raw_header_async_unadmitted(r, max_serial)
             .await
             .context("decoding a dialect PDU")?;
+        validate_header(&header)?;
+        validate_encoded_body_admission_for_dialect(
+            header.data_len,
+            header.serial,
+            header.ident,
+            header.is_compressed,
+            dialect,
+        )
+        .context("decoding a dialect PDU")?;
+        record_decoded_header_size(&header);
         let decoded = decode_raw_body_async(r, header)
             .await
             .context("decoding a dialect PDU")?;
@@ -27992,6 +28031,60 @@ mod test {
         assert_eq!(
             topology.floating_pane_state(),
             Legacy46FloatingPaneState::Unavailable
+        );
+    }
+
+    #[test]
+    fn legacy46_header_validator_precedes_absent_pdu_body_admission() {
+        let ident = <ListPanesCoherentResponse as PduWireIdent>::IDENT;
+        let payload = [0x3c_u8; 8_192];
+        let mut wire = Vec::new();
+        encode_raw(ident, 1, &payload, true, &mut wire).expect("frame above-v46 PDU");
+        let header_len = wire
+            .len()
+            .checked_sub(payload.len())
+            .expect("encoded frame contains its payload");
+
+        let (error, reader_position, validator_called) = runtime::block_on(async move {
+            let mut reader = runtime::Cursor::new(wire);
+            let mut validator_called = false;
+            let error = Pdu::decode_async_for_dialect_with_header_validator(
+                &mut reader,
+                Some(1),
+                MuxWireDialect::LEGACY46,
+                |header| {
+                    validator_called = true;
+                    assert_eq!(header.serial(), 1);
+                    assert_eq!(header.ident(), ident);
+                    assert_eq!(header.encoded_payload_len(), payload.len());
+                    assert!(header.is_compressed());
+                    anyhow::bail!("test header policy rejection")
+                },
+            )
+            .await
+            .expect_err("header policy must reject before dialect body admission");
+            (error, reader.position(), validator_called)
+        });
+
+        assert!(validator_called);
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "test header policy rejection"),
+            "unexpected header policy error: {:#}",
+            error
+        );
+        assert!(
+            error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_none(),
+            "dialect body admission ran before header policy: {:#}",
+            error
+        );
+        assert_eq!(
+            usize::try_from(reader_position).expect("reader position fits usize"),
+            header_len,
+            "header policy rejection must leave the encoded body unread"
         );
     }
 

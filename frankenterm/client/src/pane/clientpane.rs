@@ -6110,7 +6110,7 @@ mod tests {
         ));
         assert!(matches!(
             raced,
-            ReliableInputAttempt::Retry(delay, "connection_identity_unavailable")
+            ReliableInputAttempt::Retry(delay, "transport_not_ready")
                 if delay == RELIABLE_INPUT_TRANSPORT_RETRY_DELAY
         ));
         assert_eq!(
@@ -6189,7 +6189,7 @@ mod tests {
         ));
         assert!(matches!(
             retired_scope,
-            ReliableInputAttempt::Retry(delay, "connection_identity_unavailable")
+            ReliableInputAttempt::Retry(delay, "transport_not_ready")
                 if delay == RELIABLE_INPUT_TRANSPORT_RETRY_DELAY
         ));
         let pre_v64 = promise::spawn::block_on(ReliableInputQueue::attempt(
