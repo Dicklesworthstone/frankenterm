@@ -10183,7 +10183,28 @@ fn process_connector_outbound_runtime_event(
     }
 
     for action in bridge.drain_actions() {
-        dispatch_connector_outbound_action(bridge, &action, now_ms);
+        if let Err(error) = dispatch_connector_outbound_action(bridge, &action, now_ms) {
+            warn!(
+                error_code = error.code(),
+                error_kind = "permanent",
+                delivered = false,
+                "connector outbound action was not dispatched"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum ConnectorOutboundDeliveryError {
+    #[error("connector transport is unavailable; the action was not dispatched")]
+    TransportUnavailable,
+}
+
+impl ConnectorOutboundDeliveryError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::TransportUnavailable => "connector_transport_unavailable",
+        }
     }
 }
 
@@ -10191,61 +10212,15 @@ fn dispatch_connector_outbound_action(
     bridge: &mut ConnectorOutboundBridge,
     action: &ConnectorAction,
     now_ms: u64,
-) {
-    let operation_name = format!(
-        "connector.{}.{}",
-        action.target_connector,
-        action.action_kind.as_str()
-    );
-    let mut request = crate::connector_host_runtime::ConnectorOperationRequest::new(
-        operation_name,
-        action.correlation_id.clone(),
-        action.dispatch_capability(),
-    );
-    if let Some(target) = action.sandbox_target() {
-        request = request.with_target(target);
-    }
-    let result = bridge
-        .policy_engine_mut()
-        .route_connector_operation_through_mesh(action.target_connector.clone(), request, now_ms);
-
-    match result {
-        Ok(dispatch) => {
-            bridge.record_action_success(action, now_ms);
-            info!(
-                connector = %action.target_connector,
-                action = %action.action_kind,
-                correlation_id = %action.correlation_id,
-                operation_id = %dispatch.operation_envelope.operation_id,
-                host_id = %dispatch.routing_decision.host_id,
-                zone_id = %dispatch.routing_decision.zone_id,
-                "connector outbound action accepted by mesh-routed host runtime"
-            );
-        }
-        Err(err) => {
-            let kind = connector_operation_dispatch_error_kind(&err);
-            let dlq_entry_id = bridge.record_action_failure(action, err.to_string(), kind, now_ms);
-            warn!(
-                connector = %action.target_connector,
-                action = %action.action_kind,
-                correlation_id = %action.correlation_id,
-                error = %err,
-                error_kind = %kind,
-                dlq_entry_id = ?dlq_entry_id,
-                "connector outbound action rejected by host runtime"
-            );
-        }
-    }
-}
-
-fn connector_operation_dispatch_error_kind(
-    err: &crate::policy::ConnectorOperationDispatchError,
-) -> ConnectorErrorKind {
-    if err.is_retryable() {
-        ConnectorErrorKind::ServiceUnavailable
-    } else {
-        ConnectorErrorKind::Permanent
-    }
+) -> std::result::Result<(), ConnectorOutboundDeliveryError> {
+    // The policy host/mesh APIs model admission and return an envelope; they
+    // do not execute a connector. Do not synthesize host health or count that
+    // envelope as delivery. Actual transport and receipts are ft-xxfwy.47.
+    let error = ConnectorOutboundDeliveryError::TransportUnavailable;
+    bridge.record_action_failure(action, error.code(), ConnectorErrorKind::Permanent, now_ms);
+    // Missing implementation cannot recover by retrying this action. Permanent
+    // classification records the refusal without feeding the retry/DLQ loop.
+    Err(error)
 }
 
 async fn remove_runtime_pane_state_for_panes(
