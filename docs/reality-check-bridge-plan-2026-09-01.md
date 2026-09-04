@@ -938,3 +938,18 @@ dependency rationale. Shared qualification contracts are strengthened rather
 than duplicated. Capability advertising must depend on reachable configured
 providers; feature unification in a workspace build cannot stand in for the
 actual shipped binary's feature set.
+
+**Refinement 1 — ownership and stale premises.** Expanded `ft-rxk40` from an
+empty description into a complete production extension contract. Rewrote
+`ft-7h5da.10.4.4` around authenticated receipt consumption because its reader
+now exists. Corrected `ft-xxfwy.15` to supported Ed25519/Sigstore signing,
+current DSR wiring, and strict rejection of every deferred slot. Added
+connector lifecycle graduated-tier enforcement to the live-switch follow-up.
+
+**Refinement 2 — adversarial oracles.** Added G90/`ft-xxfwy.60`: redactor
+coverage currently treats any overlap as full recall; require union coverage
+of every secret byte and planted partial-redaction failures. Strengthened
+erasure tests against old/new parity ambiguity and field boundaries; tightened
+statistical boundary cases and live-loop provenance. Extended the release-gate
+repair to the GPU harness's executable legacy local-Cargo bypass. These tests
+must detect the original defect, not mirror its implementation.
