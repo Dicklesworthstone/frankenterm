@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn deserialization_cannot_bypass_config_validation() {
-        for (k, n) in [(0, 5), (3, 0), (5, 3), (3, 33)] {
+        for (k, n) in [(0, 5), (3, 0), (5, 3), (3, 33), (3, 255)] {
             assert!(
                 serde_json::from_value::<ErasureConfig>(serde_json::json!({"k": k, "n": n}))
                     .is_err()
