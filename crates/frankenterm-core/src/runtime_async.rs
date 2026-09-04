@@ -34,7 +34,7 @@ pub use asupersync::types::Time as RuntimeTime;
 /// concrete client, method, and client error needed by FrankenTerm, not a
 /// wildcard re-export of Asupersync's HTTP implementation.
 pub mod http {
-    pub use asupersync::http::h1::http_client::ClientError;
+    pub use asupersync::http::h1::http_client::{ClientError, ParsedUrl};
     pub use asupersync::http::h1::{HttpClient, Method, Response};
 }
 
