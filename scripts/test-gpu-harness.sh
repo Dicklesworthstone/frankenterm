@@ -19,6 +19,8 @@ set -euo pipefail
 #   GPU_HARNESS_RUN_DIR    run artifact directory override
 #   GPU_HARNESS_CARGO_ARGS extra cargo args before "--" (space-separated)
 #   GPU_HARNESS_RCH_TARGET_DIR repo-relative remote CARGO_TARGET_DIR override
+# Fixture filters and adapter expectations are forwarded explicitly. Custom
+# fixture roots require separate source-sync admission and are refused here.
 # Cargo always uses strict remote RCH. Native release orchestration uses DSR.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,6 +73,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "${GPU_HARNESS_FIXTURE_ROOT:-}" ]]; then
+  printf '%s\n' 'GPU-HARNESS-UNADMITTED-FIXTURE-ROOT: custom fixture roots require verified remote source admission; refusing to ignore or reinterpret GPU_HARNESS_FIXTURE_ROOT.' >&2
+  exit 2
+fi
 
 json_string() {
   python3 - "$1" <<'PY'
@@ -232,7 +239,7 @@ collect_diff_artifacts() {
 write_summary() {
   local exit_code="$1"
   local duration_ms="$2"
-  python3 - "$EVENTS_JSONL" "$SUMMARY_JSON" "$PARITY_REPORT_JSON" "$RUN_ID" "$RUN_DIR" "$ARTIFACT_DIR" "$DIFF_DIR" "$PROJECT_ROOT" "$PERF_REPORT" "$LOG_FILE" "$exit_code" "$duration_ms" <<'PY'
+  python3 - "$EVENTS_JSONL" "$SUMMARY_JSON" "$PARITY_REPORT_JSON" "$RUN_ID" "$RUN_DIR" "$ARTIFACT_DIR" "$DIFF_DIR" "$PROJECT_ROOT" "$PERF_REPORT" "$LOG_FILE" "$exit_code" "$duration_ms" ${HARNESS_ARGS[@]+"${HARNESS_ARGS[@]}"} <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -250,7 +257,23 @@ from pathlib import Path
     log_file,
     exit_code,
     duration_ms,
+    *harness_args,
 ) = sys.argv[1:]
+
+# Match the harness's real_main dispatch precedence. Diagnostic modes do not
+# establish fixture parity, even when their own checks succeed.
+if "--self-test" in harness_args:
+    mode, completion_phase, completion_status = "self-test", "self-test", "pass"
+elif "--headless-render-self-test" in harness_args:
+    mode, completion_phase, completion_status = "headless-render-self-test", "render-summary", "pass"
+elif "--perf-self-test" in harness_args:
+    mode, completion_phase, completion_status = "perf-self-test", "perf-self-test", "pass"
+elif any(arg.startswith(("--fuzz-seed=", "--fuzz-duration=", "--fuzz-start-at=")) for arg in harness_args):
+    mode, completion_phase, completion_status = "fuzz", "fuzz-summary", "pass"
+elif any(arg.startswith(("--comparison-report=", "--comparison-frankenterm-frames=", "--comparison-wezterm-frames=")) for arg in harness_args):
+    mode, completion_phase, completion_status = "comparison", "wezterm-comparison-report", "written"
+else:
+    mode, completion_phase, completion_status = "fixtures", "summary", None
 
 events = []
 if Path(events_path).exists():
@@ -332,6 +355,46 @@ total = summary_event.get("total", len(fixture_events))
 failed = summary_event.get("failed", len(failures))
 passed = summary_event.get("passed", max(0, total - failed))
 
+validation_error = None
+exit_code = int(exit_code)
+if exit_code == 0:
+    if mode == "fixtures":
+        counts_valid = all(type(count) is int and count >= 0 for count in (total, passed, failed))
+        names = [event.get("name") for event in fixture_events]
+        if (
+            not summary_event
+            or not counts_valid
+            or total <= 0
+            or passed + failed != total
+            or len(fixture_events) != total
+            or any(not isinstance(name, str) or not name for name in names)
+            or len(set(names)) != total
+            or sum(event.get("status") == "pass" for event in fixture_events) != passed
+            or sum(event.get("status") == "fail" for event in fixture_events) != failed
+            or failed != 0
+            or failures
+        ):
+            validation_error = "GPU-HARNESS-INCOMPLETE-FIXTURE-EVIDENCE"
+    else:
+        completed = [event for event in events if event.get("phase") == completion_phase]
+        terminal = completed[-1] if completed else {}
+        if terminal.get("status") != completion_status:
+            validation_error = "GPU-HARNESS-INCOMPLETE-DIAGNOSTIC-EVIDENCE"
+        elif mode == "headless-render-self-test" and (
+            type(terminal.get("iterations")) is not int or terminal["iterations"] <= 0
+        ):
+            validation_error = "GPU-HARNESS-INCOMPLETE-DIAGNOSTIC-EVIDENCE"
+        elif mode == "fuzz" and (
+            type(terminal.get("events_processed")) is not int
+            or terminal["events_processed"] <= 0
+            or terminal.get("critical_count") != 0
+        ):
+            validation_error = "GPU-HARNESS-INCOMPLETE-DIAGNOSTIC-EVIDENCE"
+    if validation_error:
+        exit_code = 1
+
+parity_qualified = mode == "fixtures" and exit_code == 0
+
 summary = {
     "run_id": run_id,
     "total": total,
@@ -339,6 +402,9 @@ summary = {
     "failed": failed,
     "duration_ms": int(duration_ms),
     "exit_code": int(exit_code),
+    "mode": mode,
+    "parity_qualified": parity_qualified,
+    "validation_error": validation_error,
     "failures": failures,
     "artifacts": {
         "run_dir": run_dir,
@@ -354,8 +420,11 @@ Path(summary_path).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\
 
 parity_report = {
     "schema_version": "1.0.0",
-    "category": "tui/render-parity",
-    "kind": "headless-gpu-renderer-parity",
+    "category": "tui/render-parity" if mode == "fixtures" else "tui/render-diagnostic",
+    "kind": "headless-gpu-renderer-parity" if mode == "fixtures" else f"gpu-harness-{mode}",
+    "mode": mode,
+    "parity_qualified": parity_qualified,
+    "validation_error": validation_error,
     "produced_by_bead": "ft-35yac.1.2",
     "run_id": run_id,
     "result": {
@@ -418,6 +487,7 @@ exit_event = {
     "summary": summary_path,
 }
 print(json.dumps(exit_event, separators=(",", ":"), sort_keys=True), file=sys.stderr)
+sys.exit(exit_code)
 PY
 }
 
@@ -432,6 +502,12 @@ set +e
   # shellcheck disable=SC2016
   run_rch_cargo_logged "$LOG_FILE" \
     env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+      GPU_HARNESS_FIXTURE_FILTER="${GPU_HARNESS_FIXTURE_FILTER:-}" \
+      FT_GPU_HARNESS_FORCE_SOFTWARE="${FT_GPU_HARNESS_FORCE_SOFTWARE:-}" \
+      FT_GPU_HARNESS_EXPECT_SOFTWARE="${FT_GPU_HARNESS_EXPECT_SOFTWARE:-}" \
+      FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING="${FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING:-}" \
+      SET_GOLDEN="${SET_GOLDEN:-}" \
+      SET_PERF_BASELINE="${SET_PERF_BASELINE:-}" \
       FT_GPU_HARNESS_ARTIFACTS_BEGIN="$REMOTE_ARTIFACTS_BEGIN" \
       FT_GPU_HARNESS_ARTIFACTS_END="$REMOTE_ARTIFACTS_END" \
       bash -lc '
@@ -461,6 +537,7 @@ set +e
 
       set +e
       env GPU_HARNESS_ARTIFACT_DIR="$remote_artifact_dir" GPU_HARNESS_PERF_REPORT="$remote_perf_report" \
+        GPU_HARNESS_FIXTURE_ROOT="$remote_project_root/tests/golden/gpu" \
         cargo test --locked \
           -p frankenterm-gui \
           --features headless-render \
@@ -511,8 +588,11 @@ emit_run "$run_exit_code"
 extract_json_lines
 extract_remote_artifacts
 collect_diff_artifacts
+set +e
 write_summary "$run_exit_code" "$duration_ms"
+summary_exit_code=$?
+set -e
 emit_summary_json
 emit_parity_report_json
 
-exit "$run_exit_code"
+exit "$summary_exit_code"

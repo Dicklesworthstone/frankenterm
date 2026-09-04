@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
-# CI/Nightly recorder validation gates (wa-oegrb.7.5)
+# Remote recorder validation gates (wa-oegrb.7.5)
 #
 # Runs explicit validation harnesses for:
 #   - chaos/failure matrix
 #   - recovery drills
 #   - correctness invariants
 #   - semantic/hybrid quality
-#   - load harness (compile-only in CI, optional run in nightly)
+#   - load harness (compile-only by default, optional measured run)
 #
 # Artifacts are written under target/recorder-validation-gates/.
 #
-# Environment:
-#   FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO
-#                           set to 1 only in GitHub Actions recorder jobs, where
-#                           the GitHub-hosted runner is the CI execution target
-#                           and the local agent/operator RCH offload policy is
-#                           not available.
+# Cargo always uses strict remote RCH. Release orchestration uses DSR.
 # =============================================================================
 
 set -euo pipefail
@@ -25,24 +20,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-github_actions_local_cargo_enabled() {
-    case "${FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO:-}" in
-        1|true|TRUE|yes|YES) ;;
-        *) return 1 ;;
-    esac
-
-    [[ "${GITHUB_ACTIONS:-}" == "true" ]]
-}
-
 RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
 ARTIFACT_DIR="${FT_RECORDER_VALIDATION_ARTIFACT_DIR:-target/recorder-validation-gates}"
-if github_actions_local_cargo_enabled; then
-    EXECUTION_MODE="github_actions_local_cargo"
-    DEFAULT_TARGET_DIR="target/github-actions-recorder-validation-gates-${RUN_ID}"
-else
-    EXECUTION_MODE="rch"
-    DEFAULT_TARGET_DIR="target/rch-recorder-validation-gates-${RUN_ID}"
-fi
+EXECUTION_MODE="rch"
+DEFAULT_TARGET_DIR="target/rch-recorder-validation-gates-${RUN_ID}"
 REQUESTED_TARGET_DIR="${FT_RECORDER_VALIDATION_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 if [[ -n "$REQUESTED_TARGET_DIR" && "$REQUESTED_TARGET_DIR" != /* ]]; then
     TARGET_DIR="$REQUESTED_TARGET_DIR"
@@ -55,14 +36,10 @@ mkdir -p "$ARTIFACT_DIR"
 
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 RCH_STEP_TIMEOUT_SECS="${FT_RECORDER_VALIDATION_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
-if github_actions_local_cargo_enabled; then
-    echo "[recorder-gates] GitHub Actions local Cargo mode enabled"
-else
-    # shellcheck source=tests/e2e/lib_rch_guards.sh
-    source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
-    rch_init "$ARTIFACT_DIR" "$RUN_ID" "recorder_validation_gates" "$PROJECT_ROOT"
-    ensure_rch_ready
-fi
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "recorder_validation_gates" "$PROJECT_ROOT"
+ensure_rch_ready
 
 # Explicit gate thresholds
 MIN_CHAOS_SUMMARY_ARTIFACTS=1
@@ -91,11 +68,7 @@ run_step() {
     echo "[recorder-gates] cmd: $*" > "$log_file"
 
     set +e
-    if github_actions_local_cargo_enabled; then
-        "$@" > "$runner_log_file" 2>&1
-    else
-        run_rch_cargo_logged "$runner_log_file" "$@"
-    fi
+    run_rch_cargo_logged "$runner_log_file" "$@"
     local rc=$?
     set -e
     cat "$runner_log_file" | tee -a "$log_file"
@@ -237,30 +210,6 @@ echo "[recorder-gates] ========================================"
 echo "[recorder-gates] pass steps: $PASS"
 echo "[recorder-gates] failures (steps + threshold checks): $FAIL"
 echo "[recorder-gates] report: $REPORT_FILE"
-
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    {
-        echo "## Recorder Validation Gates"
-        echo ""
-        echo "| Gate | Status |"
-        echo "|------|--------|"
-        echo "| chaos_matrix | $status_chaos_matrix |"
-        echo "| recovery_drills | $status_recovery_drills |"
-        echo "| correctness_invariants | $status_correctness_invariants |"
-        echo "| semantic_quality | $status_semantic_quality |"
-        echo "| hybrid_fusion | $status_hybrid_fusion |"
-        echo "| load_harness_compile | $status_load_harness_compile |"
-        echo "| load_harness_run | $status_load_harness_run |"
-        echo ""
-        echo "Thresholds:"
-        echo "- chaos summary artifacts: $CHAOS_SUMMARY_ARTIFACTS / $MIN_CHAOS_SUMMARY_ARTIFACTS"
-        echo "- recovery artifacts: $RECOVERY_ARTIFACTS / $MIN_RECOVERY_ARTIFACTS"
-        echo "- correctness tests: $CORRECTNESS_TESTS / $MIN_CORRECTNESS_TESTS"
-        echo ""
-        echo "Artifacts: \`$ARTIFACT_DIR\`"
-        echo "Report: \`$REPORT_FILE\`"
-    } >> "$GITHUB_STEP_SUMMARY"
-fi
 
 if (( FAIL > 0 )); then
     echo "[recorder-gates] FAILED"

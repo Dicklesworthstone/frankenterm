@@ -567,6 +567,7 @@ strict_rch_dir="${tmp_dir}/strict-remote-bin"
 strict_rch_env_log="${tmp_dir}/strict-remote-env.log"
 strict_rch_output_log="${tmp_dir}/strict-remote-wrapper.log"
 strict_rch_error_log="${tmp_dir}/strict-remote-wrapper.stderr.log"
+strict_local_cargo_marker="${tmp_dir}/forbidden-local-cargo.marker"
 mkdir -p "${strict_rch_dir}"
 cat >"${strict_rch_dir}/rch" <<'FAKE_RCH'
 #!/usr/bin/env bash
@@ -596,11 +597,92 @@ printf 'unexpected fake rch invocation: %s\n' "$*" >&2
 exit 64
 FAKE_RCH
 chmod +x "${strict_rch_dir}/rch"
+cat >"${strict_rch_dir}/cargo" <<'FAKE_CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${STRICT_LOCAL_CARGO_MARKER:?}"
+exit 97
+FAKE_CARGO
+chmod +x "${strict_rch_dir}/cargo"
+
+for disabled_remote_entrypoint in preflight material; do
+  disabled_remote_log="${tmp_dir}/disabled-remote-${disabled_remote_entrypoint}.log"
+  disabled_remote_invocations="${tmp_dir}/disabled-remote-${disabled_remote_entrypoint}.invocations"
+  set +e
+  (
+    export PATH="${strict_rch_dir}:${PATH}"
+    export STRICT_RCH_ENV_LOG="${disabled_remote_invocations}"
+    export STRICT_LOCAL_CARGO_MARKER="${strict_local_cargo_marker}"
+    export GITHUB_ACTIONS=true RCH_GITHUB_ACTIONS_LOCAL_CARGO=1
+    RCH_REQUIRE_REMOTE=0
+    RCH_SKIP_QUEUE_PREFLIGHT=1
+    if [[ "${disabled_remote_entrypoint}" == preflight ]]; then
+      ensure_rch_ready
+    else
+      run_rch_cargo_logged "${disabled_remote_log}.cargo" \
+        env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace
+    fi
+  ) >"${disabled_remote_log}" 2>&1
+  disabled_remote_rc=$?
+  set -e
+  if [[ "${disabled_remote_rc}" -eq 0 ]] \
+    || [[ -e "${disabled_remote_invocations}" || -e "${strict_local_cargo_marker}" ]] \
+    || ! grep -Fq "RCH_REQUIRE_REMOTE must be enabled" "${disabled_remote_log}"; then
+    emit_log "failed" "wrapper_guard" "disabled_remote_${disabled_remote_entrypoint}" \
+      "remote_requirement_disabled" "wrapper_failed_open" \
+      "${disabled_remote_log}" "disabled remote enforcement must fail before RCH or Cargo invocation"
+    exit 1
+  fi
+done
+
+# Legacy hosted-runner flags must not skip actual remote admission. The
+# fake tools make a regression observable without executing Cargo or RCH.
+set +e
+(
+  export PATH="${strict_rch_dir}:${PATH}"
+  export STRICT_RCH_ENV_LOG="${strict_rch_env_log}"
+  export STRICT_LOCAL_CARGO_MARKER="${strict_local_cargo_marker}"
+  export GITHUB_ACTIONS=true RCH_GITHUB_ACTIONS_LOCAL_CARGO=1
+  RCH_SKIP_SMOKE_PREFLIGHT=1
+  rch_init "${tmp_dir}" "legacy-flags" "guard" "${ROOT_DIR}"
+  ensure_rch_ready
+) >"${tmp_dir}/legacy-flags-preflight.log" 2>&1
+legacy_preflight_rc=$?
+set -e
+if [[ "${legacy_preflight_rc}" -eq 0 ]] \
+  || ! grep -Fxq "args=--json workers probe --all" "${strict_rch_env_log}" \
+  || [[ -e "${strict_local_cargo_marker}" ]]; then
+  emit_log "failed" "wrapper_guard" "legacy_flags_preflight" \
+    "remote_preflight_bypassed" "wrapper_failed_open" \
+    "legacy-flags-preflight.log" "legacy Actions flags must not skip remote admission"
+  exit 1
+fi
+
+set +e
+PATH="${strict_rch_dir}:${PATH}" \
+  STRICT_RCH_ENV_LOG="${strict_rch_env_log}" \
+  STRICT_LOCAL_CARGO_MARKER="${strict_local_cargo_marker}" \
+  GITHUB_ACTIONS=true RCH_GITHUB_ACTIONS_LOCAL_CARGO=1 \
+  FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO=1 \
+  FT_RECORDER_VALIDATION_ARTIFACT_DIR="${tmp_dir}/recorder-legacy-flags" \
+  bash "${ROOT_DIR}/scripts/check_recorder_validation_gates.sh" \
+    >"${tmp_dir}/recorder-legacy-flags.log" 2>&1
+legacy_recorder_rc=$?
+set -e
+if [[ "${legacy_recorder_rc}" -eq 0 ]] \
+  || [[ -e "${strict_local_cargo_marker}" ]]; then
+  emit_log "failed" "wrapper_guard" "recorder_legacy_flags" \
+    "recorder_local_cargo_bypass" "wrapper_failed_open" \
+    "recorder-legacy-flags.log" "recorder must refuse unavailable remote proof without local Cargo"
+  exit 1
+fi
 
 set +e
 (
     PATH="${strict_rch_dir}:${PATH}" \
       STRICT_RCH_ENV_LOG="${strict_rch_env_log}" \
+      STRICT_LOCAL_CARGO_MARKER="${strict_local_cargo_marker}" \
+      GITHUB_ACTIONS=true RCH_GITHUB_ACTIONS_LOCAL_CARGO=1 \
       RCH_WORKER=vmi-test \
       RCH_CANONICAL_PROJECT_ROOT=/data/projects \
       RCH_ALIAS_PROJECT_ROOT=/dp \
@@ -617,6 +699,7 @@ strict_rch_rc=$?
 set -e
 
 if [[ "${strict_rch_rc}" -eq 0 ]] \
+  || [[ -e "${strict_local_cargo_marker}" ]] \
   || ! grep -Fxq "RCH_NO_SELF_HEALING=1" "${strict_rch_env_log}" \
   || ! grep -Fxq "RCH_REQUIRE_REMOTE=1" "${strict_rch_env_log}" \
   || ! grep -Fxq "RCH_WORKER=vmi-test" "${strict_rch_env_log}" \
@@ -647,7 +730,106 @@ emit_log \
   "strict_remote_enforced" \
   "none" \
   "$(basename "${strict_rch_output_log}")" \
-  "run_rch_cargo_logged disables RCH self-healing, passes strict remote worker/topology envs, and fails closed on fake queue_timeout fallback"
+  "legacy Actions flags cannot bypass helper or recorder admission; the helper preserves strict remote envs and rejects fake local fallback without invoking Cargo"
+
+# Exercise the actual GPU summary program with retained JSONL fixtures.
+# No renderer, network, RCH executable, or Cargo executable is involved.
+python3 - "${ROOT_DIR}" "${tmp_dir}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, evidence = map(Path, sys.argv[1:])
+wrapper = root / "scripts/test-gpu-harness.sh"
+source = wrapper.read_text()
+body = source.split("write_summary() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+fixture = {"phase": "fixture", "name": "case", "status": "pass"}
+summary = {"phase": "summary", "total": 1, "passed": 1, "failed": 0}
+cases = [
+    ("missing", [], [], 0, 1, False),
+    ("zero", [{"phase": "summary", "total": 0, "passed": 0, "failed": 0}], [], 0, 1, False),
+    ("missing-completion", [summary], [], 0, 1, False),
+    ("inconsistent", [{**fixture, "status": "fail"}, summary], [], 0, 1, False),
+    ("complete", [fixture, summary], [], 0, 0, True),
+    ("remote-failure", [fixture, summary], [], 101, 101, False),
+    ("self-test", [{"phase": "self-test", "status": "pass"}], ["--self-test"], 0, 0, False),
+    ("headless-self-test", [{"phase": "render-summary", "status": "pass", "iterations": 10}], ["--headless-render-self-test"], 0, 0, False),
+    ("missing-self-test", [], ["--headless-render-self-test"], 0, 1, False),
+    ("empty-fuzz", [{"phase": "fuzz-summary", "status": "pass", "events_processed": 0, "critical_count": 0}], ["--fuzz-seed=1"], 0, 1, False),
+    ("fuzz", [{"phase": "fuzz-summary", "status": "pass", "events_processed": 3, "critical_count": 0}], ["--fuzz-seed=1"], 0, 0, False),
+]
+for name, events, args, remote_rc, expected_rc, parity in cases:
+    run = evidence / f"gpu-summary-{name}"
+    run.mkdir()
+    (run / "artifacts").mkdir()
+    (run / "diffs").mkdir()
+    events_path = run / "events.jsonl"
+    events_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    command = [sys.executable, "-", str(events_path), str(run / "summary.json"),
+               str(run / "parity.json"), name, str(run), str(run / "artifacts"),
+               str(run / "diffs"), str(root), str(run / "perf.json"),
+               str(run / "run.log"), str(remote_rc), "1", *args]
+    result = subprocess.run(command, input=body, text=True, capture_output=True)
+    (run / "summary-program.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == expected_rc, (name, result.returncode, result.stderr)
+    report = json.loads((run / "parity.json").read_text())
+    assert report["parity_qualified"] is parity, name
+    assert report["result"]["exit_code"] == expected_rc, name
+    if args:
+        assert report["category"] == "tui/render-diagnostic", name
+
+# Run the whole wrapper with a recording shell boundary to check argument
+# preservation. The shared helper itself is tested against fake tools above.
+run = evidence / "gpu-wrapper-forwarding"
+capture = evidence / "gpu-wrapper-argv.bin"
+environment = os.environ.copy()
+environment.update({
+    "GPU_HARNESS_RUN_DIR": str(run), "GPU_HARNESS_FIXTURE_FILTER": "alpha,beta",
+    "FT_GPU_HARNESS_FORCE_SOFTWARE": "1", "FT_GPU_HARNESS_EXPECT_SOFTWARE": "1",
+    "FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING": "software adapter",
+    "SET_GOLDEN": "1", "SET_PERF_BASELINE": "1", "CAPTURE": str(capture),
+})
+environment.pop("GPU_HARNESS_FIXTURE_ROOT", None)
+boundary = r'''
+rch_init() { :; }
+ensure_rch_ready() { :; }
+run_rch_cargo_logged() {
+    printf '%s\0' "$@" > "$CAPTURE"
+    printf '%s\n' '{"phase":"fixture","name":"case","status":"pass"}' \
+      '{"phase":"summary","total":1,"passed":1,"failed":0}' > "$1"
+}
+export -f rch_init ensure_rch_ready run_rch_cargo_logged
+export _LIB_RCH_GUARDS_LOADED=1
+wrapper="$1"
+shift
+bash "$wrapper" "$@"
+'''
+result = subprocess.run(["bash", "-c", boundary, "gpu-boundary-test", str(wrapper), "--", "case"],
+                        env=environment, text=True, capture_output=True)
+(evidence / "gpu-wrapper-forwarding.log").write_text(result.stdout + result.stderr)
+assert result.returncode == 0, result.stderr
+forwarded = capture.read_bytes().split(b"\0")
+for key in ("GPU_HARNESS_FIXTURE_FILTER", "FT_GPU_HARNESS_FORCE_SOFTWARE",
+            "FT_GPU_HARNESS_EXPECT_SOFTWARE", "FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING",
+            "SET_GOLDEN", "SET_PERF_BASELINE"):
+    assert f"{key}={environment[key]}".encode() in forwarded, key
+assert forwarded[-2] == b"case", forwarded[-3:]
+
+environment["GPU_HARNESS_RUN_DIR"] = str(evidence / "gpu-wrapper-default-args")
+result = subprocess.run(["bash", "-c", boundary, "gpu-boundary-test", str(wrapper)],
+                        env=environment, text=True, capture_output=True)
+(evidence / "gpu-wrapper-default-args.log").write_text(result.stdout + result.stderr)
+assert result.returncode == 0, result.stderr
+
+environment["GPU_HARNESS_FIXTURE_ROOT"] = "/unadmitted-fixture-root"
+result = subprocess.run(["bash", str(wrapper)], env=environment, text=True, capture_output=True)
+(evidence / "gpu-wrapper-unadmitted-root.log").write_text(result.stdout + result.stderr)
+assert result.returncode == 2, result.stderr
+assert "GPU-HARNESS-UNADMITTED-FIXTURE-ROOT" in result.stderr
+print(f"GPU wrapper: {len(cases)} summary cases, argument forwarding, empty arguments, and unadmitted-root refusal passed")
+PY
 
 light_timeout_rch_dir="${tmp_dir}/light-timeout-bin"
 light_timeout_output_log="${tmp_dir}/light-timeout-wrapper.log"

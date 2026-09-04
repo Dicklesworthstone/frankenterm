@@ -10,11 +10,7 @@
 # Then use `run_rch_cargo_logged <output_file> <cargo args...>` instead of
 # bare `rch exec -- env ... cargo ...`.
 #
-# Environment:
-#   RCH_GITHUB_ACTIONS_LOCAL_CARGO
-#       Set to 1 only in GitHub-hosted Actions jobs where the hosted runner is
-#       the CI execution target and the local agent/operator RCH offload policy
-#       is not available.
+# Cargo always uses strict remote RCH. There is no hosted-runner exception.
 #
 # Provides:
 #   rch_init()                 - Set up variables (call once at start)
@@ -54,7 +50,6 @@ RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS="${RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS
 RCH_MIRROR_MIN_PASSING_WORKERS="${RCH_MIRROR_MIN_PASSING_WORKERS:-1}"
 RCH_SELECTED_WORKER_MIRROR_PREFLIGHT="${RCH_SELECTED_WORKER_MIRROR_PREFLIGHT:-auto}"
 RCH_SELECTED_WORKER_SYNC_TIMEOUT_SECS="${RCH_SELECTED_WORKER_SYNC_TIMEOUT_SECS:-${RCH_SMOKE_TIMEOUT_SECS}}"
-RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
 
 # Populated by rch_init().
 _RCH_PROBE_LOG=""
@@ -87,15 +82,6 @@ resolve_timeout_bin() {
     else
         TIMEOUT_BIN=""
     fi
-}
-
-rch_github_actions_local_cargo_enabled() {
-    case "${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-}" in
-        1|true|TRUE|yes|YES) ;;
-        *) return 1 ;;
-    esac
-
-    [[ "${GITHUB_ACTIONS:-}" == "true" ]]
 }
 
 rch_probe_log_path() {
@@ -1632,6 +1618,8 @@ run_rch_cargo_logged_with_timeout() {
     local runner_pid=""
     local monitor_pid=""
 
+    rch_remote_only_required || rch_fatal "RCH_REQUIRE_REMOTE must be enabled; refusing local cargo execution."
+
     if [[ $- == *e* ]]; then
         caller_had_errexit="true"
     fi
@@ -1641,44 +1629,6 @@ run_rch_cargo_logged_with_timeout() {
     fi
     if [[ -z "${TIMEOUT_BIN}" ]]; then
         rch_fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
-    fi
-
-    if rch_github_actions_local_cargo_enabled; then
-        : >"${output_file}"
-
-        set +e
-        (
-            cd "${_RCH_REPO_ROOT}"
-            printf '%s\n' "[rch-guard] GitHub Actions local Cargo mode enabled; executing without rch on the hosted runner."
-            exec "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "$@"
-        ) >"${output_file}" 2>&1
-        local rc=$?
-        set -e
-
-        rch_write_meta_json "${output_file}" "${rc}"
-        local target_dir target_dir_lifecycle command_text residual_risk_notes
-        target_dir="$(rch_extract_cargo_target_dir_from_args "$@")"
-        target_dir_lifecycle="retained"
-        if [[ "${target_dir}" == "not_applicable" ]]; then
-            target_dir_lifecycle="not_applicable"
-        fi
-        command_text="github_actions_local_cargo ${timeout_secs} ${output_file} $*"
-        residual_risk_notes="$(rch_extract_failure_reason_detail "${output_file}")"
-        rch_emit_proof_ledger_entry \
-            "${command_text}" \
-            "${output_file}" \
-            "${rc}" \
-            "${target_dir}" \
-            "${target_dir_lifecycle}" \
-            "${residual_risk_notes}"
-
-        if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-            rch_fatal "RCH-GITHUB-ACTIONS-LOCAL-TIMEOUT: GitHub Actions local command timed out after ${timeout_secs}s. See ${output_file}"
-        fi
-        if [[ "${caller_had_errexit}" == "false" ]]; then
-            set +e
-        fi
-        return "${rc}"
     fi
 
     : >"${output_file}"
@@ -1800,26 +1750,7 @@ rch_init() {
 # Preflight check: ensure rch is available, workers reachable, and remote
 # cargo execution works. Calls rch_fatal on any failure.
 ensure_rch_ready() {
-    if rch_github_actions_local_cargo_enabled; then
-        resolve_timeout_bin
-        if [[ -z "${TIMEOUT_BIN}" ]]; then
-            rch_fatal "timeout or gtimeout is required to fail closed on stalled GitHub Actions local execution."
-        fi
-        [[ -n "${_RCH_PROBE_LOG}" ]] || rch_fatal "rch_init must be called before ensure_rch_ready."
-        printf '%s\n' \
-            "GitHub Actions local Cargo mode enabled; rch preflight skipped because the hosted runner is the CI execution target." \
-            >"${_RCH_PROBE_LOG}"
-        rch_write_meta_json "${_RCH_PROBE_LOG}" "0"
-        rch_emit_proof_ledger_entry \
-            "RCH_GITHUB_ACTIONS_LOCAL_CARGO=1 ensure_rch_ready" \
-            "${_RCH_PROBE_LOG}" \
-            "0" \
-            "not_applicable" \
-            "not_applicable" \
-            "hosted GitHub Actions local execution mode"
-        return 0
-    fi
-
+    rch_remote_only_required || rch_fatal "RCH_REQUIRE_REMOTE must be enabled; refusing local cargo execution."
     if ! command -v rch >/dev/null 2>&1; then
         rch_fatal "rch is required for this E2E harness; refusing local cargo execution."
     fi
