@@ -1,5 +1,12 @@
 # FrankenTerm Reality-Check Bridge Plan — 2026-09-01
 
+> **Current assessment: 2026-09-04, continuation of RC3.** Sections 1–10
+> retain the September 1–2 investigation and execution history. Their dated
+> counts, source locations, release configuration, and status sentences are
+> historical snapshots. Section 11 below is the current assessment and bridge
+> plan; its ambition/refinement log records the remaining skill phases. This
+> refresh completes RC3 in place rather than creating a competing roadmap.
+
 **Source:** `/reality-check-for-project` invocation 2026-09-01 (third full run). Read AGENTS.md (1,747 lines) and README.md (4,454 lines) in full, then audited HEAD `f3397177e` (workspace version `0.15.2-rc.1`) against the promises in those two documents. **Revised in place 2026-09-02** with the Phase 2 deep closure plan (§4) after the same-day execution recorded in §11.
 
 **Predecessors (cross-link required by `docs/process/reality-check-discipline.md`):**
@@ -697,3 +704,176 @@ Not done today: signed release (needs an operator-driven `dsr build/release` wit
 ## 10. Successor note
 
 The next full reality-check must cross-link this plan, `docs/reality-check-bridge-plan-2026-05-12.md`, and `docs/reality-check-bridge-plan.md`, and must start from `ft-xxfwy`'s terminal state. It becomes due per `docs/process/reality-check-discipline.md` (90 days, minor-version change, ≥ 50 open beads, contract churn, or headline-claim growth). Do not overwrite this file; revise it in place only within this run.
+
+## 11. September 4 comprehensive continuation
+
+### 11.1 Scope, evidence, and answer
+
+Audit owner: `ft-xxfwy.40`. Initial clean `main` source:
+`f216535c56994cd756f420e6be8b145f78ab6c82` (September 4). The full governing
+AGENTS.md and README.md were read, along with the original PLAN/PLAN_CODEX,
+the three reality-check plans, product journey contract, TUI ADRs, and the
+native, control, integration, storage, extension, security, and performance
+plan/contract families listed in the intake ledger at closeout. Historical
+pseudocode and noncanonical external-library dossiers define motivation or
+past decisions; they are not evidence that their example APIs are implemented.
+
+**The project is not finished.** It has a substantial implementation of the
+terminal, mux, capture/storage/detection pipeline, workflow engine, and machine
+control surfaces. September 2 retained development smokes establish useful
+same-generation mux behavior and repaired web liveness. They do not establish
+the complete real-agent loop, the packaged first hour, safe live upgrades,
+native performance across the target matrix, or actual connector delivery.
+Three fresh source defects directly contradict safety/completion expectations:
+the watcher selects a testing policy configuration; OSC 52 clipboard clearing
+bypasses write policy; and a release gate selection can pass without running a
+single check. These receive implementation work, not documentation hedges.
+
+Live observations during this refresh:
+
+- GitHub's release API still identifies `v0.15.1` as latest, published August
+  21, with no minisign asset among its 12 assets. No Actions state was used.
+- Both `~/.local/bin/ft` and the app's bundled `ft` report
+  `0.13.0 (3ebd60566)`. The existing GUI process is preserved. The installed
+  doctor's exit is 1; it reports a stale watcher lock and a failed legacy
+  socket connection. Its schema-v32 database and in-process zero counters are
+  evidence about that installed binary only, not a current-source verdict.
+- `dsr doctor` succeeds with warnings; `dsr health all` reports eight healthy
+  hosts and one unhealthy. `dsr repos info frankenterm` now includes static
+  release gates. Its configured checkout is `~/projects/ft-release-0152b`,
+  which the September 2 execution log identifies as an active release source.
+  The active remote clippy job there is not proof for this checkout. Do not
+  redirect that peer run or count its unfinished result as green.
+- `rch doctor` passes all 34 checks. Queue admission is evaluated per requested
+  command; an earlier failed lane does not establish a present fleet outage.
+- Initial `br list --all --limit 0 --json`: 4,989 issues, comprising 4,014
+  closed, 688 open, 165 in progress, 117 blocked, and 5 deferred: 975 unfinished.
+  The initial BV view reports 949 unfinished, a different population that must
+  be reconciled before final graph claims. Its 1,513 estimated work-days and
+  average confidence 0.464 are scheduling heuristics, not a credible release ETA.
+- The attestation manifest has 32 slots, four with no artifact path. The product
+  journey v1 catalog remains `contract_only`: none of its 32 cells constitutes
+  an authenticated product-support verdict. Do not overwrite its sealed history.
+
+**Would completing the existing backlog finish the product?** Not by status
+alone. Most named capabilities have owners, including WASM (`ft-rxk40`),
+mission execution (`ft-majms`), and mission mail wiring (`ft-7c21y`). The earlier
+V29 “none (honest)” entry was incorrect. Fresh gaps in watcher policy, clipboard
+policy, actual connector transport, concurrent mission persistence, and gate
+execution need explicit acceptance contracts. Existing proof beads also need
+stronger boundaries: authorization is not delivery, schema-valid JSON is not
+trusted evidence, a cancelled plan row is not a cancelled running assignment,
+and passing an adapter harness is not a real-agent journey. The revised graph
+can cover the known vision; completion still requires its declared runtime,
+hardware, release, and human-review outcomes.
+
+### 11.2 Current vision-to-implementation map
+
+`PARTIAL` means some real implementation exists; `UNPROVEN` means the claimed
+boundary lacks qualifying execution evidence; `NOT_STARTED` names a missing
+production route. A safe refusal is working refusal behavior, not delivery of
+the requested feature. Historical test counts are never fresh test results.
+
+| Goal | Current boundary and status | Owner/bridge |
+|---|---|---|
+| Verified install and useful first hour | PARTIAL: signed latest release and activation/clean-host journey unfinished | `ft-xxfwy.1`–`.4`, `.30`; product `.11.1` |
+| Same-generation GUI/CLI/mux attach | PARTIAL: retained dev attach; installed copies stale; exact packaged pair unproven | `ft-xxfwy.6`–`.8`, `.33`, `.34` |
+| Capture across domains, explicit gaps, continuity | PARTIAL: real discovery/delta/persistence; lossless ALL-output wording exceeds gap-aware paths | `ft-xxfwy.9`, `.10`, `.32`; native event/fairness producers |
+| Detection for supported real agents | PARTIAL: rule packs/corpus exist; pin provider versions and establish recall/false positives on field output | `ft-xxfwy.27`; product `.11.14` |
+| Safe automatic compaction and quota response | PARTIAL: runner/injector exist; watcher configuration bypass and full live journey remain | G81; `ft-xxfwy.9`, `.13` |
+| CAUT account choice, browser auth, resume, proceed | PARTIAL: adapters and guarded steps; configured account/provider success and safe-pause branches require live proof | `ft-xxfwy.9`, `.28`; original PLAN §7 and Appendix D |
+| Policy, approval, kill switch, audit | PARTIAL: substantial gates and persisted switch; production constructor and cross-process freshness must be tested | G81; `ft-xxfwy.14`, `.13` |
+| Robot/MCP read and mutation contracts | PARTIAL: broad dispatch and denial persistence; live mux failure/partial effects and concurrency qualification remain | `ft-xxfwy.28`, `ft-ydqah`, `ft-7h5da.4.10`, contract-doctor producers |
+| Missions and multi-pane transactions | PARTIAL: real tx effects; mission planner lifecycle metadata lacks production driver/cancellation authority | G85; `ft-majms`, `ft-7c21y`, product `.4.7` |
+| Profile/persona/fleet apply | PARTIAL: real mutation path with possible compensation failure; model atomicity must not promise all-or-none live effects | profile/fleet receipt producers; `ft-xxfwy.28` |
+| Lexical search | PARTIAL at product level: real SQLite FTS and query path; concurrent field-work journey unproven | `ft-xxfwy.28`; product `.11.7` |
+| Semantic/hybrid and Tantivy integration | PARTIAL: hash-vector n-gram embeddings are implemented; learned-semantic quality and full selected-backend parity are separate | integration/search producers; `ft-xxfwy.28` |
+| Storage correctness, migration, backup, retention | PARTIAL: real storage and transaction helpers; backend matrix and recovery/maintenance under load need exact-path proof | `ft-xxfwy.32`; storage/recorder producers |
+| Recorder, replay, export, incident diagnosis | PARTIAL: real modules/collectors; replay equivalence, privacy-safe field diagnosis and recovery are not established by fixtures | recorder producers; product `.7`, `.11.11`, `.11.13` |
+| Web HTTP and live SSE | PARTIAL: repaired accept clock and child-spawn paths; filters, lag, disconnect, redaction e2e remain | `ft-xxfwy.18`, `.19`, `.38` |
+| Distributed observation and remote mux | PARTIAL: distinct transports; unavailable distributed live reads cannot be represented as successful remote mux behavior | distributed producers; product `.11.8`, `.11.9` |
+| External connector ingress/egress | NOT_STARTED for real host transport: mesh authorization exists; no dispatched external effect or inbound service subscription proven | G84; `ft-xxfwy.28` |
+| Agent Mail, Beads/BV, CASS, CASR, NTM, process triage | PARTIAL by individual integration; installed executables and documentation do not establish runtime callers | integration-specific owners; `ft-7c21y`; `ft-xxfwy.28` |
+| Lua/WASM extension lifecycle | NOT_STARTED in production: scripting crate/host prototype has no consumer; `ft ext` currently manages pattern packs | `ft-rxk40` |
+| Shell setup and prompt evidence | PARTIAL: `ft setup shell` exists; do not invent `ft setup shell-integration`; require actual prompt transitions | `ft-xxfwy.12`, `.13` |
+| Session checkpoint, scrollback recovery | PARTIAL: real persistence/recovery; snapshot restore/restart/checkpoint rollback still refuse live execution | product `.8`, `.11.10`, `.11.11` |
+| Guardian continuity and live upgrade | NOT_STARTED/PARTIAL by component: persistent PTYs and atomic process-family handoff require real failure tests | product `.8`; `ft-xxfwy.4` |
+| Native input, render, resize, zoom, display changes | PARTIAL: real GUI; all-row rendering and long terminal-lock path remain; present-error/resize fixes already exist | `4tenz.6.3`, `.8.5`, `.8.3`; product `.4`, `.9` |
+| Clipboard, graphics and terminal protocol safety | PARTIAL: OSC 52 clear bypass is concrete; Deny/Prompt configuration and real GUI policy plumbing incomplete | G82; native security producers |
+| TUI parity, inline ownership, handoff | PARTIAL: source adapters and ownership gates exist; PTY/golden and performance proof remain independent | `ft-9xube`; TUI parity producers |
+| Accessibility and visual quality | UNPROVEN at full native journey boundary; contracts/corpora are substrates | product `.9`, `.11.12` |
+| q002/q020/q050/q200 local and Mac→LAN | UNPROVEN across exact product cells and target pairs; no inheritance across sizes/SKUs/routes | product `.11.1`–`.11.15`, `.12.3`, `.12.9` |
+| Latency, RSS, fairness, 4h/24h/72h stability | UNPROVEN for headline/target-class claims; proxy benches and synthetic rig are insufficient | `ft-xxfwy.20`; `4tenz`; product `.10` |
+| Structured concurrency and cancellation | PARTIAL: canonical runtime and type/source guards; they do not prove every effect/child cancellation race | runtime doctrine/closure producers; product `.8` |
+| Formal correctness evidence | PARTIAL: useful models, Loom/TLC/Lean lanes; bind model assumptions to production code and exact execution | `ft-xxfwy.29` |
+| Trusted release and operating-envelope evidence | PARTIAL: assembly/verification exists; unsigned/self-described keys and status strings cannot mint trusted support | G86; `ft-xxfwy.15`, `ft-7h5da.10.4.4` |
+| Windows/Linux/macOS shipped family | PARTIAL: release assets exist; native qualification and complete installer/signing/canary/upgrade proof remain | `ft-azsnz`; `ft-xxfwy.1`–`.4` |
+| Documentation, demos, maintainability, upstream upkeep | PARTIAL: measurable doc contradictions; source count stamps alone miss semantics; deliberate upstream triage need not yield a patch every week | `ft-xxfwy.21`, `.23`, `.26`, `.40` |
+| Truthful quality gates and task graph | PARTIAL: live DSR wiring exists; gate selection can be vacuously green, and backlog status is not product support | G83; `ft-xxfwy.16`, `.17`, `.24`, `.40` |
+
+Here `4tenz` abbreviates `ft-interactive-systems-performance-4tenz` and
+“product” abbreviates `ft-interactive-swarm-product-convergence-7xqz4`.
+Existing G50–G80 remain in the graph; this map does not retire any capability.
+
+### 11.3 Fresh gaps and concrete bridge work
+
+| Gap | Diagnosis and smallest coherent action | Required acceptance |
+|---|---|---|
+| G81 | `run_watcher` constructs `PolicyEngine::permissive()` rather than operator safety config; use the production config/tuning constructor plus persisted switch. Audit live switch freshness separately. | Production factory → injector regression: configured deny, prompt/rate gates, allowed control, real SQLite audit, zero denied pane effects; a running watcher must observe a subsequently tripped switch before its next effect. |
+| G82 | OSC 52 ClearSelection calls clipboard handler without SetSelection policy; route both through one decision and preserve None vs empty string. GUI policy defaults are not operator configuration. | Real parser bytes through Terminal: Deny/Prompt preserve clipboard; Allow clears exactly once; query/size controls; separate user configuration/prompt wiring and native test. |
+| G83 | Unknown `--only` name and missing/non-executable static gate can yield exit 0; explicit cargo-only selection is silently skipped. | Validate complete selection before execution; reject unknown/missing/empty work; maintain default no-Cargo scope; regressions exercise positive, mixed-invalid, missing, cargo-excluded, and failure paths without Cargo. |
+| G84 | `dispatch_connector_outbound_action` calls `record_action_success` after routing/authorization only; host runtime produces an envelope, not a service call. | Fail closed until transport exists; real host request/receipt path; persisted rules, bounded retry/DLQ, ambiguity/idempotency and cancellation; ingress authentication/deduplication; real service receipt plus deny/outage controls. |
+| G85 | Mission pause/resume/abort update JSON/assignment metadata without running-task cancellation; concurrent load→modify→rename can overwrite another process. | Serialize or CAS revisioned lifecycle transitions durably; reject stale updates; crash/parallel-process tests; production driver maps requested state to acknowledged task outcomes and preserves indeterminate effects. |
+| G86 | Release verifier accepts unsigned dev bundles and verifies Ed25519 against a key supplied by that bundle; operating-envelope reader trusts status/ready_to_sign flags without authenticated source/target/outcome. | Preserve dev inspection but add externally pinned trust and exact release mode; reject arbitrary keys/unsigned/deferred stable claims; promote envelope only from validated, fresh, passed, exact-candidate/target receipts. |
+| G87 | Active docs describe missing extension dispatch, stale policy/runtime/storage/search behavior, and unsupported commands; historical plans still read as current instructions. | Correct each demonstrated contradiction in place, preserve aspirational goals and historical evidence, link current code/owner, and check runnable examples against CLI/source. |
+
+### 11.4 Execution ordering and proof contract
+
+First repair G81–G83 and the premature-success portion of G84. These are bounded
+correctness changes. G84's real service transport, G85's cross-process lifecycle,
+G86's trusted evidence authority, and guardian/native qualification span larger
+subsystems or require external actors; their precise reproductions and acceptance
+belong in independently executable beads. No security claim closes merely because
+that work is scheduled.
+
+Then converge the signed install → matching family attach → shell capability →
+real-agent observe/detect/react/audit path, using existing RC3 producers. Run
+agent-independent deterministic tests first, a real mux harness next, and pinned
+provider sessions last. The native product matrix and long-duration resource
+work follow a useful two-agent path, while independent source repairs may proceed.
+Do not make already-ready source fixes wait for 72-hour fleet proof.
+
+Every runtime receipt must retain source SHA plus overlay identity, toolchain,
+features/profile, command, target/route, test selection/count, exit, and artifact
+paths. Zero tests, skips, stale binaries, schema validation, and unsigned development
+bundles retain their actual evidence class. Cargo proof uses strict remote RCH;
+release work uses DSR only. An unknown/missing worker or local fallback blocks
+that lane and never upgrades a result. Privacy-safe structured logs carry IDs,
+counts, reason codes, and hashes; raw pane text/credentials are excluded by default.
+
+### 11.5 Ambition and refinement log
+
+Phase 2 baseline: the map and G81–G87 above retain the full original vision and
+identify production boundaries missing from the initial RC3 plan. Phase 3a uses
+the skill's frozen bead-generation text verbatim. The next edits record three
+actual ambition rounds, bead regeneration, and at least five actual refinement
+rounds, ending only after a pass finds no further change in the reviewed graph.
+
+**Ambition round 1 — recover omitted product integrations.** The first bridge
+still hid optional accepted promises inside an undifferentiated integration row.
+Source review found no production callers for Redis session/cache authority,
+VC cursor export, UBS workflow scanning, graph-based work scoring, and Mermaid
+product rendering. Preserve these as explicit optional P2 vertical slices;
+do not silently retire them or treat a developer tool install as integration.
+Each needs its own reachable CLI/MCP/workflow entrypoint, bounded policy and
+redaction semantics, typed unavailable state, and actual external roundtrip
+when claiming interoperability. Explicitly rejected rust_proxy, APP, and ACFS
+integrations remain rejected historical choices, not new obligations.
+
+The first useful loop must prove **all** of capture continuity/gap reporting,
+real provider detection, configured policy, actual input delivery, observed
+provider response or safe pause, and durable audit for one correlated event.
+A list of independent passing component tests cannot satisfy this conjunction.
+Natural provider output, deliberately injected detection text on a real mux,
+and fake adapters are three different evidence classes. Never force a paid
+account to exhaustion merely to obtain a rate-limit trace.
