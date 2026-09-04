@@ -608,6 +608,193 @@ fn primary_device_attributes_do_not_advertise_selective_erase_without_support() 
     assert_eq!(output, "\x1b[?65;4;18;22;52c");
 }
 
+mod osc52_policy {
+    use super::*;
+    use crate::config::Osc52WritePolicy;
+
+    #[derive(Debug)]
+    struct Osc52Config {
+        policy: Osc52WritePolicy,
+        max_bytes: usize,
+    }
+
+    impl TerminalConfiguration for Osc52Config {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn osc52_write_policy(&self) -> Osc52WritePolicy {
+            self.policy
+        }
+
+        fn osc52_write_max_bytes(&self) -> usize {
+            self.max_bytes
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClipboardState {
+        contents: Option<String>,
+        calls: Vec<(ClipboardSelection, Option<String>)>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingClipboard {
+        state: Mutex<ClipboardState>,
+    }
+
+    impl Clipboard for RecordingClipboard {
+        fn set_contents(
+            &self,
+            selection: ClipboardSelection,
+            contents: Option<String>,
+        ) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push((selection, contents.clone()));
+            state.contents = contents;
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        term: Terminal,
+        clipboard: Arc<RecordingClipboard>,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Fixture {
+        fn new(policy: Osc52WritePolicy, max_bytes: usize) -> Self {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let mut term = Terminal::new(
+                TerminalSize {
+                    rows: 2,
+                    cols: 10,
+                    pixel_width: 80,
+                    pixel_height: 32,
+                    dpi: 0,
+                },
+                Arc::new(Osc52Config { policy, max_bytes }),
+                "FrankenTerm",
+                "test",
+                Box::new(SharedWriter {
+                    output: Arc::clone(&output),
+                }),
+            );
+            let clipboard = Arc::new(RecordingClipboard {
+                state: Mutex::new(ClipboardState {
+                    contents: Some("retained clipboard".to_string()),
+                    calls: Vec::new(),
+                }),
+            });
+            let handler: Arc<dyn Clipboard> = clipboard.clone();
+            term.set_clipboard(&handler);
+            Self {
+                term,
+                clipboard,
+                output,
+            }
+        }
+
+        fn assert_untouched(&self) {
+            let state = self.clipboard.state.lock().unwrap();
+            assert!(state.calls.is_empty(), "clipboard handler was called");
+            assert_eq!(state.contents.as_deref(), Some("retained clipboard"));
+        }
+    }
+
+    #[test]
+    fn clear_is_denied_before_the_clipboard_handler() {
+        for policy in [Osc52WritePolicy::Deny, Osc52WritePolicy::Prompt] {
+            for selection in ["c", "p", ""] {
+                for terminator in ["\x1b\\", "\x07"] {
+                    let mut fixture = Fixture::new(policy, 0);
+                    fixture
+                        .term
+                        .advance_bytes(format!("\x1b]52;{selection}{terminator}"));
+                    fixture.assert_untouched();
+                    assert!(fixture.output.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allow_preserves_clear_empty_write_and_selection_mapping() {
+        for (selector, selection) in [
+            ("c", ClipboardSelection::Clipboard),
+            ("p", ClipboardSelection::PrimarySelection),
+            ("", ClipboardSelection::Clipboard),
+        ] {
+            for terminator in ["\x1b\\", "\x07"] {
+                let mut fixture = Fixture::new(Osc52WritePolicy::Allow, 0);
+                fixture
+                    .term
+                    .advance_bytes(format!("\x1b]52;{selector}{terminator}"));
+                {
+                    let state = fixture.clipboard.state.lock().unwrap();
+                    assert_eq!(state.calls.as_slice(), &[(selection, None)]);
+                    assert_eq!(state.contents, None);
+                }
+                fixture
+                    .term
+                    .advance_bytes(format!("\x1b]52;{selector};{terminator}"));
+                let state = fixture.clipboard.state.lock().unwrap();
+                assert_eq!(
+                    state.calls.as_slice(),
+                    &[(selection, None), (selection, Some(String::new()))]
+                );
+                assert_eq!(state.contents.as_deref(), Some(""));
+            }
+        }
+    }
+
+    #[test]
+    fn writes_obey_policy_and_the_decoded_byte_limit() {
+        for policy in [Osc52WritePolicy::Deny, Osc52WritePolicy::Prompt] {
+            let mut fixture = Fixture::new(policy, 2);
+            fixture.term.advance_bytes("\x1b]52;c;w6k=\x1b\\");
+            fixture.assert_untouched();
+        }
+
+        // U+00E9 is one character but two decoded UTF-8 bytes.
+        let mut too_small = Fixture::new(Osc52WritePolicy::Allow, 1);
+        too_small.term.advance_bytes("\x1b]52;c;w6k=\x1b\\");
+        too_small.assert_untouched();
+
+        let mut exact = Fixture::new(Osc52WritePolicy::Allow, 2);
+        exact.term.advance_bytes("\x1b]52;c;w6k=\x1b\\");
+        let state = exact.clipboard.state.lock().unwrap();
+        assert_eq!(
+            state.calls.as_slice(),
+            &[(ClipboardSelection::Clipboard, Some("é".to_string()))]
+        );
+        assert_eq!(state.contents.as_deref(), Some("é"));
+    }
+
+    #[test]
+    fn queries_never_touch_the_clipboard_and_return_an_empty_reply() {
+        for policy in [
+            Osc52WritePolicy::Allow,
+            Osc52WritePolicy::Deny,
+            Osc52WritePolicy::Prompt,
+        ] {
+            for selection in ["c", "p"] {
+                for terminator in ["\x1b\\", "\x07"] {
+                    let mut fixture = Fixture::new(policy, 0);
+                    fixture
+                        .term
+                        .advance_bytes(format!("\x1b]52;{selection};?{terminator}"));
+                    fixture.assert_untouched();
+                    assert_eq!(
+                        fixture.output.lock().unwrap().as_slice(),
+                        format!("\x1b]52;{selection};\x1b\\").as_bytes()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Ensure that we dirty lines as the cursor is moved around, otherwise
 /// the renderer won't draw the cursor in the right place
 #[test]
