@@ -21,7 +21,7 @@
 # suite, and update this comment with what you verified. Do not replace it with
 # a bare "nightly".
 [toolchain]
-channel = "nightly-2026-08-20"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
 # Windows cross-check stdlib (ft-iubh9): rustup auto-installs this target on
 # every host that builds the repo — local Macs, CI, and RCH workers alike — so
