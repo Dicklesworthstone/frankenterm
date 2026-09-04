@@ -45752,6 +45752,7 @@ async fn run_distributed_agent(
 /// the watcher already persisted, at the storage tail's poll latency
 /// (ft-xxfwy.19).
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
 struct WatcherWebOptions {
     enabled: bool,
     port: Option<u16>,
@@ -45770,7 +45771,7 @@ async fn run_watcher_with_backoff(
     notify_only: bool,
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
-    web: WatcherWebOptions,
+    #[cfg_attr(not(feature = "web"), allow(unused_variables))] web: WatcherWebOptions,
     disable_lock: bool,
     dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
@@ -118577,10 +118578,7 @@ printf x > "$MINISIGN_MARKER"
             "process-family-ft-mux-server-pty-guardian-default-features-v1",
         );
 
-        for (index, doctor_mode) in ["nonzero", "malformed", "not-ok"]
-            .into_iter()
-            .enumerate()
-        {
+        for (index, doctor_mode) in ["nonzero", "malformed", "not-ok"].into_iter().enumerate() {
             let destination = fixture.path().join(format!("destination-{index}"));
             std::fs::create_dir(&destination).expect("create doctor rollback destination");
             std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
@@ -118612,10 +118610,8 @@ printf x > "$MINISIGN_MARKER"
             );
             assert_initial_family_is_uniformly_unavailable(&destination);
             assert!(
-                std::fs::symlink_metadata(
-                    destination.join(".frankenterm-process-family/current")
-                )
-                .is_err(),
+                std::fs::symlink_metadata(destination.join(".frankenterm-process-family/current"))
+                    .is_err(),
                 "doctor mode {doctor_mode} did not restore the absent selector"
             );
         }
@@ -118979,10 +118975,8 @@ printf x > "$MINISIGN_MARKER"
                 .as_ref()
         );
         let persisted: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(
-                destination.join(".frankenterm-process-family/install-receipt.json"),
-            )
-            .expect("read persisted install receipt"),
+            &std::fs::read(destination.join(".frankenterm-process-family/install-receipt.json"))
+                .expect("read persisted install receipt"),
         )
         .expect("parse persisted install receipt");
         assert_eq!(persisted, receipt);
@@ -119046,9 +119040,11 @@ printf x > "$MINISIGN_MARKER"
             pending_receipt["verification"]["component_manifest"],
             "verified"
         );
-        assert!(pending_receipt["next_action"]
-            .as_str()
-            .is_some_and(|command| command.contains("--idle-host-confirmed")));
+        assert!(
+            pending_receipt["next_action"]
+                .as_str()
+                .is_some_and(|command| command.contains("--idle-host-confirmed"))
+        );
         assert!(family_bytes_match(&destination, &old_family));
 
         let activated = run_installer_publish_and_idle_activation(
