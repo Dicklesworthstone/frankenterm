@@ -5798,13 +5798,8 @@ impl Pdu {
     where
         R: std::marker::Unpin + AsyncRead + std::fmt::Debug,
     {
-        Self::decode_async_for_dialect_with_header_validator(
-            r,
-            max_serial,
-            dialect,
-            |_| Ok(()),
-        )
-        .await
+        Self::decode_async_for_dialect_with_header_validator(r, max_serial, dialect, |_| Ok(()))
+            .await
     }
 
     /// Decode one complete frame under an exact dialect while allowing the
