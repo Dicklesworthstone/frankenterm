@@ -14,7 +14,16 @@
 # than a project one. It surfaces on async-heavy code, so a repository can look
 # fine one day and ICE the next purely because the channel moved.
 #
-# nightly-2026-08-20 is known-good across four repositories in that sweep.
+# nightly-2026-08-20 was known-good across four repositories in that sweep.
+#
+# 2026-09-04: the pin moved to nightly-2026-08-31 for fleet unification, and the
+# verification this comment asks for was run afterwards rather than before. On
+# the new date the workspace is clean for `clippy --workspace --all-targets --
+# -D warnings` and for `fmt --all -- --check` on macOS, and the workspace check
+# passes on the Linux proof workers. Moving cost six new lint sites and
+# twenty-three targets that needed `#![recursion_limit = "256"]` to finish the
+# Send proof on the storage-open chain -- exactly the kind of breakage this
+# comment exists to have you find first.
 #
 # If you need to move this pin: bump the date, re-run
 # `cargo clippy --workspace --all-targets -- -D warnings` and the full test
