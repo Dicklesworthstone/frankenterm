@@ -39381,7 +39381,6 @@ fn now_ms() -> u64 {
         .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Return current epoch in milliseconds as i64 (for storage queries).
 /// ft-xxfwy.14: install the persisted operator kill switch
 /// (`ft robot kill-switch`, workspace DB `config` row) into a freshly built
 /// policy engine before it authorizes anything. A missing row keeps the
@@ -39421,6 +39420,18 @@ async fn with_persisted_kill_switch(
     engine
 }
 
+/// Assemble the policy used by the watcher's real workflow injector.
+/// Restore the persisted switch after applying operator safety and tuning.
+async fn build_watcher_policy_engine(
+    config: &frankenterm_core::config::Config,
+    storage: &frankenterm_core::storage::StorageHandle,
+) -> frankenterm_core::policy::PolicyEngine {
+    let engine = frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+        .with_tuning(&config.tuning);
+    with_persisted_kill_switch(engine, storage, "watcher auto-handle").await
+}
+
+/// Return current epoch in milliseconds as i64 (for storage queries).
 fn now_epoch_ms() -> i64 {
     i64::try_from(now_ms()).unwrap_or(i64::MAX)
 }
@@ -46594,15 +46605,10 @@ async fn run_watcher(
                 .await?,
         );
 
-        // Create policy engine (permissive defaults for auto-handling). The
-        // persisted operator kill switch still applies (ft-xxfwy.14): it is
-        // restored here once, at watcher start.
-        let policy_engine = with_persisted_kill_switch(
-            PolicyEngine::permissive(),
-            &storage_for_workflows,
-            "watcher auto-handle",
-        )
-        .await;
+        // Honor the same operator safety settings as direct mutations. The
+        // persisted switch is restored once at startup; live refresh/fencing
+        // remains a separate contract (ft-xxfwy.42).
+        let policy_engine = build_watcher_policy_engine(&config, &storage_for_workflows).await;
         let wezterm_handle = wezterm_handle.clone();
         let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
             policy_engine,
