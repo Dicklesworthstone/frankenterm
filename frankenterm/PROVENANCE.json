@@ -107,20 +107,20 @@
         "cosmetic": 2,
         "docs": 1,
         "feat": 5,
-        "fix": 13,
+        "fix": 14,
         "other": 2,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 32,
+      "fork_side_commit_count": 33,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-25T01:47:10-04:00",
-        "sha": "8e68db4acc7254b13cd94389d8e6f871ec963a81",
-        "subject": "style: format workspace files per rustfmt contract"
+        "classification": "fix",
+        "committed_at": "2026-09-04T01:48:04-04:00",
+        "sha": "c9cd69175041d8ff349aba070f732730e525d4d7",
+        "subject": "fix(cell): silence needless_bool under the new nightly without breaking the no-std path"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -632,7 +632,7 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "chore": 8,
+        "chore": 9,
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
@@ -645,13 +645,13 @@
         "security-fix": 7,
         "test": 68
       },
-      "fork_side_commit_count": 541,
+      "fork_side_commit_count": 542,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "chore",
-        "committed_at": "2026-09-02T15:16:08-04:00",
-        "sha": "e856ee829d32ae8a8f8b43e238f5d6522fade9cd",
-        "subject": "chore(deps): apply the safe half of the rust-deps group bump (Refs PR #86)"
+        "committed_at": "2026-09-04T03:17:09-04:00",
+        "sha": "10c363160f5573a956759318ac4099035377e824",
+        "subject": "chore(lints): make the workspace clean under nightly-2026-08-31"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -842,7 +842,7 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "chore": 1,
+        "chore": 2,
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 12,
@@ -853,13 +853,13 @@
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 84,
+      "fork_side_commit_count": 85,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "chore",
-        "committed_at": "2026-09-02T15:16:08-04:00",
-        "sha": "e856ee829d32ae8a8f8b43e238f5d6522fade9cd",
-        "subject": "chore(deps): apply the safe half of the rust-deps group bump (Refs PR #86)"
+        "committed_at": "2026-09-04T03:17:09-04:00",
+        "sha": "10c363160f5573a956759318ac4099035377e824",
+        "subject": "chore(lints): make the workspace clean under nightly-2026-08-31"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1058,8 +1058,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2375,
-  "generated_at": "2026-09-03T20:12:28.484628Z",
+  "fork_side_commit_total": 2378,
+  "generated_at": "2026-09-04T07:45:26.877119Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

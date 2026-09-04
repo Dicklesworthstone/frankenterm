@@ -119508,6 +119508,7 @@ printf x > "$MINISIGN_MARKER"
     #[test]
     fn installer_top_level_idle_orchestration_activates_only_an_inactive_first_install() {
         use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::symlink;
 
         let fixture = InstallerTestDir::new("create idle orchestration fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
@@ -119596,7 +119597,6 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(persisted, receipt);
 
         use sha2::Digest as _;
-        use std::os::unix::fs::symlink;
         let persisted_bytes =
             std::fs::read(destination.join(".frankenterm-process-family/install-receipt.json"))
                 .expect("read exact persisted receipt bytes");
