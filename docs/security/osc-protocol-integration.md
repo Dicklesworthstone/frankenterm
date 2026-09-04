@@ -4,9 +4,17 @@
 **Status:** Foundation slice shipped — hyperlink span +
 click dispatch + per-pane cursor map + typed-state OSC 52
 read response + A11Y announcement contract + 23 lib tests.
-Integration follow-on: escape-parser dispatch in
-`frankenterm/escape-parser/src/osc.rs`, per-cell HyperlinkId
-storage, hover UI, click→open-url wiring, prompt UX.
+These are core model contracts, not a complete native integration.
+
+**Native source status (2026-09-04):** parser dispatch and OSC 52
+base64 decoding already exist in `frankenterm/escape-parser/src/osc.rs`.
+The terminal performer attaches OSC 8 hyperlinks, returns empty OSC 52
+query replies, and gates both clipboard set and clear operations.
+Its configuration defaults to `Allow` with a 1 MiB decoded-byte cap.
+The native config does not expose a policy override or an approval
+prompt; an embedding's `Prompt` request is dropped. The GUI ignores
+`MouseShapeRequested`, so the cursor model below is not native cursor
+or accessibility delivery proof.
 
 The OSC protocol substrate already lives at
 `osc_protocol_omnibus.rs` (`c46aa28b8`, 39 tests). This
@@ -15,7 +23,7 @@ the typed-state OSC 52 read-path that **structurally
 enforces** the bead's "respond with empty payload when
 denied" privacy rule.
 
-## Headline rules
+## Model contracts
 
 > 1. **OSC 52 read-denied responses cannot leak clipboard
 >    bytes.** The `Denied` typed-state has *no* method
@@ -147,23 +155,23 @@ Cross-link `a11y_tree.rs` (BR-TERM-EMULATOR-UPLIFT.A11Y.1).
 - 1 deny-policy headline scenario (privacy verified).
 - 1 cursor-map serde roundtrip.
 
-## Bead acceptance status
+## Source and model acceptance status
 
 | Item | Status |
 |---|---|
-| OSC 8 parser dispatch in escape-parser | ⏳ separate crate edit |
-| OSC 8 per-cell HyperlinkId storage | ✓ `HyperlinkSpan` shape |
-| OSC 8 hover state UI | ✓ `HyperlinkInteraction::Hovering` shape |
-| OSC 8 click handler | ✓ `dispatch_click` decision tree |
-| OSC 8 A11Y announcement | ✓ `A11yAnnouncementShape::HyperlinkFocus` |
-| OSC 22 parser dispatch | ⏳ separate crate edit |
+| OSC 8 parser dispatch in escape-parser | Implemented in native parser |
+| OSC 8 per-cell hyperlink model | `HyperlinkSpan` is a core model; native performer uses its terminal cell attributes |
+| OSC 8 hover state UI | Model shape: `HyperlinkInteraction::Hovering`; no native UI proof here |
+| OSC 8 click handler | Model decision tree: `dispatch_click`; no native click proof here |
+| OSC 8 A11Y announcement | Model shape: `A11yAnnouncementShape::HyperlinkFocus`; native delivery unproven |
+| OSC 22 parser dispatch | Implemented in native parser |
 | OSC 22 cursor renderer apply | ⏳ GUI edit |
 | OSC 22 per-pane state | ✓ `Osc22PerPaneCursorMap` |
 | OSC 22 A11Y announcement | ✓ `A11yAnnouncementShape::CursorShapeChange` |
-| OSC 52 parser dispatch | ⏳ separate crate edit |
-| OSC 52 base64 decode | ⏳ integration follow-on |
-| OSC 52 size-cap pre-decode | ✓ substrate (`osc52_size_cap_decision`) |
-| OSC 52 policy gate (write+read) | ✓ `Osc52ReadResponse` typed-state for read |
+| OSC 52 parser dispatch | Implemented in native parser |
+| OSC 52 base64 decode | Implemented in native parser |
+| OSC 52 size-cap pre-decode | Model: `osc52_size_cap_decision`; native write gate limits decoded bytes after parsing |
+| OSC 52 policy gate (write+read) | Core typed-state read model; native queries always empty and set/clear share a write gate |
 | OSC 52 prompt UX | ⏳ GUI follow-on |
 | OSC 52 read denied = empty payload | ✓ structurally enforced |
 | OSC 52 telemetry | ✓ `OscIntegrationHealth` |

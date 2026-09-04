@@ -4,9 +4,19 @@
 **Parent:** `ft-7yiu2` (term-layer slice shipped at
 `526e675cd` — OSC 22 dispatch added, OSC 8/52 audit tests).
 **Status:** Foundation slice shipped. Cursor table + hover
-state machine + clipboard policy + 21-fixture corpus + audit
-doc all live; production GUI cursor / clipboard wiring is the
-integration follow-on.
+state machine + clipboard policy model + 21 corpus descriptors
+are implemented. These model contracts do not establish native
+cursor application, clipboard approval UX, or golden-image proof.
+
+**Native source status (2026-09-04):** the escape parser and terminal
+performer handle OSC 8/22/52. OSC 52 queries return an empty reply;
+set and clear operations share the terminal write-policy gate. The
+native configuration inherits `Allow` with a 1 MiB decoded-byte cap
+from `TerminalConfiguration`. User-configurable Deny/Prompt and a GUI
+approval prompt are not wired; a term embedding that selects `Prompt`
+drops the request without changing the clipboard. The GUI currently
+ignores `MouseShapeRequested`, so the cursor table below is not proof
+of native cursor application.
 
 ## Headline rule
 
@@ -14,7 +24,8 @@ integration follow-on.
 > the user's clipboard via `OSC 52 ; <selection> ; ?` is a
 > security hole — pages can siphon credentials, secrets, and
 > any other content the user copied from elsewhere. The
-> default policy denies reads and prompts for writes.
+> core policy model denies reads and requests approval for writes.
+> The native write default differs, as recorded above.
 
 ## OSC 22 — Cursor mapping
 
@@ -26,7 +37,7 @@ integration follow-on.
 
 `native_cursor_table()` ships the per-platform mapping for
 all 14 shapes × 3 OSes (macOS / Linux / Windows = 42 entries).
-The integration code consumes this to call:
+These are mapping descriptors for a future native consumer:
 
 - macOS — `NSCursor.init(named:)` with `arrowCursor`,
   `IBeamCursor`, etc.
@@ -60,15 +71,16 @@ Anchors compare by `(id, url)` — gitstatus / eza-style
 
 `ClipboardActionKind`:
 
-| Action | Wire form | Default policy |
+| Action | Wire form | Core model default policy |
 |---|---|---|
 | `ClipboardWrite` | `OSC 52 ; <sel> ; <base64>` | `RequireApproval` (prompt) |
 | `ClipboardRead` | `OSC 52 ; <sel> ; ?` | **`Deny`** |
 
-`ClipboardPolicyTable::default()` populates these defaults.
+`ClipboardPolicyTable::default()` populates these model defaults;
+it is not the native `TerminalConfiguration` default.
 `evaluate_clipboard(action, policy)` returns:
 
-| Policy | Decision | Dispatcher behavior |
+| Policy | Decision | Intended dispatcher behavior |
 |---|---|---|
 | `Allow` | `Allow` | Forward to OS clipboard |
 | `Deny` | `Deny` | Drop silently + log |
@@ -88,8 +100,9 @@ is a gate-broken signal.
 - 4 OSC 52 scenarios: `Write`, `Clear`, `QueryAllowed`,
   `QueryDenied`.
 
-Each lives at `tests/golden/osc_<n>/<slug>/`; goldens land on
-the GPU CI runner.
+These are corpus descriptors, not a retained native golden suite.
+Native fixture capture and per-release DSR qualification remain
+follow-on work; descriptor counts do not prove rendered behavior.
 
 ## Tests
 
@@ -101,7 +114,7 @@ mapping, default-table-blocks-reads, corpus completeness,
 rollout phase ordering, health safety predicate, serde
 roundtrip.
 
-## Bead acceptance status
+## Foundation-model acceptance status
 
 | Item | Status |
 |---|---|

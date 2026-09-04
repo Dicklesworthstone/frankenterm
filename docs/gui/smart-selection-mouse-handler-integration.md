@@ -20,9 +20,10 @@ substrate-pass landed:
 | ft-cnil8.2 | dispatcher | `668e8d662` | `ClickKind::from_click_count(u32)` + `classify_click(kind, candidates, click_pos, line_start, line_end) -> Option<SelectionMatch>` |
 | ft-cnil8.1 | pipeline | `ed1654f0b` | `pick_click_target(line_text, click_pos, kind) -> Option<SelectionMatch>` |
 
-## GUI integration shape (2-call sequence)
+## Core integration example (2-call sequence)
 
-The GUI mouse handler becomes:
+This example illustrates classification and event recording. The actual GUI
+also handles display-cell conversion, selection state, and fallback paths:
 
 ```rust
 use frankenterm_core::a11y_tree::{AccessibilityRecorder, AnnouncePriority};
@@ -57,9 +58,9 @@ fn handle_mouse_click(
 }
 ```
 
-That's the entire GUI-side wiring. 5 lines of substrate use +
-the existing word-boundary fallback path stays as the `None`
-return-value handler.
+The production integration lives in `crates/frankenterm-gui/src/selection.rs`
+and `src/termwindow/selection.rs`. The existing word-boundary fallback
+handles a `None` classifier result.
 
 ## Click-count debouncing (GUI-side, scope item 1 of ft-cnil8.1)
 
@@ -101,21 +102,14 @@ impl ClickAccumulator {
 
 ## Cell coords → byte offset (GUI-side, scope item 1)
 
-The substrate accepts a byte offset (`click_pos: usize`); the
-GUI translates from `(line_idx, cell_x)` via the existing line-
-text encoding. For ASCII this is straightforward; for multi-
-byte chars / wide cells the GUI's grid module already maintains
-the cell→byte map.
-
-```rust
-fn cell_to_byte_offset(line_text: &str, cell_x: u32) -> usize {
-    line_text
-        .char_indices()
-        .nth(cell_x as usize)
-        .map(|(i, _)| i)
-        .unwrap_or(line_text.len())
-}
-```
+The substrate accepts a byte offset (`click_pos: usize`), while the
+GUI receives display-cell columns. Use the existing
+`byte_offset_for_logical_x`, `logical_x_for_byte_offset`, and
+`smart_match_logical_x_range` authorities in
+`crates/frankenterm-gui/src/selection.rs`. They account for grapheme
+width when translating the click and the selected range. Counting
+Unicode scalar values with `char_indices().nth(cell_x)` is incorrect
+for wide characters and combining sequences.
 
 ## Word-boundary fallback (scope item 6)
 
@@ -135,22 +129,22 @@ recorder's platform-specific binding; it just calls
 `recorder.record(event)` with the bridge-produced
 `AccessibilityEvent::AnnounceMessage`.
 
-The platform recorders ship under
-`crates/frankenterm-gui/src/a11y/` (per-OS modules); they
-wrap the `record` call into `NSAccessibilityPostNotification`
-or AT-SPI's announcement signal.
+The current GUI uses the process-wide `RecorderHandle` in
+`crates/frankenterm-gui/src/smart_selection_a11y.rs`.
+`emit_smart_selection_pick` records the selection event. Native
+NSAccessibility, AT-SPI, and UIA forwarding remains unwired; recording
+an event is not proof that a screen reader received an announcement.
 
 ## Test fixture (scope item 3 of ft-cnil8.4)
 
 The substrate ships unit tests covering every classifier path.
-The GUI integration test the bead asks for ("simulated mouse
-click + AT-tree assertion") composes those into an end-to-end
-fixture:
+The example below composes those contracts with a recorder. It is a
+headless contract fixture, not a native mouse or screen-reader test:
 
 ```rust
 #[test]
 fn double_click_url_emits_announcement() {
-    use frankenterm_core::a11y_tree::ContractRecorder;
+    use frankenterm_core::a11y_tree::{AccessibilityEvent, ContractRecorder};
     use frankenterm_core::smart_selection::*;
 
     let mut recorder = ContractRecorder::new();
@@ -160,11 +154,11 @@ fn double_click_url_emits_announcement() {
 
     let events = recorder.snapshot();
     assert_eq!(events.len(), 1);
-    matches!(
-        events[0],
+    assert!(matches!(
+        &events[0],
         AccessibilityEvent::AnnounceMessage { value, .. }
             if value == "URL selected: https://example.com"
-    );
+    ));
 }
 ```
 
