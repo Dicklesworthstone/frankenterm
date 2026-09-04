@@ -1111,17 +1111,17 @@ impl TeenyString {
 
     fn can_assume_default_ascii_width(unicode_version: Option<&UnicodeVersion>) -> bool {
         #[cfg(feature = "std")]
-        if unicode_version
-            .and_then(|version| version.cell_widths.as_ref())
-            .is_some()
         {
-            return false;
+            unicode_version
+                .and_then(|version| version.cell_widths.as_ref())
+                .is_none()
         }
 
         #[cfg(not(feature = "std"))]
-        let _ = unicode_version;
-
-        true
+        {
+            let _ = unicode_version;
+            true
+        }
     }
 
     const fn normalize_explicit_width(width: usize) -> usize {
