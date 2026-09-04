@@ -1468,8 +1468,7 @@ fn delete_excess_closed_sessions_with_observer(
 ) -> Result<usize, rusqlite::Error> {
     let step_budget = retention_phase_test_step_budget(conn)?;
     for _ in 0..step_budget {
-        let outcome =
-            delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?;
+        let outcome = delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?;
         if !outcome.recovery_reconciliation_pending {
             return Ok(outcome.value);
         }
@@ -1727,8 +1726,7 @@ fn delete_sessions_by_size_with_observer(
 ) -> Result<SizeCleanupOutcome, rusqlite::Error> {
     let step_budget = retention_phase_test_step_budget(conn)?;
     for _ in 0..step_budget {
-        let outcome =
-            delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?;
+        let outcome = delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?;
         if !outcome.recovery_reconciliation_pending {
             return Ok(outcome.value);
         }
@@ -3184,8 +3182,7 @@ mod tests {
         )
         .unwrap();
 
-        let first =
-            delete_excess_closed_sessions_phase_with_observer(&conn, 0, &dead).unwrap();
+        let first = delete_excess_closed_sessions_phase_with_observer(&conn, 0, &dead).unwrap();
         assert!(
             first.recovery_reconciliation_pending,
             "the first bounded legacy batch must remain explicitly pending"
@@ -3439,8 +3436,7 @@ mod tests {
             .unwrap();
         }
 
-        let first =
-            delete_excess_closed_sessions_phase_with_observer(&conn, 0, &dead).unwrap();
+        let first = delete_excess_closed_sessions_phase_with_observer(&conn, 0, &dead).unwrap();
         assert!(
             first.recovery_reconciliation_pending,
             "the first reconciliation batch must remain explicitly pending"
