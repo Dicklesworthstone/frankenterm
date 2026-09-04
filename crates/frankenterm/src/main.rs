@@ -45771,7 +45771,7 @@ async fn run_watcher_with_backoff(
     notify_only: bool,
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
-    #[cfg_attr(not(feature = "web"), allow(unused_variables))] web: WatcherWebOptions,
+    web: WatcherWebOptions,
     disable_lock: bool,
     dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
@@ -46151,7 +46151,7 @@ async fn run_watcher(
     notify_only: bool,
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
-    web: WatcherWebOptions,
+    #[cfg_attr(not(feature = "web"), allow(unused_variables))] web: WatcherWebOptions,
     disable_lock: bool,
     dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
