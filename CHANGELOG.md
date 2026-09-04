@@ -16,7 +16,7 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main) | HEAD | — | Next release |
-| [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) | Release | 2026-09-02 | Entry ramp: CLI finds the GUI, mux survives connects, `ft web` answers, signed assets |
+| [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) | Release | 2026-09-04 | Entry ramp: CLI finds the GUI, mux survives connects, `ft web` answers and streams live, signed assets |
 | [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
 | [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
@@ -30,14 +30,11 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main>
 
-### Robot contracts
-
-- `ft robot send` receipts report the paste mode that ran (`no_paste`) and whether the trailing newline was suppressed (`no_newline`), matching the human `ft send` receipt (ft-xxfwy.36).
-- Direct mux client: a reply correlated with the registration request but carrying the wrong PDU type is still refused as `InboundPduInvalidForPhase`; only serial-0 notifications are tolerated during registration (planted negative for ft-xxfwy.34).
+Nothing yet.
 
 ---
 
-## [0.15.2] -- 2026-09-02 (GitHub Release)
+## [0.15.2] -- 2026-09-04 (GitHub Release)
 
 GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2>
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.15.2>
@@ -60,6 +57,18 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.
 - Installer: `--activate <generation> --idle-host-confirmed` promotes a candidate generation on an idle host; `scripts/release/verify-release.sh <tag>` verifies every asset's minisign signature and fails on unsigned artifacts (v0.15.1 fails it).
 - Release gates moved from the retired GitHub workflows to `scripts/release-gates.sh`; the orphan-source guard, `ft robot profile create` contract, and the headless observe smoke (`scripts/smoke/headless-mux-observe.sh`, JSON receipt) are new proof surfaces.
 - Docs: README truth sweep (schema v45, attestation path, DSR-only release wording, `metrics` feature, explicit-state-model wording, paste-vs-typed `ft send` contract, `ft setup shell`).
+
+### Live events, redaction, and the watcher's own lifetime
+
+- `ft watch --web` (optional `--web-port`) serves the read-only API from the watcher process and shares its EventBus, so a detection reaches `/stream/events` when it is published instead of after a standalone `ft web`'s storage-tail poll. The tail is off in that mode: the in-process publisher is the watcher itself. A client holding a stream open when the watcher stops is reported, not treated as an unclean shutdown.
+- A base64 field can no longer smuggle a secret past redaction. A user-var event streams both the decoded `event_data`, which the redactor cleaned, and the raw `value` it was decoded from, which the redactor could not read -- so a token in the payload was served in full to any web client while the frame looked redacted. The redaction walk now decodes a base64 string that the matcher found nothing in, and if the decoded text carries a secret the field is replaced with the re-encoded redacted text (still base64, still decodable, redacted). New e2e `tests/e2e/test_web_sse_filters_and_redaction.sh` proves pane and channel filters (with a planted negative) and judges redaction on the decoded text, not on a grep.
+- `ft watch` no longer leaks a defunct child per poll once its mux server is gone: the `wezterm cli` deadline moved into the process supervisor, which terminates the process group and reaps the leader before it settles. Nine long-running watchers had accumulated 8,228 zombie children between them and exhausted a developer machine's process table.
+- `ft watch` stops when it is told to. It always caught SIGTERM, but the terminal snapshot it takes on the way out needs the mux backend -- usually the very thing that has died -- so the run returned an error and the crash-loop supervisor restarted it forever, which is indistinguishable from ignoring the signal. A requested stop is now terminal (still reported, still a non-zero exit), the shutdown listing is bounded at ten seconds, and the crash-loop backoff window waits on SIGTERM as well as Ctrl-C. Discovery also backs off (1s → 2 → 4 → … → 30s) while listings keep failing instead of paying a full subprocess timeout every interval.
+- `ft proof-doctor` accepts the proof command its own blocker text prescribes. Command classification matched argv[0] against `rch`, and argv[0] in the canonical form is an environment assignment, so `RCH_REQUIRE_REMOTE=1 … rch --no-self-healing exec -- env … cargo test` was rejected as the wrong shape and no proof command in the mandated form could be claimed as proof. Classification now looks past leading `NAME=VALUE` tokens, applies the same treatment to local-build detection, and classifies a command whose env prefix forces local execution (`RCH_FORCE_LOCAL`, `RCH_DISABLED`, `RCH_CARGO_WRAPPER_BYPASS`) as local so it cannot be laundered into a remote proof claim.
+- `ft robot send` receipts report the paste mode that ran (`no_paste`) and whether the trailing newline was suppressed (`no_newline`), matching the human `ft send` receipt (ft-xxfwy.36).
+- Direct mux client: a reply correlated with the registration request but carrying the wrong PDU type is still refused as `InboundPduInvalidForPhase`; only serial-0 notifications are tolerated during registration (planted negative for ft-xxfwy.34).
+- The CLI golden-artifact suite is runnable again: its WezTerm stub predated the unified client's version probe and the `--no-auto-start` flag, so every pane operation was a backend failure; the harness is now isolated from the host's sockets and config, and the envelope version is scrubbed so goldens no longer drift on a release bump.
+- The vendored-provenance gate fails closed on a shallow clone (the manifest is derived from per-crate git history, which a depth-1 checkout does not have) instead of reporting a thousand lines of meaningless drift, and regenerating the manifest no longer rewrites its timestamp when nothing else changed.
 
 ### Reconnect and process-family deployment safety
 
