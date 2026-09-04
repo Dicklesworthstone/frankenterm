@@ -359,13 +359,22 @@ fn steer_plan_clean_ready_json_receipt() {
             .assert()
             .success(),
     );
-    assert!(out.contains("\"receipt_id\""), "no receipt_id: {out}");
+    let receipt: serde_json::Value = serde_json::from_str(&out).expect("json receipt");
     assert!(
-        out.contains("steer:"),
+        receipt["receipt_id"]
+            .as_str()
+            .is_some_and(|receipt_id| receipt_id.starts_with("steer:")),
         "receipt id not content-addressed: {out}"
     );
-    assert!(out.contains("envelope.admit"), "wrong verdict: {out}");
-    assert!(out.contains("950"), "missing rehearsal score: {out}");
+    assert!(
+        receipt["envelope_verdict"] == "envelope.admit",
+        "wrong verdict: {out}"
+    );
+    assert_eq!(
+        receipt["rehearsal_score"],
+        serde_json::json!(1000),
+        "wrong clean-ready rehearsal score: {out}"
+    );
 }
 
 #[test]
@@ -529,7 +538,7 @@ fn persist_bound_receipt(w: &TempDir, contract: &MissionTxContract) -> SteeringR
 
 #[cfg(unix)]
 #[test]
-fn steer_run_executes_bound_contract_and_uses_workspace_global_ledger() {
+fn steer_run_cli_only_backend_fails_closed_and_uses_workspace_global_ledger() {
     let w = workspace();
     let stub = SteerWeztermCliStub::new(&w);
     let (contract_path, contract) = write_executable_tx_contract(&w);
@@ -568,10 +577,21 @@ fn steer_run_executes_bound_contract_and_uses_workspace_global_ledger() {
         Some(authoritative_contract_path.to_string_lossy().as_ref()),
         "{out}"
     );
-    assert_eq!(v["tx"]["final_state"], "committed", "{out}");
+    assert_eq!(v["tx"]["final_state"], "compensated", "{out}");
     assert_eq!(
-        v["tx"]["commit_report"]["outcome"], "fully_committed",
+        v["tx"]["commit_report"]["outcome"], "immediate_failure",
         "{out}"
+    );
+    assert_eq!(
+        v["tx"]["commit_report"]["step_results"][0]["outcome"]["failed"]["reason_code"],
+        "send_text_failed",
+        "{out}"
+    );
+    assert!(
+        v["tx"]["commit_report"]["error_code"]
+            .as_str()
+            .is_some_and(|error| error.contains("backend_failure")),
+        "CLI-only pane mutation must fail closed with a typed backend error: {out}"
     );
     assert_eq!(
         v["tx"]["steering_receipt_id"].as_str(),
@@ -586,16 +606,16 @@ fn steer_run_executes_bound_contract_and_uses_workspace_global_ledger() {
 
     assert_eq!(
         stub.effects(),
-        vec!["0\tsteer-bound-commit"],
-        "the bound contract must dispatch its one real SendText effect exactly once"
+        Vec::<String>::new(),
+        "CLI pane-input fallback is forbidden, so the stub must observe no mutation"
     );
 
     let persisted: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&contract_path).expect("read committed steering contract"),
+        &std::fs::read(&contract_path).expect("read settled steering contract"),
     )
-    .expect("committed steering contract JSON");
-    assert_eq!(persisted["lifecycle_state"], "committed");
-    assert_eq!(persisted["outcome"], "committed");
+    .expect("settled steering contract JSON");
+    assert_eq!(persisted["lifecycle_state"], "compensated");
+    assert_eq!(persisted["outcome"], "compensated");
     let attachment = persisted["receipts"]
         .as_array()
         .and_then(|receipts| receipts.first())
@@ -647,8 +667,8 @@ fn steer_run_executes_bound_contract_and_uses_workspace_global_ledger() {
     );
     assert_eq!(ledger.records().len(), 1);
     assert!(
-        matches!(&ledger.records()[0].outcome, StepOutcome::Success { .. }),
-        "the durable ledger must prove the dispatched SendText success"
+        matches!(&ledger.records()[0].outcome, StepOutcome::Failure { .. }),
+        "the durable ledger must prove that the forbidden CLI SendText was not applied"
     );
 }
 
