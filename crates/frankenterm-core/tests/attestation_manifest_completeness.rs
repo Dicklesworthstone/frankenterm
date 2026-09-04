@@ -46,6 +46,7 @@ const MANIFEST_PRODUCER_FALLBACK_ISSUES_JSONL: &str = r#"{"id":"ft-0elb9","statu
 {"id":"ft-x0666.1","status":"closed","dependencies":[]}
 {"id":"ft-x0666.2","status":"closed","dependencies":[]}
 {"id":"ft-x0666.3","status":"closed","dependencies":[]}
+{"id":"ft-xxfwy.14","status":"closed","dependencies":[]}
 {"id":"ft-zbnz4.7","status":"closed","dependencies":[]}"#;
 
 #[derive(Debug, Clone)]
