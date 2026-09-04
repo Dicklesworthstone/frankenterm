@@ -4789,22 +4789,34 @@ impl NotificationConfig {
                 ));
             }
 
-            let url = webhook.url.trim();
-            if url.is_empty() {
+            let url = webhook.url.as_str();
+            if url.trim().is_empty() {
                 return Err(format!(
                     "notifications.webhooks[{idx}].url must not be empty"
                 ));
             }
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            let parsed_url = url::Url::parse(url).map_err(|_| {
+                format!("notifications.webhooks[{idx}].url must be a valid URL")
+            })?;
+            if !matches!(parsed_url.scheme(), "http" | "https") {
                 return Err(format!(
-                    "notifications.webhooks[{idx}].url must start with http:// or https://"
+                    "notifications.webhooks[{idx}].url must use http or https"
                 ));
             }
-            if url.len() <= "http://".len() {
+            if parsed_url.host_str().is_none_or(str::is_empty) {
                 return Err(format!(
                     "notifications.webhooks[{idx}].url must include a host"
                 ));
             }
+            // Validate the exact bytes delivery receives as well: URL parsing
+            // normalizes forms (including empty userinfo) that the HTTP
+            // transport deliberately does not support. Its errors may contain
+            // credentials, so expose only the indexed configuration field.
+            crate::runtime_async::http::ParsedUrl::parse(url).map_err(|_| {
+                format!(
+                    "notifications.webhooks[{idx}].url must be supported by the HTTP transport"
+                )
+            })?;
 
             for (event_idx, pattern) in webhook.events.iter().enumerate() {
                 if pattern.trim().is_empty() {
@@ -8913,6 +8925,110 @@ log_level = "debug"
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("duplicate name"));
+    }
+
+    #[test]
+    fn notification_config_webhook_url_rejects_malformed_endpoints() {
+        for endpoint in [
+            "",
+            "   ",
+            "http://",
+            "https://",
+            "https://:443/hook",
+            "https://bad host.invalid/hook",
+            "https://[::1/hook",
+            "https://example.invalid:not-a-port/hook",
+            "https://example.invalid:65536/hook",
+            "https://example.invalid:/hook",
+            "/relative/hook",
+            "ftp://example.invalid/hook",
+            "file:///tmp/hook",
+            "hTtPs://example.invalid/hook",
+            "https:/example.invalid/hook",
+            "https:///example.invalid/hook",
+            " https://example.invalid/hook",
+            "https://@example.invalid/hook",
+            "https://user:password@example.invalid/hook",
+            "https://%75ser:password@example.invalid/hook",
+            "https://user%40example.invalid/hook",
+        ] {
+            let mut config = Config::default();
+            config
+                .notifications
+                .webhooks
+                .push(crate::webhook::WebhookEndpointConfig {
+                    name: "alerts".to_string(),
+                    url: endpoint.to_string(),
+                    template: crate::webhook::WebhookTemplate::Generic,
+                    events: Vec::new(),
+                    headers: std::collections::HashMap::new(),
+                    enabled: true,
+                });
+            let error = config.validate().expect_err("reject malformed webhook URL");
+            assert!(error.to_string().contains("notifications.webhooks[0].url"));
+        }
+    }
+
+    #[test]
+    fn notification_config_webhook_url_accepts_supported_parsed_endpoints() {
+        for endpoint in [
+            "http://example.invalid/hook",
+            "https://example.invalid:8443/path?query=value",
+            "http://localhost:8080/hook",
+            "http://127.0.0.1:8080/hook",
+            "https://[::1]:8443/hook",
+            "https://example.invalid?query=value",
+            "https://example.invalid/path%40name?query=user%40value",
+        ] {
+            let mut config = Config::default();
+            config
+                .notifications
+                .webhooks
+                .push(crate::webhook::WebhookEndpointConfig {
+                    name: "alerts".to_string(),
+                    url: endpoint.to_string(),
+                    template: crate::webhook::WebhookTemplate::Generic,
+                    events: Vec::new(),
+                    headers: std::collections::HashMap::new(),
+                    enabled: true,
+                });
+            config.validate().expect("accept supported parsed webhook URL");
+        }
+    }
+
+    #[test]
+    fn notification_config_webhook_url_errors_do_not_echo_credentials() {
+        for endpoint in [
+            "https://synthetic-user:synthetic-password@bad host.invalid/private-path?private-query=value",
+            "https://synthetic-user:synthetic-password@example.invalid/private-path?private-query=value",
+            "ftp://synthetic-user:synthetic-password@example.invalid/private-path?private-query=value",
+        ] {
+            let mut config = Config::default();
+            config
+                .notifications
+                .webhooks
+                .push(crate::webhook::WebhookEndpointConfig {
+                    name: "alerts".to_string(),
+                    url: endpoint.to_string(),
+                    template: crate::webhook::WebhookTemplate::Generic,
+                    events: Vec::new(),
+                    headers: std::collections::HashMap::new(),
+                    enabled: true,
+                });
+            let error = config
+                .validate()
+                .expect_err("reject invalid webhook URL")
+                .to_string();
+            assert!(error.contains("notifications.webhooks[0].url"));
+            for private_part in [
+                "synthetic-user",
+                "synthetic-password",
+                "private-path",
+                "private-query",
+            ] {
+                assert!(!error.contains(private_part));
+            }
+        }
     }
 
     #[test]
