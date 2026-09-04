@@ -115275,7 +115275,7 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "#!/usr/bin/env python3\n# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:ft:{target}:release-interactive:0.15.2;\n"
         );
         source.push_str(
-            r#"import hashlib, json, os, sys
+            r#"import hashlib, json, os, sys, time
 
 arguments = sys.argv[1:]
 if arguments == ["--version"]:
@@ -115283,6 +115283,8 @@ if arguments == ["--version"]:
     raise SystemExit(0)
 if arguments == ["doctor", "--json"]:
     mode = os.environ.get("FT_INSTALL_TEST_DOCTOR_MODE", "pass")
+    if mode == "hang":
+        time.sleep(60)
     if mode == "nonzero":
         raise SystemExit(70)
     if mode == "malformed":
@@ -115580,9 +115582,8 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V5={transaction_id}:{operation}:{stage_name}:{
         std::fs::create_dir_all(scratch).expect("create installer activation scratch");
         let failpoint = failpoint.unwrap_or("");
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES={}\nexport FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL={}\nexport FT_INSTALL_TEST_DOCTOR_MODE={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nIDLE_HOST_CONFIRMED=1\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nactivate_process_family_generation {}\nemit_process_family_receipt\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE={}\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES=1\nexport FT_INSTALL_TEST_PROBE_TIMEOUT_SECONDS=0.25\nexport FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL={}\nexport FT_INSTALL_TEST_DOCTOR_MODE={}\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nIDLE_HOST_CONFIRMED=1\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nactivate_process_family_generation {}\nemit_process_family_receipt\n",
             shell_single_quote(mux_state),
-            if readiness_failure { "1" } else { "0" },
             if readiness_failure { "1" } else { "0" },
             shell_single_quote(doctor_mode),
             shell_single_quote(&installer.to_string_lossy()),
@@ -116761,12 +116762,23 @@ cat "$FAKE_FONT_ARCHIVE"
             .map(|offset| probe_start + offset)
             .expect("activated process-family probe helper end");
         let probe = &installer[probe_start..probe_end];
-        assert!(
-            probe.contains("for name in ft frankenterm-mux-server frankenterm-pty-guardian; do")
-        );
-        assert!(probe.contains("\"$DEST/$name\" --version >/dev/null 2>&1 || return 1"));
-        assert!(probe.contains("\"$DEST/ft\" doctor --json"));
+        assert!(probe.contains("timeout_seconds = 10.0"));
+        assert!(probe.contains("start_new_session=True"));
+        assert!(probe.contains("os.killpg(process.pid, signal.SIGKILL)"));
+        assert!(probe.contains("run_bounded([executable, \"--version\"])"));
+        assert!(probe.contains("run_bounded([ft, \"doctor\", \"--json\"]"));
         assert!(probe.contains("report.get(\"ok\") is not True"));
+        assert!(installer.contains("emit_process_family_receipt silent"));
+        assert!(installer.contains("activation-transaction-in-progress"));
+        assert!(installer.contains("src_dir_fd=parent_descriptor"));
+        assert!(installer.contains("dst_dir_fd=parent_descriptor"));
+        assert!(
+            installer.contains("published process-family receipt differs from its pinned stage")
+        );
+        assert!(installer.contains("activation recovery receipt changed while being read"));
+        assert!(installer.contains("python3 - \"${SYSTEM_INSTALL:-0}\""));
+        assert!(installer.contains("if not all_users and process.stat().st_uid"));
+        assert!(installer.contains("ps_command.append(\"-A\")"));
         assert!(
             installer
                 .contains("Running pending candidate \\`ft doctor --json\\` by immutable path")
@@ -118348,6 +118360,22 @@ printf x > "$MINISIGN_MARKER"
             } else {
                 assert_initial_family_is_uniformly_unavailable(&destination);
             }
+            let interrupted_receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    destination.join(".frankenterm-process-family/install-receipt.json"),
+                )
+                .expect("read interrupted activation receipt"),
+            )
+            .expect("parse interrupted activation receipt");
+            assert_eq!(interrupted_receipt["activation"], "pending");
+            assert_eq!(
+                interrupted_receipt["pending_reason"],
+                "activation-transaction-in-progress"
+            );
+            assert_eq!(
+                interrupted_receipt["verification"]["activation_readiness"],
+                "running"
+            );
 
             let recovered = run_installer_activation_function(
                 &installer,
@@ -118443,6 +118471,128 @@ printf x > "$MINISIGN_MARKER"
             String::from_utf8_lossy(&recovered.stderr)
         );
         assert!(family_bytes_match(&destination, &candidate_family));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_post_commit_crash_retry_failure_restores_durable_prior_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let fixture = tempfile::tempdir().expect("create post-commit recovery fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let old_family = create_installer_test_family(
+            &fixture.path().join("old-family"),
+            &"a".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"b".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+
+        let initial_destination = fixture.path().join("initial-bin");
+        std::fs::create_dir(&initial_destination).expect("create initial destination");
+        std::fs::set_permissions(&initial_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make initial destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &initial_destination,
+                &fixture.path().join("initial-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let interrupted = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &initial_destination,
+            &fixture.path().join("initial-interrupt"),
+            Some("after-selector-activation"),
+            "inactive",
+            false,
+        );
+        assert_eq!(interrupted.status.signal(), Some(9));
+        assert!(family_bytes_match(&initial_destination, &candidate_family));
+        let failed_retry = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &initial_destination,
+            &fixture.path().join("initial-failed-retry"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!failed_retry.status.success());
+        assert_initial_family_is_uniformly_unavailable(&initial_destination);
+        assert!(
+            std::fs::symlink_metadata(
+                initial_destination.join(".frankenterm-process-family/current")
+            )
+            .is_err(),
+            "post-commit first-install recovery did not restore selector absence"
+        );
+
+        let managed_destination = fixture.path().join("managed-bin");
+        std::fs::create_dir(&managed_destination).expect("create managed destination");
+        std::fs::set_permissions(&managed_destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make managed destination private");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &old_family,
+                &managed_destination,
+                &fixture.path().join("managed-old-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        activate_installer_test_generation(&managed_destination, &old_family);
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &managed_destination,
+                &fixture.path().join("managed-candidate-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        let interrupted = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &managed_destination,
+            &fixture.path().join("managed-interrupt"),
+            Some("after-selector-activation"),
+            "inactive",
+            false,
+        );
+        assert_eq!(interrupted.status.signal(), Some(9));
+        assert!(family_bytes_match(&managed_destination, &candidate_family));
+        let failed_retry = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &managed_destination,
+            &fixture.path().join("managed-failed-retry"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!failed_retry.status.success());
+        assert!(family_bytes_match(&managed_destination, &old_family));
+        assert_eq!(
+            std::fs::read_link(managed_destination.join(".frankenterm-process-family/current"))
+                .expect("read restored managed selector"),
+            Path::new("generations").join(&old_family.generation_id)
+        );
     }
 
     #[cfg(unix)]
@@ -118605,7 +118755,10 @@ printf x > "$MINISIGN_MARKER"
             "process-family-ft-mux-server-pty-guardian-default-features-v1",
         );
 
-        for (index, doctor_mode) in ["nonzero", "malformed", "not-ok"].into_iter().enumerate() {
+        for (index, doctor_mode) in ["nonzero", "malformed", "not-ok", "hang"]
+            .into_iter()
+            .enumerate()
+        {
             let destination = fixture.path().join(format!("destination-{index}"));
             std::fs::create_dir(&destination).expect("create doctor rollback destination");
             std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
@@ -118641,7 +118794,123 @@ printf x > "$MINISIGN_MARKER"
                     .is_err(),
                 "doctor mode {doctor_mode} did not restore the absent selector"
             );
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    destination.join(".frankenterm-process-family/install-receipt.json"),
+                )
+                .expect("read failed-readiness receipt"),
+            )
+            .expect("parse failed-readiness receipt");
+            assert_eq!(receipt["activation"], "pending");
+            assert_eq!(receipt["pending_reason"], "activation-readiness-failed");
+            assert_eq!(receipt["verification"]["activation_readiness"], "failed");
+            assert_eq!(receipt["verification"]["component_manifest"], "verified");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_auto_activation_receipt_reports_component_reverification_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create component failure fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let family = create_installer_test_family(
+            &fixture.path().join("family"),
+            &"8".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let destination = fixture.path().join("bin");
+        let scratch = fixture.path().join("scratch");
+        std::fs::create_dir(&destination).expect("create component failure destination");
+        std::fs::create_dir(&scratch).expect("create component failure scratch");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make component failure destination private");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_MUX_OWNERSHIP_STATE=inactive\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nACTIVATE_IF_IDLE=0\ninstall_process_family {} {} {} {} {}\nchmod u+w \"$PUBLISHED_PROCESS_FAMILY_ROOT/ft\"\nprintf x >> \"$PUBLISHED_PROCESS_FAMILY_ROOT/ft\"\nif activate_published_generation_if_idle; then exit 90; fi\nemit_process_family_receipt\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&destination.to_string_lossy()),
+            shell_single_quote(&scratch.to_string_lossy()),
+            shell_single_quote(&family.root.join("ft").to_string_lossy()),
+            shell_single_quote(&family.root.join("frankenterm-mux-server").to_string_lossy()),
+            shell_single_quote(
+                &family
+                    .root
+                    .join("frankenterm-pty-guardian")
+                    .to_string_lossy()
+            ),
+            shell_single_quote(&family.manifest.to_string_lossy()),
+            shell_single_quote(&family.verifier.to_string_lossy()),
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute component reverification failure");
+        assert!(
+            output.status.success(),
+            "failure receipt harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt = parse_installer_process_family_receipt(&output.stdout);
+        assert_eq!(receipt["activation"], "pending");
+        assert_eq!(
+            receipt["pending_reason"],
+            "candidate-component-verification-failed"
+        );
+        assert_eq!(receipt["verification"]["component_manifest"], "failed");
+        assert_eq!(receipt["verification"]["activation_readiness"], "not-run");
+        assert!(receipt["next_action"].is_null());
+        assert!(
+            receipt["remediation"]
+                .as_str()
+                .is_some_and(|value| value.contains("different signed release generation"))
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("verified candidate remains"),
+            "component verification failure must not describe the candidate as verified"
+        );
+        assert_initial_family_is_uniformly_unavailable(&destination);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_system_process_census_scans_all_users() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("create system census fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_bin = fixture.path().join("fake-bin");
+        std::fs::create_dir(&fake_bin).expect("create fake census tool directory");
+        let fake_ps = fake_bin.join("ps");
+        std::fs::write(
+            &fake_ps,
+            b"#!/usr/bin/env bash\ncase \" $* \" in\n  *\" -A \"*) printf '42 /tmp/frankenterm-gui\\n' ;;\nesac\n",
+        )
+        .expect("write fake ps");
+        std::fs::set_permissions(&fake_ps, std::fs::Permissions::from_mode(0o555))
+            .expect("make fake ps executable");
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES=1\nexport FT_INSTALL_TEST_FORCE_PS_CENSUS=1\nsource {}\nunset FT_INSTALL_TEST_MUX_OWNERSHIP_STATE\nSYSTEM_INSTALL=0\nprintf 'user=%s\\n' \"$(installer_mux_ownership_state)\"\nSYSTEM_INSTALL=1\nprintf 'system=%s\\n' \"$(installer_mux_ownership_state)\"\n",
+            shell_single_quote(&installer.to_string_lossy()),
+        );
+        let inherited_path = std::env::var("PATH").expect("test PATH");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
+            .output()
+            .expect("execute system census fixture");
+        assert!(
+            output.status.success(),
+            "system census fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("system census output is UTF-8"),
+            "user=inactive\nsystem=active\n"
+        );
     }
 
     #[cfg(unix)]
@@ -119007,6 +119276,44 @@ printf x > "$MINISIGN_MARKER"
         )
         .expect("parse persisted install receipt");
         assert_eq!(persisted, receipt);
+
+        use sha2::Digest as _;
+        use std::os::unix::fs::symlink;
+        let persisted_bytes =
+            std::fs::read(destination.join(".frankenterm-process-family/install-receipt.json"))
+                .expect("read exact persisted receipt bytes");
+        let serialized = persisted_bytes
+            .strip_suffix(b"\n")
+            .expect("persisted receipt has one trailing newline");
+        let stage_digest = hex::encode(sha2::Sha256::digest(serialized));
+        let receipt_stage = destination.join(format!(
+            ".frankenterm-process-family/.install-receipt.{stage_digest}.writing"
+        ));
+        let victim = fixture.path().join("receipt-stage-symlink-victim");
+        std::fs::write(&victim, b"must remain unchanged").expect("write receipt-stage victim");
+        symlink(&victim, &receipt_stage).expect("plant receipt-stage symlink");
+        let replay = run_installer_publish_and_idle_activation(
+            &installer,
+            &family,
+            &destination,
+            &fixture.path().join("receipt-stage-replay"),
+            "inactive",
+            false,
+        );
+        assert!(
+            !replay.status.success(),
+            "a planted receipt-stage symlink must fail closed"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read receipt-stage victim"),
+            b"must remain unchanged"
+        );
+        assert!(
+            std::fs::symlink_metadata(&receipt_stage)
+                .expect("inspect retained receipt-stage symlink")
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

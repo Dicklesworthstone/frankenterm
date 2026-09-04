@@ -76,6 +76,7 @@ IDLE_HOST_CONFIRMED=0
 # bounded process census is inactive. First installs take this path by default
 # because there is no prior stable process-family authority to preserve.
 ACTIVATE_IF_IDLE=0
+SYSTEM_INSTALL=0
 # macOS GUI app (.app) install. -1 = auto (on for darwin-arm64 prebuilt
 # installs), 0 = disabled (--no-app), 1 = forced (--with-app). APP_DEST
 # overrides the install directory (default /Applications, fallback
@@ -101,7 +102,8 @@ PROCESS_FAMILY_ACTIVATION_STATE=""
 PROCESS_FAMILY_ACTIVE_AUTHORITY=""
 PROCESS_FAMILY_ACTIVE_ROOT=""
 PROCESS_FAMILY_PENDING_REASON=""
-PROCESS_FAMILY_VERIFICATION_STATE="not-run"
+PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
+PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
 PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="not-observed"
 INITIAL_SELECTOR_HOLD_REASON=""
 VERIFIED_ARCHIVE_IDENTITY=""
@@ -1444,8 +1446,15 @@ installer_mux_ownership_state() {
     esac
     return
   fi
-  python3 - <<'PY'
+  python3 - "${SYSTEM_INSTALL:-0}" <<'PY'
 import os, pathlib, subprocess, sys
+
+all_users = sys.argv[1] == "1"
+force_ps_census = (
+    os.environ.get("FT_INSTALL_TEST_LIBRARY_ONLY") == "1" and
+    os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1" and
+    os.environ.get("FT_INSTALL_TEST_FORCE_PS_CENSUS") == "1"
+)
 
 names = {
     "ft",
@@ -1467,7 +1476,7 @@ def classify(command):
         return "ambiguous"
     return "inactive"
 
-if sys.platform.startswith("linux"):
+if sys.platform.startswith("linux") and not force_ps_census:
     proc = pathlib.Path("/proc")
     if not proc.is_dir():
         print("ambiguous")
@@ -1477,7 +1486,7 @@ if sys.platform.startswith("linux"):
         if not process.name.isdigit():
             continue
         try:
-            if process.stat().st_uid != os.geteuid():
+            if not all_users and process.stat().st_uid != os.geteuid():
                 continue
             comm = (process / "comm").read_text(errors="surrogateescape").strip()
         except (FileNotFoundError, ProcessLookupError):
@@ -1502,8 +1511,14 @@ if sys.platform.startswith("linux"):
     raise SystemExit(0)
 
 try:
+    ps_command = ["ps"]
+    if all_users:
+        ps_command.append("-A")
+    else:
+        ps_command.extend(["-U", str(os.geteuid())])
+    ps_command.extend(["-o", "pid=", "-o", "comm="])
     observed = subprocess.run(
-        ["ps", "-U", str(os.geteuid()), "-o", "pid=", "-o", "comm="],
+        ps_command,
         check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, timeout=10,
     )
@@ -1612,7 +1627,8 @@ install_process_family() {
   PROCESS_FAMILY_ACTIVE_AUTHORITY=""
   PROCESS_FAMILY_ACTIVE_ROOT=""
   PROCESS_FAMILY_PENDING_REASON=""
-  PROCESS_FAMILY_VERIFICATION_STATE="not-run"
+  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
+  PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
   INITIAL_SELECTOR_HOLD_REASON=""
 
   command -v python3 >/dev/null 2>&1 || {
@@ -1691,7 +1707,7 @@ install_process_family() {
     err "Process-family selector authority is ambiguous or unsafe"
     return 1
   }
-  PROCESS_FAMILY_VERIFICATION_STATE="component-manifest-verified"
+  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="verified"
   case "$authority_state" in
     initial)
       initial_install=1
@@ -1777,6 +1793,15 @@ install_process_family() {
     PROCESS_FAMILY_ACTIVATION_STATE="current"
     PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
     PROCESS_FAMILY_ACTIVE_ROOT="$generation"
+    PROCESS_FAMILY_ACTIVATION_READINESS_STATE="running"
+    emit_process_family_receipt silent || return 1
+    if ! probe_activated_process_family; then
+      PROCESS_FAMILY_ACTIVATION_READINESS_STATE="failed"
+      emit_process_family_receipt silent || true
+      err "Current process-family generation failed bounded readiness verification"
+      return 1
+    fi
+    PROCESS_FAMILY_ACTIVATION_READINESS_STATE="passed"
     ok "Verified current atomic process-family generation $generation_id"
   else
     [ "$(inspect_installer_process_family_authority)" = "$authority_state" ] || {
@@ -1847,17 +1872,92 @@ probe_activated_process_family() {
      [ "${FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL:-0}" = 1 ]; then
     return 1
   fi
-  local name
-  for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
-    "$DEST/$name" --version >/dev/null 2>&1 || return 1
-  done
-  "$DEST/ft" doctor --json 2>/dev/null | python3 -c '
-import json
-import sys
+  python3 - "$DEST/ft" "$DEST/frankenterm-mux-server" \
+    "$DEST/frankenterm-pty-guardian" <<'PY'
+import json, os, selectors, signal, subprocess, sys, time
 
-limit = 1024 * 1024
-payload = sys.stdin.buffer.read(limit + 1)
-if len(payload) > limit:
+ft, mux, guardian = sys.argv[1:]
+timeout_seconds = 10.0
+if (os.environ.get("FT_INSTALL_TEST_LIBRARY_ONLY") == "1" and
+        os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1" and
+        os.environ.get("FT_INSTALL_TEST_PROBE_TIMEOUT_SECONDS")):
+    try:
+        timeout_seconds = float(os.environ["FT_INSTALL_TEST_PROBE_TIMEOUT_SECONDS"])
+    except ValueError:
+        raise SystemExit(1)
+    if not 0.05 <= timeout_seconds <= 10.0:
+        raise SystemExit(1)
+
+def terminate(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+def run_bounded(arguments, capture_stdout=False):
+    output = subprocess.PIPE if capture_stdout else subprocess.DEVNULL
+    try:
+        process = subprocess.Popen(
+            arguments, stdout=output, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False, b""
+    if not capture_stdout:
+        try:
+            return process.wait(timeout=timeout_seconds) == 0, b""
+        except subprocess.TimeoutExpired:
+            terminate(process)
+            return False, b""
+
+    limit = 1024 * 1024
+    chunks = []
+    total = 0
+    deadline = time.monotonic() + timeout_seconds
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate(process)
+                return False, b""
+            events = selector.select(min(remaining, 0.1))
+            if not events:
+                continue
+            chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                terminate(process)
+                return False, b""
+        try:
+            status = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            terminate(process)
+            return False, b""
+        return status == 0, b"".join(chunks)
+    finally:
+        selector.close()
+        process.stdout.close()
+
+for executable in (ft, mux, guardian):
+    passed, _ = run_bounded([executable, "--version"])
+    if not passed:
+        raise SystemExit(1)
+
+passed, payload = run_bounded([ft, "doctor", "--json"], capture_stdout=True)
+if not passed:
     raise SystemExit(1)
 try:
     report = json.loads(payload)
@@ -1865,7 +1965,7 @@ except (UnicodeDecodeError, json.JSONDecodeError):
     raise SystemExit(1)
 if not isinstance(report, dict) or report.get("ok") is not True:
     raise SystemExit(1)
-' >/dev/null
+PY
 }
 
 activate_process_family_generation() {
@@ -1881,7 +1981,7 @@ activate_process_family_generation() {
   local legacy_root candidate candidate_matches rollback_txid rollback_stage_id
   local rollback_target_id restored_id rollback_prior_kind rollback_stage_target
   local entrypoint_txid entrypoint_stage entrypoint_id entrypoint_stage_id
-  local selector_committed_here=0
+  local selector_committed_here=0 recovery_claim=""
 
   command -v python3 >/dev/null 2>&1 || {
     err "python3 is required for crash-atomic activation"
@@ -1921,10 +2021,15 @@ activate_process_family_generation() {
   helper="$generation/ft"
   verifier="$generation/verify-components.sh"
   manifest="$generation/process-family.component-manifest.json"
+  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="not-run"
+  PROCESS_FAMILY_ACTIVATION_READINESS_STATE="not-run"
   verify_canonical_generation "$generation" "" "$verifier" || {
+    PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="failed"
+    PROCESS_FAMILY_PENDING_REASON="candidate-component-verification-failed"
     err "Candidate generation $generation_id failed canonical verification; refusing to activate it"
     return 1
   }
+  PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="verified"
   metadata=$(process_family_manifest_metadata "$manifest" triplet) || return 1
   IFS=$'\t' read -r manifest_id build_id source_revision version target profile feature_contract inventory_bytes <<<"$metadata"
 
@@ -1937,6 +2042,192 @@ activate_process_family_generation() {
   if [[ "$authority_state" == *$'\t'* ]]; then
     current_target="${authority_state#*$'\t'}"
   fi
+
+  # A retry after the selector commit must recover the rollback authority from
+  # the receipt written before that commit.  Merely observing that the
+  # candidate is already current is insufficient: a normal, previously
+  # successful activation has no authority to roll itself back.  The durable
+  # receipt and the deterministic selector stage must agree exactly before the
+  # retry inherits the interrupted invocation's rollback claim.
+  if [ "$authority_state" = $'managed\t'"generations/$generation_id" ]; then
+    recovery_claim=$(python3 - "$DEST" "$generation_id" <<'PY'
+import json, os, re, stat, sys
+
+destination, generation = os.path.abspath(sys.argv[1]), sys.argv[2]
+managed = os.path.join(destination, ".frankenterm-process-family")
+parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+parent = os.open(managed, parent_flags)
+try:
+    observed_parent = os.fstat(parent)
+    if (not stat.S_ISDIR(observed_parent.st_mode) or
+            observed_parent.st_uid != os.geteuid() or
+            observed_parent.st_mode & 0o022):
+        raise SystemExit("activation recovery receipt parent is not private")
+    try:
+        receipt = os.open(
+            "install-receipt.json",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        raise SystemExit(0)
+    try:
+        observed = os.fstat(receipt)
+        if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
+                observed.st_uid != os.geteuid() or
+                stat.S_IMODE(observed.st_mode) != 0o400 or
+                observed.st_size > 1024 * 1024):
+            raise SystemExit("activation recovery receipt is not one exact private file")
+        encoded = b""
+        while len(encoded) <= 1024 * 1024:
+            chunk = os.read(receipt, min(65536, 1024 * 1024 + 1 - len(encoded)))
+            if not chunk:
+                break
+            encoded += chunk
+        current = os.stat("install-receipt.json", dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (observed.st_dev, observed.st_ino):
+            raise SystemExit("activation recovery receipt changed while being read")
+    finally:
+        os.close(receipt)
+finally:
+    os.close(parent)
+
+try:
+    payload = json.loads(encoded)
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit("activation recovery receipt is not canonical JSON")
+canonical = (json.dumps(
+    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+) + "\n").encode("ascii")
+if canonical != encoded:
+    raise SystemExit("activation recovery receipt is not canonical JSON")
+verification = payload.get("verification")
+recoverable = (
+    payload.get("schema_version") == "frankenterm.install.process-family-receipt.v1"
+    and payload.get("activation") == "pending"
+    and payload.get("candidate_generation") == generation
+    and payload.get("candidate_root") == os.path.join(managed, "generations", generation)
+    and payload.get("pending_reason") == "activation-transaction-in-progress"
+    and payload.get("selector_path") == os.path.join(managed, "current")
+    and isinstance(verification, dict)
+    and verification.get("component_manifest") == "verified"
+    and verification.get("activation_readiness") == "running"
+)
+if not recoverable:
+    raise SystemExit(0)
+
+authority = payload.get("active_authority")
+active_root = payload.get("active_root")
+if authority == "none" and active_root is None:
+    print("initial")
+elif authority == "legacy-direct" and active_root == destination:
+    print("legacy")
+elif authority == "managed-selector" and isinstance(active_root, str):
+    root = os.path.normpath(active_root)
+    generation_parent = os.path.join(managed, "generations")
+    prior = os.path.basename(root)
+    if (os.path.dirname(root) != generation_parent or
+            re.fullmatch(r"(?:legacy-)?[0-9a-f]{64}", prior) is None or
+            prior == generation):
+        raise SystemExit("activation recovery receipt names an invalid prior authority")
+    print("managed\tgenerations/" + prior)
+else:
+    raise SystemExit("activation recovery receipt has inconsistent prior authority")
+PY
+    ) || {
+      err "Failed to validate the interrupted activation recovery receipt"
+      return 1
+    }
+    if [ -n "$recovery_claim" ]; then
+      txid=$(atomic_transition_txid "selector:$DEST:$generation_id") || return 1
+      stage=".current.${txid}"
+      case "$recovery_claim" in
+        initial)
+          [ ! -e "$managed/$stage" ] && [ ! -L "$managed/$stage" ] || {
+            err "Interrupted first-install rollback claim conflicts with a retained selector"
+            return 1
+          }
+          ;;
+        legacy)
+          [ -L "$managed/$stage" ] || {
+            err "Interrupted legacy rollback claim lacks its retained selector"
+            return 1
+          }
+          rollback_stage_target=$(readlink "$managed/$stage") || return 1
+          [[ "$rollback_stage_target" == generations/legacy-* ]] || {
+            err "Interrupted legacy rollback selector is not a retained legacy generation"
+            return 1
+          }
+          ;;
+        managed$'\t'*)
+          rollback_stage_target="${recovery_claim#*$'\t'}"
+          [ -L "$managed/$stage" ] && \
+            [ "$(readlink "$managed/$stage")" = "$rollback_stage_target" ] || {
+            err "Interrupted managed rollback selector differs from its durable receipt"
+            return 1
+          }
+          ;;
+        *)
+          err "Interrupted activation recovery receipt has an unsupported authority"
+          return 1
+          ;;
+      esac
+      selector_committed_here=1
+    fi
+  fi
+
+  # Persist a fail-closed transaction receipt before any stable entrypoint or
+  # selector mutation. A kill after the selector commit therefore leaves an
+  # explicit unverified activation state, and the next locked retry re-runs the
+  # bounded probes before replacing it with a current/passed receipt.
+  PENDING_PROCESS_FAMILY_GENERATION="$generation_id"
+  PUBLISHED_PROCESS_FAMILY_ROOT="$generation"
+  PUBLISHED_PROCESS_FAMILY_VERSION="$version"
+  PROCESS_FAMILY_ACTIVATION_STATE="pending"
+  PROCESS_FAMILY_PENDING_REASON="activation-transaction-in-progress"
+  PROCESS_FAMILY_ACTIVATION_READINESS_STATE="running"
+  case "$recovery_claim" in
+    initial)
+      PROCESS_FAMILY_ACTIVE_AUTHORITY="none"
+      PROCESS_FAMILY_ACTIVE_ROOT=""
+      ;;
+    legacy)
+      PROCESS_FAMILY_ACTIVE_AUTHORITY="legacy-direct"
+      PROCESS_FAMILY_ACTIVE_ROOT="$DEST"
+      ;;
+    managed$'\t'*)
+      PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
+      PROCESS_FAMILY_ACTIVE_ROOT="$managed/${recovery_claim#*$'\t'}"
+      ;;
+    "")
+      case "$authority_kind" in
+        initial)
+          PROCESS_FAMILY_ACTIVE_AUTHORITY="none"
+          PROCESS_FAMILY_ACTIVE_ROOT=""
+          ;;
+        legacy|transitioning-legacy)
+          PROCESS_FAMILY_ACTIVE_AUTHORITY="legacy-direct"
+          PROCESS_FAMILY_ACTIVE_ROOT="$DEST"
+          ;;
+        managed)
+          PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
+          PROCESS_FAMILY_ACTIVE_ROOT="$managed/$current_target"
+          ;;
+        *)
+          err "Cannot describe the pre-activation process-family authority"
+          return 1
+          ;;
+      esac
+      ;;
+    *)
+      err "Cannot describe the recovered pre-activation process-family authority"
+      return 1
+      ;;
+  esac
+  emit_process_family_receipt silent || {
+    err "Failed to persist the pre-activation transaction receipt"
+    return 1
+  }
 
   if [ "$authority_state" = $'managed\t'"generations/$generation_id" ]; then
     info "Generation $generation_id is already the current selector target"
@@ -2115,7 +2406,10 @@ activate_process_family_generation() {
      ! cmp "$DEST/frankenterm-pty-guardian" \
        "$generation/frankenterm-pty-guardian" >/dev/null 2>&1 || \
      ! probe_activated_process_family; then
+    PROCESS_FAMILY_ACTIVATION_READINESS_STATE="failed"
+    PROCESS_FAMILY_PENDING_REASON="activation-readiness-failed"
     if [ "$selector_committed_here" -ne 1 ]; then
+      emit_process_family_receipt silent || true
       err "Already-current generation failed verification; leaving its authority unchanged because this invocation has no prior-selector rollback claim"
       return 1
     fi
@@ -2247,6 +2541,7 @@ activate_process_family_generation() {
         }
         ;;
     esac
+    emit_process_family_receipt silent || true
     err "Candidate activation failed readiness verification; prior process-family authority restored"
     return 1
   fi
@@ -2255,7 +2550,7 @@ activate_process_family_generation() {
   PROCESS_FAMILY_ACTIVE_AUTHORITY="managed-selector"
   PROCESS_FAMILY_ACTIVE_ROOT="$generation"
   PROCESS_FAMILY_PENDING_REASON=""
-  PROCESS_FAMILY_VERIFICATION_STATE="activated-doctor-passed"
+  PROCESS_FAMILY_ACTIVATION_READINESS_STATE="passed"
   PENDING_PROCESS_FAMILY_GENERATION=""
   PUBLISHED_PROCESS_FAMILY_ROOT="$generation"
   PUBLISHED_PROCESS_FAMILY_VERSION="$version"
@@ -2277,7 +2572,7 @@ activate_published_generation_if_idle() {
     inactive)
       generation_id="$PENDING_PROCESS_FAMILY_GENERATION"
       if ! activate_process_family_generation "$generation_id" if-idle; then
-        err "Idle-host activation failed; the verified candidate remains available by immutable path"
+        err "Idle-host activation failed; inspect the process-family receipt for the exact verification failure and remediation"
         return 1
       fi
       ;;
@@ -2293,6 +2588,9 @@ activate_published_generation_if_idle() {
 }
 
 process_family_next_action() {
+  if [ "$PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE" = failed ]; then
+    return 0
+  fi
   python3 - "$DEST" "$PENDING_PROCESS_FAMILY_GENERATION" \
     "$PUBLISHED_PROCESS_FAMILY_VERSION" "$OWNER" "$REPO" <<'PY'
 import shlex, sys
@@ -2309,21 +2607,31 @@ PY
 }
 
 emit_process_family_receipt() {
-  local next_action=""
+  local output_mode="${1:-emit}" next_action="" remediation=""
+  case "$output_mode" in
+    emit|silent) ;;
+    *) return 2 ;;
+  esac
   if [ "$PROCESS_FAMILY_ACTIVATION_STATE" = pending ]; then
     next_action=$(process_family_next_action) || return 1
+  fi
+  if [ "$PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE" = failed ]; then
+    remediation="Candidate failed immutable component verification; do not activate it. Install a different signed release generation or inspect the retained candidate bytes."
   fi
   python3 - "$PROCESS_FAMILY_ACTIVATION_STATE" "$PROCESS_FAMILY_ACTIVE_AUTHORITY" \
     "$PROCESS_FAMILY_ACTIVE_ROOT" "$PROCESS_FAMILY_PENDING_REASON" \
     "$PENDING_PROCESS_FAMILY_GENERATION" "$PUBLISHED_PROCESS_FAMILY_ROOT" \
-    "$PUBLISHED_PROCESS_FAMILY_VERSION" "$PROCESS_FAMILY_VERIFICATION_STATE" \
-    "$PROCESS_FAMILY_RELEASE_VERIFICATION_STATE" "$DEST" "$next_action" <<'PY'
+    "$PUBLISHED_PROCESS_FAMILY_VERSION" "$PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE" \
+    "$PROCESS_FAMILY_ACTIVATION_READINESS_STATE" \
+    "$PROCESS_FAMILY_RELEASE_VERIFICATION_STATE" "$DEST" "$next_action" \
+    "$remediation" "$output_mode" <<'PY'
 import hashlib, json, os, re, stat, sys
 
 (
     activation, active_authority, active_root, pending_reason,
-    generation, candidate_root, version, verification, release_verification,
-    destination, next_action,
+    generation, candidate_root, version, component_verification,
+    activation_readiness, release_verification, destination, next_action,
+    remediation, output_mode,
 ) = sys.argv[1:]
 if activation not in ("current", "pending"):
     raise SystemExit("process-family activation receipt has an invalid state")
@@ -2349,8 +2657,12 @@ else:
     active_root_value = os.path.abspath(active_root)
 if not version or any(ord(character) < 0x20 for character in version):
     raise SystemExit("process-family activation receipt has an invalid version")
-if verification not in ("component-manifest-verified", "activated-doctor-passed"):
-    raise SystemExit("process-family activation receipt has an invalid verification state")
+if component_verification not in ("not-run", "verified", "failed"):
+    raise SystemExit("process-family receipt has an invalid component verification state")
+if activation_readiness not in ("not-run", "running", "passed", "failed"):
+    raise SystemExit("process-family receipt has an invalid activation readiness state")
+if activation == "current" and activation_readiness == "not-run":
+    raise SystemExit("current process-family receipt lacks a readiness result")
 if release_verification not in (
     "not-observed", "source-build", "checksum-only", "minisign-verified",
 ):
@@ -2364,8 +2676,13 @@ if active_authority == "managed-selector":
     if re.fullmatch(r"[0-9a-f]{64}", candidate):
         current_generation = candidate
 receipt_generation = generation or current_generation
-if (activation == "pending") != bool(next_action):
+if component_verification == "failed":
+    if next_action or not remediation:
+        raise SystemExit("failed component verification has an invalid remediation")
+elif (activation == "pending") != bool(next_action):
     raise SystemExit("process-family activation receipt has an invalid next action")
+elif remediation:
+    raise SystemExit("process-family activation receipt has an unexpected remediation")
 payload = {
     "activation": activation,
     "active_authority": active_authority,
@@ -2379,13 +2696,12 @@ payload = {
     "generation": receipt_generation,
     "next_action": next_action or None,
     "pending_reason": pending_reason or None,
+    "remediation": remediation or None,
     "schema_version": "frankenterm.install.process-family-receipt.v1",
     "selector_path": selector_path,
     "verification": {
-        "activation_readiness": (
-            "passed" if verification == "activated-doctor-passed" else "not-run"
-        ),
-        "component_manifest": "verified",
+        "activation_readiness": activation_readiness,
+        "component_manifest": component_verification,
         "release": release_verification,
     },
 }
@@ -2393,36 +2709,67 @@ serialized = json.dumps(
     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
 )
 receipt_parent = os.path.join(destination, ".frankenterm-process-family")
-observed_parent = os.lstat(receipt_parent)
-if not stat.S_ISDIR(observed_parent.st_mode):
+parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+parent_descriptor = os.open(receipt_parent, parent_flags)
+observed_parent = os.fstat(parent_descriptor)
+if (not stat.S_ISDIR(observed_parent.st_mode) or
+        observed_parent.st_uid != os.geteuid() or
+        observed_parent.st_mode & 0o022):
+    os.close(parent_descriptor)
     raise SystemExit("process-family receipt parent is not a real directory")
 receipt_name = "install-receipt.json"
 stage_name = ".install-receipt." + hashlib.sha256(serialized.encode()).hexdigest() + ".writing"
-stage_path = os.path.join(receipt_parent, stage_name)
-receipt_path = os.path.join(receipt_parent, receipt_name)
 encoded = (serialized + "\n").encode("ascii")
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = None
 try:
-    descriptor = os.open(stage_path, flags, 0o400)
-except FileExistsError:
-    with open(stage_path, "rb") as existing:
-        if existing.read(len(encoded) + 1) != encoded:
-            raise SystemExit("process-family receipt stage conflicts with another transaction")
-else:
     try:
+        descriptor = os.open(stage_name, flags, 0o400, dir_fd=parent_descriptor)
+    except FileExistsError:
+        descriptor = os.open(
+            stage_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            observed_stage = os.fstat(descriptor)
+            if (not stat.S_ISREG(observed_stage.st_mode) or
+                    observed_stage.st_nlink != 1 or
+                    observed_stage.st_uid != os.geteuid() or
+                    stat.S_IMODE(observed_stage.st_mode) != 0o400 or
+                    observed_stage.st_size != len(encoded)):
+                raise SystemExit("process-family receipt stage is not one exact private file")
+            existing = b""
+            while len(existing) <= len(encoded):
+                chunk = os.read(descriptor, len(encoded) + 1 - len(existing))
+                if not chunk:
+                    break
+                existing += chunk
+            if existing != encoded:
+                raise SystemExit("process-family receipt stage conflicts with another transaction")
+    else:
         offset = 0
         while offset < len(encoded):
-            offset += os.write(descriptor, encoded[offset:])
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise SystemExit("process-family receipt stage write made no progress")
+            offset += written
         os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-os.replace(stage_path, receipt_path)
-parent_descriptor = os.open(receipt_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-try:
+    pinned_stage = os.fstat(descriptor)
+    os.replace(
+        stage_name, receipt_name,
+        src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor,
+    )
+    published = os.stat(receipt_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if ((published.st_dev, published.st_ino) !=
+            (pinned_stage.st_dev, pinned_stage.st_ino)):
+        raise SystemExit("published process-family receipt differs from its pinned stage")
     os.fsync(parent_descriptor)
 finally:
+    if descriptor is not None:
+        os.close(descriptor)
     os.close(parent_descriptor)
-print("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=" + serialized)
+if output_mode == "emit":
+    print("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=" + serialized)
 PY
 }
 
@@ -4997,7 +5344,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version) require_option_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
     --dest) require_option_value "$1" "${2:-}"; DEST="$2"; shift 2 ;;
-    --system) DEST="/usr/local/bin"; shift ;;
+    --system) SYSTEM_INSTALL=1; DEST="/usr/local/bin"; shift ;;
     --easy-mode) EASY=1; shift ;;
     --verify) VERIFY=1; shift ;;
     --with-font) WITH_FONT=1; shift ;;
@@ -5020,6 +5367,10 @@ while [ $# -gt 0 ]; do
     *) err "Unknown option: $1"; usage >&2; exit 2 ;;
   esac
 done
+
+if [ "$DEST" = /usr/local/bin ]; then
+  SYSTEM_INSTALL=1
+fi
 
 if [ -n "$ACTIVATE_GENERATION" ] && [ "$ACTIVATE_IF_IDLE" -eq 1 ]; then
   err "--activate and --activate-if-idle are mutually exclusive"
