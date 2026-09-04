@@ -138,9 +138,13 @@ impl<'a> FieldInfo<'a> {
 }
 
 fn unhandled_type_error(name: &str, ty: &Type) -> Error {
+    // `TokenStream::to_string` is intended for diagnostics rather than stable
+    // source rendering, and Syn 3 may emit a space before comma punctuation.
+    // Keep this user-facing error deterministic across parser upgrades.
+    let type_name = ty.to_token_stream().to_string().replace(" ,", ",");
     Error::new_spanned(
         ty,
-        format!("unhandled type for {name}: {}", ty.to_token_stream()),
+        format!("unhandled type for {name}: {type_name}"),
     )
 }
 
