@@ -953,3 +953,44 @@ erasure tests against old/new parity ambiguity and field boundaries; tightened
 statistical boundary cases and live-loop provenance. Extended the release-gate
 repair to the GPU harness's executable legacy local-Cargo bypass. These tests
 must detect the original defect, not mirror its implementation.
+
+**Refinement 3 — dependency order.** Live-loop proof now depends on configured
+watcher policy and live switch enforcement. Native clipboard policy depends on
+the clear fix; connector completion depends on honest dispatch semantics;
+signed release and target-envelope promotion depend on external trust. Mission
+driver completion consumes durable lifecycle state. Connector surface
+verification consumes real transport. Optional integrations do not block
+unrelated source fixes. Dependencies express required artifacts/behavior, not
+similar labels or the mere desire to serialize agents.
+
+**Refinement 4 — executable scope and evidence.** Added explicit production-seam
+tests, nonzero assertion/test counts, allowed controls, deadlines, recovery and
+privacy-safe structured logs to the immediate repair beads. Bound real-service,
+GUI/clipboard, paid-provider, and shared-process experiments to owned isolated
+actors; nothing in this audit authorizes publishing or replacing operator keys.
+Cargo rejection remains a blocked proof lane, not a product-test failure.
+
+**Refinement 5 — complete closure fields.** Reviewed all 20 new leaves and
+five revised consumer/owner beads. Every description is nonempty; added
+explicit acceptance fields to the older live-loop and supported-surface
+consumers so their proof boundaries are not buried only in historical prose.
+BV produced 50 suggestions (20 dependency, 20 duplicate, 10 label); all are
+advisory. Endpoint contracts and existing dependency paths are reviewed before
+any suggested edge can be accepted. A sixth pass is required because this
+fifth pass still found a useful correction.
+
+**Refinement 6 — convergence.** Rechecked the 25 new/revised contracts against
+the complete reviewed vision, causal prerequisites, positive/negative controls,
+failure disposition, proof boundaries, and actual scoped implementation tasks.
+No additional contract change was found. This closes the skill's plan-space
+loop, not the unfinished product or its live qualification beads.
+
+New leaf ownership: `.41` watcher configuration; `.42` live kill-switch and
+connector tiers; `.43` clipboard clear; `.44` native clipboard configuration;
+`.45` release gates; `.46` connector success truth; `.47` real connector transport;
+`.48` mission persistence; `.49` attestation trust; `.50` Redis; `.51` VC export;
+`.52` UBS; `.53` graph scoring; `.54` Mermaid; `.55` future web routes;
+`.56` CASR recorder conversion; `.57` process-triage provider; `.58` erasure;
+`.59` statistical explanations; `.60` redactor oracle. All use prefix `ft-xxfwy`.
+Existing extension, target-envelope, release, live-loop and surface-verification
+owners were revised rather than duplicated.
