@@ -12880,6 +12880,7 @@ mod tests {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("write-cancel-with-cx.sock");
             let server_socket_path = socket_path.clone();
+            let server_cancel_cx = cx.clone();
             let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
             let server = std::thread::spawn(move || {
                 let runtime = RuntimeBuilder::current_thread()
@@ -12891,6 +12892,7 @@ mod tests {
 
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut read_buf = StreamingPduBuffer::new();
+                    let mut handshake_complete = false;
 
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -12899,6 +12901,20 @@ mod tests {
                             .expect("read");
                         if read == 0 {
                             break;
+                        }
+                        if handshake_complete {
+                            // The client has crossed the transport boundary.
+                            // Cancel synchronously from this server-side
+                            // observation so thread scheduling cannot move the
+                            // signal back before request admission.
+                            server_cancel_cx.cancel_with(
+                                crate::outcome::CancelKind::User,
+                                Some("cancel after server observed request bytes"),
+                            );
+                            // Stop reading so the large request stays in
+                            // progress until cancellation is classified.
+                            sleep(Duration::from_millis(500)).await;
+                            return;
                         }
                         read_buf.extend_from_slice(&temp[..read]);
                         while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
@@ -12921,8 +12937,7 @@ mod tests {
                                     write_response_pdu(&mut stream, &response, decoded.serial)
                                         .await
                                         .expect("write client response");
-                                    sleep(Duration::from_millis(500)).await;
-                                    return;
+                                    handshake_complete = true;
                                 }
                                 _ => {}
                             }
@@ -12942,26 +12957,25 @@ mod tests {
                 .expect("connect with cx");
             client.config.write_timeout = Duration::from_millis(40);
 
-            let cancel_cx = cx.clone();
-            let cancel = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(5));
-                cancel_cx.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("cancel during request write"),
-                );
-            });
-
             let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
                 .send_paste_with_cx(&cx, 0, payload)
                 .await
                 .expect_err("send_paste_with_cx should surface cancellation");
             assert_cancelled_mux_error(&err);
+            assert!(
+                !err.is_pre_transport_cancellation(),
+                "server-observed request bytes must classify cancellation as transport-ambiguous"
+            );
+            assert_eq!(
+                err.recovery_decision().connection,
+                MuxConnectionDisposition::Discard,
+                "transport-ambiguous cancellation must discard the connection"
+            );
             assert!(client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 1);
 
             drop(client);
-            cancel.join().expect("cancel thread");
             server.join().expect("server thread");
         });
     }

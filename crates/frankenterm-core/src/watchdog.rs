@@ -1122,37 +1122,50 @@ pub fn spawn_mux_watchdog(
     }
 }
 
-/// Get the RSS (resident set size) of the FrankenTerm mux-server process under
-/// the caller's explicit capability context.
-///
-/// Pre-flight `cx.checkpoint()` gates spawning the blocking
-/// `pgrep`/`ps` fan-out. On a cancelled caller cx the function
-/// returns `None` (same sentinel as the legacy "process not
-/// found" path), so `check_cx` sees `rss_bytes = None` and skips
-/// the memory-threshold status check. spawn_blocking body is
-/// still std::process::Command — cx isn't threaded inside — but
-/// adding the pre-flight seam means a cancelled watchdog.check
-/// sweep bails before triggering another pgrep shell-out.
-async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
-    if cx.checkpoint().is_err() {
-        return None;
-    }
-    crate::runtime_async::spawn_blocking(get_mux_server_rss_sync)
-        .await
-        .ok()
-        .flatten()
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MUX_SERVER_RSS_COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MUX_SERVER_RSS_STDOUT_LIMIT_BYTES: usize = 4 * 1024;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MUX_SERVER_RSS_STDERR_LIMIT_BYTES: usize = 1024;
+
+/// Run one RSS discovery subprocess under a finite supervisor-owned deadline.
+/// The blocking worker remains usable under both production runtimes and raw
+/// `LabRuntime`; its process body is bounded by `output_blocking`, which
+/// terminates and reaps the child before returning. Caller cancellation is
+/// checked on both sides of that finite, non-preemptible worker handoff.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn mux_server_rss_command_output(
+    cx: &crate::cx::Cx,
+    program: &'static str,
+    args: Vec<String>,
+) -> Option<std::process::Output> {
+    cx.checkpoint().ok()?;
+    let output = crate::runtime_async::spawn_blocking(move || {
+        let mut command = crate::runtime_async::process::Command::new(program);
+        command.args(args);
+        command.kill_on_drop(true);
+        command.stdout_limit(MUX_SERVER_RSS_STDOUT_LIMIT_BYTES);
+        command.stderr_limit(MUX_SERVER_RSS_STDERR_LIMIT_BYTES);
+        command.output_blocking(MUX_SERVER_RSS_COMMAND_TIMEOUT)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    cx.checkpoint().ok()?;
+    Some(output)
 }
 
-/// Synchronous RSS lookup for `frankenterm-mux-server`.
+/// Get the RSS (resident set size) of the FrankenTerm mux-server process under
+/// the caller's explicit capability context.
 #[cfg(target_os = "macos")]
-fn get_mux_server_rss_sync() -> Option<u64> {
-    use std::process::Command;
-
-    // Find the mux server PID
-    let pgrep = Command::new("pgrep")
-        .args(["-f", "frankenterm-mux-server"])
-        .output()
-        .ok()?;
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    let pgrep = mux_server_rss_command_output(
+        cx,
+        "pgrep",
+        vec!["-f".to_string(), "frankenterm-mux-server".to_string()],
+    )
+    .await?;
 
     if !pgrep.status.success() {
         return None;
@@ -1161,11 +1174,13 @@ fn get_mux_server_rss_sync() -> Option<u64> {
     let pid_str = String::from_utf8_lossy(&pgrep.stdout);
     let pid: u32 = pid_str.lines().next()?.trim().parse().ok()?;
 
-    // Get RSS via ps (in KB on macOS)
-    let ps = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let pid = pid.to_string();
+    let ps = mux_server_rss_command_output(
+        cx,
+        "ps",
+        vec!["-o".to_string(), "rss=".to_string(), "-p".to_string(), pid],
+    )
+    .await?;
 
     if !ps.status.success() {
         return None;
@@ -1176,16 +1191,14 @@ fn get_mux_server_rss_sync() -> Option<u64> {
     rss_kb.checked_mul(1024) // Convert KB to bytes without wrapping.
 }
 
-/// Synchronous RSS lookup for `frankenterm-mux-server`.
 #[cfg(target_os = "linux")]
-fn get_mux_server_rss_sync() -> Option<u64> {
-    use std::process::Command;
-
-    // Find the mux server PID
-    let pgrep = Command::new("pgrep")
-        .args(["-f", "frankenterm-mux-server"])
-        .output()
-        .ok()?;
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    let pgrep = mux_server_rss_command_output(
+        cx,
+        "pgrep",
+        vec!["-f".to_string(), "frankenterm-mux-server".to_string()],
+    )
+    .await?;
 
     if !pgrep.status.success() {
         return None;
@@ -1194,7 +1207,7 @@ fn get_mux_server_rss_sync() -> Option<u64> {
     let pid_str = String::from_utf8_lossy(&pgrep.stdout);
     let pid: &str = pid_str.lines().next()?.trim();
 
-    // Read VmRSS from /proc/<pid>/status
+    cx.checkpoint().ok()?;
     let status_path = format!("/proc/{pid}/status");
     let contents = std::fs::read_to_string(status_path).ok()?;
 
@@ -1212,7 +1225,8 @@ fn get_mux_server_rss_sync() -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn get_mux_server_rss_sync() -> Option<u64> {
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    cx.checkpoint().ok()?;
     None
 }
 
@@ -1346,7 +1360,8 @@ mod tests {
         let (task_id, _handle) = runtime
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
-                let cx = crate::cx::for_testing();
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must install its timer-capable Cx");
                 let config = MuxWatchdogConfig::default();
                 let wezterm = crate::wezterm::mock_wezterm_handle();
                 let mut watchdog = MuxWatchdog::new(config, wezterm);
