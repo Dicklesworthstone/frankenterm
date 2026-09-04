@@ -16,10 +16,10 @@
 //! - [`RedactorTestVector`] — one labeled corpus row: input
 //!   bytes + the expected pattern matches (or empty for a
 //!   negative).
-//! - [`MatrixOutcome`] — TP / FN / FP / TN classification of
+//! - [`MatchOutcome`] — TP / FN / FP / partial classification of
 //!   evaluating one vector.
-//! - [`evaluate_vector`] — runs `Redactor::detect` against the
-//!   vector and classifies each match.
+//! - [`evaluate_vector`] — traces actual production replacements and
+//!   requires complete coverage of every expected secret byte.
 //! - [`MatrixSnapshot`] — per-provider TP/FP/FN/TN counters +
 //!   recall + precision + per-vector results.
 //! - [`RedactorCoverageHealth`] — `ft doctor` counter snapshot
@@ -111,6 +111,9 @@ pub enum MatchOutcome {
     /// Production matched a span the test vector says is
     /// clean. Counts against precision.
     FalsePositive,
+    /// Replacement removes only part of an expected secret. The expected
+    /// span remains a false negative until every byte is covered.
+    PartialCoverage,
 }
 
 /// Per-vector evaluation summary.
@@ -122,6 +125,9 @@ pub struct VectorEvaluation {
     pub false_negatives: u32,
     pub false_positives: u32,
     pub per_detection: Vec<DetectionRecord>,
+    /// Invalid fixture or replacement metadata. Such a vector never passes
+    /// a coverage gate, even if its other spans were fully redacted.
+    pub validation_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,46 +145,85 @@ pub struct DetectionRecord {
 /// `generic_secret` regex catching an `openai_key` still
 /// redacts it):
 ///
-/// - For each expected match: TP if at least one production
-///   detection overlaps it; FN otherwise.
-/// - For each production detection: counted as a duplicate-TP
-///   record if it overlaps an expected match (annotated, but
-///   not double-counted in the TP count); FP if it overlaps
-///   no expected match.
+/// - For each expected match: TP only if the union of actual replacement
+///   source intervals covers every byte; any surviving byte is an FN.
+/// - Replacement intervals overlapping no expected match are FP. Partial
+///   coverage is annotated without crediting a TP.
+/// - Empty, out-of-bounds, reversed, or non-UTF-8-boundary intervals are
+///   invalid evidence and fail the gate explicitly.
 #[must_use]
 pub fn evaluate_vector(vector: &RedactorTestVector) -> VectorEvaluation {
-    let redactor = Redactor::new();
-    let detections = redactor.detect(&vector.input);
+    let trace = Redactor::new().redact_with_replacement_spans(&vector.input);
+    classify_replacement_spans(vector, &trace.replacements)
+}
 
+fn classify_replacement_spans(
+    vector: &RedactorTestVector,
+    replacements: &[(&str, usize, usize)],
+) -> VectorEvaluation {
+    let mut validation_errors = Vec::new();
+    if u32::try_from(vector.input.len()).is_err() {
+        validation_errors.push("input length exceeds the corpus offset range".to_string());
+    }
+    let valid_span = |start: usize, end: usize| {
+        start < end
+            && end <= vector.input.len()
+            && vector.input.is_char_boundary(start)
+            && vector.input.is_char_boundary(end)
+    };
+    for (index, expected) in vector.expected_matches.iter().enumerate() {
+        if !valid_span(expected.start as usize, expected.end as usize) {
+            validation_errors.push(format!(
+                "expected_matches[{index}] has an invalid byte interval"
+            ));
+        }
+    }
+    for (index, (_, start, end)) in replacements.iter().enumerate() {
+        if !valid_span(*start, *end) {
+            validation_errors.push(format!("replacements[{index}] has an invalid byte interval"));
+        }
+    }
+    if !validation_errors.is_empty() {
+        return VectorEvaluation {
+            vector_name: vector.name.clone(),
+            provider: vector.provider.clone(),
+            true_positives: 0,
+            false_negatives: u32::try_from(vector.expected_matches.len()).unwrap_or(u32::MAX),
+            false_positives: 0,
+            per_detection: Vec::new(),
+            validation_errors,
+        };
+    }
+
+    let mut intervals = replacements
+        .iter()
+        .map(|(_, start, end)| (*start as u32, *end as u32))
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let covered = vector
+        .expected_matches
+        .iter()
+        .map(|expected| span_is_fully_covered(expected.start, expected.end, &intervals))
+        .collect::<Vec<_>>();
     let mut per_detection = Vec::new();
-    let mut tp = 0u32;
+    let tp = u32::try_from(covered.iter().filter(|covered| **covered).count()).unwrap_or(u32::MAX);
     let mut fp = 0u32;
-
-    // Span-level coverage: an expected match is "covered" if
-    // any production detection overlaps it. Each expected
-    // match contributes at most 1 to the TP count.
-    let mut covered = vec![false; vector.expected_matches.len()];
-
-    for (name, start, end) in &detections {
+    for (name, start, end) in replacements {
         let start_u32 = *start as u32;
         let end_u32 = *end as u32;
-
         let mut hits_expected = false;
+        let mut hits_covered = false;
         for (idx, exp) in vector.expected_matches.iter().enumerate() {
             if spans_overlap(exp.start, exp.end, start_u32, end_u32) {
-                if !covered[idx] {
-                    covered[idx] = true;
-                    tp += 1;
-                }
                 hits_expected = true;
-                // Don't break — a single detection may cover
-                // multiple adjacent expected spans (rare but
-                // possible).
+                hits_covered |= covered[idx];
             }
         }
 
-        let outcome = if hits_expected {
+        let outcome = if hits_covered {
             MatchOutcome::TruePositive
+        } else if hits_expected {
+            MatchOutcome::PartialCoverage
         } else {
             fp += 1;
             MatchOutcome::FalsePositive
@@ -212,7 +257,24 @@ pub fn evaluate_vector(vector: &RedactorTestVector) -> VectorEvaluation {
         false_negatives: fns,
         false_positives: fp,
         per_detection,
+        validation_errors,
     }
+}
+
+/// `intervals` must be sorted by start. Adjacent and overlapping spans may
+/// jointly cover the expected interval; a one-byte hole is still a miss.
+fn span_is_fully_covered(start: u32, end: u32, intervals: &[(u32, u32)]) -> bool {
+    let mut covered_until = start;
+    for &(replacement_start, replacement_end) in intervals {
+        if replacement_start > covered_until {
+            break;
+        }
+        covered_until = covered_until.max(replacement_end);
+        if covered_until >= end {
+            return true;
+        }
+    }
+    false
 }
 
 fn spans_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
@@ -298,7 +360,14 @@ impl MatrixSnapshot {
     /// Whether every provider clears the recall floor.
     #[must_use]
     pub fn meets_recall_floor(&self, floor: f64) -> bool {
-        self.by_provider.values().all(|p| p.recall() >= floor)
+        self.vectors_total > 0
+            && floor.is_finite()
+            && (0.0..=1.0).contains(&floor)
+            && self
+                .vectors
+                .iter()
+                .all(|vector| vector.validation_errors.is_empty())
+            && self.by_provider.values().all(|p| p.recall() >= floor)
     }
 
     /// Lowest per-provider recall — useful for CI failure
@@ -386,8 +455,16 @@ pub fn fold_snapshot(health: &mut RedactorCoverageHealth, snap: &MatrixSnapshot,
     health.false_positives_total += snap.overall.false_positives as u64;
     let below = snap
         .by_provider
-        .values()
-        .filter(|p| p.recall() < floor)
+        .iter()
+        .filter(|(provider, counters)| {
+            counters.recall() < floor
+                || !floor.is_finite()
+                || !(0.0..=1.0).contains(&floor)
+                || snap.vectors.iter().any(|vector| {
+                    vector.provider.as_str() == provider.as_str()
+                        && !vector.validation_errors.is_empty()
+                })
+        })
         .count() as u32;
     health.providers_below_recall_floor = below;
 }
@@ -1616,18 +1693,134 @@ mod tests {
     fn corpus_expected_pattern_names_are_detected_by_name() {
         let redactor = Redactor::new();
         for vector in synthesized_corpus() {
-            let detections = redactor.detect(&vector.input);
+            let trace = redactor.redact_with_replacement_spans(&vector.input);
             for expected in &vector.expected_matches {
-                let matched_by_name = detections.iter().any(|(name, start, end)| {
-                    *name == expected.pattern_name
-                        && spans_overlap(expected.start, expected.end, *start as u32, *end as u32)
-                });
+                let mut intervals = trace
+                    .replacements
+                    .iter()
+                    .filter(|(name, _, _)| *name == expected.pattern_name)
+                    .map(|(_, start, end)| (*start as u32, *end as u32))
+                    .collect::<Vec<_>>();
+                intervals.sort_unstable();
+                let matched_by_name =
+                    span_is_fully_covered(expected.start, expected.end, &intervals);
                 assert!(
                     matched_by_name,
-                    "vector {} expected pattern {} to detect span {}..{} by name; detections: {:?}",
-                    vector.name, expected.pattern_name, expected.start, expected.end, detections,
+                    "vector {} expected pattern {} to replace all of span {}..{}; replacements: {:?}",
+                    vector.name,
+                    expected.pattern_name,
+                    expected.start,
+                    expected.end,
+                    trace.replacements,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn coverage_rejects_partial_prefix_suffix_and_single_byte_matches() {
+        let vector = RedactorTestVector {
+            name: "partial_coverage".to_string(),
+            input: "abcdefgh".to_string(),
+            expected_matches: vec![ExpectedMatch {
+                pattern_name: "generic_secret".to_string(),
+                start: 2,
+                end: 6,
+            }],
+            provider: "test".to_string(),
+            rationale: "Any surviving expected byte is a false negative".to_string(),
+        };
+        for ranges in [
+            vec![("prefix", 2, 4)],
+            vec![("suffix", 4, 6)],
+            vec![("one_byte", 1, 3)],
+            vec![("left", 2, 4), ("right", 5, 6)],
+            vec![("adjacent_before", 0, 2), ("adjacent_after", 6, 8)],
+        ] {
+            let evaluation = classify_replacement_spans(&vector, &ranges);
+            assert!(evaluation.validation_errors.is_empty());
+            assert_eq!(evaluation.true_positives, 0, "ranges: {ranges:?}");
+            assert_eq!(evaluation.false_negatives, 1, "ranges: {ranges:?}");
+        }
+        for ranges in [
+            vec![("exact", 2, 6)],
+            vec![("superset", 0, 8)],
+            vec![("right", 4, 6), ("left", 2, 4)],
+            vec![("overlap", 3, 6), ("left", 2, 5), ("duplicate", 2, 5)],
+        ] {
+            let evaluation = classify_replacement_spans(&vector, &ranges);
+            assert!(evaluation.validation_errors.is_empty());
+            assert_eq!(evaluation.true_positives, 1, "ranges: {ranges:?}");
+            assert_eq!(evaluation.false_negatives, 0, "ranges: {ranges:?}");
+        }
+    }
+
+    #[test]
+    fn coverage_checks_actual_output_for_surviving_secret_fragments() {
+        let key = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        for input in [format!("private_prefix|{key}"), format!("{key}|private_suffix")] {
+            let vector = pos(
+                "partial_real_redaction",
+                "test",
+                "planted missing bytes",
+                &input,
+                &input,
+                "github_token",
+            );
+            let evaluation = evaluate_vector(&vector);
+            let output = Redactor::new().redact(&input);
+            assert!(
+                !output.contains(&input),
+                "whole-token disappearance alone is insufficient"
+            );
+            assert!(output.contains("private_prefix") || output.contains("private_suffix"));
+            assert_eq!(evaluation.true_positives, 0);
+            assert_eq!(evaluation.false_negatives, 1);
+            assert!(
+                evaluation
+                    .per_detection
+                    .iter()
+                    .any(|record| record.outcome == MatchOutcome::PartialCoverage)
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_unions_unicode_source_bytes_and_rejects_invalid_metadata() {
+        let mut vector = RedactorTestVector {
+            name: "unicode_coverage".to_string(),
+            input: "é秘密abcd".to_string(),
+            expected_matches: vec![ExpectedMatch {
+                pattern_name: "generic_secret".to_string(),
+                start: 0,
+                end: 12,
+            }],
+            provider: "test".to_string(),
+            rationale: "Offsets are UTF-8 byte boundaries".to_string(),
+        };
+        let full = [("latin", 0, 2), ("cjk", 2, 8), ("ascii", 8, 12)];
+        assert_eq!(classify_replacement_spans(&vector, &full).true_positives, 1);
+        for (start, end) in [(0, 0), (6, 5), (0, 13), (1, 2), (0, 1)] {
+            vector.expected_matches[0].start = start;
+            vector.expected_matches[0].end = end;
+            let evaluation = classify_replacement_spans(&vector, &full);
+            assert!(
+                !evaluation.validation_errors.is_empty(),
+                "interval: {start}..{end}"
+            );
+            assert_eq!(evaluation.true_positives, 0);
+            let snapshot = MatrixSnapshot::evaluate(&[vector.clone()]);
+            assert!(!snapshot.meets_recall_floor(0.0));
+            let mut health = RedactorCoverageHealth::baseline();
+            fold_snapshot(&mut health, &snapshot, 0.0);
+            assert!(!health.is_safe());
+        }
+        vector.expected_matches[0].start = 0;
+        vector.expected_matches[0].end = 12;
+        for (start, end) in [(0, 0), (6, 5), (0, 13), (1, 2), (0, 1)] {
+            let evaluation = classify_replacement_spans(&vector, &[("invalid", start, end)]);
+            assert!(!evaluation.validation_errors.is_empty());
+            assert_eq!(evaluation.true_positives, 0);
         }
     }
 
@@ -1649,8 +1842,7 @@ mod tests {
 
     #[test]
     fn evaluate_vector_records_false_negative_for_unmatched_expectation() {
-        // Expected match span beyond input length — the
-        // production regex won't match, so it's a False Negative.
+        // A valid expected span with no production replacement is an FN.
         let v = RedactorTestVector {
             name: "unreachable_expectation".to_string(),
             input: "no secrets here".to_string(),

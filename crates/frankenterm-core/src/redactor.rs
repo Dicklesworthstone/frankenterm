@@ -849,6 +849,29 @@ impl Redactor {
     /// Redact all detected secrets from the input text.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
+        self.redact_observed(text, |_, _, _| {})
+    }
+
+    /// Retain source-byte provenance from the actual sequential replacement
+    /// passes. `detect` scans the original text and is not an equivalent
+    /// oracle when an earlier replacement changes a later pattern's input.
+    pub(crate) fn redact_with_replacement_spans(&self, text: &str) -> RedactionTrace {
+        let mut provenance = RedactionProvenance::new(text.len());
+        let redacted = self.redact_observed(text, |pattern, input, replacement_len| {
+            provenance.record_pass(pattern, input, replacement_len);
+        });
+        RedactionTrace {
+            redacted,
+            replacements: provenance.replacements,
+            replacement_count: provenance.replacement_count,
+        }
+    }
+
+    fn redact_observed(
+        &self,
+        text: &str,
+        mut observe: impl FnMut(&SecretPattern, &str, usize),
+    ) -> String {
         // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
         let _hpt = crate::hot_path_metrics::HotPathTimer::start("redactor.redact");
 
@@ -871,6 +894,9 @@ impl Redactor {
                 REDACTED_MARKER.to_string()
             };
 
+            // The observer sees precisely the input and regex used by this
+            // replace_all, including markers emitted by preceding passes.
+            observe(pattern, &result, replacement.len());
             result = pattern.regex.replace_all(&result, &replacement).to_string();
         }
 
@@ -947,6 +973,114 @@ impl Redactor {
     pub fn redact_bytes_with_evidence(&self, bytes: &[u8]) -> RedactionResult {
         let decoded = PendingDecodedText::from_lossy_decoded(bytes);
         redact_decoded_text_with_evidence(self, &decoded)
+    }
+}
+
+/// Redacted output and the original source intervals removed by production
+/// replacements. Each source byte is recorded only when removed; markers have
+/// no original source bytes, even when a later pass replaces a marker.
+pub(crate) struct RedactionTrace {
+    pub(crate) redacted: String,
+    pub(crate) replacements: Vec<(&'static str, usize, usize)>,
+    pub(crate) replacement_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RetainedSourceSpan {
+    output_start: usize,
+    output_end: usize,
+    source_start: usize,
+}
+
+struct RedactionProvenance {
+    retained: Vec<RetainedSourceSpan>,
+    source_cursor: usize,
+    replacements: Vec<(&'static str, usize, usize)>,
+    replacement_count: usize,
+}
+
+impl RedactionProvenance {
+    fn new(input_len: usize) -> Self {
+        Self {
+            retained: vec![RetainedSourceSpan {
+                output_start: 0,
+                output_end: input_len,
+                source_start: 0,
+            }],
+            source_cursor: 0,
+            replacements: Vec::new(),
+            replacement_count: 0,
+        }
+    }
+
+    fn record_pass(&mut self, pattern: &SecretPattern, input: &str, replacement_len: usize) {
+        let mut matches = pattern.regex.find_iter(input).peekable();
+        if matches.peek().is_none() {
+            return;
+        }
+        self.source_cursor = 0;
+        let mut retained = Vec::new();
+        let mut input_cursor = 0;
+        let mut output_cursor = 0;
+        for matched in matches {
+            self.visit_source_range(
+                input_cursor..matched.start(),
+                Some(output_cursor),
+                pattern.name,
+                &mut retained,
+            );
+            output_cursor += matched.start() - input_cursor;
+            self.visit_source_range(matched.range(), None, pattern.name, &mut retained);
+            self.replacement_count = self.replacement_count.saturating_add(1);
+            output_cursor += replacement_len;
+            input_cursor = matched.end();
+        }
+        self.visit_source_range(
+            input_cursor..input.len(),
+            Some(output_cursor),
+            pattern.name,
+            &mut retained,
+        );
+        self.retained = retained;
+    }
+
+    fn visit_source_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        output_start: Option<usize>,
+        pattern_name: &'static str,
+        retained: &mut Vec<RetainedSourceSpan>,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        while let Some(span) = self.retained.get(self.source_cursor).copied() {
+            if span.output_end <= range.start {
+                self.source_cursor += 1;
+                continue;
+            }
+            if span.output_start >= range.end {
+                break;
+            }
+            let start = span.output_start.max(range.start);
+            let end = span.output_end.min(range.end);
+            let source_start = span.source_start + start - span.output_start;
+            if let Some(output_start) = output_start {
+                let output_start = output_start + start - range.start;
+                retained.push(RetainedSourceSpan {
+                    output_start,
+                    output_end: output_start + end - start,
+                    source_start,
+                });
+            } else {
+                self.replacements
+                    .push((pattern_name, source_start, source_start + end - start));
+            }
+            if span.output_end > range.end {
+                break;
+            }
+            self.source_cursor += 1;
+        }
     }
 }
 
@@ -1163,13 +1297,16 @@ fn redact_decoded_text_with_evidence(
     redactor: &Redactor,
     decoded: &PendingDecodedText,
 ) -> RedactionResult {
-    let detections = redactor.detect(decoded.as_str());
-    let replacement_count = usize_to_u32_saturating(detections.len());
-    let secret_input_bytes_replaced = detections
+    let trace = redactor.redact_with_replacement_spans(decoded.as_str());
+    let replacement_count = usize_to_u32_saturating(trace.replacement_count);
+    // Provenance records a source byte only when it is removed. A later
+    // replacement of a marker cannot count that original byte a second time.
+    let secret_input_bytes_replaced = trace
+        .replacements
         .iter()
         .map(|(_, start, end)| decoded.original_bytes_for_text_range(*start, *end))
         .fold(0, u64::saturating_add);
-    let redacted = redactor.redact(decoded.as_str());
+    let redacted = trace.redacted;
     let redacted_output_bytes = redacted.len() as u64;
 
     RedactionResult {
@@ -1794,6 +1931,87 @@ impl RedactionResult {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn replacement_provenance_tracks_later_passes_over_prior_markers() {
+        let text = concat!(
+            "-----BEGIN PRIVATE KEY-----\n",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+            "-----END PRIVATE KEY-----"
+        );
+        let redactor = Redactor::new();
+        // Original-input overlap suppression reports only the inner token.
+        let detections = redactor.detect(text);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].0, "github_token");
+
+        let trace = redactor.redact_with_replacement_spans(text);
+        assert_eq!(trace.redacted, REDACTED_MARKER);
+        assert_eq!(trace.replacement_count, 2);
+        let mut intervals = trace
+            .replacements
+            .iter()
+            .map(|(_, start, end)| (*start, *end))
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let mut cursor = 0;
+        for (start, end) in intervals {
+            assert_eq!(start, cursor, "every original byte is removed exactly once");
+            cursor = end;
+        }
+        assert_eq!(cursor, text.len());
+        let bytes = redactor.redact_bytes_with_evidence(text.as_bytes());
+        assert_eq!(bytes.bytes, REDACTED_MARKER.as_bytes());
+        assert_eq!(bytes.evidence.replacement_count, 2);
+        assert_eq!(bytes.evidence.secret_input_bytes_replaced, text.len() as u64);
+    }
+
+    #[test]
+    fn replacement_provenance_preserves_production_output_across_corpus() {
+        for vector in crate::redactor_coverage_matrix::synthesized_corpus() {
+            for redactor in [Redactor::new(), Redactor::with_debug_markers()] {
+                let trace = redactor.redact_with_replacement_spans(&vector.input);
+                let mut original_pipeline = vector.input.clone();
+                for pattern in SECRET_PATTERNS {
+                    let marker = if redactor.include_pattern_names {
+                        format!("[REDACTED:{}]", pattern.name)
+                    } else {
+                        REDACTED_MARKER.to_string()
+                    };
+                    original_pipeline = pattern
+                        .regex
+                        .replace_all(&original_pipeline, &marker)
+                        .to_string();
+                }
+                assert_eq!(trace.redacted, original_pipeline, "vector {}", vector.name);
+                assert_eq!(redactor.redact(&vector.input), original_pipeline);
+                for (_, start, end) in trace.replacements {
+                    assert!(start < end && end <= vector.input.len());
+                    assert!(vector.input.is_char_boundary(start));
+                    assert!(vector.input.is_char_boundary(end));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_provenance_preserves_unmatched_text_between_shifted_spans() {
+        let github = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let anthropic = "sk-ant-api03-1234567890123456789012345678901234567890";
+        let input = format!("πleft {github} middle {anthropic} next {github} rightλ");
+        let trace = Redactor::new().redact_with_replacement_spans(&input);
+        assert_eq!(
+            trace.redacted,
+            "πleft [REDACTED] middle [REDACTED] next [REDACTED] rightλ"
+        );
+        let mut replacements = trace.replacements;
+        replacements.sort_unstable_by_key(|(_, start, _)| *start);
+        let expected = [github, anthropic, github];
+        assert_eq!(replacements.len(), expected.len());
+        for ((_, start, end), expected) in replacements.iter().zip(expected) {
+            assert_eq!(&input[*start..*end], expected);
+        }
+    }
 
     struct HyphenatedKeyStreamingCase {
         key: &'static str,

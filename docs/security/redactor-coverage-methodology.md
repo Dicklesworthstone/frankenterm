@@ -9,6 +9,13 @@ floor are published in the JSON report; vendoring upstream
 gitleaks/trufflehog corpora remains the follow-on under `ft-tf6g3.35`
 (operator sign-off needed for licensing).
 
+**2026-09-04 correction (`ft-xxfwy.60`):** the original overlap-based oracle
+could credit a secret whose prefix or suffix survived. Coverage now follows
+the source-byte intervals removed by the actual sequential production
+replacement passes and requires every expected byte to be covered. Retained
+reports produced by the earlier oracle require revalidation; their 1.0 values
+are not proof under the corrected criterion.
+
 ## Why this matters
 
 `redactor.rs` ships **32 regex patterns** covering OpenAI,
@@ -32,17 +39,29 @@ trust**:
 
 For each test vector with N expected secret spans:
 
-- **TP** (True Positive): production redactor detection
-  overlaps an expected span. Counted **once per expected
-  span** (an expected span covered by 2+ overlapping
-  detections is still 1 TP — what matters for redaction
-  semantics is whether the secret bytes get covered).
-- **FN** (False Negative): expected span has no overlapping
-  production detection. The secret leaks — **the bead's
-  headline failure**.
-- **FP** (False Positive): production detection overlaps no
-  expected span. The redactor over-redacted (degrades
-  usability but does not leak).
+- **TP** (True Positive): the union of original-byte intervals actually
+  removed by production redaction covers the entire expected span. Counted
+  once per expected span. Adjacent or overlapping intervals can jointly cover
+  it; duplicates add no coverage.
+- **FN** (False Negative): at least one expected byte survives. Prefix-only,
+  suffix-only, one-byte overlaps, and internal holes are misses, even when the
+  original complete token no longer occurs in the output.
+- **FP** (False Positive): a removed source interval overlaps no expected
+  span. Partial removal of an expected secret is annotated as
+  `partial_coverage`, without crediting a TP.
+- **Invalid evidence:** empty, reversed, out-of-bounds, or non-UTF-8-boundary
+  intervals produce explicit `validation_errors` and fail the coverage/health
+  gates. They must not be silently treated as valid negative examples.
+
+`Redactor::detect()` is not the replacement oracle: it scans original input
+and suppresses overlapping detections, while `redact()` applies each regex to
+the text left by preceding replacements. The shared production pass now
+records retained source spans and removed intervals; replacement markers carry
+no original bytes. A token inside a PEM block exercises this difference.
+Output controls also assert which planted prefix/suffix bytes remain and that
+a fully removed synthetic secret is replaced, rather than relying on absence
+of the whole original token alone. This corpus evaluates complete input
+strings; split-chunk/overflow secrecy requires separate streaming tests.
 
 Per-provider:
 
@@ -111,13 +130,13 @@ expected. A precision drop **below 0.50** signals the regex
 set has degenerated into matching arbitrary text and warrants
 review.
 
-The current synthesized-corpus precision is **1.0**
+The retained pre-correction synthesized-corpus precision was **1.0**
 (zero false positives) because the negative vectors are
 hand-shaped to NOT trip any pattern.
 
 ## Per-provider breakdown
 
-The current coverage report at
+The retained coverage report at
 `docs/security/redactor-coverage.json` lists 27 providers:
 
 | Provider | Patterns | TP | FN | FP | Recall | Precision |
@@ -150,14 +169,17 @@ The current coverage report at
 | generic | generic_api_key, generic_token, generic_password, generic_secret | 12 | 0 | 0 | 1.0 | 1.0 |
 | negative | (cross-cutting negatives) | 0 | 0 | 0 | 1.0 | 1.0 |
 
-Source of truth: `docs/security/redactor-coverage.json`.
+Historical report: `docs/security/redactor-coverage.json`. Revalidate this
+table against the corrected oracle before citing it as current evidence.
 
-## CI gate
+## RCH regression and DSR release gate
 
 `tests/redactor_coverage_matrix.rs::synthesized_corpus_meets_recall_floor`
-asserts every provider clears the ≥99% recall floor on every
-PR. Hard failure on dip; the bead's "fail CI on dip"
-requirement.
+asserts every provider clears the ≥99% recall floor on the supplied synthetic
+corpus. Run it through remotely admitted RCH and retain source identity,
+executed test count, and result. DSR exclusively owns release orchestration
+and the release evidence bundle. This is not a statistical generalization to
+an external corpus or a claim that a current release lane already ran it.
 
 The bless flow (`FT_REDACTOR_COVERAGE_BLESS=1`) is for
 **deliberate** corpus changes only — adding a new pattern,
@@ -168,12 +190,13 @@ any provider fails the test.
 Re-bless recipe:
 
 ```bash
-FT_REDACTOR_COVERAGE_BLESS=1 \
-CARGO_TARGET_DIR=/tmp/ft-pane3-target \
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-cargo test -p frankenterm-core --test redactor_coverage_matrix \
-    --features asupersync-runtime --no-default-features
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env FT_REDACTOR_COVERAGE_BLESS=1 \
+  cargo test -p frankenterm-core --test redactor_coverage_matrix --locked
 ```
+
+Review the produced report and retain the unblessed regression result first.
+Blessing must never turn surviving secret bytes into accepted behavior.
 
 ## False-positive clustering (action #6)
 
@@ -194,28 +217,26 @@ the FP cluster table.
 
 ```bash
 # Full regression — ≥99% recall floor + bless-flow check.
-CARGO_TARGET_DIR=/tmp/ft-pane3-target \
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-cargo test -p frankenterm-core --test redactor_coverage_matrix \
-    --features asupersync-runtime --no-default-features
-# → 5 passed
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --test redactor_coverage_matrix --locked
 
 # Lib tests (corpus shape + evaluate_vector + MatrixSnapshot
 # + RedactorCoverageHealth + JSONL roundtrip):
-cargo test -p frankenterm-core --lib redactor_coverage_matrix:: \
-    --features asupersync-runtime --no-default-features
-# → 14 passed
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --lib redactor_coverage_matrix:: --locked
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --lib replacement_provenance_ --locked
 ```
 
 ## Bead acceptance status
 
 | Item | Status |
 |---|---|
-| Synthesized in-tree corpus | ✓ (83 vectors, 25 patterns, 20 providers) |
+| Synthesized in-tree corpus | Present; derive current vector/pattern/provider counts from the live corpus and report. |
 | Recall/precision benchmark + report | ✓ (`tests/redactor_coverage_matrix.rs` + `docs/security/redactor-coverage.json`) |
-| Per-provider breakdown | ✓ (20 providers in the JSON report) |
-| ≥99% recall floor enforced | ✓ (CI test + 0.01 drift bound on bless flow) |
-| Per-release JSON artifact | ✓ (`docs/security/redactor-coverage.json` re-blessed per release) |
+| Per-provider breakdown | Present in the retained JSON report; revalidate under the corrected oracle. |
+| ≥99% synthetic recall floor | Implemented regression test; current-source execution receipt required. |
+| Per-release JSON artifact | `docs/security/redactor-coverage.json` is the report slot; DSR bundle inclusion and current-source revalidation must be proved for each release. |
 | Vendored gitleaks corpus | ⏳ `ft-tf6g3.35`, operator sign-off needed for licensing |
 | Vendored trufflehog corpus | ⏳ `ft-tf6g3.35`, AGPL-3.0 license needs operator sign-off |
 | Fano's-inequality sample-size derivation | ✓ (`docs/security/redactor-recall-derivation.md`) |
