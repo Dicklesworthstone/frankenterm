@@ -8,6 +8,12 @@
         target_os = "dragonfly"
     )
 ))]
+// The Send proof for this file's async fixtures walks the storage-open chain
+// and, on nightly-2026-08-31 on macOS, exhausts the default 128-step budget
+// ("overflow evaluating the requirement ... : Send"). The same code type-checks
+// on the Linux proof workers, so this is the solver's depth budget, not a cycle;
+// frankenterm-core's lib crate has carried the same raise for a while.
+#![recursion_limit = "256"]
 
 use base64::Engine as _;
 use frankenterm_core::native_events::{
@@ -48,7 +54,10 @@ fn fail(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
 }
 
-async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+// `T: Send` so the returned future is provably Send: without it the receiver's
+// internal `VecDeque<T>` is not known to be Send and `clippy::future_not_send`
+// refuses the helper. Every caller here already passes a Send payload.
+async fn recv_next<T: Send>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
     let cx = frankenterm_core::cx::for_testing();
     rx.recv(&cx).await.ok()
 }

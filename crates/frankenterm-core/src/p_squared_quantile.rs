@@ -145,8 +145,8 @@ impl PSquaredEstimator {
         }
 
         // Increment positions of markers above the cell.
-        for i in (k + 1)..MARKER_COUNT {
-            self.n[i] += 1.0;
+        for position in &mut self.n[(k + 1)..MARKER_COUNT] {
+            *position += 1.0;
         }
         // Update desired positions.
         for i in 0..MARKER_COUNT {

@@ -321,10 +321,7 @@ impl SegmentMeta {
         }
         // Time boundary
         let age_secs = now_ms.saturating_sub(self.created_at_ms) / 1000;
-        if age_secs >= config.max_segment_duration_secs {
-            return true;
-        }
-        false
+        age_secs >= config.max_segment_duration_secs
     }
 
     /// Determine if this segment is eligible for the next lifecycle transition.

@@ -93,8 +93,8 @@ impl DiGraph {
     #[must_use]
     pub fn reverse(&self) -> DiGraph {
         let mut rev = DiGraph::new(self.n);
-        for u in 0..self.n {
-            for &v in &self.adj[u] {
+        for (u, successors) in self.adj.iter().enumerate() {
+            for &v in successors {
                 rev.adj[v].push(u);
             }
         }

@@ -577,8 +577,8 @@ mod tests {
         }
         let bytes = h.encode();
         let decoded = ScrollbackHeader::decode(&bytes).unwrap();
-        for i in 0..32 {
-            assert_eq!(decoded.pane_uuid[i], i as u8);
+        for (i, byte) in decoded.pane_uuid.iter().enumerate() {
+            assert_eq!(*byte, i as u8);
         }
     }
 }

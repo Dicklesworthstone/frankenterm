@@ -1,4 +1,12 @@
 #![cfg(feature = "asupersync-runtime")]
+// The Send proof for this fixture's future walks the storage-open chain
+// (`StorageHandle::new` -> `new_with_cx` -> ...) and, on nightly-2026-08-31 on
+// macOS, exhausts the default 128-step budget before it settles: "overflow
+// evaluating the requirement `impl Future<Output = (WorkflowRunner, ...)>`".
+// The same code type-checks on the Linux proof workers, so this is the solver's
+// depth budget, not a cycle. Raising the limit keeps the fixture buildable on
+// both.
+#![recursion_limit = "256"]
 
 //! Conformance coverage for the WorkflowRunner <-> pane-lock contract.
 //!

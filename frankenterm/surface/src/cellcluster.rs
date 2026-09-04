@@ -460,8 +460,8 @@ mod tests {
         assert_eq!(c.byte_to_cell_idx.len(), "aé".len());
         assert_eq!(c.byte_to_cell_idx[0], 0); // "a" -> cell 0
                                               // "é" bytes -> cell 1
-        for i in 1..c.byte_to_cell_idx.len() {
-            assert_eq!(c.byte_to_cell_idx[i], 1);
+        for mapped in &c.byte_to_cell_idx[1..] {
+            assert_eq!(*mapped, 1);
         }
     }
 

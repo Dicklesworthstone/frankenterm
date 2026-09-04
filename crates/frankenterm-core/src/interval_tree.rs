@@ -582,11 +582,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
         // Check height
         let lh = self.node_height(node.left);
         let rh = self.node_height(node.right);
-        if node.height != 1 + lh.max(rh) {
-            return false;
-        }
-
-        true
+        node.height == 1 + lh.max(rh)
     }
 }
 

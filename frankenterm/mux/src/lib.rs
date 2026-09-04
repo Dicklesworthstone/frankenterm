@@ -16996,10 +16996,7 @@ impl Mux {
     /// killing a remote pane or tearing down topology published after the
     /// staging handle became stale.
     pub fn remove_empty_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
-        if self.remove_empty_tab_internal_if_same(expected).is_none() {
-            return false;
-        }
-        true
+        self.remove_empty_tab_internal_if_same(expected).is_some()
     }
 
     pub fn prune_dead_windows(&self) {

@@ -1,3 +1,10 @@
+// The Send proof for this file's async fixtures walks the storage-open chain
+// and, on nightly-2026-08-31 on macOS, exhausts the default 128-step budget
+// ("overflow evaluating the requirement ... : Send"). The same code type-checks
+// on the Linux proof workers, so this is the solver's depth budget, not a cycle;
+// frankenterm-core's lib crate has carried the same raise for a while.
+#![recursion_limit = "256"]
+
 //! Property-based tests for tx_idempotency (ft-1i2ge.8.7).
 //!
 //! Tests invariants of idempotency keys, execution ledgers, dedup guards,
@@ -476,8 +483,7 @@ proptest! {
         ledger.transition_phase(TxPhase::Committing).unwrap();
 
         let to_execute = execute_count.min(n);
-        for i in 0..to_execute {
-            let step = &plan.steps[i];
+        for (i, step) in plan.steps.iter().take(to_execute).enumerate() {
             let key = IdempotencyKey::new("test-plan", &step.id, "act");
             ledger.append(key, StepOutcome::Success { result: None }, StepRisk::Low, "a", i as u64 * 1000).unwrap();
         }

@@ -56391,7 +56391,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         fail_step = fail_step.as_deref().unwrap_or(""),
                                         "robot tx run starting"
                                     );
-                                    let data = if let Some((storage, wezterm)) = real_runtime {
+                                    let data = if let Some((storage, wezterm, tx_storage)) =
+                                        real_runtime
+                                    {
                                         let policy_engine = std::cell::RefCell::new(
                                             with_persisted_kill_switch(
                                                 frankenterm_core::policy::PolicyEngine::new(
@@ -56443,7 +56445,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 approvals,
                                                 targets,
                                                 prepare_context,
-                                            );
+                                            )
+                                            .with_storage_adapter(tx_storage);
                                         execute_tx_run_with_executor(
                                             executor,
                                             execution_contract_path,
@@ -56641,7 +56644,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
                                         "robot tx rollback starting"
                                     );
-                                    let data = if let Some((storage, wezterm)) = real_runtime {
+                                    let data = if let Some((storage, wezterm, tx_storage)) =
+                                        real_runtime
+                                    {
                                         let policy_engine = std::cell::RefCell::new(
                                             with_persisted_kill_switch(
                                                 frankenterm_core::policy::PolicyEngine::new(
@@ -56693,7 +56698,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 approvals,
                                                 targets,
                                                 prepare_context,
-                                            );
+                                            )
+                                            .with_storage_adapter(tx_storage);
                                         execute_tx_rollback_with_executor(
                                             executor,
                                             execution_contract_path,
@@ -63210,7 +63216,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 } else {
                     "synthetic_fallback"
                 };
-                let data = if let Some((storage, wezterm)) = real_runtime {
+                let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
                     let policy_engine = std::cell::RefCell::new(
                         with_persisted_kill_switch(
                             frankenterm_core::policy::PolicyEngine::new(
@@ -63252,7 +63258,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         approvals,
                         targets,
                         prepare_context,
-                    );
+                    )
+                    .with_storage_adapter(tx_storage);
                     execute_tx_run_with_executor(
                         SteeringReceiptRevalidatingExecutor::new(
                             executor,
@@ -75644,6 +75651,7 @@ async fn resolve_real_tx_runtime(
     Option<(
         frankenterm_core::storage::StorageHandle,
         frankenterm_core::wezterm::WeztermHandle,
+        std::sync::Arc<dyn frankenterm_core::tx_execution::TxStorageAdapter>,
     )>,
     Option<String>,
 ) {
@@ -75667,14 +75675,29 @@ async fn resolve_real_tx_runtime(
     };
 
     let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+    let tx_storage = match frankenterm_core::tx_execution::FileTxStorageAdapter::new(
+        layout.ft_dir.join("tx_data"),
+    ) {
+        Ok(storage) => std::sync::Arc::new(storage)
+            as std::sync::Arc<dyn frankenterm_core::tx_execution::TxStorageAdapter>,
+        Err(err) => {
+            return (
+                None,
+                Some(format!(
+                    "transaction data storage unavailable at {}: {err}",
+                    layout.ft_dir.join("tx_data").display()
+                )),
+            );
+        }
+    };
     if !require_terminal_backend {
-        return (Some((storage, wezterm)), None);
+        return (Some((storage, wezterm, tx_storage)), None);
     }
 
     // ft-xbnl0.2.3 tick 234: cx-first.
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match wezterm.list_panes_with_cx(&cx).await {
-        Ok(_) => (Some((storage, wezterm)), None),
+        Ok(_) => (Some((storage, wezterm, tx_storage)), None),
         Err(err) => (
             None,
             Some(format!(
@@ -77586,7 +77609,7 @@ async fn handle_tx_command(
                 fail_step = fail_step.as_deref().unwrap_or(""),
                 "tx run starting"
             );
-            let data = if let Some((storage, wezterm)) = real_runtime {
+            let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
                 let policy_engine = std::cell::RefCell::new(
                     with_persisted_kill_switch(
                         frankenterm_core::policy::PolicyEngine::new(
@@ -77626,7 +77649,8 @@ async fn handle_tx_command(
                     approvals,
                     targets,
                     prepare_context,
-                );
+                )
+                .with_storage_adapter(tx_storage);
                 execute_tx_run_with_executor(
                     executor,
                     execution_contract_path,
@@ -77797,7 +77821,7 @@ async fn handle_tx_command(
                 fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
                 "tx rollback starting"
             );
-            let data = if let Some((storage, wezterm)) = real_runtime {
+            let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
                 let policy_engine = std::cell::RefCell::new(
                     with_persisted_kill_switch(
                         frankenterm_core::policy::PolicyEngine::new(
@@ -77837,7 +77861,8 @@ async fn handle_tx_command(
                     approvals,
                     targets,
                     prepare_context,
-                );
+                )
+                .with_storage_adapter(tx_storage);
                 execute_tx_rollback_with_executor(
                     executor,
                     execution_contract_path,

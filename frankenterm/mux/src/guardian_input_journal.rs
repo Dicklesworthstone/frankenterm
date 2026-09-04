@@ -938,7 +938,9 @@ pub enum GuardianInputJournalError {
     RecoveryAuthorityUnavailable,
     #[error("guardian input journal is poisoned after an ambiguous write or sync failure")]
     Poisoned,
-    #[error("guardian input journal length changed outside its exclusive owner: expected {expected}, observed {observed}")]
+    #[error(
+        "guardian input journal length changed outside its exclusive owner: expected {expected}, observed {observed}"
+    )]
     ExternalLengthChange { expected: u64, observed: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),

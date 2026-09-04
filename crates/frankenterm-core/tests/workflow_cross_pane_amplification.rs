@@ -1,3 +1,10 @@
+// The Send proof for this file's async fixtures walks the storage-open chain
+// and, on nightly-2026-08-31 on macOS, exhausts the default 128-step budget
+// ("overflow evaluating the requirement ... : Send"). The same code type-checks
+// on the Linux proof workers, so this is the solver's depth budget, not a cycle;
+// frankenterm-core's lib crate has carried the same raise for a while.
+#![recursion_limit = "256"]
+
 //! Regression test for ft-j0ufc — workflow runner privilege amplification by
 //! pattern injection.
 //!

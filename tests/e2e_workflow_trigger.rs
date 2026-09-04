@@ -1,3 +1,9 @@
+// The Send proof for this fixture's future walks the storage-open chain and,
+// on nightly-2026-08-31 on macOS, exhausts the default 128-step budget. The
+// same code type-checks on the Linux proof workers, so this is the solver's
+// depth budget, not a cycle.
+#![recursion_limit = "256"]
+
 use assert_cmd::Command;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
