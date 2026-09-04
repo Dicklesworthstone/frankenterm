@@ -283,8 +283,9 @@ impl Default for ErasureConfig {
 ///
 /// External code constructs shards via [`encode_row`] and
 /// reads them via [`Self::shard_index`], [`Self::is_parity`],
-/// and [`Self::bytes`]. Tests build forged shards via
-/// [`Self::for_test`] which is gated to test/integration use.
+/// and [`Self::bytes`]. The public [`Self::for_test`] constructor and serde
+/// input can supply untrusted fields; reconstruction validates their shape.
+/// Neither field privacy nor length/padding checks authenticate shard content.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ErasureShard {
     /// Version 2 uses a systematic MDS generator. Unversioned shards used a
@@ -417,10 +418,7 @@ fn generator_matrix(cfg: ErasureConfig) -> Vec<Vec<u8>> {
 ///
 /// Returns a typed error for an invalid configuration or an input that cannot
 /// fit the 4-byte length prefix and platform allocation envelope.
-pub fn encode_row(
-    cfg: ErasureConfig,
-    data: &[u8],
-) -> Result<Vec<ErasureShard>, ErasureError> {
+pub fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Result<Vec<ErasureShard>, ErasureError> {
     ErasureConfig::new(cfg.k, cfg.n)?;
     let original_len = u32::try_from(data.len())
         .map_err(|_| ErasureError::PayloadTooLarge { len: data.len() })?;
@@ -687,6 +685,197 @@ pub const fn single_host_loss_recoverable(cfg: ErasureConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Vec<ErasureShard> {
+        super::encode_row(cfg, data).expect("valid test row encodes")
+    }
+
+    #[test]
+    fn systematic_mds_recovers_every_small_survivor_set_and_order() {
+        for n in 1u8..=8 {
+            for k in 1..=n {
+                let cfg = ErasureConfig::new(k, n).unwrap();
+                for len in 0..=2 * usize::from(k) + 4 {
+                    let data: Vec<u8> = (0..len).map(|i| (i * 73 + len) as u8).collect();
+                    let shards = encode_row(cfg, &data);
+                    for mask in 0u16..(1u16 << n) {
+                        if mask.count_ones() != u32::from(k) {
+                            continue;
+                        }
+                        let mut survivors: Vec<_> = shards
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| mask & (1u16 << *index) != 0)
+                            .map(|(_, shard)| shard.clone())
+                            .collect();
+                        assert_eq!(
+                            reconstruct(cfg, &survivors).unwrap(),
+                            data,
+                            "k={k} n={n} len={len} mask={mask:#x}"
+                        );
+                        survivors.reverse();
+                        assert_eq!(reconstruct(cfg, &survivors).unwrap(), data);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn four_of_seven_recovers_previously_singular_survivors() {
+        let cfg = ErasureConfig::new(4, 7).unwrap();
+        let data: Vec<u8> = (0..=255).collect();
+        let shards = encode_row(cfg, &data);
+        let mut survivors: Vec<_> = [2, 4, 5, 6].map(|i| shards[i].clone()).into();
+        for _ in 0..survivors.len() {
+            assert_eq!(reconstruct(cfg, &survivors).unwrap(), data);
+            survivors.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn maximum_config_recovers_each_single_missing_shard() {
+        let cfg = ErasureConfig::new(31, 32).unwrap();
+        let data: Vec<u8> = (0..=255).collect();
+        let shards = encode_row(cfg, &data);
+        for missing in 0..shards.len() {
+            let survivors: Vec<_> = shards
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != missing)
+                .map(|(_, shard)| shard.clone())
+                .collect();
+            assert_eq!(reconstruct(cfg, &survivors).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn systematic_data_rows_preserve_framing_and_zero_padding() {
+        for k in 1..=8 {
+            let cfg = ErasureConfig::new(k, 8).unwrap();
+            for len in 0..=20usize {
+                let data = vec![0xa5; len];
+                let shards = encode_row(cfg, &data);
+                let payload: Vec<u8> = shards[..usize::from(k)]
+                    .iter()
+                    .flat_map(|shard| shard.bytes.iter().copied())
+                    .collect();
+                assert_eq!(&payload[..4], &(len as u32).to_le_bytes());
+                assert_eq!(&payload[4..4 + len], &data);
+                assert!(payload[4 + len..].iter().all(|byte| *byte == 0));
+                assert!(payload.len() - 4 - len < usize::from(k));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_and_singular_matrices_return_typed_errors() {
+        assert_eq!(invert_matrix(&[]), Err(ErasureError::MalformedMatrix));
+        assert_eq!(
+            invert_matrix(&[vec![1, 0], vec![1]]),
+            Err(ErasureError::MalformedMatrix)
+        );
+        // Exact old k=4,n=7 generator rows for survivor indices [2,4,5,6].
+        let legacy = vec![
+            vec![0, 0, 1, 0],
+            vec![1, 1, 1, 1],
+            vec![1, 2, 4, 8],
+            vec![1, 3, gf_pow(3, 2), gf_pow(3, 3)],
+        ];
+        assert!(matches!(
+            invert_matrix(&legacy),
+            Err(ErasureError::SingularMatrix { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialization_cannot_bypass_config_validation() {
+        for (k, n) in [(0, 5), (3, 0), (5, 3), (3, 33)] {
+            assert!(
+                serde_json::from_value::<ErasureConfig>(serde_json::json!({"k": k, "n": n}))
+                    .is_err()
+            );
+        }
+        let cfg = ErasureConfig::new(4, 7).unwrap();
+        let roundtrip: ErasureConfig =
+            serde_json::from_value(serde_json::to_value(cfg).unwrap()).unwrap();
+        assert_eq!(cfg, roundtrip);
+        assert!(matches!(
+            super::encode_row(ErasureConfig { k: 0, n: 5 }, b""),
+            Err(ErasureError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            reconstruct(ErasureConfig { k: 0, n: 5 }, &[]),
+            Err(ErasureError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_versions_and_malformed_surplus_shards() {
+        let cfg = ErasureConfig::DEFAULT;
+        let shards = encode_row(cfg, b"audit");
+        let legacy: ErasureShard = serde_json::from_value(serde_json::json!({
+            "shard_index": 0, "is_parity": false, "bytes": shards[0].bytes()
+        }))
+        .unwrap();
+        let mut bad = shards.clone();
+        bad[4] = legacy;
+        assert_eq!(
+            reconstruct(cfg, &bad),
+            Err(ErasureError::UnsupportedEncodingVersion { version: 0 })
+        );
+        let mut bad = shards.clone();
+        bad[4].is_parity = false;
+        assert_eq!(
+            reconstruct(cfg, &bad),
+            Err(ErasureError::InvalidParityFlag { index: 4 })
+        );
+        let mut bad = shards.clone();
+        bad[4].shard_index = 5;
+        assert_eq!(
+            reconstruct(cfg, &bad),
+            Err(ErasureError::ShardIndexOutOfRange { index: 5, n: 5 })
+        );
+        let mut bad = shards.clone();
+        bad.push(shards[0].clone());
+        assert_eq!(
+            reconstruct(cfg, &bad),
+            Err(ErasureError::DuplicateShardIndex { index: 0 })
+        );
+        let mut bad = shards;
+        bad[4].bytes.push(0);
+        assert!(matches!(
+            reconstruct(cfg, &bad),
+            Err(ErasureError::InconsistentShardSize { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_padding_and_missing_length() {
+        let cfg = ErasureConfig::DEFAULT;
+        let mut shards = encode_row(cfg, b"");
+        *shards[2].bytes.last_mut().unwrap() = 1;
+        assert_eq!(
+            reconstruct(cfg, &shards[..3]),
+            Err(ErasureError::InvalidPadding)
+        );
+        let mut shards = encode_row(cfg, b"");
+        for shard in &mut shards {
+            shard.bytes.clear();
+        }
+        assert_eq!(
+            reconstruct(cfg, &shards),
+            Err(ErasureError::DecodedLengthMismatch {
+                original: 0,
+                decoded: 0,
+            })
+        );
+        let mut shards = encode_row(cfg, b"");
+        for shard in &mut shards {
+            shard.bytes.push(0);
+        }
+        assert_eq!(reconstruct(cfg, &shards), Err(ErasureError::InvalidPadding));
+    }
 
     #[test]
     fn default_config_is_three_of_five() {
