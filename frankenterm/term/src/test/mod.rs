@@ -637,6 +637,7 @@ mod osc52_policy {
     struct ClipboardState {
         contents: Option<String>,
         calls: Vec<(ClipboardSelection, Option<String>)>,
+        fail_writes: bool,
     }
 
     #[derive(Debug)]
@@ -652,6 +653,9 @@ mod osc52_policy {
         ) -> anyhow::Result<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push((selection, contents.clone()));
+            if state.fail_writes {
+                anyhow::bail!("clipboard write failed for test");
+            }
             state.contents = contents;
             Ok(())
         }
@@ -685,6 +689,7 @@ mod osc52_policy {
                 state: Mutex::new(ClipboardState {
                     contents: Some("retained clipboard".to_string()),
                     calls: Vec::new(),
+                    fail_writes: false,
                 }),
             });
             let handler: Arc<dyn Clipboard> = clipboard.clone();
@@ -770,6 +775,59 @@ mod osc52_policy {
             &[(ClipboardSelection::Clipboard, Some("é".to_string()))]
         );
         assert_eq!(state.contents.as_deref(), Some("é"));
+    }
+
+    #[test]
+    fn handler_failures_preserve_contents_and_parser_progress() {
+        for policy in [
+            Osc52WritePolicy::Allow,
+            Osc52WritePolicy::Deny,
+            Osc52WritePolicy::Prompt,
+        ] {
+            for terminator in ["\x1b\\", "\x07"] {
+                let mut fixture = Fixture::new(policy, 3);
+                fixture.clipboard.state.lock().unwrap().fail_writes = true;
+                let input = format!(
+                    "\x1b]52;c{terminator}C\x1b]52;p;bmV3{terminator}S\x1b]52;c;?{terminator}Q"
+                );
+                // Split every control sequence, including the two-byte ST, at
+                // byte boundaries. Each failed callback must leave parsing live.
+                for byte in input.as_bytes() {
+                    fixture.term.advance_bytes(std::slice::from_ref(byte));
+                }
+                {
+                    let state = fixture.clipboard.state.lock().unwrap();
+                    assert_eq!(state.contents.as_deref(), Some("retained clipboard"));
+                    if policy == Osc52WritePolicy::Allow {
+                        assert_eq!(
+                            state.calls.as_slice(),
+                            &[
+                                (ClipboardSelection::Clipboard, None),
+                                (
+                                    ClipboardSelection::PrimarySelection,
+                                    Some("new".to_string()),
+                                ),
+                            ]
+                        );
+                    } else {
+                        assert!(state.calls.is_empty(), "clipboard handler was called");
+                    }
+                }
+                assert_visible_contents(&fixture.term, file!(), line!(), &["CSQ", ""]);
+                assert_eq!(
+                    fixture.output.lock().unwrap().as_slice(),
+                    b"\x1b]52;c;\x1b\\"
+                );
+
+                if policy == Osc52WritePolicy::Allow {
+                    fixture.clipboard.state.lock().unwrap().fail_writes = false;
+                    fixture.term.advance_bytes("\x1b]52;c;b2s=\x1b\\");
+                    let state = fixture.clipboard.state.lock().unwrap();
+                    assert_eq!(state.contents.as_deref(), Some("ok"));
+                    assert_eq!(state.calls.len(), 3);
+                }
+            }
+        }
     }
 
     #[test]
