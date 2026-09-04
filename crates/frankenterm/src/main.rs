@@ -111723,12 +111723,39 @@ recorder_backend = "rusqlite"
             now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        harden_test_dir(&dir);
         dir
+    }
+
+    /// Create a fixture directory that the agent-config writers will accept.
+    ///
+    /// See [`harden_test_dir`] for why the mode has to be stated rather than
+    /// inherited.
+    fn make_test_dir(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        harden_test_dir(dir);
+    }
+
+    /// Agent-config writes refuse a directory that is group- or world-writable,
+    /// which is the right production rule and made these tests depend on the
+    /// runner's umask: under the 002 umask a build worker uses, every directory
+    /// the fixtures created came out 0775 and 28 tests failed on a machine
+    /// where nothing was wrong with the code. Fixtures state their own
+    /// permissions instead of inheriting them.
+    fn harden_test_dir(dir: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
     }
 
     fn write_file(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
+            harden_test_dir(parent);
         }
         std::fs::write(path, contents).unwrap();
     }
@@ -126859,7 +126886,7 @@ printf x > "$MINISIGN_MARKER"
     fn prepare_agent_config_rejects_source_above_finite_cap() {
         let root = unique_temp_dir("agent_config_source_cap");
         let workspace_root = root.join("workspace");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
         std::fs::write(
             workspace_root.join("AGENTS.md"),
             vec![b'x'; usize::try_from(AGENT_CONFIG_MAX_BYTES).unwrap() + 1],
@@ -126885,7 +126912,7 @@ printf x > "$MINISIGN_MARKER"
     fn agent_config_candidate_cap_rejection_creates_no_backup() {
         let root = unique_temp_dir("agent_config_candidate_cap");
         let workspace_root = root.join("workspace");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
         let target = workspace_root.join("AGENTS.md");
         std::fs::write(&target, b"original instructions\n").unwrap();
         let parent = open_agent_config_parent(&target, false).unwrap().unwrap();
@@ -127235,8 +127262,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_source_xattr");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let target = global_root.join(".cursorrules");
         let original = b"# existing cursor rules\n";
         std::fs::write(&target, original).unwrap();
@@ -127290,7 +127317,7 @@ printf x > "$MINISIGN_MARKER"
     fn project_scope_agent_config_write_is_idempotent() {
         let root = unique_temp_dir("agent_config_project");
         let workspace_root = root.join("workspace");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "codex".to_string(),
             detected: true,
@@ -127337,8 +127364,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_global");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let target = global_root.join(".cursorrules");
         write_file(&target, "# existing cursor rules\n");
         #[cfg(unix)]
@@ -127433,8 +127460,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_supplementary_gid");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let target = global_root.join(".cursorrules");
         std::fs::write(&target, b"# existing cursor rules\n").unwrap();
         let source = std::fs::OpenOptions::new()
@@ -127501,7 +127528,7 @@ printf x > "$MINISIGN_MARKER"
         };
         let root = unique_temp_dir("agent_config_setgid_parent");
         let workspace_root = root.join("workspace");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
         let parent_handle = std::fs::OpenOptions::new()
             .read(true)
             .open(&workspace_root)
@@ -127542,9 +127569,9 @@ printf x > "$MINISIGN_MARKER"
         let workspace_root = root.join("workspace");
         let stale_root = root.join(".config").join("codex");
         let active_root = root.join(".codex");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&stale_root).unwrap();
-        std::fs::create_dir_all(&active_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&stale_root);
+        make_test_dir(&active_root);
 
         let active_config = active_root.join("AGENTS.md");
         write_file(&active_config, "# existing codex rules\n");
@@ -127580,9 +127607,9 @@ printf x > "$MINISIGN_MARKER"
         let workspace_root = root.join("workspace");
         let preferred_root = root.join(".cursor");
         let fallback_root = root.join(".config").join("Cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&preferred_root).unwrap();
-        std::fs::create_dir_all(&fallback_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&preferred_root);
+        make_test_dir(&fallback_root);
 
         let mut root_paths = vec![
             preferred_root.display().to_string(),
@@ -127615,8 +127642,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_concurrent_merge");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
 
         let target = global_root.join(".cursorrules");
         write_file(&target, "# existing cursor rules\n");
@@ -127656,8 +127683,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_current_after_prepare");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
 
         let target = global_root.join(".cursorrules");
         write_file(&target, "# existing cursor rules\n");
@@ -127699,7 +127726,7 @@ printf x > "$MINISIGN_MARKER"
     fn global_scope_agent_config_error_items_use_template_filename_when_root_missing() {
         let root = unique_temp_dir("agent_config_error");
         let workspace_root = root.join("workspace");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "codex".to_string(),
             detected: true,
@@ -127735,7 +127762,7 @@ printf x > "$MINISIGN_MARKER"
     fn malformed_managed_section_is_planned_as_append_not_replace() {
         let root = unique_temp_dir("agent_config_malformed_section");
         let workspace_root = root.join("workspace");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
 
         let target = workspace_root.join("AGENTS.md");
         write_file(
@@ -127774,8 +127801,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_write_error");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
 
         let target = global_root.join(".cursorrules");
         let original = "# existing cursor rules\n";
@@ -127839,8 +127866,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_private_partial_candidate");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let target = global_root.join(".cursorrules");
         let original = b"# private cursor rules\n";
         std::fs::write(&target, original).unwrap();
@@ -128047,8 +128074,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_plan_error");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
 
         let target = global_root.join(".cursorrules");
         std::fs::write(&target, [0xff]).expect("write invalid UTF-8 config fixture");
@@ -128082,8 +128109,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_non_regular_target");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(global_root.join(".cursorrules")).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root.join(".cursorrules"));
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
             slug: "cursor".to_string(),
             detected: true,
@@ -128111,8 +128138,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_symlink_target");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let victim = root.join("victim.txt");
         let victim_bytes = b"private victim contents\n";
         std::fs::write(&victim, victim_bytes).unwrap();
@@ -128146,8 +128173,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_dangling_symlink");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         symlink(
             root.join("missing-victim"),
             global_root.join(".cursorrules"),
@@ -128185,8 +128212,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_hard_link_target");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let original = root.join("original-rules");
         std::fs::write(&original, b"shared rules\n").unwrap();
         std::fs::hard_link(&original, global_root.join(".cursorrules")).unwrap();
@@ -128218,8 +128245,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_symlink_after_prepare");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let target = global_root.join(".cursorrules");
         let retained = global_root.join("retained-original");
         let original = b"# existing cursor rules\n";
@@ -128262,8 +128289,8 @@ printf x > "$MINISIGN_MARKER"
         let root = unique_temp_dir("agent_config_symlink_during_write");
         let workspace_root = root.join("workspace");
         let global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&global_root).unwrap();
+        make_test_dir(&workspace_root);
+        make_test_dir(&global_root);
         let target = global_root.join(".cursorrules");
         let retained = global_root.join("retained-original");
         let original = b"# existing cursor rules\n";
@@ -128354,7 +128381,7 @@ printf x > "$MINISIGN_MARKER"
         let workspace_root = root.join("workspace");
         let real_global_root = root.join("real-cursor-config");
         let linked_global_root = root.join(".cursor");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        make_test_dir(&workspace_root);
         std::fs::create_dir_all(&real_global_root).unwrap();
         symlink(&real_global_root, &linked_global_root).unwrap();
         let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
