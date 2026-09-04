@@ -121684,7 +121684,31 @@ printf x > "$MINISIGN_MARKER"
             let cx = frankenterm_core::cx::for_request();
             let (storage, _) = setup_storage("watcher_configured_policy").await;
             let mock = Arc::new(MockWezterm::new());
-            mock.add_default_pane_with_cx(&cx, 42).await.unwrap();
+            let pane = mock.add_default_pane_with_cx(&cx, 42).await.unwrap();
+            // A watcher acts on discovered, persisted panes. audit_actions
+            // deliberately enforces that relationship through its pane FK.
+            let now = now_ms();
+            storage
+                .upsert_pane_with_cx(
+                    &cx,
+                    PaneRecord {
+                        pane_id: pane.pane_id,
+                        pane_uuid: None,
+                        domain: pane.domain,
+                        window_id: Some(pane.window_id),
+                        tab_id: Some(pane.tab_id),
+                        title: Some(pane.title),
+                        cwd: Some(pane.cwd),
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: Some(now),
+                    },
+                )
+                .await
+                .expect("persist discovered pane before testing watcher audit writes");
             let before = mock.get_text_with_cx(&cx, 42, false).await.unwrap();
             let mut config = Config::default();
             config.safety.rules.rules.push(PolicyRule {
