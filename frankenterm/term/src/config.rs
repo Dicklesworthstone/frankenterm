@@ -22,17 +22,16 @@ pub enum NewlineCanon {
 ///
 /// Mirrors `frankenterm_core::osc_protocol_integration::Osc52PolicySlug`
 /// without taking the cross-crate dependency. The terminal-state
-/// crate sees only the local enum; the GUI integration plumbs the
-/// substrate's typed-state pipeline above this layer.
+/// crate sees only the local enum. Native GUI configuration and
+/// approval-prompt integration remain follow-on work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Osc52WritePolicy {
     /// Permit OSC 52 clipboard writes (subject to the size cap from
     /// [`TerminalConfiguration::osc52_write_max_bytes`]).
     Allow,
-    /// Surface the request to the operator via the GUI prompt UI.
-    /// At the term-state layer (no UI surface) this is treated as
-    /// `Deny`; the GUI integration intercepts before this layer is
-    /// consulted.
+    /// Require operator approval before writing. The term-state
+    /// layer drops this request without changing the clipboard;
+    /// no native GUI approval prompt is wired yet.
     Prompt,
     /// Refuse the write. The operator-facing error path is silent
     /// — per the bead's privacy rule, denied requests do not log
@@ -1172,20 +1171,20 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     }
 
     /// Operator policy for OSC 52 clipboard write requests
-    /// (`\x1b]52;<sel>;<base64>\x1b\\`). Per ft-io922 (cont of
+    /// (`\x1b]52;<sel>;<base64>\x1b\\`) and selection clears.
+    /// Per ft-io922 (cont of
     /// ft-2okh0.1.5): until this trait method gained the gate, every
     /// OSC 52 SetSelection unconditionally rewrote the OS clipboard
     /// — a trust gap when shell output is attacker-influenced.
     ///
     /// Default `Allow` preserves the prior behavior so existing
     /// operator workflows (yank-via-osc52 in vim/tmux) keep working;
-    /// privacy-conservative deployments can override to `Prompt` or
-    /// `Deny`.
+    /// embeddings can override to `Prompt` or `Deny`. Native GUI
+    /// configuration does not yet expose this override.
     ///
     /// `Prompt` is treated as `Deny` at this layer because the
     /// terminal-state crate has no UI surface to ask the operator;
-    /// the GUI-layer integration (cont-bead) intercepts before this
-    /// method is consulted to display the prompt.
+    /// native GUI approval-prompt integration remains unwired.
     fn osc52_write_policy(&self) -> Osc52WritePolicy {
         Osc52WritePolicy::Allow
     }
@@ -1194,11 +1193,9 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// request is allowed to deliver before the policy gate
     /// auto-denies. Per ft-io922.
     ///
-    /// Default 1 MiB — comfortably above any human-typed clipboard
-    /// and any single-screen yank, well below the OS clipboard
-    /// stress-thresholds. The cap is enforced before the OS
-    /// clipboard is touched so a malicious source cannot use OSC 52
-    /// as a memory-amplification primitive.
+    /// Default 1 MiB. The cap is enforced after parser decoding and
+    /// before the OS clipboard is touched; it bounds the clipboard
+    /// write, not the parser's encoded or decoded allocation.
     fn osc52_write_max_bytes(&self) -> usize {
         1024 * 1024
     }

@@ -609,6 +609,7 @@ fn primary_device_attributes_do_not_advertise_selective_erase_without_support() 
 }
 
 mod osc52_policy {
+    use super::assert_eq;
     use super::*;
     use crate::config::Osc52WritePolicy;
 
