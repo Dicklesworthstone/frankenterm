@@ -107,17 +107,56 @@ fn executable_tx_contract() -> MissionTxContract {
     }
 }
 
-fn write_executable_tx_contract(w: &TempDir) -> (std::path::PathBuf, MissionTxContract) {
+fn store_data_tx_contract() -> MissionTxContract {
+    let tx_id = TxId("tx:steer-bound-store-e2e".to_string());
+    MissionTxContract {
+        tx_version: MISSION_TX_SCHEMA_VERSION,
+        intent: TxIntent {
+            tx_id: tx_id.clone(),
+            requested_by: MissionActorRole::Operator,
+            summary: "execute the durable store transaction bound to a steering receipt"
+                .to_string(),
+            correlation_id: "corr:steer-bound-store-e2e".to_string(),
+            created_at_ms: 1_700_000_000_000,
+        },
+        plan: TxPlan {
+            plan_id: TxPlanId("plan:steer-bound-store-e2e".to_string()),
+            tx_id,
+            steps: vec![TxStep {
+                step_id: TxStepId("tx-step:steer-store".to_string()),
+                ordinal: 1,
+                action: StepAction::StoreData {
+                    key: "steer-bound-store".to_string(),
+                    value: serde_json::json!({"committed": true}),
+                },
+                description: "store the admitted steering transaction result".to_string(),
+            }],
+            preconditions: Vec::new(),
+            compensations: Vec::new(),
+        },
+        lifecycle_state: MissionTxState::Planned,
+        outcome: TxOutcome::Pending,
+        receipts: Vec::new(),
+    }
+}
+
+fn write_tx_contract(
+    w: &TempDir,
+    contract: MissionTxContract,
+) -> (std::path::PathBuf, MissionTxContract) {
     let path = w.path().join(".ft/mission/tx-active.json");
     std::fs::create_dir_all(path.parent().expect("contract parent"))
         .expect("create contract parent");
-    let contract = executable_tx_contract();
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&contract).expect("serialize executable tx contract"),
     )
     .expect("write executable tx contract");
     (path, contract)
+}
+
+fn write_executable_tx_contract(w: &TempDir) -> (std::path::PathBuf, MissionTxContract) {
+    write_tx_contract(w, executable_tx_contract())
 }
 
 #[cfg(unix)]
@@ -667,8 +706,90 @@ fn steer_run_cli_only_backend_fails_closed_and_uses_workspace_global_ledger() {
     );
     assert_eq!(ledger.records().len(), 1);
     assert!(
-        matches!(&ledger.records()[0].outcome, StepOutcome::Failure { .. }),
+        matches!(&ledger.records()[0].outcome, StepOutcome::Failed { .. }),
         "the durable ledger must prove that the forbidden CLI SendText was not applied"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn steer_run_commits_durable_store_data_with_workspace_global_ledger() {
+    let w = workspace();
+    let (contract_path, contract) = write_tx_contract(&w, store_data_tx_contract());
+    let tx_hash = contract.compute_hash();
+    let receipt = persist_bound_receipt(&w, &contract);
+
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "run",
+                "--receipt",
+                &receipt.receipt_id,
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success(),
+    );
+    let response: serde_json::Value = serde_json::from_str(&out).expect("json steer response");
+    assert_eq!(response["valid"], serde_json::json!(true), "{out}");
+    assert_eq!(response["executed"], serde_json::json!(true), "{out}");
+    assert_eq!(
+        response["live_tx_hash"].as_str(),
+        Some(tx_hash.as_str()),
+        "{out}"
+    );
+    assert_eq!(response["tx"]["final_state"], "committed", "{out}");
+    assert_eq!(
+        response["tx"]["commit_report"]["outcome"], "fully_committed",
+        "{out}"
+    );
+
+    let stored: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(w.path().join(".ft/tx_data/steer-bound-store.json"))
+            .expect("read durable transaction data"),
+    )
+    .expect("durable transaction data JSON");
+    assert_eq!(stored, serde_json::json!({"committed": true}));
+
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&contract_path).expect("read committed steering contract"),
+    )
+    .expect("committed steering contract JSON");
+    assert_eq!(persisted["lifecycle_state"], "committed");
+    assert_eq!(persisted["outcome"], "committed");
+
+    let ledger_dir = w.path().join(".ft/tx_ledgers");
+    let ledger_paths = std::fs::read_dir(&ledger_dir)
+        .unwrap_or_else(|err| {
+            panic!(
+                "read workspace-global ledger spool {}: {err}",
+                ledger_dir.display()
+            )
+        })
+        .map(|entry| entry.expect("ledger directory entry").path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    assert_eq!(ledger_paths.len(), 1, "one run must retain one ledger");
+    assert!(
+        !w.path().join(".ft/mission/tx_ledgers").exists(),
+        "the ledger spool must remain workspace-global"
+    );
+    let ledger: TxExecutionLedger = serde_json::from_slice(
+        &std::fs::read(&ledger_paths[0]).expect("read durable steering ledger"),
+    )
+    .expect("deserialize durable steering ledger");
+    assert_eq!(ledger.plan_id(), "plan:steer-bound-store-e2e");
+    assert_eq!(ledger.phase(), TxPhase::Completed);
+    assert!(
+        ledger.verify_chain().chain_intact,
+        "ledger chain must verify"
+    );
+    assert_eq!(ledger.records().len(), 1);
+    assert!(
+        matches!(&ledger.records()[0].outcome, StepOutcome::Success { .. }),
+        "the durable ledger must prove StoreData success"
     );
 }
 
