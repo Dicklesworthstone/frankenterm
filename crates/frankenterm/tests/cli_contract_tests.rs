@@ -3377,12 +3377,9 @@ fn contract_mission_graph_cli_scores_change_actual_plan_and_refuse_invalid_snaps
             let restricted = run(restricted, true);
             assert_eq!(restricted["data"]["plan_status"], "waiting_owner");
             assert_eq!(restricted["data"]["side_effects_executed"], false);
+            let wrong_hash = "0".repeat(64);
             for invalid_version in [false, true] {
-                let mut invalid = graph_command(if invalid_version {
-                    &hash
-                } else {
-                    &"0".repeat(64)
-                });
+                let mut invalid = graph_command(if invalid_version { &hash } else { &wrong_hash });
                 if invalid_version {
                     invalid.args(["--beads-graph-version", "2"]);
                 }

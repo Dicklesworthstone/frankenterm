@@ -1,18 +1,17 @@
 //! Real wezterm-mux-server subprocess fixture for no-mocks integration tests.
 //!
 //! Spawns a hermetic `wezterm-mux-server` instance with:
-//! - A fresh `HOME` (TempDir) so the global pid lock at
+//! - A fresh retained `HOME` so the global pid lock at
 //!   `~/.local/share/wezterm/pid` from the user's interactive session
 //!   does NOT block test invocations.
 //! - A unix domain socket inside that TempDir.
 //! - A generated `frankenterm.toml` inside that TempDir so the subprocess has
 //!   a single, explicit config source.
-//! - A persistent `default_prog` loop so the default pane and spawned
+//! - A persistent `default_prog` so the default pane and spawned
 //!   default-program panes stay alive across follow-up `list_panes` calls.
-//! - A mux-server binary selected from the current ft build when available
-//!   (`FT_WEZTERM_MUX_SERVER`, Cargo's bin env, or the workspace target dir),
-//!   or built from this workspace before falling back to a system
-//!   `wezterm-mux-server`.
+//! - An explicit mux-server binary supplied by `FT_WEZTERM_MUX_SERVER` or
+//!   Cargo's binary environment. The invoking RCH/DSR lane binds that artifact
+//!   to its source; this fixture never builds or discovers a system binary.
 //!
 //! Returns a real `WeztermClient` configured `with_socket(...)` against the
 //! hermetic socket. When the vendored mux backend is available, the client is
@@ -26,7 +25,7 @@
 //! let fixture = WeztermSubprocessFixture::spawn().expect("spawn mux-server");
 //! let client = fixture.client();
 //! let panes = client.list_panes().await?;  // hits the real subprocess
-//! // fixture drops -> SIGTERM mux-server, remove tempdir
+//! // fixture drops -> stop owned mux-server; retain workspace and logs
 //! ```
 //!
 //! ## Skip semantics
@@ -40,8 +39,11 @@
 #![allow(dead_code)]
 
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use frankenterm_core::wezterm::WeztermClient;
@@ -60,6 +62,11 @@ pub fn should_run() -> bool {
 #[derive(Debug)]
 pub enum FixtureError {
     BinaryNotFound(String),
+    CapacityExhausted,
+    PollFailed(std::io::Error),
+    ShutdownIndeterminate {
+        pid: u32,
+    },
     ConfigSerialize(toml::ser::Error),
     SpawnFailed(std::io::Error),
     SocketTimeout {
@@ -81,6 +88,14 @@ impl std::fmt::Display for FixtureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BinaryNotFound(p) => write!(f, "wezterm-mux-server binary not found at {p}"),
+            Self::CapacityExhausted => write!(f, "owned mux fixture capacity exhausted"),
+            Self::PollFailed(error) => write!(f, "failed to observe owned mux process: {error}"),
+            Self::ShutdownIndeterminate { pid } => {
+                write!(
+                    f,
+                    "owned mux shutdown unconfirmed; retained child pid={pid}"
+                )
+            }
             Self::ConfigSerialize(e) => write!(f, "failed to serialize mux-server config: {e}"),
             Self::SpawnFailed(e) => write!(f, "failed to spawn wezterm-mux-server: {e}"),
             Self::SocketTimeout {
@@ -115,53 +130,111 @@ impl std::fmt::Display for FixtureError {
 
 impl std::error::Error for FixtureError {}
 
+// Includes unconfirmed shutdowns. Never silently drop a Child after a failed
+// reap, and never admit an unbounded number of unresolved fixture owners.
+static MUX_FIXTURE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static RETAINED_MUX_CHILDREN: Mutex<Vec<OwnedMuxChild>> = Mutex::new(Vec::new());
+
+struct MuxFixtureSlot;
+
+impl MuxFixtureSlot {
+    fn acquire() -> Result<Self, FixtureError> {
+        RETAINED_MUX_CHILDREN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain_mut(|owner| !matches!(owner.child.try_wait(), Ok(Some(_))));
+        MUX_FIXTURE_SLOTS
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < 16).then_some(active + 1)
+            })
+            .map_err(|_| FixtureError::CapacityExhausted)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MuxFixtureSlot {
+    fn drop(&mut self) {
+        MUX_FIXTURE_SLOTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct OwnedMuxChild {
+    child: Child,
+    _slot: MuxFixtureSlot,
+}
+
+fn settle_mux_child(mut owner: OwnedMuxChild) -> Result<(), FixtureError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    match owner.child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {
+            // Signal only a leader whose unreaped ownership was just observed.
+            // A signal error is not an exit receipt; continue bounded polling.
+            let _ = owner.child.kill();
+            while Instant::now() < deadline {
+                match owner.child.try_wait() {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    let pid = owner.child.id();
+    RETAINED_MUX_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(owner);
+    Err(FixtureError::ShutdownIndeterminate { pid })
+}
+
 /// Hermetic wezterm-mux-server subprocess.
 pub struct WeztermSubprocessFixture {
-    home_dir: TempDir,
+    home_dir: PathBuf,
     socket_path: PathBuf,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    child: Option<Child>,
+    child: Option<OwnedMuxChild>,
 }
 
 impl WeztermSubprocessFixture {
     /// Spawn a new wezterm-mux-server with a hermetic HOME and socket. Blocks
     /// until the socket file appears (≤ 30s) or returns an error.
     pub fn spawn() -> Result<Self, FixtureError> {
-        Self::spawn_with_default_prog(&["/bin/sh", "-c", "while :; do sleep 3600; done"])
+        Self::spawn_with_default_prog(&["/bin/cat"])
     }
 
     /// Spawn a new wezterm-mux-server with a caller-provided default program.
     /// This keeps no-mock tests on a real mux/PTY boundary while allowing
     /// scenarios to choose an interactive echo program such as `/bin/cat`.
     pub fn spawn_with_default_prog(default_prog: &[&str]) -> Result<Self, FixtureError> {
-        let bin = locate_explicit_mux_binary()
-            .or_else(locate_current_mux_binary)
-            .or_else(build_mux_binary)
-            .or_else(locate_system_mux_binary)
-            .ok_or_else(|| {
-                FixtureError::BinaryNotFound(
-                "wezterm-mux-server (FT_WEZTERM_MUX_SERVER, current target dir, PATH, or Homebrew)"
-                    .into(),
-            )
-            })?;
+        let bin = select_mux_binary(
+            std::env::var_os("FT_WEZTERM_MUX_SERVER").map(PathBuf::from),
+            std::env::var_os("CARGO_BIN_EXE_frankenterm-mux-server").map(PathBuf::from),
+        )?;
+        let metadata = fs::symlink_metadata(&bin)
+            .map_err(|_| FixtureError::BinaryNotFound(bin.display().to_string()))?;
+        if !metadata.file_type().is_file() {
+            return Err(FixtureError::BinaryNotFound(bin.display().to_string()));
+        }
 
-        let home = TempDir::new().map_err(FixtureError::TempDir)?;
-        let socket_path = home.path().join("mux.sock");
-        let stdout_path = home.path().join("mux-server.stdout.log");
-        let stderr_path = home.path().join("mux-server.stderr.log");
-        let config_path = home.path().join("frankenterm.toml");
+        let slot = MuxFixtureSlot::acquire()?;
+        let home = TempDir::new().map_err(FixtureError::TempDir)?.keep();
+        let socket_path = home.join("mux.sock");
+        let stdout_path = home.join("mux-server.stdout.log");
+        let stderr_path = home.join("mux-server.stderr.log");
+        let config_path = home.join("frankenterm.toml");
         let config_toml = mux_server_config_toml(&socket_path, default_prog)?;
         fs::write(&config_path, config_toml).map_err(FixtureError::SpawnFailed)?;
 
         let mut cmd = Command::new(&bin);
-        cmd.env("HOME", home.path())
-            .env("XDG_RUNTIME_DIR", home.path())
-            // Strip env vars that would inadvertently target the user's
-            // interactive session.
-            .env_remove("WEZTERM_UNIX_SOCKET")
-            .env_remove("FRANKENTERM_UNIX_SOCKET")
-            .env_remove("WEZTERM_PANE")
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .current_dir(&home)
             .arg("--config-file")
             .arg(&config_path)
             .stdout(Stdio::from(
@@ -174,23 +247,25 @@ impl WeztermSubprocessFixture {
             cmd.arg("--").args(default_prog);
         }
 
-        let mut child = cmd.spawn().map_err(FixtureError::SpawnFailed)?;
+        let child = cmd.spawn().map_err(FixtureError::SpawnFailed)?;
+        let mut fixture = Self {
+            home_dir: home,
+            socket_path: socket_path.clone(),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            child: Some(OwnedMuxChild { child, _slot: slot }),
+        };
 
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if socket_path.exists() {
-                // mux-server creates the socket on bind, but we briefly wait
-                // for it to start accepting connections.
-                std::thread::sleep(Duration::from_millis(75));
-                return Ok(Self {
-                    home_dir: home,
-                    socket_path,
-                    stdout_path,
-                    stderr_path,
-                    child: Some(child),
-                });
-            }
-            if let Ok(Some(status)) = child.try_wait() {
+            let status = fixture
+                .child
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .map_err(FixtureError::PollFailed)?;
+            if let Some(status) = status {
                 let (stdout, stderr) = read_child_output(&stdout_path, &stderr_path);
                 return Err(FixtureError::EarlyExit {
                     binary: bin.clone(),
@@ -199,9 +274,12 @@ impl WeztermSubprocessFixture {
                     stderr,
                 });
             }
+            if socket_path.exists() {
+                // The caller must still perform a real protocol request;
+                // socket publication alone is not mux readiness evidence.
+                return Ok(fixture);
+            }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
                 let (stdout, stderr) = read_child_output(&stdout_path, &stderr_path);
                 return Err(FixtureError::SocketTimeout {
                     binary: bin.clone(),
@@ -237,7 +315,7 @@ impl WeztermSubprocessFixture {
     /// Path to the hermetic HOME directory (for tests that need to plant
     /// additional state there, e.g. wezterm config overrides).
     pub fn home_dir(&self) -> &Path {
-        self.home_dir.path()
+        &self.home_dir
     }
 
     /// Construct a real `WeztermClient` pointed at the hermetic socket.
@@ -272,28 +350,28 @@ impl WeztermSubprocessFixture {
     /// Process id of the running mux-server (for fault-injection tests in
     /// ft-2funa: kill -SIGSTOP, etc.).
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(|c| c.id())
+        self.child.as_ref().map(|owner| owner.child.id())
     }
 
     /// **Fault-injection helper (ft-2funa).** Kills the mux subprocess
     /// without dropping the fixture, leaving the socket file present but
     /// dead. Subsequent `WeztermClient` calls hit the strict-socket guard
     /// (ft-dvgzi.1.1) and return `Wezterm(NotRunning)` /
-    /// `Wezterm(CommandFailed("failed to connect"))`. The TempDir + socket
-    /// path are still cleaned up on Drop.
+    /// `Wezterm(CommandFailed("failed to connect"))`. The workspace, socket
+    /// and logs remain available for inspection after Drop.
     pub fn kill_mux(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(owner) = self.child.take() {
+            settle_mux_child(owner).expect("owned mux must settle before fixture proof succeeds");
         }
     }
 }
 
 impl Drop for WeztermSubprocessFixture {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(owner) = self.child.take() {
+            if let Err(error) = settle_mux_child(owner) {
+                eprintln!("MUX_FIXTURE_SETTLEMENT status=indeterminate error={error}");
+            }
         }
         if std::thread::panicking() {
             let (stdout, stderr) = read_child_output(&self.stdout_path, &self.stderr_path);
@@ -303,7 +381,7 @@ impl Drop for WeztermSubprocessFixture {
                 format_child_output(&stderr)
             );
         }
-        // home_dir TempDir's Drop removes the temp directory automatically.
+        // Retain the owned directory and logs even on success.
     }
 }
 
@@ -340,8 +418,22 @@ fn read_child_output(stdout_path: &Path, stderr_path: &Path) -> (String, String)
 }
 
 fn read_log_file(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|err| format!("<failed to read {}: {err}>", path.display()))
+    const LIMIT: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    let result =
+        File::open(path).and_then(|file| file.take((LIMIT + 1) as u64).read_to_end(&mut bytes));
+    match result {
+        Ok(_) => {
+            let truncated = bytes.len() > LIMIT;
+            bytes.truncate(LIMIT);
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            if truncated {
+                text.push_str("\n<remaining log bytes retained on disk>");
+            }
+            text
+        }
+        Err(err) => format!("<failed to read {}: {err}>", path.display()),
+    }
 }
 
 fn format_child_output(output: &str) -> String {
@@ -353,152 +445,15 @@ fn format_child_output(output: &str) -> String {
     }
 }
 
-fn locate_current_mux_binary() -> Option<PathBuf> {
-    let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    mux_binary_candidates_from(None, None, cargo_target_dir, &manifest_dir)
-        .into_iter()
-        .find(|candidate| candidate.exists())
-}
-
-fn locate_explicit_mux_binary() -> Option<PathBuf> {
-    let explicit = std::env::var_os("FT_WEZTERM_MUX_SERVER").map(PathBuf::from);
-    let cargo_bin = std::env::var_os("CARGO_BIN_EXE_frankenterm-mux-server").map(PathBuf::from);
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    mux_binary_candidates_from(explicit, cargo_bin, None, &manifest_dir)
-        .into_iter()
-        .find(|candidate| candidate.exists())
-}
-
-fn locate_system_mux_binary() -> Option<PathBuf> {
-    // Try $PATH via `which`-style probe after ft-built candidates. A system
-    // wezterm-mux-server may speak a different binary codec than this checkout.
-    if let Ok(output) = Command::new("/usr/bin/which")
-        .arg("wezterm-mux-server")
-        .output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-
-    let homebrew = PathBuf::from("/opt/homebrew/bin/wezterm-mux-server");
-    if homebrew.exists() {
-        return Some(homebrew);
-    }
-    let usr_local = PathBuf::from("/usr/local/bin/wezterm-mux-server");
-    if usr_local.exists() {
-        return Some(usr_local);
-    }
-    None
-}
-
-fn build_mux_binary() -> Option<PathBuf> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().and_then(Path::parent)?;
-    let cargo = std::env::var_os("CARGO")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("cargo"));
-    let timeout = mux_fixture_build_timeout();
-
-    eprintln!("building frankenterm-mux-server for real mux fixture");
-    let mut child = Command::new(cargo)
-        .current_dir(workspace_root)
-        .arg("build")
-        .arg("-p")
-        .arg("frankenterm-mux-server")
-        .spawn()
-        .ok()?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            Ok(None) => {
-                eprintln!(
-                    "timed out building frankenterm-mux-server for real mux fixture after {}s",
-                    timeout.as_secs()
-                );
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(err) => {
-                eprintln!("failed to poll frankenterm-mux-server fixture build: {err}");
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-
-    mux_binary_candidates()
-        .into_iter()
-        .find(|candidate| candidate.exists())
-}
-
-fn mux_fixture_build_timeout() -> Duration {
-    std::env::var("FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(900))
-}
-
-fn mux_binary_candidates() -> Vec<PathBuf> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let explicit = std::env::var_os("FT_WEZTERM_MUX_SERVER").map(PathBuf::from);
-    let cargo_bin = std::env::var_os("CARGO_BIN_EXE_frankenterm-mux-server").map(PathBuf::from);
-    let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-    mux_binary_candidates_from(explicit, cargo_bin, cargo_target_dir, manifest_dir)
-}
-
-fn mux_binary_candidates_from(
+fn select_mux_binary(
     explicit: Option<PathBuf>,
     cargo_bin: Option<PathBuf>,
-    cargo_target_dir: Option<PathBuf>,
-    manifest_dir: &Path,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let workspace_root = manifest_dir.parent().and_then(Path::parent);
-
-    if let Some(path) = explicit.filter(|path| !path.as_os_str().is_empty()) {
-        candidates.push(path);
-    }
-    if let Some(path) = cargo_bin.filter(|path| !path.as_os_str().is_empty()) {
-        candidates.push(path);
-    }
-    if let Some(target_dir) = cargo_target_dir.filter(|path| !path.as_os_str().is_empty()) {
-        let target_dir = if target_dir.is_absolute() {
-            target_dir
-        } else if let Some(workspace_root) = workspace_root {
-            workspace_root.join(target_dir)
-        } else {
-            target_dir
-        };
-        candidates.push(target_dir.join("debug").join("frankenterm-mux-server"));
-    }
-    if let Some(workspace_root) = workspace_root {
-        candidates.push(
-            workspace_root
-                .join("target")
-                .join("debug")
-                .join("frankenterm-mux-server"),
-        );
-    }
-
-    candidates
+) -> Result<PathBuf, FixtureError> {
+    explicit.or(cargo_bin).filter(|path| path.is_absolute()).ok_or_else(|| {
+        FixtureError::BinaryNotFound(
+            "supply an absolute FT_WEZTERM_MUX_SERVER or Cargo binary path from the qualified RCH/DSR build".to_string(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -506,39 +461,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mux_binary_candidates_prefer_ft_built_binary_before_workspace_target() {
-        let manifest_dir = Path::new("/repo/crates/frankenterm-core");
-        let candidates = mux_binary_candidates_from(
+    fn mux_binary_selection_uses_explicit_artifact_without_discovery() {
+        let selected = select_mux_binary(
             Some(PathBuf::from("/tmp/explicit/frankenterm-mux-server")),
             Some(PathBuf::from("/tmp/cargo-bin/frankenterm-mux-server")),
-            Some(PathBuf::from("/tmp/target")),
-            manifest_dir,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/tmp/explicit/frankenterm-mux-server"),
-                PathBuf::from("/tmp/cargo-bin/frankenterm-mux-server"),
-                PathBuf::from("/tmp/target/debug/frankenterm-mux-server"),
-                PathBuf::from("/repo/target/debug/frankenterm-mux-server"),
-            ]
+            selected,
+            PathBuf::from("/tmp/explicit/frankenterm-mux-server")
         );
     }
 
     #[test]
-    fn mux_binary_candidates_resolve_relative_cargo_target_dir_from_workspace_root() {
-        let manifest_dir = Path::new("/repo/crates/frankenterm-core");
-        let candidates = mux_binary_candidates_from(
+    fn mux_binary_selection_refuses_missing_relative_and_empty_authority() {
+        assert!(select_mux_binary(None, None).is_err());
+        for path in [
+            PathBuf::new(),
+            PathBuf::from("target/debug/frankenterm-mux-server"),
+        ] {
+            assert!(
+                select_mux_binary(
+                    Some(path),
+                    Some(PathBuf::from("/tmp/alternate/frankenterm-mux-server")),
+                )
+                .is_err()
+            );
+        }
+        let selected = select_mux_binary(
             None,
-            None,
-            Some(PathBuf::from("target/local-mux-proof")),
-            manifest_dir,
-        );
-
+            Some(PathBuf::from("/tmp/cargo-bin/frankenterm-mux-server")),
+        )
+        .unwrap();
         assert_eq!(
-            candidates[0],
-            PathBuf::from("/repo/target/local-mux-proof/debug/frankenterm-mux-server"),
+            selected,
+            PathBuf::from("/tmp/cargo-bin/frankenterm-mux-server"),
         );
+    }
+
+    #[test]
+    fn owned_mux_child_settlement_reaps_a_real_blocked_process() {
+        let slot = MuxFixtureSlot::acquire().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        let pid = child.id();
+        let started = Instant::now();
+        settle_mux_child(OwnedMuxChild { child, _slot: slot }).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(6));
+        println!("MUX_FIXTURE_SETTLEMENT pid={pid} blocked_stdin=true leader_reaped=true");
+    }
+
+    #[test]
+    fn mux_log_snapshot_is_bounded_and_retains_the_complete_file() {
+        let root = TempDir::new().unwrap().keep();
+        let path = root.join("owned-log");
+        let bytes = vec![b'x'; 128 * 1024];
+        fs::write(&path, &bytes).unwrap();
+        let snapshot = read_log_file(&path);
+        assert!(snapshot.len() < 65 * 1024);
+        assert!(snapshot.ends_with("<remaining log bytes retained on disk>"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 }

@@ -277,11 +277,12 @@ fn read_or_update_golden(path: &Path, actual: &str) -> String {
     }
 
     fs::read_to_string(path).unwrap_or_else(|err| {
+        let actual_path = path.with_extension("actual.json");
+        fs::write(&actual_path, actual).expect("retain actual contract for manual review");
         panic!(
-            "missing MCP mission TOON conformance golden at {}: {err}. Regenerate with:\n  \
-             UPDATE_GOLDEN=1 cargo test -p frankenterm-core --test wa_mission_toon_mcp_conformance \
-             --features mcp,asupersync-runtime",
-            path.display()
+            "missing MCP mission TOON conformance golden at {}: {err}. Review actual contract at {} before adding the expected artifact.",
+            path.display(),
+            actual_path.display()
         )
     })
 }
