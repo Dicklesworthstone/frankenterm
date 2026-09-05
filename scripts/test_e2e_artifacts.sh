@@ -256,13 +256,8 @@ main() {
     jq '.' "$run_dir/manifest.json"
     echo ""
 
-    # Cleanup
-    if [[ "${E2E_ARTIFACTS_CLEANUP:-1}" == "1" ]]; then
-        info "Cleaning up test artifacts..."
-        rm -rf "$E2E_ARTIFACTS_BASE"
-    else
-        info "Preserving test artifacts: $E2E_ARTIFACTS_BASE"
-    fi
+    # Test evidence is retained regardless of the result or cleanup flags.
+    info "Preserving test artifacts: $E2E_ARTIFACTS_BASE"
 
     echo ""
     echo -e "${GREEN}All tests passed!${NC}"

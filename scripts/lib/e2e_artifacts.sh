@@ -784,7 +784,31 @@ e2e_capture_scenario() {
     end_ms=$(_e2e_time_ms)
     local duration_ms=$((end_ms - start_ms))
 
-    # Write metadata
+    # Redaction failure is a failed capture even when the scenario itself
+    # passed. Do not depend on errexit: callers commonly invoke us with ||.
+    local redaction_status="disabled"
+    local captured_file
+    if [[ "$E2E_REDACT_SECRETS" == "true" ]]; then
+        redaction_status="passed"
+        for captured_file in "$stdout_file" "$stderr_file" "$combined_file"; do
+            if ! e2e_redact_secrets "$captured_file"; then
+                redaction_status="failed"
+                if [[ "$exit_code" -eq 0 ]]; then
+                    exit_code=1
+                fi
+            fi
+        done
+    fi
+
+    for captured_file in "$stdout_file" "$stderr_file" "$combined_file"; do
+        if ! e2e_limit_size "$captured_file" "$E2E_MAX_FILE_SIZE"; then
+            if [[ "$exit_code" -eq 0 ]]; then
+                exit_code=1
+            fi
+        fi
+    done
+
+    # Write metadata after sanitization so a failure cannot claim success.
     echo "$exit_code" > "$exit_code_file"
     echo "$duration_ms" > "$duration_file"
 
@@ -794,6 +818,7 @@ e2e_capture_scenario() {
   "started_at": "$(_e2e_timestamp)",
   "duration_ms": $duration_ms,
   "exit_code": $exit_code,
+  "redaction_status": "$redaction_status",
   "command": $(printf '%s\n' "${cmd[@]}" | jq -R . | jq -s .),
   "files": {
     "stdout": "stdout.log",
@@ -802,18 +827,6 @@ e2e_capture_scenario() {
   }
 }
 EOF
-
-    # Apply redaction if enabled
-    if [[ "$E2E_REDACT_SECRETS" == "true" ]]; then
-        e2e_redact_secrets "$stdout_file"
-        e2e_redact_secrets "$stderr_file"
-        e2e_redact_secrets "$combined_file"
-    fi
-
-    # Apply size limits
-    e2e_limit_size "$stdout_file" "$E2E_MAX_FILE_SIZE"
-    e2e_limit_size "$stderr_file" "$E2E_MAX_FILE_SIZE"
-    e2e_limit_size "$combined_file" "$E2E_MAX_FILE_SIZE"
 
     # Track results
     if [[ $exit_code -eq 0 ]]; then
@@ -865,9 +878,9 @@ e2e_add_file() {
 
     # Apply redaction and size limit
     if [[ "$E2E_REDACT_SECRETS" == "true" ]]; then
-        e2e_redact_secrets "$file_path"
+        e2e_redact_secrets "$file_path" || return $?
     fi
-    e2e_limit_size "$file_path" "$E2E_MAX_FILE_SIZE"
+    e2e_limit_size "$file_path" "$E2E_MAX_FILE_SIZE" || return $?
 
     _e2e_debug "Added file: $file_path"
 }
@@ -895,12 +908,14 @@ e2e_add_json() {
         # If invalid JSON, save as-is with warning
         echo "$content" > "$file_path"
         _e2e_warn "Invalid JSON content saved to: $file_path"
+        return 1
     fi
 
     # Apply redaction
     if [[ "$E2E_REDACT_SECRETS" == "true" ]]; then
-        e2e_redact_secrets "$file_path"
+        e2e_redact_secrets "$file_path" || return $?
     fi
+    e2e_limit_size "$file_path" "$E2E_MAX_FILE_SIZE" || return $?
 }
 
 # Copy existing file(s) to artifacts
@@ -916,22 +931,61 @@ e2e_copy_file() {
         target_dir="$E2E_RUN_DIR"
     fi
 
-    if [[ -f "$source" ]]; then
-        cp "$source" "$target_dir/$dest_name"
+    if [[ -L "$source" || -L "$target_dir/$dest_name" ]]; then
+        _e2e_error "Artifact copy refuses symlinks"
+        return 1
+    elif [[ -f "$source" ]]; then
+        cp "$source" "$target_dir/$dest_name" || return $?
 
         if [[ "$E2E_REDACT_SECRETS" == "true" ]]; then
-            e2e_redact_secrets "$target_dir/$dest_name"
+            e2e_redact_secrets "$target_dir/$dest_name" || return $?
         fi
-        e2e_limit_size "$target_dir/$dest_name" "$E2E_MAX_FILE_SIZE"
+        e2e_limit_size "$target_dir/$dest_name" "$E2E_MAX_FILE_SIZE" || return $?
 
         _e2e_debug "Copied file: $source -> $target_dir/$dest_name"
     elif [[ -d "$source" ]]; then
-        cp -r "$source" "$target_dir/$dest_name"
+        local unsafe_entries
+        if ! unsafe_entries=$(find -P "$source" ! -type d ! -type f -print 2>/dev/null); then
+            _e2e_error "Artifact copy could not validate directory entries"
+            return 1
+        fi
+        if [[ -n "$unsafe_entries" || -e "$target_dir/$dest_name" ]]; then
+            _e2e_error "Artifact copy requires regular entries and a new destination tree"
+            return 1
+        fi
+        cp -RP "$source" "$target_dir/$dest_name" || return $?
+        _e2e_sanitize_copied_tree "$target_dir/$dest_name" || return $?
         _e2e_debug "Copied directory: $source -> $target_dir/$dest_name"
     else
         _e2e_warn "Source not found: $source"
         return 1
     fi
+}
+
+_e2e_sanitize_copied_tree() {
+    local directory="$1"
+    local entry
+    if [[ ! -r "$directory" || ! -x "$directory" ]]; then
+        _e2e_error "Artifact copy cannot read the copied directory"
+        return 1
+    fi
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        if [[ -L "$entry" ]]; then
+            _e2e_error "Artifact copy refuses symlinks"
+            return 1
+        elif [[ -d "$entry" ]]; then
+            _e2e_sanitize_copied_tree "$entry" || return $?
+        elif [[ -f "$entry" ]]; then
+            if [[ "$E2E_REDACT_SECRETS" == "true" ]]; then
+                e2e_redact_secrets "$entry" || return $?
+            fi
+            e2e_limit_size "$entry" "$E2E_MAX_FILE_SIZE" || return $?
+        else
+            _e2e_error "Artifact copy refuses special files"
+            return 1
+        fi
+    done
 }
 
 # ==============================================================================
@@ -954,11 +1008,9 @@ e2e_redact_secrets() {
 $E2E_REDACT_PATTERNS"
     fi
 
-    local temp_file
-    temp_file=$(mktemp)
+    local temp_file=""
+    local match_file="$file"
     local redaction_count=0
-
-    cp "$file" "$temp_file"
 
     # Apply each pattern
     while IFS= read -r pattern; do
@@ -969,31 +1021,63 @@ $E2E_REDACT_PATTERNS"
 
         # Count matches before redaction
         local matches
-        matches=$(grep -cE "$pattern" "$temp_file" 2>/dev/null || true)
-        # Ensure matches is a valid integer (handle empty, whitespace, or multi-line)
-        matches="${matches%%[^0-9]*}"
-        matches="${matches:-0}"
+        local match_status=0
+        if [[ "$file" == *.json ]]; then
+            # Inspect decoded strings, including escaped credentials. Keys
+            # cannot be rewritten without risking collisions and data loss.
+            matches=$(jq -r --arg pattern "$pattern" '
+                if any(.. | objects | keys[]; test($pattern)) then
+                    error("matching_object_key")
+                else
+                    [.. | strings | select(test($pattern))] | length
+                end
+            ' "$match_file" 2>/dev/null) || match_status=2
+        else
+            matches=$(grep -acE -- "$pattern" "$match_file" 2>/dev/null) || match_status=$?
+        fi
+        if [[ "$match_status" -gt 1 || ! "$matches" =~ ^[0-9]+$ ]]; then
+            _e2e_error "Artifact redaction pattern scan failed"
+            return 1
+        fi
 
         if [[ "$matches" -gt 0 ]]; then
+            # A no-match file needs no disposable copy. For real redaction,
+            # retain the existing staged replacement behavior and permissions.
+            if [[ -z "$temp_file" ]]; then
+                temp_file=$(mktemp) || return 1
+                cp "$file" "$temp_file" || return $?
+                match_file="$temp_file"
+            fi
             # Redact pattern, preserving structure
-            if command -v perl &>/dev/null; then
-                perl -pi -e "s/$pattern/[REDACTED]/g" "$temp_file" 2>/dev/null || true
+            if [[ "$file" == *.json ]]; then
+                local json_stage
+                json_stage=$(mktemp) || return 1
+                if ! jq --arg pattern "$pattern" \
+                    'walk(if type == "string" then gsub($pattern; "[REDACTED]") else . end)' \
+                    "$temp_file" > "$json_stage" 2>/dev/null; then
+                    _e2e_error "JSON artifact redaction failed"
+                    return 1
+                fi
+                mv "$json_stage" "$temp_file" || return $?
+            elif command -v perl &>/dev/null; then
+                if ! FT_E2E_REDACT_PATTERN="$pattern" perl -pi -e \
+                    's/$ENV{FT_E2E_REDACT_PATTERN}/[REDACTED]/g' "$temp_file" 2>/dev/null; then
+                    _e2e_error "Redaction failed; retained input and staging file: $temp_file"
+                    return 1
+                fi
             else
-                sed -i -E "s/$pattern/[REDACTED]/g" "$temp_file" 2>/dev/null || true
+                # Never report successful sanitization without an admitted
+                # engine. In particular, sed -i differs between macOS/Linux.
+                _e2e_error "Redaction requires perl; retained input and staging file: $temp_file"
+                return 1
             fi
             redaction_count=$((redaction_count + matches))
         fi
     done <<< "$patterns"
 
     if [[ $redaction_count -gt 0 ]]; then
-        mv "$temp_file" "$file"
+        mv "$temp_file" "$file" || return $?
         _e2e_debug "Redacted $redaction_count sensitive patterns in: $file"
-
-        # Add redaction notice to file
-        echo "" >> "$file"
-        echo "# [e2e_artifacts] $redaction_count sensitive pattern(s) redacted" >> "$file"
-    else
-        rm -f "$temp_file"
     fi
 }
 
@@ -1003,7 +1087,7 @@ e2e_add_redact_pattern() {
     local pattern="$1"
     E2E_REDACT_PATTERNS="${E2E_REDACT_PATTERNS}
 $pattern"
-    _e2e_debug "Added redaction pattern: $pattern"
+    _e2e_debug "Added custom redaction pattern"
 }
 
 # ==============================================================================
@@ -1016,22 +1100,38 @@ e2e_limit_size() {
     local file="$1"
     local max_bytes="$2"
 
+    if [[ ! "$max_bytes" =~ ^[0-9]+$ ]]; then
+        _e2e_error "Invalid artifact size limit"
+        return 1
+    fi
+
     if [[ ! -f "$file" ]]; then
         return 0
     fi
 
     local file_size
-    file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    if ! file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null); then
+        _e2e_error "Artifact size inspection failed"
+        return 1
+    fi
+    if [[ ! "$file_size" =~ ^[0-9]+$ ]]; then
+        _e2e_error "Artifact size inspection returned an invalid size"
+        return 1
+    fi
 
     if [[ $file_size -gt $max_bytes ]]; then
+        if [[ "$file" == *.json || "$max_bytes" -le 1024 ]]; then
+            _e2e_error "Artifact cannot be truncated safely under the requested limit; retained input"
+            return 1
+        fi
         local keep_bytes=$((max_bytes - 1024))  # Reserve 1KB for truncation notice
 
         # Create truncated version
         local temp_file
-        temp_file=$(mktemp)
+        temp_file=$(mktemp) || return 1
 
         # Keep first portion
-        head -c "$((keep_bytes / 2))" "$file" > "$temp_file"
+        head -c "$((keep_bytes / 2))" "$file" > "$temp_file" || return $?
 
         # Add truncation notice
         cat >> "$temp_file" <<EOF
@@ -1045,9 +1145,9 @@ Truncated: $((file_size - max_bytes + 1024)) bytes removed
 EOF
 
         # Keep last portion
-        tail -c "$((keep_bytes / 2))" "$file" >> "$temp_file"
+        tail -c "$((keep_bytes / 2))" "$file" >> "$temp_file" || return $?
 
-        mv "$temp_file" "$file"
+        mv "$temp_file" "$file" || return $?
         _e2e_warn "Truncated oversized file: $file ($file_size -> $max_bytes bytes)"
     fi
 }
@@ -1325,42 +1425,8 @@ e2e_get_scenario_dir() {
 }
 
 # ==============================================================================
-# CI Integration Helpers
+# Proof Integration Helpers
 # ==============================================================================
-
-# Generate GitHub Actions step summary
-# Usage: e2e_github_summary
-e2e_github_summary() {
-    if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
-        return 0
-    fi
-
-    cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-
-## E2E Test Results
-
-| Metric | Value |
-|--------|-------|
-| **Total** | ${#E2E_SCENARIOS[@]} |
-| **Passed** | $E2E_PASSED |
-| **Failed** | $E2E_FAILED |
-
-### Scenarios
-
-EOF
-
-    for entry in "${E2E_SCENARIOS[@]}"; do
-        IFS=':' read -r name exit_code duration <<< "$entry"
-        local icon="✅"
-        [[ $exit_code -ne 0 ]] && icon="❌"
-        echo "- $icon **$name** (${duration}ms)" >> "$GITHUB_STEP_SUMMARY"
-    done
-
-    if [[ -n "$E2E_RUN_DIR" ]]; then
-        echo "" >> "$GITHUB_STEP_SUMMARY"
-        echo "> Artifacts: \`$E2E_RUN_DIR\`" >> "$GITHUB_STEP_SUMMARY"
-    fi
-}
 
 # Generate JSON output for CI parsing
 # Usage: e2e_ci_output > results.json
@@ -1388,5 +1454,4 @@ export -f e2e_finalize
 export -f e2e_run_test
 export -f e2e_get_artifacts_dir
 export -f e2e_get_scenario_dir
-export -f e2e_github_summary
 export -f e2e_ci_output

@@ -45,7 +45,7 @@ fi
 # ==============================================================================
 
 VERBOSE=false
-KEEP_ARTIFACTS=false
+KEEP_ARTIFACTS=true
 ARTIFACTS_DIR=""
 TIMEOUT="$DEFAULT_TIMEOUT"
 SCENARIO_RETRIES=0
@@ -144,7 +144,7 @@ Usage: $0 [OPTIONS] [SCENARIO...]
 
 Options:
     -v, --verbose         Enable verbose output (debug-level logs)
-    --keep-artifacts      Always keep artifacts (even on success)
+    --keep-artifacts      Retain artifacts (always enabled, including on success)
     --artifacts-dir DIR   Override artifacts directory
     --timeout SECS        Global timeout per scenario (default: $DEFAULT_TIMEOUT)
     --retries N           Retry each scenario up to N times on failure (default: 0)
@@ -180,7 +180,7 @@ Exit Codes:
     5 - Prerequisites missing
 
 Environment Variables:
-    FT_E2E_KEEP_ARTIFACTS  Always keep artifacts (1)
+    FT_E2E_KEEP_ARTIFACTS  Retention is always enabled, regardless of this value
     FT_E2E_TIMEOUT         Override timeout (seconds)
     FT_E2E_RETRIES         Retry count override (integer)
     FT_E2E_SEED            Deterministic run seed override
@@ -407,9 +407,10 @@ run_self_check() {
 
     # Check 4: Artifacts directory writable
     local test_artifacts="${ARTIFACTS_DIR:-$DEFAULT_ARTIFACTS_BASE}"
-    if mkdir -p "$test_artifacts" 2>/dev/null && touch "$test_artifacts/.write-test" 2>/dev/null; then
-        rm -f "$test_artifacts/.write-test"
-        check_pass "Artifacts directory: writable ($test_artifacts)"
+    local write_probe=""
+    if mkdir -p "$test_artifacts" 2>/dev/null && \
+        write_probe=$(mktemp "$test_artifacts/.write-test.XXXXXX" 2>/dev/null); then
+        check_pass "Artifacts directory: writable (retained probe: $write_probe)"
     else
         check_fail "Artifacts directory not writable: $test_artifacts"
         all_passed=false
@@ -1961,12 +1962,17 @@ EOF
 }
 
 cleanup_artifacts() {
-    if [[ "$KEEP_ARTIFACTS" == "false" && "$FAILED" -eq 0 ]]; then
-        log_verbose "Cleaning up artifacts (all tests passed)"
-        rm -rf "$RUN_ARTIFACTS_DIR"
-    else
-        log_info "Artifacts saved to: $RUN_ARTIFACTS_DIR"
-    fi
+    # Repository policy requires retaining evidence on every outcome.
+    log_info "Artifacts saved to: $RUN_ARTIFACTS_DIR"
+}
+
+retain_workspace_artifacts() {
+    local artifact_path
+    for artifact_path in "$@"; do
+        if [[ -n "$artifact_path" ]]; then
+            log_info "Workspace artifacts retained at: $artifact_path"
+        fi
+    done
 }
 
 write_summary() {
@@ -2567,7 +2573,7 @@ run_scenario_capture_search() {
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_capture_search EXIT
 
@@ -2691,7 +2697,7 @@ run_scenario_search_linting_rebuild() {
     cleanup_search_linting_rebuild() {
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
-            rm -rf "$temp_workspace"
+            retain_workspace_artifacts "$temp_workspace"
         fi
     }
     trap cleanup_search_linting_rebuild EXIT
@@ -2770,7 +2776,7 @@ run_scenario_natural_language() {
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_natural_language EXIT
 
@@ -2911,7 +2917,7 @@ run_scenario_compaction_workflow() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_compaction_workflow EXIT
 
@@ -3078,7 +3084,7 @@ run_scenario_unhandled_event_lifecycle() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_unhandled_event_lifecycle EXIT
 
@@ -3344,7 +3350,7 @@ run_scenario_usage_limit_safe_pause() {
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/caut_invocations.log" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_usage_limit_safe_pause EXIT
 
@@ -3709,7 +3715,7 @@ run_scenario_notification_webhook() {
             cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_notification_webhook EXIT
 
@@ -4268,7 +4274,7 @@ run_scenario_watch_notify_only() {
             cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_watch_notify_only EXIT
 
@@ -4819,7 +4825,7 @@ run_scenario_policy_denial() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_policy_denial EXIT
 
@@ -5006,7 +5012,7 @@ run_scenario_audit_tail_streaming() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_audit_tail EXIT
 
@@ -5183,7 +5189,7 @@ EOF
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_ipc_rpc_roundtrip EXIT
 
@@ -5378,7 +5384,7 @@ EOF
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_prepare_commit_approvals EXIT
 
@@ -5573,7 +5579,7 @@ run_scenario_quickfix_suggestions() {
         else
             unset FT_CONFIG
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_quickfix_suggestions EXIT
 
@@ -5927,7 +5933,7 @@ run_scenario_triage_multi_issue() {
         else
             unset FT_CONFIG
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_triage_multi_issue EXIT
 
@@ -6267,7 +6273,7 @@ run_scenario_stress_scale() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_stress_scale EXIT
 
@@ -6562,7 +6568,7 @@ run_scenario_graceful_shutdown() {
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.ft"/* "${scenario_dir:-/dev/null}/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_graceful_shutdown EXIT
 
@@ -6812,7 +6818,7 @@ run_scenario_pane_exclude_filter() {
             cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_pane_exclude_filter EXIT
 
@@ -7052,11 +7058,7 @@ run_scenario_workspace_isolation() {
             cp -r "$workspace_b/.ft"/* "$scenario_dir/workspace_b/" 2>/dev/null || true
         fi
 
-        if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
-            log_warn "Preserving temp workspaces (FT_E2E_PRESERVE_TEMP=1)"
-        else
-            rm -rf "${workspace_a:-}" "${workspace_b:-}"
-        fi
+        retain_workspace_artifacts "${workspace_a:-}" "${workspace_b:-}"
     }
     trap cleanup_workspace_isolation EXIT
 
@@ -7328,11 +7330,7 @@ EOF
         if [[ -d "${temp_home:-}" ]]; then
             cp -r "$temp_home" "$scenario_dir/temp_home_snapshot" 2>/dev/null || true
         fi
-        if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
-            log_warn "Preserving temp home (FT_E2E_PRESERVE_TEMP=1)"
-        else
-            rm -rf "${temp_home:-}"
-        fi
+        retain_workspace_artifacts "${temp_home:-}"
     }
     trap cleanup_setup_idempotency EXIT
 
@@ -7559,7 +7557,7 @@ run_scenario_uservar_forwarding() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_uservar_forwarding EXIT
 
@@ -7742,7 +7740,7 @@ run_scenario_workflow_resume() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_workflow_resume EXIT
 
@@ -7967,7 +7965,7 @@ run_scenario_dry_run_mode() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_dry_run_mode EXIT
 
@@ -8228,7 +8226,7 @@ run_scenario_workflow_lifecycle() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_workflow_lifecycle EXIT
 
@@ -8317,7 +8315,7 @@ run_scenario_events_unhandled_alias() {
             cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_events_unhandled_alias EXIT
 
@@ -8938,7 +8936,7 @@ run_scenario_accounts_refresh() {
         if [[ -d "$temp_workspace_invalid" ]]; then
             cp -r "$temp_workspace_invalid/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace" "$temp_workspace_fail" "$temp_workspace_invalid"
+        retain_workspace_artifacts "$temp_workspace" "$temp_workspace_fail" "$temp_workspace_invalid"
     }
     trap cleanup_accounts_refresh EXIT
 
@@ -9230,7 +9228,7 @@ PY
             cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
             cp "$emit_script" "$scenario_dir/emit_alt_screen.sh" 2>/dev/null || true
         fi
-        rm -rf "$temp_workspace"
+        retain_workspace_artifacts "$temp_workspace"
     }
     trap cleanup_alt_screen_detection EXIT
 
@@ -9825,9 +9823,7 @@ PY
                 cp "$fixture_dummy_script_safe" "$scenario_dir_safe/dummy_alt_screen.sh" 2>/dev/null || true
             fi
         fi
-        if [[ -n "$temp_workspace_safe" ]]; then
-            rm -rf "$temp_workspace_safe"
-        fi
+        retain_workspace_artifacts "$temp_workspace_safe"
     }
     trap cleanup_alt_screen_conformance EXIT
 
@@ -9907,14 +9903,14 @@ case "$profile" in
         ;;
     vim)
         if command -v vim >/dev/null 2>&1; then
-            tmp_file="$(mktemp /tmp/ft-alt-vim-XXXXXX)"
+            tmp_file="$(mktemp "${FT_WORKSPACE:?}/ft-alt-vim-XXXXXX")"
             printf 'line 1\nline 2\nline 3\n' > "$tmp_file"
             timeout "$duration" vim -Nu NONE -n \
                 -c 'set nomore' \
                 -c 'normal! G' \
                 -c 'sleep 1' \
                 -c 'qa!' "$tmp_file" >/dev/null 2>&1 || true
-            rm -f "$tmp_file"
+            printf 'Retained vim fixture: %s\n' "$tmp_file"
         else
             fallback_alt_screen "vim-fallback"
         fi
@@ -9935,9 +9931,20 @@ case "$profile" in
         ;;
     tmux)
         if command -v tmux >/dev/null 2>&1; then
-            timeout "$duration" tmux new-session -A -D -s ft_e2e_alt_conf \
-                'sh -c "printf \"tmux-alt\n\"; sleep 1"' >/dev/null 2>&1 || true
-            tmux kill-session -t ft_e2e_alt_conf >/dev/null 2>&1 || true
+            # A private socket inside a fresh directory cannot address an
+            # operator's existing server. Only stop a session we created.
+            tmux_dir="$(mktemp -d "${FT_WORKSPACE:?}/tmux-XXXXXX")"
+            tmux_socket="$tmux_dir/socket"
+            printf 'Retained tmux workspace: %s\n' "$tmux_dir"
+            if tmux -S "$tmux_socket" -f /dev/null new-session -d -s ft_e2e_alt_conf \
+                'sh -c "printf \"tmux-alt\n\"; sleep 1"'; then
+                timeout "$duration" tmux -S "$tmux_socket" attach-session \
+                    -t ft_e2e_alt_conf >/dev/null 2>&1 || true
+                tmux -S "$tmux_socket" kill-session -t ft_e2e_alt_conf >/dev/null 2>&1 || true
+            else
+                printf 'Failed to create private tmux test session\n' >&2
+                exit 1
+            fi
         else
             fallback_alt_screen "tmux-fallback"
         fi
@@ -10397,7 +10404,7 @@ EOF
         log_pass "No wa_last_status_update marker present"
     fi
 
-    rm -rf "$temp_home"
+    retain_workspace_artifacts "$temp_home"
 
     return $result
 }
@@ -10440,7 +10447,7 @@ run_scenario_watcher_crash_bundle() {
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
-        rm -rf "${temp_workspace:-}"
+        retain_workspace_artifacts "${temp_workspace:-}"
     }
     trap cleanup_watcher_crash_bundle EXIT
 
@@ -10570,11 +10577,7 @@ LUAEOF
         if [[ -d "${temp_home:-}" ]]; then
             cp -r "$temp_home" "$scenario_dir/temp_home_snapshot" 2>/dev/null || true
         fi
-        if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
-            log_warn "Preserving temp home (FT_E2E_PRESERVE_TEMP=1)"
-        else
-            rm -rf "${temp_home:-}"
-        fi
+        retain_workspace_artifacts "${temp_home:-}"
     }
     trap cleanup_environment_detection EXIT
 

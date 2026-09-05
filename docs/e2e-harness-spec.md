@@ -26,7 +26,7 @@ This document specifies the end-to-end test harness for `ft`. The harness valida
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--verbose`, `-v` | Enable verbose output (debug-level logs) | off |
-| `--keep-artifacts` | Retain artifacts on success and failure; required for this repository's proof runs | pass explicitly; do not rely on historical cleanup defaults |
+| `--keep-artifacts` | Retain artifacts on success and failure | always enabled, including without the flag |
 | `--artifacts-dir DIR` | Override artifacts directory | `./e2e-artifacts/<timestamp>` |
 | `--timeout SECS` | Global timeout per scenario | 120 |
 | `--retries N` | Retry each scenario up to `N` times on failure | 0 |
@@ -40,10 +40,10 @@ This document specifies the end-to-end test harness for `ft`. The harness valida
 
 ### Arguments
 
-Retain artifacts and use an isolated test workspace. AGENTS.md requires
-explicit authorization before deleting files; this specification does not
-authorize automatic artifact or workspace deletion. Inspect the chosen
-scenario's cleanup behavior before running it against any existing workspace.
+Use an isolated test workspace. The harness retains run artifacts, scenario
+workspaces, temporary homes, and writable-directory probes on every outcome.
+AGENTS.md requires explicit authorization before deleting files; retention
+flags cannot enable automatic artifact or workspace deletion.
 
 - `SCENARIO...` - One or more scenario names to run. If omitted, runs all scenarios.
 
@@ -478,7 +478,7 @@ Hint: Check if watcher started successfully and pane was observed.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `FT_E2E_KEEP_ARTIFACTS` | Always keep artifacts | `1` |
+| `FT_E2E_KEEP_ARTIFACTS` | Artifacts are retained regardless of this value | `1` |
 | `FT_E2E_TIMEOUT` | Override timeout (seconds) | `300` |
 | `FT_E2E_RETRIES` | Retry each scenario up to N times | `2` |
 | `FT_E2E_SEED` | Deterministic run seed override | `release-2026-02-14` |
@@ -522,15 +522,28 @@ export FT_DATA_DIR="$WORKSPACE/.ft"
 
 ### Cleanup
 
-On success (without `--keep-artifacts`):
+On success, failure, and scenario cleanup:
 
-- Remove temp workspace
-- Remove scenario artifacts
+- Stop only the test's owned processes and panes; preserve their evidence.
+- Keep temporary workspaces, homes, fixture files, and run artifacts, and print
+  their paths. `--keep-artifacts`, `FT_E2E_KEEP_ARTIFACTS`, and the historical
+  `FT_E2E_PRESERVE_TEMP` setting cannot disable retention.
+- Keep a uniquely named writable-directory probe after self-check.
+- Run the tmux conformance profile on its own fresh socket with an empty
+  configuration, and stop a session only after creating it there.
 
-On failure:
-
-- Keep all artifacts
-- Print path to artifacts
+The artifact packer test also retains its output regardless of
+`E2E_ARTIFACTS_CLEANUP`. Redaction and size limiting still intentionally
+transform captured content; a no-match redaction creates no disposable copy.
+Redaction errors fail the producing operation. JSON redaction examines decoded
+string values, refuses matching object keys to prevent collisions, and keeps
+valid JSON without appending a text trailer. Oversized JSON is retained with
+an error instead of being truncated into invalid data. Directory collection
+accepts regular descendants, sanitizes hidden files too, and refuses symlinks,
+special files, and existing destination trees.
+The isolated retention regression is
+`bash tests/e2e/test_e2e_shell_script_contract.sh --retention-only`; it uses
+recording process commands and never starts the live harness.
 
 ### Timeout Handling
 

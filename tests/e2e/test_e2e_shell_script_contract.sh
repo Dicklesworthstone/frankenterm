@@ -21,6 +21,346 @@ record_command() {
 record_command "bash -n tests/e2e/test_e2e_shell_script_contract.sh"
 bash -n "${BASH_SOURCE[0]}"
 
+record_command "python3 isolated retention contract (extracted production shell; no real actors)"
+python3 - "${ROOT_DIR}" "${ARTIFACT_DIR}" <<'PY'
+import hashlib
+import itertools
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+root, artifacts = map(Path, sys.argv[1:])
+work = Path(tempfile.mkdtemp(prefix="retention-", dir=artifacts))
+checks = []
+paths = ["scripts/e2e_test.sh", "scripts/lib/e2e_artifacts.sh",
+         "scripts/test_e2e_artifacts.sh", "tests/e2e/test_e2e_shell_script_contract.sh",
+         "docs/e2e-harness-spec.md"]
+sources = {path: (root / path).read_text() for path in paths}
+baseline_ref = os.environ.get("FT_E2E_RETENTION_BASELINE_REF", "")
+if baseline_ref:
+    for path in paths[:3]:
+        sources[path] = subprocess.run(["git", "show", f"{baseline_ref}:{path}"], cwd=root,
+                                       check=True, capture_output=True, text=True).stdout
+(work / "source-manifest.json").write_text(json.dumps({
+    "baseline_ref": baseline_ref or None,
+    "source_sha256": {path: hashlib.sha256(text.encode()).hexdigest() for path, text in sources.items()},
+}, indent=2) + "\n")
+harness = sources[paths[0]]
+packer = sources[paths[1]]
+
+def check(ok, name):
+    checks.append({"check": name, "passed": bool(ok)})
+    with (work / "checks.jsonl").open("a") as stream:
+        stream.write(json.dumps(checks[-1]) + "\n")
+    if not ok:
+        raise AssertionError(name)
+
+def function(text, name, indent=""):
+    start = text.index(f"{indent}{name}() {{\n")
+    end = text.index(f"\n{indent}}}", start) + len(indent) + 2
+    return text[start:end] + "\n"
+
+def no_deletion(text):
+    return not re.search(r"(?m)^\s*(?:command\s+)?(?:rm|rmdir|unlink)\s", text)
+
+for path in paths[:3]:
+    check(no_deletion(sources[path]), f"no_deletion:{path}")
+check("e2e_github_summary" not in packer and "GITHUB_STEP_SUMMARY" not in packer,
+      "obsolete_actions_summary_removed")
+check(not no_deletion('cleanup() {\n    rm -rf "$fixture"\n}\n'),
+      "planted_deletion_is_rejected_without_execution")
+
+prelude = r'''
+set -euo pipefail
+record() { printf '%s' "$1" >> "$CALLS"; shift; printf '\t%s' "$@" >> "$CALLS"; printf '\n' >> "$CALLS"; }
+kill() { record kill "$@"; }
+wait() { record wait "$@"; }
+wezterm() { record wezterm "$@"; }
+timeout() { record timeout "$@"; }
+vim() { record vim "$@"; }
+tmux() { record tmux "$@"; [[ "${TMUX_CREATE_FAIL:-0}" != 1 || " $* " != *' new-session '* ]]; }
+rm() { record forbidden_rm "$@"; return 97; }
+rmdir() { record forbidden_rmdir "$@"; return 97; }
+unlink() { record forbidden_unlink "$@"; return 97; }
+log_info() { printf '%s\n' "$*"; }
+log_verbose() { :; }
+log_warn() { printf '%s\n' "$*"; }
+log_pass() { :; }
+log_fail() { :; }
+info() { printf '%s\n' "$*"; }
+check_pass() { printf '%s\n' "$*"; }
+check_fail() { printf '%s\n' "$*"; }
+'''
+
+def run(label, body, variables=None, expected=0):
+    directory = Path(tempfile.mkdtemp(prefix=label + "-", dir=work))
+    calls = directory / "calls.tsv"
+    env = os.environ.copy()
+    env.update({"CALLS": str(calls), "TMUX_CREATE_FAIL": "0"})
+    env.update({k: str(v) for k, v in (variables or {}).items()})
+    result = subprocess.run(["bash", "-c", prelude + body], env=env,
+                            capture_output=True, text=True, timeout=15)
+    (directory / "stdout.log").write_text(result.stdout)
+    (directory / "stderr.log").write_text(result.stderr)
+    check(result.returncode == expected, f"{label}:exit={expected}")
+    recorded = [line.split("\t") for line in calls.read_text().splitlines()] if calls.exists() else []
+    check(not any(row[0].startswith("forbidden_") for row in recorded), f"{label}:no_deletion_call")
+    return result, recorded
+
+retain = function(harness, "retain_workspace_artifacts")
+cleanup = function(harness, "cleanup_artifacts")
+seed = work / "root evidence with spaces"
+seed.mkdir()
+marker = seed / "seed.bin"
+marker.write_bytes(b"retained\x00evidence\n")
+for keep, failed, preserve in itertools.product(["false", "true"], [0, 1], [0, 1]):
+    result, _ = run("root", cleanup + "cleanup_artifacts\n",
+                    {"RUN_ARTIFACTS_DIR": seed, "KEEP_ARTIFACTS": keep,
+                     "FAILED": failed, "FT_E2E_PRESERVE_TEMP": preserve})
+    check(marker.read_bytes() == b"retained\x00evidence\n", "root:seed_survives")
+    check(str(seed) in result.stdout, "root:retained_path_reported")
+
+# This table is independent of shell extraction: exact owned actors are the
+# behavioral oracle, including cleanup paths that should address no actors.
+actors = {
+    "capture_search": (["ft_pid"], ["pane_id"]),
+    "search_linting_rebuild": ([], []),
+    "natural_language": (["ft_pid"], ["pane_id"]),
+    "compaction_workflow": (["ft_pid"], ["pane_id"]),
+    "unhandled_event_lifecycle": (["ft_pid"], ["pane_id"]),
+    "usage_limit_safe_pause": (["ft_pid", "ft_pid_restart"], ["pane_id"]),
+    "notification_webhook": (["mock_pid", "ft_pid"], ["pane_id"]),
+    "watch_notify_only": (["mock_pid", "ft_pid"], ["pane_usage", "pane_token", "pane_burst"]),
+    "policy_denial": (["ft_pid"], ["pane_id"]),
+    "audit_tail": (["tail_pid", "ft_pid"], ["pane_id"]),
+    "ipc_rpc_roundtrip": (["ft_pid"], []),
+    "prepare_commit_approvals": ([], ["pane_id"]),
+    "quickfix_suggestions": (["ft_pid"], ["compaction_pane", "alt_pane"]),
+    "triage_multi_issue": ([], []),
+    "stress_scale": (["ft_pid"], ["pane_id", "pane_burst"]),
+    "graceful_shutdown": (["ft_pid"], ["pane_id"]),
+    "pane_exclude_filter": (["ft_pid"], ["observed_pane_id", "ignored_pane_id"]),
+    "workspace_isolation": (["ft_pid"], ["pane_a_id", "pane_b_id"]),
+    "setup_idempotency": ([], []),
+    "uservar_forwarding": (["ft_pid", "wezterm_pid"], ["pane_id"]),
+    "workflow_resume": (["ft_pid"], ["pane_id"]),
+    "dry_run_mode": (["ft_pid"], ["pane_id"]),
+    "workflow_lifecycle": ([], []),
+    "events_unhandled_alias": ([], []),
+    "events_annotations_triage": ([], []),
+    "history_undo_workflow": ([], []),
+    "accounts_refresh": ([], []),
+    "alt_screen_detection": (["ft_pid", "wezterm_pid"], ["pane_id"]),
+    "alt_screen_conformance": (["ft_pid", "wezterm_pid"], ["pane_id", "pane_burst"]),
+    "watcher_crash_bundle": (["ft_pid"], []),
+    "environment_detection": ([], []),
+}
+found = re.findall(r"(?m)^    cleanup_(\w+)\(\) \{", harness)
+check(set(found) == set(actors), "all_31_cleanup_bodies_have_actor_oracles")
+actor_names = sorted({name for processes, panes in actors.values() for name in processes + panes})
+actor_values = {name: str(11000 + i) for i, name in enumerate(actor_names)}
+cleanup_cases = 0
+for name, (processes, panes) in actors.items():
+    base = Path(tempfile.mkdtemp(prefix=name + "-", dir=work))
+    variables = dict(actor_values)
+    seed_files = []
+    for variable in ["temp_workspace", "temp_workspace_fail", "temp_workspace_invalid",
+                     "temp_home", "workspace_a", "workspace_b"]:
+        directory = base / (variable + " with spaces")
+        (directory / ".ft").mkdir(parents=True)
+        variables[variable] = str(directory)
+        for leaf in [".ft/state.db", ".hidden", "seed.bin", "ft.toml", "caut_invocations.log"]:
+            path = directory / leaf
+            path.write_bytes(b"retained\x00evidence\n")
+            seed_files.append(path)
+    for variable in ["config_file", "runner_script", "emit_script", "enter_seq_file",
+                     "leave_seq_file", "fixture_dummy_script"]:
+        variables[variable] = str(seed_files[2])
+    variables.update({"old_path": os.environ["PATH"], "wezterm_class": "owned-class",
+                      "wezterm_socket": str(base / "owned.socket"), "wezterm_bin": "wezterm"})
+    for variable in ["old_ft_data_dir", "old_ft_workspace", "old_ft_config",
+                     "old_caut_mode", "old_caut_log", "old_crash_flag"]:
+        variables[variable] = ""
+    body = retain + function(harness, "cleanup_" + name, "    ")
+    body += 'pane_ids=("$pane_id" "$pane_burst"); spawned_panes=("$pane_id" "$pane_burst")\n'
+    body += "cleanup_" + name + "\n"
+    for keep, failed, preserve in itertools.product(["false", "true"], [0, 1], [0, 1]):
+        scenario = base / f"scenario-{keep}-{failed}-{preserve}"
+        scenario.mkdir()
+        variables.update({"scenario_dir": str(scenario), "KEEP_ARTIFACTS": keep,
+                          "FAILED": failed, "FT_E2E_PRESERVE_TEMP": preserve})
+        result, calls = run(name, body, variables)
+        cleanup_cases += 1
+        check(all(path.read_bytes() == b"retained\x00evidence\n" for path in seed_files),
+              f"{name}:all_seeded_bytes_survive")
+        stopped = [row[-1] for row in calls if row[0] == "kill" and row[1] != "-0"]
+        waited = [row[-1] for row in calls if row[0] == "wait"]
+        closed = [row[-1] for row in calls if row[0] == "wezterm"]
+        check(sorted(stopped) == sorted(actor_values[v] for v in processes), f"{name}:exact_owned_pids")
+        check(sorted(waited) == sorted(stopped), f"{name}:owned_waits_preserved")
+        check(sorted(closed) == sorted(actor_values[v] for v in panes), f"{name}:exact_owned_panes")
+
+# Run only the writable-directory production block, never its native checks.
+probe = harness.split("    # Check 4: Artifacts directory writable\n", 1)[1].split("    # Check 5:", 1)[0]
+probe_body = "probe() { local all_passed=true\n" + probe + '\n[[ "$all_passed" == true ]]; }\nprobe\n'
+legacy_probe = seed / ".write-test"
+legacy_probe.write_bytes(b"existing probe must survive")
+for _ in range(2):
+    run("write-probe", probe_body, {"ARTIFACTS_DIR": seed})
+check(len(list(seed.glob(".write-test.*"))) == 2, "write_probe:unique_and_retained")
+check(legacy_probe.read_bytes() == b"existing probe must survive", "write_probe:preexisting_bytes_survive")
+run("write-probe-failure", probe_body, {"ARTIFACTS_DIR": marker}, expected=1)
+
+runner = harness.split('    cat > "$runner_script" <<\'EOS\'\n', 1)[1].split("\nEOS", 1)[0]
+runner_workspace = work / "runner workspace"
+runner_workspace.mkdir()
+for failed in [0, 1]:
+    result, calls = run("tmux-profile", 'set -- tmux 2\n' + runner,
+                        {"FT_WORKSPACE": runner_workspace, "TMUX_CREATE_FAIL": failed}, expected=failed)
+    tmux_calls = [row for row in calls if row[0] == "tmux"]
+    check(len(tmux_calls) == (1 if failed else 2), "tmux:creation_gates_teardown")
+    socket = Path(tmux_calls[0][2])
+    check(tmux_calls[0][1] == "-S" and socket.parent.parent == runner_workspace
+          and socket.parent.is_dir(), "tmux:fresh_private_socket")
+    check(tmux_calls[0][3:8] == ["-f", "/dev/null", "new-session", "-d", "-s"],
+          "tmux:never_attach_existing_session_or_load_operator_config")
+    check(all(row[1:3] == ["-S", str(socket)] for row in tmux_calls), "tmux:teardown_uses_owned_socket")
+    timed = [row for row in calls if row[0] == "timeout"]
+    check(len(timed) == (0 if failed else 1), "tmux:failed_creation_never_attaches")
+    check(str(socket.parent) in result.stdout, "tmux:workspace_retained_and_reported")
+run("vim-profile", 'set -- vim 2\n' + runner, {"FT_WORKSPACE": runner_workspace})
+vim_files = list(runner_workspace.glob("ft-alt-vim-*"))
+check(len(vim_files) == 1 and vim_files[0].read_text() == "line 1\nline 2\nline 3\n",
+      "vim:fixture_retained_in_workspace")
+
+smoke_tail = sources[paths[2]].split("    # Test evidence is retained", 1)[1].split('    echo ""', 1)[0]
+smoke_tail = smoke_tail.split("\n", 1)[1]
+for flag in [0, 1]:
+    result, _ = run("artifact-smoke-retention", smoke_tail,
+                    {"E2E_ARTIFACTS_BASE": seed, "E2E_ARTIFACTS_CLEANUP": flag})
+    check(marker.read_bytes() == b"retained\x00evidence\n" and str(seed) in result.stdout,
+          "artifact_smoke:retention_unconditional")
+
+# Sourcing this library defines functions/configuration only. None of its
+# environment collectors, visual detectors, or complete harnesses is invoked.
+library = "source " + shlex.quote(str(root / paths[1])) + "\n"
+plain = work / "plain.log"
+plain.write_bytes(b"plain\x00bytes\n\n")
+run("no-match-redaction", library + 'mktemp() { return 96; }; e2e_redact_secrets "$INPUT"\n', {"INPUT": plain})
+check(plain.read_bytes() == b"plain\x00bytes\n\n", "redaction:no_match_preserves_bytes_without_allocation")
+secret = "A/" * 20
+text_file = work / "secret.log"
+text_file.write_text("aws_secret_access_key=" + secret + "\npassword=synthetic-secret\n")
+run("actual-redaction", library + 'e2e_redact_secrets "$INPUT"\n', {"INPUT": text_file})
+check(secret not in text_file.read_text() and "synthetic-secret" not in text_file.read_text()
+      and "[REDACTED]" in text_file.read_text(), "redaction:slash_credential_and_password_removed")
+
+failed_file = work / "failed.log"
+failed_file.write_text("password=synthetic-secret\n")
+failure_body = library + 'perl() { echo PRIVATE_PATTERN_SENTINEL >&2; return 42; }; e2e_redact_secrets "$INPUT" || exit $?\n'
+result, _ = run("redactor-failure", failure_body, {"INPUT": failed_file}, expected=1)
+check("PRIVATE_PATTERN_SENTINEL" not in result.stderr and "synthetic-secret" not in result.stderr,
+      "redaction:engine_errors_are_reason_only")
+check(failed_file.read_text() == "password=synthetic-secret\n", "redaction:failed_engine_retains_input")
+for mode in ["invalid", "read-error"]:
+    injected = ('E2E_REDACT_PATTERNS="[PRIVATE_PATTERN_SENTINEL"\n' if mode == "invalid"
+                else 'grep() { echo PRIVATE_PATTERN_SENTINEL >&2; return 2; }\n')
+    result, _ = run("pattern-" + mode, library + injected + 'e2e_redact_secrets "$INPUT" || exit $?\n',
+                    {"INPUT": plain}, expected=1)
+    check("PRIVATE_PATTERN_SENTINEL" not in result.stderr, f"redaction:{mode}_privacy")
+result, _ = run("pattern-registration", library + 'E2E_DEBUG=true; e2e_add_redact_pattern PRIVATE_PATTERN_SENTINEL\n')
+check("PRIVATE_PATTERN_SENTINEL" not in result.stderr, "redaction:registration_does_not_log_pattern")
+
+packed = work / "packed"
+packed.mkdir()
+pack_env = {"E2E_RUN_DIR": packed, "E2E_CURRENT_SCENARIO": "", "E2E_REDACT_SECRETS": "true",
+            "E2E_MAX_FILE_SIZE": "5000", "INPUT": failed_file}
+for producer in ['e2e_add_file result.txt "password=synthetic-secret"',
+                 'e2e_add_json result.json \'{"value":"password=synthetic-secret"}\'',
+                 'e2e_copy_file "$INPUT" result-copy.txt']:
+    run("producer-failure", library + 'e2e_redact_secrets() { return 23; }; ' + producer + ' || exit $?\n',
+        pack_env, expected=23)
+capture_body = library + r'''
+E2E_SCENARIOS_DIR="$E2E_RUN_DIR/scenarios"
+mkdir -p "$E2E_SCENARIOS_DIR"
+e2e_redact_secrets() { return 23; }
+e2e_limit_size() { return 0; }
+e2e_capture_scenario redaction_failure printf '' || exit $?
+'''
+run("capture-failure", capture_body, pack_env, expected=1)
+metadata = json.loads((packed / "scenarios/redaction_failure/metadata.json").read_text())
+check(metadata["exit_code"] == 1 and metadata["redaction_status"] == "failed"
+      and (packed / "scenarios/redaction_failure/FAIL").exists(), "capture:redaction_failure_is_failed_evidence")
+
+run("json-redaction", library + 'e2e_add_json valid.json \'{"value":"password=synthetic-secret","n":2}\'\n', pack_env)
+payload = json.loads((packed / "valid.json").read_text())
+check(payload == {"value": "[REDACTED]", "n": 2}, "json:redaction_preserves_valid_structure")
+escaped = work / "escaped.json"
+escaped.write_text('{"value":"pass\\u0077ord=synthetic-secret"}')
+run("json-escaped-redaction", library + 'e2e_redact_secrets "$INPUT"\n', {"INPUT": escaped})
+check(json.loads(escaped.read_text()) == {"value": "[REDACTED]"}, "json:decoded_credentials_are_matched")
+keyed = work / "keyed.json"
+keyed_bytes = b'{"password=synthetic-secret":1,"[REDACTED]":2}'
+keyed.write_bytes(keyed_bytes)
+result, _ = run("json-key-refusal", library + 'e2e_redact_secrets "$INPUT" || exit $?\n',
+                {"INPUT": keyed}, expected=1)
+check(keyed.read_bytes() == keyed_bytes, "json:matching_key_refused_without_collision_or_data_loss")
+check("synthetic-secret" not in result.stderr, "json:key_refusal_logs_no_secret")
+run("json-size-refusal", library + 'E2E_MAX_FILE_SIZE=2; e2e_add_json oversized.json \'{"n":2}\' || exit $?\n',
+    pack_env, expected=1)
+check(json.loads((packed / "oversized.json").read_text()) == {"n": 2}, "json:oversize_input_retained_valid")
+run("stat-failure", library + 'stat() { return 42; }; e2e_limit_size "$INPUT" 5000 || exit $?\n',
+    {"INPUT": plain}, expected=1)
+check(plain.read_bytes() == b"plain\x00bytes\n\n", "stat_failure:input_retained")
+run("json-engine-failure", library + 'jq() { echo PRIVATE_PATTERN_SENTINEL >&2; return 42; }; e2e_redact_secrets "$INPUT" || exit $?\n',
+    {"INPUT": escaped}, expected=1)
+tree = work / "source-tree"
+(tree / ".hidden").mkdir(parents=True)
+(tree / ".hidden/credentials.txt").write_text("password=synthetic-secret\n")
+(tree / "data.json").write_text('{"value":"password=synthetic-secret"}')
+(tree / "large.txt").write_text("x" * 10000)
+run("directory-copy", library + 'e2e_copy_file "$TREE" safe-tree\n', {**pack_env, "TREE": tree})
+check("synthetic-secret" not in (packed / "safe-tree/.hidden/credentials.txt").read_text(), "directory:hidden_file_sanitized")
+check(json.loads((packed / "safe-tree/data.json").read_text()) == {"value": "[REDACTED]"}, "directory:json_valid_and_sanitized")
+check((packed / "safe-tree/large.txt").stat().st_size <= 5000, "directory:size_limit_applied")
+unsafe = work / "linked-tree"
+unsafe.mkdir()
+(unsafe / "external").symlink_to(plain)
+run("directory-symlink-refusal", library + 'e2e_copy_file "$TREE" refused-tree || exit $?\n',
+    {**pack_env, "TREE": unsafe}, expected=1)
+check(not (packed / "refused-tree").exists() and plain.read_bytes() == b"plain\x00bytes\n\n",
+      "directory:external_link_not_followed_or_copied")
+special = work / "special-tree"
+special.mkdir()
+os.mkfifo(special / "pipe")
+run("directory-special-refusal", library + 'e2e_copy_file "$TREE" refused-special || exit $?\n',
+    {**pack_env, "TREE": special}, expected=1)
+check(not (packed / "refused-special").exists(), "directory:special_file_refused_before_copy")
+run("directory-redaction-failure", library + 'e2e_redact_secrets() { return 23; }; e2e_copy_file "$TREE" failed-tree || exit $?\n',
+    {**pack_env, "TREE": tree}, expected=23)
+check((tree / ".hidden/credentials.txt").read_text() == "password=synthetic-secret\n",
+      "directory:source_unchanged_after_failed_sanitization")
+
+check(all((root / path).read_text() == text for path, text in sources.items()),
+      "source_files_unchanged_during_proof")
+summary = {"bead_id": "ft-xxfwy.63.1", "status": "passed", "checks": len(checks),
+           "cleanup_bodies": len(actors), "cleanup_cases": cleanup_cases,
+           "proof_kind": "isolated-shell-boundary", "artifacts": str(work),
+           "source_sha256": {path: hashlib.sha256(text.encode()).hexdigest() for path, text in sources.items()}}
+(work / "checks.json").write_text(json.dumps(checks, indent=2) + "\n")
+(artifacts / "retention-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+print(json.dumps(summary, sort_keys=True))
+PY
+
+if [[ "${1:-}" == "--retention-only" ]]; then
+    exit 0
+fi
+
 # shellcheck source=tests/scripts/static_attestation_helpers.sh
 source "${ROOT_DIR}/tests/scripts/static_attestation_helpers.sh"
 
