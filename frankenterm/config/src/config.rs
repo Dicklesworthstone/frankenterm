@@ -96,6 +96,17 @@ pub struct Config {
     #[dynamic(default)]
     pub log_unknown_escape_sequences: bool,
 
+    /// Native OSC 52 writes and clears require one visible consent by default.
+    /// `Allow` permits writes within the byte cap; `Deny` refuses them.
+    /// A headless embedding without a consent handler cannot approve `Prompt`.
+    #[dynamic(default = "default_osc52_write_policy")]
+    pub osc52_write_policy: frankenterm_term::config::Osc52WritePolicy,
+
+    /// Maximum decoded OSC 52 payload bytes, including deferred prompts.
+    /// Zero permits only empty Set or Clear requests, still subject to policy.
+    #[dynamic(default = "default_osc52_write_max_bytes")]
+    pub osc52_write_max_bytes: usize,
+
     #[dynamic(default)]
     pub integrated_title_button_alignment: IntegratedTitleButtonAlignment,
 
@@ -2109,6 +2120,14 @@ fn default_mux_socket_buffer_size() -> usize {
     1024 * 1024
 }
 
+fn default_osc52_write_policy() -> frankenterm_term::config::Osc52WritePolicy {
+    frankenterm_term::config::Osc52WritePolicy::Prompt
+}
+
+fn default_osc52_write_max_bytes() -> usize {
+    1024 * 1024
+}
+
 fn default_mux_max_synchronized_output_bytes() -> usize {
     8 * 1024 * 1024
 }
@@ -3959,5 +3978,24 @@ mod tests {
         let val = Value::U64(42);
         let err = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap_err();
         assert!(err.to_string().contains("NewlineCanon"));
+    }
+
+    #[test]
+    fn osc52_native_policy_rejects_invalid_enum_and_negative_cap() {
+        for (key, value) in [
+            (
+                "osc52_write_policy",
+                Value::String("permit-everything".into()),
+            ),
+            ("osc52_write_max_bytes", Value::I64(-1)),
+        ] {
+            let mut overrides = std::collections::BTreeMap::new();
+            overrides.insert(Value::String(key.into()), value);
+            assert!(Config::from_dynamic(
+                &Value::Object(overrides.into()),
+                FromDynamicOptions::default()
+            )
+            .is_err());
+        }
     }
 }

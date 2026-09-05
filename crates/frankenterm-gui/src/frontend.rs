@@ -62,6 +62,7 @@ pub struct GuiFrontEnd {
     config_subscription: RefCell<Option<ConfigSubscription>>,
     workspace_reconcile_gate: Cell<WorkspaceReconcileGate>,
     workspace_reconcile_waiters: RefCell<WorkspaceReconcileWaiters>,
+    osc52_dispatch_identity: Arc<()>,
 }
 
 impl Drop for GuiFrontEnd {
@@ -91,7 +92,63 @@ impl GuiFrontEnd {
             config_subscription: RefCell::new(None),
             workspace_reconcile_gate: Cell::new(WorkspaceReconcileGate::default()),
             workspace_reconcile_waiters: RefCell::new(WorkspaceReconcileWaiters::default()),
+            osc52_dispatch_identity: Arc::new(()),
         });
+
+        let prompt_frontend = Arc::downgrade(&front_end.osc52_dispatch_identity);
+        let prompt_mux = Arc::downgrade(&mux);
+        mux.set_osc52_prompt_handler(Arc::new(move |target, request| {
+            if prompt_frontend.upgrade().is_none() || !request.is_pending() || !target.is_current()
+            {
+                return Err(wezterm_term::Osc52PromptError::Unavailable.into());
+            }
+            let reservation = match try_reserve_main_thread(
+                MainThreadServiceClass::Input,
+                FRONTEND_MAIN_THREAD_ESTIMATED_BYTES.saturating_add(request.decoded_bytes()),
+            ) {
+                MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                _ => return Err(wezterm_term::Osc52PromptError::Overloaded.into()),
+            };
+            let expected_frontend = prompt_frontend.clone();
+            let mux_owner = prompt_mux.clone();
+            reservation
+                .spawn(async move {
+                    let Some(frontend) = try_front_end() else {
+                        request.cancel();
+                        return;
+                    };
+                    if !std::sync::Weak::ptr_eq(
+                        &expected_frontend,
+                        &Arc::downgrade(&frontend.osc52_dispatch_identity),
+                    ) || !target.is_current()
+                        || !request.is_pending()
+                    {
+                        request.cancel();
+                        return;
+                    }
+                    let Some(gui) = frontend.gui_window_for_mux_window(target.window_id()) else {
+                        log::warn!(
+                            "OSC 52 consent unavailable request={}: no originating GUI window",
+                            request.id()
+                        );
+                        request.cancel();
+                        return;
+                    };
+                    let exact_window = gui.window.clone();
+                    gui.window
+                        .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            term_window.show_osc52_prompt(
+                                target,
+                                request,
+                                mux_owner,
+                                expected_frontend,
+                                exact_window,
+                            );
+                        })));
+                })
+                .detach();
+            Ok(())
+        }));
 
         mux.subscribe(move |n| {
             match n {
@@ -316,10 +373,10 @@ impl GuiFrontEnd {
                         "clipboard assignment",
                         || async move {
                             log::trace!(
-                                "set clipboard in pane {} {:?} {:?}",
+                                "enqueue clipboard in pane {} selection={:?} bytes={}",
                                 pane_id,
                                 selection,
-                                clipboard
+                                clipboard.as_ref().map_or(0, String::len)
                             );
                             let Some(fe) = crate::frontend::try_front_end() else {
                                 return;
@@ -379,48 +436,48 @@ impl GuiFrontEnd {
                     FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                     "open command script",
                     || async move {
-                    use config::keyassignment::SpawnTabDomain;
-                    use wezterm_term::TerminalSize;
+                        use config::keyassignment::SpawnTabDomain;
+                        use wezterm_term::TerminalSize;
 
-                    // We send the script to execute to the shell on stdin, rather than ask the
-                    // shell to execute it directly, so that we start the shell and read in the
-                    // user's rc files before running the script.  Without this, wezterm on macOS
-                    // is launched with a default and very anemic path, and that is frustrating for
-                    // users.
+                        // We send the script to execute to the shell on stdin, rather than ask the
+                        // shell to execute it directly, so that we start the shell and read in the
+                        // user's rc files before running the script.  Without this, wezterm on macOS
+                        // is launched with a default and very anemic path, and that is frustrating for
+                        // users.
 
-                    let Some(mux) = Mux::try_get() else {
-                        log::error!("OpenCommandScript: mux singleton is not available");
-                        return;
-                    };
-                    let window_id = None;
-                    let pane_id = None;
-                    let cmd = None;
-                    let cwd = None;
-                    let workspace = mux.active_workspace();
+                        let Some(mux) = Mux::try_get() else {
+                            log::error!("OpenCommandScript: mux singleton is not available");
+                            return;
+                        };
+                        let window_id = None;
+                        let pane_id = None;
+                        let cmd = None;
+                        let cwd = None;
+                        let workspace = mux.active_workspace();
 
-                    match mux
-                        .spawn_tab_or_window(
-                            window_id,
-                            SpawnTabDomain::DomainName("local".to_string()),
-                            cmd,
-                            cwd,
-                            TerminalSize::default(),
-                            pane_id,
-                            workspace,
-                            None, // optional position
-                            mux.active_identity(),
-                        )
-                        .await
-                    {
-                        Ok((_tab, pane, _window_id)) => {
-                            log::trace!("Spawned {file_name} as pane_id {}", pane.pane_id());
-                            let mut writer = pane.writer();
-                            write!(writer, "{quoted_file_name} ; exit\n").ok();
-                        }
-                        Err(err) => {
-                            log::error!("Failed to spawn {file_name}: {err:#?}");
-                        }
-                    };
+                        match mux
+                            .spawn_tab_or_window(
+                                window_id,
+                                SpawnTabDomain::DomainName("local".to_string()),
+                                cmd,
+                                cwd,
+                                TerminalSize::default(),
+                                pane_id,
+                                workspace,
+                                None, // optional position
+                                mux.active_identity(),
+                            )
+                            .await
+                        {
+                            Ok((_tab, pane, _window_id)) => {
+                                log::trace!("Spawned {file_name} as pane_id {}", pane.pane_id());
+                                let mut writer = pane.writer();
+                                write!(writer, "{quoted_file_name} ; exit\n").ok();
+                            }
+                            Err(err) => {
+                                log::error!("Failed to spawn {file_name}: {err:#?}");
+                            }
+                        };
                     },
                 );
             }
@@ -602,36 +659,38 @@ impl GuiFrontEnd {
                 return;
             }
         };
-        reservation.spawn_local(async move {
-            while let Some(mux_window_id) = mux_windows.next() {
-                let Some(fe) = try_front_end() else {
-                    return;
-                };
-                if fe.has_mux_window(mux_window_id)
-                    || fe.spawned_mux_window.borrow().contains(&mux_window_id)
-                {
-                    continue;
-                }
-                fe.spawned_mux_window.borrow_mut().insert(mux_window_id);
-                log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
-                if let Err(err) =
-                    TermWindow::new_window(mux_window_id, workspace.clone(), saved_window_state)
-                        .await
-                {
-                    log::error!("Failed to create window: {:#}", err);
-                    if let Some(mux) = Mux::try_get() {
-                        mux.kill_window(mux_window_id);
+        reservation
+            .spawn_local(async move {
+                while let Some(mux_window_id) = mux_windows.next() {
+                    let Some(fe) = try_front_end() else {
+                        return;
+                    };
+                    if fe.has_mux_window(mux_window_id)
+                        || fe.spawned_mux_window.borrow().contains(&mux_window_id)
+                    {
+                        continue;
                     }
-                    if let Some(fe) = try_front_end() {
-                        fe.spawned_mux_window.borrow_mut().remove(&mux_window_id);
+                    fe.spawned_mux_window.borrow_mut().insert(mux_window_id);
+                    log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
+                    if let Err(err) =
+                        TermWindow::new_window(mux_window_id, workspace.clone(), saved_window_state)
+                            .await
+                    {
+                        log::error!("Failed to create window: {:#}", err);
+                        if let Some(mux) = Mux::try_get() {
+                            mux.kill_window(mux_window_id);
+                        }
+                        if let Some(fe) = try_front_end() {
+                            fe.spawned_mux_window.borrow_mut().remove(&mux_window_id);
+                        }
                     }
                 }
-            }
-            if let Some(fe) = try_front_end() {
-                *fe.switching_workspaces.borrow_mut() = false;
-                fe.finish_workspace_reconcile_pass();
-            }
-        }).detach();
+                if let Some(fe) = try_front_end() {
+                    *fe.switching_workspaces.borrow_mut() = false;
+                    fe.finish_workspace_reconcile_pass();
+                }
+            })
+            .detach();
     }
 
     fn finish_workspace_reconcile_pass(&self) {
@@ -739,6 +798,12 @@ impl GuiFrontEnd {
                 .set_cursor(Some(mouse_cursor_for_osc22_shape(shape)));
         }
     }
+}
+
+pub(crate) fn osc52_frontend_is_current(expected: &std::sync::Weak<()>) -> bool {
+    try_front_end().is_some_and(|frontend| {
+        std::sync::Weak::ptr_eq(expected, &Arc::downgrade(&frontend.osc52_dispatch_identity))
+    })
 }
 
 #[must_use]

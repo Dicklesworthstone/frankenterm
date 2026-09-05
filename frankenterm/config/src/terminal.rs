@@ -186,6 +186,14 @@ impl TermConfig {
 }
 
 impl frankenterm_term::TerminalConfiguration for TermConfig {
+    fn osc52_write_policy(&self) -> frankenterm_term::config::Osc52WritePolicy {
+        self.configuration().osc52_write_policy
+    }
+
+    fn osc52_write_max_bytes(&self) -> usize {
+        self.configuration().osc52_write_max_bytes
+    }
+
     fn generation(&self) -> usize {
         self.configuration().generation()
     }
@@ -446,6 +454,108 @@ mod tests {
     fn overridden_config_for_test(overrides: Value) -> ConfigHandle {
         let _env_lock = crate::test_env_lock();
         crate::overridden_config(&overrides).expect("override parsing to succeed")
+    }
+
+    #[test]
+    fn osc52_parsed_native_config_reaches_terminal_and_revokes_consent() {
+        use frankenterm_term::{
+            Clipboard, ClipboardSelection, Osc52ClipboardRequest, Terminal, TerminalSize,
+        };
+        #[derive(Default)]
+        struct Sink {
+            effects: Mutex<Vec<(ClipboardSelection, Option<String>)>>,
+            prompt: Mutex<Option<Osc52ClipboardRequest>>,
+        }
+        impl Clipboard for Sink {
+            fn set_contents(
+                &self,
+                selection: ClipboardSelection,
+                data: Option<String>,
+            ) -> anyhow::Result<()> {
+                self.effects.lock().unwrap().push((selection, data));
+                Ok(())
+            }
+            fn request_contents(&self, request: Osc52ClipboardRequest) -> anyhow::Result<()> {
+                *self.prompt.lock().unwrap() = Some(request);
+                Ok(())
+            }
+        }
+        assert_eq!(
+            ConfigHandle::default_config().osc52_write_policy,
+            frankenterm_term::config::Osc52WritePolicy::Prompt
+        );
+        assert_eq!(
+            ConfigHandle::default_config().osc52_write_max_bytes,
+            1024 * 1024
+        );
+        for policy in ["Allow", "Deny", "Prompt"] {
+            for cap in [1, 2] {
+                let mut overrides = BTreeMap::new();
+                overrides.insert(
+                    Value::String("osc52_write_policy".into()),
+                    Value::String(policy.into()),
+                );
+                overrides.insert(
+                    Value::String("osc52_write_max_bytes".into()),
+                    Value::U64(cap),
+                );
+                let config = Arc::new(TermConfig::with_config(overridden_config_for_test(
+                    Value::Object(overrides.into()),
+                )));
+                let mut terminal = Terminal::new(
+                    TerminalSize {
+                        rows: 4,
+                        cols: 32,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                        dpi: 96,
+                    },
+                    config.clone(),
+                    "FrankenTerm",
+                    "osc52-config-test",
+                    Box::new(std::io::sink()),
+                );
+                let sink = Arc::new(Sink::default());
+                let clipboard: Arc<dyn Clipboard> = sink.clone();
+                terminal.set_clipboard(&clipboard);
+                terminal.advance_bytes(b"\x1b]52;c;w6k=\x1b\\");
+                assert_eq!(
+                    sink.effects.lock().unwrap().len(),
+                    usize::from(policy == "Allow" && cap == 2)
+                );
+                let request = sink.prompt.lock().unwrap().take();
+                assert_eq!(request.is_some(), policy == "Prompt" && cap == 2);
+                if let Some(request) = request {
+                    assert!(
+                        sink.effects.lock().unwrap().is_empty(),
+                        "zero effects before operator consent"
+                    );
+                    request
+                        .apply_with(|selection, data| sink.set_contents(selection, data))
+                        .unwrap();
+                    assert_eq!(
+                        sink.effects.lock().unwrap().as_slice(),
+                        &[(ClipboardSelection::Clipboard, Some("é".to_string()))]
+                    );
+                    assert_eq!(
+                        request.apply_with(|_, _| panic!("duplicate consent reached sink")),
+                        Err(frankenterm_term::Osc52PromptError::AlreadyResolved)
+                    );
+                    terminal.advance_bytes(b"\x1b]52;c;w6k=\x1b\\");
+                    let revoked = sink.prompt.lock().unwrap().take().unwrap();
+                    config.set_config(ConfigHandle::default_config());
+                    assert_eq!(
+                        revoked.apply_with(|_, _| panic!("revoked config reached sink")),
+                        Err(frankenterm_term::Osc52PromptError::Revoked)
+                    );
+                    assert_eq!(sink.effects.lock().unwrap().len(), 1);
+                }
+                println!(
+                    "OSC52_CONFIG_TERMINAL policy={policy} cap={cap} effects={}",
+                    sink.effects.lock().unwrap().len()
+                );
+            }
+        }
     }
 
     #[test]

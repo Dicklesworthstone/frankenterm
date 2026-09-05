@@ -31,7 +31,7 @@ use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use termwiz::input::{InputEvent, KeyEvent, Modifiers, MouseEvent as TermWizMouseEvent};
 use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::{Change, Line, SequenceNo};
@@ -392,13 +392,45 @@ impl TermWizTerminal {
 struct TermWizTerminalRenderTty {
     render_tx: BufWriter<FileDescriptor>,
     screen_size: ScreenSize,
+    bounded_deadline: Option<Instant>,
+    remaining_render_bytes: usize,
 }
+
+const BOUNDED_OVERLAY_RENDER_BYTES: usize = 64 * 1024;
 
 impl std::io::Write for TermWizTerminalRenderTty {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.bounded_deadline {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "overlay render deadline expired",
+                ));
+            }
+            if buf.len() > self.remaining_render_bytes {
+                return Err(std::io::Error::other(
+                    "overlay render byte budget exhausted",
+                ));
+            }
+            // Bounded overlays bypass buffering: a nonblocking write either
+            // advances or reports backpressure. No buffered bytes can be
+            // flushed later by BufWriter::drop after consent has retired.
+            let written = self.render_tx.get_mut().write(buf)?;
+            self.remaining_render_bytes -= written;
+            return Ok(written);
+        }
         self.render_tx.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(deadline) = self.bounded_deadline {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "overlay render deadline expired",
+                ));
+            }
+            return self.render_tx.get_mut().flush();
+        }
         self.render_tx.flush()
     }
 }
@@ -485,7 +517,7 @@ impl termwiz::terminal::Terminal for TermWizTerminal {
     }
 
     fn flush(&mut self) -> termwiz::Result<()> {
-        self.render_tx.render_tx.flush()?;
+        self.render_tx.flush()?;
         Ok(())
     }
 
@@ -520,9 +552,41 @@ pub fn allocate(
     size: TerminalSize,
     config: Arc<dyn TerminalConfiguration + Send + Sync>,
 ) -> anyhow::Result<(TermWizTerminal, Arc<dyn Pane>)> {
-    let render_pipe = Pipe::new().context(
-        "failed to create render pipe for TermWiz terminal — check file descriptor limits",
-    )?;
+    allocate_with_render_deadline(size, config, None)
+}
+
+/// Allocate an expiring overlay with a nonblocking render socket and a 64-KiB
+/// lifetime render budget. Failure to configure that transport refuses the
+/// overlay; ordinary overlays retain their existing buffered pipe transport.
+pub fn allocate_bounded(
+    size: TerminalSize,
+    config: Arc<dyn TerminalConfiguration + Send + Sync>,
+    deadline: Instant,
+) -> anyhow::Result<(TermWizTerminal, Arc<dyn Pane>)> {
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "overlay expired before allocation"
+    );
+    allocate_with_render_deadline(size, config, Some(deadline))
+}
+
+fn allocate_with_render_deadline(
+    size: TerminalSize,
+    config: Arc<dyn TerminalConfiguration + Send + Sync>,
+    deadline: Option<Instant>,
+) -> anyhow::Result<(TermWizTerminal, Arc<dyn Pane>)> {
+    let render_pipe = if deadline.is_some() {
+        let (read, mut write) =
+            filedescriptor::socketpair().context("allocate bounded overlay render socketpair")?;
+        write
+            .set_non_blocking(true)
+            .context("bounded overlay render transport unavailable on this platform")?;
+        Pipe { read, write }
+    } else {
+        Pipe::new().context(
+            "failed to create render pipe for TermWiz terminal — check file descriptor limits",
+        )?
+    };
 
     let (input_tx, input_rx) = channel();
 
@@ -531,6 +595,8 @@ pub fn allocate(
     let tw_term = TermWizTerminal {
         render_tx: TermWizTerminalRenderTty {
             render_tx: BufWriter::new(render_pipe.write),
+            bounded_deadline: deadline,
+            remaining_render_bytes: BOUNDED_OVERLAY_RENDER_BYTES,
             screen_size: ScreenSize {
                 cols: size.cols as usize,
                 rows: size.rows as usize,
@@ -677,6 +743,8 @@ pub fn run<T: Send + 'static, F: Send + 'static + FnOnce(TermWizTerminal) -> any
         let tw_term = TermWizTerminal {
             render_tx: TermWizTerminalRenderTty {
                 render_tx: BufWriter::new(render_pipe.write),
+                bounded_deadline: None,
+                remaining_render_bytes: BOUNDED_OVERLAY_RENDER_BYTES,
                 screen_size: ScreenSize {
                     cols: size.cols as usize,
                     rows: size.rows as usize,
@@ -797,6 +865,102 @@ mod tests {
     use super::*;
     use crate::domain::LocalDomain;
     use crate::Mux;
+
+    fn bounded_render_writer(write: FileDescriptor, deadline: Instant) -> TermWizTerminalRenderTty {
+        TermWizTerminalRenderTty {
+            render_tx: BufWriter::new(write),
+            screen_size: ScreenSize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            },
+            bounded_deadline: Some(deadline),
+            remaining_render_bytes: BOUNDED_OVERLAY_RENDER_BYTES,
+        }
+    }
+
+    #[test]
+    fn osc52_bounded_render_preserves_bytes_and_rejects_deadline_and_budget() {
+        use std::io::Read;
+        let (mut read, mut write) = filedescriptor::socketpair().unwrap();
+        read.set_non_blocking(true).unwrap();
+        write.set_non_blocking(true).unwrap();
+        let mut render = bounded_render_writer(write, Instant::now() + Duration::from_secs(2));
+        let expected = b"public overlay transport canary";
+        render.write_all(expected).unwrap();
+        render.flush().unwrap();
+        let mut observed = vec![0; expected.len()];
+        read.read_exact(&mut observed).unwrap();
+        assert_eq!(observed, expected);
+        assert!(
+            render.render_tx.buffer().is_empty(),
+            "no deferred destructor flush is permitted"
+        );
+        read.set_non_blocking(true).unwrap();
+        render.remaining_render_bytes = 2;
+        assert_eq!(
+            render.write_all(b"abc").unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
+        render.bounded_deadline = Some(Instant::now());
+        assert_eq!(
+            render.write_all(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            render.flush().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let mut extra = [0; 1];
+        assert_eq!(
+            read.read(&mut extra).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        println!(
+            "OSC52_RENDER accepted_bytes={} expired_and_over_budget_bytes=0 buffered_bytes=0",
+            observed.len()
+        );
+    }
+
+    #[test]
+    fn osc52_bounded_render_stalled_reader_settles_without_waiting_for_peer() {
+        let (read, mut write) = filedescriptor::socketpair().unwrap();
+        write.set_non_blocking(true).unwrap();
+        let fill = [b'x'; 4096];
+        let mut filled = 0;
+        let mut backpressured = false;
+        while filled < 8 * 1024 * 1024 {
+            match write.write(&fill) {
+                Ok(0) => panic!("socket accepted zero bytes before backpressure"),
+                Ok(count) => filled += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    backpressured = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected owned-socket fill error: {error}"),
+            }
+        }
+        assert!(
+            backpressured,
+            "bounded 8 MiB fixture must reach actual socket backpressure"
+        );
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut render = bounded_render_writer(write, Instant::now() + Duration::from_secs(2));
+            let result = render.write_all(b"public").map_err(|error| error.kind());
+            completed.send(result).unwrap();
+        });
+        let observed = completion.recv_timeout(Duration::from_millis(500));
+        // If the regression blocks, closing this owned peer releases the
+        // write before joining; elapsed time alone never substitutes for join.
+        drop(read);
+        worker
+            .join()
+            .expect("owned render worker must settle without panic");
+        assert_eq!(observed.unwrap(), Err(std::io::ErrorKind::WouldBlock));
+        println!("OSC52_RENDER actual_socket_backpressure=true prefilled_bytes={filled} worker_joined=true live_window=false");
+    }
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,

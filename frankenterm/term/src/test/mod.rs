@@ -709,6 +709,74 @@ mod osc52_policy {
     }
 
     #[test]
+    fn prompt_parser_defers_exact_bytes_and_revokes_superseded_and_dropped_requests() {
+        struct PromptSink {
+            effects: Arc<RecordingClipboard>,
+            pending: Mutex<Option<Osc52ClipboardRequest>>,
+        }
+        impl Clipboard for PromptSink {
+            fn set_contents(
+                &self,
+                selection: ClipboardSelection,
+                data: Option<String>,
+            ) -> anyhow::Result<()> {
+                self.effects.set_contents(selection, data)
+            }
+            fn request_contents(&self, request: Osc52ClipboardRequest) -> anyhow::Result<()> {
+                *self.pending.lock().unwrap() = Some(request);
+                Ok(())
+            }
+        }
+        let mut fixture = Fixture::new(Osc52WritePolicy::Prompt, 16);
+        let sink = Arc::new(PromptSink {
+            effects: fixture.clipboard.clone(),
+            pending: Mutex::new(None),
+        });
+        let handler: Arc<dyn Clipboard> = sink.clone();
+        fixture.term.set_clipboard(&handler);
+        fixture.term.advance_bytes(b"\x1b]52;c;\x1b\\");
+        let empty = sink.pending.lock().unwrap().take().unwrap();
+        fixture.assert_untouched();
+        assert!(!empty.is_clear());
+        fixture.term.advance_bytes(b"\x1b]52;c\x1b\\");
+        let clear = sink.pending.lock().unwrap().take().unwrap();
+        assert_eq!(
+            empty.apply_with(|_, _| panic!("superseded empty Set reached sink")),
+            Err(Osc52PromptError::AlreadyResolved)
+        );
+        assert!(clear.is_clear());
+        clear
+            .apply_with(|selection, data| sink.set_contents(selection, data))
+            .unwrap();
+        assert_eq!(
+            fixture.clipboard.state.lock().unwrap().calls.as_slice(),
+            &[(ClipboardSelection::Clipboard, None)]
+        );
+        drop(empty);
+        drop(clear);
+        fixture.term.advance_bytes(b"\x1b]52;p;cHVibGlj\x1b\\");
+        let old_config = sink.pending.lock().unwrap().take().unwrap();
+        fixture.term.set_config(Arc::new(Osc52Config {
+            policy: Osc52WritePolicy::Prompt,
+            max_bytes: 16,
+        }));
+        assert_eq!(
+            old_config.apply_with(|_, _| panic!("replaced configuration reached sink")),
+            Err(Osc52PromptError::AlreadyResolved)
+        );
+        drop(old_config);
+        fixture.term.advance_bytes(b"\x1b]52;p;cHVibGlj\x1b\\");
+        let pending = sink.pending.lock().unwrap().take().unwrap();
+        drop(fixture.term);
+        assert_eq!(
+            pending.apply_with(|_, _| panic!("dropped terminal reached sink")),
+            Err(Osc52PromptError::AlreadyResolved)
+        );
+        assert_eq!(sink.effects.state.lock().unwrap().calls.len(), 1);
+        println!("OSC52_PARSER prompt_without_effect superseded_refused clear_effect=1 config_replaced_and_terminal_drop_revoked");
+    }
+
+    #[test]
     fn clear_is_denied_before_the_clipboard_handler() {
         for policy in [Osc52WritePolicy::Deny, Osc52WritePolicy::Prompt] {
             for selection in ["c", "p", ""] {

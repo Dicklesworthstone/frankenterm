@@ -8997,6 +8997,7 @@ pub struct Mux {
     /// caused by spawn operations.  This is per-mux rather than process-global
     /// so test muxes and headless servers cannot inherit GUI policy.
     domain_spawn_lifecycle: OnceLock<Arc<dyn DomainSpawnLifecycle>>,
+    osc52_prompt_handler: RwLock<Option<Arc<Osc52PromptHandler>>>,
     domain_retirements: Arc<DomainRetirementTracker>,
     pending_domain_retirements: Mutex<PendingDomainRetirements>,
     domain_retirement_wakeup: Arc<DomainRetirementWakeup>,
@@ -10586,6 +10587,7 @@ impl Mux {
             domain_registration: Mutex::new(()),
             domain_owner_identity: Arc::new(()),
             domain_spawn_lifecycle: OnceLock::new(),
+            osc52_prompt_handler: RwLock::new(None),
             domain_retirements: Arc::new(DomainRetirementTracker::default()),
             pending_domain_retirements: Mutex::new(PendingDomainRetirements::default()),
             domain_retirement_wakeup: Arc::new(DomainRetirementWakeup::default()),
@@ -20295,6 +20297,194 @@ impl Clipboard for MuxClipboard {
                 )
             })
     }
+
+    fn request_contents(
+        &self,
+        request: frankenterm_term::Osc52ClipboardRequest,
+    ) -> anyhow::Result<()> {
+        let owner = self
+            .target
+            .owner()
+            .ok_or(frankenterm_term::Osc52PromptError::Unavailable)?;
+        let target = Osc52PromptTarget::capture(&owner, self.target.clone())?;
+        let handler = owner
+            .osc52_prompt_handler
+            .read()
+            .clone()
+            .ok_or(frankenterm_term::Osc52PromptError::Unavailable)?;
+        // Admission is synchronous/fallible and holds no registry locks while
+        // calling the frontend. It does not acknowledge clipboard delivery.
+        handler(target, request)
+    }
+}
+
+pub type Osc52PromptHandler = dyn Fn(Osc52PromptTarget, frankenterm_term::Osc52ClipboardRequest) -> anyhow::Result<()>
+    + Send
+    + Sync;
+
+/// Exact originating mux, pane registration, tab allocation, and mux window.
+/// Numeric IDs are diagnostics, never sufficient authority for a delayed grant.
+#[derive(Clone)]
+pub struct Osc52PromptTarget {
+    owner: Weak<Mux>,
+    registration: PaneRegistrationHandle,
+    tab: Weak<Tab>,
+    window_id: WindowId,
+    structural_generation: u64,
+    window_order_revision: WindowOrderRevision,
+}
+
+impl Mux {
+    /// Install only the frontend owned by this mux. Headless muxes have no
+    /// handler and explicitly refuse deferred clipboard consent.
+    pub fn set_osc52_prompt_handler(&self, handler: Arc<Osc52PromptHandler>) {
+        *self.osc52_prompt_handler.write() = Some(handler);
+    }
+}
+
+impl Osc52PromptTarget {
+    fn capture(owner: &Arc<Mux>, registration: PaneRegistrationHandle) -> anyhow::Result<Self> {
+        let operation = registration
+            .operation_guard(owner)
+            .ok_or(frankenterm_term::Osc52PromptError::Revoked)?;
+        let (_, window_id, tab) = operation.exact_location()?;
+        let (structural_generation, window_order_revision) = {
+            let authority = owner.pane_authority.lock();
+            let entry = authority
+                .structural_by_pane_id
+                .get(&registration.pane_id())
+                .filter(|entry| entry.matches_tab(&tab) && entry.matches_pane(operation.pane()))
+                .ok_or(frankenterm_term::Osc52PromptError::Revoked)?;
+            let windows = owner.windows.read();
+            let window = windows
+                .get(&window_id)
+                .filter(|window| {
+                    window.has_exact_mux_identity(owner, window_id)
+                        && window.iter().any(|current| Arc::ptr_eq(current, &tab))
+                })
+                .ok_or(frankenterm_term::Osc52PromptError::Revoked)?;
+            (entry.generation, window.order_revision())
+        };
+        Ok(Self {
+            owner: Arc::downgrade(owner),
+            registration,
+            tab: Arc::downgrade(&tab),
+            window_id,
+            structural_generation,
+            window_order_revision,
+        })
+    }
+
+    pub fn pane_id(&self) -> PaneId {
+        self.registration.pane_id()
+    }
+    pub fn window_id(&self) -> WindowId {
+        self.window_id
+    }
+    pub fn structural_generation(&self) -> u64 {
+        self.structural_generation
+    }
+    pub fn registration(&self) -> &PaneRegistrationHandle {
+        &self.registration
+    }
+    pub fn is_for_owner(&self, owner: &Arc<Mux>) -> bool {
+        Weak::ptr_eq(&self.owner, &Arc::downgrade(owner))
+    }
+    pub fn is_current(&self) -> bool {
+        self.with_current(|| ()).is_ok()
+    }
+
+    /// Recheck the original deadline after acquiring all exact authority locks,
+    /// immediately before enqueue. Waiting for topology must not extend consent.
+    pub fn with_current_until<T>(
+        &self,
+        deadline: Instant,
+        enqueue: impl FnOnce() -> T,
+    ) -> anyhow::Result<T> {
+        self.with_current(|| {
+            if Instant::now() >= deadline {
+                return Err(frankenterm_term::Osc52PromptError::Expired.into());
+            }
+            Ok(enqueue())
+        })?
+    }
+
+    /// A bounded synchronous clipboard enqueue only. The callback must not
+    /// re-enter mux/configuration or wait: exact domain/pane/window authority
+    /// remains locked through the enqueue so a move cannot retarget consent.
+    /// This is not a durable/application ACK for the existing void OS API.
+    pub fn with_current<T>(&self, enqueue: impl FnOnce() -> T) -> anyhow::Result<T> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(frankenterm_term::Osc52PromptError::Revoked)?;
+        anyhow::ensure!(
+            Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner)),
+            "OSC 52 originating mux was replaced"
+        );
+        let operation = self
+            .registration
+            .operation_guard(&owner)
+            .ok_or(frankenterm_term::Osc52PromptError::Revoked)?;
+        let tab = self
+            .tab
+            .upgrade()
+            .ok_or(frankenterm_term::Osc52PromptError::Revoked)?;
+        let _domain_registration = owner.domain_registration.lock();
+        let _pane_registration = owner.pane_registration.lock();
+        anyhow::ensure!(
+            !owner
+                .retired_domain_ids
+                .lock()
+                .contains(&operation.admitted_domain_id()),
+            "OSC 52 originating domain was retired"
+        );
+        anyhow::ensure!(
+            owner
+                .panes
+                .read()
+                .get(&self.pane_id())
+                .is_some_and(|live| self.registration.matches_live_registration(live)),
+            "OSC 52 originating pane registration changed"
+        );
+        let authority = owner.pane_authority.lock();
+        anyhow::ensure!(
+            authority
+                .structural_by_pane_id
+                .get(&self.pane_id())
+                .is_some_and(|entry| {
+                    entry.matches_tab(&tab)
+                        && entry.matches_pane(operation.pane())
+                        && entry.generation == self.structural_generation
+                }),
+            "OSC 52 originating pane moved to another tab"
+        );
+        let tabs = owner.tabs.read();
+        anyhow::ensure!(
+            tabs.get(&tab.tab_id())
+                .is_some_and(|current| Arc::ptr_eq(current, &tab)),
+            "OSC 52 originating tab was replaced"
+        );
+        let windows = owner.windows.read();
+        anyhow::ensure!(
+            windows.get(&self.window_id).is_some_and(|window| {
+                window.has_exact_mux_identity(&owner, self.window_id)
+                    && window.order_revision() == self.window_order_revision
+                    && window.iter().any(|current| Arc::ptr_eq(current, &tab))
+            }),
+            "OSC 52 originating window ownership changed"
+        );
+        // The singleton lock has no mux-lock-taking writers. Keep it through
+        // this bounded enqueue so replacement cannot win after validation.
+        let current_mux = MUX.lock();
+        anyhow::ensure!(
+            current_mux
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &owner)),
+            "OSC 52 originating mux was replaced before enqueue"
+        );
+        Ok(enqueue())
+    }
 }
 
 struct MuxDownloader {
@@ -22420,6 +22610,275 @@ mod tests {
         mux.add_domain(&domain)
             .expect("register exact guarded-mutation test domain");
         domain
+    }
+
+    fn osc52_test_request() -> frankenterm_term::Osc52ClipboardRequest {
+        frankenterm_term::Osc52ClipboardRequest::new(
+            Arc::new(config::TermConfig::with_config(
+                config::ConfigHandle::default_config(),
+            )),
+            ClipboardSelection::Clipboard,
+            Some("public OSC52 consent canary".to_string()),
+        )
+        .expect("native default admits a bounded consent request")
+    }
+
+    #[test]
+    fn osc52_mux_admission_defers_effect_and_refuses_unavailable_and_failed_callbacks() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let _current = ScopedMuxOverride::install(&mux);
+        let (pane, _kills) = KillCountingPane::new(52_440, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let clipboard = MuxClipboard {
+            target: mux.capture_pane_registration(&pane).unwrap(),
+        };
+        let unavailable = osc52_test_request();
+        let error = clipboard.request_contents(unavailable.clone()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<frankenterm_term::Osc52PromptError>(),
+            Some(&frankenterm_term::Osc52PromptError::Unavailable)
+        );
+        unavailable.cancel();
+        drop(unavailable);
+
+        let admitted = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&admitted);
+        mux.set_osc52_prompt_handler(Arc::new(move |target, request| {
+            *observed.lock() = Some((target, request));
+            Ok(())
+        }));
+        let request = osc52_test_request();
+        let request_id = request.id();
+        clipboard.request_contents(request).unwrap();
+        let (target, request) = admitted.lock().take().unwrap();
+        assert_eq!(target.window_id(), window_id);
+        assert_eq!(target.pane_id(), pane.pane_id());
+        let mut effects = Vec::new();
+        assert!(
+            effects.is_empty(),
+            "admission alone must never invoke the sink"
+        );
+        request
+            .apply_with(|selection, data| {
+                target.with_current(|| {
+                    effects.push((selection, data));
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            effects,
+            vec![(
+                ClipboardSelection::Clipboard,
+                Some("public OSC52 consent canary".to_string())
+            )]
+        );
+        assert_eq!(
+            request.apply_with(|_, _| panic!("duplicate grant invoked the sink")),
+            Err(frankenterm_term::Osc52PromptError::AlreadyResolved)
+        );
+        drop(request);
+
+        let rejected = osc52_test_request();
+        mux.set_osc52_prompt_handler(Arc::new(|_, _| {
+            Err(frankenterm_term::Osc52PromptError::Overloaded.into())
+        }));
+        let error = clipboard.request_contents(rejected.clone()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<frankenterm_term::Osc52PromptError>(),
+            Some(&frankenterm_term::Osc52PromptError::Overloaded)
+        );
+        rejected.cancel();
+        drop(rejected);
+
+        let failed = osc52_test_request();
+        let mut attempts = 0;
+        assert_eq!(
+            failed.apply_with(|_, _| {
+                target.with_current(|| {
+                    attempts += 1;
+                })?;
+                anyhow::bail!("synthetic clipboard callback failed");
+            }),
+            Err(frankenterm_term::Osc52PromptError::CallbackFailed)
+        );
+        assert_eq!(
+            failed.apply_with(|_, _| panic!("failed callback was retried")),
+            Err(frankenterm_term::Osc52PromptError::AlreadyResolved)
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(effects.len(), 1);
+        println!("OSC52_MUX request={request_id} pane={} window={window_id} admission_effects=0 accepted_effects=1 failed_attempts=1 delivery_ack=unproven", pane.pane_id());
+    }
+
+    #[test]
+    fn osc52_mux_grant_rejects_moved_returned_and_replaced_origin_authority() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let _current = ScopedMuxOverride::install(&mux);
+        let (pane, _kills) = KillCountingPane::new(52_441, test_size());
+        let (tab, original_window) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux.capture_pane_registration(&pane).unwrap();
+        let capture = || Osc52PromptTarget::capture(&mux, registration.clone()).unwrap();
+        let original = capture();
+        assert!(original.is_current());
+        let destination = mux.new_empty_window(None, None);
+        mux.move_tab_between_windows(tab.tab_id(), *destination, None)
+            .unwrap();
+        assert!(original
+            .with_current(|| panic!("moved window inherited consent"))
+            .is_err());
+        mux.move_tab_between_windows(tab.tab_id(), original_window, None)
+            .unwrap();
+        assert!(original
+            .with_current(|| panic!("returned window revived consent"))
+            .is_err());
+
+        let before_structural_change = capture();
+        let removed = tab.remove_pane(pane.pane_id()).unwrap();
+        assert!(Arc::ptr_eq(&removed, &pane));
+        tab.assign_pane(&pane);
+        assert!(before_structural_change
+            .with_current(|| panic!("returned structural generation inherited consent"))
+            .is_err());
+        let current = capture();
+        let request = osc52_test_request();
+        let replacement_mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&replacement_mux);
+        assert_eq!(
+            request.apply_with(|_, _| current.with_current(|| {
+                panic!("replacement mux received origin consent");
+            })),
+            Err(frankenterm_term::Osc52PromptError::CallbackFailed)
+        );
+        Mux::set_mux(&mux);
+        assert_eq!(
+            request.apply_with(|_, _| panic!("rejected callback became retryable")),
+            Err(frankenterm_term::Osc52PromptError::AlreadyResolved)
+        );
+        drop(request);
+
+        let before_replacement = capture();
+        mux.remove_pane(pane.pane_id());
+        mux.remove_tab(tab.tab_id());
+        let (replacement, _replacement_kills) = KillCountingPane::new(pane.pane_id(), test_size());
+        let (_replacement_tab, _replacement_window) =
+            register_attached_test_pane(&global_guard, &mux, &replacement);
+        assert!(before_replacement
+            .with_current(|| panic!("same-ID successor inherited consent"))
+            .is_err());
+        let next =
+            Osc52PromptTarget::capture(&mux, mux.capture_pane_registration(&replacement).unwrap())
+                .unwrap();
+        assert!(
+            next.is_current(),
+            "negative controls must preserve a usable replacement"
+        );
+        println!("OSC52_MUX_AUTHORITY moved_returned_replaced_zero_effect replacement_usable=true");
+    }
+
+    #[test]
+    fn osc52_mux_apply_cancellation_and_retirement_release_owned_locks() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let _current = ScopedMuxOverride::install(&mux);
+        let (pane, _kills) = KillCountingPane::new(52_442, test_size());
+        let (_tab, _window) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let target =
+            Osc52PromptTarget::capture(&mux, mux.capture_pane_registration(&pane).unwrap())
+                .unwrap();
+        let request = osc52_test_request();
+        let applying = request.clone();
+        let (entered, entry) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let (applied, application) = std::sync::mpsc::sync_channel(1);
+        let apply_worker = std::thread::spawn(move || {
+            let result = applying.apply_with(|_, _| {
+                target.with_current(|| {
+                    entered.send(()).unwrap();
+                    // Test-only hold in the real enqueue seam. The production
+                    // callback performs a synchronous OS enqueue and never waits.
+                    released.recv_timeout(Duration::from_secs(2)).unwrap();
+                })
+            });
+            applied.send(result).unwrap();
+        });
+        entry.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cancelling = request.clone();
+        let (cancelled, cancellation) = std::sync::mpsc::sync_channel(1);
+        let cancel_worker = std::thread::spawn(move || {
+            cancelling.cancel();
+            cancelled.send(()).unwrap();
+        });
+        let retiring_mux = Arc::clone(&mux);
+        let (retired, retirement) = std::sync::mpsc::sync_channel(1);
+        let retire_worker = std::thread::spawn(move || {
+            retiring_mux.remove_pane(52_442);
+            retired.send(()).unwrap();
+        });
+        release.send(()).unwrap();
+        assert_eq!(
+            application.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Ok(())
+        );
+        cancellation.recv_timeout(Duration::from_secs(3)).unwrap();
+        retirement.recv_timeout(Duration::from_secs(3)).unwrap();
+        apply_worker.join().unwrap();
+        cancel_worker.join().unwrap();
+        retire_worker.join().unwrap();
+        assert!(!request.is_pending());
+        assert_eq!(
+            request.apply_with(|_, _| panic!("settled request repeated its effect")),
+            Err(frankenterm_term::Osc52PromptError::AlreadyResolved)
+        );
+        assert!(mux.get_pane(52_442).is_none());
+        println!(
+            "OSC52_LOCKS apply_cancel_retire_workers_joined=3 accepted_enqueue=1 repeated_effect=0"
+        );
+    }
+
+    #[test]
+    fn osc52_mux_grant_deadline_is_rechecked_after_authority_lock_wait() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let _current = ScopedMuxOverride::install(&mux);
+        let (pane, _kills) = KillCountingPane::new(52_443, test_size());
+        let (_tab, _window) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let target =
+            Osc52PromptTarget::capture(&mux, mux.capture_pane_registration(&pane).unwrap())
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let window_hold = mux.windows.write();
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result: anyhow::Result<()> = target.with_current_until(deadline, || {
+                panic!("authority contention extended an expired grant");
+            });
+            completed.send(result).unwrap();
+        });
+        while mux.pane_registration.try_lock().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "worker must reach the real authority lock wait while its grant is live"
+            );
+            std::thread::yield_now();
+        }
+        assert!(Instant::now() < deadline);
+        // This wait advances the original deadline, not a settlement guess.
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+        );
+        drop(window_hold);
+        let error = completion
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(
+            error.downcast_ref::<frankenterm_term::Osc52PromptError>(),
+            Some(&frankenterm_term::Osc52PromptError::Expired)
+        );
+        println!("OSC52_DEADLINE live_at_lock_wait=true expired_before_enqueue=true effects=0 worker_joined=true");
     }
 
     #[test]

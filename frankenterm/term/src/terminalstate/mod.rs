@@ -455,6 +455,7 @@ pub struct TerminalState {
     dpi: u32,
 
     clipboard: Option<Arc<dyn Clipboard>>,
+    osc52_prompt: crate::terminal::Osc52PromptSlot,
     device_control_handler: Option<Box<dyn DeviceControlHandler>>,
     alert_handler: Option<Box<dyn AlertHandler>>,
     download_handler: Option<Arc<dyn DownloadHandler>>,
@@ -789,6 +790,7 @@ impl TerminalState {
             pixel_width: size.pixel_width,
             dpi: size.dpi,
             clipboard: None,
+            osc52_prompt: crate::terminal::Osc52PromptSlot::default(),
             device_control_handler: None,
             alert_handler: None,
             download_handler: None,
@@ -905,6 +907,7 @@ impl TerminalState {
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
+        self.osc52_prompt.replace(None);
         let previous_unicode_version = self.config.unicode_version();
         let should_refresh_unicode_version = self.unicode_version_stack.is_empty()
             && self.unicode_version == previous_unicode_version;
@@ -924,6 +927,7 @@ impl TerminalState {
     }
 
     pub fn set_clipboard(&mut self, clipboard: &Arc<dyn Clipboard>) {
+        self.osc52_prompt.replace(None);
         self.clipboard.replace(Arc::clone(clipboard));
     }
 

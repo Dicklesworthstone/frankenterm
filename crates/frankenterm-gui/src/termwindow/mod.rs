@@ -313,6 +313,7 @@ pub struct OverlayState {
     /// same-numbered mux pane.
     registration: Option<PaneRegistrationHandle>,
     cancellation_ticket: OverlayCancellationTicket,
+    osc52_request: Option<wezterm_term::Osc52ClipboardRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8096,6 +8097,7 @@ impl TermWindow {
             key_table_state: KeyTableState::default(),
             registration,
             cancellation_ticket,
+            osc52_request: None,
         }
     }
 
@@ -8175,6 +8177,7 @@ impl TermWindow {
             key_table_state: KeyTableState::default(),
             registration: Some(current),
             cancellation_ticket: ticket,
+            osc52_request: None,
         })
     }
 
@@ -8185,6 +8188,10 @@ impl TermWindow {
     /// replaced. GUI-only overlays intentionally carry no registration and
     /// therefore cannot kill the underlying same-numbered pane.
     fn retire_overlay_registration(_slot: OverlaySlot, overlay: OverlayState) {
+        overlay.cancellation_ticket.request_cancellation();
+        if let Some(request) = &overlay.osc52_request {
+            request.cancel();
+        }
         let pane_id = overlay.pane.pane_id();
         match overlay.registration {
             Some(registration) => {

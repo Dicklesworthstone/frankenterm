@@ -163,6 +163,40 @@ where
     T: Send + 'static,
     F: Send + 'static + FnOnce(PaneId, TermWizTerminal) -> anyhow::Result<T>,
 {
+    start_overlay_pane_with_deadline(term_window, pane, None, func)
+}
+
+pub(crate) fn start_bounded_overlay_pane<T, F>(
+    term_window: &TermWindow,
+    pane: &Arc<dyn Pane>,
+    deadline: std::time::Instant,
+    func: F,
+) -> anyhow::Result<(
+    Arc<dyn Pane>,
+    OverlayCancellationTicket,
+    Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>>>>,
+)>
+where
+    T: Send + 'static,
+    F: Send + 'static + FnOnce(PaneId, TermWizTerminal) -> anyhow::Result<T>,
+{
+    start_overlay_pane_with_deadline(term_window, pane, Some(deadline), func)
+}
+
+fn start_overlay_pane_with_deadline<T, F>(
+    term_window: &TermWindow,
+    pane: &Arc<dyn Pane>,
+    deadline: Option<std::time::Instant>,
+    func: F,
+) -> anyhow::Result<(
+    Arc<dyn Pane>,
+    OverlayCancellationTicket,
+    Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>>>>,
+)>
+where
+    T: Send + 'static,
+    F: Send + 'static + FnOnce(PaneId, TermWizTerminal) -> anyhow::Result<T>,
+{
     let pane_id = pane.pane_id();
     let dims = pane.get_dimensions();
     let window = term_window
@@ -178,7 +212,10 @@ where
     };
     let term_config: Arc<dyn TerminalConfiguration + Send + Sync> =
         Arc::new(config::TermConfig::with_config(term_window.config.clone()));
-    let (tw_term, tw_tab) = allocate(size, term_config)?;
+    let (tw_term, tw_tab) = match deadline {
+        Some(deadline) => mux::termwiztermtab::allocate_bounded(size, term_config, deadline)?,
+        None => allocate(size, term_config)?,
+    };
     let cancellation_ticket =
         match TermWindow::mint_pane_overlay_cancellation_ticket(pane_id, &tw_tab) {
             Ok(ticket) => ticket,

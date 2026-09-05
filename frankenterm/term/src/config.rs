@@ -22,16 +22,23 @@ pub enum NewlineCanon {
 ///
 /// Mirrors `frankenterm_core::osc_protocol_integration::Osc52PolicySlug`
 /// without taking the cross-crate dependency. The terminal-state
-/// crate sees only the local enum. Native GUI configuration and
-/// approval-prompt integration remain follow-on work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// crate sees only the local enum. Native configuration uses this same enum.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    frankenterm_dynamic::FromDynamic,
+    frankenterm_dynamic::ToDynamic,
+)]
 pub enum Osc52WritePolicy {
     /// Permit OSC 52 clipboard writes (subject to the size cap from
     /// [`TerminalConfiguration::osc52_write_max_bytes`]).
     Allow,
-    /// Require operator approval before writing. The term-state
-    /// layer drops this request without changing the clipboard;
-    /// no native GUI approval prompt is wired yet.
+    /// Require one bounded operator approval before writing. Embeddings without
+    /// a prompt handler refuse the request without changing the clipboard.
     Prompt,
     /// Refuse the write. The operator-facing error path is silent
     /// — per the bead's privacy rule, denied requests do not log
@@ -1178,13 +1185,12 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// — a trust gap when shell output is attacker-influenced.
     ///
     /// Default `Allow` preserves the prior behavior so existing
-    /// operator workflows (yank-via-osc52 in vim/tmux) keep working;
-    /// embeddings can override to `Prompt` or `Deny`. Native GUI
-    /// configuration does not yet expose this override.
+    /// operator workflows (yank-via-osc52 in vim/tmux) keep working.
+    /// Native `TermConfig` overrides this with the parsed `osc52_write_policy`,
+    /// whose default is `Prompt`.
     ///
-    /// `Prompt` is treated as `Deny` at this layer because the
-    /// terminal-state crate has no UI surface to ask the operator;
-    /// native GUI approval-prompt integration remains unwired.
+    /// `Prompt` routes to the embedding's fallible deferred-consent handler;
+    /// absence of that handler is an explicit refusal.
     fn osc52_write_policy(&self) -> Osc52WritePolicy {
         Osc52WritePolicy::Allow
     }

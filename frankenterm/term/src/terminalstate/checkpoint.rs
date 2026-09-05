@@ -4216,6 +4216,7 @@ impl TerminalState {
             pixel_height: size.pixel_height,
             dpi,
             clipboard: None,
+            osc52_prompt: crate::terminal::Osc52PromptSlot::default(),
             device_control_handler: None,
             alert_handler: None,
             download_handler: None,

@@ -28,6 +28,12 @@ pub trait Clipboard: Send + Sync {
         selection: ClipboardSelection,
         data: Option<String>,
     ) -> anyhow::Result<()>;
+
+    /// Admit a bounded consent request. Success means queued for an operator,
+    /// not delivered to the operating-system clipboard.
+    fn request_contents(&self, _request: Osc52ClipboardRequest) -> anyhow::Result<()> {
+        Err(Osc52PromptError::Unavailable.into())
+    }
 }
 
 impl Clipboard for Box<dyn Clipboard> {
@@ -37,6 +43,296 @@ impl Clipboard for Box<dyn Clipboard> {
         data: Option<String>,
     ) -> anyhow::Result<()> {
         self.as_ref().set_contents(selection, data)
+    }
+
+    fn request_contents(&self, request: Osc52ClipboardRequest) -> anyhow::Result<()> {
+        self.as_ref().request_contents(request)
+    }
+}
+
+/// Finite, payload-free outcomes of one OSC 52 consent request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Osc52PromptError {
+    Unavailable,
+    Overloaded,
+    Oversized,
+    Cancelled,
+    Expired,
+    Revoked,
+    AlreadyResolved,
+    CallbackFailed,
+}
+
+impl std::fmt::Display for Osc52PromptError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "OSC 52 consent {:?}", self)
+    }
+}
+
+impl std::error::Error for Osc52PromptError {}
+
+const OSC52_PENDING_MAX_ITEMS: usize = 8;
+const OSC52_PENDING_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const OSC52_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+static OSC52_NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static OSC52_PENDING_BUDGET: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+struct Osc52PendingPermit {
+    bytes: usize,
+}
+
+impl Osc52PendingPermit {
+    fn acquire(bytes: usize) -> Result<Self, Osc52PromptError> {
+        let mut budget = OSC52_PENDING_BUDGET
+            .lock()
+            .map_err(|_| Osc52PromptError::Overloaded)?;
+        reserve_osc52_budget(&mut budget, bytes)?;
+        Ok(Self { bytes })
+    }
+}
+
+fn reserve_osc52_budget(budget: &mut (usize, usize), bytes: usize) -> Result<(), Osc52PromptError> {
+    if budget.0 >= OSC52_PENDING_MAX_ITEMS
+        || bytes > OSC52_PENDING_MAX_BYTES.saturating_sub(budget.1)
+    {
+        return Err(Osc52PromptError::Overloaded);
+    }
+    budget.0 += 1;
+    budget.1 += bytes;
+    Ok(())
+}
+
+impl Drop for Osc52PendingPermit {
+    fn drop(&mut self) {
+        let mut budget = OSC52_PENDING_BUDGET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget.0 -= 1;
+        budget.1 -= self.bytes;
+    }
+}
+
+struct Osc52PromptState {
+    // Outer None means consumed; inner None is Clear, Some("") is empty Set.
+    data: Option<Option<String>>,
+    outcome: Option<Result<(), Osc52PromptError>>,
+}
+
+struct Osc52PromptInner {
+    id: u64,
+    selection: ClipboardSelection,
+    decoded_bytes: usize,
+    clear: bool,
+    deadline: std::time::Instant,
+    config: Arc<dyn TerminalConfiguration>,
+    revision: config::TerminalConfigurationRevision,
+    state: std::sync::Mutex<Osc52PromptState>,
+    _permit: Osc52PendingPermit,
+}
+
+/// One operator decision, bounded by 30 seconds and a process-wide 8-item / 8-MiB
+/// payload budget. Clones share the same one-shot state; they do not copy bytes.
+/// Target pane/window authority is supplied by the embedding at admission/apply.
+#[derive(Clone)]
+pub struct Osc52ClipboardRequest(Arc<Osc52PromptInner>);
+
+impl std::fmt::Debug for Osc52ClipboardRequest {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("Osc52ClipboardRequest")
+            .field("id", &self.id())
+            .field("selection", &self.selection())
+            .field("decoded_bytes", &self.decoded_bytes())
+            .field("clear", &self.is_clear())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Osc52ClipboardRequest {
+    pub fn new(
+        config: Arc<dyn TerminalConfiguration>,
+        selection: ClipboardSelection,
+        data: Option<String>,
+    ) -> Result<Self, Osc52PromptError> {
+        let decoded_bytes = data.as_ref().map_or(0, String::len);
+        if decoded_bytes > config.osc52_write_max_bytes() {
+            return Err(Osc52PromptError::Oversized);
+        }
+        if config.osc52_write_policy() != config::Osc52WritePolicy::Prompt {
+            return Err(Osc52PromptError::Revoked);
+        }
+        let permit = Osc52PendingPermit::acquire(decoded_bytes)?;
+        let id = OSC52_NEXT_REQUEST
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .map_err(|_| Osc52PromptError::Overloaded)?;
+        Ok(Self(Arc::new(Osc52PromptInner {
+            id,
+            selection,
+            decoded_bytes,
+            clear: data.is_none(),
+            deadline: std::time::Instant::now() + OSC52_PROMPT_TIMEOUT,
+            revision: config.revision(),
+            config,
+            state: std::sync::Mutex::new(Osc52PromptState {
+                data: Some(data),
+                outcome: None,
+            }),
+            _permit: permit,
+        })))
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0.id
+    }
+    pub fn selection(&self) -> ClipboardSelection {
+        self.0.selection
+    }
+    pub fn decoded_bytes(&self) -> usize {
+        self.0.decoded_bytes
+    }
+    pub fn is_clear(&self) -> bool {
+        self.0.clear
+    }
+    pub fn deadline(&self) -> std::time::Instant {
+        self.0.deadline
+    }
+
+    fn invalid_at(&self, now: std::time::Instant) -> Option<Osc52PromptError> {
+        if now >= self.0.deadline {
+            Some(Osc52PromptError::Expired)
+        } else if self.0.config.revision() != self.0.revision
+            || self.0.config.osc52_write_policy() != config::Osc52WritePolicy::Prompt
+            || self.decoded_bytes() > self.0.config.osc52_write_max_bytes()
+        {
+            Some(Osc52PromptError::Revoked)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        if let Some(reason) = self.invalid_at(std::time::Instant::now()) {
+            self.cancel_with(reason);
+        }
+        self.0
+            .state
+            .lock()
+            .is_ok_and(|state| state.outcome.is_none())
+    }
+
+    pub fn cancel(&self) {
+        self.cancel_with(Osc52PromptError::Cancelled);
+    }
+
+    fn cancel_with(&self, reason: Osc52PromptError) {
+        if let Ok(mut state) = self.0.state.lock() {
+            if state.outcome.is_none() {
+                state.data.take();
+                state.outcome = Some(Err(reason));
+                log::info!(
+                    "OSC 52 consent request={} outcome={reason:?} bytes={}",
+                    self.id(),
+                    self.decoded_bytes()
+                );
+            }
+        }
+    }
+
+    /// Invoke a synchronous fallible sink at most once after explicit consent.
+    /// The embedding must hold exact pane/window authority for this call. A
+    /// successful void OS enqueue is not an application acknowledgement.
+    pub fn apply_with(
+        &self,
+        sink: impl FnOnce(ClipboardSelection, Option<String>) -> anyhow::Result<()>,
+    ) -> Result<(), Osc52PromptError> {
+        self.apply_at(std::time::Instant::now, sink)
+    }
+
+    fn apply_at(
+        &self,
+        now: impl FnOnce() -> std::time::Instant,
+        sink: impl FnOnce(ClipboardSelection, Option<String>) -> anyhow::Result<()>,
+    ) -> Result<(), Osc52PromptError> {
+        // A callback may dispose its terminal or attempt a duplicate grant.
+        // Already-consumed requests must not reacquire the configuration gate.
+        if self
+            .0
+            .state
+            .lock()
+            .map_err(|_| Osc52PromptError::CallbackFailed)?
+            .outcome
+            .is_some()
+        {
+            return Err(Osc52PromptError::AlreadyResolved);
+        }
+        // Reuse the configuration's synchronous semantic-mutation exclusion;
+        // neither the sink nor this transaction performs async work.
+        let _config_lease = self.0.config.acquire_recovery_activation_lease();
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| Osc52PromptError::CallbackFailed)?;
+        if state.outcome.is_some() {
+            return Err(Osc52PromptError::AlreadyResolved);
+        }
+        if let Some(reason) = self.invalid_at(now()) {
+            state.data.take();
+            state.outcome = Some(Err(reason));
+            log::info!(
+                "OSC 52 consent request={} outcome={reason:?} bytes={}",
+                self.id(),
+                self.decoded_bytes()
+            );
+            return Err(reason);
+        }
+        let data = state.data.take().ok_or(Osc52PromptError::AlreadyResolved)?;
+        // A callback panic cannot leave an apparently pending/retryable grant.
+        state.outcome = Some(Err(Osc52PromptError::CallbackFailed));
+        // Consumption is the one-shot decision boundary. Do not retain this
+        // mutex across the callback: releasing exact mux authority can dispose
+        // the originating terminal, whose prompt-slot Drop calls cancel().
+        drop(state);
+        let outcome = sink(self.selection(), data).map_err(|_| Osc52PromptError::CallbackFailed);
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| Osc52PromptError::CallbackFailed)?;
+        state.outcome = Some(outcome);
+        log::info!(
+            "OSC 52 consent request={} outcome={outcome:?} bytes={}",
+            self.id(),
+            self.decoded_bytes()
+        );
+        outcome
+    }
+}
+
+/// Replacing terminal configuration/clipboard handlers or dropping the terminal
+/// revokes its pending request, even if GUI work still holds a clone.
+#[derive(Default)]
+pub(crate) struct Osc52PromptSlot(std::sync::Mutex<Option<std::sync::Weak<Osc52PromptInner>>>);
+
+impl Osc52PromptSlot {
+    pub(crate) fn replace(&self, next: Option<Osc52ClipboardRequest>) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = slot.take().and_then(|request| request.upgrade()) {
+            Osc52ClipboardRequest(previous).cancel();
+        }
+        *slot = next.map(|request| Arc::downgrade(&request.0));
+    }
+}
+
+impl Drop for Osc52PromptSlot {
+    fn drop(&mut self) {
+        self.replace(None);
     }
 }
 
@@ -846,6 +1142,180 @@ mod tests {
     use crate::{CellAttributes, CursorPosition, Line};
     use proptest::prelude::*;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ConsentConfig;
+    impl TerminalConfiguration for ConsentConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+        fn osc52_write_policy(&self) -> config::Osc52WritePolicy {
+            config::Osc52WritePolicy::Prompt
+        }
+    }
+
+    #[test]
+    fn osc52_consent_preserves_clear_and_empty_set_and_is_one_shot() {
+        let mut effects = Vec::new();
+        for data in [
+            None,
+            Some(String::new()),
+            Some("public consent canary".to_string()),
+        ] {
+            let request = Osc52ClipboardRequest::new(
+                Arc::new(ConsentConfig),
+                ClipboardSelection::PrimarySelection,
+                data.clone(),
+            )
+            .unwrap();
+            assert!(request.is_pending());
+            assert_eq!(request.is_clear(), data.is_none());
+            let duplicate = request.clone();
+            request
+                .apply_with(|selection, value| {
+                    effects.push((selection, value));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                effects.last(),
+                Some(&(ClipboardSelection::PrimarySelection, data))
+            );
+            assert_eq!(
+                duplicate.apply_with(|_, _| panic!("duplicate grant reached sink")),
+                Err(Osc52PromptError::AlreadyResolved)
+            );
+        }
+        assert_eq!(effects.len(), 3);
+        println!("OSC52_CONSENT distinct_clear_empty_set one_grant effects=3");
+    }
+
+    #[test]
+    fn osc52_consent_expiry_cancellation_and_callback_failure_are_terminal() {
+        let make = || {
+            Osc52ClipboardRequest::new(
+                Arc::new(ConsentConfig),
+                ClipboardSelection::Clipboard,
+                Some("public".to_string()),
+            )
+            .unwrap()
+        };
+        let expired = make();
+        assert_eq!(
+            expired.apply_at(
+                || expired.deadline(),
+                |_, _| panic!("expired request reached sink")
+            ),
+            Err(Osc52PromptError::Expired)
+        );
+        drop(expired);
+        let cancelled = make();
+        cancelled.cancel();
+        assert_eq!(
+            cancelled.apply_with(|_, _| panic!("cancelled request reached sink")),
+            Err(Osc52PromptError::AlreadyResolved)
+        );
+        drop(cancelled);
+        let failed = make();
+        let mut attempts = 0;
+        assert_eq!(
+            failed.apply_with(|_, _| {
+                attempts += 1;
+                anyhow::bail!("synthetic callback failure");
+            }),
+            Err(Osc52PromptError::CallbackFailed)
+        );
+        assert_eq!(
+            failed.apply_with(|_, _| panic!("failed callback was retried")),
+            Err(Osc52PromptError::AlreadyResolved)
+        );
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            Osc52PendingPermit::acquire(OSC52_PENDING_MAX_BYTES + 1),
+            Err(Osc52PromptError::Overloaded)
+        ));
+        println!("OSC52_CONSENT expired_cancelled_no_effect callback_attempts=1 no_retry oversized_budget_refused");
+    }
+
+    #[test]
+    fn osc52_consent_budget_rejects_count_and_bytes_without_changing_accounting() {
+        let mut budget = (0, 0);
+        for _ in 0..OSC52_PENDING_MAX_ITEMS {
+            reserve_osc52_budget(&mut budget, 0).unwrap();
+        }
+        let before = budget;
+        assert_eq!(
+            reserve_osc52_budget(&mut budget, 0),
+            Err(Osc52PromptError::Overloaded)
+        );
+        assert_eq!(
+            budget, before,
+            "empty requests still consume bounded item slots"
+        );
+        let mut budget = (0, 0);
+        reserve_osc52_budget(&mut budget, OSC52_PENDING_MAX_BYTES).unwrap();
+        let before = budget;
+        assert_eq!(
+            reserve_osc52_budget(&mut budget, 1),
+            Err(Osc52PromptError::Overloaded)
+        );
+        assert_eq!(budget, before);
+        println!("OSC52_BUDGET item_limit=8 byte_limit=8388608 rejected_accounting_unchanged=true");
+    }
+
+    #[test]
+    fn osc52_consent_callback_can_drop_its_origin_terminal_without_reentrant_locking() {
+        struct Capture(std::sync::Mutex<Option<Osc52ClipboardRequest>>);
+        impl Clipboard for Capture {
+            fn set_contents(&self, _: ClipboardSelection, _: Option<String>) -> anyhow::Result<()> {
+                anyhow::bail!("Prompt must not call the immediate clipboard path")
+            }
+            fn request_contents(&self, request: Osc52ClipboardRequest) -> anyhow::Result<()> {
+                *self.0.lock().unwrap() = Some(request);
+                Ok(())
+            }
+        }
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(ConsentConfig);
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 2,
+                cols: 10,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::clone(&config),
+            "FrankenTerm",
+            "osc52-drop-test",
+            Box::new(std::io::sink()),
+        );
+        let capture = Arc::new(Capture(std::sync::Mutex::new(None)));
+        let clipboard: Arc<dyn Clipboard> = capture.clone();
+        terminal.set_clipboard(&clipboard);
+        terminal.advance_bytes(b"\x1b]52;c;cHVibGlj\x1b\\");
+        let request = capture.0.lock().unwrap().take().unwrap();
+        let mut effects = 0;
+        request
+            .apply_with(|_, _| {
+                effects += 1;
+                assert_eq!(
+                    request.apply_with(|_, _| panic!("recursive grant repeated the sink")),
+                    Err(Osc52PromptError::AlreadyResolved)
+                );
+                drop(terminal);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(effects, 1);
+        assert!(!request.is_pending());
+        assert_eq!(
+            request.apply_with(|_, _| panic!("terminal drop made the grant retryable")),
+            Err(Osc52PromptError::AlreadyResolved)
+        );
+        println!(
+            "OSC52_CONSENT callback_dropped_terminal=true recursive_grant_refused=true effects=1"
+        );
+    }
 
     #[derive(Debug)]
     struct PropTermConfig;

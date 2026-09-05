@@ -1074,6 +1074,8 @@ impl<'a> Performer<'a> {
     }
 
     fn osc52_write_selection(&self, selection: Selection, selection_data: Option<String>) {
+        // A newer terminal request supersedes consent for the prior bytes.
+        self.osc52_prompt.replace(None);
         // Clearing a selection is also a clipboard write. Route both forms
         // through the same policy gate, treating a clear as a zero-byte payload
         // while preserving None versus Some("") for the clipboard handler.
@@ -1097,12 +1099,32 @@ impl<'a> Performer<'a> {
                 }
             }
             crate::config::Osc52WriteOutcome::Prompt { .. } => {
-                // No GUI approval prompt is wired yet. Do not mutate the
-                // clipboard before approval; log without clipboard contents.
-                log::info!(
-                    "OSC 52 write deferred to operator prompt \
-                     (no GUI prompt wired yet — request dropped)"
-                );
+                let admitted = (|| -> anyhow::Result<()> {
+                    let clipboard = self
+                        .clipboard
+                        .as_ref()
+                        .ok_or(crate::Osc52PromptError::Unavailable)?;
+                    let request = crate::Osc52ClipboardRequest::new(
+                        self.config.clone(),
+                        selection_to_selection(selection),
+                        selection_data,
+                    )?;
+                    self.osc52_prompt.replace(Some(request.clone()));
+                    if clipboard.request_contents(request.clone()).is_err() {
+                        request.cancel();
+                        return Err(crate::Osc52PromptError::Unavailable.into());
+                    }
+                    log::info!(
+                        "OSC 52 consent queued request={} bytes={}",
+                        request.id(),
+                        request.decoded_bytes()
+                    );
+                    Ok(())
+                })();
+                if admitted.is_err() {
+                    self.osc52_prompt.replace(None);
+                    error!("OSC 52 consent unavailable or refused; no clipboard effect");
+                }
             }
             crate::config::Osc52WriteOutcome::DenyByPolicy => {
                 log::debug!(
