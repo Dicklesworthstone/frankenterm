@@ -56,10 +56,49 @@ case "$CODEC_VERSION" in
 esac
 
 D="${2:-$(mktemp -d "${TMPDIR:-/tmp}/ft-smoke-XXXXXX")}"
-mkdir -p "$D/.ft"
-chmod 700 "$D/.ft"
-printf '[storage]\ndb_path = "ft.db"\n' > "$D/ft.toml"
+if [ -d "$D" ] && [ -n "$(ls -A "$D")" ]; then
+  echo "refusing to overwrite a nonempty evidence directory: $D" >&2
+  exit 2
+fi
+mkdir -p "$D/.ft" "$D/home" "$D/config" "$D/cache" "$D/data" "$D/state" "$D/runtime" "$D/tmp"
+D=$(cd "$D" && pwd -P) || exit 2
+chmod 700 "$D" "$D/.ft" "$D/runtime"
+SOCK="$D/mux.sock"
+[ "${#SOCK}" -le 90 ] || { echo "private socket path too long; choose a shorter evidence directory" >&2; exit 2; }
+KILL_SWITCH_SMOKE="${FT_SMOKE_KILL_SWITCH:-0}"
+PYTHON=$(command -v python3) || exit 2
+case "$PYTHON" in /*) ;; *) echo "python3 must resolve to an absolute path" >&2; exit 2 ;; esac
+"$PYTHON" - "$D" "$SOCK" "$KILL_SWITCH_SMOKE" <<'PY'
+import json, pathlib, sys
+root, socket, stopped = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3] == "1"
+quote = json.dumps
+(root / "frankenterm.toml").write_text(
+    '[[unix_domains]]\nname = "rc3-owned"\nsocket_path = ' + quote(socket) + '\nno_serve_automatically = true\n'
+)
+config = '[storage]\ndb_path = "ft.db"\n[vendored]\nmux_socket_path = ' + quote(socket) + '\n'
+if stopped:
+    config += ('[workflows]\nenabled = ["handle_compaction"]\nauto_run_allowlist = ["handle_compaction"]\n'
+               'max_concurrent = 1\n[workflows.compaction_prompts.by_agent]\n'
+               'claude_code = "RC3_FENCE_EFFECT\\n"\n')
+(root / "ft.toml").write_text(config)
+PY
+[ "$?" -eq 0 ] || exit 2
 chmod 600 "$D/ft.toml"
+HERMETIC_ENV=(
+  "PATH=$BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" "LANG=C" "HOME=$D/home"
+  "XDG_CONFIG_HOME=$D/config" "XDG_CACHE_HOME=$D/cache" "XDG_DATA_HOME=$D/data"
+  "XDG_STATE_HOME=$D/state" "XDG_RUNTIME_DIR=$D/runtime" "TMPDIR=$D/tmp"
+  "WEZTERM_UNIX_SOCKET=$SOCK" "FRANKENTERM_UNIX_SOCKET=$SOCK"
+  "FRANKENTERM_CONFIG_FILE=$D/frankenterm.toml" "FT_WORKSPACE=$D"
+  "FT_WEZTERM_CLI=$D/external-cli-disabled" "FT_METRICS_ENABLED=false"
+)
+file_sha() { "$PYTHON" - "$1" <<'PY'
+import hashlib, pathlib, sys
+print(hashlib.file_digest(pathlib.Path(sys.argv[1]).open('rb'), 'sha256').hexdigest())
+PY
+}
+CLI_SHA=$(file_sha "$FT") || exit 2
+MUX_SHA=$(file_sha "$MUX") || exit 2
 LOG="$D/smoke.log"
 RECEIPT="$D/receipt.json"
 STEPS="$D/steps.jsonl"
@@ -74,11 +113,17 @@ step() { # name status detail
   jq -cn --arg n "$1" --arg s "$2" --arg d "$detail" '{name:$n,status:$s,detail:$d}' >> "$STEPS"
   log "step $1: $2 ($detail)"
 }
+owned_running() {
+  local candidate="$1" running
+  for running in $(jobs -pr); do [ "$running" = "$candidate" ] && return 0; done
+  return 1
+}
 stop_children() {
   # Never `kill 0`: an unset pid would signal the whole process group (the
   # script included) before the receipt is written.
-  [ -n "${WATCH:-}" ] && kill "$WATCH" 2>/dev/null
-  [ -n "${MUX_PID:-}" ] && kill "$MUX_PID" 2>/dev/null
+  if [ "$KILL_SWITCH_SMOKE" = 1 ] && [ -f "$D/phase" ]; then printf 'stop\n' > "$D/phase"; fi
+  [ -n "${WATCH:-}" ] && owned_running "$WATCH" && kill -TERM "$WATCH"
+  [ -n "${MUX_PID:-}" ] && owned_running "$MUX_PID" && kill -TERM "$MUX_PID"
   # A watcher whose mux is already gone does not honour SIGTERM (ft-yykm1)
   # and keeps polling, leaking a defunct child per poll; nine such orphans
   # once exhausted the maintainer Mac's process limit. Escalate to SIGKILL
@@ -86,12 +131,13 @@ stop_children() {
   local pid deadline
   for pid in ${WATCH:-} ${MUX_PID:-}; do
     deadline=$((SECONDS + 5))
-    while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
-    if kill -0 "$pid" 2>/dev/null; then
+    while owned_running "$pid" && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
+    if owned_running "$pid"; then
       log "child $pid ignored SIGTERM for 5s; sending SIGKILL"
-      kill -9 "$pid" 2>/dev/null
+      kill -9 "$pid"
     fi
-    wait "$pid" 2>/dev/null || true
+    wait "$pid"
+    log "owned child $pid reaped with status $?"
   done
   return 0
 }
@@ -102,13 +148,16 @@ finish() { # status
     --arg generated_at "$(date -u +%FT%TZ)" \
     --arg host "$(hostname)" \
     --arg commit "$RELEASE_COMMIT" \
+    --arg source_authority "$SOURCE_AUTHORITY" \
+    --arg cli_sha256 "$CLI_SHA" --arg mux_sha256 "$MUX_SHA" \
+    --arg private_socket "$SOCK" \
     --argjson codec_version "$CODEC_VERSION" \
     --arg cli_version "$("$FT" --version 2>/dev/null | head -1)" \
     --arg mux_version "$("$MUX" --version 2>/dev/null | head -1)" \
     --arg bin_dir "$BIN_DIR" \
     --arg status "$status" \
     --slurpfile steps "$STEPS" \
-    '{schema:$schema,generated_at:$generated_at,host:$host,commit:$commit,codec_version:$codec_version,cli_version:$cli_version,mux_version:$mux_version,bin_dir:$bin_dir,status:$status,steps:$steps}' \
+    '{schema:$schema,generated_at:$generated_at,host:$host,commit:$commit,source_authority:$source_authority,cli_sha256:$cli_sha256,mux_sha256:$mux_sha256,private_socket:$private_socket,codec_version:$codec_version,cli_version:$cli_version,mux_version:$mux_version,bin_dir:$bin_dir,status:$status,steps:$steps}' \
     > "$RECEIPT"
   log "receipt: $RECEIPT (status=$status)"
 }
@@ -121,8 +170,50 @@ fail() { # step-name detail
 trap stop_children EXIT
 trap 'exit 1' HUP INT TERM
 
-# Bare zsh: nothing rewrites the pane title after we set it.
-"$MUX" --daemonize=false --cwd "$D" -- /bin/zsh -f > "$D/mux.log" 2>&1 &
+# This fixture records actual PTY input; it never fabricates an injector,
+# policy decision, CLI result, or workflow event. Only captured terminal output
+# can trigger the production watcher workflow.
+if [ "$KILL_SWITCH_SMOKE" = 1 ]; then
+  printf '0\n' > "$D/phase"
+  cat > "$D/owned-pane.py" <<'PY'
+import json, os, pathlib, select, sys, time, tty
+root = pathlib.Path(sys.argv[1])
+tty.setraw(sys.stdin.fileno())
+(root / 'pane-owner.json').write_text(json.dumps({'pid': os.getpid(), 'parent_pid': os.getppid()}))
+received = (root / 'pane-input.bin').open('ab', buffering=0)
+deadline, previous, total = time.monotonic() + 180, '0', 0
+os.write(1, b'\x1b]2;claude-code-owned-fixture\x07\x1b]133;A\x07fixture ready\r\n')
+while time.monotonic() < deadline:
+    phase = (root / 'phase').read_text().strip()
+    if phase == 'stop':
+        break
+    if phase in {'1', '2', '3'} and phase != previous:
+        previous = phase
+        number = int(phase)
+        os.write(1, f'Conversation compacted: {9000 + number} tokens to {4500 + number}\r\n'.encode())
+        os.write(1, b'\x1b]133;A\x07fixture ready\r\n')
+        (root / 'pane-phase.json').write_text(json.dumps({'phase': number, 'pid': os.getpid()}))
+    ready, _, _ = select.select([0], [], [], 0.1)
+    if ready:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > 65536:
+            raise RuntimeError('owned PTY input exceeded fixture cap')
+        received.write(chunk)
+        os.fsync(received.fileno())
+        os.write(1, b'RC3_FIXTURE_INPUT_RECEIVED\r\n\x1b]133;A\x07')
+else:
+    raise RuntimeError('owned pane fixture deadline exceeded')
+PY
+  env -i "${HERMETIC_ENV[@]}" "$MUX" --config-file "$D/frankenterm.toml" \
+    --daemonize=false --cwd "$D" -- "$PYTHON" "$D/owned-pane.py" "$D" > "$D/mux.log" 2>&1 &
+else
+  # Bare zsh: nothing rewrites the pane title after we set it.
+  env -i "${HERMETIC_ENV[@]}" "$MUX" --config-file "$D/frankenterm.toml" \
+    --daemonize=false --cwd "$D" -- /bin/zsh -f > "$D/mux.log" 2>&1 &
+fi
 MUX_PID=$!
 # A stale socket file from an earlier server satisfies `-S`; wait for the lease
 # file to name THIS server's pid so a client never dials a dead socket.
@@ -130,8 +221,7 @@ for _ in $(seq 1 150); do grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null && [ -
 grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null || fail mux_start "server pid $MUX_PID never took the socket lease: $(tail -3 "$D/mux.log" | tr '\n' ' ')"
 step mux_start pass "pid $MUX_PID on $SOCK"
 
-export WEZTERM_UNIX_SOCKET="$SOCK" FT_WORKSPACE="$D"
-ft() { "$FT" -c "$D/ft.toml" "$@"; }
+ft() { env -i "${HERMETIC_ENV[@]}" "$FT" -c "$D/ft.toml" "$@"; }
 
 ft doctor --json > "$D/doctor.json" 2> "$D/doctor.err"
 SOCK_ROW=$(jq -c '.checks[] | select(.name=="mux socket")' "$D/doctor.json" 2>/dev/null)
@@ -144,14 +234,80 @@ step doctor pass "$(jq -r '.checks[] | select(.name=="WezTerm connection") | .de
 ft list --json > "$D/list.json" 2> "$D/list.err"
 PANE=$(jq -r '.[0].pane_id' "$D/list.json" 2>/dev/null)
 [ -n "$PANE" ] && [ "$PANE" != "null" ] || fail list "no pane listed: $(tail -3 "$D/list.err" | tr '\n' ' ')"
+jq -e 'length == 1' "$D/list.json" > /dev/null || fail list "private fixture must own exactly one pane"
 step list pass "pane $PANE"
 
-ft watch --foreground --poll-interval 1000 > "$D/watch.log" 2>&1 &
+WATCH_ARGS=(watch --foreground --poll-interval 1000)
+[ "$KILL_SWITCH_SMOKE" = 1 ] && WATCH_ARGS+=(--auto-handle)
+env -i "${HERMETIC_ENV[@]}" "$FT" -c "$D/ft.toml" "${WATCH_ARGS[@]}" > "$D/watch.log" 2>&1 &
 WATCH=$!
 sleep 5
 grep -a -q 'Started vendored pane streaming subscription' "$D/watch.log" \
   || fail watch "no streaming subscription within 5 s: $(tail -3 "$D/watch.log" | tr '\n' ' ')"
 step watch pass "streaming subscription for pane $PANE"
+
+if [ "$KILL_SWITCH_SMOKE" = 1 ]; then
+  # Observe durable decisions independently of CLI success and of the pane
+  # recorder. A timeout is failure, not a skipped/fallback mode.
+  await_audit() {
+    "$PYTHON" - "$D" "$PANE" "$1" "$2" <<'PY'
+import json, pathlib, sqlite3, sys, time
+root, pane, decision, required = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+deadline = time.monotonic() + 35
+while time.monotonic() < deadline:
+    with sqlite3.connect(f'file:{root / ".ft" / "ft.db"}?mode=ro', uri=True, timeout=1) as db:
+        rows = db.execute('SELECT id, policy_decision, rule_id, result FROM audit_actions WHERE pane_id=? AND actor_kind=? AND action_kind=? AND policy_decision=? ORDER BY id', (pane, 'workflow', 'send_text', decision)).fetchall()
+    if len(rows) >= required:
+        if decision == 'deny' and rows[-1][2] != 'policy.kill_switch':
+            raise RuntimeError(f'wrong denial source: {rows[-1]!r}')
+        print(json.dumps({'decision': decision, 'rows': rows}))
+        break
+    time.sleep(0.2)
+else:
+    raise RuntimeError(f'no {decision} workflow audit within deadline')
+PY
+  }
+  printf '1\n' > "$D/phase"
+  await_audit allow 1 > "$D/baseline-audit.json" 2> "$D/baseline-audit.err" \
+    || fail kill_switch_baseline "no real workflow allow; see baseline-audit.err and watch.log"
+  grep -a -q 'RC3_FENCE_EFFECT' "$D/pane-input.bin" \
+    || fail kill_switch_baseline "allowed workflow did not reach owned PTY input"
+  BASE_INPUT_SHA=$(file_sha "$D/pane-input.bin")
+  step kill_switch_baseline pass "watcher $WATCH delivered a compaction workflow to owned pane $PANE"
+
+  ft robot --format json kill-switch trip --level hard-stop --reason rc3-owned-trip \
+    > "$D/trip.json" 2> "$D/trip.err" || fail kill_switch_trip "operator CLI exited unsuccessfully; see trip.err"
+  jq -e '.ok == true and .data.persisted == true and .data.level == "hard_stop" and .data.revision > 0 and .data.fenced_owner == "policy_gated_injector" and .data.pre_admitted_remote_effects == "not_proven_settled"' "$D/trip.json" > /dev/null \
+    || fail kill_switch_trip "trip not durably acknowledged with the required scope"
+  printf '2\n' > "$D/phase"
+  await_audit deny 1 > "$D/denial-audit.json" 2> "$D/denial-audit.err" \
+    || fail kill_switch_denial "same watcher did not persist kill-switch denial; see denial-audit.err and watch.log"
+  [ "$(file_sha "$D/pane-input.bin")" = "$BASE_INPUT_SHA" ] \
+    || fail kill_switch_denial "stopped workflow changed actual PTY input bytes"
+  owned_running "$WATCH" || fail kill_switch_denial "original watcher exited"
+  step kill_switch_denial pass "same watcher $WATCH persisted policy.kill_switch denial; PTY input unchanged"
+
+  ft robot --format json kill-switch reset --by rc3-owned-operator \
+    > "$D/reset.json" 2> "$D/reset.err" || fail kill_switch_reset "operator reset exited unsuccessfully; see reset.err"
+  jq -e --slurpfile trip "$D/trip.json" '.ok == true and .data.persisted == true and .data.level == "disarmed" and .data.revision > $trip[0].data.revision' "$D/reset.json" > /dev/null \
+    || fail kill_switch_reset "reset did not advance durable revision"
+  sleep 3
+  [ "$(file_sha "$D/pane-input.bin")" = "$BASE_INPUT_SHA" ] \
+    || fail kill_switch_reset "reset replayed denied input without a fresh trigger"
+  printf '3\n' > "$D/phase"
+  await_audit allow 2 > "$D/recovery-audit.json" 2> "$D/recovery-audit.err" \
+    || fail kill_switch_recovery "fresh workflow did not succeed after reset"
+  [ "$(file_sha "$D/pane-input.bin")" != "$BASE_INPUT_SHA" ] \
+    || fail kill_switch_recovery "fresh allowed workflow did not reach PTY input"
+  owned_running "$WATCH" || fail kill_switch_recovery "watcher was replaced or exited"
+  [ "$(file_sha "$FT")" = "$CLI_SHA" ] && [ "$(file_sha "$MUX")" = "$MUX_SHA" ] \
+    || fail source_identity "candidate binary bytes changed during the run"
+  step kill_switch_recovery pass "fresh compaction trigger delivered after reset; no rejected send replay"
+  stop_children
+  finish pass
+  echo "PASS: owned watcher kill-switch admission (remote settlement remains unproven; evidence in $D)"
+  exit 0
+fi
 
 ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$D/send1.log" 2>&1 || fail send_title "$(tail -2 "$D/send1.log" | tr '\n' ' ')"
 sleep 3
