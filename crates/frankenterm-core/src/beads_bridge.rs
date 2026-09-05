@@ -8,6 +8,8 @@
 //! Feature-gated behind `subprocess-bridge`.
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -43,8 +45,6 @@ fn read_bead_work_selection_with_hook(
         BEAD_WORK_GRAPH_MAX_BYTES, BeadWorkSelectionError, select_bead_work_from_jsonl,
     };
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
     // O_NONBLOCK prevents an attacker-controlled FIFO replacement from hanging
     // before fstat can reject it. The same opened regular file is retained for
     // the complete bounded read and compared with its named entry afterward.
@@ -377,6 +377,8 @@ mod tests {
      {
         use crate::beads_types::{BEAD_WORK_GRAPH_MAX_BYTES, BeadWorkSelectionError};
         use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("issues.jsonl");
         let bytes = br#"{"id":"ready-docs","status":"open","priority":2,"issue_type":"docs","description":"private-body-do-not-log"}
@@ -428,7 +430,7 @@ mod tests {
             BeadWorkSelectionError::FileUnavailable
         );
         let link = fixture.path().join("symlink.jsonl");
-        std::os::unix::fs::symlink(&backup, &link).unwrap();
+        symlink(&backup, &link).unwrap();
         assert_eq!(
             read_bead_work_selection(&link, &hash, 1, now()).unwrap_err(),
             BeadWorkSelectionError::FileUnavailable
