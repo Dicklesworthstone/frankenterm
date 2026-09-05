@@ -685,6 +685,8 @@ pub const fn single_host_loss_recoverable(cfg: ErasureConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
+    use sha2::{Digest, Sha256};
 
     fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Vec<ErasureShard> {
         super::encode_row(cfg, data).expect("valid test row encodes")
@@ -747,6 +749,188 @@ mod tests {
                 .collect();
             assert_eq!(reconstruct(cfg, &survivors).unwrap(), data);
         }
+    }
+
+    #[test]
+    fn seeded_serialized_survivors_reconstruct_original_bytes() {
+        // Bounded, reproducible library-path evidence: 4 seeds, 16 configs
+        // per seed, 5 rows per config, 2 survivor orders; rows <= 1024 bytes.
+        // The oracle is the independently retained input, not GF arithmetic
+        // shared with the implementation. No host or persistence claim.
+        let seeds = [0, 0x58_58_01, 0x4d44_535f_7632, u64::MAX];
+        let boundaries = [
+            (1, 1),
+            (3, 5),
+            (4, 7),
+            (8, 9),
+            (1, 32),
+            (16, 32),
+            (31, 32),
+            (32, 32),
+        ];
+        let mut reconstructions = 0;
+        for seed in seeds {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut configs = boundaries.to_vec();
+            for _ in 0..8 {
+                let n = rng.random_range(9..=32);
+                configs.push((rng.random_range(1..=n), n));
+            }
+            for (case, (k, n)) in configs.into_iter().enumerate() {
+                let cfg = ErasureConfig::new(k, n).unwrap();
+                let lengths = [
+                    0,
+                    1,
+                    usize::from(k).saturating_sub(4),
+                    usize::from(k) + 1,
+                    rng.random_range(0..=1024),
+                ];
+                for (row, len) in lengths.into_iter().enumerate() {
+                    let original: Vec<u8> = (0..len).map(|_| rng.random()).collect();
+                    let input_hash = format!("{:x}", Sha256::digest(&original));
+                    let encoded = super::encode_row(cfg, &original).unwrap();
+                    let serialized: Vec<Vec<u8>> = encoded
+                        .iter()
+                        .map(|shard| serde_json::to_vec(shard).unwrap())
+                        .collect();
+                    // Select after serialization, so reconstruction cannot
+                    // accidentally reuse the original in-memory shards.
+                    let mut order: Vec<usize> = (0..usize::from(n)).collect();
+                    order.shuffle(&mut rng);
+                    order.truncate(usize::from(k));
+                    for permutation in 0..2 {
+                        let survivors: Vec<ErasureShard> = order
+                            .iter()
+                            .map(|&index| serde_json::from_slice(&serialized[index]).unwrap())
+                            .collect();
+                        let recovered = reconstruct(cfg, &survivors).unwrap_or_else(|error| {
+                            panic!("seed={seed} case={case} row={row} k={k} n={n} len={len} order={order:?}: {error}")
+                        });
+                        assert_eq!(survivors.len(), usize::from(k));
+                        assert!(survivors.iter().all(|shard| shard.encoding_version == 2));
+                        assert_eq!(recovered.len(), original.len());
+                        assert!(
+                            recovered == original,
+                            "seed={seed} case={case} row={row} order={order:?} input_sha256={input_hash}"
+                        );
+                        reconstructions += 1;
+                        eprintln!(
+                            "ERASURE_SERIALIZED_RECOVERY {}",
+                            serde_json::json!({
+                            "seed": seed, "case": case, "row": row,
+                            "k": k, "n": n, "length": len, "survivor_order": order,
+                            "permutation": permutation, "encoding_version": 2,
+                            "input_sha256": input_hash,
+                            "recovered_sha256": format!("{:x}", Sha256::digest(&recovered)),
+                            "assertions": 4, "error": null
+                            })
+                        );
+                        order.reverse();
+                    }
+                }
+            }
+        }
+        assert_eq!(reconstructions, 640);
+    }
+
+    #[test]
+    fn serialized_survivor_negative_controls_return_expected_errors() {
+        let cfg = ErasureConfig::new(4, 7).unwrap();
+        let original = b"synthetic audit row with framing!";
+        let encoded = super::encode_row(cfg, original).unwrap();
+        let serialized: Vec<serde_json::Value> = encoded
+            .iter()
+            .map(|shard| serde_json::to_value(shard).unwrap())
+            .collect();
+        // Deliberately corrupt the serialized representation, then traverse
+        // the same deserialization/reconstruction boundary as the positives.
+        let mut controls = Vec::new();
+        controls.push((
+            "missing_survivor",
+            serialized[..3].to_vec(),
+            ErasureError::InsufficientShards { have: 3, k: 4 },
+        ));
+        let mut short = serialized[..4].to_vec();
+        short[1]["bytes"].as_array_mut().unwrap().pop();
+        controls.push((
+            "short_shard",
+            short,
+            ErasureError::InconsistentShardSize {
+                index: 1,
+                got: encoded[1].bytes().len() - 1,
+                expected: encoded[0].bytes().len(),
+            },
+        ));
+        for version in [0, 1, 3, 255] {
+            let mut invalid = serialized[..4].to_vec();
+            invalid[2]["encoding_version"] = serde_json::json!(version);
+            controls.push((
+                "unsupported_version",
+                invalid,
+                ErasureError::UnsupportedEncodingVersion { version },
+            ));
+        }
+        let mut unversioned = serialized[..4].to_vec();
+        unversioned[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("encoding_version");
+        controls.push((
+            "missing_version",
+            unversioned,
+            ErasureError::UnsupportedEncodingVersion { version: 0 },
+        ));
+        let mut corrupt = serialized[..4].to_vec();
+        // The first systematic shard starts with the original length. A
+        // forged u32::MAX prefix cannot fit this bounded row and must fail.
+        for byte in corrupt[0]["bytes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .take(4)
+        {
+            *byte = serde_json::json!(255);
+        }
+        controls.push((
+            "corrupt_length",
+            corrupt,
+            ErasureError::DecodedLengthMismatch {
+                original: u32::MAX as usize,
+                decoded: encoded[0].bytes().len() * 4 - 4,
+            },
+        ));
+        let mut corrupt_padding = serialized[..4].to_vec();
+        *corrupt_padding[3]["bytes"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap() = serde_json::json!(1);
+        controls.push((
+            "corrupt_padding",
+            corrupt_padding,
+            ErasureError::InvalidPadding,
+        ));
+        let control_count = controls.len();
+        for (control, wire, expected) in controls {
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            let survivors: Vec<ErasureShard> = serde_json::from_slice(&bytes).unwrap();
+            let result = reconstruct(cfg, &survivors);
+            assert_eq!(result, Err(expected.clone()), "control={control}");
+            eprintln!(
+                "ERASURE_SERIALIZED_NEGATIVE {}",
+                serde_json::json!({
+                "control": control, "k": cfg.k(), "n": cfg.n(),
+                "length": original.len(), "survivor_order": survivors.iter().map(ErasureShard::shard_index).collect::<Vec<_>>(),
+                "wire_sha256": format!("{:x}", Sha256::digest(&bytes)),
+                "expected_error": expected, "assertions": 1
+                })
+            );
+        }
+        assert_eq!(control_count, 9);
+        let missing_bytes = br#"{"encoding_version":2,"shard_index":0,"is_parity":false}"#;
+        assert!(serde_json::from_slice::<ErasureShard>(missing_bytes).is_err());
+        let malformed_json = b"{";
+        assert!(serde_json::from_slice::<ErasureShard>(malformed_json).is_err());
     }
 
     #[test]
@@ -1150,37 +1334,19 @@ mod tests {
 
     #[test]
     fn round_trip_handles_empty_data() {
-        // Empty data — degenerate case. Encode produces n shards
-        // (possibly all empty or all-padding); decode round-trips
-        // back to empty.
         let cfg = ErasureConfig::DEFAULT;
         let shards = encode_row(cfg, &[]);
         assert_eq!(shards.len(), cfg.n as usize);
         let recovered = reconstruct(cfg, &shards[0..cfg.k as usize]).unwrap();
-        // Recovered may have padding; the original was empty so
-        // either empty bytes or k zero-padding bytes is acceptable
-        // for the trivial-data degenerate case. Both shapes are
-        // padding-or-empty.
-        assert!(
-            recovered.iter().all(|&b| b == 0),
-            "empty input should round-trip to all-zero / empty bytes; got {:?}",
-            recovered
-        );
+        assert!(recovered.is_empty(), "padding must not escape reconstruction");
     }
 
     #[test]
     fn round_trip_handles_single_byte_data() {
-        // Single-byte data is below k=3 bytes; padding adds k-1
-        // zero bytes per chunk.
         let cfg = ErasureConfig::DEFAULT;
         let shards = encode_row(cfg, &[0xAB]);
         let recovered = reconstruct(cfg, &shards[0..cfg.k as usize]).unwrap();
-        assert!(
-            !recovered.is_empty(),
-            "padded single byte must round-trip to non-empty"
-        );
-        // First byte preserved.
-        assert_eq!(recovered[0], 0xAB);
+        assert_eq!(recovered, [0xAB]);
     }
 
     #[test]
@@ -1194,7 +1360,7 @@ mod tests {
         // Subset: [0, 3, 4] = 1 data + 2 parity.
         let subset = vec![all[0].clone(), all[3].clone(), all[4].clone()];
         let recovered = reconstruct(cfg, &subset).unwrap();
-        assert_eq!(&recovered[..data.len()], data);
+        assert_eq!(recovered, data);
     }
 
     #[test]
@@ -1206,7 +1372,7 @@ mod tests {
         let all = encode_row(cfg, data);
         let parity_only = vec![all[3].clone(), all[4].clone()];
         let recovered = reconstruct(cfg, &parity_only).unwrap();
-        assert_eq!(&recovered[..data.len()], data);
+        assert_eq!(recovered, data);
     }
 
     #[test]
@@ -1219,7 +1385,7 @@ mod tests {
         // Skip shard 0; use [1, 2, 3].
         let subset = vec![all[1].clone(), all[2].clone(), all[3].clone()];
         let recovered = reconstruct(cfg, &subset).unwrap();
-        assert_eq!(&recovered[..data.len()], data);
+        assert_eq!(recovered, data);
     }
 
     #[test]
@@ -1232,10 +1398,10 @@ mod tests {
         assert_eq!(all.len(), 3);
         // Any single shard reconstructs.
         let recovered = reconstruct(cfg, &all[0..1]).unwrap();
-        assert_eq!(&recovered[..data.len()], data);
+        assert_eq!(recovered, data);
         // Even just the parity.
         let recovered_p = reconstruct(cfg, &all[2..3]).unwrap();
-        assert_eq!(&recovered_p[..data.len()], data);
+        assert_eq!(recovered_p, data);
     }
 
     /// ft-mpnj3 regression guard: ErasureConfig fields are private,
@@ -1297,51 +1463,32 @@ mod tests {
     }
 
     #[test]
-    fn shard_index_forgery_within_range_does_not_silently_succeed() {
-        // The audit threat: an attacker mutates a parity shard's
-        // shard_index to point at a different in-range slot, hoping
-        // reconstruct will pick the wrong generator-matrix row and
-        // produce garbage that passes the 4-byte length-prefix check.
-        //
-        // Since shard_index is now pub(crate), external code cannot
-        // construct or mutate a shard except via encode_row or
-        // for_test. This regression simulates the forgery via
-        // for_test, confirms that a shard with mutated metadata but
-        // legitimate bytes either (a) still reconstructs to the
-        // original (when index matches) or (b) reconstructs to
-        // recognisable garbage that the length-prefix sanity check
-        // catches.
-        let cfg = ErasureConfig::new(3, 5).unwrap();
-        let data = b"forge-test".to_vec();
-        let shards = encode_row(cfg, &data);
-
-        // Take 3 valid shards; replace one with a forged-index variant
-        // whose bytes belong to a DIFFERENT shard.
-        let forged_bytes = shards[3].bytes().to_vec();
-        let forged = ErasureShard::for_test(0, false, forged_bytes); // claim index 0, ship index-3 bytes
-        let surviving = vec![forged, shards[1].clone(), shards[2].clone()];
-
-        // reconstruct will use generator row 0 (identity) on bytes
-        // that are actually parity-3 — produces nonsense. The 4-byte
-        // length prefix on the corrupted shard is the parity-row
-        // computation, which has astronomically low probability of
-        // matching a legitimate length.
-        match reconstruct(cfg, &surviving) {
-            Ok(out) => {
-                // If reconstruction succeeds, the bytes must NOT match
-                // the original — that would mean the forgery was
-                // undetected and silently corrupted the audit row.
-                // Allow that the spurious length-prefix happens to
-                // bound a valid range, but the bytes will differ.
-                assert_ne!(
-                    out, data,
-                    "shard-index forgery silently reconstructed correct data — substrate cannot defend against this without integration-layer MACs"
-                );
-            }
-            Err(_) => {
-                // Length-prefix sanity check caught the garbage —
-                // expected outcome.
-            }
-        }
+    fn serialized_payload_corruption_requires_an_external_integrity_oracle() {
+        // Shape/version/length/padding validation is not authentication.
+        // Corrupt a data byte without touching framing and prove that an
+        // independent original-byte oracle rejects the successful decode.
+        let cfg = ErasureConfig::new(1, 1).unwrap();
+        let original = b"synthetic integrity control";
+        let shards = super::encode_row(cfg, original).unwrap();
+        let mut wire = serde_json::to_value(&shards).unwrap();
+        wire[0]["bytes"][4] = serde_json::json!(original[0] ^ 1);
+        let serialized = serde_json::to_vec(&wire).unwrap();
+        let survivors: Vec<ErasureShard> = serde_json::from_slice(&serialized).unwrap();
+        let recovered = reconstruct(cfg, &survivors).unwrap();
+        assert_eq!(recovered.len(), original.len());
+        assert_ne!(recovered.as_slice(), original);
+        assert_eq!(recovered[0], original[0] ^ 1);
+        assert_eq!(&recovered[1..], &original[1..]);
+        eprintln!(
+            "ERASURE_INTEGRITY_NEGATIVE {}",
+            serde_json::json!({
+                "control": "unframed_payload_bit_flip", "k": 1, "n": 1,
+                "encoding_version": 2, "length": original.len(),
+                "original_sha256": format!("{:x}", Sha256::digest(original)),
+                "recovered_sha256": format!("{:x}", Sha256::digest(&recovered)),
+                "original_byte_oracle_agrees": recovered.as_slice() == original,
+                "assertions": 4
+            })
+        );
     }
 }
