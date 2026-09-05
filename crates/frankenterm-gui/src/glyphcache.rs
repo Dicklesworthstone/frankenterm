@@ -193,7 +193,7 @@ fn monochrome_glyph_feature_atlas_key(font_id: LoadedFontId, glyph_id: u32) -> u
 }
 
 /// Caches a rendered glyph.
-/// The image data may be None for whitespace glyphs.
+/// The image data may be None for inkless glyphs, including ligature carriers.
 pub struct CachedGlyph {
     pub has_color: bool,
     pub brightness_adjust: f32,
@@ -3510,6 +3510,7 @@ mod tests {
         enum OracleError {
             MissingGlyph,
             MissingBitmap,
+            SourceRasterization(String),
             StaleOrDifferentOutput,
         }
 
@@ -3568,10 +3569,14 @@ mod tests {
                 }
                 Some((width, height, pixels))
             } else {
-                let source_is_inkless = info.is_space
-                    || font
-                        .rasterize_glyph(info.glyph_pos, info.font_idx)
-                        .is_ok_and(|source| source.width == 0 || source.height == 0);
+                // Source text is not an ink-presence oracle: JetBrains Mono
+                // shapes "!=" as an empty carrier followed by the drawn ligature.
+                // Independently check the actual font raster so a lost cached
+                // bitmap for a drawable glyph still fails, retaining any error.
+                let source_is_inkless = font
+                    .rasterize_glyph(info.glyph_pos, info.font_idx)
+                    .map_err(|err| OracleError::SourceRasterization(format!("{err:#}")))
+                    .map(|source| source.width == 0 || source.height == 0)?;
                 if source_is_inkless {
                     None
                 } else {
@@ -3734,7 +3739,7 @@ mod tests {
             }
         }
 
-        fn phase(cache: &mut GlyphCache, scale: f64, budget_ms: u64) -> PhaseSample {
+        fn phase(cache: &mut GlyphCache, name: &str, scale: f64, budget_ms: u64) -> PhaseSample {
             let started = Instant::now();
             if cache.fonts.get_font_scale().to_bits() != scale.to_bits() {
                 cache.fonts.change_scaling(scale, 96);
@@ -3771,7 +3776,7 @@ mod tests {
             let mut resolved = Vec::new();
             let mut demand_hits = 0;
             let mut demand_misses = 0;
-            for infos in &runs {
+            for (text, infos) in DEMANDS.iter().zip(&runs) {
                 for (index, info) in infos.iter().enumerate() {
                     // Match glyph_infos_to_glyphs: use the shaped cell span and
                     // the following glyph's spacing, not text character count.
@@ -3789,16 +3794,40 @@ mod tests {
                         .unwrap();
                     demand_hits += usize::from(hit);
                     demand_misses += usize::from(!hit);
-                    resolved.push((info, glyph));
+                    resolved.push((text, info, glyph));
                 }
             }
             let demand_raster_ns = raster_started.elapsed().as_nanos();
             let cpu_path_wall_ns = started.elapsed().as_nanos();
             // Readback and comparison are deliberately outside the timed path.
-            let glyphs = resolved
+            let handles = font.clone_handles();
+            let glyphs: Vec<_> = resolved
                 .iter()
-                .map(|(info, glyph)| witness(&font, info, glyph).unwrap())
+                .map(|(text, info, glyph)| {
+                    witness(&font, info, glyph).unwrap_or_else(|err| {
+                        panic!(
+                            "demanded glyph failed: phase={name} scale={scale} \
+                             budget_ms={budget_ms} metric={metric:?} text={text:?} \
+                             face={:?} info={info:?} cached={glyph:?}: {err:?}",
+                            handles[info.font_idx].names().full_name,
+                        )
+                    })
+                })
                 .collect();
+            let mut offset = 0;
+            for (text, infos) in DEMANDS.iter().zip(&runs) {
+                let end = offset + infos.len();
+                assert!(
+                    glyphs[offset..end].iter().any(|glyph| {
+                        glyph.bitmap.as_ref().is_some_and(|(_, _, pixels)| {
+                            pixels.chunks_exact(4).any(|pixel| pixel[3] != 0)
+                        })
+                    }),
+                    "demand must retain visible ink: phase={name} scale={scale} \
+                     budget_ms={budget_ms} text={text:?}"
+                );
+                offset = end;
+            }
             PhaseSample {
                 metric,
                 glyphs,
@@ -3819,7 +3848,7 @@ mod tests {
             let (mut cache, _) = fixture();
             let samples: Vec<_> = PHASES
                 .iter()
-                .map(|(_, scale)| phase(&mut cache, *scale, budget_ms))
+                .map(|(name, scale)| phase(&mut cache, name, *scale, budget_ms))
                 .collect();
             assert_eq!(samples[0].metric, samples[1].metric);
             assert_ne!(samples[1].metric, samples[2].metric);
@@ -3928,12 +3957,77 @@ mod tests {
                 witness(&font, &info, &missing),
                 Err(OracleError::MissingBitmap)
             );
+            // Text metadata alone cannot excuse a lost drawable raster.
+            let mut labeled_space = info.clone();
+            labeled_space.is_space = true;
+            assert_eq!(
+                witness(&font, &labeled_space, &missing),
+                Err(OracleError::MissingBitmap)
+            );
             let mut notdef = info.clone();
             notdef.glyph_pos = 0;
             assert_eq!(
                 witness(&font, &notdef, &correct),
                 Err(OracleError::MissingGlyph)
             );
+
+            // Use a named bundled face without changing global configuration or
+            // font features. Its contextual "!=" ligature has one non-space,
+            // inkless carrier and one visible companion. The old is_space-only
+            // oracle rejects the carrier; accepting all empty caches would
+            // incorrectly admit the planted loss of its visible companion.
+            let ligature_style = TextStyle {
+                font: vec![config::FontAttributes::new("JetBrains Mono")],
+                foreground: None,
+            };
+            let ligature_font = cache.fonts.resolve_font(&ligature_style).unwrap();
+            let infos = ligature_font
+                .blocking_shape("!=", None, Direction::LeftToRight, None, None)
+                .unwrap();
+            assert_eq!(infos.len(), 2, "bundled ligature fixture must be exercised");
+            let mut inkless = 0;
+            let mut drawable = 0;
+            for info in &infos {
+                assert!(!info.is_space && info.glyph_pos != 0);
+                let source = ligature_font
+                    .rasterize_glyph(info.glyph_pos, info.font_idx)
+                    .unwrap();
+                let glyph = cache
+                    .cached_glyph(
+                        info,
+                        &ligature_style,
+                        false,
+                        &ligature_font,
+                        &metrics,
+                        info.num_cells,
+                    )
+                    .unwrap();
+                let output = witness(&ligature_font, info, &glyph)
+                    .unwrap_or_else(|err| panic!("ligature fixture {info:?}: {err:?}"));
+                if source.width == 0 || source.height == 0 {
+                    inkless += 1;
+                    assert!(glyph.texture.is_none() && output.bitmap.is_none());
+                } else {
+                    drawable += 1;
+                    assert!(output.bitmap.is_some());
+                    let missing_companion = CachedGlyph {
+                        texture: None,
+                        has_color: glyph.has_color,
+                        brightness_adjust: glyph.brightness_adjust,
+                        x_offset: glyph.x_offset,
+                        y_offset: glyph.y_offset,
+                        x_advance: glyph.x_advance,
+                        bearing_x: glyph.bearing_x,
+                        bearing_y: glyph.bearing_y,
+                        scale: glyph.scale,
+                    };
+                    assert_eq!(
+                        witness(&ligature_font, info, &missing_companion),
+                        Err(OracleError::MissingBitmap)
+                    );
+                }
+            }
+            assert_eq!((inkless, drawable), (1, 1));
         }
 
         #[test]
