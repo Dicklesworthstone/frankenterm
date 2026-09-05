@@ -134,6 +134,265 @@ atomic-component: {}",
     }
 }
 
+const LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/Dicklesworthstone/frankenterm/releases/latest";
+const GITHUB_API_VERSION: &str = "2026-03-10";
+const RELEASE_PRIMARY_ASSETS: [&str; 5] = [
+    "ft-darwin-arm64.tar.xz",
+    "ft-linux-amd64.tar.xz",
+    "ft-linux-arm64.tar.xz",
+    "ft-windows-amd64.zip",
+    "FrankenTerm-darwin-arm64.app.tar.xz",
+];
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReleaseVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl ReleaseVersion {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.strip_prefix('v').unwrap_or(value);
+        let mut components = value.split('.');
+        let mut parse_component = || {
+            let component = components.next()?;
+            if component.is_empty()
+                || (component.len() > 1 && component.starts_with('0'))
+                || !component.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            component.parse::<u64>().ok()
+        };
+        let version = Self {
+            major: parse_component()?,
+            minor: parse_component()?,
+            patch: parse_component()?,
+        };
+        components.next().is_none().then_some(version)
+    }
+}
+
+impl std::fmt::Display for ReleaseVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LatestReleaseAsset {
+    id: u64,
+    name: String,
+    size: u64,
+    state: String,
+    digest: Option<String>,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LatestReleaseResponse {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<LatestReleaseAsset>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LatestReleaseCheck {
+    current: ReleaseVersion,
+    latest: ReleaseVersion,
+    compatible_asset: &'static str,
+}
+
+impl LatestReleaseCheck {
+    fn render(&self) -> String {
+        use std::cmp::Ordering;
+
+        match self.current.cmp(&self.latest) {
+            Ordering::Less => format!(
+                "ft {}; latest version {} is available ({})",
+                self.current, self.latest, self.compatible_asset
+            ),
+            Ordering::Equal => format!(
+                "ft {} is already the latest version {} ({})",
+                self.current, self.latest, self.compatible_asset
+            ),
+            Ordering::Greater => format!(
+                "ft {} is newer than latest version {} ({})",
+                self.current, self.latest, self.compatible_asset
+            ),
+        }
+    }
+}
+
+fn expected_release_asset_names() -> BTreeSet<String> {
+    let mut expected = BTreeSet::new();
+    for primary in RELEASE_PRIMARY_ASSETS {
+        expected.insert(primary.to_string());
+        expected.insert(format!("{primary}.sha256"));
+        expected.insert(format!("{primary}.minisig"));
+    }
+    expected.insert("SHA256SUMS".to_string());
+    expected.insert("SHA256SUMS.minisig".to_string());
+    expected
+}
+
+fn release_asset_size_limit(name: &str) -> Option<u64> {
+    match name {
+        "FrankenTerm-darwin-arm64.app.tar.xz" => Some(4 * 1024 * 1024 * 1024),
+        name if name.ends_with(".tar.xz") || name.ends_with(".zip") => {
+            Some(1024 * 1024 * 1024)
+        }
+        name if name.ends_with(".sha256") => Some(4096),
+        name if name.ends_with(".minisig") => Some(65_536),
+        "SHA256SUMS" => Some(65_536),
+        _ => None,
+    }
+}
+
+fn current_release_asset_name() -> anyhow::Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("ft-darwin-arm64.tar.xz"),
+        ("linux", "x86_64") => Ok("ft-linux-amd64.tar.xz"),
+        ("linux", "aarch64") => Ok("ft-linux-arm64.tar.xz"),
+        ("windows", "x86_64") => Ok("ft-windows-amd64.zip"),
+        _ => anyhow::bail!(
+            "no prebuilt FrankenTerm release asset supports this operating system and architecture"
+        ),
+    }
+}
+
+fn is_canonical_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
+
+fn validate_latest_release_payload(
+    payload: &[u8],
+    current_version: &str,
+) -> anyhow::Result<LatestReleaseCheck> {
+    let current = ReleaseVersion::parse(current_version)
+        .ok_or_else(|| anyhow::anyhow!("the installed ft version is not canonical X.Y.Z"))?;
+    let compatible_asset = current_release_asset_name()?;
+    let release: LatestReleaseResponse = serde_json::from_slice(payload)
+        .map_err(|_| anyhow::anyhow!("GitHub returned an invalid latest-release response"))?;
+    if release.draft || release.prerelease {
+        anyhow::bail!("GitHub's latest release is not a published stable release");
+    }
+    let latest = ReleaseVersion::parse(&release.tag_name)
+        .filter(|version| release.tag_name == format!("v{version}"))
+        .ok_or_else(|| anyhow::anyhow!("GitHub's latest release tag is not canonical vX.Y.Z"))?;
+
+    let expected = expected_release_asset_names();
+    let mut observed = BTreeSet::new();
+    let mut observed_ids = HashSet::new();
+    for asset in &release.assets {
+        if !observed.insert(asset.name.clone()) {
+            anyhow::bail!("GitHub's latest release contains a duplicate asset name");
+        }
+        if asset.id == 0 || !observed_ids.insert(asset.id) {
+            anyhow::bail!("GitHub's latest release contains an invalid or duplicate asset ID");
+        }
+        if asset.state != "uploaded" {
+            anyhow::bail!("GitHub's latest release contains an asset that is not fully uploaded");
+        }
+        let Some(limit) = release_asset_size_limit(&asset.name) else {
+            continue;
+        };
+        if asset.size == 0 || asset.size > limit {
+            anyhow::bail!("GitHub's latest release contains an asset outside its size bound");
+        }
+        if !asset
+            .digest
+            .as_deref()
+            .is_some_and(is_canonical_sha256_digest)
+        {
+            anyhow::bail!("GitHub's latest release contains an asset without a canonical digest");
+        }
+        let expected_url = format!(
+            "https://github.com/Dicklesworthstone/frankenterm/releases/download/{}/{name}",
+            release.tag_name,
+            name = asset.name
+        );
+        if asset.browser_download_url != expected_url {
+            anyhow::bail!("GitHub's latest release contains an unexpected asset URL");
+        }
+    }
+    if observed != expected || release.assets.len() != expected.len() {
+        let missing = expected.difference(&observed).count();
+        let unexpected = observed.difference(&expected).count();
+        anyhow::bail!(
+            "GitHub's latest release does not satisfy the signed 17-asset contract ({missing} missing, {unexpected} unexpected)"
+        );
+    }
+    if !observed.contains(compatible_asset) {
+        anyhow::bail!("GitHub's latest release has no asset for this platform");
+    }
+
+    Ok(LatestReleaseCheck {
+        current,
+        latest,
+        compatible_asset,
+    })
+}
+
+async fn fetch_latest_release_check(
+    cx: &frankenterm_core::cx::Cx,
+) -> anyhow::Result<LatestReleaseCheck> {
+    let client = frankenterm_core::runtime_async::http::HttpClient::builder()
+        .no_redirects()
+        .no_retries()
+        .max_body_size(1024 * 1024)
+        .request_timeout(Duration::from_secs(15))
+        .user_agent(format!(
+            "frankenterm/{} (+https://github.com/Dicklesworthstone/frankenterm)",
+            frankenterm_core::VERSION
+        ))
+        .default_header("Accept", "application/vnd.github+json")
+        .default_header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .build();
+    let response = client
+        .request(
+            cx,
+            frankenterm_core::runtime_async::http::Method::Get,
+            LATEST_RELEASE_URL,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the latest-release request failed"))?;
+    if response.status != 200 {
+        anyhow::bail!(
+            "the latest-release request returned HTTP status {}",
+            response.status
+        );
+    }
+    validate_latest_release_payload(&response.body, frankenterm_core::VERSION)
+}
+
+async fn print_version_command(
+    cx: &frankenterm_core::cx::Cx,
+    full: bool,
+    check: bool,
+) -> anyhow::Result<()> {
+    if check {
+        println!("{}", fetch_latest_release_check(cx).await?.render());
+    } else if full {
+        println!("{}", build_meta::verbose_version());
+    } else {
+        println!("ft {}", build_meta::short_version());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "mcp")]
 mod mcp;
 
@@ -262,13 +521,18 @@ NOTES:
     #[command(after_help = r#"EXAMPLES:
     ft version                        Short version line
     ft version --full                 Detailed build metadata
+    ft version --check                Check the exact signed latest-release asset set
 
 SEE ALSO:
     ft doctor     Check environment prerequisites"#)]
     Version {
         /// Show detailed build metadata (commit, rustc, target, features)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "check")]
         full: bool,
+
+        /// Check for a newer stable release with the complete signed asset set
+        #[arg(long, conflicts_with = "full")]
+        check: bool,
     },
 
     /// Robot mode commands (machine-readable I/O)
@@ -48378,6 +48642,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         return Ok(());
     }
 
+    // DSR's installed-binary upgrade canary must remain independent of user
+    // configuration, workspace databases, logging, font installation, and mux
+    // state. The public latest-release response and this binary's embedded
+    // version are the only authorities needed by `ft version --check`.
+    if let Some(Commands::Version {
+        full,
+        check: true,
+    }) = command.as_ref()
+    {
+        print_version_command(cx, *full, true).await?;
+        return Ok(());
+    }
+
     // Incident recovery through a pinned older client must not depend on the
     // current config, workspace database, logging, font setup, or mux client.
     // Dispatch it before all of those surfaces so an explicit compatible
@@ -48618,12 +48895,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     emit_permission_warnings(&permission_warnings);
 
     match command {
-        Some(Commands::Version { full }) => {
-            if full {
-                println!("{}", build_meta::verbose_version());
-            } else {
-                println!("ft {}", build_meta::short_version());
-            }
+        Some(Commands::Version { full, check }) => {
+            print_version_command(cx, full, check).await?;
             return Ok(());
         }
 
@@ -115753,7 +116026,7 @@ print(f"FT_ATOMIC_PATH_TRANSITION_V5={transaction_id}:{operation}:{stage_name}:{
     #[cfg(unix)]
     fn parse_installer_app_receipt(stdout: &[u8]) -> serde_json::Value {
         let stdout = std::str::from_utf8(stdout).expect("installer app receipt is UTF-8");
-        let prefix = "FT_INSTALL_APP_RECEIPT_V1=";
+        let prefix = "FT_INSTALL_APP_RECEIPT_V2=";
         let records = stdout
             .lines()
             .filter_map(|line| line.strip_prefix(prefix))
@@ -116151,11 +116424,25 @@ exit 0
         let inherited_path = std::env::var("PATH").expect("test PATH");
         let test_path = format!("{}:{inherited_path}", fake_tools.display());
         let failpoint = failpoint.unwrap_or("");
+        let selector_setup = if allow_selector {
+            format!(
+                "ACTIVATE_IF_IDLE=1\nPROCESS_FAMILY_ACTIVATION_STATE=current\nPROCESS_FAMILY_ACTIVE_AUTHORITY=managed-selector\nPROCESS_FAMILY_ACTIVE_ROOT={}\nPENDING_PROCESS_FAMILY_GENERATION=\n",
+                shell_single_quote(
+                    &destination
+                        .join(".frankenterm-process-family/generations")
+                        .join(&family.generation_id)
+                        .to_string_lossy()
+                )
+            )
+        } else {
+            "ACTIVATE_IF_IDLE=0\n".to_string()
+        };
         let script = format!(
-            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\nVERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_MINISIGN=1\nMAX_APP_ARCHIVE_BYTES={}\nMAX_APP_EXPANDED_BYTES={}\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nPUBLISHED_PROCESS_FAMILY_ROOT={}\nPUBLISHED_PROCESS_FAMILY_VERSION=0.15.2\nPUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY={}\nAPP_RECEIPT_REQUESTED=true\nAPP_RECEIPT_RESULT=in_progress\nAPP_RECEIPT_REASON=selected\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\nfinalize_app_receipt_state\nemit_app_receipt\n",
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nTMP={}\nQUIET=1\nHAS_GUM=0\n{}VERSION=v0.15.2\nOWNER=fixture\nREPO=fixture\nAPP_ASSET=FrankenTerm-darwin-arm64.app.tar.xz\nAPP_DEST={}\nNO_MINISIGN=1\nMAX_APP_ARCHIVE_BYTES={}\nMAX_APP_EXPANDED_BYTES={}\nACTIVE_PROCESS_FAMILY_MANIFEST={}\nACTIVE_PROCESS_FAMILY_VERIFIER={}\nACTIVE_ATOMIC_TRANSITION_HELPER={}\nPUBLISHED_PROCESS_FAMILY_ROOT={}\nPUBLISHED_PROCESS_FAMILY_VERSION=0.15.2\nPUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY={}\nAPP_RECEIPT_REQUESTED=true\nAPP_RECEIPT_RESULT=in_progress\nAPP_RECEIPT_REASON=selected\nexport FT_INSTALL_TEST_ENABLE_FAILPOINTS={}\nexport FT_INSTALL_TEST_FAILPOINT={}\nexport FT_INSTALL_TEST_STAGE_FAIL_AFTER_FILES={}\ninstall_macos_app\nfinalize_app_receipt_state\nemit_app_receipt\n",
             shell_single_quote(&installer.to_string_lossy()),
             shell_single_quote(&destination.to_string_lossy()),
             shell_single_quote(&scratch.to_string_lossy()),
+            selector_setup,
             shell_single_quote(&app_destination.to_string_lossy()),
             app.archive_budget,
             app.expanded_budget,
@@ -116201,9 +116488,13 @@ exit 0
                 codesign_fail_after.unwrap_or(0).to_string(),
             );
         if allow_selector {
-            command.env("FT_INSTALL_TEST_ALLOW_APP_SELECTOR", "1");
+            command
+                .env("FT_INSTALL_TEST_ALLOW_APP_SELECTOR", "1")
+                .env("FT_INSTALL_TEST_MUX_OWNERSHIP_STATE", "inactive");
         } else {
-            command.env_remove("FT_INSTALL_TEST_ALLOW_APP_SELECTOR");
+            command
+                .env_remove("FT_INSTALL_TEST_ALLOW_APP_SELECTOR")
+                .env_remove("FT_INSTALL_TEST_MUX_OWNERSHIP_STATE");
         }
         command
             .output()
@@ -117089,8 +117380,10 @@ cat "$FAKE_FONT_ARCHIVE"
         assert!(native_readiness.contains("private_mux_socket_absent_after_execution"));
         assert!(native_readiness.contains("frankenterm-mux-server--version"));
         assert!(native_readiness.contains("frankenterm-pty-guardian--version"));
-        assert!(installer.contains("FT_INSTALL_APP_RECEIPT_V1="));
-        assert!(installer.contains("frankenterm.install.app-receipt.v1"));
+        assert!(installer.contains("FT_INSTALL_APP_RECEIPT_V2="));
+        assert!(installer.contains("frankenterm.install.app-receipt.v2"));
+        assert!(installer.contains("cross_launcher_lifecycle_unproven"));
+        assert!(installer.contains("app_isolated_launch_action"));
 
         let source_build_start = installer
             .find("build_from_source() {")
@@ -119998,16 +120291,31 @@ printf x > "$MINISIGN_MARKER"
         let pending_receipt = parse_installer_app_receipt(&pending.stdout);
         assert_eq!(pending_receipt["requested"], true);
         assert_eq!(pending_receipt["result"], "verified");
+        assert_eq!(pending_receipt["reason"], "activation_pending");
         assert_eq!(
-            pending_receipt["reason"],
-            "activation_pending_lifecycle_transaction"
+            pending_receipt["pending_reason"],
+            "cross_launcher_lifecycle_unproven"
         );
         assert_eq!(
             pending_receipt["manifest_id"],
             format!("sha256:{}", app.app_id)
         );
-        assert_eq!(pending_receipt["readiness"], "passed");
+        assert_eq!(pending_receipt["readiness"], "not_run");
         assert_eq!(pending_receipt["activation"], "pending");
+        assert_eq!(pending_receipt["activation_action"], serde_json::Value::Null);
+        assert_eq!(pending_receipt["transaction"]["state"], "pending");
+        assert_eq!(pending_receipt["transaction"]["id"], serde_json::Value::Null);
+        assert_eq!(pending_receipt["transaction"]["operation"], "none");
+        assert_eq!(
+            pending_receipt["transaction"]["prior_content_id"],
+            serde_json::Value::Null
+        );
+        assert!(
+            pending_receipt["transaction"]["candidate_content_id"]
+                .as_str()
+                .is_some_and(is_canonical_sha256_digest),
+            "pending candidate must retain its exact content identity"
+        );
         assert_eq!(
             pending_receipt["candidate_path"],
             pending_destination
@@ -120015,6 +120323,29 @@ printf x > "$MINISIGN_MARKER"
                 .to_string_lossy()
                 .as_ref()
         );
+        let effective_uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("query app installer test user")
+            .stdout;
+        if effective_uid != b"0\n" {
+            let isolated_launch = pending_receipt["isolated_launch_action"]
+                .as_str()
+                .expect("non-root candidate receipt must include an isolated launch action");
+            assert!(isolated_launch.contains("Contents/MacOS/frankenterm-gui"));
+            assert!(isolated_launch.contains("HOME="));
+            assert!(isolated_launch.contains("FRANKENTERM_UNIX_SOCKET="));
+            assert!(isolated_launch.contains("--skip-config"));
+            assert!(isolated_launch.contains("check_for_updates=false"));
+            assert!(isolated_launch.contains("--always-new-process"));
+            assert!(isolated_launch.contains("--no-auto-connect"));
+        } else {
+            assert_eq!(
+                pending_receipt["isolated_launch_action"],
+                serde_json::Value::Null,
+                "root/system installs must not suggest an AppKit launch"
+            );
+        }
         assert_eq!(
             std::fs::read(pending_destination.join("FrankenTerm.app/old-generation.txt")).unwrap(),
             b"retained old app generation\n"
@@ -120099,14 +120430,7 @@ printf x > "$MINISIGN_MARKER"
             );
             let replay_receipt = parse_installer_app_receipt(&replay.stdout);
             assert_eq!(replay_receipt["result"], "verified");
-            assert_eq!(
-                replay_receipt["readiness"],
-                if switched {
-                    "existing_manifest_verified"
-                } else {
-                    "passed"
-                }
-            );
+            assert_eq!(replay_receipt["readiness"], "passed");
             assert_eq!(replay_receipt["activation"], "current");
             verify_live(&app_destination, "replay after app switch crash cut");
         }
@@ -137029,6 +137353,149 @@ A  docs/new-proof.md\n";
         });
     }
 
+    fn latest_release_fixture(tag: &str) -> serde_json::Value {
+        let assets = expected_release_asset_names()
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "name": name,
+                    "size": index + 1,
+                    "state": "uploaded",
+                    "digest": format!("sha256:{:064x}", index + 1),
+                    "browser_download_url": format!(
+                        "https://github.com/Dicklesworthstone/frankenterm/releases/download/{tag}/{name}"
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": false,
+            "prerelease": false,
+            "assets": assets,
+        })
+    }
+
+    fn validate_latest_release_fixture(
+        fixture: &serde_json::Value,
+        current: &str,
+    ) -> anyhow::Result<LatestReleaseCheck> {
+        validate_latest_release_payload(
+            &serde_json::to_vec(fixture).expect("serialize latest-release fixture"),
+            current,
+        )
+    }
+
+    #[test]
+    fn release_version_parser_accepts_only_canonical_stable_versions() {
+        assert_eq!(
+            ReleaseVersion::parse("v0.15.2"),
+            Some(ReleaseVersion {
+                major: 0,
+                minor: 15,
+                patch: 2,
+            })
+        );
+        assert_eq!(ReleaseVersion::parse("0.15.2").unwrap().to_string(), "0.15.2");
+        for invalid in [
+            "",
+            "v",
+            "V0.15.2",
+            "v00.15.2",
+            "v0.015.2",
+            "v0.15.02",
+            "v0.15",
+            "v0.15.2.1",
+            "v0.15.2-rc.1",
+            "v0.15.x",
+        ] {
+            assert_eq!(ReleaseVersion::parse(invalid), None, "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn latest_release_payload_requires_the_exact_signed_asset_closure() {
+        let fixture = latest_release_fixture("v0.15.2");
+        let current = validate_latest_release_fixture(&fixture, "0.15.2")
+            .expect("exact latest-release fixture");
+        assert_eq!(current.current, current.latest);
+        assert!(current.render().contains("already the latest version 0.15.2"));
+
+        let update = validate_latest_release_fixture(&fixture, "0.15.1")
+            .expect("older installed version against exact release");
+        assert!(update.render().contains("latest version 0.15.2 is available"));
+
+        let mut incomplete = fixture.clone();
+        incomplete["assets"]
+            .as_array_mut()
+            .expect("fixture assets")
+            .pop();
+        assert!(
+            validate_latest_release_fixture(&incomplete, "0.15.1")
+                .unwrap_err()
+                .to_string()
+                .contains("signed 17-asset contract")
+        );
+    }
+
+    #[test]
+    fn latest_release_payload_rejects_ambiguous_or_unsealed_assets() {
+        let fixture = latest_release_fixture("v0.15.2");
+
+        let mut duplicate_id = fixture.clone();
+        duplicate_id["assets"][1]["id"] = duplicate_id["assets"][0]["id"].clone();
+        assert!(
+            validate_latest_release_fixture(&duplicate_id, "0.15.2")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate asset ID")
+        );
+
+        let mut missing_digest = fixture.clone();
+        missing_digest["assets"][0]["digest"] = serde_json::Value::Null;
+        assert!(
+            validate_latest_release_fixture(&missing_digest, "0.15.2")
+                .unwrap_err()
+                .to_string()
+                .contains("without a canonical digest")
+        );
+
+        let mut pending_upload = fixture.clone();
+        pending_upload["assets"][0]["state"] = serde_json::json!("new");
+        assert!(
+            validate_latest_release_fixture(&pending_upload, "0.15.2")
+                .unwrap_err()
+                .to_string()
+                .contains("not fully uploaded")
+        );
+
+        let mut wrong_url = fixture;
+        wrong_url["assets"][0]["browser_download_url"] =
+            serde_json::json!("https://example.invalid/asset");
+        assert!(
+            validate_latest_release_fixture(&wrong_url, "0.15.2")
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected asset URL")
+        );
+    }
+
+    #[test]
+    fn version_command_parses_check_and_rejects_full_check_combination() {
+        let cli = Cli::try_parse_from(["ft", "version", "--check"])
+            .expect("version --check should parse");
+        assert!(matches!(
+            cli.command.map(|command| *command),
+            Some(Commands::Version {
+                full: false,
+                check: true,
+            })
+        ));
+        assert!(Cli::try_parse_from(["ft", "version", "--full", "--check"]).is_err());
+    }
+
     #[test]
     fn setup_font_command_parses_flags() {
         let cli = Cli::try_parse_from([
@@ -137062,7 +137529,10 @@ A  docs/new-proof.md\n";
     #[test]
     fn auto_font_install_respects_version_dry_run_and_setup_font() {
         assert!(!should_auto_install_bundled_font(Some(
-            &Commands::Version { full: false }
+            &Commands::Version {
+                full: false,
+                check: false,
+            }
         )));
         assert!(!should_auto_install_bundled_font(Some(&Commands::Setup {
             list_hosts: false,
