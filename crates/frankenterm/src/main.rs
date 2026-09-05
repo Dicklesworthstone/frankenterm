@@ -41365,11 +41365,11 @@ fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError>
     };
     // Validate the original syntax first, including attached short values and
     // clusters such as -vfjson. Only then force the transport's JSON format.
-    let argv = ["ft", "robot"]
+    let command_line = ["ft", "robot"]
         .into_iter()
         .chain(args.iter().map(String::as_str));
     let matches = <Cli as clap::CommandFactory>::command()
-        .try_get_matches_from(argv)
+        .try_get_matches_from(command_line)
         .map_err(|_| invalid())?;
     for option in ["workspace", "config"] {
         if matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine) {
