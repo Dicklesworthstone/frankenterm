@@ -4099,10 +4099,8 @@ pub mod process {
                 }
                 if self.cancel.load(Ordering::SeqCst) && cancelled_at.is_none() {
                     cancelled_at = Some(now);
-                    cutoff = cutoff.min(
-                        now.checked_add(CONTROLLED_SETTLEMENT_GRACE)
-                            .unwrap_or(now),
-                    );
+                    cutoff =
+                        cutoff.min(now.checked_add(CONTROLLED_SETTLEMENT_GRACE).unwrap_or(now));
                 }
                 if now >= cutoff {
                     self.cancel.store(true, Ordering::SeqCst);
@@ -5218,7 +5216,10 @@ pub mod process {
         let mut post_exit_deadline = None;
 
         loop {
-            if request_cx.as_ref().is_some_and(|cx| cx.checkpoint().is_err()) {
+            if request_cx
+                .as_ref()
+                .is_some_and(|cx| cx.checkpoint().is_err())
+            {
                 cancel.store(true, Ordering::SeqCst);
             }
             if cancel.load(Ordering::SeqCst) {
@@ -6065,6 +6066,8 @@ pub mod process {
     #[cfg(test)]
     mod output_capture_unit_tests {
         use super::*;
+        #[cfg(unix)]
+        use crate::runtime_async::CompatRuntime;
 
         #[cfg(unix)]
         #[test]

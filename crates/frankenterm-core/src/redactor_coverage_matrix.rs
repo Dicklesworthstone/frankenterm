@@ -1847,8 +1847,8 @@ mod tests {
                 "REDACTOR_BYTE_ORACLE {}",
                 serde_json::json!({
                 "fixture": vector.name,
-                "input_sha256": format!("{:x}", Sha256::digest(vector.input.as_bytes())),
-                "output_sha256": format!("{:x}", Sha256::digest(&bytes_result.bytes)),
+                "input_sha256": hex::encode(Sha256::digest(vector.input.as_bytes())),
+                "output_sha256": hex::encode(Sha256::digest(&bytes_result.bytes)),
                 "expected_spans": expected_ranges.len(), "replacement_spans": actual_ranges.len(),
                 "replacement_operations": trace.replacement_count, "detector_spans": detections.len(),
                 "covered_original_bytes": covered, "uncovered_original_bytes": uncovered,

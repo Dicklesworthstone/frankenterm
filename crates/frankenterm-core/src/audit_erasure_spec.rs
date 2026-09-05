@@ -787,7 +787,7 @@ mod tests {
                 ];
                 for (row, len) in lengths.into_iter().enumerate() {
                     let original: Vec<u8> = (0..len).map(|_| rng.random()).collect();
-                    let input_hash = format!("{:x}", Sha256::digest(&original));
+                    let input_hash = hex::encode(Sha256::digest(&original));
                     let encoded = super::encode_row(cfg, &original).unwrap();
                     let serialized: Vec<Vec<u8>> = encoded
                         .iter()
@@ -821,7 +821,7 @@ mod tests {
                             "k": k, "n": n, "length": len, "survivor_order": order,
                             "permutation": permutation, "encoding_version": 2,
                             "input_sha256": input_hash,
-                            "recovered_sha256": format!("{:x}", Sha256::digest(&recovered)),
+                            "recovered_sha256": hex::encode(Sha256::digest(&recovered)),
                             "assertions": 4, "error": null
                             })
                         );
@@ -921,7 +921,7 @@ mod tests {
                 serde_json::json!({
                 "control": control, "k": cfg.k(), "n": cfg.n(),
                 "length": original.len(), "survivor_order": survivors.iter().map(ErasureShard::shard_index).collect::<Vec<_>>(),
-                "wire_sha256": format!("{:x}", Sha256::digest(&bytes)),
+                "wire_sha256": hex::encode(Sha256::digest(&bytes)),
                 "expected_error": expected, "assertions": 1
                 })
             );
@@ -1487,8 +1487,8 @@ mod tests {
             serde_json::json!({
                 "control": "unframed_payload_bit_flip", "k": 1, "n": 1,
                 "encoding_version": 2, "length": original.len(),
-                "original_sha256": format!("{:x}", Sha256::digest(original)),
-                "recovered_sha256": format!("{:x}", Sha256::digest(&recovered)),
+                "original_sha256": hex::encode(Sha256::digest(original)),
+                "recovered_sha256": hex::encode(Sha256::digest(&recovered)),
                 "original_byte_oracle_agrees": recovered.as_slice() == original,
                 "assertions": 4
             })
