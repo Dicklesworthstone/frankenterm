@@ -84,7 +84,7 @@ proptest! {
     // 1. PageRank scores sum to ~1.0 for any graph
     #[test]
     fn pagerank_scores_sum_to_one(graph in arb_graph(15)) {
-        let result = pagerank(&graph, &PageRankConfig::default());
+        let result = pagerank(&graph, &PageRankConfig::default()).unwrap();
         if graph.node_count() > 0 {
             let total: f64 = result.scores.values().sum();
             prop_assert!((total - 1.0).abs() < 0.02, "sum={}", total);
@@ -94,14 +94,14 @@ proptest! {
     // 2. PageRank returns scores for all nodes
     #[test]
     fn pagerank_covers_all_nodes(graph in arb_graph(15)) {
-        let result = pagerank(&graph, &PageRankConfig::default());
+        let result = pagerank(&graph, &PageRankConfig::default()).unwrap();
         prop_assert_eq!(result.scores.len(), graph.node_count());
     }
 
     // 3. PageRank scores are non-negative
     #[test]
     fn pagerank_scores_nonneg(graph in arb_graph(15)) {
-        let result = pagerank(&graph, &PageRankConfig::default());
+        let result = pagerank(&graph, &PageRankConfig::default()).unwrap();
         for (&_node, &score) in &result.scores {
             prop_assert!(score >= 0.0);
         }
@@ -111,7 +111,7 @@ proptest! {
     #[test]
     fn pagerank_empty(_dummy in 0..1u8) {
         let g = AdjGraph::new(0);
-        let result = pagerank(&g, &PageRankConfig::default());
+        let result = pagerank(&g, &PageRankConfig::default()).unwrap();
         prop_assert!(result.scores.is_empty());
         prop_assert!(result.converged);
         prop_assert_eq!(result.iterations, 0);
@@ -121,7 +121,7 @@ proptest! {
     #[test]
     fn pagerank_single(_dummy in 0..1u8) {
         let g = AdjGraph::new(1);
-        let result = pagerank(&g, &PageRankConfig::default());
+        let result = pagerank(&g, &PageRankConfig::default()).unwrap();
         prop_assert!((result.scores[&0] - 1.0).abs() < 0.01);
     }
 
@@ -130,7 +130,7 @@ proptest! {
     fn pagerank_cycle_equal(g in arb_cycle(10)) {
         let n = g.node_count();
         let expected = 1.0 / n as f64;
-        let result = pagerank(&g, &PageRankConfig::default());
+        let result = pagerank(&g, &PageRankConfig::default()).unwrap();
         for i in 0..n {
             prop_assert!((result.scores[&i] - expected).abs() < 0.02);
         }
@@ -141,7 +141,7 @@ proptest! {
     fn pagerank_complete_equal(g in arb_complete(8)) {
         let n = g.node_count();
         let expected = 1.0 / n as f64;
-        let result = pagerank(&g, &PageRankConfig::default());
+        let result = pagerank(&g, &PageRankConfig::default()).unwrap();
         for i in 0..n {
             prop_assert!((result.scores[&i] - expected).abs() < 0.02);
         }
@@ -151,7 +151,7 @@ proptest! {
     #[test]
     fn pagerank_chain_last_highest(g in arb_chain(10)) {
         let n = g.node_count();
-        let result = pagerank(&g, &PageRankConfig::default());
+        let result = pagerank(&g, &PageRankConfig::default()).unwrap();
         let last_rank = result.scores[&(n - 1)];
         let first_rank = result.scores[&0];
         prop_assert!(last_rank > first_rank);
@@ -160,7 +160,7 @@ proptest! {
     // 9. PageRank converges for reasonable configs
     #[test]
     fn pagerank_converges(graph in arb_graph(10), config in arb_pagerank_config()) {
-        let result = pagerank(&graph, &config);
+        let result = pagerank(&graph, &config).unwrap();
         // Should at least run and produce results
         prop_assert_eq!(result.scores.len(), graph.node_count());
     }
@@ -172,7 +172,7 @@ proptest! {
         damping in 0.5..0.99f64,
     ) {
         let config = PageRankConfig { damping, ..Default::default() };
-        let result = pagerank(&graph, &config);
+        let result = pagerank(&graph, &config).unwrap();
         if graph.node_count() > 0 {
             let total: f64 = result.scores.values().sum();
             prop_assert!((total - 1.0).abs() < 0.02, "sum={}", total);
@@ -182,14 +182,14 @@ proptest! {
     // 11. Betweenness centrality returns scores for all nodes
     #[test]
     fn betweenness_covers_all_nodes(graph in arb_graph(10)) {
-        let result = betweenness_centrality(&graph);
+        let result = betweenness_centrality(&graph).unwrap();
         prop_assert_eq!(result.scores.len(), graph.node_count());
     }
 
     // 12. Betweenness scores are non-negative
     #[test]
     fn betweenness_nonneg(graph in arb_graph(10)) {
-        let result = betweenness_centrality(&graph);
+        let result = betweenness_centrality(&graph).unwrap();
         for (&_node, &score) in &result.scores {
             prop_assert!(score >= 0.0);
         }
@@ -199,7 +199,7 @@ proptest! {
     #[test]
     fn betweenness_empty(_dummy in 0..1u8) {
         let g = AdjGraph::new(0);
-        let result = betweenness_centrality(&g);
+        let result = betweenness_centrality(&g).unwrap();
         prop_assert!(result.scores.is_empty());
     }
 
@@ -207,7 +207,7 @@ proptest! {
     #[test]
     fn betweenness_single(_dummy in 0..1u8) {
         let g = AdjGraph::new(1);
-        let result = betweenness_centrality(&g);
+        let result = betweenness_centrality(&g).unwrap();
         prop_assert!(result.scores[&0].abs() < f64::EPSILON);
     }
 
@@ -215,7 +215,7 @@ proptest! {
     #[test]
     fn betweenness_cycle_equal(g in arb_cycle(8)) {
         let n = g.node_count();
-        let result = betweenness_centrality(&g);
+        let result = betweenness_centrality(&g).unwrap();
         let first = result.scores[&0];
         for i in 1..n {
             prop_assert!((result.scores[&i] - first).abs() < 0.01);
@@ -226,7 +226,7 @@ proptest! {
     #[test]
     fn betweenness_complete_equal(g in arb_complete(6)) {
         let n = g.node_count();
-        let result = betweenness_centrality(&g);
+        let result = betweenness_centrality(&g).unwrap();
         let first = result.scores[&0];
         for i in 1..n {
             prop_assert!((result.scores[&i] - first).abs() < 0.01);
@@ -236,7 +236,7 @@ proptest! {
     // 17. Betweenness chain: source node is 0
     #[test]
     fn betweenness_chain_source_zero(g in arb_chain(8)) {
-        let result = betweenness_centrality(&g);
+        let result = betweenness_centrality(&g).unwrap();
         prop_assert!(result.scores[&0].abs() < f64::EPSILON);
     }
 
@@ -244,7 +244,7 @@ proptest! {
     #[test]
     fn betweenness_chain_terminal_zero(g in arb_chain(8)) {
         let n = g.node_count();
-        let result = betweenness_centrality(&g);
+        let result = betweenness_centrality(&g).unwrap();
         prop_assert!(result.scores[&(n - 1)].abs() < f64::EPSILON);
     }
 
@@ -253,7 +253,7 @@ proptest! {
     fn betweenness_chain_middle_highest(g in arb_chain(8)) {
         let n = g.node_count();
         if n >= 3 {
-            let result = betweenness_centrality(&g);
+            let result = betweenness_centrality(&g).unwrap();
             let mid = n / 2;
             prop_assert!(result.scores[&mid] > result.scores[&0]);
             prop_assert!(result.scores[&mid] > result.scores[&(n - 1)]);
@@ -264,7 +264,7 @@ proptest! {
     #[test]
     fn normalize_produces_unit_range(g in arb_chain(10)) {
         let n = g.node_count();
-        let mut result = betweenness_centrality(&g);
+        let mut result = betweenness_centrality(&g).unwrap();
         normalize_betweenness(&mut result.scores, n);
         for &score in result.scores.values() {
             prop_assert!(score >= 0.0);
@@ -276,7 +276,7 @@ proptest! {
     #[test]
     fn normalize_small_noop(n in 0..3usize) {
         let g = AdjGraph::new(n);
-        let mut result = betweenness_centrality(&g);
+        let mut result = betweenness_centrality(&g).unwrap();
         let before: Vec<f64> = result.scores.values().copied().collect();
         normalize_betweenness(&mut result.scores, n);
         let after: Vec<f64> = result.scores.values().copied().collect();
@@ -335,7 +335,7 @@ proptest! {
             tolerance: 1e-20,
             ..Default::default()
         };
-        let result = pagerank(&graph, &config);
+        let result = pagerank(&graph, &config).unwrap();
         if graph.node_count() > 0 {
             prop_assert_eq!(result.iterations, 1);
         }
@@ -344,8 +344,8 @@ proptest! {
     // 28. Both algorithms return same node count
     #[test]
     fn both_algorithms_same_nodes(graph in arb_graph(10)) {
-        let pr = pagerank(&graph, &PageRankConfig::default());
-        let bc = betweenness_centrality(&graph);
+        let pr = pagerank(&graph, &PageRankConfig::default()).unwrap();
+        let bc = betweenness_centrality(&graph).unwrap();
         prop_assert_eq!(pr.scores.len(), bc.scores.len());
     }
 
@@ -367,8 +367,8 @@ proptest! {
     #[test]
     fn pagerank_deterministic(graph in arb_graph(10)) {
         let config = PageRankConfig::default();
-        let r1 = pagerank(&graph, &config);
-        let r2 = pagerank(&graph, &config);
+        let r1 = pagerank(&graph, &config).unwrap();
+        let r2 = pagerank(&graph, &config).unwrap();
         for node in graph.nodes() {
             let diff = (r1.scores[&node] - r2.scores[&node]).abs();
             prop_assert!(diff < 1e-10);
