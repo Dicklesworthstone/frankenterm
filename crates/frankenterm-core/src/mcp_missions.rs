@@ -5,7 +5,6 @@
 //! used by the mission/tx tool handlers.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Config;
 use crate::mcp_error::{
@@ -34,18 +33,6 @@ use super::{
 // serde_json::from_str sees them.
 const MAX_MISSION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TX_CONTRACT_BYTES: u64 = 16 * 1024 * 1024;
-static MISSION_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
-
-fn unique_mcp_json_tmp_path(path: &Path) -> PathBuf {
-    let nonce = MISSION_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("tmp");
-    path.with_extension(format!("{extension}.{pid}.{nonce}.tmp"))
-}
-
 /// Read a mission-adjacent JSON file with a hard size cap. Stat-checks
 /// before `read_to_string` to reject oversize files without allocating
 /// the full content; re-checks bytes-read after to catch filesystems
@@ -505,45 +492,29 @@ pub(super) fn mcp_load_mission_from_path(
     Ok(mission)
 }
 
-pub(super) fn mcp_save_mission_to_path(
-    path: &Path,
-    mission: &crate::plan::Mission,
-) -> std::result::Result<(), McpToolError> {
-    let json = serde_json::to_string_pretty(mission).map_err(|err| {
-        McpToolError::new(
-            "robot.mission_serialize_failed",
-            format!("Failed to serialize mission: {err}"),
-            None,
-        )
-    })?;
+pub(super) fn mcp_mission_store_error(
+    error: crate::tx_execution::MissionStoreError,
+) -> McpToolError {
+    McpToolError::new(error.code(), error.to_string(), None)
+}
 
-    // [ft-wxqbt] Atomic write — see mcp_save_mission_tx_contract_to_path
-    // for the full rationale. fs::write here would leave a truncated
-    // mission file on mid-write crash; tmp+rename preserves the old
-    // contents across the durability boundary.
-    let tmp_path = unique_mcp_json_tmp_path(path);
-    std::fs::write(&tmp_path, &json).map_err(|err| {
-        McpToolError::new(
-            "robot.mission_write_failed",
-            format!(
-                "Failed to write mission temp file {}: {err}",
-                tmp_path.display()
-            ),
-            None,
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path);
-        McpToolError::new(
-            "robot.mission_write_failed",
-            format!(
-                "Failed to rename mission temp file {} -> {}: {err}",
-                tmp_path.display(),
-                path.display()
-            ),
-            None,
-        )
-    })
+pub(super) fn mcp_acquire_mission_mutation(
+    config: &Config,
+    path: &Path,
+    expected: Option<&crate::tx_execution::MissionRevisionToken>,
+) -> std::result::Result<crate::tx_execution::MissionMutationGuard, McpToolError> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(McpToolError::from_error)?;
+    crate::tx_execution::MissionMutationGuard::acquire(&layout.root, path, expected)
+        .map_err(mcp_mission_store_error)
+}
+
+pub(super) fn mcp_save_mission_to_path(
+    guard: crate::tx_execution::MissionMutationGuard,
+    mission: &mut crate::plan::Mission,
+) -> std::result::Result<crate::tx_execution::MissionMutationReceipt, McpToolError> {
+    guard.commit(mission).map_err(mcp_mission_store_error)
 }
 
 pub(super) fn mcp_mission_lifecycle_transitions(
@@ -1425,8 +1396,14 @@ mod tests {
     fn save_and_load_mission_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mission.json");
-        let mission = make_mission_with_assignments(vec![]);
-        mcp_save_mission_to_path(&path, &mission).unwrap();
+        let mut mission = make_mission_with_assignments(vec![]);
+        std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+        let guard =
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        mission.title = "durably changed".to_string();
+        let receipt = mcp_save_mission_to_path(guard, &mut mission).unwrap();
+        assert!(receipt.changed);
+        assert_eq!(receipt.current.revision, 1);
         let loaded = mcp_load_mission_from_path(&path).unwrap();
         assert_eq!(loaded.mission_id.0, mission.mission_id.0);
         assert_eq!(loaded.title, mission.title);
@@ -1510,46 +1487,56 @@ mod tests {
     }
 
     #[test]
-    fn mission_tmp_paths_are_unique_per_save_attempt() {
+    fn mission_stale_revision_cannot_overwrite_accepted_abort() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mission.json");
-
-        let first = super::unique_mcp_json_tmp_path(&path);
-        let second = super::unique_mcp_json_tmp_path(&path);
-
-        assert_ne!(first, second, "mission temp paths must not collide");
-        assert_eq!(first.parent(), path.parent());
-        assert_eq!(second.parent(), path.parent());
-        assert_ne!(first, path.with_extension("json.tmp"));
-        assert_ne!(second, path.with_extension("json.tmp"));
+        let mission = make_mission_with_assignments(vec![]);
+        std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+        let stale = crate::tx_execution::MissionRevisionToken::from_mission(&mission).unwrap();
+        let guard =
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, Some(&stale))
+                .unwrap();
+        let mut mission = guard.mission().clone();
+        mission
+            .abort_mission("test-operator", "stop", None, mission.created_at_ms, None)
+            .unwrap();
+        let receipt = mcp_save_mission_to_path(guard, &mut mission).unwrap();
+        assert_eq!(
+            receipt.owner_acknowledgement,
+            "unavailable_no_mission_driver"
+        );
+        let accepted = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, Some(&stale))
+                .err()
+                .unwrap(),
+            crate::tx_execution::MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
     }
 
-    // [ft-wxqbt] Same atomic-write contract for mcp_save_mission_to_path.
-    // If this ever reverts to direct fs::write, a mid-save crash would
-    // corrupt .ft/mission/active.json and lose the mission.
+    // An already-open descriptor must retain the old snapshot after replacement.
+    #[cfg(unix)]
     #[test]
     fn save_mission_is_atomic_rename_ft_wxqbt() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("active.json");
-        let tmp_path = path.with_extension("json.tmp");
-
         let mission = make_mission_with_assignments(vec![]);
-        mcp_save_mission_to_path(&path, &mission).unwrap();
-        assert!(path.exists(), "target mission file must exist after save");
-        assert!(
-            !tmp_path.exists(),
-            "ft-wxqbt: {}.tmp must not linger after successful rename",
-            path.display()
-        );
-
-        // Overwrite path: same invariant.
+        let original = serde_json::to_vec(&mission).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let mut old_file = std::fs::File::open(&path).unwrap();
+        let old_inode = old_file.metadata().unwrap().ino();
+        let guard =
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
         let mut mission2 = mission.clone();
         mission2.title = "renamed".to_string();
-        mcp_save_mission_to_path(&path, &mission2).unwrap();
-        assert!(
-            !tmp_path.exists(),
-            "ft-wxqbt: .tmp must not linger on overwrite"
-        );
+        mcp_save_mission_to_path(guard, &mut mission2).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), old_inode);
+        let mut old_bytes = Vec::new();
+        old_file.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, original);
         let loaded = mcp_load_mission_from_path(&path).unwrap();
         assert_eq!(loaded.title, "renamed");
     }

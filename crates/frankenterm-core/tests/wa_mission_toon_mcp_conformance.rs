@@ -209,6 +209,12 @@ fn canonicalize(value: &mut Value) {
                 match key.as_str() {
                     "now" | "elapsed_ms" => *child = Value::from(0_u64),
                     "mission_file" => *child = Value::String("<mission_file>".to_string()),
+                    "mission_hash" | "content_sha256" => {
+                        *child = Value::String("<verified_content_hash>".to_string())
+                    }
+                    "checkpoint_id" if !child.is_null() => {
+                        *child = Value::String("<verified_checkpoint_id>".to_string())
+                    }
                     _ if key.ends_with("_ms") => *child = Value::from(0_i64),
                     _ => canonicalize(child),
                 }
@@ -342,6 +348,8 @@ fn make_running_mission() -> Mission {
         },
         1_700_000_000_000,
     );
+    // This fixture represents the same explicit incarnation in JSON and TOON.
+    mission.generation = "0123456789abcdef0123456789abcdef".to_string();
     mission.lifecycle_state = MissionLifecycleState::Running;
     mission.candidates = vec![
         make_candidate("candidate:alpha", 1, "/approve alpha", 1_700_000_000_010),
@@ -400,6 +408,50 @@ fn seed_paused_mission(harness: &mut TestHarness) {
     );
 }
 
+fn assert_mission_response_authority(envelope: &Value, before: &Mission, path: &Path) {
+    use frankenterm_core::tx_execution::MissionRevisionToken;
+    let after: Mission = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    after.validate().unwrap();
+    let data = &envelope["data"];
+    if let Some(hash) = data.get("mission_hash") {
+        assert_eq!(hash, &Value::String(after.compute_hash()));
+    }
+    let current =
+        serde_json::to_value(MissionRevisionToken::from_mission(&after).unwrap()).unwrap();
+    if let Some(mutation) = data.get("mutation") {
+        assert_eq!(
+            mutation["previous"],
+            serde_json::to_value(MissionRevisionToken::from_mission(before).unwrap()).unwrap()
+        );
+        assert_eq!(mutation["current"], current);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(mutation["changed"], true);
+        assert_eq!(mutation["durability"], "file_and_directory_synced");
+        assert_eq!(
+            mutation["owner_acknowledgement"],
+            "unavailable_no_mission_driver"
+        );
+        if let Some(checkpoint_id) = data.get("checkpoint_id").and_then(Value::as_str) {
+            let checkpoint = after
+                .pause_resume_state
+                .current_checkpoint
+                .as_ref()
+                .or_else(|| after.pause_resume_state.checkpoint_history.last())
+                .unwrap();
+            assert_eq!(checkpoint_id, checkpoint.checkpoint_id);
+        }
+    } else {
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        if let Some(token) = data.get("revision_token") {
+            assert_eq!(token, &current);
+        }
+    }
+}
+
 fn capture_tool_contract(
     tool_name: &str,
     success_setup: impl Fn(&mut TestHarness),
@@ -411,6 +463,8 @@ fn capture_tool_contract(
     let (input_schema, json_success_envelope) = {
         let mut json_harness = new_harness();
         success_setup(&mut json_harness);
+        let mission_path = mission_file_path(json_harness.workspace.path());
+        let before: Mission = serde_json::from_slice(&fs::read(&mission_path).unwrap()).unwrap();
         let input_schema = tool_input_schema(&mut json_harness.client, tool_name);
         assert_schema_matches_manifest(tool_name, &input_schema);
         let json_success_envelope = parse_tool_envelope(
@@ -420,19 +474,24 @@ fn capture_tool_contract(
                 .unwrap_or_else(|err| panic!("call {tool_name} json success case: {err}")),
             "json",
         );
+        assert_mission_response_authority(&json_success_envelope, &before, &mission_path);
         (input_schema, json_success_envelope)
     };
 
     let toon_success_envelope = {
         let mut toon_harness = new_harness();
         success_setup(&mut toon_harness);
-        parse_tool_envelope(
+        let mission_path = mission_file_path(toon_harness.workspace.path());
+        let before: Mission = serde_json::from_slice(&fs::read(&mission_path).unwrap()).unwrap();
+        let envelope = parse_tool_envelope(
             &toon_harness
                 .client
                 .call_tool(tool_name, success_args(&toon_harness, "toon"))
                 .unwrap_or_else(|err| panic!("call {tool_name} toon success case: {err}")),
             "toon",
-        )
+        );
+        assert_mission_response_authority(&envelope, &before, &mission_path);
+        envelope
     };
 
     assert_success_envelope_shape(&json_success_envelope, &format!("{tool_name} json"));

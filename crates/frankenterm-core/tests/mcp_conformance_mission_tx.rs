@@ -156,6 +156,9 @@ fn canonicalize(value: &mut Value, workspace_root: &Path) {
                     "now" | "elapsed_ms" => *child = Value::from(0_u64),
                     "mission_file" => *child = Value::String("<mission_file>".to_string()),
                     "contract_file" => *child = Value::String("<contract_file>".to_string()),
+                    "mission_hash" | "content_sha256" => {
+                        *child = Value::String("<verified_content_hash>".to_string())
+                    }
                     "checkpoint_id" if !child.is_null() => {
                         *child = Value::String("<checkpoint_id>".to_string());
                     }
@@ -310,6 +313,7 @@ fn make_running_mission() -> Mission {
         },
         1_700_000_000_000,
     );
+    mission.generation = "0123456789abcdef0123456789abcdef".to_string();
     mission.lifecycle_state = MissionLifecycleState::Running;
     mission.candidates = vec![
         make_candidate("candidate:alpha", 1, "/approve alpha", 1_700_000_000_010),
@@ -430,6 +434,50 @@ fn make_tx_contract() -> MissionTxContract {
     }
 }
 
+fn assert_mission_response_authority(envelope: &Value, before: &Mission, path: &Path) {
+    use frankenterm_core::tx_execution::MissionRevisionToken;
+    let after: Mission = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    after.validate().unwrap();
+    let data = &envelope["data"];
+    if let Some(hash) = data.get("mission_hash") {
+        assert_eq!(hash, &Value::String(after.compute_hash()));
+    }
+    let current =
+        serde_json::to_value(MissionRevisionToken::from_mission(&after).unwrap()).unwrap();
+    if let Some(mutation) = data.get("mutation") {
+        assert_eq!(
+            mutation["previous"],
+            serde_json::to_value(MissionRevisionToken::from_mission(before).unwrap()).unwrap()
+        );
+        assert_eq!(mutation["current"], current);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(mutation["changed"], true);
+        assert_eq!(mutation["durability"], "file_and_directory_synced");
+        assert_eq!(
+            mutation["owner_acknowledgement"],
+            "unavailable_no_mission_driver"
+        );
+        if let Some(checkpoint_id) = data.get("checkpoint_id").and_then(Value::as_str) {
+            let checkpoint = after
+                .pause_resume_state
+                .current_checkpoint
+                .as_ref()
+                .or_else(|| after.pause_resume_state.checkpoint_history.last())
+                .unwrap();
+            assert_eq!(checkpoint_id, checkpoint.checkpoint_id);
+        }
+    } else {
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        if let Some(token) = data.get("revision_token") {
+            assert_eq!(token, &current);
+        }
+    }
+}
+
 fn capture_tool_contract(
     tool_name: &str,
     success_setup: impl FnOnce(&mut TestHarness),
@@ -439,6 +487,10 @@ fn capture_tool_contract(
 ) -> ToolGoldenCapture {
     let mut harness = new_harness();
     success_setup(&mut harness);
+    let mission_path = mission_file_path(harness.workspace.path());
+    let before = tool_name
+        .starts_with("wa.mission_")
+        .then(|| serde_json::from_slice::<Mission>(&fs::read(&mission_path).unwrap()).unwrap());
     let input_schema = tool_input_schema(&mut harness.client, tool_name);
     assert_schema_matches_manifest(tool_name, &input_schema);
     let success_args = success_args(&harness);
@@ -448,6 +500,9 @@ fn capture_tool_contract(
             .call_tool(tool_name, success_args)
             .unwrap_or_else(|err| panic!("call {tool_name} success case: {err}")),
     );
+    if let Some(before) = &before {
+        assert_mission_response_authority(&success_envelope, before, &mission_path);
+    }
 
     invalid_setup(&mut harness);
     let invalid_args = invalid_args(&harness);

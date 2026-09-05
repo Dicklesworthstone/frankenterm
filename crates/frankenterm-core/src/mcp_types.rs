@@ -682,6 +682,7 @@ pub(super) struct MissionExplainParams {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct MissionPauseParams {
+    pub expected_token: Option<crate::tx_execution::MissionRevisionToken>,
     #[serde(default)]
     pub mission_file: Option<String>,
     pub reason: Option<String>,
@@ -691,6 +692,7 @@ pub(super) struct MissionPauseParams {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct MissionResumeParams {
+    pub expected_token: Option<crate::tx_execution::MissionRevisionToken>,
     #[serde(default)]
     pub mission_file: Option<String>,
     #[serde(default = "mcp_default_requested_by")]
@@ -699,6 +701,7 @@ pub(super) struct MissionResumeParams {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct MissionAbortParams {
+    pub expected_token: Option<crate::tx_execution::MissionRevisionToken>,
     #[serde(default)]
     pub mission_file: Option<String>,
     pub reason: Option<String>,
@@ -747,6 +750,8 @@ pub(super) struct McpMissionAssignmentData {
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct McpMissionStateData {
+    pub revision_token: crate::tx_execution::MissionRevisionToken,
+    pub owner_acknowledgement: &'static str,
     pub mission_file: String,
     pub mission_id: String,
     pub title: String,
@@ -782,6 +787,7 @@ pub(super) struct McpMissionFailureCatalogEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct McpMissionControlData {
+    pub mutation: crate::tx_execution::MissionMutationReceipt,
     pub command: String,
     pub mission_file: String,
     pub mission_id: String,
@@ -2594,6 +2600,17 @@ mod tests {
             mission_hash in arb_string(),
         ) {
             let d = McpMissionControlData {
+                mutation: crate::tx_execution::MissionMutationReceipt {
+                    previous: crate::tx_execution::MissionRevisionToken {
+                        mission_id: mission_id.clone(), generation: "1".repeat(32), revision: 0, content_sha256: "a".repeat(64),
+                    },
+                    current: crate::tx_execution::MissionRevisionToken {
+                        mission_id: mission_id.clone(), generation: "1".repeat(32), revision: 1, content_sha256: "b".repeat(64),
+                    },
+                    changed: true,
+                    durability: "file_and_directory_synced",
+                    owner_acknowledgement: "unavailable_no_mission_driver",
+                },
                 command: command.clone(),
                 mission_file: mission_file.clone(),
                 mission_id: mission_id.clone(),

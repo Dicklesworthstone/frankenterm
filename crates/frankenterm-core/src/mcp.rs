@@ -100,7 +100,7 @@ use mcp_middleware::{
     extract_mcp_output_format, parse_mcp_output_format,
 };
 use mcp_missions::{
-    mcp_build_mission_assignments, mcp_load_mission_from_path,
+    mcp_acquire_mission_mutation, mcp_build_mission_assignments, mcp_load_mission_from_path,
     mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
     mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
@@ -4077,6 +4077,13 @@ mod tests {
             mission_id: "m-1".to_string(),
             title: "Test Mission".to_string(),
             mission_hash: "sha256:abcd".to_string(),
+            revision_token: crate::tx_execution::MissionRevisionToken {
+                mission_id: "m-1".to_string(),
+                generation: "1".repeat(32),
+                revision: 0,
+                content_sha256: "a".repeat(64),
+            },
+            owner_acknowledgement: "unavailable_no_mission_driver",
             lifecycle_state: "running".to_string(),
             candidate_count: 3,
             assignment_count: 2,
@@ -4122,6 +4129,23 @@ mod tests {
             error_code: None,
             checkpoint_id: Some("cp-m-1-123".to_string()),
             mission_hash: "sha256:abcd".to_string(),
+            mutation: crate::tx_execution::MissionMutationReceipt {
+                previous: crate::tx_execution::MissionRevisionToken {
+                    mission_id: "m-1".to_string(),
+                    generation: "1".repeat(32),
+                    revision: 0,
+                    content_sha256: "a".repeat(64),
+                },
+                current: crate::tx_execution::MissionRevisionToken {
+                    mission_id: "m-1".to_string(),
+                    generation: "1".repeat(32),
+                    revision: 1,
+                    content_sha256: "b".repeat(64),
+                },
+                changed: true,
+                durability: "file_and_directory_synced",
+                owner_acknowledgement: "unavailable_no_mission_driver",
+            },
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("pause"));

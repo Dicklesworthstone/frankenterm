@@ -2879,6 +2879,178 @@ fn contract_help_lists_core_commands() {
 // ft tx contract tests
 // =============================================================================
 
+#[cfg(unix)]
+#[test]
+fn contract_mission_cli_durable_lifecycle_and_stale_token_refusal() {
+    use frankenterm_core::plan::{Mission, MissionId, MissionLifecycleState, MissionOwnership};
+    let (dir, ws) = setup_workspace();
+    let path = dir.path().join(".ft/mission/active.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mission = Mission::new(
+        MissionId("mission:owned-cli".to_string()),
+        "Owned lifecycle persistence test",
+        "owned-cli-workspace",
+        MissionOwnership {
+            planner: "test-planner".to_string(),
+            dispatcher: "test-dispatcher".to_string(),
+            operator: "test-operator".to_string(),
+        },
+        1_000,
+    );
+    std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+    // These owned short inputs produce finite JSON receipts. Each actual CLI
+    // subprocess has a deadline; preserve stderr in every failure diagnostic.
+    let call = |verb: &str, token: Option<&serde_json::Value>, success: bool| {
+        let mut command = wa_cmd_for(&ws);
+        command.timeout(std::time::Duration::from_secs(15));
+        command.args(["mission", verb, "--format", "json"]);
+        if let Some(token) = token {
+            command
+                .arg("--expected-token")
+                .arg(serde_json::to_string(token).unwrap());
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{verb}: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() < 64 * 1024 && output.stderr.len() < 64 * 1024);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let original = std::fs::read(&path).unwrap();
+    let status = call("status", None, true);
+    let initial = status["data"]["revision_token"].clone();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "status is observational"
+    );
+    let run = call("run", Some(&initial), true);
+    assert_eq!(run["data"]["lifecycle_state"], "running");
+    assert_eq!(run["data"]["mutation"]["current"]["revision"], 1);
+    let paused = call("pause", Some(&run["data"]["mutation"]["current"]), true);
+    assert_eq!(paused["data"]["lifecycle_state"], "paused");
+    let loaded: Mission = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(loaded.pause_resume_state.current_checkpoint.is_some());
+    let resumed = call("resume", Some(&paused["data"]["mutation"]["current"]), true);
+    assert_eq!(resumed["data"]["lifecycle_state"], "running");
+    let aborted = call("abort", Some(&resumed["data"]["mutation"]["current"]), true);
+    assert_eq!(aborted["data"]["mutation"]["current"]["revision"], 4);
+    assert_eq!(
+        aborted["data"]["mutation"]["owner_acknowledgement"],
+        "unavailable_no_mission_driver"
+    );
+    let accepted = std::fs::read(&path).unwrap();
+    let rejected = call(
+        "resume",
+        Some(&resumed["data"]["mutation"]["current"]),
+        false,
+    );
+    assert_eq!(rejected["error_code"], "mission.revision_conflict");
+    assert_eq!(std::fs::read(&path).unwrap(), accepted);
+    let loaded: Mission = serde_json::from_slice(&accepted).unwrap();
+    loaded.validate().unwrap();
+    assert_eq!(loaded.lifecycle_state, MissionLifecycleState::Cancelled);
+    assert_eq!(loaded.pause_resume_state.total_abort_count, 1);
+    assert_eq!(loaded.pause_resume_state.checkpoint_history.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_mission_cli_process_race_has_one_revision_winner() {
+    use frankenterm_core::plan::{Mission, MissionId, MissionLifecycleState, MissionOwnership};
+    use frankenterm_core::tx_execution::MissionRevisionToken;
+    let (dir, ws) = setup_workspace();
+    let path = dir.path().join(".ft/mission/active.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut mission = Mission::new(
+        MissionId("mission:owned-cli-race".to_string()),
+        "Owned CLI concurrency test",
+        "owned-cli-workspace",
+        MissionOwnership {
+            planner: "test-planner".to_string(),
+            dispatcher: "test-dispatcher".to_string(),
+            operator: "test-operator".to_string(),
+        },
+        1_000,
+    );
+    mission.lifecycle_state = MissionLifecycleState::Running;
+    mission
+        .pause_mission("test-operator", "seed", 2_000, None)
+        .unwrap();
+    std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+    let token =
+        serde_json::to_value(MissionRevisionToken::from_mission(&mission).unwrap()).unwrap();
+    let call = |verb: &str, expected: &serde_json::Value| {
+        let output = wa_cmd_for(&ws)
+            .timeout(std::time::Duration::from_secs(15))
+            .args(["mission", verb, "--format", "json", "--expected-token"])
+            .arg(serde_json::to_string(expected).unwrap())
+            .output()
+            .unwrap();
+        assert!(output.stdout.len() < 64 * 1024 && output.stderr.len() < 64 * 1024);
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        eprintln!(
+            "owned CLI mission race: verb={verb}, status={:?}, response={response}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.success(), response["ok"] == true);
+        response
+    };
+    // The launch barrier admits both actual CLI requests from the same observed
+    // revision. OS scheduling may serialize execution; neither winner is chosen.
+    let barrier = std::sync::Barrier::new(3);
+    let (resume, abort) = std::thread::scope(|scope| {
+        let resume = scope.spawn(|| {
+            barrier.wait();
+            call("resume", &token)
+        });
+        let abort = scope.spawn(|| {
+            barrier.wait();
+            call("abort", &token)
+        });
+        barrier.wait();
+        (resume.join().unwrap(), abort.join().unwrap())
+    });
+    assert_ne!(
+        resume["ok"], abort["ok"],
+        "exactly one request may accept revision zero"
+    );
+    let (winner, loser) = if abort["ok"] == true {
+        (&abort, &resume)
+    } else {
+        (&resume, &abort)
+    };
+    assert_eq!(winner["data"]["mutation"]["previous"], token);
+    assert_eq!(winner["data"]["mutation"]["current"]["revision"], 1);
+    assert!(matches!(
+        loser["error_code"].as_str(),
+        Some("mission.revision_conflict" | "mission.mutation_in_progress")
+    ));
+    if abort["ok"] == false {
+        let fresh_abort = call("abort", &winner["data"]["mutation"]["current"]);
+        assert_eq!(fresh_abort["ok"], true);
+        assert_eq!(fresh_abort["data"]["mutation"]["current"]["revision"], 2);
+    }
+    let accepted = std::fs::read(&path).unwrap();
+    let stale_resume = call("resume", &token);
+    assert_eq!(stale_resume["ok"], false);
+    assert_eq!(stale_resume["error_code"], "mission.revision_conflict");
+    assert_eq!(std::fs::read(&path).unwrap(), accepted);
+    let final_mission: Mission = serde_json::from_slice(&accepted).unwrap();
+    final_mission.validate().unwrap();
+    assert_eq!(
+        final_mission.lifecycle_state,
+        MissionLifecycleState::Cancelled
+    );
+    assert_eq!(final_mission.pause_resume_state.total_abort_count, 1);
+}
+
 #[test]
 fn contract_tx_plan_json_envelope() {
     let (dir, ws) = setup_workspace();

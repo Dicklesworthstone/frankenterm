@@ -1085,7 +1085,7 @@ impl OnFailure {
 // ============================================================================
 
 /// Current schema version for mission nouns and ownership contracts.
-pub const MISSION_SCHEMA_VERSION: u32 = 1;
+pub const MISSION_SCHEMA_VERSION: u32 = 2;
 
 /// Stable mission identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1847,6 +1847,8 @@ pub enum MissionLifecycleError {
         from: MissionLifecycleState,
         transition: MissionLifecycleTransitionKind,
     },
+    InvalidTimestamp,
+    ArithmeticOverflow,
 }
 
 impl fmt::Display for MissionLifecycleError {
@@ -1856,6 +1858,12 @@ impl fmt::Display for MissionLifecycleError {
                 f,
                 "invalid mission lifecycle transition: {from} --{transition}--> ?"
             ),
+            Self::InvalidTimestamp => {
+                f.write_str("mission lifecycle timestamp precedes recorded state")
+            }
+            Self::ArithmeticOverflow => {
+                f.write_str("mission lifecycle counter or duration overflow")
+            }
         }
     }
 }
@@ -2135,8 +2143,14 @@ impl Assignment {
 pub struct Mission {
     pub mission_version: u32,
     pub mission_id: MissionId,
+    /// Storage incarnation, generated once at creation and preserved on load.
+    pub generation: String,
+    /// Accepted durable mutations within this incarnation.
+    pub revision: u64,
     pub title: String,
     pub workspace_id: String,
+    /// Persisted orchestration state. A control transition does not acknowledge
+    /// that an external mission driver or assignment owner applied it.
     #[serde(default)]
     pub lifecycle_state: MissionLifecycleState,
     pub ownership: MissionOwnership,
@@ -2166,6 +2180,8 @@ impl Mission {
         Self {
             mission_version: MISSION_SCHEMA_VERSION,
             mission_id,
+            generation: format!("{:032x}", rand::random::<u128>()),
+            revision: 0,
             title: title.into(),
             workspace_id: workspace_id.into(),
             lifecycle_state: MissionLifecycleState::Planning,
@@ -2186,6 +2202,7 @@ impl Mission {
         transitioned_at_ms: i64,
     ) -> Result<MissionLifecycleState, MissionLifecycleError> {
         let next = self.lifecycle_state.apply_transition(transition)?;
+        self.validate_transition_time(transitioned_at_ms)?;
         self.lifecycle_state = next;
         self.updated_at_ms = Some(transitioned_at_ms);
         Ok(next)
@@ -2211,6 +2228,8 @@ impl Mission {
         let mut parts = vec![
             format!("v={}", self.mission_version),
             format!("mission_id={}", self.mission_id.0),
+            format!("generation={}", self.generation),
+            format!("revision={}", self.revision),
             format!("title={}", self.title),
             format!("workspace_id={}", self.workspace_id),
             format!("lifecycle_state={}", self.lifecycle_state),
@@ -2226,6 +2245,11 @@ impl Mission {
         if let Some(provenance) = &self.provenance {
             parts.push(format!("provenance={}", provenance.canonical_string()));
         }
+        parts.push(format!(
+            "pause_resume_state={}",
+            serde_json::to_string(&self.pause_resume_state)
+                .expect("mission checkpoint state contains only JSON-serializable fields")
+        ));
 
         let mut candidate_parts: Vec<String> = self
             .candidates
@@ -2257,6 +2281,17 @@ impl Mission {
                 version: self.mission_version,
                 max_supported: MISSION_SCHEMA_VERSION,
             });
+        }
+        if self.generation.len() != 32
+            || !self
+                .generation
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(MissionValidationError::InvalidGeneration);
+        }
+        if !self.recorded_times_valid() {
+            return Err(MissionValidationError::InvalidTimestamps);
         }
         if self.title.trim().is_empty() {
             return Err(MissionValidationError::MissingTitle);
@@ -2332,6 +2367,7 @@ impl Mission {
                 transition: kind,
             });
         }
+        self.validate_transition_time(transitioned_at_ms)?;
         self.lifecycle_state = to;
         self.updated_at_ms = Some(transitioned_at_ms);
         Ok(to)
@@ -2465,7 +2501,9 @@ impl Mission {
                     detail: "failed mission requires at least one failed outcome",
                 })
             }
-            MissionLifecycleState::Cancelled if !has_cancel => {
+            MissionLifecycleState::Cancelled
+                if !has_cancel && self.pause_resume_state.total_abort_count == 0 =>
+            {
                 Err(MissionValidationError::LifecycleStateOutcomeMismatch {
                     state: self.lifecycle_state,
                     detail: "cancelled mission requires at least one cancelled outcome",
@@ -2584,6 +2622,8 @@ pub enum MissionValidationError {
     DuplicateOwnershipActor(String),
     MissingTitle,
     MissingWorkspaceId,
+    InvalidGeneration,
+    InvalidTimestamps,
     DuplicateCandidateId(CandidateActionId),
     DuplicateAssignmentId(AssignmentId),
     UnknownCandidateReference(CandidateActionId),
@@ -2620,6 +2660,12 @@ impl fmt::Display for MissionValidationError {
             }
             Self::MissingTitle => f.write_str("Mission title cannot be empty"),
             Self::MissingWorkspaceId => f.write_str("Mission workspace_id cannot be empty"),
+            Self::InvalidGeneration => f.write_str(
+                "Mission generation must be a persisted 128-bit lowercase hexadecimal incarnation",
+            ),
+            Self::InvalidTimestamps => {
+                f.write_str("Mission timestamps or pause duration are inconsistent")
+            }
             Self::DuplicateCandidateId(id) => write!(f, "Duplicate candidate ID: {}", id.0),
             Self::DuplicateAssignmentId(id) => write!(f, "Duplicate assignment ID: {}", id.0),
             Self::UnknownCandidateReference(id) => {
@@ -5793,6 +5839,64 @@ pub struct MissionLifecycleDecision {
 }
 
 impl Mission {
+    fn recorded_times_valid(&self) -> bool {
+        let latest = self.updated_at_ms.unwrap_or(self.created_at_ms);
+        self.created_at_ms >= 0
+            && latest >= self.created_at_ms
+            && self.pause_resume_state.cumulative_pause_duration_ms >= 0
+            && self
+                .pause_resume_state
+                .current_checkpoint
+                .as_ref()
+                .is_none_or(|checkpoint| {
+                    self.lifecycle_state == MissionLifecycleState::Paused
+                        && checkpoint.resumed_at_ms.is_none()
+                })
+            && self
+                .pause_resume_state
+                .current_checkpoint
+                .iter()
+                .chain(self.pause_resume_state.checkpoint_history.iter())
+                .all(|checkpoint| {
+                    checkpoint.paused_at_ms >= self.created_at_ms
+                        && checkpoint.paused_at_ms <= latest
+                        && checkpoint.resumed_at_ms.is_none_or(|resumed| {
+                            resumed >= checkpoint.paused_at_ms && resumed <= latest
+                        })
+                })
+    }
+
+    fn validate_transition_time(&self, requested_at_ms: i64) -> Result<(), MissionLifecycleError> {
+        if !self.recorded_times_valid()
+            || requested_at_ms < self.created_at_ms
+            || self
+                .updated_at_ms
+                .is_some_and(|previous| requested_at_ms < previous)
+        {
+            return Err(MissionLifecycleError::InvalidTimestamp);
+        }
+        Ok(())
+    }
+
+    fn checked_pause_duration(&self, requested_at_ms: i64) -> Result<i64, MissionLifecycleError> {
+        let previous = self.pause_resume_state.cumulative_pause_duration_ms;
+        if previous < 0 {
+            return Err(MissionLifecycleError::InvalidTimestamp);
+        }
+        let Some(checkpoint) = &self.pause_resume_state.current_checkpoint else {
+            return Ok(previous);
+        };
+        if requested_at_ms < checkpoint.paused_at_ms {
+            return Err(MissionLifecycleError::InvalidTimestamp);
+        }
+        let duration = requested_at_ms
+            .checked_sub(checkpoint.paused_at_ms)
+            .ok_or(MissionLifecycleError::ArithmeticOverflow)?;
+        previous
+            .checked_add(duration)
+            .ok_or(MissionLifecycleError::ArithmeticOverflow)
+    }
+
     /// Pause a running mission, creating a checkpoint.
     pub fn pause_mission(
         &mut self,
@@ -5805,6 +5909,12 @@ impl Mission {
         let to = self
             .lifecycle_state
             .apply_transition(MissionLifecycleTransitionKind::ExecutionBlocked)?;
+        self.validate_transition_time(requested_at_ms)?;
+        let next_pause_count = self
+            .pause_resume_state
+            .total_pause_count
+            .checked_add(1)
+            .ok_or(MissionLifecycleError::ArithmeticOverflow)?;
 
         // Create checkpoint with assignment snapshot
         let assignment_entries: Vec<String> = self
@@ -5831,8 +5941,9 @@ impl Mission {
         };
 
         self.pause_resume_state.current_checkpoint = Some(checkpoint);
-        self.pause_resume_state.total_pause_count += 1;
+        self.pause_resume_state.total_pause_count = next_pause_count;
         self.lifecycle_state = to;
+        self.updated_at_ms = Some(requested_at_ms);
 
         Ok(MissionLifecycleDecision {
             lifecycle_from: from,
@@ -5875,14 +5986,19 @@ impl Mission {
             self.lifecycle_state
                 .apply_transition(MissionLifecycleTransitionKind::RetryResumed)?
         };
+        self.validate_transition_time(requested_at_ms)?;
+        let next_resume_count = self
+            .pause_resume_state
+            .total_resume_count
+            .checked_add(1)
+            .ok_or(MissionLifecycleError::ArithmeticOverflow)?;
+        let next_pause_duration = self.checked_pause_duration(requested_at_ms)?;
 
         // Finalize checkpoint and move to history
         let checkpoint_id = if let Some(mut cp) = self.pause_resume_state.current_checkpoint.take()
         {
             cp.resumed_at_ms = Some(requested_at_ms);
             cp.resumed_by = Some(requested_by.to_string());
-            let duration = requested_at_ms.saturating_sub(cp.paused_at_ms);
-            self.pause_resume_state.cumulative_pause_duration_ms += duration;
             let id = cp.checkpoint_id.clone();
             self.pause_resume_state.checkpoint_history.push(cp);
             Some(id)
@@ -5890,8 +6006,10 @@ impl Mission {
             None
         };
 
-        self.pause_resume_state.total_resume_count += 1;
+        self.pause_resume_state.cumulative_pause_duration_ms = next_pause_duration;
+        self.pause_resume_state.total_resume_count = next_resume_count;
         self.lifecycle_state = to;
+        self.updated_at_ms = Some(requested_at_ms);
 
         Ok(MissionLifecycleDecision {
             lifecycle_from: from,
@@ -5903,7 +6021,8 @@ impl Mission {
         })
     }
 
-    /// Abort a mission (cancel with error context).
+    /// Record an abort request with error context. Assignment execution outcomes
+    /// remain owned by their executors; this method does not acknowledge effects.
     pub fn abort_mission(
         &mut self,
         requested_by: &str,
@@ -5916,28 +6035,25 @@ impl Mission {
         let to = self
             .lifecycle_state
             .apply_transition(MissionLifecycleTransitionKind::Cancel)?;
+        self.validate_transition_time(requested_at_ms)?;
+        let next_abort_count = self
+            .pause_resume_state
+            .total_abort_count
+            .checked_add(1)
+            .ok_or(MissionLifecycleError::ArithmeticOverflow)?;
+        let next_pause_duration = self.checked_pause_duration(requested_at_ms)?;
 
         // If paused, finalize checkpoint
         if let Some(mut cp) = self.pause_resume_state.current_checkpoint.take() {
             cp.resumed_at_ms = Some(requested_at_ms);
             cp.resumed_by = Some(requested_by.to_string());
-            let duration = requested_at_ms.saturating_sub(cp.paused_at_ms);
-            self.pause_resume_state.cumulative_pause_duration_ms += duration;
             self.pause_resume_state.checkpoint_history.push(cp);
         }
 
-        // Cancel all in-flight assignments
-        for assignment in &mut self.assignments {
-            if assignment.outcome.is_none() {
-                assignment.outcome = Some(Outcome::Cancelled {
-                    reason_code: format!("mission_aborted:{reason}"),
-                    completed_at_ms: requested_at_ms,
-                });
-            }
-        }
-
-        self.pause_resume_state.total_abort_count += 1;
+        self.pause_resume_state.cumulative_pause_duration_ms = next_pause_duration;
+        self.pause_resume_state.total_abort_count = next_abort_count;
         self.lifecycle_state = to;
+        self.updated_at_ms = Some(requested_at_ms);
 
         Ok(MissionLifecycleDecision {
             lifecycle_from: from,
@@ -8498,7 +8614,7 @@ mod tests {
                 dispatcher: "dispatcher-agent".to_string(),
                 operator: "operator-human".to_string(),
             },
-            1_704_000_000_000,
+            0,
         );
 
         assert_eq!(mission.lifecycle_state, MissionLifecycleState::Planning);
@@ -8535,7 +8651,7 @@ mod tests {
                 dispatcher: "dispatcher-agent".to_string(),
                 operator: "operator-human".to_string(),
             },
-            1_704_000_000_000,
+            0,
         );
 
         mission
@@ -8632,6 +8748,143 @@ mod tests {
             },
             1_000_000,
         )
+    }
+
+    #[test]
+    fn mission_incarnation_roundtrip_and_missing_identity_rejection() {
+        let mission = planning_mission();
+        let recreated = planning_mission();
+        assert_eq!(mission.mission_id, recreated.mission_id);
+        assert_eq!(mission.created_at_ms, recreated.created_at_ms);
+        assert_ne!(mission.generation, recreated.generation);
+        let mut json = serde_json::to_value(&mission).unwrap();
+        let loaded: Mission = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded.generation, mission.generation);
+        assert_eq!(loaded.compute_hash(), mission.compute_hash());
+        json.as_object_mut().unwrap().remove("generation");
+        assert!(serde_json::from_value::<Mission>(json).is_err());
+    }
+
+    #[test]
+    fn mission_lifecycle_arithmetic_errors_preserve_complete_state() {
+        let mut running = planning_mission();
+        running.lifecycle_state = MissionLifecycleState::Running;
+        let mut overflowing_pause = running.clone();
+        overflowing_pause.pause_resume_state.total_pause_count = u32::MAX;
+        let before = serde_json::to_vec(&overflowing_pause).unwrap();
+        assert_eq!(
+            overflowing_pause
+                .pause_mission("operator", "pause", 2_000_000, None)
+                .unwrap_err(),
+            MissionLifecycleError::ArithmeticOverflow
+        );
+        assert_eq!(serde_json::to_vec(&overflowing_pause).unwrap(), before);
+
+        running
+            .pause_mission("operator", "pause", 2_000_000, None)
+            .unwrap();
+        for (resume, counter_overflow) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let mut mission = running.clone();
+            if counter_overflow {
+                if resume {
+                    mission.pause_resume_state.total_resume_count = u32::MAX;
+                } else {
+                    mission.pause_resume_state.total_abort_count = u32::MAX;
+                }
+            } else {
+                mission.pause_resume_state.cumulative_pause_duration_ms = i64::MAX;
+            }
+            let before = serde_json::to_vec(&mission).unwrap();
+            let result = if resume {
+                mission.resume_mission("operator", "resume", 2_000_001, None)
+            } else {
+                mission.abort_mission("operator", "abort", None, 2_000_001, None)
+            };
+            assert_eq!(
+                result.unwrap_err(),
+                MissionLifecycleError::ArithmeticOverflow
+            );
+            assert_eq!(serde_json::to_vec(&mission).unwrap(), before);
+        }
+        running
+            .resume_mission("operator", "resume", 2_000_050, None)
+            .unwrap();
+        assert_eq!(running.pause_resume_state.cumulative_pause_duration_ms, 50);
+        assert_eq!(running.pause_resume_state.total_resume_count, 1);
+        assert_eq!(running.pause_resume_state.checkpoint_history.len(), 1);
+        running
+            .abort_mission("operator", "abort", None, 2_000_060, None)
+            .unwrap();
+        assert_eq!(running.pause_resume_state.total_abort_count, 1);
+        assert!(
+            running.validate().is_ok(),
+            "a requested abort needs no fabricated assignment outcome"
+        );
+    }
+
+    #[test]
+    fn mission_lifecycle_reversed_or_corrupt_time_is_transactional() {
+        let mut baseline = planning_mission();
+        baseline.lifecycle_state = MissionLifecycleState::Running;
+        let before = serde_json::to_vec(&baseline).unwrap();
+        assert_eq!(
+            baseline
+                .pause_mission("operator", "early", 999_999, None)
+                .unwrap_err(),
+            MissionLifecycleError::InvalidTimestamp
+        );
+        assert_eq!(serde_json::to_vec(&baseline).unwrap(), before);
+        baseline
+            .pause_mission("operator", "pause", 2_000_000, None)
+            .unwrap();
+        for checkpoint_time in [-1, 999_999, 2_000_002] {
+            let mut mission = baseline.clone();
+            mission
+                .pause_resume_state
+                .current_checkpoint
+                .as_mut()
+                .unwrap()
+                .paused_at_ms = checkpoint_time;
+            assert!(mission.validate().is_err());
+            let before = serde_json::to_vec(&mission).unwrap();
+            assert_eq!(
+                mission
+                    .resume_mission("operator", "resume", 2_000_001, None)
+                    .unwrap_err(),
+                MissionLifecycleError::InvalidTimestamp
+            );
+            assert_eq!(serde_json::to_vec(&mission).unwrap(), before);
+        }
+        let before = serde_json::to_vec(&baseline).unwrap();
+        assert_eq!(
+            baseline
+                .abort_mission("operator", "abort", None, 1_999_999, None)
+                .unwrap_err(),
+            MissionLifecycleError::InvalidTimestamp
+        );
+        assert_eq!(serde_json::to_vec(&baseline).unwrap(), before);
+    }
+
+    #[test]
+    fn mission_abort_request_preserves_execution_outcomes_without_acknowledgement() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        let mut unresolved = mission.assignments[0].clone();
+        unresolved.assignment_id = AssignmentId("assignment:unresolved".to_string());
+        unresolved.outcome = None;
+        mission.assignments.push(unresolved);
+        let before = serde_json::to_vec(&mission.assignments).unwrap();
+        mission
+            .abort_mission("operator", "requested stop", None, 1_704_000_001_000, None)
+            .unwrap();
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
+        assert_eq!(mission.pause_resume_state.total_abort_count, 1);
+        assert_eq!(serde_json::to_vec(&mission.assignments).unwrap(), before);
+        assert!(mission.assignments[0].outcome.is_some());
+        assert!(mission.assignments[1].outcome.is_none());
+        mission.validate().unwrap();
     }
 
     #[test]

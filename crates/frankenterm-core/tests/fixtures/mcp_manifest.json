@@ -1125,13 +1125,17 @@
     },
     {
       "annotations": null,
-      "description": "Abort a mission, cancelling all in-flight assignments (robot parity)",
+      "description": "Persist a mission abort request; assignment outcomes remain unchanged until their owners report completion",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
           "error_code": {
             "description": "Optional error code for the abort",
             "type": "string"
+          },
+          "expected_token": {
+            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected.",
+            "type": "object"
           },
           "format": {
             "description": "Optional output format override for this call",
@@ -1349,6 +1353,10 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "expected_token": {
+            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected.",
+            "type": "object"
+          },
           "format": {
             "description": "Optional output format override for this call",
             "enum": [
@@ -1391,6 +1399,10 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "expected_token": {
+            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected.",
+            "type": "object"
+          },
           "format": {
             "description": "Optional output format override for this call",
             "enum": [

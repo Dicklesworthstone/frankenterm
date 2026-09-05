@@ -48,9 +48,9 @@ use super::{
     build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
     effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
-    mcp_build_mission_assignments, mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
-    mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
-    mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
+    mcp_acquire_mission_mutation, mcp_build_mission_assignments, mcp_build_tx_compensation_inputs,
+    mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
+    mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
     mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
     policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
@@ -12831,7 +12831,21 @@ impl ToolHandler for WaMissionStateTool {
             mcp_build_mission_assignments(&mission, &params);
         let returned_count = assignments.len();
 
+        let revision_token = match crate::tx_execution::MissionRevisionToken::from_mission(&mission)
+        {
+            Ok(token) => token,
+            Err(error) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    error.code(),
+                    error.to_string(),
+                    None,
+                    elapsed_ms(start),
+                ));
+            }
+        };
         let data = McpMissionStateData {
+            revision_token,
+            owner_acknowledgement: "unavailable_no_mission_driver",
             mission_file: mission_path.display().to_string(),
             mission_id: mission.mission_id.0.clone(),
             title: mission.title.clone(),
@@ -13002,6 +13016,7 @@ impl ToolHandler for WaMissionPauseTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "expected_token": { "type": "object", "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected." },
                     "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
                     "reason": { "type": "string", "description": "Reason code for the pause (required)" },
                     "requested_by": { "type": "string", "description": "Who requested the pause (default: mcp-agent)" }
@@ -13068,8 +13083,12 @@ impl ToolHandler for WaMissionPauseTool {
             }
         };
 
-        let mut mission = match mcp_load_mission_from_path(&mission_path) {
-            Ok(m) => m,
+        let mutation = match mcp_acquire_mission_mutation(
+            self.config.as_ref(),
+            &mission_path,
+            params.expected_token.as_ref(),
+        ) {
+            Ok(guard) => guard,
             Err(err) => {
                 let envelope =
                     McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
@@ -13077,6 +13096,7 @@ impl ToolHandler for WaMissionPauseTool {
             }
         };
 
+        let mut mission = mutation.mission().clone();
         let requested_at_ms = mcp_now_ms_i64();
         let decision =
             match mission.pause_mission(&params.requested_by, &reason, requested_at_ms, None) {
@@ -13092,13 +13112,20 @@ impl ToolHandler for WaMissionPauseTool {
                 }
             };
 
-        if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
-            let envelope =
-                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
-            return envelope_to_content(envelope);
-        }
+        let mutation = match mcp_save_mission_to_path(mutation, &mut mission) {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                ));
+            }
+        };
 
         let data = McpMissionControlData {
+            mutation,
             command: "pause".to_string(),
             mission_file: mission_path.display().to_string(),
             mission_id: mission.mission_id.0.clone(),
@@ -13151,6 +13178,7 @@ impl ToolHandler for WaMissionResumeTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "expected_token": { "type": "object", "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected." },
                     "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
                     "requested_by": { "type": "string", "description": "Who requested the resume (default: mcp-agent)" }
                 },
@@ -13167,7 +13195,10 @@ impl ToolHandler for WaMissionResumeTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: MissionResumeParams = if arguments.is_null() {
-            MissionResumeParams::default()
+            MissionResumeParams {
+                requested_by: super::mcp_types::mcp_default_requested_by(),
+                ..MissionResumeParams::default()
+            }
         } else {
             match serde_json::from_value(arguments) {
                 Ok(parsed) => parsed,
@@ -13206,8 +13237,12 @@ impl ToolHandler for WaMissionResumeTool {
             }
         };
 
-        let mut mission = match mcp_load_mission_from_path(&mission_path) {
-            Ok(m) => m,
+        let mutation = match mcp_acquire_mission_mutation(
+            self.config.as_ref(),
+            &mission_path,
+            params.expected_token.as_ref(),
+        ) {
+            Ok(guard) => guard,
             Err(err) => {
                 let envelope =
                     McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
@@ -13215,6 +13250,7 @@ impl ToolHandler for WaMissionResumeTool {
             }
         };
 
+        let mut mission = mutation.mission().clone();
         let requested_at_ms = mcp_now_ms_i64();
         let decision =
             match mission.resume_mission(&params.requested_by, "mcp_resume", requested_at_ms, None)
@@ -13231,13 +13267,20 @@ impl ToolHandler for WaMissionResumeTool {
                 }
             };
 
-        if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
-            let envelope =
-                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
-            return envelope_to_content(envelope);
-        }
+        let mutation = match mcp_save_mission_to_path(mutation, &mut mission) {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                ));
+            }
+        };
 
         let data = McpMissionControlData {
+            mutation,
             command: "resume".to_string(),
             mission_file: mission_path.display().to_string(),
             mission_id: mission.mission_id.0.clone(),
@@ -13284,12 +13327,13 @@ impl ToolHandler for WaMissionAbortTool {
         Tool {
             name: "wa.mission_abort".to_string(),
             description: Some(
-                "Persist an aborted mission and cancelled assignment outcomes; does not cancel live tasks"
+                "Persist a mission abort request; assignment outcomes remain unchanged until their owners report completion"
                     .to_string(),
             ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "expected_token": { "type": "object", "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected." },
                     "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
                     "reason": { "type": "string", "description": "Reason code for the abort (required)" },
                     "requested_by": { "type": "string", "description": "Who requested the abort (default: mcp-agent)" },
@@ -13357,8 +13401,12 @@ impl ToolHandler for WaMissionAbortTool {
             }
         };
 
-        let mut mission = match mcp_load_mission_from_path(&mission_path) {
-            Ok(m) => m,
+        let mutation = match mcp_acquire_mission_mutation(
+            self.config.as_ref(),
+            &mission_path,
+            params.expected_token.as_ref(),
+        ) {
+            Ok(guard) => guard,
             Err(err) => {
                 let envelope =
                     McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
@@ -13366,6 +13414,7 @@ impl ToolHandler for WaMissionAbortTool {
             }
         };
 
+        let mut mission = mutation.mission().clone();
         let requested_at_ms = mcp_now_ms_i64();
         let decision = match mission.abort_mission(
             &params.requested_by,
@@ -13386,13 +13435,20 @@ impl ToolHandler for WaMissionAbortTool {
             }
         };
 
-        if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
-            let envelope =
-                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
-            return envelope_to_content(envelope);
-        }
+        let mutation = match mcp_save_mission_to_path(mutation, &mut mission) {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    err.code,
+                    err.message,
+                    err.hint,
+                    elapsed_ms(start),
+                ));
+            }
+        };
 
         let data = McpMissionControlData {
+            mutation,
             command: "abort".to_string(),
             mission_file: mission_path.display().to_string(),
             mission_id: mission.mission_id.0.clone(),
@@ -21716,6 +21772,56 @@ mod tests {
             "Use wa.mission_state without mission_state to inspect the active mission, or request the current lifecycle state."
         );
         assert!(envelope.get("data").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_mutation_tools_serialize_revisions_and_reject_stale_abort_resume() {
+        let dir = workspace_tempdir();
+        let path = write_mission_file(&dir, MissionLifecycleState::Running);
+        let cfg = config();
+        let state = WaMissionStateTool::new(Arc::clone(&cfg));
+        let pause = WaMissionPauseTool::new(Arc::clone(&cfg));
+        let resume = WaMissionResumeTool::new(Arc::clone(&cfg));
+        let abort = WaMissionAbortTool::new(Arc::clone(&cfg));
+        let context = test_mcp_context();
+        let initial = parse_json_content(
+            state
+                .call(&context, serde_json::json!({"mission_file": path}))
+                .unwrap(),
+        );
+        assert_eq!(initial["ok"], true, "{initial}");
+        let token = initial["data"]["revision_token"].clone();
+        let paused = parse_json_content(pause.call(&context, serde_json::json!({"mission_file": path, "reason": "owned-test-pause", "expected_token": token})).unwrap());
+        assert_eq!(paused["ok"], true, "{paused}");
+        assert_eq!(paused["data"]["mutation"]["current"]["revision"], 1);
+        let loaded = super::mcp_load_mission_from_path(&path).unwrap();
+        assert_eq!(loaded.lifecycle_state, MissionLifecycleState::Paused);
+        assert!(loaded.pause_resume_state.current_checkpoint.is_some());
+
+        let accepted = std::fs::read(&path).unwrap();
+        let stale = parse_json_content(abort.call(&context, serde_json::json!({"mission_file": path, "reason": "stale-abort", "expected_token": token})).unwrap());
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["error_code"], "mission.revision_conflict");
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+
+        let resumed = parse_json_content(resume.call(&context, serde_json::json!({"mission_file": path, "expected_token": paused["data"]["mutation"]["current"]})).unwrap());
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["data"]["mutation"]["current"]["revision"], 2);
+        let aborted = parse_json_content(abort.call(&context, serde_json::json!({"mission_file": path, "reason": "owned-test-abort", "expected_token": resumed["data"]["mutation"]["current"]})).unwrap());
+        assert_eq!(aborted["ok"], true, "{aborted}");
+        assert_eq!(aborted["data"]["mutation"]["current"]["revision"], 3);
+        assert_eq!(
+            aborted["data"]["mutation"]["owner_acknowledgement"],
+            "unavailable_no_mission_driver"
+        );
+        let accepted = std::fs::read(&path).unwrap();
+        let stale = parse_json_content(resume.call(&context, serde_json::json!({"mission_file": path, "expected_token": resumed["data"]["mutation"]["current"]})).unwrap());
+        assert_eq!(stale["error_code"], "mission.revision_conflict");
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+        let loaded = super::mcp_load_mission_from_path(&path).unwrap();
+        assert_eq!(loaded.lifecycle_state, MissionLifecycleState::Cancelled);
+        assert_eq!(loaded.pause_resume_state.total_abort_count, 1);
     }
 
     #[test]

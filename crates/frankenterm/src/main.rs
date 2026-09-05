@@ -6100,6 +6100,9 @@ enum MissionCommands {
 
     /// Advance mission lifecycle into execution state and persist updated mission
     Run {
+        /// Expected revision_token JSON from mission status; stale tokens fail closed
+        #[arg(long)]
+        expected_token: Option<String>,
         /// Mission JSON file (default: .ft/mission/active.json)
         #[arg(long)]
         mission_file: Option<PathBuf>,
@@ -6137,6 +6140,9 @@ enum MissionCommands {
 
     /// Pause mission execution using canonical blocked lifecycle transition
     Pause {
+        /// Expected revision_token JSON from mission status
+        #[arg(long)]
+        expected_token: Option<String>,
         /// Mission JSON file (default: .ft/mission/active.json)
         #[arg(long)]
         mission_file: Option<PathBuf>,
@@ -6152,6 +6158,9 @@ enum MissionCommands {
 
     /// Resume mission execution from blocked or retry-pending state
     Resume {
+        /// Expected revision_token JSON from mission status
+        #[arg(long)]
+        expected_token: Option<String>,
         /// Mission JSON file (default: .ft/mission/active.json)
         #[arg(long)]
         mission_file: Option<PathBuf>,
@@ -6163,6 +6172,9 @@ enum MissionCommands {
 
     /// Abort mission execution using canonical cancelled lifecycle transition
     Abort {
+        /// Expected revision_token JSON from mission status
+        #[arg(long)]
+        expected_token: Option<String>,
         /// Mission JSON file (default: .ft/mission/active.json)
         #[arg(long)]
         mission_file: Option<PathBuf>,
@@ -76570,35 +76582,34 @@ fn execute_tx_rollback_with_executor<E: frankenterm_core::tx_execution::StepExec
     })
 }
 
-fn persist_mission_to_path(
-    path: &Path,
-    mission: &frankenterm_core::plan::Mission,
-) -> Result<(), MissionCommandError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| MissionCommandError {
-            exit_code: MISSION_EXIT_IO,
-            error_code: "mission.file_write_failed",
-            message: format!(
-                "Failed to create mission directory {}: {err}",
-                parent.display()
-            ),
-            hint: None,
-        })?;
+fn mission_store_error(
+    error: frankenterm_core::tx_execution::MissionStoreError,
+) -> MissionCommandError {
+    MissionCommandError {
+        exit_code: MISSION_EXIT_IO,
+        error_code: error.code(),
+        message: error.to_string(),
+        hint: None,
     }
+}
 
-    let serialized = serde_json::to_string_pretty(mission).map_err(|err| MissionCommandError {
-        exit_code: MISSION_EXIT_IO,
-        error_code: "mission.serialize_failed",
-        message: format!("Failed to serialize mission: {err}"),
-        hint: None,
-    })?;
-
-    fs::write(path, format!("{serialized}\n")).map_err(|err| MissionCommandError {
-        exit_code: MISSION_EXIT_IO,
-        error_code: "mission.file_write_failed",
-        message: format!("Failed to write mission file {}: {err}", path.display()),
-        hint: None,
-    })
+fn acquire_mission_mutation(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    path: &Path,
+    expected: Option<&str>,
+) -> Result<frankenterm_core::tx_execution::MissionMutationGuard, MissionCommandError> {
+    let token = expected
+        .map(serde_json::from_str::<frankenterm_core::tx_execution::MissionRevisionToken>)
+        .transpose()
+        .map_err(|_| {
+            mission_store_error(frankenterm_core::tx_execution::MissionStoreError::Invalid)
+        })?;
+    frankenterm_core::tx_execution::MissionMutationGuard::acquire(
+        &layout.root,
+        path,
+        token.as_ref(),
+    )
+    .map_err(mission_store_error)
 }
 
 fn mission_assignment_counters(
@@ -78607,21 +78618,35 @@ fn apply_mission_transition_plan(
         frankenterm_core::plan::MissionLifecycleTransitionKind,
     )],
     transitioned_at_ms: i64,
+    reason: &str,
 ) -> Result<Vec<MissionTransitionRecord>, MissionCommandError> {
+    use frankenterm_core::plan::{
+        MissionLifecycleState as State, MissionLifecycleTransitionKind as Kind,
+    };
     let mut transitions = Vec::with_capacity(plan.len());
     for (to, kind) in plan {
         let from = mission.lifecycle_state;
-        mission
-            .transition_lifecycle(*to, *kind, transitioned_at_ms)
-            .map_err(|err| MissionCommandError {
-                exit_code: MISSION_EXIT_TRANSITION,
-                error_code: "mission.transition.invalid",
-                message: format!("Illegal lifecycle transition {from} -> {to} ({kind}): {err}"),
-                hint: Some("Use `ft mission explain` to inspect legal transitions.".to_string()),
-            })?;
+        let result = match kind {
+            Kind::ExecutionBlocked => mission
+                .pause_mission("cli-operator", reason, transitioned_at_ms, None)
+                .map(|decision| decision.lifecycle_to),
+            Kind::MissionCancelled => mission
+                .abort_mission("cli-operator", reason, None, transitioned_at_ms, None)
+                .map(|decision| decision.lifecycle_to),
+            Kind::RetryResumed if from != State::RetryPending || *to != State::Running => mission
+                .resume_mission("cli-operator", reason, transitioned_at_ms, None)
+                .map(|decision| decision.lifecycle_to),
+            _ => mission.transition_lifecycle(*to, *kind, transitioned_at_ms),
+        };
+        result.map_err(|err| MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.invalid",
+            message: format!("Illegal lifecycle transition {from} -> {to} ({kind}): {err}"),
+            hint: Some("Use `ft mission explain` to inspect legal transitions.".to_string()),
+        })?;
         transitions.push(MissionTransitionRecord {
             from,
-            to: *to,
+            to: mission.lifecycle_state,
             kind: *kind,
         });
     }
@@ -78808,6 +78833,8 @@ fn handle_mission_command(
 
             let data = serde_json::json!({
                 "command": "status",
+                "revision_token": frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)?,
+                "owner_acknowledgement": "unavailable_no_mission_driver",
                 "mission_file": mission_path.display().to_string(),
                 "mission_id": mission_id,
                 "title": mission_title,
@@ -78831,6 +78858,8 @@ fn handle_mission_command(
             });
             let plain_lines = vec![
                 format!("Mission status: {}", mission.mission_id.0.as_str()),
+                "  Lifecycle is persisted state; mission-driver acknowledgement unavailable"
+                    .to_string(),
                 format!("  File: {}", mission_path.display()),
                 format!("  Lifecycle: {}", mission.lifecycle_state),
                 format!("  Terminal: {}", mission.lifecycle_state.is_terminal()),
@@ -79126,29 +79155,35 @@ fn handle_mission_command(
         }
 
         MissionCommands::Run {
+            expected_token,
             mission_file,
             format,
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mut mission = match load_mission_from_path(&mission_path) {
-                Ok(mission) => mission,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let mutation =
+                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
+                    Ok(guard) => guard,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
+            let mut mission = mutation.mission().clone();
             let plan = match mission_run_transition_plan(mission.lifecycle_state) {
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions =
-                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
-                    Ok(transitions) => transitions,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            if !transitions.is_empty() {
-                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
-                    emit_mission_error(output_format, err);
-                }
-            }
+            let transitions = match apply_mission_transition_plan(
+                &mut mission,
+                &plan,
+                mission_now_ms(),
+                "cli_run",
+            ) {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
+                Ok(receipt) => receipt,
+                Err(err) => emit_mission_error(output_format, err),
+            };
             let transitions_json = transitions
                 .iter()
                 .map(|transition| {
@@ -79162,6 +79197,7 @@ fn handle_mission_command(
             let mission_hash = mission.compute_hash();
             let data = serde_json::json!({
                 "command": "run",
+                "mutation": mutation,
                 "mission_file": mission_path.display().to_string(),
                 "mission_id": mission.mission_id.0.clone(),
                 "lifecycle_state": mission.lifecycle_state.to_string(),
@@ -79171,6 +79207,10 @@ fn handle_mission_command(
             });
             let plain_lines = vec![
                 format!("Mission run: {}", mission.mission_id.0.as_str()),
+                format!(
+                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
+                    mutation.durability
+                ),
                 format!("  File: {}", mission_path.display()),
                 format!("  Lifecycle: {}", mission.lifecycle_state),
                 format!("  Transitions applied: {}", transitions.len()),
@@ -79180,30 +79220,36 @@ fn handle_mission_command(
         }
 
         MissionCommands::Pause {
+            expected_token,
             mission_file,
             reason,
             format,
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mut mission = match load_mission_from_path(&mission_path) {
-                Ok(mission) => mission,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let mutation =
+                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
+                    Ok(guard) => guard,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
+            let mut mission = mutation.mission().clone();
             let plan = match mission_pause_transition_plan(mission.lifecycle_state) {
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions =
-                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
-                    Ok(transitions) => transitions,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            if !transitions.is_empty() {
-                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
-                    emit_mission_error(output_format, err);
-                }
-            }
+            let transitions = match apply_mission_transition_plan(
+                &mut mission,
+                &plan,
+                mission_now_ms(),
+                reason.as_deref().unwrap_or("cli_pause"),
+            ) {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
+                Ok(receipt) => receipt,
+                Err(err) => emit_mission_error(output_format, err),
+            };
             let transitions_json = transitions
                 .iter()
                 .map(|transition| {
@@ -79218,6 +79264,7 @@ fn handle_mission_command(
             let mission_hash = mission.compute_hash();
             let data = serde_json::json!({
                 "command": "pause",
+                "mutation": mutation,
                 "mission_file": mission_path.display().to_string(),
                 "mission_id": mission.mission_id.0.clone(),
                 "lifecycle_state": mission.lifecycle_state.to_string(),
@@ -79228,6 +79275,10 @@ fn handle_mission_command(
             });
             let plain_lines = vec![
                 format!("Mission pause: {}", mission.mission_id.0.as_str()),
+                format!(
+                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
+                    mutation.durability
+                ),
                 format!("  File: {}", mission_path.display()),
                 format!("  Lifecycle: {}", mission.lifecycle_state),
                 format!("  Transitions applied: {}", transitions.len()),
@@ -79237,29 +79288,35 @@ fn handle_mission_command(
         }
 
         MissionCommands::Resume {
+            expected_token,
             mission_file,
             format,
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mut mission = match load_mission_from_path(&mission_path) {
-                Ok(mission) => mission,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let mutation =
+                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
+                    Ok(guard) => guard,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
+            let mut mission = mutation.mission().clone();
             let plan = match mission_resume_transition_plan(mission.lifecycle_state) {
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions =
-                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
-                    Ok(transitions) => transitions,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            if !transitions.is_empty() {
-                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
-                    emit_mission_error(output_format, err);
-                }
-            }
+            let transitions = match apply_mission_transition_plan(
+                &mut mission,
+                &plan,
+                mission_now_ms(),
+                "cli_resume",
+            ) {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
+                Ok(receipt) => receipt,
+                Err(err) => emit_mission_error(output_format, err),
+            };
             let transitions_json = transitions
                 .iter()
                 .map(|transition| {
@@ -79273,6 +79330,7 @@ fn handle_mission_command(
             let mission_hash = mission.compute_hash();
             let data = serde_json::json!({
                 "command": "resume",
+                "mutation": mutation,
                 "mission_file": mission_path.display().to_string(),
                 "mission_id": mission.mission_id.0.clone(),
                 "lifecycle_state": mission.lifecycle_state.to_string(),
@@ -79282,6 +79340,10 @@ fn handle_mission_command(
             });
             let plain_lines = vec![
                 format!("Mission resume: {}", mission.mission_id.0.as_str()),
+                format!(
+                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
+                    mutation.durability
+                ),
                 format!("  File: {}", mission_path.display()),
                 format!("  Lifecycle: {}", mission.lifecycle_state),
                 format!("  Transitions applied: {}", transitions.len()),
@@ -79291,30 +79353,36 @@ fn handle_mission_command(
         }
 
         MissionCommands::Abort {
+            expected_token,
             mission_file,
             reason,
             format,
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mut mission = match load_mission_from_path(&mission_path) {
-                Ok(mission) => mission,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let mutation =
+                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
+                    Ok(guard) => guard,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
+            let mut mission = mutation.mission().clone();
             let plan = match mission_abort_transition_plan(mission.lifecycle_state) {
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions =
-                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
-                    Ok(transitions) => transitions,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            if !transitions.is_empty() {
-                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
-                    emit_mission_error(output_format, err);
-                }
-            }
+            let transitions = match apply_mission_transition_plan(
+                &mut mission,
+                &plan,
+                mission_now_ms(),
+                reason.as_deref().unwrap_or("cli_abort"),
+            ) {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
+                Ok(receipt) => receipt,
+                Err(err) => emit_mission_error(output_format, err),
+            };
             let transitions_json = transitions
                 .iter()
                 .map(|transition| {
@@ -79329,6 +79397,7 @@ fn handle_mission_command(
             let mission_hash = mission.compute_hash();
             let data = serde_json::json!({
                 "command": "abort",
+                "mutation": mutation,
                 "mission_file": mission_path.display().to_string(),
                 "mission_id": mission.mission_id.0.clone(),
                 "lifecycle_state": mission.lifecycle_state.to_string(),
@@ -79339,6 +79408,10 @@ fn handle_mission_command(
             });
             let plain_lines = vec![
                 format!("Mission abort: {}", mission.mission_id.0.as_str()),
+                format!(
+                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
+                    mutation.durability
+                ),
                 format!("  File: {}", mission_path.display()),
                 format!("  Lifecycle: {}", mission.lifecycle_state),
                 format!("  Transitions applied: {}", transitions.len()),
@@ -102244,6 +102317,7 @@ reason = "overly conservative pending threshold"
                     MissionCommands::Run {
                         mission_file,
                         format,
+                        ..
                     },
             }) => {
                 assert_eq!(mission_file, None);

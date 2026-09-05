@@ -17,12 +17,13 @@
 //! every transition emits observability events with reason codes.
 
 use crate::plan::{
-    MissionEconomicAuditRow, MissionEconomicBreakerDecision, MissionEconomicHardStopEnvelope,
-    MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction, TxCommitOutcome,
-    TxCommitReport, TxCommitStepInput, TxCompensationReport, TxCompensationStepInput, TxOutcome,
-    TxPrepareApprovalChecker, TxPrepareEvaluationContext, TxPrepareGateInput, TxPrepareOutcome,
-    TxPreparePolicyAuthorizer, TxPrepareReport, TxPrepareTargetLookup, evaluate_prepare_phase,
-    execute_commit_phase, execute_compensation_phase, mission_tx_rollback_commit_report,
+    Mission, MissionEconomicAuditRow, MissionEconomicBreakerDecision,
+    MissionEconomicHardStopEnvelope, MissionKillSwitchLevel, MissionTxContract, MissionTxState,
+    StepAction, TxCommitOutcome, TxCommitReport, TxCommitStepInput, TxCompensationReport,
+    TxCompensationStepInput, TxOutcome, TxPrepareApprovalChecker, TxPrepareEvaluationContext,
+    TxPrepareGateInput, TxPrepareOutcome, TxPreparePolicyAuthorizer, TxPrepareReport,
+    TxPrepareTargetLookup, evaluate_prepare_phase, execute_commit_phase,
+    execute_compensation_phase, mission_tx_rollback_commit_report,
 };
 use crate::runtime_async::CompatRuntime;
 use crate::tx_idempotency::{
@@ -45,7 +46,6 @@ use cap_std::fs::{
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-#[cfg(not(windows))]
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -148,6 +148,7 @@ pub struct TxContractStoreError {
     kind: TxContractStoreErrorKind,
     message: String,
     recovery_path: Option<PathBuf>,
+    published: bool,
 }
 
 impl TxContractStoreError {
@@ -156,12 +157,25 @@ impl TxContractStoreError {
             kind,
             message,
             recovery_path: None,
+            published: false,
         }
     }
 
     fn with_recovery_path(mut self, recovery_path: PathBuf) -> Self {
         self.recovery_path = Some(recovery_path);
         self
+    }
+
+    fn after_publication(mut self) -> Self {
+        self.published = true;
+        self
+    }
+
+    /// Whether replacement occurred before the error. Never retry such a
+    /// mutation without reading and reconciling its authoritative state.
+    #[must_use]
+    pub fn published(&self) -> bool {
+        self.published
     }
 
     #[must_use]
@@ -1494,6 +1508,7 @@ fn acquire_tx_contract_lock_supported(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxContractSaveFaultPoint {
+    BeforeWrite,
     BeforeFileSync,
     BeforeAtomicReplace,
     ParentDirectorySync,
@@ -1594,7 +1609,7 @@ fn save_tx_contract_atomic_impl<F>(
     guard: &TxContractLockGuard,
     path: &Path,
     contract: &MissionTxContract,
-    mut fault: F,
+    fault: F,
 ) -> Result<(), TxContractStoreError>
 where
     F: FnMut(TxContractSaveFaultPoint) -> std::io::Result<()>,
@@ -1606,8 +1621,6 @@ where
     // authoritative recovery objects. The basename inside that pinned parent
     // is revalidated immediately before publication below.
     guard.verify_pinned_mutation_edges()?;
-    let path = guard.key.as_path();
-    let metadata = guard.pinned_contract_metadata()?;
     contract.validate().map_err(|err| {
         TxContractStoreError::new(
             TxContractStoreErrorKind::Validation,
@@ -1626,11 +1639,29 @@ where
             format!("failed to serialize transaction contract: {err}"),
         )
     })?;
+    save_contract_bytes_atomic_impl(guard, path, &bytes, fault)
+}
+
+fn save_contract_bytes_atomic_impl<F>(
+    guard: &TxContractLockGuard,
+    path: &Path,
+    bytes: &[u8],
+    mut fault: F,
+) -> Result<(), TxContractStoreError>
+where
+    F: FnMut(TxContractSaveFaultPoint) -> std::io::Result<()>,
+{
+    guard.verify_logical_path(path)?;
+    guard.verify_pinned_mutation_edges()?;
+    let path = guard.key.as_path();
+    let metadata = guard.pinned_contract_metadata()?;
     let existing_permissions = metadata.permissions();
     let (temp_name, mut temp_file) = create_tx_contract_recovery_file(guard)?;
     let temp_path = guard.recovery_display_path(&temp_name);
 
-    if let Err(err) = temp_file.write_all(&bytes) {
+    if let Err(err) =
+        fault(TxContractSaveFaultPoint::BeforeWrite).and_then(|()| temp_file.write_all(bytes))
+    {
         return Err(retain_failed_tx_contract_temp(
             guard,
             &temp_name,
@@ -1835,7 +1866,7 @@ where
                     .unwrap_or_else(|| Path::new("."))
                     .display()
             ),
-        ));
+        ).after_publication());
     }
 
     let parent_still_named = guard.named_parent_matches_pinned_parent().map_err(|err| {
@@ -1845,7 +1876,7 @@ where
                 "transaction contract was durably saved through its pinned parent, but the last-known namespace {} could not be revalidated: {err}",
                 path.display()
             ),
-        )
+        ).after_publication()
     })?;
     if !parent_still_named {
         return Err(TxContractStoreError::new(
@@ -1854,7 +1885,7 @@ where
                 "transaction contract was durably saved through its pinned parent, but the last-known contract path {} is namespace-detached and may resolve to stale or foreign data",
                 path.display()
             ),
-        ));
+        ).after_publication());
     }
     let basename_still_names_replacement = guard
         .named_contract_entry_matches_pinned_file()
@@ -1865,7 +1896,7 @@ where
                     "transaction contract was durably saved through its pinned parent, but the last-known basename {} could not be revalidated: {err}",
                     path.display()
                 ),
-            )
+            ).after_publication()
         })?;
     if !basename_still_names_replacement {
         return Err(TxContractStoreError::new(
@@ -1874,10 +1905,228 @@ where
                 "transaction contract was durably saved through its pinned parent, but the last-known basename {} is stale or now resolves to foreign data",
                 path.display()
             ),
-        ));
+        ).after_publication());
     }
 
     Ok(())
+}
+
+/// Optimistic concurrency token for one complete persisted mission incarnation.
+/// The semantic mission ID alone is reusable and cannot authorize an update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissionRevisionToken {
+    pub mission_id: String,
+    pub generation: String,
+    pub revision: u64,
+    pub content_sha256: String,
+}
+
+impl MissionRevisionToken {
+    /// Compute from every serialized field, including checkpoint history.
+    pub fn from_mission(mission: &Mission) -> Result<Self, MissionStoreError> {
+        let bytes = serde_json::to_vec(mission).map_err(|_| MissionStoreError::Invalid)?;
+        Ok(Self {
+            mission_id: mission.mission_id.0.clone(),
+            generation: mission.generation.clone(),
+            revision: mission.revision,
+            content_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        })
+    }
+}
+
+/// Content-free classifications: neither task text nor filesystem error payloads
+/// are copied into the control response. Indeterminate requires reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MissionStoreError {
+    #[error("another mission mutation owns the file lock")]
+    InProgress,
+    #[error("mission revision or incarnation changed; reread before retrying")]
+    Conflict,
+    #[error("mission contract or revision token is invalid")]
+    Invalid,
+    #[error("mission contract exceeds the bounded storage limit")]
+    TooLarge,
+    #[error("mission file authority could not be established")]
+    Authority,
+    #[error("mission write failed before publication")]
+    Write,
+    #[error("mission file sync failed before publication")]
+    Sync,
+    #[error("mission replacement failed before publication")]
+    Rename,
+    #[error(
+        "mission was published but durability or namespace is indeterminate; reconcile before any retry"
+    )]
+    Indeterminate,
+}
+
+impl MissionStoreError {
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InProgress => "mission.mutation_in_progress",
+            Self::Conflict => "mission.revision_conflict",
+            Self::Invalid => "mission.invalid_contract",
+            Self::TooLarge => "mission.too_large",
+            Self::Authority => "mission.authority_failed",
+            Self::Write => "mission.write_failed",
+            Self::Sync => "mission.sync_failed",
+            Self::Rename => "mission.rename_failed",
+            Self::Indeterminate => "mission.durability_indeterminate",
+        }
+    }
+}
+
+impl From<TxContractStoreError> for MissionStoreError {
+    fn from(error: TxContractStoreError) -> Self {
+        if error.published() {
+            return Self::Indeterminate;
+        }
+        match error.kind() {
+            TxContractStoreErrorKind::InProgress => Self::InProgress,
+            TxContractStoreErrorKind::Lock => Self::Authority,
+            TxContractStoreErrorKind::Validation | TxContractStoreErrorKind::Serialization => {
+                Self::Invalid
+            }
+            TxContractStoreErrorKind::TooLarge => Self::TooLarge,
+            TxContractStoreErrorKind::Write => Self::Write,
+            TxContractStoreErrorKind::Sync => Self::Sync,
+            TxContractStoreErrorKind::Rename => Self::Rename,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MissionMutationReceipt {
+    pub previous: MissionRevisionToken,
+    pub current: MissionRevisionToken,
+    pub changed: bool,
+    pub durability: &'static str,
+    /// A persisted lifecycle request is not acknowledgement by a running owner.
+    pub owner_acknowledgement: &'static str,
+}
+
+/// One lock spans the authoritative bounded read, transition, and durable save.
+/// Uses the same pinned capability and trusted workspace assumptions as tx saves.
+pub struct MissionMutationGuard {
+    guard: TxContractLockGuard,
+    mission: Mission,
+    original: MissionRevisionToken,
+    original_bytes_sha256: String,
+}
+
+impl MissionMutationGuard {
+    pub fn acquire(
+        workspace_root: &Path,
+        path: &Path,
+        expected: Option<&MissionRevisionToken>,
+    ) -> Result<Self, MissionStoreError> {
+        let guard = acquire_tx_contract_lock(workspace_root, path)?;
+        let bytes = guard.read_authoritative_contract_bytes()?;
+        let mission: Mission =
+            serde_json::from_slice(&bytes).map_err(|_| MissionStoreError::Invalid)?;
+        mission.validate().map_err(|_| MissionStoreError::Invalid)?;
+        let original = MissionRevisionToken::from_mission(&mission)?;
+        if expected.is_some_and(|token| token != &original) {
+            return Err(MissionStoreError::Conflict);
+        }
+        Ok(Self {
+            guard,
+            mission,
+            original,
+            original_bytes_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        })
+    }
+
+    #[must_use]
+    pub fn mission(&self) -> &Mission {
+        &self.mission
+    }
+
+    pub fn commit(
+        self,
+        mission: &mut Mission,
+    ) -> Result<MissionMutationReceipt, MissionStoreError> {
+        self.commit_impl(mission, |_| Ok(()))
+    }
+
+    fn commit_impl<F>(
+        self,
+        mission: &mut Mission,
+        fault: F,
+    ) -> Result<MissionMutationReceipt, MissionStoreError>
+    where
+        F: FnMut(TxContractSaveFaultPoint) -> std::io::Result<()>,
+    {
+        if mission.mission_id != self.mission.mission_id
+            || mission.generation != self.mission.generation
+            || mission.workspace_id != self.mission.workspace_id
+            || mission.created_at_ms != self.mission.created_at_ms
+            || mission.revision != self.mission.revision
+        {
+            return Err(MissionStoreError::Conflict);
+        }
+        if mission.updated_at_ms.unwrap_or(mission.created_at_ms)
+            < self
+                .mission
+                .updated_at_ms
+                .unwrap_or(self.mission.created_at_ms)
+            || mission.pause_resume_state.total_pause_count
+                < self.mission.pause_resume_state.total_pause_count
+            || mission.pause_resume_state.total_resume_count
+                < self.mission.pause_resume_state.total_resume_count
+            || mission.pause_resume_state.total_abort_count
+                < self.mission.pause_resume_state.total_abort_count
+            || mission.pause_resume_state.cumulative_pause_duration_ms
+                < self.mission.pause_resume_state.cumulative_pause_duration_ms
+        {
+            return Err(MissionStoreError::Invalid);
+        }
+        mission.validate().map_err(|_| MissionStoreError::Invalid)?;
+        // Detect an uncooperative in-place writer as well as inode replacement.
+        // Same-UID mutation racing the final read/rename remains outside the
+        // shared trusted-anchor model; cooperative writers all take this lock.
+        let bytes = self.guard.read_authoritative_contract_bytes()?;
+        if format!("{:x}", Sha256::digest(&bytes)) != self.original_bytes_sha256 {
+            return Err(MissionStoreError::Conflict);
+        }
+        let proposed = MissionRevisionToken::from_mission(mission)?;
+        let changed = proposed != self.original;
+        let current = if changed {
+            let mut next = mission.clone();
+            next.revision = next
+                .revision
+                .checked_add(1)
+                .ok_or(MissionStoreError::Invalid)?;
+            let bytes = serde_json::to_vec_pretty(&next).map_err(|_| MissionStoreError::Invalid)?;
+            if bytes.len() > TX_CONTRACT_MAX_BYTES {
+                return Err(MissionStoreError::TooLarge);
+            }
+            let current = MissionRevisionToken::from_mission(&next)?;
+            save_contract_bytes_atomic_impl(
+                &self.guard,
+                self.guard.authoritative_path(),
+                &bytes,
+                fault,
+            )?;
+            *mission = next;
+            current
+        } else {
+            proposed
+        };
+        Ok(MissionMutationReceipt {
+            previous: self.original,
+            current,
+            changed,
+            durability: if changed {
+                "file_and_directory_synced"
+            } else {
+                "unchanged_observation"
+            },
+            owner_acknowledgement: "unavailable_no_mission_driver",
+        })
+    }
 }
 
 // ── Step Executor Trait ──────────────────────────────────────────────────────
@@ -6795,6 +7044,486 @@ mod tests {
     use std::rc::Rc;
 
     type RecordedStepIds = Rc<RefCell<Vec<String>>>;
+
+    fn stored_mission_fixture(path: &Path) -> Mission {
+        let mut mission = Mission::new(
+            crate::plan::MissionId("mission:durability-test".to_string()),
+            "Owned mission persistence test",
+            "owned-test-workspace",
+            crate::plan::MissionOwnership {
+                planner: "test-planner".to_string(),
+                dispatcher: "test-dispatcher".to_string(),
+                operator: "test-operator".to_string(),
+            },
+            1_000,
+        );
+        mission.lifecycle_state = crate::plan::MissionLifecycleState::Running;
+        std::fs::write(path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
+        mission
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_revision_incarnation_and_content_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        let baseline = stored_mission_fixture(&path);
+        let expected = MissionRevisionToken::from_mission(&baseline).unwrap();
+        let guard = MissionMutationGuard::acquire(dir.path(), &path, Some(&expected)).unwrap();
+        let mut mission = guard.mission().clone();
+        mission
+            .pause_mission("operator", "pause", 2_000, None)
+            .unwrap();
+        let receipt = guard.commit(&mut mission).unwrap();
+        assert_eq!(receipt.current.revision, 1);
+        assert_eq!(receipt.previous, expected);
+        assert!(receipt.changed);
+        assert_eq!(
+            receipt.owner_acknowledgement,
+            "unavailable_no_mission_driver"
+        );
+        let accepted = std::fs::read(&path).unwrap();
+        assert_eq!(
+            MissionMutationGuard::acquire(dir.path(), &path, Some(&expected))
+                .err()
+                .unwrap(),
+            MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+
+        let guard =
+            MissionMutationGuard::acquire(dir.path(), &path, Some(&receipt.current)).unwrap();
+        let unchanged = guard.commit(&mut mission).unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.current, receipt.current);
+        assert_eq!(unchanged.durability, "unchanged_observation");
+
+        // Same semantic ID and caller timestamp, independently created incarnation.
+        let recreated = stored_mission_fixture(&path);
+        assert_eq!(recreated.mission_id, baseline.mission_id);
+        assert_eq!(recreated.created_at_ms, baseline.created_at_ms);
+        assert_ne!(recreated.generation, baseline.generation);
+        assert_eq!(
+            MissionMutationGuard::acquire(dir.path(), &path, Some(&expected))
+                .err()
+                .unwrap(),
+            MissionStoreError::Conflict
+        );
+
+        let guard = MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        let mut proposal = guard.mission().clone();
+        proposal.title = "our update".to_string();
+        let mut external = recreated.clone();
+        external.title = "foreign in-place update".to_string();
+        let foreign = serde_json::to_vec(&external).unwrap();
+        std::fs::write(&path, &foreign).unwrap();
+        assert_eq!(
+            guard.commit(&mut proposal).unwrap_err(),
+            MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), foreign);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_faults_preserve_old_or_new_complete_snapshot() {
+        for point in [
+            TxContractSaveFaultPoint::BeforeWrite,
+            TxContractSaveFaultPoint::BeforeFileSync,
+            TxContractSaveFaultPoint::BeforeAtomicReplace,
+            TxContractSaveFaultPoint::ParentDirectorySync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mission.json");
+            stored_mission_fixture(&path);
+            let original = std::fs::read(&path).unwrap();
+            let guard = MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+            let mut mission = guard.mission().clone();
+            mission
+                .abort_mission("operator", "abort", None, 2_000, None)
+                .unwrap();
+            let result = guard.commit_impl(&mut mission, |at| {
+                if at == point {
+                    Err(std::io::Error::other("owned deterministic fault"))
+                } else {
+                    Ok(())
+                }
+            });
+            let error = result.unwrap_err();
+            let actual = std::fs::read(&path).unwrap();
+            let loaded: Mission = serde_json::from_slice(&actual).unwrap();
+            loaded.validate().unwrap();
+            if point == TxContractSaveFaultPoint::ParentDirectorySync {
+                assert_eq!(error, MissionStoreError::Indeterminate);
+                assert_eq!(loaded.revision, 1);
+                assert_eq!(
+                    loaded.lifecycle_state,
+                    crate::plan::MissionLifecycleState::Cancelled
+                );
+                assert_ne!(actual, original);
+            } else {
+                let expected = match point {
+                    TxContractSaveFaultPoint::BeforeWrite => MissionStoreError::Write,
+                    TxContractSaveFaultPoint::BeforeFileSync => MissionStoreError::Sync,
+                    TxContractSaveFaultPoint::BeforeAtomicReplace => MissionStoreError::Rename,
+                    TxContractSaveFaultPoint::ParentDirectorySync => unreachable!(),
+                };
+                assert_eq!(error, expected);
+                assert_eq!(actual, original);
+            }
+            assert_eq!(
+                mission.revision, 0,
+                "failed commit must not claim a durable new revision"
+            );
+            assert!(!error.to_string().contains("owned deterministic fault"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_rejects_replaced_path_and_revision_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        let mut mission = stored_mission_fixture(&path);
+        mission.revision = u64::MAX;
+        std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let guard = MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        mission.title = "overflow proposal".to_string();
+        assert_eq!(
+            guard.commit(&mut mission).unwrap_err(),
+            MissionStoreError::Invalid
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let guard = MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        let mut proposal = guard.mission().clone();
+        proposal.title = "replaced path proposal".to_string();
+        let foreign_path = dir.path().join("foreign.json");
+        stored_mission_fixture(&foreign_path);
+        let foreign = std::fs::read(&foreign_path).unwrap();
+        std::fs::rename(&path, dir.path().join("original-retained.json")).unwrap();
+        std::fs::rename(&foreign_path, &path).unwrap();
+        assert!(guard.commit(&mut proposal).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), foreign);
+        assert_eq!(
+            std::fs::read(dir.path().join("original-retained.json")).unwrap(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    struct OwnedMissionChild {
+        child: std::process::Child,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl OwnedMissionChild {
+        fn spawn(root: &Path, name: &str, action: &str, expected: &MissionRevisionToken) -> Self {
+            let stdout = root.join(format!("{name}.stdout"));
+            let stderr = root.join(format!("{name}.stderr"));
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tx_execution::tests::mission_store_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FT_MISSION_TEST_ROOT", root)
+                .env("FT_MISSION_TEST_NAME", name)
+                .env("FT_MISSION_TEST_ACTION", action)
+                .env(
+                    "FT_MISSION_TEST_TOKEN",
+                    serde_json::to_string(expected).unwrap(),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(File::create_new(&stdout).unwrap())
+                .stderr(File::create_new(&stderr).unwrap())
+                .spawn()
+                .unwrap();
+            Self {
+                child,
+                stdout,
+                stderr,
+            }
+        }
+
+        fn wait(&mut self) -> std::process::ExitStatus {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let oversized = [&self.stdout, &self.stderr].iter().any(|path| {
+                    std::fs::metadata(path).map_or(true, |metadata| metadata.len() > 256 * 1024)
+                });
+                let poll = self.child.try_wait();
+                if !oversized {
+                    if let Ok(Some(status)) = &poll {
+                        return *status;
+                    }
+                }
+                if oversized || poll.is_err() || std::time::Instant::now() >= deadline {
+                    let killed = self.child.kill();
+                    let reaped = self.child.wait();
+                    let mut stderr = String::new();
+                    let diagnostic = File::open(&self.stderr)
+                        .and_then(|file| file.take(64 * 1024).read_to_string(&mut stderr));
+                    panic!(
+                        "owned mission child failed: poll={poll:?}, oversized={oversized}, kill={killed:?}, reap={reaped:?}, stderr_read={diagnostic:?}, stderr={stderr}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedMissionChild {
+        fn drop(&mut self) {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {}
+                poll => {
+                    let killed = self.child.kill();
+                    let reaped = self.child.wait();
+                    eprintln!(
+                        "owned mission child cleanup: poll={poll:?}, kill={killed:?}, reap={reaped:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Executed only as an owned child by the tests below. Crash injection tests
+    /// process interruption at filesystem cut points, not actual power loss.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "owned subprocess entrypoint"]
+    fn mission_store_child() {
+        let root = std::env::var_os("FT_MISSION_TEST_ROOT")
+            .expect("owned subprocess requires its isolated workspace");
+        let root = PathBuf::from(root);
+        let name = std::env::var("FT_MISSION_TEST_NAME").unwrap();
+        let action = std::env::var("FT_MISSION_TEST_ACTION").unwrap();
+        let expected: MissionRevisionToken =
+            serde_json::from_str(&std::env::var("FT_MISSION_TEST_TOKEN").unwrap()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.join("release").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent did not release owned child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let guard = loop {
+            match MissionMutationGuard::acquire(&root, &root.join("mission.json"), Some(&expected))
+            {
+                Err(MissionStoreError::InProgress) if std::time::Instant::now() < deadline => {
+                    let marker = root.join(format!("{name}.contended"));
+                    if !marker.exists() {
+                        std::fs::write(marker, b"observed cross-process lock contention").unwrap();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => break result,
+            }
+        };
+        let result = guard.and_then(|guard| {
+            let mut mission = guard.mission().clone();
+            if action == "resume" {
+                mission
+                    .resume_mission("owned-child", "resume", 3_000, None)
+                    .unwrap();
+            } else {
+                mission
+                    .abort_mission("owned-child", "abort", None, 3_000, None)
+                    .unwrap();
+            }
+            guard.commit_impl(&mut mission, |point| {
+                let crash = match action.as_str() {
+                    "crash_before_write" => point == TxContractSaveFaultPoint::BeforeWrite,
+                    "crash_before_file_sync" => point == TxContractSaveFaultPoint::BeforeFileSync,
+                    "crash_before_replace" => {
+                        point == TxContractSaveFaultPoint::BeforeAtomicReplace
+                    }
+                    "crash_before_directory_sync" => {
+                        point == TxContractSaveFaultPoint::ParentDirectorySync
+                    }
+                    _ => false,
+                };
+                if crash {
+                    std::process::exit(72);
+                }
+                Ok(())
+            })
+        });
+        let report = match result {
+            Ok(receipt) => serde_json::json!({"ok": true, "receipt": receipt}),
+            Err(error) => serde_json::json!({"ok": false, "error": error.code()}),
+        };
+        std::fs::write(
+            root.join(format!("{name}.result.json")),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_process_lock_spans_read_through_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        let mission = stored_mission_fixture(&path);
+        let token = MissionRevisionToken::from_mission(&mission).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let guard = MissionMutationGuard::acquire(dir.path(), &path, Some(&token)).unwrap();
+        let mut child = OwnedMissionChild::spawn(dir.path(), "blocked-abort", "abort", &token);
+        std::fs::write(dir.path().join("release"), b"release").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dir.path().join("blocked-abort.contended").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not observe held file lock"
+            );
+            assert!(child.child.try_wait().unwrap().is_none());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(guard.mission().revision, 0);
+        drop(guard);
+        assert!(
+            child.wait().success(),
+            "child stderr: {}",
+            std::fs::read_to_string(&child.stderr).unwrap()
+        );
+        let accepted: Mission = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(accepted.revision, 1);
+        assert_eq!(
+            accepted.lifecycle_state,
+            crate::plan::MissionLifecycleState::Cancelled
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_two_process_cas_race_preserves_accepted_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        let mut mission = stored_mission_fixture(&path);
+        let guard = MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        mission
+            .pause_mission("operator", "pause", 2_000, None)
+            .unwrap();
+        let token = guard.commit(&mut mission).unwrap().current;
+        let mut resume = OwnedMissionChild::spawn(dir.path(), "resume", "resume", &token);
+        let mut abort = OwnedMissionChild::spawn(dir.path(), "abort", "abort", &token);
+        std::fs::write(dir.path().join("release"), b"owned children may proceed").unwrap();
+        assert!(
+            resume.wait().success(),
+            "resume child stderr: {}",
+            std::fs::read_to_string(&resume.stderr).unwrap()
+        );
+        assert!(
+            abort.wait().success(),
+            "abort child stderr: {}",
+            std::fs::read_to_string(&abort.stderr).unwrap()
+        );
+        let resume: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("resume.result.json")).unwrap())
+                .unwrap();
+        let abort: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("abort.result.json")).unwrap())
+                .unwrap();
+        assert_ne!(
+            resume["ok"], abort["ok"],
+            "exactly one mutation may accept a shared revision"
+        );
+        let rejected = if resume["ok"] == true {
+            &abort
+        } else {
+            &resume
+        };
+        assert_eq!(rejected["error"], "mission.revision_conflict");
+        let mut current: Mission = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        current.validate().unwrap();
+        assert_eq!(current.revision, token.revision + 1);
+        if abort["ok"] == false {
+            assert_eq!(
+                current.lifecycle_state,
+                crate::plan::MissionLifecycleState::Running
+            );
+            let fresh = MissionRevisionToken::from_mission(&current).unwrap();
+            let mut abort = OwnedMissionChild::spawn(dir.path(), "fresh-abort", "abort", &fresh);
+            assert!(
+                abort.wait().success(),
+                "fresh abort stderr: {}",
+                std::fs::read_to_string(&abort.stderr).unwrap()
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(dir.path().join("fresh-abort.result.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["ok"], true);
+            current = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        }
+        assert_eq!(
+            current.lifecycle_state,
+            crate::plan::MissionLifecycleState::Cancelled
+        );
+        assert_eq!(current.pause_resume_state.total_abort_count, 1);
+        let accepted = std::fs::read(&path).unwrap();
+        assert_eq!(
+            MissionMutationGuard::acquire(dir.path(), &path, Some(&token))
+                .err()
+                .unwrap(),
+            MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_process_crash_cutpoints_leave_complete_old_or_new() {
+        for action in [
+            "crash_before_write",
+            "crash_before_file_sync",
+            "crash_before_replace",
+            "crash_before_directory_sync",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mission.json");
+            let mission = stored_mission_fixture(&path);
+            let original = std::fs::read(&path).unwrap();
+            let token = MissionRevisionToken::from_mission(&mission).unwrap();
+            let mut child = OwnedMissionChild::spawn(dir.path(), "crash", action, &token);
+            std::fs::write(dir.path().join("release"), b"release").unwrap();
+            assert_eq!(
+                child.wait().code(),
+                Some(72),
+                "crash child stderr: {}",
+                std::fs::read_to_string(&child.stderr).unwrap()
+            );
+            assert!(
+                !dir.path().join("crash.result.json").exists(),
+                "interrupted mutation must not acknowledge success"
+            );
+            let actual = std::fs::read(&path).unwrap();
+            let loaded: Mission = serde_json::from_slice(&actual).unwrap();
+            loaded.validate().unwrap();
+            if action == "crash_before_directory_sync" {
+                assert_eq!(loaded.revision, 1);
+                assert_eq!(
+                    loaded.lifecycle_state,
+                    crate::plan::MissionLifecycleState::Cancelled
+                );
+            } else {
+                assert_eq!(actual, original);
+            }
+            assert!(
+                MissionMutationGuard::acquire(dir.path(), &path, None).is_ok(),
+                "crashed process must release its OS lock"
+            );
+        }
+    }
 
     // ── ft-3lqyu / ft-0rlfq.8: effect seal ──────────────────────────────
     //

@@ -156,7 +156,11 @@ fn make_mission(state: MissionLifecycleState, num_assignments: usize) -> Mission
         MissionId(format!("m-prop-{}", state)),
         "proptest",
         "ws-prop",
-        MissionOwnership::solo("agent-prop"),
+        MissionOwnership {
+            planner: "planner-prop".to_string(),
+            dispatcher: "dispatcher-prop".to_string(),
+            operator: "operator-prop".to_string(),
+        },
         1000,
     );
     mission.lifecycle_state = state;
@@ -323,17 +327,18 @@ proptest! {
     }
 
     #[test]
-    fn abort_cancels_all_inflight_assignments(
+    fn abort_request_preserves_unacknowledged_assignment_outcomes(
         num_assignments in 0usize..5,
     ) {
         let mut mission = make_mission(MissionLifecycleState::Running, num_assignments);
+        let before = serde_json::to_vec(&mission.assignments).unwrap();
 
         mission.abort_mission("op", "abort", None, 5000, None).unwrap();
 
-        for assignment in &mission.assignments {
-            let is_cancelled = matches!(assignment.outcome, Some(frankenterm_core::plan::Outcome::Cancelled { .. }));
-            prop_assert!(is_cancelled, "assignment {} must be cancelled", assignment.assignment_id.0);
-        }
+        prop_assert_eq!(serde_json::to_vec(&mission.assignments).unwrap(), before);
+        prop_assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
+        prop_assert_eq!(mission.pause_resume_state.total_abort_count, 1);
+        prop_assert!(mission.validate().is_ok());
     }
 
     #[test]
