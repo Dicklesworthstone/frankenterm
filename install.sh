@@ -94,6 +94,18 @@ APP_RECEIPT_REASON="not_selected"
 APP_RECEIPT_MANIFEST_ID=""
 APP_RECEIPT_CANDIDATE_PATH=""
 APP_RECEIPT_READINESS="not_run"
+APP_RECEIPT_STATE_PARENT=""
+APP_RECEIPT_CURRENT_PATH=""
+APP_RECEIPT_PREVIOUS_PATH=""
+APP_RECEIPT_PENDING_REASON=""
+APP_RECEIPT_PROCESS_GENERATION=""
+APP_RECEIPT_TRANSACTION_ID=""
+APP_RECEIPT_TRANSACTION_OPERATION="none"
+APP_RECEIPT_TRANSACTION_STATE="none"
+APP_RECEIPT_CANDIDATE_CONTENT_ID=""
+APP_RECEIPT_PRIOR_CONTENT_ID=""
+APP_RECEIPT_ACTIVATION_ACTION=""
+APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
 PENDING_PROCESS_FAMILY_GENERATION=""
 PUBLISHED_PROCESS_FAMILY_VERSION=""
 PUBLISHED_PROCESS_FAMILY_ROOT=""
@@ -2922,33 +2934,39 @@ if (not stat.S_ISDIR(observed_parent.st_mode) or
     os.close(parent_descriptor)
     raise SystemExit("process-family receipt parent is not a real directory")
 receipt_name = "install-receipt.json"
-stage_name = ".install-receipt." + hashlib.sha256(serialized.encode()).hexdigest() + ".writing"
+stage_name = ".install-receipt." + hashlib.sha256(serialized.encode()).hexdigest() + ".writing-v2"
 encoded = (serialized + "\n").encode("ascii")
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 descriptor = None
 try:
     try:
-        descriptor = os.open(stage_name, flags, 0o400, dir_fd=parent_descriptor)
+        descriptor = os.open(stage_name, flags, 0o600, dir_fd=parent_descriptor)
     except FileExistsError:
         descriptor = os.open(
-            stage_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            stage_name, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_descriptor,
         )
         observed_stage = os.fstat(descriptor)
         if (not stat.S_ISREG(observed_stage.st_mode) or
                 observed_stage.st_nlink != 1 or
                 observed_stage.st_uid != os.geteuid() or
-                stat.S_IMODE(observed_stage.st_mode) != 0o400 or
-                observed_stage.st_size != len(encoded)):
+                stat.S_IMODE(observed_stage.st_mode) != 0o600 or
+                observed_stage.st_size > len(encoded)):
             raise SystemExit("process-family receipt stage is not one exact private file")
         existing = b""
-        while len(existing) <= len(encoded):
-            chunk = os.read(descriptor, len(encoded) + 1 - len(existing))
+        while len(existing) < observed_stage.st_size:
+            chunk = os.read(descriptor, observed_stage.st_size - len(existing))
             if not chunk:
                 break
             existing += chunk
-        if existing != encoded:
+        if existing != encoded[:observed_stage.st_size]:
             raise SystemExit("process-family receipt stage conflicts with another transaction")
+        offset = observed_stage.st_size
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise SystemExit("process-family receipt stage write made no progress")
+            offset += written
     else:
         offset = 0
         while offset < len(encoded):
@@ -2956,15 +2974,21 @@ try:
             if written <= 0:
                 raise SystemExit("process-family receipt stage write made no progress")
             offset += written
-        os.fsync(descriptor)
+    os.fsync(descriptor)
     pinned_stage = os.fstat(descriptor)
+    if (pinned_stage.st_size != len(encoded) or
+            stat.S_IMODE(pinned_stage.st_mode) != 0o600):
+        raise SystemExit("process-family receipt stage did not seal exactly")
     os.replace(
         stage_name, receipt_name,
         src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor,
     )
+    os.fchmod(descriptor, 0o400)
+    os.fsync(descriptor)
     published = os.stat(receipt_name, dir_fd=parent_descriptor, follow_symlinks=False)
     if ((published.st_dev, published.st_ino) !=
-            (pinned_stage.st_dev, pinned_stage.st_ino)):
+            (pinned_stage.st_dev, pinned_stage.st_ino) or
+            stat.S_IMODE(published.st_mode) != 0o400):
         raise SystemExit("published process-family receipt differs from its pinned stage")
     os.fsync(parent_descriptor)
 finally:
@@ -2976,28 +3000,186 @@ if output_mode == "emit":
 PY
 }
 
+ensure_private_app_state_parent() {
+  python3 - "$1" <<'PY'
+import os, stat, sys
+
+destination = os.path.abspath(sys.argv[1])
+directory = getattr(os, "O_DIRECTORY", 0)
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+parent = os.open(destination, os.O_RDONLY | directory | nofollow | cloexec)
+child = None
+name = ".frankenterm-app-manifests"
+try:
+    observed_parent = os.fstat(parent)
+    if (not stat.S_ISDIR(observed_parent.st_mode) or
+            observed_parent.st_uid != os.geteuid() or
+            observed_parent.st_mode & 0o022):
+        raise SystemExit("app destination is not one private owner-controlled directory")
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent)
+        os.fsync(parent)
+    except FileExistsError:
+        pass
+    named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    child = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent)
+    opened = os.fstat(child)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or
+            opened.st_mode & 0o077 or
+            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit("app receipt parent is not one private owner-controlled directory")
+    print(os.path.join(destination, name))
+finally:
+    if child is not None:
+        os.close(child)
+    os.close(parent)
+PY
+}
+
+prepare_app_isolated_runtime() {
+  python3 - "$1" "$2" <<'PY'
+import os, re, stat, sys
+
+parent_path, app_id = sys.argv[1:]
+if re.fullmatch(r"[0-9a-f]{64}", app_id) is None:
+    raise SystemExit("invalid app identity for isolated runtime")
+directory = getattr(os, "O_DIRECTORY", 0)
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+parent = os.open(parent_path, os.O_RDONLY | directory | nofollow | cloexec)
+opened = []
+try:
+    parent_stat = os.fstat(parent)
+    if (not stat.S_ISDIR(parent_stat.st_mode) or
+            parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o077):
+        raise SystemExit("isolated app runtime parent is not private")
+    root_name = "candidate-runtime-" + app_id
+    try:
+        os.mkdir(root_name, 0o700, dir_fd=parent)
+        os.fsync(parent)
+    except FileExistsError:
+        pass
+    named_root = os.stat(root_name, dir_fd=parent, follow_symlinks=False)
+    root = os.open(root_name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent)
+    opened.append(root)
+    root_stat = os.fstat(root)
+    if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.geteuid() or
+            root_stat.st_mode & 0o077 or
+            (root_stat.st_dev, root_stat.st_ino) !=
+            (named_root.st_dev, named_root.st_ino)):
+        raise SystemExit("isolated app runtime root is not private")
+    for name in ("home", "config", "cache", "data", "state", "runtime", "tmp", "workspace"):
+        try:
+            os.mkdir(name, 0o700, dir_fd=root)
+            os.fsync(root)
+        except FileExistsError:
+            pass
+        named = os.stat(name, dir_fd=root, follow_symlinks=False)
+        child = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=root)
+        opened.append(child)
+        observed = os.fstat(child)
+        if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid() or
+                observed.st_mode & 0o077 or
+                (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+            raise SystemExit("isolated app runtime member is not private")
+    print(os.path.join(os.path.abspath(parent_path), root_name))
+finally:
+    for descriptor in reversed(opened):
+        os.close(descriptor)
+    os.close(parent)
+PY
+}
+
+app_isolated_launch_action() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import os, shlex, sys
+
+candidate = os.path.abspath(sys.argv[1])
+runtime_root = os.path.abspath(sys.argv[2])
+app_id = sys.argv[3]
+binary = os.path.join(candidate, "Contents", "MacOS", "frankenterm-gui")
+window_class = "com.dicklesworthstone.frankenterm.candidate." + app_id[:16]
+words = [
+    "/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C",
+    "HOME=" + os.path.join(runtime_root, "home"),
+    "CFFIXED_USER_HOME=" + os.path.join(runtime_root, "home"),
+    "XDG_CONFIG_HOME=" + os.path.join(runtime_root, "config"),
+    "XDG_CACHE_HOME=" + os.path.join(runtime_root, "cache"),
+    "XDG_DATA_HOME=" + os.path.join(runtime_root, "data"),
+    "XDG_STATE_HOME=" + os.path.join(runtime_root, "state"),
+    "XDG_RUNTIME_DIR=" + os.path.join(runtime_root, "runtime"),
+    "TMPDIR=" + os.path.join(runtime_root, "tmp"),
+    "FRANKENTERM_CONFIG_DIR=" + os.path.join(runtime_root, "config"),
+    "WEZTERM_CONFIG_DIR=" + os.path.join(runtime_root, "config"),
+    "FRANKENTERM_UNIX_SOCKET=" + os.path.join(runtime_root, "runtime", "mux.sock"),
+    "WEZTERM_UNIX_SOCKET=" + os.path.join(runtime_root, "runtime", "mux.sock"),
+    "FT_WEZTERM_CLI=" + os.path.join(runtime_root, "runtime", "not-created-cli"),
+    "FT_WORKSPACE=" + os.path.join(runtime_root, "workspace"),
+    binary, "--skip-config", "--config", "check_for_updates=false", "start",
+    "--class", window_class, "--always-new-process", "--no-auto-connect",
+    "--", "/bin/zsh", "-l",
+]
+print(" ".join(shlex.quote(word) for word in words))
+PY
+}
+
 emit_app_receipt() {
+  local output_mode="${1:-emit}"
+  case "$output_mode" in
+    emit|silent) ;;
+    *) return 2 ;;
+  esac
   python3 - "$APP_RECEIPT_REQUESTED" "$APP_RECEIPT_RESULT" \
     "$APP_RECEIPT_REASON" "$APP_RECEIPT_MANIFEST_ID" \
     "$APP_RECEIPT_CANDIDATE_PATH" "$APP_RECEIPT_READINESS" \
-    "${APP_ACTIVATION_STATE:-none}" <<'PY'
-import json, os, re, sys
+    "${APP_ACTIVATION_STATE:-none}" "$APP_RECEIPT_STATE_PARENT" \
+    "$APP_RECEIPT_CURRENT_PATH" "$APP_RECEIPT_PREVIOUS_PATH" \
+    "$APP_RECEIPT_PENDING_REASON" "$APP_RECEIPT_PROCESS_GENERATION" \
+    "$APP_RECEIPT_TRANSACTION_ID" "$APP_RECEIPT_TRANSACTION_OPERATION" \
+    "$APP_RECEIPT_TRANSACTION_STATE" "$APP_RECEIPT_CANDIDATE_CONTENT_ID" \
+    "$APP_RECEIPT_PRIOR_CONTENT_ID" "$APP_RECEIPT_ACTIVATION_ACTION" \
+    "$APP_RECEIPT_ISOLATED_LAUNCH_ACTION" "$output_mode" <<'PY'
+import hashlib, json, os, re, stat, sys
 
-requested, result, reason, manifest_id, candidate_path, readiness, activation = sys.argv[1:]
+(
+    requested, result, reason, manifest_id, candidate_path, readiness,
+    activation, receipt_parent, current_path, previous_path, pending_reason,
+    process_generation, transaction_id, operation, transaction_state,
+    candidate_content_id, prior_content_id, activation_action,
+    isolated_launch_action, output_mode,
+) = sys.argv[1:]
 if requested not in ("true", "false"):
     raise SystemExit("app receipt has an invalid requested flag")
-if result not in ("not_requested", "skipped", "verified"):
+if result not in ("not_requested", "in_progress", "skipped", "verified", "failed"):
     raise SystemExit("app receipt has an invalid result")
 if re.fullmatch(r"[a-z0-9_]+", reason) is None:
     raise SystemExit("app receipt has an invalid reason")
-if readiness not in ("not_run", "running", "failed", "passed", "existing_manifest_verified"):
+if readiness not in ("not_run", "running", "failed", "passed"):
     raise SystemExit("app receipt has an invalid readiness state")
 if activation not in ("none", "pending", "current"):
     raise SystemExit("app receipt has an invalid activation state")
+if transaction_state not in ("none", "staged", "prepared", "pending", "committed", "rolled_back", "failed"):
+    raise SystemExit("app receipt has an invalid transaction state")
+if operation not in ("none", "exchange", "publish-noreplace"):
+    raise SystemExit("app receipt has an invalid transaction operation")
 if manifest_id and re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_id) is None:
     raise SystemExit("app receipt has an invalid manifest identity")
-if candidate_path:
-    candidate_path = os.path.abspath(candidate_path)
+if process_generation and re.fullmatch(r"[0-9a-f]{64}", process_generation) is None:
+    raise SystemExit("app receipt has an invalid process-family generation")
+if transaction_id and re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+    raise SystemExit("app receipt has an invalid transaction identity")
+if candidate_content_id and re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_content_id) is None:
+    raise SystemExit("app receipt has an invalid candidate content identity")
+if prior_content_id and prior_content_id != "missing" and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", prior_content_id) is None:
+    raise SystemExit("app receipt has an invalid prior content identity")
+for value in (reason, pending_reason, activation_action, isolated_launch_action):
+    if any(ord(character) < 0x20 for character in value):
+        raise SystemExit("app receipt contains a control character")
+candidate_path = os.path.abspath(candidate_path) if candidate_path else None
+current_path = os.path.abspath(current_path) if current_path else None
+previous_path = os.path.abspath(previous_path) if previous_path else None
 if result == "verified":
     if not manifest_id or not candidate_path or activation not in ("pending", "current"):
         raise SystemExit("verified app receipt lacks candidate authority")
@@ -3005,19 +3187,113 @@ elif activation != "none":
     raise SystemExit("non-verified app receipt claims active authority")
 if result == "not_requested" and requested != "false":
     raise SystemExit("not-requested app receipt claims a request")
+if activation == "pending":
+    if not pending_reason or transaction_state != "pending":
+        raise SystemExit("pending app receipt lacks its exact blocker")
+elif pending_reason or activation_action or isolated_launch_action:
+    raise SystemExit("non-pending app receipt contains pending-only state")
+if transaction_state == "prepared":
+    if (result != "in_progress" or operation == "none" or not transaction_id or
+            not candidate_content_id or not prior_content_id):
+        raise SystemExit("prepared app receipt lacks its transaction authority")
+if transaction_state == "committed" and (activation != "current" or operation == "none"):
+    raise SystemExit("committed app receipt lacks current authority")
 payload = {
     "activation": activation,
-    "candidate_path": candidate_path or None,
+    "activation_action": activation_action or None,
+    "candidate_path": candidate_path,
+    "current_path": current_path,
+    "isolated_launch_action": isolated_launch_action or None,
     "manifest_id": manifest_id or None,
+    "pending_reason": pending_reason or None,
+    "previous_path": previous_path,
+    "process_family_generation": process_generation or None,
     "readiness": readiness,
     "reason": reason,
     "requested": requested == "true",
     "result": result,
-    "schema_version": "frankenterm.install.app-receipt.v1",
+    "schema_version": "frankenterm.install.app-receipt.v2",
+    "transaction": {
+        "candidate_content_id": candidate_content_id or None,
+        "id": transaction_id or None,
+        "operation": operation,
+        "prior_content_id": prior_content_id or None,
+        "state": transaction_state,
+    },
 }
-print("FT_INSTALL_APP_RECEIPT_V1=" + json.dumps(
-    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-))
+serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+if receipt_parent:
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = os.open(receipt_parent, parent_flags)
+    descriptor = None
+    try:
+        observed_parent = os.fstat(parent_descriptor)
+        if (not stat.S_ISDIR(observed_parent.st_mode) or
+                observed_parent.st_uid != os.geteuid() or
+                observed_parent.st_mode & 0o077):
+            raise SystemExit("app receipt parent is not one private directory")
+        receipt_name = "install-receipt.json"
+        stage_name = ".install-receipt." + hashlib.sha256(serialized.encode()).hexdigest() + ".writing-v2"
+        encoded = (serialized + "\n").encode("ascii")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(stage_name, flags, 0o600, dir_fd=parent_descriptor)
+        except FileExistsError:
+            descriptor = os.open(
+                stage_name, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            observed_stage = os.fstat(descriptor)
+            if (not stat.S_ISREG(observed_stage.st_mode) or
+                    observed_stage.st_nlink != 1 or
+                    observed_stage.st_uid != os.geteuid() or
+                    stat.S_IMODE(observed_stage.st_mode) != 0o600 or
+                    observed_stage.st_size > len(encoded)):
+                raise SystemExit("app receipt stage is not one exact private file")
+            existing = b""
+            while len(existing) < observed_stage.st_size:
+                chunk = os.read(descriptor, observed_stage.st_size - len(existing))
+                if not chunk:
+                    break
+                existing += chunk
+            if existing != encoded[:observed_stage.st_size]:
+                raise SystemExit("app receipt stage conflicts with another transaction")
+            offset = observed_stage.st_size
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise SystemExit("app receipt stage write made no progress")
+                offset += written
+        else:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise SystemExit("app receipt stage write made no progress")
+                offset += written
+        os.fsync(descriptor)
+        pinned_stage = os.fstat(descriptor)
+        if (pinned_stage.st_size != len(encoded) or
+                stat.S_IMODE(pinned_stage.st_mode) != 0o600):
+            raise SystemExit("app receipt stage did not seal exactly")
+        os.replace(
+            stage_name, receipt_name,
+            src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor,
+        )
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+        published = os.stat(receipt_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if ((published.st_dev, published.st_ino) !=
+                (pinned_stage.st_dev, pinned_stage.st_ino) or
+                stat.S_IMODE(published.st_mode) != 0o400):
+            raise SystemExit("published app receipt differs from its pinned stage")
+        os.fsync(parent_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+if output_mode == "emit":
+    print("FT_INSTALL_APP_RECEIPT_V2=" + serialized)
 PY
 }
 
@@ -3029,6 +3305,18 @@ mark_app_not_selected() {
   APP_RECEIPT_MANIFEST_ID=""
   APP_RECEIPT_CANDIDATE_PATH=""
   APP_RECEIPT_READINESS="not_run"
+  APP_RECEIPT_STATE_PARENT=""
+  APP_RECEIPT_CURRENT_PATH=""
+  APP_RECEIPT_PREVIOUS_PATH=""
+  APP_RECEIPT_PENDING_REASON=""
+  APP_RECEIPT_PROCESS_GENERATION=""
+  APP_RECEIPT_TRANSACTION_ID=""
+  APP_RECEIPT_TRANSACTION_OPERATION="none"
+  APP_RECEIPT_TRANSACTION_STATE="none"
+  APP_RECEIPT_CANDIDATE_CONTENT_ID=""
+  APP_RECEIPT_PRIOR_CONTENT_ID=""
+  APP_RECEIPT_ACTIVATION_ACTION=""
+  APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
   APP_ACTIVATION_STATE="none"
 }
 
@@ -3036,11 +3324,26 @@ mark_app_skipped() {
   local reason="$1"
   APP_RECEIPT_RESULT="skipped"
   APP_RECEIPT_REASON="$reason"
+  APP_RECEIPT_PENDING_REASON=""
+  APP_RECEIPT_ACTIVATION_ACTION=""
+  APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
+  APP_ACTIVATION_STATE="none"
+}
+
+mark_app_failed() {
+  local reason="$1"
+  APP_RECEIPT_RESULT="failed"
+  APP_RECEIPT_REASON="$reason"
+  APP_RECEIPT_PENDING_REASON=""
+  APP_RECEIPT_ACTIVATION_ACTION=""
+  APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
+  APP_RECEIPT_TRANSACTION_STATE="failed"
   APP_ACTIVATION_STATE="none"
 }
 
 finalize_app_receipt_state() {
-  if [ "$APP_RECEIPT_RESULT" = in_progress ]; then
+  if [ "$APP_RECEIPT_RESULT" = in_progress ] && \
+     [ "$APP_RECEIPT_TRANSACTION_STATE" != prepared ]; then
     mark_app_skipped app_install_incomplete
   fi
 }
@@ -4946,8 +5249,214 @@ should_install_app() {
   APP_RECEIPT_MANIFEST_ID=""
   APP_RECEIPT_CANDIDATE_PATH=""
   APP_RECEIPT_READINESS="not_run"
+  APP_RECEIPT_STATE_PARENT=""
+  APP_RECEIPT_CURRENT_PATH=""
+  APP_RECEIPT_PREVIOUS_PATH=""
+  APP_RECEIPT_PENDING_REASON=""
+  APP_RECEIPT_PROCESS_GENERATION=""
+  APP_RECEIPT_TRANSACTION_ID=""
+  APP_RECEIPT_TRANSACTION_OPERATION="none"
+  APP_RECEIPT_TRANSACTION_STATE="none"
+  APP_RECEIPT_CANDIDATE_CONTENT_ID=""
+  APP_RECEIPT_PRIOR_CONTENT_ID=""
+  APP_RECEIPT_ACTIVATION_ACTION=""
+  APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
   APP_ACTIVATION_STATE="none"
   return 0
+}
+
+app_process_family_is_current() {
+  local generation_id authority_state
+  [ "$PROCESS_FAMILY_ACTIVATION_STATE" = current ] || return 1
+  [ "$PROCESS_FAMILY_ACTIVE_AUTHORITY" = managed-selector ] || return 1
+  [ -n "$PUBLISHED_PROCESS_FAMILY_ROOT" ] || return 1
+  [ "$PROCESS_FAMILY_ACTIVE_ROOT" = "$PUBLISHED_PROCESS_FAMILY_ROOT" ] || return 1
+  [ -z "$PENDING_PROCESS_FAMILY_GENERATION" ] || return 1
+  generation_id="${PUBLISHED_PROCESS_FAMILY_ROOT##*/}"
+  [[ "$generation_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  authority_state=$(inspect_installer_process_family_authority 1) || return 1
+  [ "$authority_state" = $'managed\t'"generations/$generation_id" ] || return 1
+  verify_canonical_generation "$PUBLISHED_PROCESS_FAMILY_ROOT" \
+    "$PUBLISHED_PROCESS_FAMILY_VERSION" \
+    "$PUBLISHED_PROCESS_FAMILY_VERIFIER_AUTHORITY" || return 1
+  APP_RECEIPT_PROCESS_GENERATION="$generation_id"
+}
+
+run_macos_app_readiness() {
+  local app_root="$1" retained_manifest="$2" app_source="$3" app_profile="$4"
+  local readiness_harness="$app_root/Contents/Resources/e2e-native-events.sh"
+  local staged_verifier="$app_root/Contents/Resources/verify-components.sh"
+  [ -f "$readiness_harness" ] && [ -x "$readiness_harness" ] && \
+    [ ! -L "$readiness_harness" ] && [ -f "$staged_verifier" ] && \
+    [ -x "$staged_verifier" ] && [ ! -L "$staged_verifier" ] || return 2
+  FRANKENTERM_ALLOW_GUI_E2E=1 \
+    FRANKENTERM_GUI="$app_root/Contents/MacOS/frankenterm-gui" \
+    FRANKENTERM_CLI="$app_root/Contents/MacOS/ft" \
+    FRANKENTERM_MUX_SERVER="$app_root/Contents/MacOS/frankenterm-mux-server" \
+    FRANKENTERM_PTY_GUARDIAN="$app_root/Contents/MacOS/frankenterm-pty-guardian" \
+    FRANKENTERM_CANDIDATE_ROOT="$app_root" \
+    FRANKENTERM_COMPONENT_MANIFEST="$retained_manifest" \
+    FRANKENTERM_CANDIDATE_SHA="$app_source" \
+    FRANKENTERM_BUILD_PROFILE="$app_profile" \
+    FRANKENTERM_ATOMIC_MANIFEST_TOOL="$staged_verifier" \
+    /bin/bash "$readiness_harness"
+}
+
+read_prepared_app_transaction() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, os, re, stat, sys
+
+parent_path, manifest_id, candidate_path, target_path = sys.argv[1:]
+directory = getattr(os, "O_DIRECTORY", 0)
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+parent = os.open(parent_path, os.O_RDONLY | directory | nofollow)
+receipt = None
+try:
+    parent_stat = os.fstat(parent)
+    if (not stat.S_ISDIR(parent_stat.st_mode) or
+            parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o077):
+        raise SystemExit(2)
+    try:
+        receipt = os.open("install-receipt.json", os.O_RDONLY | nofollow, dir_fd=parent)
+    except FileNotFoundError:
+        raise SystemExit(1)
+    observed = os.fstat(receipt)
+    named = os.stat("install-receipt.json", dir_fd=parent, follow_symlinks=False)
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or
+            observed.st_uid != os.geteuid() or
+            stat.S_IMODE(observed.st_mode) != 0o400 or
+            observed.st_size > 1024 * 1024 or
+            (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)):
+        raise SystemExit(2)
+    payload = b""
+    while len(payload) <= observed.st_size:
+        chunk = os.read(receipt, observed.st_size + 1 - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+    if len(payload) != observed.st_size:
+        raise SystemExit(2)
+    after = os.fstat(receipt)
+    named_after = os.stat("install-receipt.json", dir_fd=parent, follow_symlinks=False)
+    if ((observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns,
+         observed.st_ctime_ns) !=
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+         after.st_ctime_ns) or
+            (after.st_dev, after.st_ino) != (named_after.st_dev, named_after.st_ino)):
+        raise SystemExit(2)
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        record = json.loads(payload, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise SystemExit(2)
+    transaction = record.get("transaction")
+    if (record.get("schema_version") != "frankenterm.install.app-receipt.v2" or
+            not isinstance(transaction, dict)):
+        raise SystemExit(1)
+    if transaction.get("state") != "prepared" or record.get("manifest_id") != manifest_id:
+        raise SystemExit(1)
+    operation = transaction.get("operation")
+    transaction_id = transaction.get("id")
+    candidate_id = transaction.get("candidate_content_id")
+    prior_id = transaction.get("prior_content_id")
+    if (operation not in ("exchange", "publish-noreplace") or
+            re.fullmatch(r"[0-9a-f]{32}", transaction_id or "") is None or
+            re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_id or "") is None or
+            (prior_id != "missing" and
+             re.fullmatch(r"sha256:[0-9a-f]{64}", prior_id or "") is None)):
+        raise SystemExit(2)
+    process_generation = record.get("process_family_generation")
+    expected_current = os.path.abspath(target_path) if operation == "exchange" else None
+    if (record.get("candidate_path") != os.path.abspath(candidate_path) or
+            record.get("current_path") != expected_current or
+            record.get("requested") is not True or
+            record.get("result") != "in_progress" or
+            record.get("reason") != "activation_prepared" or
+            record.get("readiness") != "passed" or
+            record.get("activation") != "none" or
+            record.get("pending_reason") is not None or
+            record.get("activation_action") is not None or
+            record.get("isolated_launch_action") is not None or
+            re.fullmatch(r"[0-9a-f]{64}", process_generation or "") is None):
+        raise SystemExit(2)
+    print("\t".join((operation, transaction_id, candidate_id, prior_id)))
+finally:
+    if receipt is not None:
+        os.close(receipt)
+    os.close(parent)
+PY
+}
+
+mark_app_pending() {
+  local reason="$1" staged_app="$2" app_id="$3"
+  local isolated_runtime
+  APP_INSTALLED_PATH="$staged_app"
+  APP_ACTIVATION_STATE="pending"
+  APP_RECEIPT_RESULT="verified"
+  APP_RECEIPT_REASON="activation_pending"
+  APP_RECEIPT_PENDING_REASON="$reason"
+  APP_RECEIPT_TRANSACTION_STATE="pending"
+  APP_RECEIPT_TRANSACTION_ID=""
+  APP_RECEIPT_TRANSACTION_OPERATION="none"
+  APP_RECEIPT_PRIOR_CONTENT_ID=""
+  APP_RECEIPT_ACTIVATION_ACTION=""
+  APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
+  if [ "${SYSTEM_INSTALL:-0}" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    isolated_runtime=$(prepare_app_isolated_runtime \
+      "$APP_RECEIPT_STATE_PARENT" "$app_id") || {
+      mark_app_failed isolated_runtime_creation_failed
+      emit_app_receipt silent || true
+      return 1
+    }
+    APP_RECEIPT_ISOLATED_LAUNCH_ACTION=$(app_isolated_launch_action \
+      "$staged_app" "$isolated_runtime" "$app_id") || return 1
+  fi
+  emit_app_receipt silent
+}
+
+rollback_macos_app_activation() {
+  local helper="$1" dest="$2" staged_app="$3" target_app="$4" app_id="$5"
+  local operation="$6" candidate_id="$7" prior_id="$8"
+  local rollback_txid rollback_stage_id rollback_target_id restored_id failed_app
+  if [ "$operation" = exchange ]; then
+    rollback_stage_id=$(atomic_path_content_id "$helper" \
+      "$dest" "$(basename "$staged_app")") || return 1
+    rollback_target_id=$(atomic_path_content_id "$helper" \
+      "$dest" "$(basename "$target_app")") || return 1
+    [ "$rollback_stage_id" = "$prior_id" ] && \
+      [ "$rollback_target_id" = "$candidate_id" ] || return 1
+    rollback_txid=$(atomic_transition_txid "app-rollback:$dest:$app_id") || return 1
+    atomic_path_transition "$helper" "$dest" \
+      "$(basename "$staged_app")" "$(basename "$target_app")" "$rollback_txid" \
+      "$rollback_stage_id" "$rollback_target_id" exchange || return 1
+    restored_id=$(atomic_path_content_id "$helper" \
+      "$dest" "$(basename "$target_app")") || return 1
+    [ "$restored_id" = "$prior_id" ] || return 1
+  elif [ "$operation" = publish-noreplace ]; then
+    [ "$prior_id" = missing ] || return 1
+    [ ! -e "$staged_app" ] && [ ! -L "$staged_app" ] || return 1
+    rollback_target_id=$(atomic_path_content_id "$helper" \
+      "$dest" "$(basename "$target_app")") || return 1
+    [ "$rollback_target_id" = "$candidate_id" ] || return 1
+    failed_app="$(basename "$staged_app")"
+    rollback_txid=$(atomic_transition_txid \
+      "app-first-publish-rollback:$dest:$app_id") || return 1
+    atomic_path_transition "$helper" "$dest" \
+      "$(basename "$target_app")" "$failed_app" "$rollback_txid" \
+      "$rollback_target_id" missing publish-noreplace || return 1
+    [ ! -e "$target_app" ] && [ ! -L "$target_app" ] || return 1
+    restored_id=$(atomic_path_content_id "$helper" "$dest" "$failed_app") || return 1
+    [ "$restored_id" = "$candidate_id" ] || return 1
+  else
+    return 1
+  fi
 }
 
 install_macos_app() {
@@ -4957,6 +5466,8 @@ install_macos_app() {
   local app_inventory_bytes _family_manifest_id family_build family_source family_version
   local family_target family_profile family_features family_inventory_bytes
   local stage_id target_id txid operation retained_manifest manifest_store manifest_stage
+  local census prepared prepared_status prepared_operation prepared_txid
+  local prepared_candidate_id prepared_prior_id current_id previous_id isolated_runtime
   local family_manifest family_verifier transition_helper
   app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
 
@@ -5109,10 +5620,18 @@ PY
     return 0
   }
   APP_RECEIPT_MANIFEST_ID="$app_manifest_id"
+  APP_RECEIPT_PROCESS_GENERATION="${PUBLISHED_PROCESS_FAMILY_ROOT##*/}"
+  [[ "$APP_RECEIPT_PROCESS_GENERATION" =~ ^[0-9a-f]{64}$ ]] || {
+    mark_app_skipped invalid_process_family_generation
+    return 0
+  }
 
-  manifest_store="$dest/.frankenterm-app-manifests"
-  mkdir -p "$manifest_store" || return 0
-  chmod 0700 "$manifest_store" || return 0
+  manifest_store=$(ensure_private_app_state_parent "$dest") || {
+    warn "App manifest and receipt authority is unsafe; live app authority is unchanged"
+    mark_app_skipped unsafe_app_state_authority
+    return 0
+  }
+  APP_RECEIPT_STATE_PARENT="$manifest_store"
   retained_manifest="$manifest_store/$app_id.json"
   if [ -e "$retained_manifest" ] || [ -L "$retained_manifest" ]; then
     [ -f "$retained_manifest" ] && [ ! -L "$retained_manifest" ] && \
@@ -5131,15 +5650,186 @@ PY
 
   target_app="$dest/FrankenTerm.app"
   staged_app="$dest/.FrankenTerm.app.installing-$app_id"
+  APP_RECEIPT_CURRENT_PATH=""
+  if [ -e "$target_app" ] && [ ! -L "$target_app" ]; then
+    APP_RECEIPT_CURRENT_PATH="$target_app"
+  fi
   if [ -d "$target_app" ] && [ ! -L "$target_app" ] && \
       bash "$family_verifier" verify \
         --root "$target_app" --manifest "$retained_manifest" >/dev/null 2>&1; then
+    if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" != 1 ] || \
+       [ "${FT_INSTALL_TEST_ALLOW_APP_SELECTOR:-0}" != 1 ]; then
+      APP_INSTALLED_PATH="$target_app"
+      APP_RECEIPT_CANDIDATE_PATH="$target_app"
+      APP_RECEIPT_READINESS="not_run"
+      if ! command -v codesign >/dev/null 2>&1 || \
+         ! codesign --verify --deep --strict "$target_app" >/dev/null 2>&1; then
+        APP_RECEIPT_READINESS="failed"
+        err "Existing current app failed strict codesign verification"
+        mark_app_failed current_app_verification_failed
+        emit_app_receipt silent || true
+        return 1
+      fi
+      APP_ACTIVATION_STATE="current"
+      APP_RECEIPT_RESULT="verified"
+      APP_RECEIPT_REASON="already_current"
+      APP_RECEIPT_TRANSACTION_ID=""
+      APP_RECEIPT_TRANSACTION_OPERATION="none"
+      APP_RECEIPT_TRANSACTION_STATE="none"
+      APP_RECEIPT_CANDIDATE_CONTENT_ID=$(atomic_path_content_id \
+        "$transition_helper" "$dest" FrankenTerm.app) || return 1
+      APP_RECEIPT_PRIOR_CONTENT_ID=""
+      emit_app_receipt silent || return 1
+      ok "FrankenTerm.app already matches atomic app generation $app_id"
+      return 0
+    fi
+    prepared_status=0
+    prepared=""
+    if prepared=$(read_prepared_app_transaction "$manifest_store" \
+        "$app_manifest_id" "$staged_app" "$target_app"); then
+      IFS=$'\t' read -r prepared_operation prepared_txid \
+        prepared_candidate_id prepared_prior_id <<<"$prepared"
+      APP_RECEIPT_TRANSACTION_ID="$prepared_txid"
+      APP_RECEIPT_TRANSACTION_OPERATION="$prepared_operation"
+      APP_RECEIPT_TRANSACTION_STATE="prepared"
+      APP_RECEIPT_CANDIDATE_CONTENT_ID="$prepared_candidate_id"
+      APP_RECEIPT_PRIOR_CONTENT_ID="$prepared_prior_id"
+      current_id=$(atomic_path_content_id "$transition_helper" \
+        "$dest" FrankenTerm.app) || return 1
+      [ "$current_id" = "$prepared_candidate_id" ] || {
+        err "Current app differs from the prepared activation authority"
+        mark_app_failed prepared_app_current_identity_mismatch
+        emit_app_receipt silent || true
+        return 1
+      }
+      if [ "$prepared_operation" = exchange ]; then
+        previous_id=$(atomic_path_content_id "$transition_helper" \
+          "$dest" "$(basename "$staged_app")") || return 1
+        [ "$previous_id" = "$prepared_prior_id" ] || {
+          err "Retained prior app differs from the prepared rollback authority"
+          mark_app_failed prepared_app_prior_identity_mismatch
+          emit_app_receipt silent || true
+          return 1
+        }
+      else
+        [ "$prepared_prior_id" = missing ] && \
+          [ ! -e "$staged_app" ] && [ ! -L "$staged_app" ] || {
+          err "First-install app recovery does not match its prepared transaction"
+          mark_app_failed prepared_app_first_install_state_mismatch
+          emit_app_receipt silent || true
+          return 1
+        }
+      fi
+    else
+      prepared_status=$?
+      if [ "$prepared_status" -ne 1 ]; then
+        err "Persisted app transaction receipt is unsafe or malformed"
+        mark_app_failed unsafe_persisted_app_receipt
+        emit_app_receipt silent || true
+        return 1
+      fi
+    fi
+
     APP_INSTALLED_PATH="$target_app"
-    APP_ACTIVATION_STATE="current"
     APP_RECEIPT_CANDIDATE_PATH="$target_app"
-    APP_RECEIPT_READINESS="existing_manifest_verified"
+    APP_RECEIPT_READINESS="not_run"
+    if ! command -v codesign >/dev/null 2>&1 || \
+       ! codesign --verify --deep --strict "$target_app" >/dev/null 2>&1; then
+      APP_RECEIPT_READINESS="failed"
+      if [ -n "$prepared" ]; then
+        warn "Interrupted app activation failed strict verification; restoring the prior authority"
+        if ! rollback_macos_app_activation "$transition_helper" "$dest" \
+            "$staged_app" "$target_app" "$app_id" "$prepared_operation" \
+            "$prepared_candidate_id" "$prepared_prior_id"; then
+          err "App rollback failed; refusing to claim a current or pending authority"
+          mark_app_failed app_recovery_rollback_failed
+          emit_app_receipt silent || true
+          return 1
+        fi
+        APP_RECEIPT_CANDIDATE_PATH="$staged_app"
+        if [ "$prepared_operation" = exchange ]; then
+          APP_RECEIPT_CURRENT_PATH="$target_app"
+          APP_RECEIPT_PREVIOUS_PATH=""
+        else
+          APP_RECEIPT_CURRENT_PATH=""
+        fi
+        APP_RECEIPT_TRANSACTION_ID="$prepared_txid"
+        APP_RECEIPT_TRANSACTION_OPERATION="$prepared_operation"
+        APP_RECEIPT_CANDIDATE_CONTENT_ID="$prepared_candidate_id"
+        APP_RECEIPT_PRIOR_CONTENT_ID="$prepared_prior_id"
+        APP_RECEIPT_TRANSACTION_STATE="rolled_back"
+        mark_app_skipped interrupted_activation_verification_failed
+        emit_app_receipt silent || return 1
+        return 0
+      fi
+      err "Existing current app failed strict codesign or native readiness verification"
+      mark_app_failed current_app_verification_failed
+      emit_app_receipt silent || true
+      return 1
+    fi
+    if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] && \
+       [ "${FT_INSTALL_TEST_ALLOW_APP_SELECTOR:-0}" = 1 ]; then
+      APP_RECEIPT_READINESS="running"
+      if ! run_macos_app_readiness "$target_app" "$retained_manifest" \
+          "$app_source" "$app_profile"; then
+        APP_RECEIPT_READINESS="failed"
+        if [ -n "$prepared" ]; then
+          warn "Interrupted test-only app activation failed readiness; restoring the prior authority"
+          if ! rollback_macos_app_activation "$transition_helper" "$dest" \
+              "$staged_app" "$target_app" "$app_id" "$prepared_operation" \
+              "$prepared_candidate_id" "$prepared_prior_id"; then
+            err "App rollback failed; refusing to claim a current or pending authority"
+            mark_app_failed app_recovery_rollback_failed
+            emit_app_receipt silent || true
+            return 1
+          fi
+          APP_RECEIPT_CANDIDATE_PATH="$staged_app"
+          if [ "$prepared_operation" = exchange ]; then
+            APP_RECEIPT_CURRENT_PATH="$target_app"
+            APP_RECEIPT_PREVIOUS_PATH=""
+          else
+            APP_RECEIPT_CURRENT_PATH=""
+          fi
+          APP_RECEIPT_TRANSACTION_ID="$prepared_txid"
+          APP_RECEIPT_TRANSACTION_OPERATION="$prepared_operation"
+          APP_RECEIPT_CANDIDATE_CONTENT_ID="$prepared_candidate_id"
+          APP_RECEIPT_PRIOR_CONTENT_ID="$prepared_prior_id"
+          APP_RECEIPT_TRANSACTION_STATE="rolled_back"
+          mark_app_skipped interrupted_activation_verification_failed
+          emit_app_receipt silent || return 1
+          return 0
+        fi
+        err "Existing test-only current app failed native readiness verification"
+        mark_app_failed current_app_verification_failed
+        emit_app_receipt silent || true
+        return 1
+      fi
+      APP_RECEIPT_READINESS="passed"
+    fi
+    APP_ACTIVATION_STATE="current"
     APP_RECEIPT_RESULT="verified"
     APP_RECEIPT_REASON="already_current"
+    APP_RECEIPT_PENDING_REASON=""
+    APP_RECEIPT_ACTIVATION_ACTION=""
+    APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
+    if [ -n "$prepared" ]; then
+      APP_RECEIPT_TRANSACTION_ID="$prepared_txid"
+      APP_RECEIPT_TRANSACTION_OPERATION="$prepared_operation"
+      APP_RECEIPT_CANDIDATE_CONTENT_ID="$prepared_candidate_id"
+      APP_RECEIPT_PRIOR_CONTENT_ID="$prepared_prior_id"
+      APP_RECEIPT_TRANSACTION_STATE="committed"
+      if [ "$prepared_operation" = exchange ]; then
+        APP_RECEIPT_PREVIOUS_PATH="$staged_app"
+      fi
+    else
+      APP_RECEIPT_TRANSACTION_ID=""
+      APP_RECEIPT_TRANSACTION_OPERATION="none"
+      APP_RECEIPT_TRANSACTION_STATE="none"
+      APP_RECEIPT_CANDIDATE_CONTENT_ID=$(atomic_path_content_id \
+        "$transition_helper" "$dest" FrankenTerm.app) || return 1
+      APP_RECEIPT_PRIOR_CONTENT_ID=""
+    fi
+    emit_app_receipt silent || return 1
     ok "FrankenTerm.app already matches atomic app generation $app_id"
     return 0
   fi
@@ -5173,32 +5863,35 @@ PY
   fsync_installer_tree "$staged_app" || return 0
   bash "$family_verifier" verify \
     --root "$staged_app" --manifest "$retained_manifest" >/dev/null || return 0
-  if command -v codesign >/dev/null 2>&1; then
-    codesign --verify --deep --strict "$staged_app" >/dev/null 2>&1 || return 0
+  if ! command -v codesign >/dev/null 2>&1 || \
+     ! codesign --verify --deep --strict "$staged_app" >/dev/null 2>&1; then
+    warn "FrankenTerm.app failed strict codesign verification; live app authority is unchanged"
+    mark_app_skipped app_codesign_verification_failed
+    return 0
+  fi
+  stage_id=$(atomic_path_content_id "$transition_helper" \
+    "$dest" "$(basename "$staged_app")") || return 1
+  APP_RECEIPT_CANDIDATE_CONTENT_ID="$stage_id"
+
+  # The app remains a generation-specific candidate until one production
+  # authority serializes every GUI/CLI/mux/guardian launcher and proves PTY
+  # handoff plus rollback under that same lease. A process census is evidence,
+  # not that missing exclusion primitive. The source-only test seam below may
+  # exercise selector crash recovery against private fixtures, but no normal
+  # installer invocation may cross this boundary.
+  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" != 1 ] || \
+     [ "${FT_INSTALL_TEST_ALLOW_APP_SELECTOR:-0}" != 1 ]; then
+    APP_RECEIPT_READINESS="not_run"
+    warn "FrankenTerm.app candidate is verified and retained; live app authority is unchanged"
+    warn "Production activation requires the cross-launcher lifetime and guardian-handoff transaction"
+    mark_app_pending cross_launcher_lifecycle_unproven "$staged_app" "$app_id"
+    return
   fi
 
-  local readiness_harness="$staged_app/Contents/Resources/e2e-native-events.sh"
-  local staged_verifier="$staged_app/Contents/Resources/verify-components.sh"
-  [ -f "$readiness_harness" ] && [ -x "$readiness_harness" ] && \
-    [ ! -L "$readiness_harness" ] && [ -f "$staged_verifier" ] && \
-    [ -x "$staged_verifier" ] && [ ! -L "$staged_verifier" ] || {
-      warn "FrankenTerm.app lacks its manifest-bound native readiness authorities"
-      mark_app_skipped readiness_authority_missing
-      return 0
-    }
-  info "Running non-activating native readiness proof before app selector switch"
+  info "Running test-only non-activating native readiness proof before app selector switch"
   APP_RECEIPT_READINESS="running"
-  if ! FRANKENTERM_ALLOW_GUI_E2E=1 \
-      FRANKENTERM_GUI="$staged_app/Contents/MacOS/frankenterm-gui" \
-      FRANKENTERM_CLI="$staged_app/Contents/MacOS/ft" \
-      FRANKENTERM_MUX_SERVER="$staged_app/Contents/MacOS/frankenterm-mux-server" \
-      FRANKENTERM_PTY_GUARDIAN="$staged_app/Contents/MacOS/frankenterm-pty-guardian" \
-      FRANKENTERM_CANDIDATE_ROOT="$staged_app" \
-      FRANKENTERM_COMPONENT_MANIFEST="$retained_manifest" \
-      FRANKENTERM_CANDIDATE_SHA="$app_source" \
-      FRANKENTERM_BUILD_PROFILE="$app_profile" \
-      FRANKENTERM_ATOMIC_MANIFEST_TOOL="$staged_verifier" \
-      /bin/bash "$readiness_harness"; then
+  if ! run_macos_app_readiness "$staged_app" "$retained_manifest" \
+      "$app_source" "$app_profile"; then
     warn "FrankenTerm.app native readiness proof failed; live app authority is unchanged"
     APP_RECEIPT_READINESS="failed"
     mark_app_skipped native_readiness_failed
@@ -5206,85 +5899,85 @@ PY
   fi
   APP_RECEIPT_READINESS="passed"
 
-  # Publication is deliberately non-activating until one production lifecycle
-  # authority serializes every GUI/CLI/mux/guardian launcher, proves guardian
-  # PTY handoff and exact successor readiness, and owns rollback under the same
-  # lease. A pathname exchange by the installer alone would recreate the mixed
-  # live-family window that immutable generations are intended to eliminate.
-  # The source-only test harness may cross this boundary to exercise the exact
-  # crash and rollback state machine against private fixtures.
-  if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" != 1 ] || \
-     [ "${FT_INSTALL_TEST_ALLOW_APP_SELECTOR:-0}" != 1 ]; then
-    APP_INSTALLED_PATH="$staged_app"
-    APP_ACTIVATION_STATE="pending"
-    APP_RECEIPT_RESULT="verified"
-    APP_RECEIPT_REASON="activation_pending_lifecycle_transaction"
-    warn "FrankenTerm.app candidate is verified and retained; live app authority is unchanged"
-    warn "Activation requires the cross-launcher lifetime and guardian-handoff transaction"
-    return 0
+  if ! app_process_family_is_current; then
+    warn "Matching process-family generation is not current; verified GUI candidate remains pending"
+    mark_app_pending process_family_not_current "$staged_app" "$app_id"
+    return
+  fi
+  if [ -e "$target_app" ] && [ "$ACTIVATE_IF_IDLE" -ne 1 ]; then
+    warn "Existing FrankenTerm.app requires --activate-if-idle; verified candidate remains pending"
+    mark_app_pending activation_not_requested "$staged_app" "$app_id"
+    return
   fi
 
-  stage_id=$(atomic_path_content_id "$transition_helper" \
-    "$dest" "$(basename "$staged_app")") || return 0
-  txid=$(atomic_transition_txid "app-publish:$dest:$app_id") || return 0
+  txid=$(atomic_transition_txid "app-publish:$dest:$app_id") || return 1
   if [ -e "$target_app" ]; then
-    target_id=$(atomic_path_content_id "$transition_helper" "$dest" FrankenTerm.app) || return 0
+    target_id=$(atomic_path_content_id "$transition_helper" "$dest" FrankenTerm.app) || return 1
     operation=exchange
+    APP_RECEIPT_CURRENT_PATH="$target_app"
   else
     target_id=missing
     operation=publish-noreplace
+    APP_RECEIPT_CURRENT_PATH=""
   fi
+  APP_RECEIPT_TRANSACTION_ID="$txid"
+  APP_RECEIPT_TRANSACTION_OPERATION="$operation"
+  APP_RECEIPT_TRANSACTION_STATE="prepared"
+  APP_RECEIPT_PRIOR_CONTENT_ID="$target_id"
+  APP_RECEIPT_RESULT="in_progress"
+  APP_RECEIPT_REASON="activation_prepared"
+  APP_RECEIPT_PENDING_REASON=""
+  APP_RECEIPT_ACTIVATION_ACTION=""
+  APP_RECEIPT_ISOLATED_LAUNCH_ACTION=""
+  emit_app_receipt silent || return 1
+
+  # This is evidence rather than a shared launcher lease, so it is deliberately
+  # the last operation before the descriptor-pinned namespace transaction. A
+  # live or ambiguous v0.13 process always retains its exact app authority.
+  census=$(installer_mux_ownership_state) || census=ambiguous
+  case "$census" in
+    inactive) ;;
+    active)
+      warn "A live FrankenTerm process owns session state; verified GUI candidate remains pending"
+      mark_app_pending active_mux_owns_session_state "$staged_app" "$app_id"
+      return
+      ;;
+    *)
+      warn "FrankenTerm process ownership is ambiguous; verified GUI candidate remains pending"
+      mark_app_pending ambiguous_mux_ownership "$staged_app" "$app_id"
+      return
+      ;;
+  esac
+
   installer_failpoint before-app-selector-switch
-  atomic_path_transition "$transition_helper" "$dest" \
+  if ! atomic_path_transition "$transition_helper" "$dest" \
     "$(basename "$staged_app")" FrankenTerm.app "$txid" "$stage_id" "$target_id" \
-    "$operation" || return 0
+      "$operation"; then
+    err "App activation transition did not acknowledge completion; the prepared receipt was retained for exact recovery"
+    return 1
+  fi
   installer_failpoint after-app-selector-switch
   if ! bash "$family_verifier" verify \
       --root "$target_app" --manifest "$retained_manifest" >/dev/null || \
-     { command -v codesign >/dev/null 2>&1 && \
-       ! codesign --verify --deep --strict "$target_app" >/dev/null 2>&1; }; then
+     ! command -v codesign >/dev/null 2>&1 || \
+     ! codesign --verify --deep --strict "$target_app" >/dev/null 2>&1; then
     warn "Post-switch app verification failed; restoring the prior app authority"
-    local rollback_txid rollback_stage_id rollback_target_id restored_id failed_app
-    if [ "$operation" = exchange ]; then
-      rollback_stage_id=$(atomic_path_content_id "$transition_helper" \
-        "$dest" "$(basename "$staged_app")") || return 1
-      rollback_target_id=$(atomic_path_content_id "$transition_helper" \
-        "$dest" FrankenTerm.app) || return 1
-      rollback_txid=$(atomic_transition_txid "app-rollback:$dest:$app_id") || return 1
-      atomic_path_transition "$transition_helper" "$dest" \
-        "$(basename "$staged_app")" FrankenTerm.app "$rollback_txid" \
-        "$rollback_stage_id" "$rollback_target_id" exchange || return 1
-      restored_id=$(atomic_path_content_id "$transition_helper" \
-        "$dest" FrankenTerm.app) || return 1
-      [ "$restored_id" = "$target_id" ] || {
-        err "App rollback completed without restoring the exact prior authority"
-        return 1
-      }
-    else
-      # The successful publish consumed the exact staging name, so moving the
-      # failed first generation back to that same name is collision-free under
-      # the installer lease and restores both the prior absent authority and
-      # the original recoverable candidate location.
-      failed_app="$(basename "$staged_app")"
-      rollback_stage_id=$(atomic_path_content_id "$transition_helper" \
-        "$dest" FrankenTerm.app) || return 1
-      rollback_txid=$(atomic_transition_txid "app-first-publish-rollback:$dest:$app_id") || return 1
-      atomic_path_transition "$transition_helper" "$dest" \
-        FrankenTerm.app "$failed_app" "$rollback_txid" \
-        "$rollback_stage_id" missing publish-noreplace || return 1
-      if [ -e "$target_app" ] || [ -L "$target_app" ]; then
-        err "First-publish rollback did not restore the prior absent app authority"
-        return 1
-      fi
-      restored_id=$(atomic_path_content_id "$transition_helper" \
-        "$dest" "$failed_app") || return 1
-      [ "$restored_id" = "$rollback_stage_id" ] || {
-        err "Failed app quarantine differs from the switched candidate authority"
-        return 1
-      }
+    if ! rollback_macos_app_activation "$transition_helper" "$dest" \
+        "$staged_app" "$target_app" "$app_id" "$operation" "$stage_id" "$target_id"; then
+      err "App rollback failed; refusing to claim a current or pending authority"
+      mark_app_failed app_post_switch_rollback_failed
+      emit_app_receipt silent || true
+      return 1
     fi
     warn "Candidate app retained for diagnosis; prior app authority was restored"
+    APP_RECEIPT_CANDIDATE_PATH="$staged_app"
+    APP_RECEIPT_CURRENT_PATH=""
+    if [ "$operation" = exchange ]; then
+      APP_RECEIPT_CURRENT_PATH="$target_app"
+    fi
+    APP_RECEIPT_TRANSACTION_STATE="rolled_back"
     mark_app_skipped post_switch_verification_failed
+    emit_app_receipt silent || return 1
     return 0
   fi
 
@@ -5308,8 +6001,15 @@ PY
   APP_INSTALLED_PATH="$target_app"
   APP_ACTIVATION_STATE="current"
   APP_RECEIPT_CANDIDATE_PATH="$target_app"
+  APP_RECEIPT_CURRENT_PATH="$target_app"
+  APP_RECEIPT_PREVIOUS_PATH=""
+  if [ "$operation" = exchange ]; then
+    APP_RECEIPT_PREVIOUS_PATH="$staged_app"
+  fi
   APP_RECEIPT_RESULT="verified"
-  APP_RECEIPT_REASON="activated_test_selector"
+  APP_RECEIPT_REASON="activated"
+  APP_RECEIPT_TRANSACTION_STATE="committed"
+  emit_app_receipt silent || return 1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -5761,7 +6461,10 @@ if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] 
     TMP=$(mktemp -d)
     if [ "$WITH_FONT" -eq 1 ]; then install_pragmasevka; fi
     if [ "$app_wanted" -eq 1 ] && ! install_macos_app; then
-      mark_app_skipped app_install_transaction_failed
+      if [ "$APP_RECEIPT_RESULT" != failed ] && \
+         [ "$APP_RECEIPT_TRANSACTION_STATE" != prepared ]; then
+        mark_app_failed app_install_transaction_failed
+      fi
       finalize_app_receipt_state
       emit_app_receipt || true
       exit 1
@@ -5939,7 +6642,10 @@ fi
 
 if should_install_app; then
   if ! install_macos_app; then
-    mark_app_skipped app_install_transaction_failed
+    if [ "$APP_RECEIPT_RESULT" != failed ] && \
+       [ "$APP_RECEIPT_TRANSACTION_STATE" != prepared ]; then
+      mark_app_failed app_install_transaction_failed
+    fi
     finalize_app_receipt_state
     emit_app_receipt || true
     exit 1
@@ -6051,6 +6757,14 @@ if [ "$QUIET" -eq 0 ]; then
     if [ "$APP_ACTIVATION_STATE" = pending ]; then
       summary_lines+=("GUI candidate:       $APP_INSTALLED_PATH")
       summary_lines+=("GUI activation:      pending; live app authority unchanged")
+      summary_lines+=("GUI pending reason:  $APP_RECEIPT_PENDING_REASON")
+      if [ -n "$APP_RECEIPT_ISOLATED_LAUNCH_ACTION" ]; then
+        summary_lines+=("Launch isolated verified GUI candidate:")
+        summary_lines+=("  $APP_RECEIPT_ISOLATED_LAUNCH_ACTION")
+      else
+        summary_lines+=("Isolated GUI launch is unavailable from a root/system install.")
+        summary_lines+=("Stage into a non-root user-owned --app-dest to obtain a safe launch action.")
+      fi
     else
       summary_lines+=("GUI app:  $APP_INSTALLED_PATH")
     fi
@@ -6066,26 +6780,6 @@ if [ "$QUIET" -eq 0 ]; then
     summary_lines+=("  ft version --full       Build metadata (commit / rustc / features)")
     summary_lines+=("  ft doctor --json        Diagnostic snapshot")
     summary_lines+=("  ft session list         Inspect running sessions")
-  fi
-  summary_lines+=("")
-  if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
-    summary_lines+=("Candidate cleanup (active authority is not changed):")
-    summary_lines+=("  rm -r $PUBLISHED_PROCESS_FAMILY_ROOT")
-  else
-    summary_lines+=("Uninstall:")
-    summary_lines+=("  rm $DEST/ft")
-    summary_lines+=("  rm $DEST/frankenterm-mux-server")
-    summary_lines+=("  rm $DEST/frankenterm-pty-guardian")
-  fi
-  if [ -n "$FONT_INSTALLED_PATH" ]; then
-    # Select the right font path based on the platform we installed for —
-    # don't concatenate Linux + macOS paths together.
-    case "$OS" in
-      linux|darwin) summary_lines+=("  rm -r $FONT_INSTALLED_PATH") ;;
-    esac
-  fi
-  if [ -n "$APP_INSTALLED_PATH" ]; then
-    summary_lines+=("  rm -r $APP_INSTALLED_PATH")
   fi
   summary_lines+=("")
   summary_lines+=("Docs:     https://github.com/${OWNER}/${REPO}")
