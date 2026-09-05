@@ -4891,7 +4891,7 @@ pub mod process {
             }
             reap_abandoned_supervisors();
             if CONTROLLED_SUPERVISORS
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                     (active < CONTROLLED_SUPERVISOR_LIMIT).then_some(active + 1)
                 })
                 .is_err()
