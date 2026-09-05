@@ -3171,6 +3171,9 @@ pub struct SafetyConfig {
     /// Connector host runtime settings (execution environment)
     pub connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig,
 
+    /// Explicit FCP transport and durable routing configuration. Absence performs no I/O.
+    pub connector_transport: Option<crate::connector_host_runtime::FcpTransportConfig>,
+
     /// Connector reliability settings (circuit breaker + DLQ)
     pub connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig,
 
@@ -3214,6 +3217,7 @@ impl Default for SafetyConfig {
             connector_governor: crate::connector_governor::ConnectorGovernorConfig::default(),
             connector_registry: crate::connector_registry::ConnectorRegistryConfig::default(),
             connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig::default(),
+            connector_transport: None,
             connector_reliability:
                 crate::connector_reliability::ConnectorReliabilityConfig::default(),
             bundle_registry: crate::connector_bundles::BundleRegistryConfig::default(),
@@ -5781,6 +5785,14 @@ impl Config {
     pub fn validate(&self) -> crate::Result<()> {
         self.recorder_backend_selection()
             .map_err(crate::error::ConfigError::RecorderBackendSelection)?;
+
+        if let Some(transport) = &self.safety.connector_transport {
+            transport
+                .validate(&self.safety.connector_host_runtime)
+                .map_err(|error| {
+                    crate::error::ConfigError::ValidationError(error.to_string())
+                })?;
+        }
 
         if self.ingest.min_poll_interval_ms == 0 {
             return Err(crate::error::ConfigError::ValidationError(

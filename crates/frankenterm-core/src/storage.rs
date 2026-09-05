@@ -875,6 +875,10 @@ fn action_plan_record_from_plan(
 
 /// Commands sent to the writer thread
 enum WriteCommand {
+    ConnectorMutation {
+        mutation: crate::connector_reliability::ConnectorStorageMutation,
+        respond: oneshot::Sender<Result<crate::connector_reliability::ConnectorStorageOutcome>>,
+    },
     /// Append a segment (pane_id, content, content_hash, zone_type, response channel)
     AppendSegment {
         pane_id: u64,
@@ -1396,6 +1400,7 @@ enum WriteCommand {
 impl std::fmt::Debug for WriteCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let variant = match self {
+            Self::ConnectorMutation { .. } => "ConnectorMutation",
             Self::AppendSegment { .. } => "AppendSegment",
             Self::AcknowledgeRecorderDelivery { .. } => "AcknowledgeRecorderDelivery",
             Self::RecordGap { .. } => "RecordGap",
@@ -3009,6 +3014,92 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
+    pub(crate) async fn connector_mutation_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mutation: crate::connector_reliability::ConnectorStorageMutation,
+    ) -> Result<crate::connector_reliability::ConnectorStorageOutcome> {
+        Self::checkpoint_storage_operation(cx, "connector_mutation")?;
+        if connector_mutation_bytes(&mutation) > 4 * 1024 * 1024 {
+            return Err(connector_storage_invalid());
+        }
+        let (respond, receipt) = oneshot::channel();
+        self.write_tx.send_with_cx(cx, WriteCommand::ConnectorMutation { mutation, respond })
+            .await.map_err(|error| Self::writer_send_error("connector_mutation", error))?;
+        // Once queued, await the serialized writer's actual settlement. Caller
+        // cancellation cannot turn a committed dispatch into permission to retry.
+        Self::recv_writer_response(receipt).await
+    }
+
+    pub async fn get_connector_outbox_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        generation: &str,
+        pending_only: bool,
+        limit: usize,
+    ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
+        Self::checkpoint_storage_operation(cx, "connector_outbox")?;
+        if !connector_hash_valid(generation) || !(1..=256).contains(&limit) {
+            return Err(connector_storage_invalid());
+        }
+        let generation = generation.to_string();
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "connector_outbox", move || {
+            with_provider_read_backend(provider.as_ref(), &db_path, |backend| {
+                let rows = backend.query_map_cells(
+                    "SELECT item_key, generation, source_event_id, state, revision, due_at, record_json
+                     FROM connector_outbox WHERE generation = ?1
+                     AND (?2 = 0 OR state IN ('admitted','dispatched'))
+                     ORDER BY due_at, item_key LIMIT ?3",
+                    &[ToSqlValue::Text(&generation), ToSqlValue::Integer(i64::from(pending_only)),
+                        ToSqlValue::Integer(i64::try_from(limit).map_err(|_| connector_storage_invalid())?)],
+                ).map_err(|_| connector_storage_invalid())?;
+                rows.iter().map(|row| connector_outbox_from_cells(row)).collect()
+            })
+        }).await
+    }
+
+    pub(crate) async fn connector_ingress_cursor_with_cx(
+        &self, cx: &crate::cx::Cx, subscription_key: &str,
+    ) -> Result<i64> {
+        Self::checkpoint_storage_operation(cx, "connector_ingress_cursor")?;
+        if !connector_hash_valid(subscription_key) { return Err(connector_storage_invalid()); }
+        let key = subscription_key.to_string();
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "connector_ingress_cursor", move || {
+            with_provider_read_backend(provider.as_ref(), &db_path, |backend| {
+                connector_ingress_cursor_backend(backend, &key)
+            })
+        }).await
+    }
+
+    pub(crate) async fn pending_connector_ingress_with_cx(
+        &self, cx: &crate::cx::Cx,
+    ) -> Result<Vec<StoredEvent>> {
+        Self::checkpoint_storage_operation(cx, "connector_ingress_delivery")?;
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "connector_ingress_delivery", move || {
+            with_provider_read_backend(provider.as_ref(), &db_path, |backend| {
+                let rows = backend.query_map_cells(
+                    "SELECT event_id, record_json FROM connector_ingress_delivery ORDER BY event_id LIMIT 64", &[],
+                ).map_err(|_| connector_storage_invalid())?;
+                rows.iter().map(|row| {
+                    let reader = CellRowReader::new(row);
+                    let json = reader.string(1).map_err(|_| connector_storage_invalid())?;
+                    if json.len() > 1_048_576 { return Err(connector_storage_invalid()); }
+                    let event: StoredEvent = serde_json::from_str(&json).map_err(|_| connector_storage_invalid())?;
+                    if event.id != reader.i64(0).map_err(|_| connector_storage_invalid())? {
+                        return Err(connector_storage_invalid());
+                    }
+                    Ok(event)
+                }).collect()
+            })
+        }).await
+    }
+
     #[cfg(test)]
     fn cancel_shutdown_after_enqueue_for_test(&self) {
         self.test_cancel_shutdown_after_enqueue
@@ -11881,6 +11972,9 @@ impl StorageIoWriterGate {
 
     fn work_item_for_command(&mut self, cmd: &WriteCommand) -> Option<StorageIoWorkItem> {
         match cmd {
+            WriteCommand::ConnectorMutation { mutation, .. } => Some(StorageIoWorkItem::new(
+                self.next_work_id(), StorageIoClass::PolicyAudit, connector_mutation_bytes(mutation),
+            )),
             WriteCommand::AppendSegment {
                 pane_id, content, ..
             } => Some(self.ordered_pane_work_item(
@@ -12851,6 +12945,9 @@ fn drop_capture_persistence_hold_recovering(capture_hold: Option<CapturePersiste
 
 fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -> bool {
     match cmd {
+        WriteCommand::ConnectorMutation { respond, .. } => {
+            respond_oneshot_best_effort(respond, failure.result());
+        }
         WriteCommand::AppendSegment {
             capture_hold,
             respond,
@@ -13093,6 +13190,7 @@ fn storage_io_admission_failure_message(
 
 fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
     match cmd {
+        WriteCommand::ConnectorMutation { .. } => "ConnectorMutation",
         WriteCommand::AppendSegment { .. } => "AppendSegment",
         WriteCommand::RecordGap { .. } => "RecordGap",
         WriteCommand::RecordEvent { .. } => "RecordEvent",
@@ -13107,6 +13205,9 @@ fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
 
 fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
     match cmd {
+        WriteCommand::ConnectorMutation { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
+        }
         WriteCommand::AppendSegment {
             capture_hold,
             respond,
@@ -17490,6 +17591,16 @@ fn dispatch_write_command_raw(
         "storage::dispatch_write_command_raw",
     );
     match cmd {
+        WriteCommand::ConnectorMutation { mutation, respond } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = run_writer_transaction(
+                backend,
+                WriterTransactionBeginMode::Immediate,
+                "connector durable transition",
+                || connector_mutation_backend(backend, mutation),
+            );
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::AppendSegment {
             pane_id,
             content,
@@ -22938,6 +23049,293 @@ fn delete_agent_profile_backend(backend: &dyn StorageBackend, name: &str) -> Res
 fn get_config_value_backend(backend: &dyn StorageBackend, key: &str) -> Result<Option<String>> {
     crate::storage_backend_helpers::get_config_kv(backend, key)
         .map_err(|err| storage_backend_error("config get", err).into())
+}
+
+fn connector_storage_invalid() -> crate::Error {
+    StorageError::Database("connector_storage_authority_invalid".to_string()).into()
+}
+
+fn connector_hash_valid(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn connector_mutation_bytes(mutation: &crate::connector_reliability::ConnectorStorageMutation) -> u64 {
+    use crate::connector_reliability::ConnectorStorageMutation as Mutation;
+    let mut counter = StorageIoJsonByteCounter::default();
+    let result = match mutation {
+        Mutation::Admit { entries, .. } => serde_json::to_writer(&mut counter, entries),
+        Mutation::Ingest { records, .. } => serde_json::to_writer(&mut counter, records),
+        Mutation::AcknowledgeIngress { event_ids } => serde_json::to_writer(&mut counter, event_ids),
+        Mutation::Initialize { .. } | Mutation::Transition { .. } => return 1024,
+    };
+    if result.is_err() { u64::MAX } else { counter.bytes.saturating_add(1024) }
+}
+
+fn connector_outbox_from_cells(row: &[SqlCell]) -> Result<crate::connector_reliability::ConnectorOutboxEntry> {
+    let reader = CellRowReader::new(row);
+    let json = reader.string(6).map_err(|_| connector_storage_invalid())?;
+    if json.len() > 1_048_576 { return Err(connector_storage_invalid()); }
+    let entry: crate::connector_reliability::ConnectorOutboxEntry =
+        serde_json::from_str(&json).map_err(|_| connector_storage_invalid())?;
+    if entry.key != reader.string(0).map_err(|_| connector_storage_invalid())?
+        || entry.generation != reader.string(1).map_err(|_| connector_storage_invalid())?
+        || entry.source_event_id != reader.i64(2).map_err(|_| connector_storage_invalid())?
+        || entry.state.as_str() != reader.string(3).map_err(|_| connector_storage_invalid())?
+        || entry.revision != reader.i64(4).map_err(|_| connector_storage_invalid())?
+        || entry.due_at_ms != reader.i64(5).map_err(|_| connector_storage_invalid())?
+        || !connector_hash_valid(&entry.key) || !connector_hash_valid(&entry.generation)
+        || entry.revision < 0 || entry.created_at_ms < 0 || entry.updated_at_ms < entry.created_at_ms
+        || entry.due_at_ms < entry.created_at_ms || entry.source_event_id <= 0
+    { return Err(connector_storage_invalid()); }
+    Ok(entry)
+}
+
+fn connector_ingress_cursor_backend(backend: &dyn StorageBackend, key: &str) -> Result<i64> {
+    let row = backend.query_row_cells(
+        "SELECT after_record_id FROM connector_ingress_cursors WHERE subscription_key = ?1",
+        &[ToSqlValue::Text(key)],
+    ).map_err(|_| connector_storage_invalid())?;
+    row.map_or(Ok(0), |row| CellRowReader::new(&row).i64(0).map_err(|_| connector_storage_invalid()))
+}
+
+fn connector_mutation_backend(
+    backend: &dyn StorageBackend,
+    mutation: crate::connector_reliability::ConnectorStorageMutation,
+) -> Result<crate::connector_reliability::ConnectorStorageOutcome> {
+    use crate::connector_reliability::{ConnectorDeliveryState as State, ConnectorStorageMutation as Mutation,
+        ConnectorStorageOutcome as Outcome};
+    if connector_mutation_bytes(&mutation) > 4 * 1024 * 1024 { return Err(connector_storage_invalid()); }
+    match mutation {
+        Mutation::Initialize { generation, now_ms } => {
+            if !connector_hash_valid(&generation) || now_ms < 0 { return Err(connector_storage_invalid()); }
+            let existing = backend.query_row_cells(
+                "SELECT after_event_id, cursor_epoch FROM connector_outbox_cursors WHERE generation = ?1",
+                &[ToSqlValue::Text(&generation)],
+            ).map_err(|_| connector_storage_invalid())?;
+            if let Some(row) = existing {
+                let reader = CellRowReader::new(&row);
+                return Ok(Outcome::Cursor {
+                    after_event_id: reader.i64(0).map_err(|_| connector_storage_invalid())?,
+                    cursor_epoch: reader.string(1).map_err(|_| connector_storage_invalid())?,
+                });
+            }
+            let count = backend.query_scalar("SELECT COUNT(*) FROM connector_outbox_cursors")
+                .map_err(|_| connector_storage_invalid())?.and_then(|count| count.parse::<u64>().ok())
+                .ok_or_else(connector_storage_invalid)?;
+            if count >= 64 { return Ok(Outcome::Saturated); }
+            let row = backend.query_row_cells(
+                "SELECT max_event_id, cursor_epoch FROM event_retention_state WHERE singleton = 1", &[],
+            ).map_err(|_| connector_storage_invalid())?.ok_or_else(connector_storage_invalid)?;
+            let reader = CellRowReader::new(&row);
+            let after_event_id = reader.i64(0).map_err(|_| connector_storage_invalid())?;
+            let cursor_epoch = reader.string(1).map_err(|_| connector_storage_invalid())?;
+            execute_typed(backend,
+                "INSERT INTO connector_outbox_cursors (generation, after_event_id, cursor_epoch, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[ToSqlValue::Text(&generation), ToSqlValue::Integer(after_event_id),
+                    ToSqlValue::Text(&cursor_epoch), ToSqlValue::Integer(now_ms)],
+            ).map_err(|_| connector_storage_invalid())?;
+            Ok(Outcome::Cursor { after_event_id, cursor_epoch })
+        }
+        Mutation::Admit { generation, expected_cursor, through_event_id, entries, max_pending, max_retained } => {
+            if !connector_hash_valid(&generation) || expected_cursor < 0 || through_event_id <= expected_cursor
+                || entries.len() > 64 || !(1..=4096).contains(&max_pending)
+                || max_retained < max_pending || max_retained > 65_536
+            { return Err(connector_storage_invalid()); }
+            let row = backend.query_row_cells(
+                "SELECT after_event_id, cursor_epoch FROM connector_outbox_cursors WHERE generation = ?1",
+                &[ToSqlValue::Text(&generation)],
+            ).map_err(|_| connector_storage_invalid())?.ok_or_else(connector_storage_invalid)?;
+            let reader = CellRowReader::new(&row);
+            if reader.i64(0).map_err(|_| connector_storage_invalid())? != expected_cursor {
+                return Ok(Outcome::Conflict);
+            }
+            let current = backend.query_row_cells(
+                "SELECT max_event_id, cursor_epoch FROM event_retention_state WHERE singleton = 1", &[],
+            ).map_err(|_| connector_storage_invalid())?.ok_or_else(connector_storage_invalid)?;
+            let current = CellRowReader::new(&current);
+            if current.i64(0).map_err(|_| connector_storage_invalid())? < through_event_id
+                || current.string(1).map_err(|_| connector_storage_invalid())?
+                    != reader.string(1).map_err(|_| connector_storage_invalid())?
+            { return Err(connector_storage_invalid()); }
+            let mut keys = std::collections::BTreeSet::new();
+            let mut encoded = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                if !connector_hash_valid(&entry.key) || entry.generation != generation
+                    || entry.source_event_id != through_event_id || entry.revision != 0
+                    || !matches!(entry.state, State::Admitted | State::Rejected)
+                    || entry.created_at_ms < 0 || entry.updated_at_ms != entry.created_at_ms
+                    || entry.due_at_ms < entry.created_at_ms || !keys.insert(&entry.key)
+                    || entry.receipt_id.is_some() || entry.receipt_hash.is_some()
+                { return Err(connector_storage_invalid()); }
+                let json = serde_json::to_string(entry).map_err(|_| connector_storage_invalid())?;
+                if json.len() > 1_048_576 { return Err(connector_storage_invalid()); }
+                encoded.push(json);
+            }
+            let counts = backend.query_row_cells(
+                "SELECT COUNT(*), COALESCE(SUM(state IN ('admitted','dispatched','indeterminate')),0),
+                 COALESCE(SUM(length(CAST(record_json AS BLOB))),0) FROM connector_outbox", &[],
+            ).map_err(|_| connector_storage_invalid())?.ok_or_else(connector_storage_invalid)?;
+            let counts = CellRowReader::new(&counts);
+            let retained = usize::try_from(counts.i64(0).map_err(|_| connector_storage_invalid())?)
+                .map_err(|_| connector_storage_invalid())?;
+            let pending = usize::try_from(counts.i64(1).map_err(|_| connector_storage_invalid())?)
+                .map_err(|_| connector_storage_invalid())?;
+            let bytes = usize::try_from(counts.i64(2).map_err(|_| connector_storage_invalid())?)
+                .map_err(|_| connector_storage_invalid())?;
+            let added_pending = entries.iter().filter(|entry| entry.state == State::Admitted).count();
+            let added_bytes: usize = encoded.iter().map(String::len).sum();
+            if pending.saturating_add(added_pending) > max_pending { return Ok(Outcome::Saturated); }
+            let mut prune = retained.saturating_add(entries.len()).saturating_sub(max_retained);
+            if bytes.saturating_add(added_bytes) > 64 * 1024 * 1024 {
+                prune = prune.max(256).min(retained.saturating_sub(pending));
+            }
+            if prune > 0 {
+                let removed = backend.query_map_cells(
+                    "DELETE FROM connector_outbox WHERE item_key IN (
+                     SELECT item_key FROM connector_outbox
+                     WHERE state IN ('completed','rejected','failed','cancelled')
+                     ORDER BY source_event_id, item_key LIMIT ?1) RETURNING item_key",
+                    &[ToSqlValue::Integer(i64::try_from(prune).map_err(|_| connector_storage_invalid())?)],
+                ).map_err(|_| connector_storage_invalid())?;
+                if removed.len() != prune {
+                    // Returning an error rolls this transaction back, including
+                    // any terminal rows tentatively selected for compaction.
+                    return Err(StorageError::Database("connector_storage_retention_saturated".into()).into());
+                }
+            }
+            let remaining_bytes = backend.query_scalar(
+                "SELECT COALESCE(SUM(length(CAST(record_json AS BLOB))),0) FROM connector_outbox",
+            ).map_err(|_| connector_storage_invalid())?.and_then(|bytes| bytes.parse::<usize>().ok())
+                .ok_or_else(connector_storage_invalid)?;
+            if remaining_bytes.saturating_add(added_bytes) > 64 * 1024 * 1024 {
+                // Terminal-row compaction may commit, but the source cursor
+                // stays put and no new action is admitted under saturation.
+                return Ok(Outcome::Saturated);
+            }
+            for (entry, json) in entries.iter().zip(&encoded) {
+                execute_typed(backend,
+                    "INSERT INTO connector_outbox (item_key, generation, source_event_id, state, revision, due_at, record_json)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                    &[ToSqlValue::Text(&entry.key), ToSqlValue::Text(&entry.generation),
+                        ToSqlValue::Integer(entry.source_event_id), ToSqlValue::Text(entry.state.as_str()),
+                        ToSqlValue::Integer(entry.due_at_ms), ToSqlValue::Text(json)],
+                ).map_err(|_| connector_storage_invalid())?;
+            }
+            execute_typed(backend,
+                "UPDATE connector_outbox_cursors SET after_event_id = ?1, updated_at = ?2 WHERE generation = ?3",
+                &[ToSqlValue::Integer(through_event_id), ToSqlValue::Integer(now_ms_strict()?), ToSqlValue::Text(&generation)],
+            ).map_err(|_| connector_storage_invalid())?;
+            Ok(Outcome::Admitted)
+        }
+        Mutation::Transition { key, expected_revision, expected_state, next_state, now_ms,
+            receipt_id, receipt_hash, reason_code } => {
+            if !connector_hash_valid(&key) || expected_revision < 0 || now_ms < 0
+                || !expected_state.permits(next_state)
+                || reason_code.as_ref().is_some_and(|reason| reason.len() > 128
+                    || !reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'))
+            { return Err(connector_storage_invalid()); }
+            let acknowledged = matches!(next_state, State::Completed | State::Failed);
+            if acknowledged != (receipt_id.as_ref().is_some_and(|id| connector_hash_valid(id))
+                && receipt_hash.as_ref().is_some_and(|hash| connector_hash_valid(hash)))
+                || (!acknowledged && (receipt_id.is_some() || receipt_hash.is_some()))
+            { return Err(connector_storage_invalid()); }
+            let row = backend.query_row_cells(
+                "SELECT item_key, generation, source_event_id, state, revision, due_at, record_json
+                 FROM connector_outbox WHERE item_key = ?1", &[ToSqlValue::Text(&key)],
+            ).map_err(|_| connector_storage_invalid())?;
+            let Some(row) = row else { return Ok(Outcome::Conflict); };
+            let mut entry = connector_outbox_from_cells(&row)?;
+            if entry.revision != expected_revision || entry.state != expected_state { return Ok(Outcome::Conflict); }
+            if now_ms < entry.updated_at_ms { return Err(connector_storage_invalid()); }
+            entry.revision = entry.revision.checked_add(1).ok_or_else(connector_storage_invalid)?;
+            entry.state = next_state;
+            entry.updated_at_ms = now_ms;
+            entry.receipt_id = receipt_id;
+            entry.receipt_hash = receipt_hash;
+            entry.reason_code = reason_code;
+            let json = serde_json::to_string(&entry).map_err(|_| connector_storage_invalid())?;
+            if json.len() > 1_048_576 { return Err(connector_storage_invalid()); }
+            let changed = backend.query_row_cells(
+                "UPDATE connector_outbox SET state = ?1, revision = ?2, record_json = ?3
+                 WHERE item_key = ?4 AND revision = ?5 AND state = ?6 RETURNING item_key",
+                &[ToSqlValue::Text(next_state.as_str()), ToSqlValue::Integer(entry.revision),
+                    ToSqlValue::Text(&json), ToSqlValue::Text(&key), ToSqlValue::Integer(expected_revision),
+                    ToSqlValue::Text(expected_state.as_str())],
+            ).map_err(|_| connector_storage_invalid())?;
+            if changed.is_none() { return Ok(Outcome::Conflict); }
+            Ok(Outcome::Transitioned(entry))
+        }
+        Mutation::Ingest { subscription_key, expected_cursor, records } => {
+            if !connector_hash_valid(&subscription_key) || expected_cursor < 0
+                || records.is_empty() || records.len() > 256
+            { return Err(connector_storage_invalid()); }
+            if connector_ingress_cursor_backend(backend, &subscription_key)? != expected_cursor {
+                return Ok(Outcome::Conflict);
+            }
+            let capacity = backend.query_row_cells(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(record_json AS BLOB))),0)
+                 FROM connector_ingress_delivery", &[],
+            ).map_err(|_| connector_storage_invalid())?.ok_or_else(connector_storage_invalid)?;
+            let capacity = CellRowReader::new(&capacity);
+            let pending = usize::try_from(capacity.i64(0).map_err(|_| connector_storage_invalid())?)
+                .map_err(|_| connector_storage_invalid())?;
+            let pending_bytes = usize::try_from(capacity.i64(1).map_err(|_| connector_storage_invalid())?)
+                .map_err(|_| connector_storage_invalid())?;
+            let encoded_bytes = records.iter().try_fold(0_usize, |sum, (_, event)| {
+                serde_json::to_vec(event).map(|json| sum.saturating_add(json.len() + 32))
+                    .map_err(|_| connector_storage_invalid())
+            })?;
+            if pending.saturating_add(records.len()) > 4096
+                || pending_bytes.saturating_add(encoded_bytes) > 16 * 1024 * 1024
+            { return Ok(Outcome::Saturated); }
+            let cursor_count = backend.query_scalar("SELECT COUNT(*) FROM connector_ingress_cursors")
+                .map_err(|_| connector_storage_invalid())?.and_then(|count| count.parse::<u64>().ok())
+                .ok_or_else(connector_storage_invalid)?;
+            if expected_cursor == 0 && cursor_count >= 64 { return Ok(Outcome::Saturated); }
+            let mut through = expected_cursor;
+            let mut outcomes = Vec::with_capacity(records.len());
+            for (record_id, mut event) in records {
+                let dedupe_key = format!("connector:{subscription_key}:{record_id}");
+                if record_id <= through || event.dedupe_key.as_deref() != Some(&dedupe_key)
+                    || serde_json::to_vec(&event).map_err(|_| connector_storage_invalid())?.len() > 1_048_576
+                { return Err(connector_storage_invalid()); }
+                let observed = backend.query_row_cells("SELECT observed FROM panes WHERE pane_id = ?1",
+                    &[ToSqlValue::Integer(i64::try_from(event.pane_id).map_err(|_| connector_storage_invalid())?)])
+                    .map_err(|_| connector_storage_invalid())?.ok_or_else(connector_storage_invalid)?;
+                if !CellRowReader::new(&observed).bool(0).map_err(|_| connector_storage_invalid())? {
+                    return Err(connector_storage_invalid());
+                }
+                let outcome = record_event_backend(backend, &event)?;
+                if let Some(id) = outcome.inserted_event_id() {
+                    event.id = id;
+                    let json = serde_json::to_string(&event).map_err(|_| connector_storage_invalid())?;
+                    execute_typed(backend,
+                        "INSERT INTO connector_ingress_delivery (event_id, record_json) VALUES (?1, ?2)",
+                        &[ToSqlValue::Integer(id), ToSqlValue::Text(&json)],
+                    ).map_err(|_| connector_storage_invalid())?;
+                }
+                outcomes.push(outcome);
+                through = record_id;
+            }
+            execute_typed(backend,
+                "INSERT INTO connector_ingress_cursors (subscription_key, after_record_id) VALUES (?1, ?2)
+                 ON CONFLICT(subscription_key) DO UPDATE SET after_record_id = excluded.after_record_id",
+                &[ToSqlValue::Text(&subscription_key), ToSqlValue::Integer(through)],
+            ).map_err(|_| connector_storage_invalid())?;
+            Ok(Outcome::Ingested(outcomes))
+        }
+        Mutation::AcknowledgeIngress { event_ids } => {
+            if event_ids.is_empty() || event_ids.len() > 64 || event_ids.iter().any(|id| *id <= 0) {
+                return Err(connector_storage_invalid());
+            }
+            for event_id in event_ids {
+                execute_typed(backend, "DELETE FROM connector_ingress_delivery WHERE event_id = ?1",
+                    &[ToSqlValue::Integer(event_id)]).map_err(|_| connector_storage_invalid())?;
+            }
+            Ok(Outcome::IngressAcknowledged)
+        }
+    }
 }
 
 /// ft-pohny: upsert one JSON value into the generic `config` KV table.

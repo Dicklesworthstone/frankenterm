@@ -2192,6 +2192,40 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // Keep the crash-consistency boundary forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 46,
+        description: "Serialize connector effect ownership and durable service ingress",
+        up_sql: "
+        CREATE TABLE IF NOT EXISTS connector_outbox_cursors (
+            generation TEXT PRIMARY KEY CHECK(length(generation) = 64),
+            after_event_id INTEGER NOT NULL CHECK(after_event_id >= 0),
+            cursor_epoch TEXT NOT NULL CHECK(length(cursor_epoch) = 32),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+        );
+        CREATE TABLE IF NOT EXISTS connector_outbox (
+            item_key TEXT PRIMARY KEY CHECK(length(item_key) = 64),
+            generation TEXT NOT NULL REFERENCES connector_outbox_cursors(generation),
+            source_event_id INTEGER NOT NULL CHECK(source_event_id > 0),
+            state TEXT NOT NULL CHECK(state IN
+                ('admitted','dispatched','completed','rejected','failed','cancelled','indeterminate')),
+            revision INTEGER NOT NULL CHECK(revision >= 0),
+            due_at INTEGER NOT NULL CHECK(due_at >= 0),
+            record_json TEXT NOT NULL CHECK(length(CAST(record_json AS BLOB)) <= 1048576)
+        );
+        CREATE INDEX IF NOT EXISTS idx_connector_outbox_pending
+            ON connector_outbox(generation, state, due_at, item_key);
+        CREATE TABLE IF NOT EXISTS connector_ingress_cursors (
+            subscription_key TEXT PRIMARY KEY CHECK(length(subscription_key) = 64),
+            after_record_id INTEGER NOT NULL CHECK(after_record_id >= 0)
+        );
+        CREATE TABLE IF NOT EXISTS connector_ingress_delivery (
+            event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE RESTRICT,
+            record_json TEXT NOT NULL CHECK(length(CAST(record_json AS BLOB)) <= 1048576)
+        );
+        ",
+        // Rollback would erase dispatch ownership and permit duplicate effects.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================

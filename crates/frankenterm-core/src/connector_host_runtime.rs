@@ -3,6 +3,7 @@
 //! This module provides a deterministic, testable host-runtime core for
 //! connector-fabric embedding. It intentionally avoids side effects and uses
 //! caller-provided timestamps so lifecycle behavior is reproducible in tests.
+//! The explicit FCP client below owns bounded I/O; model admission never invokes it.
 
 use std::collections::VecDeque;
 
@@ -11,6 +12,485 @@ use thiserror::Error;
 
 const TRANSITION_HISTORY_CAPACITY: usize = 64;
 const SANDBOX_DECISION_HISTORY_CAPACITY: usize = 128;
+
+/// Operator-owned operation binding. Event payloads cannot select an operation,
+/// capability, destination, or credential source.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FcpOperation {
+    pub connector_id: String,
+    pub operation: String,
+    pub capability: ConnectorCapability,
+    pub target: Option<String>,
+    pub input: serde_json::Value,
+}
+
+impl std::fmt::Debug for FcpOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FcpOperation")
+            .field("identity_hash", &fcp_identity_hash(&self.operation))
+            .field("capability", &self.capability)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A persisted routing rule plus its trusted FCP operation binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FcpOutboundRoute {
+    pub rule: crate::connector_outbound_bridge::OutboundRoutingRule,
+    pub invoke: FcpOperation,
+    /// Existing input slot receiving the stable source correlation string.
+    /// For example, `/params/0` can bind a SQL uniqueness key.
+    pub correlation_input_pointer: Option<String>,
+}
+
+/// Bounded service polling through the same authenticated host invocation path.
+/// Rows must have strictly increasing positive integer identities. The durable
+/// cursor is substituted into an existing operation-input slot before each poll.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FcpInboundSubscription {
+    pub subscription_id: String,
+    pub invoke: FcpOperation,
+    pub pane_id: u64,
+    pub records_pointer: String,
+    pub identity_pointer: String,
+    pub cursor_input_pointer: String,
+    pub poll_interval_ms: u64,
+}
+
+/// Explicit local-host transport. Credentials are opaque regular files, never
+/// serialized into an outbox, response, diagnostic, or configuration dump.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FcpTransportConfig {
+    pub endpoint: String,
+    pub capability_token_file: std::path::PathBuf,
+    pub admin_token_file: std::path::PathBuf,
+    pub request_timeout_ms: u64,
+    pub max_payload_bytes: usize,
+    pub max_pending_actions: usize,
+    pub max_retained_actions: usize,
+    pub max_ingress_batch: usize,
+    #[serde(default)]
+    pub outbound: Vec<FcpOutboundRoute>,
+    #[serde(default)]
+    pub inbound: Vec<FcpInboundSubscription>,
+}
+
+impl std::fmt::Debug for FcpTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FcpTransportConfig")
+            .field("endpoint_hash", &fcp_identity_hash(&self.endpoint))
+            .field("outbound_rules", &self.outbound.len())
+            .field("inbound_subscriptions", &self.inbound.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Finite, content-free protocol errors. After dispatch every one of these
+/// means an uncertain effect; a network error does not authorize a retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum FcpTransportError {
+    #[error("connector_transport_invalid_config")]
+    InvalidConfig,
+    #[error("connector_transport_credential_unavailable")]
+    CredentialUnavailable,
+    #[error("connector_transport_cancelled")]
+    Cancelled,
+    #[error("connector_transport_unavailable")]
+    Unavailable,
+    #[error("connector_transport_payload_limit")]
+    PayloadLimit,
+    #[error("connector_transport_protocol_invalid")]
+    ProtocolInvalid,
+    #[error("connector_transport_receipt_unconfirmed")]
+    ReceiptUnconfirmed,
+}
+
+pub(crate) fn fcp_identity_hash(value: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(value.as_bytes()))
+}
+
+fn valid_fcp_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._:-/".contains(&byte))
+}
+
+fn valid_input_pointer(input: &serde_json::Value, pointer: &str) -> bool {
+    pointer.len() <= 1024 && pointer.starts_with('/') && input.pointer(pointer).is_some()
+}
+
+impl FcpTransportConfig {
+    pub fn validate(&self, host: &ConnectorHostConfig) -> Result<(), FcpTransportError> {
+        let invalid = FcpTransportError::InvalidConfig;
+        if !cfg!(unix) {
+            // This implementation requires no-follow, nonblocking regular-file
+            // credential authority; other platforms cannot silently weaken it.
+            return Err(invalid);
+        }
+        let parsed = url::Url::parse(&self.endpoint).map_err(|_| invalid)?;
+        let canonical = crate::runtime_async::http::ParsedUrl::parse(&self.endpoint)
+            .map_err(|_| invalid)?;
+        // No DNS, redirects, userinfo, proxy, or alternate URL spelling can
+        // expand the explicitly authorized owned-loopback host boundary.
+        let loopback = match parsed.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            _ => false,
+        };
+        let _ = canonical;
+        if !loopback
+            || !self.endpoint.starts_with("http://")
+            || parsed.scheme() != "http"
+            || parsed.port().is_none()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || self.endpoint.contains('@')
+            || self.endpoint.trim_end_matches('/') != parsed.as_str().trim_end_matches('/')
+            || !self.capability_token_file.is_absolute()
+            || !self.admin_token_file.is_absolute()
+            || !(1..=30_000).contains(&self.request_timeout_ms)
+            || !(1024..=1_048_576).contains(&self.max_payload_bytes)
+            || !(1..=4096).contains(&self.max_pending_actions)
+            || self.max_retained_actions < self.max_pending_actions
+            || self.max_retained_actions > 65_536
+            || !(1..=256).contains(&self.max_ingress_batch)
+            || self.outbound.len() > 64
+            || self.inbound.len() > 64
+            || (self.outbound.is_empty() && self.inbound.is_empty())
+            || !valid_fcp_label(&host.host_id)
+            || !valid_fcp_label(&host.sandbox.zone_id)
+            || !host.sandbox.fail_closed
+        {
+            return Err(invalid);
+        }
+        host.validate().map_err(|_| invalid)?;
+        let mut identities = std::collections::BTreeSet::new();
+        for route in &self.outbound {
+            if !valid_fcp_label(&route.rule.rule_id)
+                || !identities.insert(route.rule.rule_id.as_str())
+                || route.rule.target_connector != route.invoke.connector_id
+                || route.correlation_input_pointer.as_ref().is_some_and(|pointer| {
+                    !valid_input_pointer(&route.invoke.input, pointer)
+                })
+            {
+                return Err(invalid);
+            }
+            self.validate_operation(&route.invoke)?;
+        }
+        for subscription in &self.inbound {
+            if !valid_fcp_label(&subscription.subscription_id)
+                || !identities.insert(subscription.subscription_id.as_str())
+                || i64::try_from(subscription.pane_id).is_err()
+                || subscription.records_pointer.len() > 1024
+                || subscription.identity_pointer.len() > 1024
+                || !subscription.records_pointer.starts_with('/')
+                || !subscription.identity_pointer.starts_with('/')
+                || !valid_input_pointer(&subscription.invoke.input, &subscription.cursor_input_pointer)
+                || !(100..=3_600_000).contains(&subscription.poll_interval_ms)
+                || subscription.invoke.capability != ConnectorCapability::ReadState
+            {
+                return Err(invalid);
+            }
+            self.validate_operation(&subscription.invoke)?;
+        }
+        Ok(())
+    }
+
+    fn validate_operation(&self, operation: &FcpOperation) -> Result<(), FcpTransportError> {
+        if !valid_fcp_label(&operation.connector_id)
+            || !valid_fcp_label(&operation.operation)
+            || operation.target.as_ref().is_some_and(|target| target.len() > 4096)
+            || serde_json::to_vec(&operation.input).map_err(|_| FcpTransportError::InvalidConfig)?.len()
+                > self.max_payload_bytes
+        {
+            return Err(FcpTransportError::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn generation(&self) -> Result<String, FcpTransportError> {
+        serde_json::to_string(self)
+            .map(|json| fcp_identity_hash(&json))
+            .map_err(|_| FcpTransportError::InvalidConfig)
+    }
+}
+
+/// An acknowledged response whose receipt was independently queried through
+/// the authenticated admin endpoint and matched to this invocation.
+pub struct FcpAcknowledgement {
+    pub receipt_id: String,
+    pub receipt_hash: String,
+    pub success: bool,
+    pub result: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for FcpAcknowledgement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FcpAcknowledgement")
+            .field("receipt_hash", &self.receipt_hash)
+            .field("success", &self.success)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The HTTP request is prepared before the durable dispatched transition.
+/// Its capability bytes are deliberately private and have no Debug/Serialize.
+pub struct PreparedFcpInvocation {
+    body: Vec<u8>,
+    request_id: String,
+    connector_id: String,
+    operation: String,
+    idempotency_key: String,
+    admin_token: String,
+}
+
+pub struct FcpHostClient {
+    config: FcpTransportConfig,
+    zone_id: String,
+    http: crate::runtime_async::http::HttpClient,
+}
+
+impl FcpHostClient {
+    pub fn new(config: FcpTransportConfig, host: &ConnectorHostConfig) -> Result<Self, FcpTransportError> {
+        config.validate(host)?;
+        let http = crate::runtime_async::http::HttpClient::builder()
+            .no_redirects()
+            .no_retries()
+            .no_proxy()
+            .no_cookie_store()
+            .max_connections_per_host(1)
+            .max_total_connections(1)
+            .max_body_size(config.max_payload_bytes)
+            .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
+            .build();
+        Ok(Self { config, zone_id: host.sandbox.zone_id.clone(), http })
+    }
+
+    pub fn operation_deadline(&self) -> Result<std::time::Instant, FcpTransportError> {
+        std::time::Instant::now().checked_add(std::time::Duration::from_millis(self.config.request_timeout_ms))
+            .ok_or(FcpTransportError::InvalidConfig)
+    }
+
+    pub async fn prepare_invocation(
+        &self,
+        cx: &crate::cx::Cx,
+        deadline: std::time::Instant,
+        operation: &FcpOperation,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> Result<PreparedFcpInvocation, FcpTransportError> {
+        self.config.validate_operation(operation)?;
+        if !valid_fcp_label(request_id) || idempotency_key.len() != 64
+            || !idempotency_key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(FcpTransportError::InvalidConfig);
+        }
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+        remaining_fcp_time(deadline)?;
+        let token_path = self.config.capability_token_file.clone();
+        let admin_path = self.config.admin_token_file.clone();
+        let read_cx = cx.clone();
+        let read_mask = crate::cx::effective_cap_mask(cx);
+        let (token, admin_bytes) = crate::runtime_async::spawn_blocking(move || {
+            let _scope = crate::cx::Cx::set_current(Some(read_cx.clone()));
+            let _capabilities = crate::cx::Cx::push_restriction(read_mask);
+            read_cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            remaining_fcp_time(deadline)?;
+            let token = read_fcp_secret_file(&token_path, 65_536)?;
+            read_cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            let admin = read_fcp_secret_file(&admin_path, 8192)?;
+            read_cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            remaining_fcp_time(deadline)?;
+            Ok::<_, FcpTransportError>((token, admin))
+        }).await.map_err(|_| FcpTransportError::CredentialUnavailable)??;
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+        let remaining = remaining_fcp_time(deadline)?;
+        let admin_token = std::str::from_utf8(&admin_bytes)
+            .map_err(|_| FcpTransportError::CredentialUnavailable)?.trim().to_string();
+        if admin_token.is_empty() || !admin_token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(FcpTransportError::CredentialUnavailable);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "invoke", "id": request_id,
+            "connector_id": operation.connector_id, "operation": operation.operation,
+            "zone_id": self.zone_id, "input": operation.input,
+            "capability_token": token, "idempotency_key": idempotency_key,
+            // FCP protocol.rs explicitly defines this as milliseconds from now.
+            "correlation_id": request_id, "deadline_ms": u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+        })).map_err(|_| FcpTransportError::ProtocolInvalid)?;
+        if body.len() > self.config.max_payload_bytes {
+            return Err(FcpTransportError::PayloadLimit);
+        }
+        Ok(PreparedFcpInvocation {
+            body, request_id: request_id.to_string(), connector_id: operation.connector_id.clone(),
+            operation: operation.operation.clone(), idempotency_key: idempotency_key.to_string(), admin_token,
+        })
+    }
+
+    /// Confirms this exact connector/operation exists in the real host inventory.
+    /// This is an observation only; it never turns model authorization into delivery.
+    pub async fn observe_operation(
+        &self,
+        cx: &crate::cx::Cx,
+        deadline: std::time::Instant,
+        operation: &FcpOperation,
+    ) -> Result<(), FcpTransportError> {
+        self.config.validate_operation(operation)?;
+        let discovery = self.request_json(cx, deadline, "/rpc/discover", serde_json::json!({}), None).await?;
+        let connectors = discovery.get("connectors").and_then(serde_json::Value::as_array)
+            .ok_or(FcpTransportError::ProtocolInvalid)?;
+        let connector = connectors.iter().find(|connector| connector.get("id").and_then(serde_json::Value::as_str)
+            == Some(operation.connector_id.as_str())).ok_or(FcpTransportError::Unavailable)?;
+        if connector.get("enabled").and_then(serde_json::Value::as_bool) != Some(true)
+            || connector.pointer("/health/status").and_then(serde_json::Value::as_str) != Some("healthy")
+        {
+            return Err(FcpTransportError::Unavailable);
+        }
+        let path = format!("/rpc/introspect/{}", operation.connector_id);
+        let response = self.exchange(cx, deadline, crate::runtime_async::http::Method::Get, &path, Vec::new(), None).await?;
+        let operations = response.get("operations").and_then(serde_json::Value::as_array)
+            .ok_or(FcpTransportError::ProtocolInvalid)?;
+        if !operations.iter().any(|candidate| candidate.get("id").and_then(serde_json::Value::as_str)
+            == Some(operation.operation.as_str()))
+        {
+            return Err(FcpTransportError::Unavailable);
+        }
+        Ok(())
+    }
+
+    /// Call only after durable dispatch ownership is acquired. Any error,
+    /// cancellation, or owner drop after this call begins is indeterminate.
+    pub async fn invoke(
+        &self,
+        cx: &crate::cx::Cx,
+        deadline: std::time::Instant,
+        request: PreparedFcpInvocation,
+    ) -> Result<FcpAcknowledgement, FcpTransportError> {
+        let response = self.exchange(cx, deadline, crate::runtime_async::http::Method::Post,
+            "/rpc/invoke", request.body, None).await?;
+        if response.get("type").and_then(serde_json::Value::as_str) != Some("response")
+            || response.get("id").and_then(serde_json::Value::as_str) != Some(request.request_id.as_str())
+        {
+            return Err(FcpTransportError::ProtocolInvalid);
+        }
+        let success = match response.get("status").and_then(serde_json::Value::as_str) {
+            Some("ok") if response.get("error").is_none_or(serde_json::Value::is_null) => true,
+            Some("error") if response.get("error").is_some_and(|error| !error.is_null()) => false,
+            _ => return Err(FcpTransportError::ProtocolInvalid),
+        };
+        let receipt_id = response.get("receipt_id").and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or(FcpTransportError::ReceiptUnconfirmed)?;
+        let receipts = self.request_json(cx, deadline, "/rpc/admin/receipts", serde_json::json!({
+            "connector_id": request.connector_id, "operation": request.operation, "limit": 256,
+        }), Some(&request.admin_token)).await?;
+        let matches: Vec<&serde_json::Value> = receipts.get("receipts")
+            .and_then(serde_json::Value::as_array).ok_or(FcpTransportError::ProtocolInvalid)?
+            .iter().filter(|receipt| receipt.get("receipt_id").and_then(serde_json::Value::as_str) == Some(receipt_id))
+            .collect();
+        let [receipt] = matches.as_slice() else { return Err(FcpTransportError::ReceiptUnconfirmed); };
+        if receipt.get("connector_id").and_then(serde_json::Value::as_str) != Some(request.connector_id.as_str())
+            || receipt.get("operation").and_then(serde_json::Value::as_str) != Some(request.operation.as_str())
+            || receipt.get("idempotency_key").and_then(serde_json::Value::as_str) != Some(request.idempotency_key.as_str())
+            || receipt.get("success").and_then(serde_json::Value::as_bool) != Some(success)
+        {
+            return Err(FcpTransportError::ReceiptUnconfirmed);
+        }
+        let receipt_json = serde_json::to_string(receipt).map_err(|_| FcpTransportError::ProtocolInvalid)?;
+        Ok(FcpAcknowledgement { receipt_id: receipt_id.to_string(), receipt_hash: fcp_identity_hash(&receipt_json),
+            success, result: response.get("result").cloned() })
+    }
+
+    async fn request_json(&self, cx: &crate::cx::Cx, deadline: std::time::Instant,
+        path: &str, body: serde_json::Value, admin: Option<&str>)
+        -> Result<serde_json::Value, FcpTransportError>
+    {
+        let body = serde_json::to_vec(&body).map_err(|_| FcpTransportError::ProtocolInvalid)?;
+        self.exchange(cx, deadline, crate::runtime_async::http::Method::Post, path, body, admin).await
+    }
+
+    async fn exchange(&self, cx: &crate::cx::Cx, deadline: std::time::Instant,
+        method: crate::runtime_async::http::Method,
+        path: &str, body: Vec<u8>, admin: Option<&str>) -> Result<serde_json::Value, FcpTransportError>
+    {
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+        if body.len() > self.config.max_payload_bytes { return Err(FcpTransportError::PayloadLimit); }
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        if let Some(token) = admin {
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+            headers.push(("x-fcp-zone".to_string(), "z:owner".to_string()));
+        }
+        let endpoint = format!("{}{path}", self.config.endpoint.trim_end_matches('/'));
+        let response = self.http.request_with_timeout(cx, method, &endpoint, headers, body,
+            remaining_fcp_time(deadline)?).await
+            .map_err(|_| FcpTransportError::Unavailable)?;
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+        if response.status != 200 { return Err(FcpTransportError::Unavailable); }
+        if response.body.len() > self.config.max_payload_bytes { return Err(FcpTransportError::PayloadLimit); }
+        serde_json::from_slice(&response.body).map_err(|_| FcpTransportError::ProtocolInvalid)
+    }
+}
+
+fn remaining_fcp_time(deadline: std::time::Instant) -> Result<std::time::Duration, FcpTransportError> {
+    deadline.checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| remaining.as_millis() > 0)
+        .ok_or(FcpTransportError::Unavailable)
+}
+
+fn read_fcp_secret_file(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, FcpTransportError> {
+    use std::io::Read;
+    let denied = FcpTransportError::CredentialUnavailable;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| denied)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit { return Err(denied); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 { return Err(denied); }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A pathname replaced with a FIFO or symlink must not block the
+        // executor or redirect credential authority between metadata and open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| denied)?;
+    let opened = file.metadata().map_err(|_| denied)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() { return Err(denied); }
+    }
+    if !opened.is_file() || opened.len() > limit { return Err(denied); }
+    let mut bytes = Vec::new();
+    (&file).take(limit + 1).read_to_end(&mut bytes).map_err(|_| denied)?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).map_err(|_| denied)? > limit { return Err(denied); }
+    let after = file.metadata().map_err(|_| denied)?;
+    let named = std::fs::symlink_metadata(path).map_err(|_| denied)?;
+    if !after.is_file() || !named.is_file() || after.len() != opened.len()
+        || after.len() != u64::try_from(bytes.len()).map_err(|_| denied)?
+        || named.len() != after.len()
+    { return Err(denied); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != named.dev() || after.ino() != named.ino()
+            || after.dev() != opened.dev() || after.ino() != opened.ino()
+            || after.mode() & 0o077 != 0 || named.mode() & 0o077 != 0
+            || after.mtime() != opened.mtime() || after.mtime_nsec() != opened.mtime_nsec()
+            || after.ctime() != opened.ctime() || after.ctime_nsec() != opened.ctime_nsec()
+        { return Err(denied); }
+    }
+    Ok(bytes)
+}
 
 /// Protocol version shared between the FrankenTerm control plane and connector host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
