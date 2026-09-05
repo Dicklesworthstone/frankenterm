@@ -320,7 +320,7 @@ StaticAttestation.require_terms!(
     MANIFEST,
     "cargo fuzz run",
     "-max_total_time=",
-    ".targets[] | [.cargo_fuzz_target, .corpus]",
+    ".[] | [.cargo_fuzz_target, .seed_corpus]",
   ),
   source: WORKFLOW,
   check: "adversarial.workflow.campaign_wiring",

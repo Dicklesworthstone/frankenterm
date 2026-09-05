@@ -232,7 +232,7 @@
         "chore": 3,
         "cleanup": 1,
         "cosmetic": 4,
-        "feat": 41,
+        "feat": 42,
         "fix": 41,
         "other": 10,
         "refactor": 5,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 130,
+      "fork_side_commit_count": 131,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-04T12:21:37-04:00",
-        "sha": "5871557dbe67f26cf5efc98fbde7809d9f686109",
-        "subject": "style(config-derive): satisfy release rustfmt proof"
+        "classification": "feat",
+        "committed_at": "2026-09-05T04:55:48-04:00",
+        "sha": "01da23e3e03275e7c24ee50e81935c08a0fe7523",
+        "subject": "feat(clipboard): wire bounded OSC52 consent to the originating GUI pane"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -637,22 +637,22 @@
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
-        "feat": 184,
+        "feat": 185,
         "fix": 188,
         "other": 34,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 68
+        "test": 69
       },
-      "fork_side_commit_count": 542,
+      "fork_side_commit_count": 544,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "chore",
-        "committed_at": "2026-09-04T03:17:09-04:00",
-        "sha": "10c363160f5573a956759318ac4099035377e824",
-        "subject": "chore(lints): make the workspace clean under nightly-2026-08-31"
+        "classification": "test",
+        "committed_at": "2026-09-05T05:20:57-04:00",
+        "sha": "426b47857960f817698666146ef3d82172b1611b",
+        "subject": "test(clipboard): format socket failures correctly in Rust 2018"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -891,21 +891,21 @@
       "classification_summary": {
         "cleanup": 3,
         "cosmetic": 14,
-        "feat": 48,
-        "fix": 78,
+        "feat": 49,
+        "fix": 81,
         "other": 28,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 41
+        "test": 44
       },
-      "fork_side_commit_count": 225,
+      "fork_side_commit_count": 232,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-26T11:43:29-04:00",
-        "sha": "1eea629df0048141b0b608541834a63deb6401cd",
-        "subject": "feat(guardian): restore authenticated replay before mux activation"
+        "classification": "fix",
+        "committed_at": "2026-09-05T05:18:03-04:00",
+        "sha": "1a616c697ab217c3fd8d23a6461434876b450e8f",
+        "subject": "fix(clipboard): compile the terminal retirement regression on nightly"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2386,
-  "generated_at": "2026-09-04T16:21:50.462704Z",
+  "fork_side_commit_total": 2396,
+  "generated_at": "2026-09-05T13:08:01.366978Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

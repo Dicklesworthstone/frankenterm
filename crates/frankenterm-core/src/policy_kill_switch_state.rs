@@ -876,13 +876,15 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn kill_switch_fence_aliases_share_authority_and_hardlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.db");
         let _backend =
             crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
                 .unwrap();
         let alias = directory.path().join("alias.db");
-        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        symlink(&path, &alias).unwrap();
         let guard = acquire_kill_switch_fence(&path).unwrap();
         assert!(matches!(
             acquire_kill_switch_fence(&alias),

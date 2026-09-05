@@ -124658,6 +124658,7 @@ printf x > "$MINISIGN_MARKER"
         use frankenterm_core::ipc::*;
         use frankenterm_core::runtime_async::{Mutex, RwLock, mpsc};
         use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
         let dir = tempfile::Builder::new()
             .prefix("ft-ipc-rpc-")
             .tempdir_in("/tmp")
@@ -124718,7 +124719,7 @@ printf x > "$MINISIGN_MARKER"
         // The server has bound its socket but has not polled accept. Queue a
         // complete authenticated request and close it first, making EOF
         // observable before the callback's first poll, without a timing guess.
-        let mut already_closed = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let mut already_closed = UnixStream::connect(&socket).unwrap();
         writeln!(already_closed, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", "99"]})).unwrap();
         already_closed.shutdown(std::net::Shutdown::Both).unwrap();
         drop(already_closed);
@@ -124791,7 +124792,7 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(rejected.rpc.unwrap().admission, IpcRpcAdmission::NotStarted);
         let shutdown_stream = if !artifact_test {
             for case in 0..5 {
-                let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+                let mut stream = UnixStream::connect(&socket).unwrap();
                 writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", case.to_string()]})).unwrap();
                 let ready = dir.path().join(format!("ready-{case}"));
                 let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -124826,7 +124827,7 @@ printf x > "$MINISIGN_MARKER"
                     "disconnect must not cancel the shared server context"
                 );
             }
-            let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            let mut stream = UnixStream::connect(&socket).unwrap();
             writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", "5"]})).unwrap();
             let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while !dir.path().join("ready-5").exists() {
