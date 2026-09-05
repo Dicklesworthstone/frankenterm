@@ -70,6 +70,57 @@ fn read_workspace_file(path: &str) -> String {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", full_path.display()))
 }
 
+fn readme_schema_versions_match(readme: &str, expected: i32) -> bool {
+    let marker = Regex::new(r"<!--count:storage_schema_version-->([^<]*)<!--/count-->")
+        .expect("schema marker regex compiles");
+    let versions: Vec<_> = marker.captures_iter(readme).collect();
+    !versions.is_empty()
+        && versions.len()
+            == readme
+                .matches("<!--count:storage_schema_version-->")
+                .count()
+        && versions
+            .iter()
+            .all(|capture| capture[1].parse::<i32>() == Ok(expected))
+}
+
+#[test]
+fn readme_storage_schema_version_matches_source() {
+    assert!(
+        readme_schema_versions_match(
+            &read_workspace_file("README.md"),
+            frankenterm_core::storage::SCHEMA_VERSION,
+        ),
+        "README schema markers must exist and exactly match SCHEMA_VERSION"
+    );
+}
+
+#[test]
+fn readme_schema_guard_rejects_missing_stale_and_malformed_markers() {
+    let current = "<!--count:storage_schema_version-->46<!--/count-->";
+    let stale = "<!--count:storage_schema_version-->45<!--/count-->";
+    assert!(readme_schema_versions_match(current, 46));
+    assert!(!readme_schema_versions_match("no marker", 46));
+    assert!(!readme_schema_versions_match(stale, 46));
+    assert!(!readme_schema_versions_match(
+        &format!("{current}{stale}"),
+        46
+    ));
+    assert!(!readme_schema_versions_match(
+        "<!--count:storage_schema_version-->unknown<!--/count-->",
+        46,
+    ));
+    for malformed in [
+        "<!--count:storage_schema_version-->46",
+        "<!--count:storage_schema_version--><46><!--/count-->",
+    ] {
+        assert!(!readme_schema_versions_match(
+            &format!("{current}{malformed}"),
+            46,
+        ));
+    }
+}
+
 fn manifest_slots_by_category() -> HashMap<String, Vec<ManifestSlot>> {
     let manifest: Manifest =
         serde_json::from_str(&read_workspace_file("docs/attestations/manifest.json"))

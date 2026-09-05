@@ -191,6 +191,8 @@ rustix = { workspace = true, features = ["process"] }
 xattr.workspace = true
 
 [dev-dependencies]
+syn = { workspace = true, features = ["full", "visit"] }
+proc-macro2 = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["trace"] }
 # `round6_quality_metric_harness` directly exercises the vendored cache API,

@@ -41,7 +41,10 @@ fn injector_emits_policy_decision_to_replay_capture() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = Arc::new(CaptureAdapter::new(sink.clone(), CaptureConfig::default()));
+        let adapter = Arc::new(
+            CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+                .expect("valid capture configuration"),
+        );
 
         let mut injector = PolicyGatedInjector::new(
             PolicyEngine::strict(),

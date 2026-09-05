@@ -325,9 +325,7 @@ report() {{
                 "hardlink" => {
                     std::fs::hard_link(&database, fixture.base.join("database-link")).unwrap()
                 }
-                "journal_symlink" => {
-                    symlink(&outside, fixture.root.join(".ft/ft.db-wal")).unwrap()
-                }
+                "journal_symlink" => symlink(&outside, fixture.root.join(".ft/ft.db-wal")).unwrap(),
                 "lock_symlink" => symlink(
                     &outside,
                     fixture.root.join(".ft/ft.db.policy-kill-switch.lock"),
@@ -441,7 +439,8 @@ report() {{
 /// Create a temp workspace with `.ft/` directory and initialized DB.
 /// Returns (TempDir guard, workspace path string).
 fn setup_workspace() -> (TempDir, String) {
-    let dir = TempDir::new().expect("create temp dir");
+    let mut dir = TempDir::new().expect("create temp dir");
+    dir.disable_cleanup(true);
     let ft_dir = dir.path().join(".ft");
     std::fs::create_dir_all(&ft_dir).expect("create .ft dir");
     #[cfg(unix)]
@@ -3346,10 +3345,7 @@ fn contract_mission_graph_cli_scores_change_actual_plan_and_refuse_invalid_snaps
             let mut manual = command(robot);
             manual.args(["--target-bead", "blocked"]);
             let before = run(manual, true);
-            assert_eq!(
-                before["data"]["plan"]["steps"][0]["target"],
-                "blocked"
-            );
+            assert_eq!(before["data"]["plan"]["steps"][0]["target"], "blocked");
 
             let graph_command = |hash: &str| {
                 let mut cmd = command(robot);
@@ -3383,7 +3379,9 @@ fn contract_mission_graph_cli_scores_change_actual_plan_and_refuse_invalid_snaps
                 if invalid_version {
                     invalid.args(["--beads-graph-version", "2"]);
                 }
-                let refused = run(invalid, false);
+                // Robot Mode reports domain refusals in its JSON envelope;
+                // the human CLI also reports failure through the exit status.
+                let refused = run(invalid, robot);
                 assert_eq!(refused["ok"], false);
                 assert_eq!(
                     refused["error_code"],

@@ -91,6 +91,7 @@ fn synthetic_delta(pane_id: u64, seq: u64, content: &str, captured_at: i64) -> C
     CapturedSegment {
         pane_id,
         seq,
+        seq_correction: 0,
         content: content.to_string(),
         kind: CapturedSegmentKind::Delta,
         captured_at,
@@ -108,6 +109,7 @@ fn synthetic_gap(
     CapturedSegment {
         pane_id,
         seq,
+        seq_correction: 0,
         content: content.to_string(),
         kind: CapturedSegmentKind::Gap {
             reason: reason.to_string(),

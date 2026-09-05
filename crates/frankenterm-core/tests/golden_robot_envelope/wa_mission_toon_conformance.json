@@ -1,0 +1,868 @@
+[
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.limit: value must be >= 1",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "action_state": {
+          "description": "Filter by action state (ready, blocked, completed)",
+          "type": "string"
+        },
+        "agent_state": {
+          "description": "Filter by agent approval state (not_required, pending, approved, denied, expired)",
+          "type": "string"
+        },
+        "assignee": {
+          "description": "Filter by assignee name",
+          "type": "string"
+        },
+        "assignment_id": {
+          "description": "Filter to specific assignment ID",
+          "type": "string"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "maxLength": 16,
+          "type": "string"
+        },
+        "limit": {
+          "description": "Max assignments to return (default: 100)",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mission_file": {
+          "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+          "type": "string"
+        },
+        "mission_state": {
+          "description": "Filter by lifecycle state (e.g., running, paused, completed)",
+          "type": "string"
+        },
+        "run_state": {
+          "description": "Filter assignments by run state (pending, succeeded, failed, cancelled)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "assignment_count": 2,
+        "assignment_counters": {
+          "approved": 1,
+          "cancelled": 0,
+          "denied": 0,
+          "expired": 0,
+          "failed": 0,
+          "pending_approval": 1,
+          "succeeded": 1,
+          "unresolved": 1
+        },
+        "assignments": [
+          {
+            "action_state": "blocked",
+            "agent_state": "pending",
+            "assignee": "agent-alpha",
+            "assignment_id": "assignment:alpha",
+            "candidate_id": "candidate:alpha",
+            "run_state": "pending"
+          },
+          {
+            "action_state": "completed",
+            "agent_state": "approved",
+            "assignee": "agent-beta",
+            "assignment_id": "assignment:beta",
+            "candidate_id": "candidate:beta",
+            "run_state": "succeeded"
+          }
+        ],
+        "available_transitions": [
+          {
+            "from": "running",
+            "kind": "retry",
+            "to": "retry_pending"
+          },
+          {
+            "from": "running",
+            "kind": "complete",
+            "to": "completed"
+          },
+          {
+            "from": "running",
+            "kind": "fail",
+            "to": "failed"
+          },
+          {
+            "from": "running",
+            "kind": "block",
+            "to": "blocked"
+          },
+          {
+            "from": "running",
+            "kind": "cancel",
+            "to": "cancelled"
+          },
+          {
+            "from": "running",
+            "kind": "execution_blocked",
+            "to": "paused"
+          },
+          {
+            "from": "running",
+            "kind": "mission_cancelled",
+            "to": "cancelled"
+          }
+        ],
+        "candidate_count": 2,
+        "lifecycle_state": "running",
+        "matched_assignment_count": 2,
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "owner_acknowledgement": "unavailable_no_mission_driver",
+        "returned_assignment_count": 2,
+        "revision_token": {
+          "content_sha256": "<verified_content_hash>",
+          "generation": "0123456789abcdef0123456789abcdef",
+          "mission_id": "mission:qiba0",
+          "revision": "0"
+        },
+        "title": "Mission MCP Conformance"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    },
+    "tool": "wa.mission_state",
+    "toon_success_envelope": {
+      "data": {
+        "assignment_count": 2,
+        "assignment_counters": {
+          "approved": 1,
+          "cancelled": 0,
+          "denied": 0,
+          "expired": 0,
+          "failed": 0,
+          "pending_approval": 1,
+          "succeeded": 1,
+          "unresolved": 1
+        },
+        "assignments": [
+          {
+            "action_state": "blocked",
+            "agent_state": "pending",
+            "assignee": "agent-alpha",
+            "assignment_id": "assignment:alpha",
+            "candidate_id": "candidate:alpha",
+            "run_state": "pending"
+          },
+          {
+            "action_state": "completed",
+            "agent_state": "approved",
+            "assignee": "agent-beta",
+            "assignment_id": "assignment:beta",
+            "candidate_id": "candidate:beta",
+            "run_state": "succeeded"
+          }
+        ],
+        "available_transitions": [
+          {
+            "from": "running",
+            "kind": "retry",
+            "to": "retry_pending"
+          },
+          {
+            "from": "running",
+            "kind": "complete",
+            "to": "completed"
+          },
+          {
+            "from": "running",
+            "kind": "fail",
+            "to": "failed"
+          },
+          {
+            "from": "running",
+            "kind": "block",
+            "to": "blocked"
+          },
+          {
+            "from": "running",
+            "kind": "cancel",
+            "to": "cancelled"
+          },
+          {
+            "from": "running",
+            "kind": "execution_blocked",
+            "to": "paused"
+          },
+          {
+            "from": "running",
+            "kind": "mission_cancelled",
+            "to": "cancelled"
+          }
+        ],
+        "candidate_count": 2,
+        "lifecycle_state": "running",
+        "matched_assignment_count": 2,
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "owner_acknowledgement": "unavailable_no_mission_driver",
+        "returned_assignment_count": 2,
+        "revision_token": {
+          "content_sha256": "<verified_content_hash>",
+          "generation": "0123456789abcdef0123456789abcdef",
+          "mission_id": "mission:qiba0",
+          "revision": "0"
+        },
+        "title": "Mission MCP Conformance"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.assignment_id: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_id": {
+          "description": "Optional assignment ID for dispatch context details",
+          "type": "string"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "maxLength": 16,
+          "type": "string"
+        },
+        "mission_file": {
+          "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "assignment_context": {
+          "approval_state": "pending:dispatcher-a:1700000000100",
+          "assignee": "agent-alpha",
+          "assignment_id": "assignment:alpha",
+          "candidate_id": "candidate:alpha",
+          "outcome": null
+        },
+        "available_transitions": [
+          {
+            "from": "running",
+            "kind": "retry",
+            "to": "retry_pending"
+          },
+          {
+            "from": "running",
+            "kind": "complete",
+            "to": "completed"
+          },
+          {
+            "from": "running",
+            "kind": "fail",
+            "to": "failed"
+          },
+          {
+            "from": "running",
+            "kind": "block",
+            "to": "blocked"
+          },
+          {
+            "from": "running",
+            "kind": "cancel",
+            "to": "cancelled"
+          },
+          {
+            "from": "running",
+            "kind": "execution_blocked",
+            "to": "paused"
+          },
+          {
+            "from": "running",
+            "kind": "mission_cancelled",
+            "to": "cancelled"
+          }
+        ],
+        "failure_catalog": [
+          {
+            "code": "PolicyDenied",
+            "error_code": "robot.mission_policy_denied",
+            "reason_code": "mission.policy_denied"
+          },
+          {
+            "code": "ReservationConflict",
+            "error_code": "robot.mission_reservation_conflict",
+            "reason_code": "mission.reservation_conflict"
+          },
+          {
+            "code": "RateLimited",
+            "error_code": "robot.mission_rate_limited",
+            "reason_code": "mission.rate_limited"
+          },
+          {
+            "code": "StaleState",
+            "error_code": "robot.mission_stale_state",
+            "reason_code": "mission.stale_state"
+          },
+          {
+            "code": "DispatchError",
+            "error_code": "robot.mission_dispatch_error",
+            "reason_code": "mission.dispatch_error"
+          },
+          {
+            "code": "ApprovalRequired",
+            "error_code": "robot.mission_approval_required",
+            "reason_code": "mission.approval_required"
+          },
+          {
+            "code": "ApprovalDenied",
+            "error_code": "robot.mission_approval_denied",
+            "reason_code": "mission.approval_denied"
+          },
+          {
+            "code": "ApprovalExpired",
+            "error_code": "robot.mission_approval_expired",
+            "reason_code": "mission.approval_expired"
+          },
+          {
+            "code": "KillSwitchActivated",
+            "error_code": "robot.mission_kill_switch_activated",
+            "reason_code": "mission.kill_switch_activated"
+          }
+        ],
+        "lifecycle_state": "running",
+        "mission_file": "<mission_file>",
+        "mission_id": "mission:qiba0",
+        "title": "Mission MCP Conformance"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    },
+    "tool": "wa.mission_explain",
+    "toon_success_envelope": {
+      "data": {
+        "assignment_context": {
+          "approval_state": "pending:dispatcher-a:1700000000100",
+          "assignee": "agent-alpha",
+          "assignment_id": "assignment:alpha",
+          "candidate_id": "candidate:alpha",
+          "outcome": null
+        },
+        "available_transitions": [
+          {
+            "from": "running",
+            "kind": "retry",
+            "to": "retry_pending"
+          },
+          {
+            "from": "running",
+            "kind": "complete",
+            "to": "completed"
+          },
+          {
+            "from": "running",
+            "kind": "fail",
+            "to": "failed"
+          },
+          {
+            "from": "running",
+            "kind": "block",
+            "to": "blocked"
+          },
+          {
+            "from": "running",
+            "kind": "cancel",
+            "to": "cancelled"
+          },
+          {
+            "from": "running",
+            "kind": "execution_blocked",
+            "to": "paused"
+          },
+          {
+            "from": "running",
+            "kind": "mission_cancelled",
+            "to": "cancelled"
+          }
+        ],
+        "failure_catalog": [
+          {
+            "code": "PolicyDenied",
+            "error_code": "robot.mission_policy_denied",
+            "reason_code": "mission.policy_denied"
+          },
+          {
+            "code": "ReservationConflict",
+            "error_code": "robot.mission_reservation_conflict",
+            "reason_code": "mission.reservation_conflict"
+          },
+          {
+            "code": "RateLimited",
+            "error_code": "robot.mission_rate_limited",
+            "reason_code": "mission.rate_limited"
+          },
+          {
+            "code": "StaleState",
+            "error_code": "robot.mission_stale_state",
+            "reason_code": "mission.stale_state"
+          },
+          {
+            "code": "DispatchError",
+            "error_code": "robot.mission_dispatch_error",
+            "reason_code": "mission.dispatch_error"
+          },
+          {
+            "code": "ApprovalRequired",
+            "error_code": "robot.mission_approval_required",
+            "reason_code": "mission.approval_required"
+          },
+          {
+            "code": "ApprovalDenied",
+            "error_code": "robot.mission_approval_denied",
+            "reason_code": "mission.approval_denied"
+          },
+          {
+            "code": "ApprovalExpired",
+            "error_code": "robot.mission_approval_expired",
+            "reason_code": "mission.approval_expired"
+          },
+          {
+            "code": "KillSwitchActivated",
+            "error_code": "robot.mission_kill_switch_activated",
+            "reason_code": "mission.kill_switch_activated"
+          }
+        ],
+        "lifecycle_state": "running",
+        "mission_file": "<mission_file>",
+        "mission_id": "mission:qiba0",
+        "title": "Mission MCP Conformance"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.reason: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_token": {
+          "additionalProperties": false,
+          "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+          "properties": {
+            "content_sha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "mission_id": {
+              "type": "string"
+            },
+            "revision": {
+              "maxLength": 20,
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mission_id",
+            "generation",
+            "revision",
+            "content_sha256"
+          ],
+          "type": "object"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "maxLength": 16,
+          "type": "string"
+        },
+        "mission_file": {
+          "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Reason code for the pause (required)",
+          "type": "string"
+        },
+        "requested_by": {
+          "description": "Who requested the pause (default: mcp-agent)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "checkpoint_id": "<verified_checkpoint_id>",
+        "command": "pause",
+        "decision_path": "pause",
+        "lifecycle_from": "running",
+        "lifecycle_to": "paused",
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "mutation": {
+          "changed": true,
+          "current": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "1"
+          },
+          "durability": "file_and_directory_synced",
+          "owner_acknowledgement": "unavailable_no_mission_driver",
+          "previous": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "0"
+          }
+        },
+        "reason_code": "maintenance_window"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    },
+    "tool": "wa.mission_pause",
+    "toon_success_envelope": {
+      "data": {
+        "checkpoint_id": "<verified_checkpoint_id>",
+        "command": "pause",
+        "decision_path": "pause",
+        "lifecycle_from": "running",
+        "lifecycle_to": "paused",
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "mutation": {
+          "changed": true,
+          "current": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "1"
+          },
+          "durability": "file_and_directory_synced",
+          "owner_acknowledgement": "unavailable_no_mission_driver",
+          "previous": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "0"
+          }
+        },
+        "reason_code": "maintenance_window"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.requested_by: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_token": {
+          "additionalProperties": false,
+          "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+          "properties": {
+            "content_sha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "mission_id": {
+              "type": "string"
+            },
+            "revision": {
+              "maxLength": 20,
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mission_id",
+            "generation",
+            "revision",
+            "content_sha256"
+          ],
+          "type": "object"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "maxLength": 16,
+          "type": "string"
+        },
+        "mission_file": {
+          "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+          "type": "string"
+        },
+        "requested_by": {
+          "description": "Who requested the resume (default: mcp-agent)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "checkpoint_id": "<verified_checkpoint_id>",
+        "command": "resume",
+        "decision_path": "resume",
+        "lifecycle_from": "paused",
+        "lifecycle_to": "running",
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "mutation": {
+          "changed": true,
+          "current": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "1"
+          },
+          "durability": "file_and_directory_synced",
+          "owner_acknowledgement": "unavailable_no_mission_driver",
+          "previous": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "0"
+          }
+        },
+        "reason_code": "resumed"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    },
+    "tool": "wa.mission_resume",
+    "toon_success_envelope": {
+      "data": {
+        "checkpoint_id": "<verified_checkpoint_id>",
+        "command": "resume",
+        "decision_path": "resume",
+        "lifecycle_from": "paused",
+        "lifecycle_to": "running",
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "mutation": {
+          "changed": true,
+          "current": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "1"
+          },
+          "durability": "file_and_directory_synced",
+          "owner_acknowledgement": "unavailable_no_mission_driver",
+          "previous": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "0"
+          }
+        },
+        "reason_code": "resumed"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.reason: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "error_code": {
+          "description": "Optional error code for the abort",
+          "type": "string"
+        },
+        "expected_token": {
+          "additionalProperties": false,
+          "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+          "properties": {
+            "content_sha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "generation": {
+              "type": "string"
+            },
+            "mission_id": {
+              "type": "string"
+            },
+            "revision": {
+              "maxLength": 20,
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mission_id",
+            "generation",
+            "revision",
+            "content_sha256"
+          ],
+          "type": "object"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "maxLength": 16,
+          "type": "string"
+        },
+        "mission_file": {
+          "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Reason code for the abort (required)",
+          "type": "string"
+        },
+        "requested_by": {
+          "description": "Who requested the abort (default: mcp-agent)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "command": "abort",
+        "decision_path": "abort",
+        "error_code": "mission.failure.manual_abort",
+        "lifecycle_from": "running",
+        "lifecycle_to": "cancelled",
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "mutation": {
+          "changed": true,
+          "current": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "1"
+          },
+          "durability": "file_and_directory_synced",
+          "owner_acknowledgement": "unavailable_no_mission_driver",
+          "previous": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "0"
+          }
+        },
+        "reason_code": "operator_abort"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    },
+    "tool": "wa.mission_abort",
+    "toon_success_envelope": {
+      "data": {
+        "command": "abort",
+        "decision_path": "abort",
+        "error_code": "mission.failure.manual_abort",
+        "lifecycle_from": "running",
+        "lifecycle_to": "cancelled",
+        "mission_file": "<mission_file>",
+        "mission_hash": "<verified_content_hash>",
+        "mission_id": "mission:qiba0",
+        "mutation": {
+          "changed": true,
+          "current": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "1"
+          },
+          "durability": "file_and_directory_synced",
+          "owner_acknowledgement": "unavailable_no_mission_driver",
+          "previous": {
+            "content_sha256": "<verified_content_hash>",
+            "generation": "0123456789abcdef0123456789abcdef",
+            "mission_id": "mission:qiba0",
+            "revision": "0"
+          }
+        },
+        "reason_code": "operator_abort"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.15.2"
+    }
+  }
+]

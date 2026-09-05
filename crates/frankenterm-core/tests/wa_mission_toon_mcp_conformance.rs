@@ -112,8 +112,7 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
-        pretty_canonical(actual_schema),
-        pretty_canonical(&expected_schema),
+        actual_schema, &expected_schema,
         "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
 }
@@ -207,15 +206,20 @@ fn canonicalize(value: &mut Value) {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
-                    "now" | "elapsed_ms" => *child = Value::from(0_u64),
-                    "mission_file" => *child = Value::String("<mission_file>".to_string()),
-                    "mission_hash" | "content_sha256" => {
+                    // Schemas are contracts, not volatile response data. A
+                    // property named mission_file must retain its full schema.
+                    "input_schema" => {}
+                    "now" | "elapsed_ms" if child.is_number() => *child = Value::from(0_u64),
+                    "mission_file" if child.is_string() => {
+                        *child = Value::String("<mission_file>".to_string())
+                    }
+                    "mission_hash" | "content_sha256" if child.is_string() => {
                         *child = Value::String("<verified_content_hash>".to_string())
                     }
-                    "checkpoint_id" if !child.is_null() => {
+                    "checkpoint_id" if child.is_string() => {
                         *child = Value::String("<verified_checkpoint_id>".to_string())
                     }
-                    _ if key.ends_with("_ms") => *child = Value::from(0_i64),
+                    _ if key.ends_with("_ms") && child.is_number() => *child = Value::from(0_i64),
                     _ => canonicalize(child),
                 }
             }
@@ -258,6 +262,35 @@ fn pretty_canonical(value: &Value) -> String {
         "{}\n",
         serde_json::to_string_pretty(&canonical_value(value)).expect("serialize canonical JSON")
     )
+}
+
+#[test]
+fn canonicalization_preserves_schema_constraints_and_response_types() {
+    let schema = json!({"properties": {
+        "mission_file": {"type": "string", "maxLength": 4096},
+        "expected_token": {"properties": {
+            "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }},
+        "timeout_ms": {"type": "integer", "minimum": 1}
+    }});
+    let response = json!({"input_schema": schema, "data": {
+        "mission_file": "/owned/mission.json", "now": 123,
+        "revision": "9007199254740993", "checkpoint_id": null
+    }});
+    let canonical = canonical_value(&response);
+    assert_eq!(canonical["input_schema"], schema);
+    assert_eq!(canonical["data"]["mission_file"], "<mission_file>");
+    assert_eq!(canonical["data"]["now"], 0);
+    assert_eq!(canonical["data"]["revision"], "9007199254740993");
+    assert_eq!(canonical["data"]["checkpoint_id"], Value::Null);
+    let mut changed = response.clone();
+    changed["input_schema"]["properties"]["mission_file"]["maxLength"] = json!(4097);
+    assert_ne!(canonical_value(&changed), canonical);
+    let malformed = json!({"data": {
+        "mission_file": 7, "now": "wrong", "timeout_ms": false,
+        "content_sha256": {"invalid": true}, "checkpoint_id": 7
+    }});
+    assert_eq!(canonical_value(&malformed), malformed);
 }
 
 fn golden_path(name: &str) -> PathBuf {

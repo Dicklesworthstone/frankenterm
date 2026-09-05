@@ -421,7 +421,7 @@ The operating envelope, network-pressure selector, process-snapshot pipeline, an
 
 ### 9. Layered via Extraction
 
-Layering is enforced through sub-crate extraction, not just discipline. `frankenterm-core` has 19 sibling sub-crates carved out. Leaf type crates declare **zero first-party dependencies**; cluster sub-crates depend on `frankenterm-core` only; **there are zero core → sub-crate edges**. Cycles can't sneak in because the build refuses to compile them.
+Layering is enforced through sub-crate extraction, not just discipline. `frankenterm-core` has 19 sibling sub-crates carved out. Core imports shared leaf types; cluster crates such as ARS, replay, search, and fleet depend on core and shared leaves. Cargo rejects cycles among normal and build dependencies; dev-dependency cycles allow core's tests to exercise extracted clusters.
 
 ### 10. Reality-Check Discipline
 
@@ -1661,8 +1661,9 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 ### Sub-crate extraction invariants
 
 - **Leaf type crates** (`*-types`) declare zero first-party dependencies.
-- **Cluster sub-crates** (`*-ars`, `*-tantivy`, `*-replay`, `*-fleet`, `*-connectors`, `*-mcp`) depend on `frankenterm-core` only.
-- **Zero core → sub-crate edges.** Cycles can't sneak in because the build refuses to compile them.
+- **Cluster sub-crates** (`*-ars`, `*-tantivy`, `*-replay`, `*-fleet`) depend on `frankenterm-core` and, where needed, shared leaf types.
+- **Core imports shared leaves**, including the feature-gated MCP type crate. The connector boundary imports connector types, not core.
+- **Normal/build dependency cycles are forbidden.** Dev-dependency cycles let core tests exercise the extracted clusters.
 - See [`docs/proposals/ft-l3tfo-cold-build-measurements.md`](docs/proposals/ft-l3tfo-cold-build-measurements.md) for the cold-build ADR.
 
 ### Key algorithms and techniques
@@ -1733,20 +1734,20 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 | `frankenterm-core-tantivy` | Full Tantivy lexical search stack (~16k LOC) | Tantivy is a heavy dep; sub-crating it lets `frankenterm-core` test paths skip it |
 | `frankenterm-core-replay` | Replay + replay-assessment harness (~25k LOC) | Determinism testing has its own dep set (proptest, criterion) |
 | `frankenterm-core-fleet` | Fleet dashboard | Will host multi-host coordination; partial extraction in progress |
-| `frankenterm-core-connectors` | Connector boundary (cluster) | External-system integration is opt-in for some builds |
+| `frankenterm-core-connectors` | Connector type boundary | Reuses connector types without importing the core runtime |
 | `frankenterm-core-mcp` | MCP type boundary | MCP integration is feature-gated; types live in their own crate so consumers can depend on schemas without dragging in the server |
 | `frankenterm-core-test-macros` | `#[lab_runtime_test]` proc macros | Proc-macros must live in their own crate by Cargo decree |
 | `frankenterm-core-*-types` (12 leaves) | Data-only types (errors, configs, telemetry, audit, etc.) | Zero first-party deps; importable from anywhere without cycles |
 
 ### Dependency rules (enforced by the build, not just by convention)
 
-1. **No core → sub-crate edges.** `frankenterm-core` cannot import from any `frankenterm-core-*` sub-crate. The extraction is one-way.
+1. **Core imports shared type crates.** The normal dependency direction for extracted implementation clusters is cluster → core; core's dev-dependencies can exercise those clusters in tests.
 2. **Leaf type crates declare zero first-party deps.** They depend only on external libs (serde, etc.).
-3. **Cluster sub-crates depend on `frankenterm-core` only.** They don't depend on each other (except for the leaf type crates they import).
+3. **Implementation clusters depend on core and shared leaves.** MCP and connector type boundaries have narrower dependency graphs; the `frankenterm-core-*` prefix alone does not identify a cluster.
 4. **`tokio` ban** at the `cargo-deny` layer fails the build if any first-party `Cargo.toml` declares `tokio` directly.
 5. **Cycle detection** runs in the release gate (`scripts/release-gates.sh`, DSR quality) via `cargo-deny` + the workspace-topology crate (`frankenterm-topo`).
 
-Practical consequence: reading code in a sub-crate, you can be sure it doesn't reach back into `frankenterm-core`. Reading code in a leaf type crate, you can be sure it doesn't reach anywhere else in the first-party graph. The compile-time graph is the documentation.
+Practical consequence: distinguish data-only leaves from implementation clusters when following imports. The Cargo manifests identify the actual normal, optional, and dev-dependency edges.
 
 ---
 
@@ -1907,9 +1908,10 @@ restore state machine:
 Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
 ```
 
-That detector is not wired into production `ft watch` startup. The human
-snapshot-restore and robot-rollback commands provide bounded metadata-only
-dry-runs; all non-dry execution is unavailable.
+Production `ft watch` startup runs that detector and logs its result; it does
+not prompt for or execute a restore. The human snapshot-restore and
+robot-rollback commands provide bounded metadata-only dry-runs; all non-dry
+execution is unavailable.
 
 The checkpoint schema can record:
 
@@ -2573,7 +2575,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v45** (as of 2026-09-01). The authoritative source is
+The current version is **v<!--count:storage_schema_version-->46<!--/count-->**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -3791,7 +3793,7 @@ The project uses **asupersync** exclusively. Direct `tokio` usage is forbidden a
 
 ### Unsafe code
 
-`#![forbid(unsafe_code)]` is declared workspace-wide via `[workspace.lints.rust]`. There is no opt-out path for first-party code. Vendored WezTerm crates that use `unsafe` are audited separately and tracked in [`docs/vendored-wezterm-design.md`](docs/vendored-wezterm-design.md).
+The workspace sets `unsafe_code = "forbid"` in `[workspace.lints.rust]` for crates that inherit those lints. The CLI and core library also declare `#![forbid(unsafe_code)]`. Native/FFI crates, including the GUI and vendored WezTerm code, have separately audited exceptions; the entire workspace is not unsafe-free. See [`docs/vendored-wezterm-design.md`](docs/vendored-wezterm-design.md).
 
 ### Reality-check discipline
 
@@ -3940,7 +3942,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Versioned storage**: schema migrations are versioned (`SCHEMA_VERSION = 45` at this source revision; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->46<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?

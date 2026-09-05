@@ -66,6 +66,7 @@ done
 # README.md / AGENTS.md (or anywhere — the script scans both files for
 # any matching placeholder names).
 WORKTREE_MANIFEST=(
+    "storage_schema_version|awk -F ' = |;' '/^pub const SCHEMA_VERSION: i32 = / { print \$2 }' crates/frankenterm-core/src/storage/schema_ddl.rs"
     "workspace_members|awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"'"
     "vendored_members|awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"frankenterm/'"
     "vendored_top_level|find frankenterm -maxdepth 2 -name Cargo.toml | wc -l"
@@ -81,6 +82,7 @@ WORKTREE_MANIFEST=(
 )
 
 HEAD_MANIFEST=(
+    "storage_schema_version|git show HEAD:crates/frankenterm-core/src/storage/schema_ddl.rs | awk -F ' = |;' '/^pub const SCHEMA_VERSION: i32 = / { print \$2 }'"
     "workspace_members|git show HEAD:Cargo.toml | awk '/^members = \\[/,/^]/' | grep -c '^[[:space:]]*\"'"
     "vendored_members|git show HEAD:Cargo.toml | awk '/^members = \\[/,/^]/' | grep -c '^[[:space:]]*\"frankenterm/'"
     "vendored_top_level|git ls-tree -r --name-only HEAD frankenterm | awk -F/ '\$NF == \"Cargo.toml\" && NF <= 3 { count++ } END { print count + 0 }'"
@@ -102,6 +104,17 @@ case "${SOURCE_MODE}" in
 esac
 
 DOCS=(README.md AGENTS.md)
+
+# Validate the schema markers before write mode can touch either document.
+# A valid occurrence must not hide another incomplete or malformed marker.
+python3 - <<'PYEOF'
+import pathlib, re, sys
+text = pathlib.Path("README.md").read_text()
+opening = "<!--count:storage_schema_version-->"
+matches = re.findall(re.escape(opening) + r"[0-9]+<!--/count-->", text)
+if not matches or len(matches) != text.count(opening):
+    sys.exit("README.md must contain complete numeric storage_schema_version markers")
+PYEOF
 
 # ---- helpers ----------------------------------------------------------
 
@@ -177,7 +190,26 @@ updated_occurrence_count=0
 for entry in "${MANIFEST[@]}"; do
     name="${entry%%|*}"
     cmd="${entry#*|}"
-    live="$(compute_count "${cmd}")"
+    # A schema identity is not an approximate size/count: even one version
+    # of drift is wrong, regardless of the configured percentage threshold.
+    count_strict="${STRICT}"
+    if [[ "${name}" == "storage_schema_version" ]]; then
+        count_strict=1
+    fi
+    if [[ "${name}" == "storage_schema_version" ]]; then
+        # Do not use compute_count's count-oriented fallback here: a missing
+        # schema source must never become a fabricated schema version zero.
+        if ! live="$(bash -o pipefail -c "${cmd}")"; then
+            echo "storage_schema_version: failed to read ${SOURCE_MODE} schema source" >&2
+            exit 1
+        fi
+        if ! [[ "${live}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "storage_schema_version: source must define one positive integer" >&2
+            exit 1
+        fi
+    else
+        live="$(compute_count "${cmd}")"
+    fi
     total_count=$((total_count + 1))
     live_status="ok"
     if [[ -z "${live}" ]] || ! [[ "${live}" =~ ^[0-9]+$ ]]; then
@@ -226,6 +258,9 @@ for entry in "${MANIFEST[@]}"; do
         done < <(read_documented_values "${doc}" "${name}")
         if [[ ${#documented_values[@]} -eq 0 ]]; then
             missing_placeholder_count=$((missing_placeholder_count + 1))
+            if [[ "${name}" == "storage_schema_version" && "${doc}" == "README.md" ]]; then
+                violations+=("README.md must contain a storage_schema_version placeholder")
+            fi
             if [[ "${MODE}" == "json" ]]; then
                 doc_reports+=("$(jq -cn \
                     --arg path "${doc}" \
@@ -242,7 +277,7 @@ for entry in "${MANIFEST[@]}"; do
             doc_status="matches"
             if [[ "${documented}" == "${live}" ]]; then
                 matching_count=$((matching_count + 1))
-            elif [[ "${STRICT}" -eq 1 ]]; then
+            elif [[ "${count_strict}" -eq 1 ]]; then
                 doc_status="strict_mismatch"
             elif [[ "${drift_pct}" -le "${THRESHOLD_PCT}" ]]; then
                 within_threshold_count=$((within_threshold_count + 1))
@@ -251,7 +286,7 @@ for entry in "${MANIFEST[@]}"; do
                 doc_status="drift_exceeded"
             fi
             if [[ "${MODE}" == "check" ]]; then
-                if [[ "${STRICT}" -eq 1 ]]; then
+                if [[ "${count_strict}" -eq 1 ]]; then
                     if [[ "${documented}" != "${live}" ]]; then
                         violations+=("${doc}::${name}#${occurrence}: documented=${documented} live=${live} (strict)")
                         doc_status="strict_mismatch"
