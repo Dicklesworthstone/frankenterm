@@ -5330,7 +5330,12 @@ impl ObservationRuntime {
         // Register before returning the task handle. Events published after
         // startup must not race the spawned task's first poll and disappear.
         let mut subscriber = event_bus.subscribe();
-        Some(spawn_runtime_task(&loop_cx, move |loop_cx| async move {
+        // Keep this task's diagnostic subscriber across executor threads and
+        // polls. A caller's scoped subscriber must not become process-global.
+        let diagnostic_dispatch = tracing::dispatcher::get_default(Clone::clone);
+        Some(spawn_runtime_task(&loop_cx, move |loop_cx| {
+            use tracing::instrument::WithSubscriber;
+            async move {
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     break;
@@ -5399,9 +5404,16 @@ impl ObservationRuntime {
                         record_runtime_wait_failure("connector_outbound_bridge_recv", failure);
                         break;
                     }
-                    Err(RuntimeTimeoutFailure::Elapsed) => {}
+                    Err(RuntimeTimeoutFailure::Elapsed) => {
+                        debug!(
+                            tick_kind = "connector_outbound_idle",
+                            "connector outbound subscriber timeout tick"
+                        );
+                    }
                 }
             }
+            }
+            .with_subscriber(diagnostic_dispatch)
         }))
     }
 
@@ -15138,6 +15150,43 @@ mod tests {
         assert!(!hash.contains("private"));
     }
 
+    #[derive(Clone)]
+    struct ConnectorDiagnosticCapture(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for ConnectorDiagnosticCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut captured = self.0.lock().unwrap();
+            assert!(captured.len() + bytes.len() <= 65_536, "diagnostic capture exceeded its byte limit");
+            captured.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ConnectorDiagnosticCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl ConnectorDiagnosticCapture {
+        fn records(&self) -> Vec<serde_json::Value> {
+            let bytes = self.0.lock().unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            // The writer may be between chunks while the task is active.
+            // Only fully emitted JSON lines count as observed events.
+            text.split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
     #[test]
     fn connector_outbound_subscriber_preserves_admission_and_never_delivers_model_events() {
         run_async_test(async {
@@ -15152,21 +15201,84 @@ mod tests {
                 runtime.connector_outbound_bridge = Some(Arc::clone(&bridge));
                 let before_mesh = format!("{:?}", bridge.lock().unwrap().policy_engine().connector_mesh());
                 let before_host = bridge.lock().unwrap().policy_engine().connector_host_runtime().clone();
-                let task = runtime.spawn_connector_outbound_task().unwrap();
+                let capture = ConnectorDiagnosticCapture(Arc::new(StdMutex::new(Vec::new())));
+                let diagnostic_dispatch = tracing::Dispatch::new(
+                    tracing_subscriber::fmt()
+                        .json()
+                        .without_time()
+                        .with_ansi(false)
+                        .with_env_filter("off,frankenterm_core::runtime=debug")
+                        .with_writer(capture.clone())
+                        .finish(),
+                );
+                let task = tracing::dispatcher::with_default(&diagnostic_dispatch, || {
+                    runtime.spawn_connector_outbound_task().unwrap()
+                });
                 assert_eq!(bus.subscriber_count(), 1, "subscriber must be registered before startup returns");
-                assert_eq!(bus.publish(connector_outbound_model_event()), 1);
-                assert_eq!(bus.publish(connector_outbound_model_event()), 1);
+                let mut event = connector_outbound_model_event();
+                let Event::PatternDetected { detection, .. } = &mut event else { unreachable!() };
+                detection.matched_text = "SYNTHETIC_PRIVATE_PANE_CANARY".to_string();
+                detection.extracted = serde_json::json!({ "synthetic": "SYNTHETIC_PRIVATE_PAYLOAD_CANARY" });
+                assert_eq!(bus.publish(event.clone()), 1);
+                assert_eq!(bus.publish(event), 1);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     if bridge.lock().unwrap().telemetry().events_received == 2 { break; }
                     assert!(Instant::now() < deadline, "subscriber stalled: {scenario}");
                     sleep(Duration::from_millis(1)).await;
                 }
-                // Cross an actual subscriber timeout tick, then settle its
-                // owned task before checking that no retry appeared.
-                sleep(Duration::from_millis(CONNECTOR_OUTBOUND_BRIDGE_TICK_MS + 10)).await;
+                // Observe the actual subscriber timeout branch, rather than
+                // treating a sleep interval as evidence that it was polled.
+                let tick_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if capture.records().iter().any(|record| {
+                        record["fields"]["tick_kind"] == "connector_outbound_idle"
+                    }) { break; }
+                    assert!(Instant::now() < tick_deadline, "subscriber tick missing: {scenario}");
+                    sleep(Duration::from_millis(1)).await;
+                }
                 runtime.shutdown_flag.store(true, Ordering::SeqCst);
                 runtime_timeout(&runtime_loop_cx(), Duration::from_secs(5), task).await.unwrap().unwrap();
+                let records = capture.records();
+                let outcome_records: Vec<_> = records.iter()
+                    .filter(|record| record["fields"]["error_code"].is_string()).collect();
+                assert_eq!(outcome_records.len(), 1, "once-only outcome: {scenario}");
+                let fields = &outcome_records[0]["fields"];
+                assert_eq!(outcome_records[0]["target"], "frankenterm_core::runtime");
+                assert_eq!(fields["delivered"], false);
+                assert_eq!(fields["correlation_hash"], connector_diagnostic_hash("event:123"));
+                let expected_code = match scenario {
+                    "admitted" => "connector_transport_unavailable",
+                    "policy_denied" => "connector_admission_denied",
+                    _ => "connector_routing_failed",
+                };
+                assert_eq!(fields["error_code"], expected_code, "{scenario}");
+                if scenario == "policy_denied" {
+                    assert_eq!(fields["rule_hash"], connector_diagnostic_hash("model-rule"));
+                    assert_eq!(fields["denial_hash"], format!("Some({:?})", connector_diagnostic_hash("policy.kill_switch")));
+                    assert_eq!(fields["message"], "connector outbound action denied before planning");
+                } else {
+                    let expected_reason = if scenario == "admitted" {
+                        expected_code.to_string()
+                    } else {
+                        format!("routing failed: {scenario}")
+                    };
+                    assert_eq!(fields["reason_code"], expected_reason, "{scenario}");
+                    assert_eq!(fields["error_kind"], "permanent");
+                    assert_eq!(fields["message"], "connector outbound action was not dispatched");
+                }
+                let captured = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+                for private in ["SYNTHETIC_PRIVATE_PANE_CANARY", "SYNTHETIC_PRIVATE_PAYLOAD_CANARY", "event:123", "model-rule", "policy.kill_switch"] {
+                    assert!(!captured.contains(private), "runtime diagnostic exposed canary: {scenario}");
+                }
+                let idle_ticks = records.iter().filter(|record| record["fields"]["tick_kind"] == "connector_outbound_idle").count();
+                assert!(idle_ticks > 0);
+                eprintln!("CONNECTOR_SUBSCRIBER_DIAGNOSTIC {}", serde_json::json!({
+                    "scenario": scenario, "error_code": fields["error_code"],
+                    "reason_code": fields["reason_code"], "delivered": fields["delivered"],
+                    "correlation_hash": fields["correlation_hash"], "outcome_records": outcome_records.len(),
+                    "idle_ticks_observed": idle_ticks, "capture_bytes": captured.len()
+                }));
                 let guard = bridge.lock().unwrap();
                 assert_eq!(format!("{:?}", guard.policy_engine().connector_mesh()), before_mesh, "{scenario}");
                 assert_eq!(guard.policy_engine().connector_host_runtime(), &before_host, "{scenario}");
