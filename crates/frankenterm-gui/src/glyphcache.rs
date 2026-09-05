@@ -3525,6 +3525,394 @@ mod tests {
         assert_eq!(second.failed_glyphs, 0);
     }
 
+    // Preparation for 4tenz.8.7: the actual CPU font/raster/atlas path, using
+    // ImageTexture instead of a GPU. This deliberately does not call TermWindow,
+    // open a window, or claim first-paint/presentation timing. The production
+    // 16ms warmup default is unchanged. Only sprite-local bytes are comparable:
+    // warmup may legitimately change atlas packing and sprite coordinates.
+    mod zoom_warmup_experiment {
+        use super::*;
+
+        const BUDGETS_MS: [u64; 4] = [0, 2, 4, 16];
+        const PHASES: [(&str, f64); 4] = [
+            ("cold_glyph_cache", 1.25),
+            ("warm_same_metrics", 1.25),
+            ("scale_down", 0.875),
+            ("scale_reverse", 1.25),
+        ];
+        // Built-in JetBrains Mono and Noto Color Emoji provide these scripts.
+        // No operator font lookup is permitted. CJK and RTL are not qualified
+        // by this corpus; they need additional pinned fixture font faces.
+        const DEMANDS: [&str; 5] = ["A fi != ", "e\u{301}", "αβγ", "ЖЯ", "🙂"];
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct GlyphWitness {
+            face: String,
+            glyph_pos: u32,
+            cluster: u32,
+            num_cells: u8,
+            shaping_bits: [u64; 4],
+            raster_bits: [u64; 6],
+            brightness_bits: u32,
+            has_color: bool,
+            bitmap: Option<(usize, usize, Vec<u8>)>,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum OracleError {
+            MissingGlyph,
+            MissingBitmap,
+            StaleOrDifferentOutput,
+        }
+
+        struct PhaseSample {
+            metric: CellMetricKey,
+            glyphs: Vec<GlyphWitness>,
+            warmup: GlyphWarmupStats,
+            transition_ns: u128,
+            warmup_wall_ns: u128,
+            demand_shape_ns: u128,
+            demand_raster_ns: u128,
+            cpu_path_wall_ns: u128,
+            demand_hits: usize,
+            demand_misses: usize,
+            atlas_version_delta: u64,
+            resident_glyphs: usize,
+        }
+
+        fn fixture() -> (GlyphCache, RenderMetrics) {
+            static LOGGING: std::sync::Once = std::sync::Once::new();
+            LOGGING.call_once(|| {
+                if let Err(err) = env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("warn"),
+                )
+                .is_test(true)
+                .try_init()
+                {
+                    eprintln!("zoom diagnostic retains the existing logger: {err}");
+                }
+            });
+            let (cache, metrics) = test_glyph_cache_with_atlas_size(2048);
+            assert_eq!(
+                cache.fonts.config().font_locator,
+                config::FontLocatorSelection::ConfigDirsOnly,
+                "the diagnostic must never use operator font discovery"
+            );
+            (cache, metrics)
+        }
+
+        fn witness(
+            font: &LoadedFont,
+            info: &GlyphInfo,
+            glyph: &CachedGlyph,
+        ) -> Result<GlyphWitness, OracleError> {
+            if info.glyph_pos == 0 {
+                return Err(OracleError::MissingGlyph);
+            }
+            let bitmap = if let Some(sprite) = &glyph.texture {
+                let width = usize::try_from(sprite.coords.size.width).unwrap();
+                let height = usize::try_from(sprite.coords.size.height).unwrap();
+                let mut image = Image::new(width, height);
+                sprite.texture.read(sprite.coords, &mut image).unwrap();
+                let pixels = image.pixel_data_slice().to_vec();
+                if !info.is_space && !pixels.chunks_exact(4).any(|pixel| pixel[3] != 0) {
+                    return Err(OracleError::MissingBitmap);
+                }
+                Some((width, height, pixels))
+            } else if info.is_space {
+                None
+            } else {
+                return Err(OracleError::MissingBitmap);
+            };
+            let handles = font.clone_handles();
+            Ok(GlyphWitness {
+                face: handles[info.font_idx].names().full_name.clone(),
+                glyph_pos: info.glyph_pos,
+                cluster: info.cluster,
+                num_cells: info.num_cells,
+                shaping_bits: [
+                    info.x_advance.get().to_bits(),
+                    info.y_advance.get().to_bits(),
+                    info.x_offset.get().to_bits(),
+                    info.y_offset.get().to_bits(),
+                ],
+                raster_bits: [
+                    glyph.x_advance.get().to_bits(),
+                    glyph.x_offset.get().to_bits(),
+                    glyph.y_offset.get().to_bits(),
+                    glyph.bearing_x.get().to_bits(),
+                    glyph.bearing_y.get().to_bits(),
+                    glyph.scale.to_bits(),
+                ],
+                brightness_bits: glyph.brightness_adjust.to_bits(),
+                has_color: glyph.has_color,
+                bitmap,
+            })
+        }
+
+        fn compare(expected: &[GlyphWitness], actual: &[GlyphWitness]) -> Result<(), OracleError> {
+            if expected == actual && !actual.is_empty() {
+                Ok(())
+            } else {
+                Err(OracleError::StaleOrDifferentOutput)
+            }
+        }
+
+        fn phase(cache: &mut GlyphCache, scale: f64, budget_ms: u64) -> PhaseSample {
+            let started = Instant::now();
+            if cache.fonts.get_font_scale().to_bits() != scale.to_bits() {
+                cache.fonts.change_scaling(scale, 96);
+            }
+            let metrics = RenderMetrics::new(&cache.fonts).unwrap();
+            let metric = CellMetricKey::from(&metrics);
+            cache.evict_stale_cell_metrics(metric);
+            let transition_ns = started.elapsed().as_nanos();
+            let atlas_before = cache.atlas.version();
+            let warmup_started = Instant::now();
+            let warmup = cache.warm_up_default_glyphs(&metrics, Duration::from_millis(budget_ms));
+            // The public stats start after default-plan allocation, so retain
+            // the complete call cost separately, including the zero-budget case.
+            let warmup_wall_ns = warmup_started.elapsed().as_nanos();
+            let style = TextStyle::default();
+            let shape_started = Instant::now();
+            let font = cache.fonts.resolve_font(&style).unwrap();
+            let runs: Vec<_> = DEMANDS
+                .iter()
+                .map(|text| {
+                    let infos = font
+                        .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                        .unwrap();
+                    assert!(!infos.is_empty(), "demanded text must produce glyphs");
+                    assert!(
+                        infos.iter().all(|info| info.glyph_pos != 0),
+                        "missing fixture glyph: .notdef must not count as parity"
+                    );
+                    infos
+                })
+                .collect();
+            let demand_shape_ns = shape_started.elapsed().as_nanos();
+            let raster_started = Instant::now();
+            let mut resolved = Vec::new();
+            let mut demand_hits = 0;
+            let mut demand_misses = 0;
+            for infos in &runs {
+                for (index, info) in infos.iter().enumerate() {
+                    // Match glyph_infos_to_glyphs: use the shaped cell span and
+                    // the following glyph's spacing, not text character count.
+                    let followed_by_space = infos.get(index + 1).is_some_and(|next| next.is_space);
+                    let (glyph, hit) = cache
+                        .cached_glyph_for_subpixel_bin_with_status(
+                            info,
+                            &style,
+                            followed_by_space,
+                            &font,
+                            &metrics,
+                            info.num_cells,
+                            SubpixelBin::Quarter0,
+                        )
+                        .unwrap();
+                    demand_hits += usize::from(hit);
+                    demand_misses += usize::from(!hit);
+                    resolved.push((info, glyph));
+                }
+            }
+            let demand_raster_ns = raster_started.elapsed().as_nanos();
+            let cpu_path_wall_ns = started.elapsed().as_nanos();
+            // Readback and comparison are deliberately outside the timed path.
+            let glyphs = resolved
+                .iter()
+                .map(|(info, glyph)| witness(&font, info, glyph).unwrap())
+                .collect();
+            PhaseSample {
+                metric,
+                glyphs,
+                warmup,
+                transition_ns,
+                warmup_wall_ns,
+                demand_shape_ns,
+                demand_raster_ns,
+                cpu_path_wall_ns,
+                demand_hits,
+                demand_misses,
+                atlas_version_delta: cache.atlas.version() - atlas_before,
+                resident_glyphs: cache.glyph_cache.len(),
+            }
+        }
+
+        fn trial(budget_ms: u64) -> Vec<PhaseSample> {
+            let (mut cache, _) = fixture();
+            let samples: Vec<_> = PHASES
+                .iter()
+                .map(|(_, scale)| phase(&mut cache, *scale, budget_ms))
+                .collect();
+            assert_eq!(samples[0].metric, samples[1].metric);
+            assert_ne!(samples[1].metric, samples[2].metric);
+            assert_eq!(samples[0].metric, samples[3].metric);
+            assert_eq!(samples[1].demand_misses, 0);
+            assert_eq!(samples[1].demand_hits, samples[1].glyphs.len());
+            assert_eq!(compare(&samples[0].glyphs, &samples[1].glyphs), Ok(()));
+            assert_eq!(compare(&samples[0].glyphs, &samples[3].glyphs), Ok(()));
+            if budget_ms == 0 {
+                for sample in &samples {
+                    assert_eq!(sample.warmup.attempted_requests, 0);
+                    assert_eq!(sample.warmup.warmed_glyphs, 0);
+                }
+                assert!(samples[0].demand_misses > 0);
+                assert!(samples[2].demand_misses > 0);
+                assert!(samples[3].demand_misses > 0);
+            }
+            samples
+        }
+
+        #[test]
+        fn budgets_preserve_demanded_pixels_across_scale_changes() {
+            let baseline = trial(0);
+            for budget_ms in BUDGETS_MS.into_iter().skip(1) {
+                for (expected, actual) in baseline.iter().zip(trial(budget_ms)) {
+                    assert_eq!(expected.metric, actual.metric);
+                    assert_eq!(compare(&expected.glyphs, &actual.glyphs), Ok(()));
+                }
+            }
+        }
+
+        #[test]
+        fn oracle_rejects_stale_metric_and_missing_glyph_cache_entries() {
+            let (mut cache, old_metrics) = fixture();
+            let style = TextStyle::default();
+            let old_font = cache.fonts.resolve_font(&style).unwrap();
+            let old_info = old_font
+                .blocking_shape("A", None, Direction::LeftToRight, None, None)
+                .unwrap()
+                .remove(0);
+            let stale = cache
+                .cached_glyph(&old_info, &style, false, &old_font, &old_metrics, 1)
+                .unwrap();
+            cache.fonts.change_scaling(1.5, 96);
+            let metrics = RenderMetrics::new(&cache.fonts).unwrap();
+            assert_ne!(
+                CellMetricKey::from(&old_metrics),
+                CellMetricKey::from(&metrics)
+            );
+            cache.evict_stale_cell_metrics((&metrics).into());
+            let font = cache.fonts.resolve_font(&style).unwrap();
+            let info = font
+                .blocking_shape("A", None, Direction::LeftToRight, None, None)
+                .unwrap()
+                .remove(0);
+            let correct = cache
+                .cached_glyph(&info, &style, false, &font, &metrics, 1)
+                .unwrap();
+            let expected = witness(&font, &info, &correct).unwrap();
+            assert_eq!(compare(&[expected.clone()], &[expected.clone()]), Ok(()));
+            let key = cache
+                .glyph_cache
+                .iter()
+                .find(|(_, value)| Rc::ptr_eq(value, &correct))
+                .map(|(key, _)| key.clone())
+                .unwrap();
+
+            // Plant old-scale pixels under a current, production-generated key.
+            // The real lookup must hit the canary; the output oracle must fail.
+            cache.glyph_cache.insert(key.clone(), stale);
+            let (corrupt, hit) = cache
+                .cached_glyph_for_subpixel_bin_with_status(
+                    &info, &style, false, &font, &metrics, 1, SubpixelBin::Quarter0,
+                )
+                .unwrap();
+            assert!(hit);
+            assert_eq!(
+                compare(&[expected], &[witness(&font, &info, &corrupt).unwrap()]),
+                Err(OracleError::StaleOrDifferentOutput)
+            );
+
+            cache.glyph_cache.insert(
+                key,
+                Rc::new(CachedGlyph {
+                    texture: None,
+                    has_color: correct.has_color,
+                    brightness_adjust: correct.brightness_adjust,
+                    x_offset: correct.x_offset,
+                    y_offset: correct.y_offset,
+                    x_advance: correct.x_advance,
+                    bearing_x: correct.bearing_x,
+                    bearing_y: correct.bearing_y,
+                    scale: correct.scale,
+                }),
+            );
+            let missing = cache
+                .cached_glyph(&info, &style, false, &font, &metrics, 1)
+                .unwrap();
+            assert_eq!(
+                witness(&font, &info, &missing),
+                Err(OracleError::MissingBitmap)
+            );
+            let mut notdef = info.clone();
+            notdef.glyph_pos = 0;
+            assert_eq!(
+                witness(&font, &notdef, &correct),
+                Err(OracleError::MissingGlyph)
+            );
+        }
+
+        #[test]
+        #[ignore = "CPU GlyphCache diagnostic only; run exact filter with --ignored --nocapture"]
+        fn paired_budget_diagnostic() {
+            let baseline = trial(0);
+            for round in 0..10 {
+                // Rotate ordering to avoid making one budget the universal
+                // cold-start or final sample. Cold here means glyph cache, not
+                // OS/font-database/process coldness or a native cold launch.
+                for offset in 0..BUDGETS_MS.len() {
+                    let budget_ms = BUDGETS_MS[(round + offset) % BUDGETS_MS.len()];
+                    for (phase_index, sample) in trial(budget_ms).into_iter().enumerate() {
+                        assert_eq!(
+                            compare(&baseline[phase_index].glyphs, &sample.glyphs),
+                            Ok(())
+                        );
+                        println!(
+                            "ZOOM_WARMUP_CPU_SAMPLE {}",
+                            serde_json::json!({
+                                "claim_scope": "cpu_glyphcache_diagnostic_only",
+                                "round": round,
+                                "phase": PHASES[phase_index].0,
+                                "scale": PHASES[phase_index].1,
+                                "budget_ms": budget_ms,
+                                "dpi": 96,
+                                "cell_width": sample.metric.pixel_width,
+                                "cell_height": sample.metric.pixel_height,
+                                "transition_ns": sample.transition_ns,
+                                "warmup_wall_ns": sample.warmup_wall_ns,
+                                "warmup_inner_ns": sample.warmup.elapsed.as_nanos(),
+                                "demand_shape_ns": sample.demand_shape_ns,
+                                "demand_raster_ns": sample.demand_raster_ns,
+                                "cpu_path_wall_ns": sample.cpu_path_wall_ns,
+                                "warmup_requests": sample.warmup.attempted_requests,
+                                "warmed_glyphs": sample.warmup.warmed_glyphs,
+                                "warmup_hits": sample.warmup.cache_hits,
+                                "warmup_failures": sample.warmup.failed_glyphs,
+                                "budget_exhausted": sample.warmup.budget_exhausted,
+                                "demand_hits": sample.demand_hits,
+                                "demand_misses": sample.demand_misses,
+                                "atlas_version_delta": sample.atlas_version_delta,
+                                "resident_glyphs": sample.resident_glyphs,
+                                "glyph_count": sample.glyphs.len(),
+                                "byte_and_metric_equivalence": true,
+                                "texture_backend": "ImageTexture_cpu",
+                                "os": std::env::consts::OS,
+                                "arch": std::env::consts::ARCH,
+                                "resolved_faces": sample.glyphs.iter()
+                                    .map(|glyph| glyph.face.as_str())
+                                    .collect::<std::collections::BTreeSet<_>>(),
+                                "unproven_corpus": ["cjk", "rtl"],
+                                "presented_frames": 0,
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn cached_subpixel_glyph_bins_materializes_four_cache_variants() {
         let (mut cache, metrics) = test_glyph_cache();
