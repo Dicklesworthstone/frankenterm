@@ -124108,15 +124108,12 @@ printf x > "$MINISIGN_MARKER"
         let handler_dir = dir.path().to_path_buf();
         let expected_region = cx.region_id();
         let expected_task = cx.task_id();
-        let expected_caps = frankenterm_core::cx::effective_capability_bits(&cx);
+        let expected_caps = cx.capabilities().effective;
         let artifact_test = actual_ft.is_some();
         let handler: IpcRpcHandler = Arc::new(move |request| {
             assert_eq!(request.cx.region_id(), expected_region);
             assert_eq!(request.cx.task_id(), expected_task);
-            assert_eq!(
-                frankenterm_core::cx::effective_capability_bits(&request.cx),
-                expected_caps
-            );
+            assert_eq!(request.cx.capabilities().effective, expected_caps);
             assert!(request.deadline > std::time::Instant::now());
             let storage = Arc::clone(&handler_storage);
             let observed = Arc::clone(&handler_observed);
