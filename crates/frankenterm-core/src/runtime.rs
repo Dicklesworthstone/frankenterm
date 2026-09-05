@@ -15166,7 +15166,7 @@ mod tests {
                 dispatch_connector_outbound_action(&mut bridge, &action, 50_000).unwrap_err();
             match scenario {
                 "admitted" => {
-                    assert_eq!(error, ConnectorOutboundDeliveryError::TransportUnavailable)
+                    assert_eq!(error, ConnectorOutboundDeliveryError::TransportUnavailable);
                 }
                 "policy_denied" => assert_eq!(error, ConnectorOutboundDeliveryError::Denied),
                 reason => assert_eq!(

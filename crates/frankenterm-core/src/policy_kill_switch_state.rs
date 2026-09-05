@@ -663,7 +663,7 @@ pub(crate) mod tests {
 
     /// Runs the real transition API in a separately owned test process. The
     /// output contains only state/control receipts, never captured pane text.
-    pub(crate) fn transition_in_test_process(path: &Path, operation: &str) -> String {
+    pub fn transition_in_test_process(path: &Path, operation: &str) -> String {
         use std::io::Read;
         fn drain(pipe: impl Read) -> std::io::Result<Vec<u8>> {
             let mut bytes = Vec::new();

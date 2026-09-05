@@ -242,7 +242,8 @@ fn expected_release_asset_names() -> BTreeSet<String> {
 fn release_asset_size_limit(name: &str) -> Option<u64> {
     match name {
         "FrankenTerm-darwin-arm64.app.tar.xz" => Some(4 * 1024 * 1024 * 1024),
-        name if name.ends_with(".tar.xz") || name.ends_with(".zip") => Some(1024 * 1024 * 1024),
+        // Archive limits apply to canonical release assets, including casing.
+        name if RELEASE_PRIMARY_ASSETS.contains(&name) => Some(1024 * 1024 * 1024),
         name if name.ends_with(".sha256") => Some(4096),
         name if name.ends_with(".minisig") => Some(65_536),
         "SHA256SUMS" => Some(65_536),
@@ -123748,7 +123749,7 @@ printf x > "$MINISIGN_MARKER"
             vec!["--format", "toon", "watch-events", "--follow"],
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
-            let error = sanitize_ipc_rpc_args(&args).err().expect("stream rejected");
+            let error = sanitize_ipc_rpc_args(&args).expect_err("stream rejected");
             assert_eq!(error.code, "ipc.rpc_streaming_unsupported");
             assert!(error.hint.unwrap().contains("SubscribeEvents"));
         }
@@ -124222,8 +124223,7 @@ printf x > "$MINISIGN_MARKER"
             Some("ipc.rpc_streaming_unsupported")
         );
         assert_eq!(rejected.rpc.unwrap().admission, IpcRpcAdmission::NotStarted);
-        let mut shutdown_stream = None;
-        if !artifact_test {
+        let shutdown_stream = if !artifact_test {
             for case in 0..5 {
                 let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
                 writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", case.to_string()]})).unwrap();
@@ -124267,8 +124267,10 @@ printf x > "$MINISIGN_MARKER"
                 assert!(std::time::Instant::now() < bound);
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5)).await;
             }
-            shutdown_stream = Some(stream);
-        }
+            Some(stream)
+        } else {
+            None
+        };
         shutdown_tx.reserve(&cx).await.unwrap().send(());
         frankenterm_core::runtime_async::timeout_with_cx(
             &cx,
