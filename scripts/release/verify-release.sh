@@ -24,7 +24,8 @@
 #   3. bounded regular-file sizes, manifest hashes/sizes, and exact checksum
 #      sidecar contents;
 #   4. every Minisign signature against the tracked release/minisign.pub key;
-#   5. online release/tag identity bound to the manifest source commit.
+#   5. archive member inventories accepted by the production installer;
+#   6. online release/tag identity bound to the manifest source commit.
 #
 # This preserves the v0.15.1 negative contract: its four-artifact unsigned
 # build output cannot satisfy the current strict five-artifact release plan.
@@ -284,6 +285,127 @@ verify_exact_inventory() {
   done
 }
 
+verify_archive_inventory() {
+  local name="$1"
+  local archive_kind manifest_name
+  case "$name" in
+    ft-darwin-arm64.tar.xz)
+      archive_kind="process-tar"
+      manifest_name="ft-darwin-arm64.component-manifest.json"
+      ;;
+    ft-linux-amd64.tar.xz)
+      archive_kind="process-tar"
+      manifest_name="ft-linux-amd64.component-manifest.json"
+      ;;
+    ft-linux-arm64.tar.xz)
+      archive_kind="process-tar"
+      manifest_name="ft-linux-arm64.component-manifest.json"
+      ;;
+    ft-windows-amd64.zip)
+      archive_kind="process-zip"
+      manifest_name=""
+      ;;
+    FrankenTerm-darwin-arm64.app.tar.xz)
+      archive_kind="app-tar"
+      manifest_name="FrankenTerm.app.component-manifest.json"
+      ;;
+    *)
+      bad "$name has no production archive-inventory contract"
+      return
+      ;;
+  esac
+
+  if python3 - "$ASSETS_DIR/$name" "$archive_kind" "$manifest_name" <<'PY'
+import posixpath
+import stat
+import sys
+import tarfile
+import zipfile
+
+archive_path, archive_kind, manifest_name = sys.argv[1:]
+max_entries = 1_000_000
+max_name_bytes = 64 * 1024 * 1024
+
+
+def canonical_name(name):
+    if (not name or name.startswith("/") or posixpath.normpath(name) != name or
+            name in (".", "..") or name.startswith("../")):
+        raise SystemExit("archive contains a non-canonical member name")
+    return name
+
+
+if archive_kind in ("process-tar", "app-tar"):
+    members = []
+    name_bytes = 0
+    with tarfile.open(archive_path, mode="r:xz") as archive:
+        for member in archive:
+            if len(members) >= max_entries:
+                raise SystemExit("archive exceeds its member-count bound")
+            name = canonical_name(member.name)
+            name_bytes += len(name.encode("utf-8", "surrogateescape"))
+            if name_bytes > max_name_bytes:
+                raise SystemExit("archive exceeds its member-name bound")
+            if member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                raise SystemExit("archive contains a hard link or special member")
+            members.append((name, member))
+    names = [name for name, _ in members]
+    if len(names) != len(set(names)):
+        raise SystemExit("archive contains duplicate member names")
+    if archive_kind == "process-tar":
+        expected = {
+            "ft",
+            "frankenterm-mux-server",
+            "frankenterm-pty-guardian",
+            "verify-components.sh",
+            manifest_name,
+        }
+        if set(names) != expected or any(not member.isfile() for _, member in members):
+            raise SystemExit("Unix process-family archive violates the exact five-file installer contract")
+    else:
+        by_name = dict(members)
+        if (set(name.split("/", 1)[0] for name in names) !=
+                {"FrankenTerm.app", manifest_name} or
+                manifest_name not in by_name or not by_name[manifest_name].isfile() or
+                "FrankenTerm.app" not in by_name or not by_name["FrankenTerm.app"].isdir()):
+            raise SystemExit("application archive violates its exact top-level installer contract")
+        for name, member in members:
+            if member.issym():
+                target = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(name), member.linkname)
+                )
+                if target != "FrankenTerm.app" and not target.startswith("FrankenTerm.app/"):
+                    raise SystemExit("application archive symlink escapes the bundle")
+elif archive_kind == "process-zip":
+    with zipfile.ZipFile(archive_path) as archive:
+        infos = archive.infolist()
+        if len(infos) > max_entries:
+            raise SystemExit("archive exceeds its member-count bound")
+        names = [canonical_name(info.filename) for info in infos]
+        if sum(len(name.encode("utf-8", "surrogateescape")) for name in names) > max_name_bytes:
+            raise SystemExit("archive exceeds its member-name bound")
+        if len(names) != len(set(names)):
+            raise SystemExit("archive contains duplicate member names")
+        expected = {
+            "ft.exe",
+            "frankenterm-mux-server.exe",
+            "frankenterm-pty-guardian.exe",
+        }
+        if set(names) != expected or any(info.is_dir() for info in infos):
+            raise SystemExit("Windows process-family archive violates its exact executable contract")
+        for info in infos:
+            mode = info.external_attr >> 16
+            if mode and stat.S_ISLNK(mode):
+                raise SystemExit("Windows process-family archive contains a symlink")
+else:
+    raise SystemExit("unknown release archive kind")
+PY
+  then
+    good "$name satisfies its production installer archive-inventory contract"
+  else
+    bad "$name violates its production installer archive-inventory contract"
+  fi
+}
+
 resolve_remote_tag_sha() {
   local ref_json object_type object_sha tag_json depth
   ref_json="$(gh api --method GET "repos/$OWNER_REPO/git/ref/tags/$TAG" 2>/dev/null)" || return 1
@@ -445,6 +567,8 @@ for name in "${BASE_ASSETS[@]}"; do
   else
     good "$name.minisig verifies against release/minisign.pub"
   fi
+
+  verify_archive_inventory "$name"
 done
 
 if ! cmp -s "$ASSETS_DIR/SHA256SUMS" <(

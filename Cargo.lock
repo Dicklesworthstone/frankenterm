@@ -402,6 +402,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots",
  "windows-sys 0.61.2",
  "x509-parser",
  "xattr",

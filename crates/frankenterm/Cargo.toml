@@ -67,7 +67,7 @@ sha2.workspace = true
 hex.workspace = true
 tar.workspace = true
 zstd.workspace = true
-asupersync = { workspace = true, features = ["tls"] }
+asupersync = { workspace = true, features = ["tls-webpki-roots"] }
 
 [target.'cfg(unix)'.dependencies]
 frankensearch-index-acl.workspace = true
