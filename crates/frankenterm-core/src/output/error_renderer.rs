@@ -66,7 +66,7 @@ impl ErrorRenderer {
                 WeztermError::CircuitOpen { .. } => "FT-1030",
             },
             Error::Storage(e) => match e {
-                StorageError::Database(_) => "FT-2001",
+                StorageError::Database(_) | StorageError::WriterBusyNotCommitted => "FT-2001",
                 StorageError::WriterBackendEpochPoisoned => "FT-2005",
                 StorageError::MigrationEpochPoisoned => "FT-2006",
                 StorageError::BackendEpochPoisoned => "FT-2007",
@@ -665,6 +665,10 @@ mod tests {
 
     #[test]
     fn error_code_storage_all_variants() {
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(StorageError::WriterBusyNotCommitted)),
+            "FT-2001"
+        );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::Database("x".into()))),
             "FT-2001"

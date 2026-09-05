@@ -1358,6 +1358,7 @@ impl ShardedWeztermClient {
             },
             crate::Error::Storage(error) => crate::Error::Storage(match error {
                 StorageError::Database(_) => StorageError::Database(finite_detail()),
+                StorageError::WriterBusyNotCommitted => StorageError::WriterBusyNotCommitted,
                 StorageError::WriterBackendEpochPoisoned => {
                     StorageError::WriterBackendEpochPoisoned
                 }

@@ -570,6 +570,9 @@ pub fn is_retryable(error: &Error) -> bool {
         // Storage errors - only generic database errors are retryable (lock conflicts)
         Error::Storage(e) => match e {
             StorageError::Database(_) => true, // Might be transient lock conflict
+            // Only the append stage owns this retry. A compound operation may
+            // have committed an earlier stage before its current BEGIN failed.
+            StorageError::WriterBusyNotCommitted => false,
             StorageError::WriterBackendEpochPoisoned => false, // Must reopen the storage handle
             StorageError::BackendEpochPoisoned => false, // Must reopen/discard the backend loan
             StorageError::MigrationEpochPoisoned => false, // Must reopen the migration connection
@@ -1886,6 +1889,13 @@ mod tests {
         assert!(is_retryable(&Error::Storage(StorageError::Database(
             "SQLITE_BUSY".into()
         ))));
+    }
+
+    #[test]
+    fn writer_noncommit_authority_is_not_generic_compound_operation_retry_authority() {
+        assert!(!is_retryable(&Error::Storage(
+            crate::error::StorageError::WriterBusyNotCommitted,
+        )));
     }
 
     #[test]

@@ -1691,6 +1691,7 @@ mod tests {
             let segment = CapturedSegment {
                 pane_id: 1,
                 seq: 0,
+                seq_correction: 0,
                 content: format!("token {key}"),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 10,
@@ -2086,6 +2087,7 @@ mod tests {
         let segment = CapturedSegment {
             pane_id: 1,
             seq: 0,
+            seq_correction: 0,
             content: "dropped before start".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 10,
@@ -2157,6 +2159,7 @@ mod tests {
         let segment = CapturedSegment {
             pane_id: 1,
             seq: 0,
+            seq_correction: 0,
             content: "output data".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 50,
@@ -2197,6 +2200,7 @@ mod tests {
             .record_segment(&CapturedSegment {
                 pane_id: 42,
                 seq: 0,
+                seq_correction: 0,
                 content: "x".to_string(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 1,
@@ -2254,6 +2258,7 @@ mod tests {
             let seg1 = CapturedSegment {
                 pane_id: 1,
                 seq: 0,
+                seq_correction: 0,
                 content: "pane1_data".into(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 10,
@@ -2261,6 +2266,7 @@ mod tests {
             let seg2 = CapturedSegment {
                 pane_id: 2,
                 seq: 0,
+                seq_correction: 0,
                 content: "pane2_data".into(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 10,
@@ -2320,6 +2326,7 @@ mod tests {
             let segment = CapturedSegment {
                 pane_id: 999,
                 seq: 0,
+                seq_correction: 0,
                 content: "ghost".into(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 0,
@@ -2350,6 +2357,7 @@ mod tests {
             let segment = CapturedSegment {
                 pane_id: 7,
                 seq: 1,
+                seq_correction: 0,
                 content: "hello world".into(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 1_100,
@@ -2409,6 +2417,7 @@ mod tests {
             let segment = CapturedSegment {
                 pane_id: 11,
                 seq: 0,
+                seq_correction: 0,
                 content: "buffered".to_string(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 1_050,

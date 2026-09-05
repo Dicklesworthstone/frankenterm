@@ -804,14 +804,16 @@ struct RuntimeRecorderPersistence {
 }
 
 impl RuntimeRecorderPersistence {
-    fn new(storage: Arc<crate::recorder_storage::RecorderStorageInstance>) -> Self {
-        Self {
+    fn new(
+        storage: Arc<crate::recorder_storage::RecorderStorageInstance>,
+    ) -> std::result::Result<Self, crate::replay_capture::ReplayCaptureConfigError> {
+        Ok(Self {
             storage,
             capture: Arc::new(crate::replay_capture::CaptureAdapter::new(
                 Arc::new(crate::replay_capture::NoopCaptureSink),
                 crate::replay_capture::CaptureConfig::default(),
-            )),
-        }
+            )?),
+        })
     }
 }
 
@@ -4831,13 +4833,13 @@ impl ObservationRuntime {
 
     /// Route every authority-admitted, durably sequenced capture through the
     /// exact recorder backend selected during watcher startup.
-    #[must_use]
+    /// Reject invalid capture policy before installing the recorder.
     pub fn with_recorder_storage(
         mut self,
         storage: Arc<crate::recorder_storage::RecorderStorageInstance>,
-    ) -> Self {
-        self.recorder_persistence = Some(RuntimeRecorderPersistence::new(storage));
-        self
+    ) -> std::result::Result<Self, crate::replay_capture::ReplayCaptureConfigError> {
+        self.recorder_persistence = Some(RuntimeRecorderPersistence::new(storage)?);
+        Ok(self)
     }
 
     /// Set a replay capture adapter for extracting deterministic recorder events.
@@ -9291,13 +9293,13 @@ impl ObservationRuntime {
                                 continue;
                             };
                             let shift =
-                                cursor.realign_next_seq(captured_seq, persisted.segment.seq);
+                                cursor.realign_next_seq(&bounded_segment, persisted.segment.seq);
                             if shift != 0 {
                                 warn!(
                                     pane_id,
                                     expected_seq = captured_seq,
                                     actual_seq = persisted.segment.seq,
-                                    shift,
+                                    shift = %shift,
                                     next_seq = cursor.next_seq,
                                     "Sequence discontinuity detected, realigned producer cursor"
                                 );
@@ -9306,10 +9308,15 @@ impl ObservationRuntime {
                                     pane_id,
                                     expected_seq = captured_seq,
                                     actual_seq = persisted.segment.seq,
-                                    correction = cursor.seq_correction(),
+                                    correction = %cursor.seq_correction(),
                                     "Sequence discontinuity from a segment queued before the last realignment; offset already applied"
                                 );
                             }
+                        } else if let Some(cursor) = cursors.write().await.get_mut(&pane_id) {
+                            // Issuance metadata remains authoritative even
+                            // when numeric sequences match: other queued
+                            // captures may have changed the current correction.
+                            cursor.realign_next_seq(&bounded_segment, persisted.segment.seq);
                         }
 
                         if let Some(ref recorder) = recorder_persistence
@@ -9561,6 +9568,7 @@ impl ObservationRuntime {
                         }
                     }
                     Err(e) => {
+                        metrics::counter!("capture.persist.failures").increment(1);
                         error!(pane_id = pane_id, error = %e, "Failed to persist segment");
                         if let Some(decision) = resync_decision.as_mut() {
                             decision.finish(Err(e.to_string()));
@@ -12575,6 +12583,7 @@ mod tests {
                     CapturedSegment {
                         pane_id: u64::try_from(capacity).expect("bounded capacity"),
                         seq: 0,
+                        seq_correction: 0,
                         content: "queued data".to_string(),
                         kind: CapturedSegmentKind::Delta,
                         captured_at: 1_700_000_000_000,
@@ -12683,6 +12692,7 @@ mod tests {
             let segment = CapturedSegment {
                 pane_id,
                 seq: 0,
+                seq_correction: 0,
                 content: "predecessor output".to_string(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 1_700_000_000_000,
@@ -12811,6 +12821,7 @@ mod tests {
                     let segment = CapturedSegment {
                         pane_id,
                         seq: 0,
+                        seq_correction: 0,
                         content: "output".to_string(),
                         kind: CapturedSegmentKind::Delta,
                         captured_at: 1_700_000_000_000,
@@ -12922,6 +12933,7 @@ mod tests {
                     let segment = CapturedSegment {
                         pane_id,
                         seq: generation,
+                        seq_correction: 0,
                         content: "same-id output".to_string(),
                         kind: CapturedSegmentKind::Delta,
                         captured_at: 1_700_000_000_000,
@@ -14718,10 +14730,13 @@ mod tests {
             let event_bus = Arc::new(EventBus::new(16));
             let mut event_subscriber = event_bus.subscribe();
             let replay_sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-            let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
-                replay_sink.clone(),
-                crate::replay_capture::CaptureConfig::default(),
-            ));
+            let replay_adapter = Arc::new(
+                crate::replay_capture::CaptureAdapter::new(
+                    replay_sink.clone(),
+                    crate::replay_capture::CaptureConfig::default(),
+                )
+                .expect("valid capture configuration"),
+            );
             let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
             let runtime = ObservationRuntime::new(
                 RuntimeConfig::default(),
@@ -15636,10 +15651,12 @@ mod tests {
         let adapter = crate::replay_capture::CaptureAdapter::new(
             sink.clone(),
             crate::replay_capture::CaptureConfig::default(),
-        );
+        )
+        .expect("valid capture configuration");
         let captured = CapturedSegment {
             pane_id: 9,
             seq: 3,
+            seq_correction: 0,
             content: "durable sequence".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 1_700_000_000_000,
@@ -15682,16 +15699,20 @@ mod tests {
             .expect("capture source");
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        let adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
-            Arc::new(BlockingCaptureSink {
-                entered: entered_tx,
-                release: std::sync::Mutex::new(release_rx),
-            }),
-            crate::replay_capture::CaptureConfig::default(),
-        ));
+        let adapter = Arc::new(
+            crate::replay_capture::CaptureAdapter::new(
+                Arc::new(BlockingCaptureSink {
+                    entered: entered_tx,
+                    release: std::sync::Mutex::new(release_rx),
+                }),
+                crate::replay_capture::CaptureConfig::default(),
+            )
+            .expect("valid capture configuration"),
+        );
         let captured = CapturedSegment {
             pane_id: 9,
             seq: 0,
+            seq_correction: 0,
             content: "guarded replay egress".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 1_700_000_000_000,
@@ -15738,10 +15759,13 @@ mod tests {
                 .expect("persist test pane");
 
             let replay_sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-            let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
-                replay_sink.clone(),
-                crate::replay_capture::CaptureConfig::default(),
-            ));
+            let replay_adapter = Arc::new(
+                crate::replay_capture::CaptureAdapter::new(
+                    replay_sink.clone(),
+                    crate::replay_capture::CaptureConfig::default(),
+                )
+                .expect("valid capture configuration"),
+            );
             let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
             let runtime = ObservationRuntime::new(
                 RuntimeConfig::default(),
@@ -15799,6 +15823,7 @@ mod tests {
                         CapturedSegment {
                             pane_id,
                             seq: 0,
+                            seq_correction: 0,
                             content: "polling delta".to_string(),
                             kind: CapturedSegmentKind::Delta,
                             captured_at: 1_700_000_000_000,
@@ -15812,6 +15837,7 @@ mod tests {
                         CapturedSegment {
                             pane_id,
                             seq: 1,
+                            seq_correction: 0,
                             content: "streaming gap".to_string(),
                             kind: CapturedSegmentKind::Gap {
                                 reason: "streaming_resync".to_string(),
@@ -15827,6 +15853,7 @@ mod tests {
                         CapturedSegment {
                             pane_id,
                             seq: 2,
+                            seq_correction: 0,
                             content: "native delta".to_string(),
                             kind: CapturedSegmentKind::Delta,
                             captured_at: 1_700_000_000_002,
@@ -15969,6 +15996,7 @@ mod tests {
                 Arc::new(RwLock::new(PatternEngine::new())),
             )
             .with_recorder_storage(Arc::clone(&selected))
+            .expect("valid capture configuration")
             .with_wezterm_handle(wezterm);
 
             let pane = runtime
@@ -16006,6 +16034,7 @@ mod tests {
             let captured = CapturedSegment {
                 pane_id,
                 seq: 0,
+                seq_correction: 0,
                 content: "selected recorder payload".to_string(),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 1_700_000_000_100,
@@ -16131,10 +16160,13 @@ mod tests {
         };
         crate::storage::RecorderDeliverySeed {
             egress,
-            capture: Arc::new(crate::replay_capture::CaptureAdapter::new(
-                Arc::new(crate::replay_capture::NoopCaptureSink),
-                crate::replay_capture::CaptureConfig::default(),
-            )),
+            capture: Arc::new(
+                crate::replay_capture::CaptureAdapter::new(
+                    Arc::new(crate::replay_capture::NoopCaptureSink),
+                    crate::replay_capture::CaptureConfig::default(),
+                )
+                .expect("valid capture configuration"),
+            ),
             target_backend,
         }
     }
@@ -16295,7 +16327,8 @@ mod tests {
                         recorder_dir.path(),
                     ))
                     .expect("open selected recorder"),
-                ));
+                ))
+                .expect("valid capture configuration");
                 let cx = crate::cx::for_testing();
                 assert_eq!(
                     drain_runtime_recorder_deliveries_with_cx(
@@ -16373,7 +16406,8 @@ mod tests {
                 let recorder = RuntimeRecorderPersistence::new(Arc::new(
                     bootstrap_recorder_storage(recorder_config.clone())
                         .expect("open selected recorder"),
-                ));
+                ))
+                .expect("valid capture configuration");
                 let cx = crate::cx::for_testing();
                 let error = drain_runtime_recorder_deliveries_with_cx(
                     &cx,
@@ -16406,7 +16440,8 @@ mod tests {
                 let recorder = RuntimeRecorderPersistence::new(Arc::new(
                     bootstrap_recorder_storage(recorder_config)
                         .expect("reopen selected recorder after planted crash"),
-                ));
+                ))
+                .expect("valid capture configuration");
                 let cx = crate::cx::for_testing();
                 assert_eq!(
                     drain_runtime_recorder_deliveries_with_cx(
@@ -16523,7 +16558,8 @@ mod tests {
                 let recorder = RuntimeRecorderPersistence::new(Arc::new(
                     bootstrap_recorder_storage(recorder_config.clone())
                         .expect("open selected recorder"),
-                ));
+                ))
+                .expect("valid capture configuration");
                 assert_eq!(
                     drain_runtime_recorder_deliveries_with_cx(
                         &cx,
@@ -16613,7 +16649,8 @@ mod tests {
                     recorder_dir.path(),
                 ))
                 .expect("open selected recorder"),
-            ));
+            ))
+            .expect("valid capture configuration");
             let cancelled = crate::cx::for_testing();
             cancelled.cancel_with(crate::outcome::CancelKind::User, Some("planted failure"));
             drain_runtime_recorder_deliveries_with_cx(
@@ -16708,6 +16745,7 @@ mod tests {
         let captured = CapturedSegment {
             pane_id: 9,
             seq: 1,
+            seq_correction: 0,
             content: "cargo test failed\n".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 1_700_000_000_000,
@@ -16745,6 +16783,7 @@ mod tests {
         let captured = CapturedSegment {
             pane_id: 9,
             seq: 2,
+            seq_correction: 0,
             content: "full snapshot after overlap miss\n".to_string(),
             kind: CapturedSegmentKind::Gap {
                 reason: "overlap_not_found".to_string(),
@@ -17022,6 +17061,7 @@ mod tests {
             CapturedSegment {
                 pane_id,
                 seq,
+                seq_correction: 0,
                 content: "test".to_string(),
                 kind: crate::ingest::CapturedSegmentKind::Delta,
                 captured_at: epoch_ms(),
@@ -17044,6 +17084,7 @@ mod tests {
         CapturedSegment {
             pane_id,
             seq: u64::try_from(captured_at).unwrap_or(0),
+            seq_correction: 0,
             content,
             kind: crate::ingest::CapturedSegmentKind::Delta,
             captured_at,
@@ -17322,6 +17363,7 @@ mod tests {
         let empty_gap = CapturedSegment {
             pane_id: 7,
             seq: 2,
+            seq_correction: 0,
             content: String::new(),
             kind: crate::ingest::CapturedSegmentKind::Gap {
                 reason: "pane_closed".to_string(),
@@ -18137,13 +18179,16 @@ mod tests {
             let wezterm_handle: WeztermHandle = mock.clone();
 
             let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-            let adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
-                sink.clone(),
-                crate::replay_capture::CaptureConfig {
-                    session_id: Some("runtime-replay-test".to_string()),
-                    ..Default::default()
-                },
-            ));
+            let adapter = Arc::new(
+                crate::replay_capture::CaptureAdapter::new(
+                    sink.clone(),
+                    crate::replay_capture::CaptureConfig {
+                        session_id: Some("runtime-replay-test".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .expect("valid capture configuration"),
+            );
             let adapter_probe = adapter.clone();
 
             let mut runtime =

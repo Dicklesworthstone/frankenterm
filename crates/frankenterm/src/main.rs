@@ -41553,7 +41553,18 @@ struct IpcRpcArgError {
     hint: Option<String>,
 }
 
-fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError> {
+fn ipc_rpc_command_grammar() -> Arc<clap::Command> {
+    // Construct on the watcher startup thread, before spawning its IPC task.
+    // In debug builds the generated Commands builder alone exceeds 2 MiB;
+    // executing it on an RPC worker aborts the entire watcher. Each request
+    // instead parses a clone of this watcher-owned canonical grammar.
+    Arc::new(<Cli as clap::CommandFactory>::command())
+}
+
+fn sanitize_ipc_rpc_args(
+    grammar: &clap::Command,
+    args: &[String],
+) -> Result<Vec<String>, IpcRpcArgError> {
     let invalid = || IpcRpcArgError {
         code: "ipc.rpc_invalid_args",
         message: "RPC requires valid robot arguments and one JSON response".to_string(),
@@ -41564,7 +41575,8 @@ fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError>
     let command_line = ["ft", "robot"]
         .into_iter()
         .chain(args.iter().map(String::as_str));
-    let matches = <Cli as clap::CommandFactory>::command()
+    let matches = grammar
+        .clone()
         .try_get_matches_from(command_line)
         .map_err(|_| invalid())?;
     for option in ["workspace", "config"] {
@@ -42232,8 +42244,9 @@ async fn handle_ipc_rpc_request(
     workspace_root: PathBuf,
     config_path: Option<PathBuf>,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
+    grammar: Arc<clap::Command>,
 ) -> frankenterm_core::ipc::IpcResponse {
-    execute_ipc_rpc_request(request, storage, move |args| {
+    execute_ipc_rpc_request(request, storage, &grammar, move |args| {
         build_robot_rpc_command(args, config_path.as_deref(), &workspace_root)
     })
     .await
@@ -42242,6 +42255,7 @@ async fn handle_ipc_rpc_request(
 async fn execute_ipc_rpc_request<F>(
     request: frankenterm_core::ipc::IpcRpcRequest,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
+    grammar: &clap::Command,
     build_command: F,
 ) -> frankenterm_core::ipc::IpcResponse
 where
@@ -42274,7 +42288,7 @@ where
     } else if std::time::Instant::now() >= request.deadline {
         ipc_rpc_failure("ipc.rpc_deadline_exceeded")
     } else {
-        match sanitize_ipc_rpc_args(&request.args) {
+        match sanitize_ipc_rpc_args(grammar, &request.args) {
             Err(err) => {
                 frankenterm_core::ipc::IpcResponse::error_with_code(err.code, err.message, err.hint)
             }
@@ -42322,12 +42336,14 @@ fn build_ipc_rpc_handler(
     config_path: Option<PathBuf>,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
 ) -> frankenterm_core::ipc::IpcRpcHandler {
+    let grammar = ipc_rpc_command_grammar();
     Arc::new(move |request: frankenterm_core::ipc::IpcRpcRequest| {
         let workspace_root = workspace_root.clone();
         let config_path = config_path.clone();
         let storage = Arc::clone(&storage);
+        let grammar = Arc::clone(&grammar);
         Box::pin(async move {
-            handle_ipc_rpc_request(request, workspace_root, config_path, storage).await
+            handle_ipc_rpc_request(request, workspace_root, config_path, storage, grammar).await
         })
     })
 }
@@ -47381,7 +47397,7 @@ async fn run_watcher(
     // Create and start the observation runtime (with event bus for workflow integration)
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_tuning(config.tuning.clone())
-        .with_recorder_storage(Arc::clone(&recorder_storage))
+        .with_recorder_storage(Arc::clone(&recorder_storage))?
         .with_connector_inbound_bridge_config(
             frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
                 classifier: config.safety.data_classifier.clone(),
@@ -76192,6 +76208,7 @@ fn load_mission_tx_contract_from_guard(
                 hint: Some("16 MiB is the ft-99ybo mission/tx hostile-file DoS cap.".to_string()),
             },
             TxContractStoreErrorKind::InProgress
+            | TxContractStoreErrorKind::Conflict
             | TxContractStoreErrorKind::Lock
             | TxContractStoreErrorKind::Validation
             | TxContractStoreErrorKind::Serialization
@@ -77341,6 +77358,7 @@ fn tx_contract_store_mission_error_code(
     use frankenterm_core::tx_execution::TxContractStoreErrorKind;
 
     match kind {
+        TxContractStoreErrorKind::Conflict => "mission.tx.revision_conflict",
         TxContractStoreErrorKind::Validation => "mission.tx.validation_failed",
         TxContractStoreErrorKind::Serialization => "mission.tx.serialize_failed",
         TxContractStoreErrorKind::TooLarge => "mission.tx.oversize",
@@ -77355,10 +77373,14 @@ fn tx_contract_store_mission_error_code(
 fn tx_contract_lock_mission_error_code(
     kind: frankenterm_core::tx_execution::TxContractStoreErrorKind,
 ) -> &'static str {
-    if kind == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress {
-        "mission.tx.in_progress"
-    } else {
-        "mission.tx.lock_failed"
+    match kind {
+        frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress => {
+            "mission.tx.in_progress"
+        }
+        frankenterm_core::tx_execution::TxContractStoreErrorKind::Conflict => {
+            "mission.tx.revision_conflict"
+        }
+        _ => "mission.tx.lock_failed",
     }
 }
 
@@ -77371,6 +77393,7 @@ fn tx_contract_store_exit_code(
         TxContractStoreErrorKind::Validation => MISSION_EXIT_VALIDATION,
         TxContractStoreErrorKind::TooLarge => MISSION_EXIT_INVALID_INPUT,
         TxContractStoreErrorKind::InProgress
+        | TxContractStoreErrorKind::Conflict
         | TxContractStoreErrorKind::Lock
         | TxContractStoreErrorKind::Serialization
         | TxContractStoreErrorKind::Write
@@ -112692,10 +112715,9 @@ recorder_backend = "rusqlite"
     }
 
     async fn cleanup_storage(storage: StorageHandle, db_path: &str) {
-        let _ = storage.shutdown().await;
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}-wal"));
-        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        storage.shutdown().await.expect("settle owned test storage");
+        // Retain the database and any sidecars for inspection after the test.
+        println!("TEST_STORAGE_RETAINED path={db_path}");
     }
 
     #[cfg(feature = "distributed")]
@@ -124306,13 +124328,17 @@ printf x > "$MINISIGN_MARKER"
 
     #[test]
     fn ipc_rpc_validates_single_response_commands_before_launch() {
+        assert_ipc_rpc_single_response_syntax(&ipc_rpc_command_grammar());
+    }
+
+    fn assert_ipc_rpc_single_response_syntax(grammar: &clap::Command) {
         for args in [
             vec!["watch-events"],
             vec!["watch-event", "--follow"],
             vec!["--format", "toon", "watch-events", "--follow"],
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
-            let error = sanitize_ipc_rpc_args(&args).expect_err("stream rejected");
+            let error = sanitize_ipc_rpc_args(grammar, &args).expect_err("stream rejected");
             assert_eq!(error.code, "ipc.rpc_streaming_unsupported");
             assert!(error.hint.unwrap().contains("SubscribeEvents"));
         }
@@ -124325,7 +124351,7 @@ printf x > "$MINISIGN_MARKER"
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert!(
-                sanitize_ipc_rpc_args(&args).is_ok(),
+                sanitize_ipc_rpc_args(grammar, &args).is_ok(),
                 "finite syntax: {args:?}"
             );
         }
@@ -124337,7 +124363,7 @@ printf x > "$MINISIGN_MARKER"
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert_eq!(
-                sanitize_ipc_rpc_args(&args).ok(),
+                sanitize_ipc_rpc_args(grammar, &args).ok(),
                 Some(expected.into_iter().map(str::to_string).collect())
             );
         }
@@ -124348,16 +124374,20 @@ printf x > "$MINISIGN_MARKER"
             vec!["--config", "/private/config", "help"],
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
-            assert!(sanitize_ipc_rpc_args(&args).is_err());
+            assert!(sanitize_ipc_rpc_args(grammar, &args).is_err());
         }
     }
 
     #[test]
     fn ipc_rpc_validation_fits_bounded_worker_stack() {
+        let grammar = ipc_rpc_command_grammar();
         std::thread::Builder::new()
             .name("ipc-validation-stack".to_string())
             .stack_size(2 * 1024 * 1024)
-            .spawn(ipc_rpc_validates_single_response_commands_before_launch)
+            .spawn(move || {
+                assert_ipc_rpc_single_response_syntax(&grammar);
+                assert_ipc_rpc_single_response_syntax(&grammar);
+            })
             .expect("spawn bounded validation worker")
             .join()
             .expect("finite, streaming, alias and context validation on 2 MiB stack");
@@ -124464,6 +124494,7 @@ printf x > "$MINISIGN_MARKER"
     #[cfg(unix)]
     #[test]
     fn ipc_rpc_pre_admission_refusals_never_build_a_child_and_audit_truthfully() {
+        let grammar = ipc_rpc_command_grammar();
         run_async_test(async {
             use frankenterm_core::ipc::*;
             let (storage, db_path) = setup_storage("ipc_no_admission").await;
@@ -124504,10 +124535,11 @@ printf x > "$MINISIGN_MARKER"
                         "ipc.rpc_deadline_exceeded"
                     }
                 };
-                let response = execute_ipc_rpc_request(request, Arc::clone(&shared), |_| {
-                    panic!("no child construction before admission")
-                })
-                .await;
+                let response =
+                    execute_ipc_rpc_request(request, Arc::clone(&shared), &grammar, |_| {
+                        panic!("no child construction before admission")
+                    })
+                    .await;
                 assert_eq!(response.error_code.as_deref(), Some(code));
                 let receipt = response.rpc.unwrap();
                 assert_eq!(receipt.admission, IpcRpcAdmission::NotStarted);
@@ -124530,6 +124562,7 @@ printf x > "$MINISIGN_MARKER"
             let response = execute_ipc_rpc_request(
                 ipc_rpc_test_request(&["help"]),
                 Arc::clone(&shared),
+                &grammar,
                 |_| {
                     Ok(frankenterm_core::runtime_async::process::Command::new(
                         "/nonexistent-ft-ipc-test-executable",
@@ -124541,13 +124574,14 @@ printf x > "$MINISIGN_MARKER"
             assert_eq!(response.rpc.unwrap().effects, IpcRpcEffects::NotAdmitted);
             // An actually closed storage writer cannot be called confirmed.
             storage.shutdown().await.unwrap();
-            let response = execute_ipc_rpc_request(ipc_rpc_test_request(&["help"]), shared, |_| {
-                Ok(ipc_rpc_shell(
-                    "printf '%s' \"$1\"",
-                    &[&serde_json::to_string(&IpcResponse::ok()).unwrap()],
-                ))
-            })
-            .await;
+            let response =
+                execute_ipc_rpc_request(ipc_rpc_test_request(&["help"]), shared, &grammar, |_| {
+                    Ok(ipc_rpc_shell(
+                        "printf '%s' \"$1\"",
+                        &[&serde_json::to_string(&IpcResponse::ok()).unwrap()],
+                    ))
+                })
+                .await;
             assert!(response.ok);
             assert_eq!(
                 response.rpc.unwrap().audit_delivery,
@@ -124662,7 +124696,7 @@ printf x > "$MINISIGN_MARKER"
     }
 
     #[cfg(unix)]
-    async fn ipc_rpc_socket_exercise(actual_ft: Option<PathBuf>) {
+    async fn ipc_rpc_socket_exercise(actual_ft: Option<PathBuf>, grammar: Arc<clap::Command>) {
         use frankenterm_core::ipc::*;
         use frankenterm_core::runtime_async::{Mutex, RwLock, mpsc};
         use std::io::Write as _;
@@ -124670,18 +124704,24 @@ printf x > "$MINISIGN_MARKER"
         let dir = tempfile::Builder::new()
             .prefix("ft-ipc-rpc-")
             .tempdir_in("/tmp")
-            .unwrap();
-        let socket = dir.path().join("s");
-        let config = dir.path().join("ft.toml");
+            .unwrap()
+            .keep();
+        let socket = dir.join("s");
+        let config = dir.join("ft.toml");
+        for name in ["home", "config", "cache", "data", "tmp", "bin"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
         std::fs::write(&config, b"").unwrap();
-        let cx = frankenterm_core::cx::for_testing();
+        let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned IPC context");
+        assert!(cx.io_driver_handle().is_some(), "real socket I/O driver");
+        assert!(cx.timer_driver().is_some(), "real deadline timer driver");
         let server = IpcServer::bind_with_cx(&cx, &socket).await.unwrap();
         let (storage, db_path) = setup_storage("ipc_owned_socket").await;
         let shared = Arc::new(Mutex::new(storage.clone()));
         let observed = Arc::new(std::sync::Mutex::new(Vec::<IpcResponse>::new()));
         let handler_observed = Arc::clone(&observed);
         let handler_storage = Arc::clone(&shared);
-        let handler_dir = dir.path().to_path_buf();
+        let handler_dir = dir.clone();
         let expected_region = cx.region_id();
         let expected_task = cx.task_id();
         let expected_caps = cx.capabilities().effective;
@@ -124696,10 +124736,24 @@ printf x > "$MINISIGN_MARKER"
             let workspace = handler_dir.clone();
             let config = config.clone();
             let executable = actual_ft.clone();
+            let grammar = Arc::clone(&grammar);
             Box::pin(async move {
-                let response = execute_ipc_rpc_request(request, storage, move |args| {
+                let response = execute_ipc_rpc_request(request, storage, &grammar, move |args| {
                     if let Some(executable) = executable {
-                        return Ok(build_robot_rpc_command_at(&executable, args, Some(&config), &workspace));
+                        let mut command = build_robot_rpc_command_at(&executable, args, Some(&config), &workspace);
+                        for (key, _) in std::env::vars_os() {
+                            command.env_remove(key);
+                        }
+                        command.current_dir(&workspace)
+                            .env("HOME", workspace.join("home"))
+                            .env("XDG_CONFIG_HOME", workspace.join("config"))
+                            .env("XDG_CACHE_HOME", workspace.join("cache"))
+                            .env("XDG_DATA_HOME", workspace.join("data"))
+                            .env("TMPDIR", workspace.join("tmp"))
+                            .env("PATH", workspace.join("bin"))
+                            .env("FT_RUNTIME_WORKER_THREADS", "2")
+                            .env("FT_WEZTERM_CLI", workspace.join("bin/no-mux"));
+                        return Ok(command);
                     }
                     if args.first().is_some_and(|arg| arg == "state") {
                         let case = args.last().unwrap().parse::<usize>().unwrap();
@@ -124755,7 +124809,7 @@ printf x > "$MINISIGN_MARKER"
             observed.lock().unwrap()[0].rpc.as_ref().unwrap().admission,
             IpcRpcAdmission::NotStarted
         );
-        assert!(!dir.path().join("ready-99").exists());
+        assert!(!dir.join("ready-99").exists());
         let denied = IpcClient::with_token(&socket, "wrong-owned-test-token")
             .call_rpc_with_cx(&cx, vec!["help".to_string()], None)
             .await
@@ -124802,7 +124856,7 @@ printf x > "$MINISIGN_MARKER"
             for case in 0..5 {
                 let mut stream = UnixStream::connect(&socket).unwrap();
                 writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", case.to_string()]})).unwrap();
-                let ready = dir.path().join(format!("ready-{case}"));
+                let ready = dir.join(format!("ready-{case}"));
                 let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
                 while !ready.exists() {
                     assert!(
@@ -124826,10 +124880,9 @@ printf x > "$MINISIGN_MARKER"
                 let receipt = response.rpc.unwrap();
                 assert_eq!(receipt.settlement, IpcRpcSettlement::Terminated);
                 assert_eq!(receipt.effects, IpcRpcEffects::Indeterminate);
-                std::fs::write(dir.path().join(format!("release-{case}")), b"late release")
-                    .unwrap();
+                std::fs::write(dir.join(format!("release-{case}")), b"late release").unwrap();
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(20)).await;
-                assert!(!dir.path().join(format!("effect-{case}")).exists());
+                assert!(!dir.join(format!("effect-{case}")).exists());
                 assert!(
                     client.ping_with_cx(&cx).await.unwrap().ok,
                     "disconnect must not cancel the shared server context"
@@ -124838,7 +124891,7 @@ printf x > "$MINISIGN_MARKER"
             let mut stream = UnixStream::connect(&socket).unwrap();
             writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", "5"]})).unwrap();
             let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !dir.path().join("ready-5").exists() {
+            while !dir.join("ready-5").exists() {
                 assert!(std::time::Instant::now() < bound);
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -124870,9 +124923,9 @@ printf x > "$MINISIGN_MARKER"
                 9,
                 "shutdown must retain and finish the active RPC callback"
             );
-            std::fs::write(dir.path().join("release-5"), b"after shutdown settlement").unwrap();
+            std::fs::write(dir.join("release-5"), b"after shutdown settlement").unwrap();
             frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(20)).await;
-            assert!(!dir.path().join("effect-5").exists());
+            assert!(!dir.join("effect-5").exists());
         }
         assert!(!socket.exists());
         cleanup_storage(storage, &db_path).await;
@@ -124881,12 +124934,13 @@ printf x > "$MINISIGN_MARKER"
     #[cfg(unix)]
     #[test]
     fn ipc_rpc_real_socket_preserves_context_and_settles_disconnected_children() {
-        run_async_test(ipc_rpc_socket_exercise(None));
+        run_async_test(ipc_rpc_socket_exercise(None, ipc_rpc_command_grammar()));
     }
 
     #[cfg(unix)]
     #[test]
     fn ipc_rpc_diagnostics_capture_actual_outcomes_without_private_content() {
+        let grammar = ipc_rpc_command_grammar();
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
         #[derive(Clone)]
@@ -124930,6 +124984,7 @@ printf x > "$MINISIGN_MARKER"
                 let response = execute_ipc_rpc_request(
                     ipc_rpc_test_request(&["help"]),
                     Arc::clone(&shared),
+                    &grammar,
                     |_| {
                         Ok(ipc_rpc_shell(
                             "printf private-raw-child-canary >&2; exit 2",
@@ -124943,6 +124998,7 @@ printf x > "$MINISIGN_MARKER"
                 let response = execute_ipc_rpc_request(
                     ipc_rpc_test_request(&["watch-events", "--follow"]),
                     shared,
+                    &grammar,
                     |_| panic!("streaming must not launch"),
                 )
                 .await;
@@ -125011,7 +125067,10 @@ printf x > "$MINISIGN_MARKER"
                 .expect("set the independently built ft artifact path"),
         );
         assert!(executable.is_absolute() && executable.is_file());
-        run_async_test(ipc_rpc_socket_exercise(Some(executable)));
+        run_async_test(ipc_rpc_socket_exercise(
+            Some(executable),
+            ipc_rpc_command_grammar(),
+        ));
     }
 
     // ---- Triage scoring / ordering tests ----

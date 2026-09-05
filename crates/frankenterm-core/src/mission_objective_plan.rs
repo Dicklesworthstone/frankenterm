@@ -477,6 +477,7 @@ impl MissionObjectivePlannerInput {
     /// work. The ordinary planner still applies source, path, proof and capacity
     /// restrictions. A snapshot recommendation does not claim or dispatch it.
     #[cfg(feature = "subprocess-bridge")]
+    #[must_use]
     pub fn with_bead_work_selection(
         mut self,
         selection: crate::beads_types::BeadWorkSelection,

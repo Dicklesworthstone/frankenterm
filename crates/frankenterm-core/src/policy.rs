@@ -10213,10 +10213,13 @@ mod tests {
     fn injector_emits_policy_decision_to_replay_capture() {
         run_async_test(async {
             let sink = std::sync::Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-            let adapter = std::sync::Arc::new(crate::replay_capture::CaptureAdapter::new(
-                sink.clone(),
-                crate::replay_capture::CaptureConfig::default(),
-            ));
+            let adapter = std::sync::Arc::new(
+                crate::replay_capture::CaptureAdapter::new(
+                    sink.clone(),
+                    crate::replay_capture::CaptureConfig::default(),
+                )
+                .expect("valid capture configuration"),
+            );
 
             let mut injector = PolicyGatedInjector::new(
                 PolicyEngine::strict(),

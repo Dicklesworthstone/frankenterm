@@ -133,7 +133,7 @@ pub(crate) enum ConnectorStorageOutcome {
         cursor_epoch: String,
     },
     Admitted,
-    Transitioned(ConnectorOutboxEntry),
+    Transitioned(Box<ConnectorOutboxEntry>),
     Ingested(Vec<crate::storage::EventRecordOutcome>),
     IngressAcknowledged,
     Conflict,

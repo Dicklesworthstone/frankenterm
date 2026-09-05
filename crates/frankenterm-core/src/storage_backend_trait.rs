@@ -750,6 +750,12 @@ pub enum BackendError {
     Connect(String),
     /// SQL syntax or constraint violation.
     Query(String),
+    /// Native SQLite `SQLITE_BUSY`, without SQL or captured content.
+    ///
+    /// This is not retry authority: a caller must separately prove that no
+    /// mutation occurred and the connection remains in autocommit before retrying.
+    /// It is distinct from [`Self::TransactionBusy`], which signals callback ownership.
+    SqliteBusy,
     /// Backend-specific unrecoverable transaction poison.
     TxPoisoned,
     /// A transaction callback already owns the backend connection.
@@ -769,6 +775,9 @@ impl std::fmt::Display for BackendError {
         match self {
             Self::Connect(s) => write!(f, "storage backend connect: {s}"),
             Self::Query(s) => write!(f, "storage backend query: {s}"),
+            Self::SqliteBusy => {
+                write!(f, "storage backend query: database is locked (SQLITE_BUSY)")
+            }
             Self::TxPoisoned => write!(f, "storage backend transaction poisoned"),
             Self::TransactionBusy => write!(f, "storage backend transaction already active"),
             Self::TransactionBoundaryLost => {
@@ -1968,8 +1977,13 @@ impl StorageBackendFactory for RusqliteBackend {
 impl StorageBackend for RusqliteBackend {
     fn execute(&self, sql: &str) -> Result<usize, BackendError> {
         let conn = self.conn_guard()?;
-        conn.execute(sql, [])
-            .map_err(|e| BackendError::Query(e.to_string()))
+        conn.execute(sql, []).map_err(|error| {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) {
+                BackendError::SqliteBusy
+            } else {
+                BackendError::Query(error.to_string())
+            }
+        })
     }
 
     fn execute_batch(&self, sql: &str) -> Result<(), BackendError> {
@@ -2761,6 +2775,7 @@ mod tests {
         let v = vec![
             BackendError::Connect("path".into()),
             BackendError::Query("bad sql".into()),
+            BackendError::SqliteBusy,
             BackendError::TxPoisoned,
             BackendError::TransactionBusy,
             BackendError::TransactionBoundaryLost,
@@ -2916,6 +2931,57 @@ mod tests {
             .unwrap();
         let got = backend.query_scalar("PRAGMA busy_timeout").unwrap();
         assert_eq!(got.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn rusqlite_backend_execute_preserves_native_busy_and_recovers_after_lock_release() {
+        let dir = tempfile::tempdir().expect("create database directory");
+        let path = dir.path().join("typed-busy.db");
+        let backend = RusqliteBackend::open_path(&path, &OpenConfig::default())
+            .expect("open capture backend");
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend.set_busy_timeout(std::time::Duration::ZERO).unwrap();
+        let lock_holder = rusqlite::Connection::open(&path).expect("open competing connection");
+        lock_holder.execute("BEGIN IMMEDIATE", []).unwrap();
+
+        let error = backend.execute("BEGIN IMMEDIATE").unwrap_err();
+        assert!(matches!(error, BackendError::SqliteBusy));
+        assert_eq!(
+            error.to_string(),
+            "storage backend query: database is locked (SQLITE_BUSY)"
+        );
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+        assert_eq!(
+            backend.query_scalar("SELECT COUNT(*) FROM t").unwrap(),
+            Some("0".to_string())
+        );
+
+        let syntax_error = backend.execute("INSERT INTO t VALUES (").unwrap_err();
+        assert!(matches!(syntax_error, BackendError::Query(_)));
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+
+        lock_holder.execute("COMMIT", []).unwrap();
+        backend.execute("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Transaction
+        );
+        assert_eq!(backend.execute("INSERT INTO t VALUES (1)").unwrap(), 1);
+        backend.execute("COMMIT").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+        let committed: i64 = lock_holder
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(committed, 1);
     }
 
     #[test]

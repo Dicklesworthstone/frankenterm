@@ -782,10 +782,9 @@ pub struct PaneCursor {
     /// caller that could overwrite it after capture started would silently
     /// re-anchor mid-stream. Set it with [`Self::with_resume_anchor`].
     resume_anchor: Option<String>,
-    /// Offset currently applied between this producer's numbering and the
-    /// sequence storage actually assigns (`storage_seq - captured_seq` at the
-    /// last correction). See [`Self::realign_next_seq`] (ft-xxfwy.32).
-    seq_correction: i64,
+    /// Cumulative correction applied to issued sequence numbers. Each capture
+    /// retains its issuance-time value so queued generations stay distinguishable.
+    seq_correction: i128,
 }
 
 /// The capture-advanced fields of a [`PaneCursor`], lifted out so the
@@ -1034,6 +1033,7 @@ impl PaneCursor {
             return Some(CapturedSegment {
                 pane_id: self.pane_id,
                 seq,
+                seq_correction: self.seq_correction,
                 content,
                 kind: CapturedSegmentKind::Gap { reason },
                 captured_at: epoch_ms(),
@@ -1056,6 +1056,7 @@ impl PaneCursor {
                 Some(CapturedSegment {
                     pane_id: self.pane_id,
                     seq,
+                    seq_correction: self.seq_correction,
                     content,
                     kind: CapturedSegmentKind::Delta,
                     captured_at: epoch_ms(),
@@ -1068,6 +1069,7 @@ impl PaneCursor {
                 Some(CapturedSegment {
                     pane_id: self.pane_id,
                     seq,
+                    seq_correction: self.seq_correction,
                     content,
                     kind: CapturedSegmentKind::Gap { reason },
                     captured_at: epoch_ms(),
@@ -1091,6 +1093,7 @@ impl PaneCursor {
     /// observability signal fires at the resync that saturated, not on the
     /// next bump.
     pub fn resync_seq(&mut self, storage_seq: u64) {
+        let previous_next_seq = self.next_seq;
         self.next_seq = match storage_seq.checked_add(1) {
             Some(next) => next,
             None => {
@@ -1098,6 +1101,9 @@ impl PaneCursor {
                 u64::MAX
             }
         };
+        self.seq_correction = self
+            .seq_correction
+            .saturating_add(i128::from(self.next_seq) - i128::from(previous_next_seq));
         self.in_gap = true;
     }
 
@@ -1112,36 +1118,39 @@ impl PaneCursor {
     /// reuses a number that is still in flight and the mismatch reappears on
     /// every segment forever (12 of 12 in the first real observe run). This
     /// method instead treats the mismatch as an *offset* between the two
-    /// numberings and shifts `next_seq` by however much that offset changed
-    /// since the last correction: a single dropped segment shifts once, the
-    /// queued backlog drains with the already-known offset, and every capture
-    /// after the shift lines up with storage. Returns the shift applied
-    /// (0 when the offset was already known).
-    pub fn realign_next_seq(&mut self, captured_seq: u64, storage_seq: u64) -> i64 {
-        let observed = i128::from(storage_seq) - i128::from(captured_seq);
-        let shift = observed - i128::from(self.seq_correction);
-        let shift = i64::try_from(shift).unwrap_or(if shift < 0 { i64::MIN } else { i64::MAX });
+    /// numberings. The capture's issuance-time correction plus the observed
+    /// difference gives the desired cumulative correction; only the difference
+    /// from the cursor's current correction is applied. Old queued captures
+    /// therefore cannot double-apply a shift, and a newly lost capture is still
+    /// recognized even if no matching acknowledgement separated two losses.
+    /// Call this for every persisted segment, including matching sequences.
+    /// Returns the shift applied (0 when the correction was already applied).
+    pub fn realign_next_seq(&mut self, captured: &CapturedSegment, storage_seq: u64) -> i128 {
+        let observed = i128::from(storage_seq) - i128::from(captured.seq);
+        let correction = captured.seq_correction.saturating_add(observed);
+        let shift = correction.saturating_sub(self.seq_correction);
         if shift != 0 {
-            let shifted = i128::from(self.next_seq) + i128::from(shift);
-            self.next_seq = if shifted <= 0 {
-                // Never allocate at or below what storage already holds.
-                storage_seq.saturating_add(1)
-            } else if shifted > i128::from(u64::MAX) {
+            let shifted = i128::from(self.next_seq)
+                .saturating_add(shift)
+                .max(i128::from(storage_seq) + 1);
+            self.next_seq = if shifted > i128::from(u64::MAX) {
                 record_pane_cursor_seq_saturation();
                 u64::MAX
             } else {
                 u64::try_from(shifted).unwrap_or(u64::MAX)
             };
-            self.seq_correction = i64::try_from(observed).unwrap_or(self.seq_correction);
+            self.seq_correction = correction;
         }
-        self.in_gap = true;
+        if captured.seq != storage_seq || shift != 0 {
+            self.in_gap = true;
+        }
         shift
     }
 
     /// Offset currently applied between this producer's numbering and
     /// storage's (`0` until a mismatch was observed).
     #[must_use]
-    pub fn seq_correction(&self) -> i64 {
+    pub fn seq_correction(&self) -> i128 {
         self.seq_correction
     }
 
@@ -1157,6 +1166,7 @@ impl PaneCursor {
         CapturedSegment {
             pane_id: self.pane_id,
             seq,
+            seq_correction: self.seq_correction,
             content,
             kind: CapturedSegmentKind::Delta,
             captured_at,
@@ -1201,6 +1211,7 @@ impl PaneCursor {
         CapturedSegment {
             pane_id: self.pane_id,
             seq,
+            seq_correction: self.seq_correction,
             content,
             kind: CapturedSegmentKind::Gap { reason },
             captured_at: epoch_ms(),
@@ -1215,6 +1226,7 @@ impl PaneCursor {
         CapturedSegment {
             pane_id: self.pane_id,
             seq,
+            seq_correction: self.seq_correction,
             content: String::new(),
             kind: CapturedSegmentKind::Gap {
                 reason: reason.to_string(),
@@ -2051,8 +2063,13 @@ pub enum DeltaResult {
 pub struct CapturedSegment {
     /// Pane id
     pub pane_id: u64,
-    /// Per-pane monotonic sequence number
+    /// Producer sequence number. Corrections can rebase this value; interpret
+    /// queued captures together with their issuance-time `seq_correction`.
     pub seq: u64,
+    /// Cumulative correction already applied when this sequence was issued.
+    /// Preserve this through truncation, queuing, and cloning; standalone
+    /// synthetic captures that have never been corrected use zero.
+    pub seq_correction: i128,
     /// Captured content (delta or full snapshot when `Gap`)
     pub content: String,
     /// Segment kind
@@ -2156,6 +2173,7 @@ fn enforce_segment_size_for_persistence(
         CapturedSegment {
             pane_id: captured.pane_id,
             seq: captured.seq,
+            seq_correction: captured.seq_correction,
             content: truncated_content,
             kind,
             captured_at: captured.captured_at,
@@ -2501,40 +2519,95 @@ async fn append_segment_with_optional_capture_hold(
     recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
 ) -> Result<Segment> {
-    match (guard, recorder_delivery) {
-        (Some(guard), Some(recorder_delivery)) => {
-            storage
-                .append_captured_segment_with_recorder_delivery_with_cx(
-                    cx,
-                    pane_id,
-                    content,
-                    None,
-                    zone_type,
-                    recorder_delivery,
-                    guard.delegate_storage()?,
-                )
-                .await
+    retry_capture_append(cx, || async {
+        // Each admitted attempt consumes its own delegated hold. Keep the
+        // parent authority and immutable recorder identity across safe retries.
+        match (guard, recorder_delivery.clone()) {
+            (Some(guard), Some(recorder_delivery)) => {
+                storage
+                    .append_captured_segment_with_recorder_delivery_with_cx(
+                        cx,
+                        pane_id,
+                        content,
+                        None,
+                        zone_type,
+                        recorder_delivery,
+                        guard.delegate_storage()?,
+                    )
+                    .await
+            }
+            (Some(guard), None) => {
+                storage
+                    .append_captured_segment_with_zone_with_cx(
+                        cx,
+                        pane_id,
+                        content,
+                        None,
+                        zone_type,
+                        guard.delegate_storage()?,
+                    )
+                    .await
+            }
+            (None, None) => {
+                storage
+                    .append_segment_with_zone_with_cx(cx, pane_id, content, None, zone_type)
+                    .await
+            }
+            (None, Some(_)) => Err(crate::Error::Storage(crate::error::StorageError::Database(
+                "recorder delivery seed requires capture persistence authority".to_string(),
+            ))),
         }
-        (Some(guard), None) => {
-            storage
-                .append_captured_segment_with_zone_with_cx(
-                    cx,
-                    pane_id,
-                    content,
-                    None,
-                    zone_type,
-                    guard.delegate_storage()?,
-                )
-                .await
+    })
+    .await
+}
+
+/// Retry only an append whose writer proved BEGIN never acquired a transaction.
+/// Never wrap the complete persistence flow: a later gap write may fail after
+/// the segment and recorder delivery have already committed.
+async fn retry_capture_append<F, Fut>(cx: &crate::cx::Cx, mut append: F) -> Result<Segment>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Segment>>,
+{
+    const BACKOFF_MS: [u64; 2] = [50, 100];
+    let mut retries = 0;
+    loop {
+        cx.checkpoint()
+            .map_err(|err| ingest_cancelled_error("capture_append_retry", err))?;
+        if retries > 0 {
+            metrics::counter!("capture.persist.retries").increment(1);
         }
-        (None, None) => {
-            storage
-                .append_segment_with_zone_with_cx(cx, pane_id, content, None, zone_type)
-                .await
+        // Do not race or time out an admitted write: its authoritative response
+        // must settle before another attempt can be considered.
+        let error = match append().await {
+            Ok(segment) => return Ok(segment),
+            Err(error) => error,
+        };
+        if !matches!(
+            error,
+            crate::Error::Storage(crate::error::StorageError::WriterBusyNotCommitted)
+        ) {
+            return Err(error);
         }
-        (None, Some(_)) => Err(crate::Error::Storage(crate::error::StorageError::Database(
-            "recorder delivery seed requires capture persistence authority".to_string(),
-        ))),
+        let Some(&base_ms) = BACKOFF_MS.get(retries) else {
+            metrics::counter!("capture.persist.retry_exhausted").increment(1);
+            metrics::counter!("capture.persist.dropped").increment(1);
+            return Err(error);
+        };
+        cx.checkpoint()
+            .map_err(|err| ingest_cancelled_error("capture_append_retry", err))?;
+        let delay =
+            std::time::Duration::from_millis(rand::rng().random_range(base_ms..=base_ms * 2));
+        // This budget-aware timer also supports explicitly delegated contexts.
+        // Jitter avoids synchronized fleet retries. Cancellation is checked on
+        // both sides, bounding its delay to 200 ms (300 ms total backoff).
+        crate::runtime_async::sleep_with_cx(cx, delay)
+            .await
+            .map_err(|error| crate::Error::RuntimeOperation {
+                operation: "capture_append_retry_backoff",
+                source: RuntimeOperationSource::Backend(error),
+            })?;
+        retries += 1;
     }
 }
 
@@ -4023,6 +4096,245 @@ mod tests {
         }
     }
 
+    /// Test-local counter observer, not an exporter. Unrelated runtime metrics
+    /// and gauge/histogram descriptions are intentionally outside this oracle.
+    #[derive(Default)]
+    struct CaptureRetryRecorder {
+        retries: std::sync::Arc<metrics::atomics::AtomicU64>,
+        dropped: std::sync::Arc<metrics::atomics::AtomicU64>,
+        exhausted: std::sync::Arc<metrics::atomics::AtomicU64>,
+    }
+
+    impl metrics::Recorder for CaptureRetryRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let counter = match key.name() {
+                "capture.persist.retries" => &self.retries,
+                "capture.persist.dropped" => &self.dropped,
+                "capture.persist.retry_exhausted" => &self.exhausted,
+                _ => return metrics::Counter::noop(),
+            };
+            metrics::Counter::from_arc(std::sync::Arc::clone(counter))
+        }
+
+        fn register_gauge(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    fn run_capture_retry_test<F>(expected_counts: (u64, u64, u64), future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let recorder = CaptureRetryRecorder::default();
+        metrics::with_local_recorder(&recorder, || run_async_test(future));
+        assert_eq!(
+            recorder.retries.load(Ordering::SeqCst),
+            expected_counts.0,
+            "capture.persist.retries"
+        );
+        assert_eq!(
+            recorder.dropped.load(Ordering::SeqCst),
+            expected_counts.1,
+            "capture.persist.dropped"
+        );
+        assert_eq!(
+            recorder.exhausted.load(Ordering::SeqCst),
+            expected_counts.2,
+            "capture.persist.retry_exhausted"
+        );
+    }
+
+    // Synthetic append responses exercise retry control flow only. Native
+    // SQLite contention and writer settlement require their separate tests.
+    #[test]
+    fn retry_capture_append_succeeds_after_two_verified_busy_responses() {
+        run_capture_retry_test((2, 0, 0), async {
+            let cx = crate::cx::for_testing();
+            let expected = Segment {
+                id: 41,
+                pane_id: 7,
+                seq: 3,
+                content: "captured output".to_string(),
+                content_len: 15,
+                content_hash: Some("retained-hash".to_string()),
+                captured_at: 1_700_000_000_000,
+            };
+            let mut attempts = 0;
+            let segment = retry_capture_append(&cx, || {
+                attempts += 1;
+                std::future::ready(if attempts < 3 {
+                    Err(crate::Error::Storage(
+                        crate::error::StorageError::WriterBusyNotCommitted,
+                    ))
+                } else {
+                    Ok(expected.clone())
+                })
+            })
+            .await
+            .expect("third append response succeeds");
+
+            assert_eq!(attempts, 3);
+            assert_eq!(segment.id, expected.id);
+            assert_eq!(segment.pane_id, expected.pane_id);
+            assert_eq!(segment.seq, expected.seq);
+            assert_eq!(segment.content, expected.content);
+            assert_eq!(segment.content_len, expected.content_len);
+            assert_eq!(segment.content_hash, expected.content_hash);
+            assert_eq!(segment.captured_at, expected.captured_at);
+        });
+    }
+
+    #[test]
+    fn retry_capture_append_exhausts_after_three_verified_busy_responses() {
+        run_capture_retry_test((2, 1, 1), async {
+            let cx = crate::cx::for_testing();
+            let mut attempts = 0;
+            let result = retry_capture_append(&cx, || {
+                attempts += 1;
+                std::future::ready(Err(crate::Error::Storage(
+                    crate::error::StorageError::WriterBusyNotCommitted,
+                )))
+            })
+            .await;
+
+            assert_eq!(attempts, 3);
+            assert!(matches!(
+                result,
+                Err(crate::Error::Storage(
+                    crate::error::StorageError::WriterBusyNotCommitted
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn retry_capture_append_never_retries_unverified_or_indeterminate_errors() {
+        run_capture_retry_test((0, 0, 0), async {
+            for error in [
+                crate::error::StorageError::Database("database is locked".to_string()),
+                crate::error::StorageError::WriterBackendEpochPoisoned,
+                crate::error::StorageError::WriterSettlementIndeterminate {
+                    phase: "command_response",
+                },
+                crate::error::StorageError::IndeterminateMutation {
+                    operation: "append_segment",
+                },
+            ] {
+                let cx = crate::cx::for_testing();
+                let expected_variant = std::mem::discriminant(&error);
+                let expected_message = error.to_string();
+                let mut response = Some(error);
+                let mut attempts = 0;
+                let result = retry_capture_append(&cx, || {
+                    attempts += 1;
+                    std::future::ready(Err(crate::Error::Storage(
+                        response
+                            .take()
+                            .expect("unverified append must not be attempted twice"),
+                    )))
+                })
+                .await;
+
+                assert_eq!(attempts, 1);
+                let Err(crate::Error::Storage(returned)) = result else {
+                    panic!("expected original storage error");
+                };
+                assert_eq!(std::mem::discriminant(&returned), expected_variant);
+                assert_eq!(returned.to_string(), expected_message);
+            }
+        });
+    }
+
+    #[test]
+    fn retry_capture_append_precancelled_context_admits_no_attempt() {
+        run_capture_retry_test((0, 0, 0), async {
+            let cx = crate::cx::for_testing();
+            cx.set_cancel_requested(true);
+            let mut attempts = 0;
+            let result = retry_capture_append(&cx, || {
+                attempts += 1;
+                std::future::ready(Err(crate::Error::Storage(
+                    crate::error::StorageError::WriterBusyNotCommitted,
+                )))
+            })
+            .await;
+
+            assert_eq!(attempts, 0);
+            assert!(matches!(
+                result,
+                Err(crate::Error::RuntimeOperation {
+                    operation: "capture_append_retry",
+                    source: RuntimeOperationSource::Cancelled(_),
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn retry_capture_append_cancellation_after_busy_prevents_second_attempt() {
+        run_capture_retry_test((0, 0, 0), async {
+            let cx = crate::cx::for_testing();
+            let mut attempts = 0;
+            let result = retry_capture_append(&cx, || {
+                attempts += 1;
+                cx.set_cancel_requested(true);
+                std::future::ready(Err(crate::Error::Storage(
+                    crate::error::StorageError::WriterBusyNotCommitted,
+                )))
+            })
+            .await;
+
+            assert_eq!(attempts, 1);
+            assert!(matches!(
+                result,
+                Err(crate::Error::RuntimeOperation {
+                    operation: "capture_append_retry",
+                    source: RuntimeOperationSource::Cancelled(_),
+                })
+            ));
+        });
+    }
+
     fn temp_db_path() -> String {
         let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir();
@@ -5095,6 +5407,7 @@ mod tests {
         let captured = CapturedSegment {
             pane_id: 7,
             seq: 11,
+            seq_correction: 0,
             content: "alpha sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN omega".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: epoch_ms(),
@@ -5277,6 +5590,7 @@ mod tests {
             let gap_segment = CapturedSegment {
                 pane_id: 1,
                 seq: 0,
+                seq_correction: 0,
                 content: "full snapshot after missed history\n".to_string(),
                 kind: CapturedSegmentKind::Gap {
                     reason: "overlap_not_found".to_string(),
@@ -5313,6 +5627,7 @@ mod tests {
             let gap_segment = CapturedSegment {
                 pane_id: 1,
                 seq: 0,
+                seq_correction: 0,
                 content: "cx full snapshot after missed history\n".to_string(),
                 kind: CapturedSegmentKind::Gap {
                     reason: "stream_overflow".to_string(),
@@ -5425,7 +5740,7 @@ mod tests {
         assert_eq!(seg.seq, 6);
         let (storage_seq, mismatch) = assign(seg.seq);
         assert!(mismatch, "storage assigned {storage_seq} for captured 6");
-        assert_eq!(cursor.realign_next_seq(seg.seq, storage_seq), -1);
+        assert_eq!(cursor.realign_next_seq(&seg, storage_seq), -1);
         assert_eq!(cursor.seq_correction(), -1);
         assert!(cursor.in_gap);
         // Every capture after the shift lines up with storage.
@@ -5448,16 +5763,19 @@ mod tests {
         // producer kept colliding with in-flight numbering; the offset must
         // be applied exactly once and later queued segments must not move it.
         let mut cursor = PaneCursor::from_seq(1, 5);
-        let queued: Vec<u64> = (0..3)
-            .map(|i| cursor.capture_delta(format!("q{i}"), i64::from(i)).seq)
+        let queued: Vec<CapturedSegment> = (0..3)
+            .map(|i| cursor.capture_delta(format!("q{i}"), i64::from(i)))
             .collect();
-        assert_eq!(queued, vec![5, 6, 7]);
+        assert_eq!(
+            queued.iter().map(|segment| segment.seq).collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
         assert_eq!(cursor.next_seq, 8);
         // persist(5) failed; storage assigns 5 to captured 6 and 6 to captured 7
-        assert_eq!(cursor.realign_next_seq(6, 5), -1);
+        assert_eq!(cursor.realign_next_seq(&queued[1], 5), -1);
         assert_eq!(cursor.next_seq, 7, "one shift for the backlog");
         assert_eq!(
-            cursor.realign_next_seq(7, 6),
+            cursor.realign_next_seq(&queued[2], 6),
             0,
             "same offset: no second shift"
         );
@@ -5468,13 +5786,39 @@ mod tests {
     }
 
     #[test]
+    fn realign_recovers_from_repeated_losses_after_each_backlog_drains() {
+        let mut cursor = PaneCursor::from_seq(1, 5);
+        let mut storage_next = 5;
+        for round in 0..3 {
+            let dropped = cursor.capture_delta(format!("dropped {round}"), round);
+            assert_eq!(dropped.seq, storage_next);
+            let first = cursor.capture_delta("queued first".into(), round);
+            let second = cursor.capture_delta("queued second".into(), round);
+            assert_eq!(cursor.realign_next_seq(&first, storage_next), -1);
+            storage_next += 1;
+            assert_eq!(cursor.realign_next_seq(&second, storage_next), 0);
+            storage_next += 1;
+            assert_eq!(cursor.next_seq, storage_next);
+
+            // A matching acknowledgement must preserve the cumulative stamp;
+            // resetting it would invalidate captures already in flight.
+            let fresh = cursor.capture_delta("fresh".into(), round);
+            assert_eq!(fresh.seq, storage_next);
+            assert_eq!(cursor.realign_next_seq(&fresh, storage_next), 0);
+            assert_eq!(cursor.seq_correction(), -i128::from(round + 1));
+            storage_next += 1;
+            assert_eq!(cursor.next_seq, storage_next);
+        }
+    }
+
+    #[test]
     fn realign_handles_storage_ahead_of_the_producer_and_never_underflows() {
         // A cursor resumed from a stale checkpoint numbers below what storage
         // already holds: the shift is positive.
         let mut cursor = PaneCursor::from_seq(1, 10);
         let seg = cursor.capture_delta("x".into(), 1);
         assert_eq!(seg.seq, 10);
-        assert_eq!(cursor.realign_next_seq(seg.seq, 15), 5);
+        assert_eq!(cursor.realign_next_seq(&seg, 15), 5);
         assert_eq!(cursor.next_seq, 16);
         assert_eq!(cursor.seq_correction(), 5);
         // A shift that would push next_seq to or below zero clamps to the
@@ -5483,8 +5827,71 @@ mod tests {
         let seg = low.capture_delta("y".into(), 1);
         assert_eq!(seg.seq, 1);
         assert_eq!(low.next_seq, 2);
-        assert_eq!(low.realign_next_seq(seg.seq, 0), -1);
+        assert_eq!(low.realign_next_seq(&seg, 0), -1);
         assert_eq!(low.next_seq, 1);
+    }
+
+    #[test]
+    fn realign_recovers_when_first_fresh_capture_is_lost_without_matching_ack() {
+        let mut cursor = PaneCursor::from_seq(1, 5);
+        let mut storage_next = 5;
+        for round in 0..3 {
+            let dropped = cursor.capture_delta("lost".into(), round);
+            assert_eq!(dropped.seq, storage_next);
+            let first = cursor.capture_delta("queued first".into(), round);
+            let second = cursor.capture_delta("queued second".into(), round);
+            assert_eq!(cursor.realign_next_seq(&first, storage_next), -1);
+            storage_next += 1;
+            assert_eq!(cursor.realign_next_seq(&second, storage_next), 0);
+            storage_next += 1;
+            assert_eq!(cursor.next_seq, storage_next);
+            // No matching acknowledgement occurs between these losses.
+        }
+        let fresh = cursor.capture_delta("finally durable".into(), 4);
+        assert_eq!(fresh.seq, storage_next);
+        assert_eq!(cursor.realign_next_seq(&fresh, storage_next), 0);
+    }
+
+    #[test]
+    fn realign_late_old_backlog_loss_does_not_double_shift_new_captures() {
+        let mut cursor = PaneCursor::from_seq(1, 5);
+        let old: Vec<_> = (0..4)
+            .map(|i| cursor.capture_delta(format!("old {i}"), i))
+            .collect();
+        // Lose old 5, acknowledge old 6 as storage 5.
+        assert_eq!(cursor.realign_next_seq(&old[1], 5), -1);
+        let first_new = cursor.capture_delta("new 8".into(), 4);
+        let second_new = cursor.capture_delta("new 9".into(), 5);
+        assert_eq!((first_new.seq, first_new.seq_correction), (8, -1));
+        assert_eq!((second_new.seq, second_new.seq_correction), (9, -1));
+        // Lose old 7 after newer captures were already issued.
+        assert_eq!(cursor.realign_next_seq(&old[3], 6), -1);
+        assert_eq!(cursor.next_seq, 9);
+        let fresh = cursor.capture_delta("fresh 9".into(), 6);
+        assert_eq!((fresh.seq, fresh.seq_correction), (9, -2));
+        assert!(!cursor.in_gap);
+        assert_eq!(cursor.realign_next_seq(&first_new, 7), 0);
+        assert!(
+            cursor.in_gap,
+            "known-offset backlog still carries a durable gap"
+        );
+        assert_eq!(cursor.realign_next_seq(&second_new, 8), 0);
+        assert_eq!(cursor.next_seq, 10);
+        assert_eq!(cursor.realign_next_seq(&fresh, 9), 0);
+    }
+
+    #[test]
+    fn realign_supports_corrections_beyond_i64_without_repeating_them() {
+        let mut cursor = PaneCursor::from_seq(1, u64::MAX - 2);
+        let first = cursor.capture_delta("old first".into(), 0);
+        let second = cursor.capture_delta("old second".into(), 1);
+        assert_eq!(cursor.realign_next_seq(&first, 0), -i128::from(first.seq));
+        assert_eq!(cursor.next_seq, 2);
+        assert_eq!(cursor.realign_next_seq(&second, 1), 0);
+        assert_eq!(cursor.next_seq, 2);
+        let fresh = cursor.capture_delta("fresh".into(), 2);
+        assert_eq!(cursor.realign_next_seq(&fresh, 2), 0);
+        assert_eq!(cursor.next_seq, 3);
     }
 
     #[test]
@@ -5546,12 +5953,14 @@ mod tests {
         let captured = CapturedSegment {
             pane_id: 1,
             seq: 3,
+            seq_correction: -7,
             content: "abc0123456789".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 0,
         };
 
         let (bounded, enforcement) = enforce_segment_size_for_persistence(&captured, 5);
+        assert_eq!(bounded.seq_correction, -7);
         let enforcement = enforcement.expect("size enforcement expected");
 
         assert_eq!(enforcement.original_bytes, captured.content.len());
@@ -5582,6 +5991,7 @@ mod tests {
             let oversized = CapturedSegment {
                 pane_id: 1,
                 seq: 0,
+                seq_correction: 0,
                 content: oversized_content,
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 0,
@@ -5611,12 +6021,14 @@ mod tests {
         let oversized = CapturedSegment {
             pane_id: 9,
             seq: 1,
+            seq_correction: -3,
             content: format!("prefix-{}", "x".repeat(max_segment_bytes + 17)),
             kind: CapturedSegmentKind::Delta,
             captured_at: 123,
         };
 
         let bounded = bounded_segment_for_persistence(&oversized, max_segment_bytes);
+        assert_eq!(bounded.seq_correction, -3);
         assert_eq!(bounded.pane_id, oversized.pane_id);
         assert_eq!(bounded.seq, oversized.seq);
         assert_eq!(bounded.captured_at, oversized.captured_at);
@@ -9254,6 +9666,7 @@ mod tests {
         let seg = CapturedSegment {
             pane_id: 1,
             seq: 0,
+            seq_correction: 0,
             content: "hello".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 1000,
@@ -9543,6 +9956,7 @@ mod tests {
         let captured = CapturedSegment {
             pane_id: 1,
             seq: 0,
+            seq_correction: 0,
             content: "中".to_string(),
             kind: CapturedSegmentKind::Delta,
             captured_at: 0,

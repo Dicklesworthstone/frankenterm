@@ -2768,10 +2768,11 @@ impl StorageBackendProvider for RusqliteStorageBackendProvider {
         // `open_read_storage_backend`) makes the very next PRAGMA fail
         // with SQLITE_BUSY. SCHEMA_SQL doesn't set this (and is
         // short-circuited on reopen of an up-to-date DB), so it must
-        // be applied here on every connection-open path. The discard
-        // is intentional — failure to apply busy_timeout is non-fatal,
-        // just makes the writer more contention-sensitive.
-        let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
+        // be applied here on every connection-open path. Fail opening rather
+        // than silently admit a writer without its bounded contention retry.
+        backend
+            .set_busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| storage_backend_error("Set writer busy timeout", err))?;
 
         // Check for and recover from unclean shutdown (wa-o8j)
         check_and_recover_wal(&backend, &request.db_path)?;
@@ -11317,6 +11318,7 @@ fn is_backend_epoch_poisoned(error: &crate::Error) -> bool {
 #[derive(Debug, Clone)]
 enum WriterFailure {
     Database(String),
+    BusyNotCommitted,
     BackendEpochPoisoned,
     WriterClosed,
 }
@@ -11325,6 +11327,7 @@ impl WriterFailure {
     fn result<T>(&self) -> Result<T> {
         match self {
             Self::Database(message) => Err(StorageError::Database(message.clone()).into()),
+            Self::BusyNotCommitted => Err(StorageError::WriterBusyNotCommitted.into()),
             Self::BackendEpochPoisoned => writer_backend_epoch_poisoned_error(),
             Self::WriterClosed => Err(StorageError::WriterClosed.into()),
         }
@@ -11355,6 +11358,8 @@ impl WriterDispatchInterruption {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriterTransactionBeginMode {
+    // Only fault/negative controls use deferred writer transactions now.
+    #[cfg(test)]
     Deferred,
     Immediate,
 }
@@ -11362,6 +11367,7 @@ enum WriterTransactionBeginMode {
 impl WriterTransactionBeginMode {
     const fn sql(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Deferred => "BEGIN",
             Self::Immediate => "BEGIN IMMEDIATE",
         }
@@ -11550,7 +11556,13 @@ where
                 "begin-failure-verification",
             ) {
                 WriterTransactionStateOutcome::Known(_) => {
-                    Err(storage_backend_error("Begin writer transaction", error).into())
+                    if begin_mode == WriterTransactionBeginMode::Immediate
+                        && matches!(error, BackendError::SqliteBusy)
+                    {
+                        Err(StorageError::WriterBusyNotCommitted.into())
+                    } else {
+                        Err(storage_backend_error("Begin writer transaction", error).into())
+                    }
                 }
                 WriterTransactionStateOutcome::Failed => {
                     let _ = rollback_writer_transaction(
@@ -12708,6 +12720,11 @@ fn dispatch_event_gap_group_commit_result(
         Err(error) => {
             let failure = if is_writer_backend_epoch_poisoned(&error) {
                 WriterFailure::BackendEpochPoisoned
+            } else if matches!(
+                error,
+                crate::Error::Storage(StorageError::WriterBusyNotCommitted)
+            ) {
+                WriterFailure::BusyNotCommitted
             } else {
                 WriterFailure::Database(format!("storage event/gap group commit failed: {error}"))
             };
@@ -12897,6 +12914,11 @@ fn dispatch_append_segment_group_commit_result(
         Err(error) => {
             let failure = if is_writer_backend_epoch_poisoned(&error) {
                 WriterFailure::BackendEpochPoisoned
+            } else if matches!(
+                error,
+                crate::Error::Storage(StorageError::WriterBusyNotCommitted)
+            ) {
+                WriterFailure::BusyNotCommitted
             } else {
                 WriterFailure::Database(format!(
                     "storage append segment group commit failed: {error}"
@@ -15394,6 +15416,11 @@ mod writer_io_scheduler_tests {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory writer database");
         initialize_schema(&conn).expect("initialize writer test schema");
         let backend = RusqliteBackend::new(conn);
+        seed_writer_test_panes(&backend, pane_ids);
+        backend
+    }
+
+    fn seed_writer_test_panes(backend: &dyn StorageBackend, pane_ids: &[u64]) {
         for &pane_id in pane_ids {
             let pane = PaneRecord {
                 pane_id,
@@ -15410,9 +15437,8 @@ mod writer_io_scheduler_tests {
                 ignore_reason: None,
                 last_decision_at: None,
             };
-            upsert_pane_backend(&backend, &pane).expect("seed append rollback pane");
+            upsert_pane_backend(backend, &pane).expect("seed append rollback pane");
         }
-        backend
     }
 
     fn sorted_segment_contents(backend: &dyn StorageBackend, pane_id: u64) -> Vec<String> {
@@ -15423,6 +15449,250 @@ mod writer_io_scheduler_tests {
             .into_iter()
             .map(|segment| segment.content)
             .collect()
+    }
+
+    #[test]
+    fn singleton_append_waits_for_external_writer_before_reading_sequence() {
+        let dir = tempfile::tempdir().expect("create writer contention directory");
+        let db_path = dir.path().join("capture.sqlite3");
+        let backend = RusqliteStorageBackendProvider::default()
+            .open_writer_backend(StorageWriterOpenRequest {
+                db_path: db_path.to_string_lossy().into_owned(),
+                db_existed: false,
+                defer_fts_triggers: false,
+                cx: None,
+            })
+            .expect("open production capture writer");
+        seed_writer_test_panes(backend.as_ref(), &[71]);
+        assert_eq!(
+            backend.query_scalar("PRAGMA busy_timeout").unwrap(),
+            Some("5000".to_string())
+        );
+        let blocker = rusqlite::Connection::open(&db_path).expect("open independent writer");
+        blocker
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE panes SET title = 'contended' WHERE pane_id = 71",
+            )
+            .expect("hold the competing SQLite writer lock");
+        // Plant the original failure against these same real connections.
+        // Even the installed five-second timeout cannot rescue the deferred
+        // SELECT MAX(seq) snapshot when its subsequent INSERT needs a writer.
+        let deferred = run_writer_transaction(
+            backend.as_ref(),
+            WriterTransactionBeginMode::Deferred,
+            "deferred capture negative control",
+            || append_segment_backend(backend.as_ref(), 71, "must not commit", None, None, None),
+        )
+        .expect_err("the deferred read-to-write upgrade must fail under contention");
+        assert!(
+            deferred.to_string().contains("database is locked"),
+            "{deferred}"
+        );
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let hold = std::time::Duration::from_millis(200);
+        let release = std::thread::spawn(move || {
+            // An early completion is the old deferred read-to-write upgrade
+            // failure: SQLite cannot invoke its busy handler for that upgrade.
+            let early = finished_rx.recv_timeout(hold);
+            blocker
+                .execute_batch("COMMIT")
+                .expect("release writer lock");
+            early
+        });
+        let mut redactors = HashMap::new();
+        let result = append_segment_commit_backend(
+            backend.as_ref(),
+            71,
+            "captured while contended",
+            None,
+            None,
+            None,
+            &mut redactors,
+        );
+        let _ = finished_tx.send(());
+        assert!(
+            matches!(
+                release.join().expect("join lock holder"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "append must wait for the competing writer instead of failing immediately"
+        );
+        let committed = result.unwrap_or_else(|error| panic!("capture must persist: {error}"));
+        assert_eq!(committed.segment.seq, 0);
+        assert_eq!(
+            sorted_segment_contents(backend.as_ref(), 71),
+            vec!["captured while contended".to_string()]
+        );
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+    }
+
+    #[test]
+    fn singleton_append_zero_busy_timeout_preserves_state_for_retry() {
+        let dir = tempfile::tempdir().expect("create writer retry directory");
+        let db_path = dir.path().join("capture.sqlite3");
+        let backend = RusqliteStorageBackendProvider::default()
+            .open_writer_backend(StorageWriterOpenRequest {
+                db_path: db_path.to_string_lossy().into_owned(),
+                db_existed: false,
+                defer_fts_triggers: false,
+                cx: None,
+            })
+            .expect("open production capture writer");
+        seed_writer_test_panes(backend.as_ref(), &[71]);
+        let mut redactors = HashMap::new();
+        append_segment_commit_backend(
+            backend.as_ref(),
+            71,
+            "prefix sk-",
+            None,
+            None,
+            None,
+            &mut redactors,
+        )
+        .unwrap_or_else(|error| panic!("seed split-secret prefix: {error}"));
+        let before = redactors.clone();
+        backend
+            .set_busy_timeout(std::time::Duration::ZERO)
+            .expect("disable SQLite contention retries for the negative control");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open independent writer");
+        blocker.execute_batch("BEGIN IMMEDIATE").expect("hold lock");
+        let result = append_segment_commit_backend(
+            backend.as_ref(),
+            71,
+            "abcdefghijklmnopqrstuvwxyz suffix",
+            None,
+            None,
+            None,
+            &mut redactors,
+        );
+        blocker
+            .execute_batch("COMMIT")
+            .expect("release writer lock");
+        let error = match result {
+            Ok(_) => panic!("zero timeout must refuse the contended append"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("database is locked"), "{error}");
+        assert!(matches!(
+            error,
+            crate::Error::Storage(StorageError::WriterBusyNotCommitted)
+        ));
+        assert!(!is_backend_epoch_poisoned(&error));
+        assert_eq!(redactors, before);
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+        assert_eq!(
+            sorted_segment_contents(backend.as_ref(), 71),
+            vec!["prefix sk-".to_string()]
+        );
+        let retried = append_segment_commit_backend(
+            backend.as_ref(),
+            71,
+            "abcdefghijklmnopqrstuvwxyz suffix",
+            None,
+            None,
+            None,
+            &mut redactors,
+        )
+        .unwrap_or_else(|error| panic!("retry after proven non-commit: {error}"));
+        assert_eq!(
+            retried.segment.seq, 1,
+            "a failed append consumes no sequence"
+        );
+        let contents = sorted_segment_contents(backend.as_ref(), 71);
+        assert_eq!(contents.len(), 2, "retry must not duplicate the append");
+        let persisted = contents.concat();
+        assert!(!persisted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(persisted.contains(crate::redactor::REDACTED_MARKER));
+    }
+
+    #[test]
+    fn grouped_append_native_busy_preserves_noncommit_authority_for_every_caller() {
+        run_storage_async_test(async {
+            let dir = tempfile::tempdir().expect("create grouped contention directory");
+            let db_path = dir.path().join("capture.sqlite3");
+            let backend = RusqliteStorageBackendProvider::default()
+                .open_writer_backend(StorageWriterOpenRequest {
+                    db_path: db_path.to_string_lossy().into_owned(),
+                    db_existed: false,
+                    defer_fts_triggers: false,
+                    cx: None,
+                })
+                .expect("open production grouped capture writer");
+            seed_writer_test_panes(backend.as_ref(), &[81, 82]);
+            backend
+                .set_busy_timeout(std::time::Duration::ZERO)
+                .expect("make contention immediately observable");
+            let blocker = rusqlite::Connection::open(&db_path).expect("open competing writer");
+            blocker
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("hold writer lock");
+            let mut group = Vec::new();
+            let mut receivers = Vec::new();
+            for pane_id in [81, 82] {
+                let (send, receive) = oneshot::channel();
+                group.push(PendingAppendSegmentWrite {
+                    pane_id,
+                    content: format!("capture for {pane_id}"),
+                    content_hash: None,
+                    zone_type: None,
+                    recorder_delivery: None,
+                    capture_hold: None,
+                    respond: WriterResultResponder::new(send),
+                });
+                receivers.push(receive);
+            }
+            let mut redactors = HashMap::new();
+            let result =
+                append_segment_group_commit_backend(backend.as_ref(), &group, &mut redactors);
+            assert!(matches!(
+                &result,
+                Err(crate::Error::Storage(StorageError::WriterBusyNotCommitted))
+            ));
+            assert!(
+                redactors.is_empty(),
+                "BEGIN refusal cannot change redactor state"
+            );
+            assert_eq!(
+                backend.transaction_state().unwrap(),
+                BackendTransactionState::Autocommit
+            );
+            for pane_id in [81, 82] {
+                assert!(sorted_segment_contents(backend.as_ref(), pane_id).is_empty());
+            }
+            dispatch_append_segment_group_commit_result(result, group, &mut None);
+            for receiver in receivers {
+                let result = crate::runtime_async::oneshot_recv(receiver)
+                    .await
+                    .expect("grouped caller receives the authoritative result");
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::Storage(StorageError::WriterBusyNotCommitted))
+                ));
+            }
+            blocker
+                .execute_batch("COMMIT")
+                .expect("release writer lock");
+            for pane_id in [81, 82] {
+                let committed = append_segment_commit_backend(
+                    backend.as_ref(),
+                    pane_id,
+                    &format!("capture for {pane_id}"),
+                    None,
+                    None,
+                    None,
+                    &mut redactors,
+                )
+                .expect("safe append after lock release");
+                assert_eq!(committed.segment.seq, 0, "refusal consumes no sequence");
+                assert_eq!(sorted_segment_contents(backend.as_ref(), pane_id).len(), 1);
+            }
+        });
     }
 
     #[test]
@@ -19322,7 +19592,10 @@ fn append_segment_commit_backend(
     let snapshot = segment_redactors.get(&pane_id).cloned();
     let result = run_writer_transaction(
         backend,
-        WriterTransactionBeginMode::Deferred,
+        // Reserve the writer before redaction and MAX(seq) establish a read
+        // snapshot. A deferred read-to-write upgrade can bypass busy_timeout
+        // and drop a capture even when the competing writer is short-lived.
+        WriterTransactionBeginMode::Immediate,
         "append segment commit",
         || {
             let (redacted_content, retained_tail_moved) =
@@ -21227,9 +21500,8 @@ fn record_policy_denial_audit_backend(
 /// All `StorageHandle` reader helpers funnel through this. It applies the
 /// standard 5s `busy_timeout` so a concurrent writer holding the WAL
 /// write lock does not surface as an immediate `SQLITE_BUSY` to the
-/// caller — SQLite retries internally for the configured window. The
-/// `let _ =` discard on `busy_timeout` is intentional: failure to apply
-/// the PRAGMA is non-fatal; the read may simply contend more aggressively.
+/// caller — SQLite retries internally for the configured window. Opening
+/// fails if that bounded retry policy cannot be installed.
 ///
 /// Match the recipe in `record_policy_denial_audit_blocking`. Without
 /// this, every MCP / robot / TUI read path could fail under modest writer
@@ -21241,7 +21513,9 @@ fn open_read_storage_backend(db_path: &str) -> Result<RusqliteBackend> {
     };
     let backend = RusqliteBackend::open(db_path, &config)
         .map_err(|err| StorageError::Database(format!("Failed to open read connection: {err}")))?;
-    let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
+    backend
+        .set_busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|err| storage_backend_error("Set reader busy timeout", err))?;
     Ok(backend)
 }
 
@@ -21249,6 +21523,7 @@ const fn storage_backend_error_class(error: &BackendError) -> &'static str {
     match error {
         BackendError::Connect(_) => "connect",
         BackendError::Query(_) => "query",
+        BackendError::SqliteBusy => "sqlite_busy",
         BackendError::TxPoisoned => "transaction_poisoned",
         BackendError::TransactionBusy => "transaction_busy",
         BackendError::TransactionBoundaryLost => "transaction_boundary_lost",
@@ -23399,7 +23674,7 @@ fn connector_mutation_backend(
             if changed.is_none() {
                 return Ok(Outcome::Conflict);
             }
-            Ok(Outcome::Transitioned(entry))
+            Ok(Outcome::Transitioned(Box::new(entry)))
         }
         Mutation::Ingest {
             subscription_key,
@@ -32791,6 +33066,7 @@ fn storage_backend_error_class_is_finite_and_content_free() {
     let cases = [
         (BackendError::Connect(sensitive.to_string()), "connect"),
         (BackendError::Query(sensitive.to_string()), "query"),
+        (BackendError::SqliteBusy, "sqlite_busy"),
         (BackendError::TxPoisoned, "transaction_poisoned"),
         (BackendError::TransactionBusy, "transaction_busy"),
         (

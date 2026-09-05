@@ -156,7 +156,7 @@ impl BeadDependencyRef {
     pub fn blocks_readiness(&self) -> bool {
         self.dependency_type
             .as_deref()
-            .map_or(true, |kind| work_graph_blocks(kind).unwrap_or(true))
+            .is_none_or(|kind| work_graph_blocks(kind).unwrap_or(true))
     }
 }
 

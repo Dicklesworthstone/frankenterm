@@ -245,6 +245,11 @@ impl CaptureConfig {
     }
 }
 
+/// Configuration rejected before an adapter can emit any recorder event.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid replay capture configuration: {0}")]
+pub struct ReplayCaptureConfigError(String);
+
 /// Runtime capture adapter that converts pipeline events into
 /// [`RecorderEvent`] records with deterministic ordering metadata.
 ///
@@ -277,13 +282,15 @@ pub struct CaptureAdapter {
 
 impl CaptureAdapter {
     /// Create a new capture adapter with the given sink and configuration.
-    pub fn new(sink: Arc<dyn CaptureSink>, config: CaptureConfig) -> Self {
-        config
-            .validate()
-            .unwrap_or_else(|err| panic!("invalid CaptureConfig: {err}"));
+    /// Returns an error before touching the sink if the policy is invalid.
+    pub fn new(
+        sink: Arc<dyn CaptureSink>,
+        config: CaptureConfig,
+    ) -> Result<Self, ReplayCaptureConfigError> {
+        config.validate().map_err(ReplayCaptureConfigError)?;
         let redaction = CaptureRedactionRuntime::new(config.redaction_policy.clone())
-            .unwrap_or_else(|err| panic!("invalid CaptureRedactionPolicy: {err}"));
-        Self {
+            .map_err(ReplayCaptureConfigError)?;
+        Ok(Self {
             sink,
             pane_sequences: Mutex::new(HashMap::new()),
             enabled: AtomicBool::new(config.enabled),
@@ -293,12 +300,11 @@ impl CaptureAdapter {
             total_captured: AtomicU64::new(0),
             sequence_error_count: AtomicU64::new(0),
             sequence_error_warned: AtomicBool::new(false),
-        }
+        })
     }
 
     /// Create a capture adapter with a no-op sink.
-    #[must_use]
-    pub fn disabled() -> Self {
+    pub fn disabled() -> Result<Self, ReplayCaptureConfigError> {
         Self::new(
             Arc::new(NoopCaptureSink),
             CaptureConfig {
@@ -1350,14 +1356,60 @@ mod tests {
             session_id: Some("test-session-001".into()),
             ..Default::default()
         };
-        let adapter = CaptureAdapter::new(sink.clone(), config);
+        let adapter =
+            CaptureAdapter::new(sink.clone(), config).expect("valid capture configuration");
         (sink, adapter)
+    }
+
+    #[test]
+    fn capture_constructor_rejects_invalid_policy_without_unwind_or_sink_events() {
+        for enabled in [true, false] {
+            for (policy, expected) in [
+                (
+                    CaptureRedactionPolicy {
+                        custom_patterns: vec!["[".to_string()],
+                        ..Default::default()
+                    },
+                    "custom_patterns[0]",
+                ),
+                (
+                    CaptureRedactionPolicy {
+                        t1_retention_days: 0,
+                        ..Default::default()
+                    },
+                    "t1_retention_days",
+                ),
+            ] {
+                let sink = Arc::new(CollectingCaptureSink::new());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    CaptureAdapter::new(
+                        sink.clone(),
+                        CaptureConfig {
+                            enabled,
+                            redaction_policy: policy,
+                            ..Default::default()
+                        },
+                    )
+                }))
+                .expect("invalid configuration must return an error, not unwind");
+                let error = result.err().expect("invalid policy must be rejected");
+                assert!(error.to_string().contains(expected), "{error}");
+                assert!(sink.is_empty(), "rejected construction must emit nothing");
+
+                // Correcting the policy preserves the positive capture path.
+                let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+                    .expect("valid capture configuration");
+                expect_capture(adapter.capture_egress(&make_segment(1, "valid capture", 0)));
+                assert_eq!(sink.len(), 1);
+            }
+        }
     }
 
     fn make_segment(pane_id: u64, content: &str, seq: u64) -> CapturedSegment {
         CapturedSegment {
             pane_id,
             seq,
+            seq_correction: 0,
             content: content.to_string(),
             kind: crate::ingest::CapturedSegmentKind::Delta,
             captured_at: 1700000000000,
@@ -1368,6 +1420,7 @@ mod tests {
         CapturedSegment {
             pane_id,
             seq,
+            seq_correction: 0,
             content: String::new(),
             kind: crate::ingest::CapturedSegmentKind::Gap {
                 reason: reason.to_string(),
@@ -1567,7 +1620,10 @@ mod tests {
         const THREADS: usize = 16;
 
         let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = Arc::new(CaptureAdapter::new(sink.clone(), CaptureConfig::default()));
+        let adapter = Arc::new(
+            CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+                .expect("valid capture configuration"),
+        );
         let pane_id = 92;
         seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -1729,7 +1785,8 @@ mod tests {
     #[test]
     fn egress_tap_failure_is_bounded_and_never_reaches_sink() {
         let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default());
+        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+            .expect("valid capture configuration");
         let pane_id = 97;
         seed_pane_frontier(&adapter, pane_id, u64::MAX);
         adapter
@@ -1751,7 +1808,8 @@ mod tests {
     #[test]
     fn ingress_tap_stops_after_the_first_sequence_error() {
         let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default());
+        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+            .expect("valid capture configuration");
         let pane_id = 98;
         seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
 
@@ -2066,7 +2124,7 @@ mod tests {
 
     #[test]
     fn test_disabled_constructor_captures_nothing() {
-        let adapter = CaptureAdapter::disabled();
+        let adapter = CaptureAdapter::disabled().expect("valid disabled capture configuration");
         expect_capture(adapter.capture_egress(&make_segment(1, "nope", 0)));
         assert_eq!(adapter.total_captured(), 0);
     }
@@ -2236,7 +2294,8 @@ mod tests {
     fn test_egress_tap_impl() {
         let sink = Arc::new(CollectingCaptureSink::new());
         let config = CaptureConfig::default();
-        let adapter = CaptureAdapter::new(sink.clone(), config);
+        let adapter =
+            CaptureAdapter::new(sink.clone(), config).expect("valid capture configuration");
 
         let egress = EgressEvent {
             pane_id: 99,
@@ -2262,7 +2321,8 @@ mod tests {
     fn test_ingress_tap_impl_records_ingress_and_decision_marker() {
         let sink = Arc::new(CollectingCaptureSink::new());
         let config = CaptureConfig::default();
-        let adapter = CaptureAdapter::new(sink.clone(), config);
+        let adapter =
+            CaptureAdapter::new(sink.clone(), config).expect("valid capture configuration");
 
         IngressTap::on_ingress(
             &adapter,
@@ -2367,7 +2427,8 @@ mod tests {
                 session_id: Some("test-session-sink-poison".into()),
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid capture configuration");
 
         let sink_for_poison = Arc::clone(&sink);
         let poison = std::thread::spawn(move || {
@@ -2536,13 +2597,16 @@ mod tests {
         // poisoning thread can hold a reference to its internal Mutex
         // while the main thread continues to drive captures.
         let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = Arc::new(CaptureAdapter::new(
-            sink.clone(),
-            CaptureConfig {
-                session_id: Some("test-session-poison".into()),
-                ..Default::default()
-            },
-        ));
+        let adapter = Arc::new(
+            CaptureAdapter::new(
+                sink.clone(),
+                CaptureConfig {
+                    session_id: Some("test-session-poison".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("valid capture configuration"),
+        );
 
         // Baseline: the recorder works pre-poison.
         expect_capture(adapter.capture_egress(&make_segment(7, "before-poison", 0)));
@@ -2778,7 +2842,8 @@ mod tests {
                 },
                 ..Default::default()
             },
-        );
+        )
+        .expect("valid capture configuration");
 
         expect_capture(adapter.capture_egress(&make_segment(
             42,

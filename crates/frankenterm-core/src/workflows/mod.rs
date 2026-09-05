@@ -1627,10 +1627,13 @@ steps:
             ));
 
             let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-            let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
-                sink.clone(),
-                crate::replay_capture::CaptureConfig::default(),
-            ));
+            let replay_adapter = Arc::new(
+                crate::replay_capture::CaptureAdapter::new(
+                    sink.clone(),
+                    crate::replay_capture::CaptureConfig::default(),
+                )
+                .expect("valid capture configuration"),
+            );
 
             let runner = WorkflowRunner::new(
                 engine,

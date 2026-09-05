@@ -133,6 +133,8 @@ fn run_rollback_post_proof_lease_test_hook() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxContractStoreErrorKind {
     InProgress,
+    /// The namespace observation changed before lock ownership or effects.
+    Conflict,
     Lock,
     Validation,
     Serialization,
@@ -523,6 +525,28 @@ impl TxContractLockGuard {
     pub fn authorizes(&self, path: &Path) -> Result<(), TxContractStoreError> {
         self.verify_logical_path(path)?;
         self.verify_pinned_mutation_edges()?;
+        #[cfg(target_os = "macos")]
+        {
+            let contract = self.contract_file.lock().map_err(|_| {
+                TxContractStoreError::new(
+                    TxContractStoreErrorKind::Lock,
+                    "pinned transaction contract file mutex is poisoned".to_string(),
+                )
+            })?;
+            // Inode equality alone does not detect a case-only rename on a
+            // case-insensitive volume. Refuse a stale pathname-derived lock
+            // identity, including changes to parent or workspace spelling.
+            if native_tx_descriptor_path(&*contract, &self.key)? != self.key
+                || native_tx_descriptor_path(&self.workspace_dir, &self.workspace_display)?
+                    != self.workspace_display
+            {
+                return Err(TxContractStoreError::new(
+                    TxContractStoreErrorKind::Conflict,
+                    "transaction contract canonical spelling changed before effect dispatch"
+                        .to_string(),
+                ));
+            }
+        }
         if !self.named_parent_matches_pinned_parent()? {
             return Err(TxContractStoreError::new(
                 TxContractStoreErrorKind::Lock,
@@ -1048,14 +1072,131 @@ pub fn acquire_tx_contract_lock(
     }
     #[cfg(not(windows))]
     {
-        acquire_tx_contract_lock_supported(workspace_root, path)
+        acquire_tx_contract_lock_supported(workspace_root, path, || {})
     }
+}
+
+#[cfg(not(windows))]
+fn verify_tx_contract_canonical_leaf(
+    parent: &CapDir,
+    requested: &std::ffi::OsStr,
+    canonical: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<(), TxContractStoreError> {
+    let observe = |name: &std::ffi::OsStr| {
+        parent.symlink_metadata(name).map_err(|error| {
+            TxContractStoreError::new(
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    TxContractStoreErrorKind::Conflict
+                } else {
+                    TxContractStoreErrorKind::Lock
+                },
+                format!(
+                    "cannot verify canonical transaction leaf {} before locking: {error}",
+                    display.display()
+                ),
+            )
+        })
+    };
+    let requested_metadata = observe(requested)?;
+    let canonical_metadata = observe(canonical)?;
+    if !requested_metadata.is_file() || !canonical_metadata.is_file() {
+        return Err(TxContractStoreError::new(
+            TxContractStoreErrorKind::Lock,
+            format!(
+                "transaction contract is not a regular file: {}",
+                display.display()
+            ),
+        ));
+    }
+    if cap_object_identity(&requested_metadata)? != cap_object_identity(&canonical_metadata)? {
+        return Err(TxContractStoreError::new(
+            TxContractStoreErrorKind::Conflict,
+            format!(
+                "canonical transaction leaf changed before locking: {}",
+                display.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn native_tx_descriptor_path(
+    file: impl std::os::fd::AsFd,
+    display: &Path,
+) -> Result<PathBuf, TxContractStoreError> {
+    use std::os::unix::ffi::OsStringExt;
+
+    // F_GETPATH returns the filesystem's stored spelling; realpath and the
+    // capability library's manual canonicalizer retain caller case on macOS.
+    rustix::fs::getpath(file)
+        .map(|path| PathBuf::from(OsString::from_vec(path.into_bytes())))
+        .map_err(|err| {
+            TxContractStoreError::new(
+                if err == rustix::io::Errno::NOENT {
+                    TxContractStoreErrorKind::Conflict
+                } else {
+                    TxContractStoreErrorKind::Lock
+                },
+                format!(
+                    "failed to resolve native transaction descriptor path {}: {err}",
+                    display.display()
+                ),
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn discover_native_tx_contract_path(
+    parent: &CapDir,
+    name: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<PathBuf, TxContractStoreError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file = parent.open_with(name, &options).map_err(|err| {
+        TxContractStoreError::new(
+            if err.kind() == std::io::ErrorKind::NotFound {
+                TxContractStoreErrorKind::Conflict
+            } else {
+                TxContractStoreErrorKind::Lock
+            },
+            format!(
+                "failed to open native transaction discovery descriptor {}: {err}",
+                display.display()
+            ),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|err| {
+        TxContractStoreError::new(
+            TxContractStoreErrorKind::Lock,
+            format!(
+                "failed to inspect native transaction discovery descriptor {}: {err}",
+                display.display()
+            ),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(TxContractStoreError::new(
+            TxContractStoreErrorKind::Lock,
+            format!(
+                "transaction contract is not a regular file: {}",
+                display.display()
+            ),
+        ));
+    }
+    // Discovery never supplies the mutation handle. Pin the authoritative
+    // file only after acquiring both locks, so a completed competing commit
+    // is observed through its replacement inode.
+    native_tx_descriptor_path(&file, display)
 }
 
 #[cfg(not(windows))]
 fn acquire_tx_contract_lock_supported(
     workspace_root: &Path,
     path: &Path,
+    before_lock: impl FnOnce(),
 ) -> Result<TxContractLockGuard, TxContractStoreError> {
     let workspace_dir = CapDir::open_ambient_dir(workspace_root, cap_std::ambient_authority())
         .map_err(|err| {
@@ -1077,6 +1218,9 @@ fn acquire_tx_contract_lock_supported(
                 ),
             )
         })?)?;
+    #[cfg(target_os = "macos")]
+    let workspace_display = native_tx_descriptor_path(&workspace_dir, workspace_root)?;
+    #[cfg(not(target_os = "macos"))]
     let workspace_display = workspace_root.canonicalize().map_err(|err| {
         TxContractStoreError::new(
             TxContractStoreErrorKind::Lock,
@@ -1172,13 +1316,9 @@ fn acquire_tx_contract_lock_supported(
         .join(requested_parent_relative)
         .join(&requested_contract_name);
 
-    // Type-check the leaf WITHOUT opening it (fstatat, no follow). Opening a
-    // hostile leaf first is both non-deterministic (a FIFO open can fail with
-    // a platform-dependent errno instead of the typed "not a regular file"
-    // rejection) and — via the canonicalize below, which opens without
-    // O_NONBLOCK — a block-forever-waiting-for-a-writer hazard. The post-open
-    // metadata check further down stays as the TOCTOU confirmation
-    // (ft-kccj8).
+    // Reject hostile leaf types before discovery. Native discovery and the
+    // post-lock authoritative open also use O_NONBLOCK and no-follow, then
+    // recheck the opened type, so replacement with a FIFO cannot block either.
     let leaf_metadata = parent_dir
         .symlink_metadata(&requested_contract_name)
         .map_err(|err| {
@@ -1200,44 +1340,13 @@ fn acquire_tx_contract_lock_supported(
         ));
     }
 
-    let mut contract_options = CapOpenOptions::new();
-    contract_options.read(true).follow(FollowSymlinks::No);
-    #[cfg(unix)]
-    contract_options.nonblock(true);
-    let contract_file = parent_dir
-        .open_with(&requested_contract_name, &contract_options)
-        .map_err(|err| {
-            TxContractStoreError::new(
-                TxContractStoreErrorKind::Lock,
-                format!(
-                    "failed to open transaction contract {} without following symlinks: {err}",
-                    requested_key.display()
-                ),
-            )
-        })?;
-    let contract_metadata = contract_file.metadata().map_err(|err| {
-        TxContractStoreError::new(
-            TxContractStoreErrorKind::Lock,
-            format!(
-                "failed to inspect transaction contract {}: {err}",
-                requested_key.display()
-            ),
-        )
-    })?;
-    if !contract_metadata.is_file() {
-        return Err(TxContractStoreError::new(
-            TxContractStoreErrorKind::Lock,
-            format!(
-                "transaction contract is not a regular file: {}",
-                requested_key.display()
-            ),
-        ));
-    }
-    require_single_link(&contract_metadata, &requested_key, "contract")?;
-
     // Derive the process and sidecar lock key from the filesystem's verified
     // canonical spelling. This collapses case/spelling aliases on
     // case-insensitive filesystems before either lock namespace is consulted.
+    #[cfg(target_os = "macos")]
+    let canonical_relative =
+        discover_native_tx_contract_path(&parent_dir, &requested_contract_name, &requested_key)?;
+    #[cfg(not(target_os = "macos"))]
     let canonical_relative = workspace_dir.canonicalize(&relative).map_err(|err| {
         TxContractStoreError::new(
             TxContractStoreErrorKind::Lock,
@@ -1296,45 +1405,21 @@ fn acquire_tx_contract_lock_supported(
             ),
         ));
     }
-    let canonical_file = canonical_parent_dir
-        .open_with(&contract_name, &contract_options)
-        .map_err(|err| {
-            TxContractStoreError::new(
-                TxContractStoreErrorKind::Lock,
-                format!(
-                    "failed to verify canonical transaction contract {} without following symlinks: {err}",
-                    workspace_display.join(&relative).display()
-                ),
-            )
-        })?;
-    let canonical_metadata = canonical_file.metadata().map_err(|err| {
-        TxContractStoreError::new(
-            TxContractStoreErrorKind::Lock,
-            format!(
-                "failed to identify canonical transaction contract {}: {err}",
-                workspace_display.join(&relative).display()
-            ),
-        )
-    })?;
-    if cap_object_identity(&canonical_metadata)? != cap_object_identity(&contract_metadata)? {
-        return Err(TxContractStoreError::new(
-            TxContractStoreErrorKind::Lock,
-            format!(
-                "transaction contract identity changed while canonicalizing {}",
-                requested_key.display()
-            ),
-        ));
-    }
-    require_single_link(
-        &canonical_metadata,
-        &workspace_display.join(&relative),
-        "contract",
-    )?;
-    drop(canonical_file);
     parent_dir = canonical_parent_dir;
     let parent_identity = canonical_parent_identity;
     let parent_display = workspace_display.join(parent_relative);
     let key = workspace_display.join(&relative);
+    // On Linux, capability canonicalization opens O_PATH and reads its procfs
+    // name. A concurrent rename can leave a deleted-inode spelling. Confirm
+    // that the observed spelling still names the requested regular leaf;
+    // stale discovery is a pre-effect conflict, never a different lock key.
+    // Keep filesystem spelling/alias resolution instead of lowercasing names.
+    verify_tx_contract_canonical_leaf(
+        &parent_dir,
+        &requested_contract_name,
+        &contract_name,
+        &requested_key,
+    )?;
     let parent_sync_file = open_workspace_relative_directory_sync_file(
         &workspace_dir,
         parent_relative,
@@ -1342,6 +1427,9 @@ fn acquire_tx_contract_lock_supported(
         &parent_display,
     )?;
 
+    // The production callback is empty. Tests use this exact cutpoint to
+    // complete a competing durable replacement before this contender locks.
+    before_lock();
     let mut locks = TX_CONTRACT_LOCKS.lock().map_err(|_| {
         TxContractStoreError::new(
             TxContractStoreErrorKind::Lock,
@@ -1477,6 +1565,86 @@ fn acquire_tx_contract_lock_supported(
             ),
         ));
     }
+
+    // Pin the mutable leaf only after both lock namespaces are owned. A
+    // cooperative commit can replace its inode at any earlier point; keeping
+    // that stale inode used to turn ordinary contention into an authority
+    // failure. Repeat all leaf/type/alias checks under the lock instead.
+    let pinned_contract = (|| -> Result<CapFile, TxContractStoreError> {
+        let mut contract_options = CapOpenOptions::new();
+        contract_options.read(true).follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        contract_options.nonblock(true);
+        let contract_file = parent_dir
+            .open_with(&requested_contract_name, &contract_options)
+            .map_err(|err| {
+                TxContractStoreError::new(
+                    TxContractStoreErrorKind::Lock,
+                    format!(
+                        "failed to open transaction contract {} without following symlinks: {err}",
+                        requested_key.display()
+                    ),
+                )
+            })?;
+        let contract_metadata = contract_file.metadata().map_err(|err| {
+            TxContractStoreError::new(
+                TxContractStoreErrorKind::Lock,
+                format!(
+                    "failed to inspect transaction contract {}: {err}",
+                    requested_key.display()
+                ),
+            )
+        })?;
+        if !contract_metadata.is_file() {
+            return Err(TxContractStoreError::new(
+                TxContractStoreErrorKind::Lock,
+                format!(
+                    "transaction contract is not a regular file: {}",
+                    requested_key.display()
+                ),
+            ));
+        }
+        require_single_link(&contract_metadata, &requested_key, "contract")?;
+        let canonical_file = parent_dir
+            .open_with(&contract_name, &contract_options)
+            .map_err(|err| {
+                TxContractStoreError::new(
+                    TxContractStoreErrorKind::Lock,
+                    format!(
+                        "failed to verify canonical transaction contract {} without following symlinks: {err}",
+                        key.display()
+                    ),
+                )
+            })?;
+        let canonical_metadata = canonical_file.metadata().map_err(|err| {
+            TxContractStoreError::new(
+                TxContractStoreErrorKind::Lock,
+                format!(
+                    "failed to identify canonical transaction contract {}: {err}",
+                    key.display()
+                ),
+            )
+        })?;
+        if cap_object_identity(&canonical_metadata)? != cap_object_identity(&contract_metadata)? {
+            return Err(TxContractStoreError::new(
+                TxContractStoreErrorKind::Lock,
+                format!(
+                    "transaction contract identity changed while pinning {}",
+                    requested_key.display()
+                ),
+            ));
+        }
+        require_single_link(&canonical_metadata, &key, "contract")?;
+        Ok(contract_file)
+    })();
+    let contract_file = match pinned_contract {
+        Ok(contract_file) => contract_file,
+        Err(err) => {
+            drop(file);
+            release_tx_contract_lock_key(&key);
+            return Err(err);
+        }
+    };
 
     let guard = TxContractLockGuard {
         key,
@@ -1823,6 +1991,22 @@ where
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // Preserve recovery through a detached pinned parent, but never
+        // replace a case-renamed basename under the old sidecar identity.
+        let spelling = native_tx_descriptor_path(&*pinned_contract, path);
+        if !matches!(spelling, Ok(ref current) if current.file_name() == Some(guard.contract_name.as_os_str()))
+        {
+            return Err(retain_failed_tx_contract_temp(
+                guard,
+                &temp_name,
+                TxContractStoreErrorKind::Rename,
+                "transaction contract native basename changed before publication".to_string(),
+            ));
+        }
+    }
+
     if let Err(err) = guard.parent_dir.rename(
         &temp_name,
         &guard.parent_dir,
@@ -1928,6 +2112,10 @@ pub struct MissionRevisionToken {
 mod mission_revision_wire {
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Serde serialize_with callbacks receive a reference to the field"
+    )]
     pub fn serialize<S: Serializer>(revision: &u64, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&revision.to_string())
     }
@@ -2009,6 +2197,7 @@ impl From<TxContractStoreError> for MissionStoreError {
         }
         match error.kind() {
             TxContractStoreErrorKind::InProgress => Self::InProgress,
+            TxContractStoreErrorKind::Conflict => Self::Conflict,
             TxContractStoreErrorKind::Lock => Self::Authority,
             TxContractStoreErrorKind::Validation | TxContractStoreErrorKind::Serialization => {
                 Self::Invalid
@@ -2047,6 +2236,13 @@ impl MissionMutationGuard {
         expected: Option<&MissionRevisionToken>,
     ) -> Result<Self, MissionStoreError> {
         let guard = acquire_tx_contract_lock(workspace_root, path)?;
+        Self::from_guard(guard, expected)
+    }
+
+    fn from_guard(
+        guard: TxContractLockGuard,
+        expected: Option<&MissionRevisionToken>,
+    ) -> Result<Self, MissionStoreError> {
         let bytes = guard.read_authoritative_contract_bytes()?;
         let mission: Mission =
             serde_json::from_slice(&bytes).map_err(|_| MissionStoreError::Invalid)?;
@@ -7145,7 +7341,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mission_store_revision_incarnation_and_content_conflicts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("mission.json");
         let baseline = stored_mission_fixture(&path);
         let expected = MissionRevisionToken::from_mission(&baseline).unwrap();
@@ -7206,6 +7405,111 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn mission_store_commit_before_lock_pins_new_revision_and_refuses_stale_token() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("mission.json");
+        let baseline = stored_mission_fixture(&path);
+        let expected = MissionRevisionToken::from_mission(&baseline).unwrap();
+        let guard = acquire_tx_contract_lock_supported(&root, &path, || {
+            let winner = MissionMutationGuard::acquire(&root, &path, Some(&expected)).unwrap();
+            let mut mission = winner.mission().clone();
+            mission
+                .pause_mission("operator", "competing pause", 2_000, None)
+                .unwrap();
+            winner.commit(&mut mission).unwrap();
+        })
+        .unwrap();
+        let accepted = std::fs::read(&path).unwrap();
+        assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), accepted);
+        assert_eq!(
+            MissionMutationGuard::from_guard(guard, Some(&expected))
+                .err()
+                .unwrap(),
+            MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+        let current = MissionMutationGuard::acquire(&root, &path, None).unwrap();
+        assert_eq!(current.mission().revision, 1);
+        assert_eq!(
+            current.mission().lifecycle_state,
+            crate::plan::MissionLifecycleState::Paused
+        );
+        println!(
+            "MISSION_LOCK_ORDER competing_commit_before_lock=true latest_inode_pinned=true stale_token_conflict=true accepted_bytes_preserved=true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_store_late_leaf_attack_refuses_and_releases_lock_registry() {
+        for symlink in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("mission.json");
+            stored_mission_fixture(&path);
+            let original = std::fs::read(&path).unwrap();
+            let retained = root.join("retained.json");
+            let error = acquire_tx_contract_lock_supported(&root, &path, || {
+                if symlink {
+                    std::fs::rename(&path, &retained).unwrap();
+                    std::os::unix::fs::symlink(&retained, &path).unwrap();
+                } else {
+                    std::fs::hard_link(&path, &retained).unwrap();
+                }
+            })
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), TxContractStoreErrorKind::Lock);
+            assert_eq!(std::fs::read(&retained).unwrap(), original);
+            let again = acquire_tx_contract_lock(&root, &path).err().unwrap();
+            assert_eq!(again.kind(), TxContractStoreErrorKind::Lock);
+            assert!(
+                !TX_CONTRACT_LOCKS
+                    .lock()
+                    .unwrap()
+                    .contains(&root.canonicalize().unwrap().join("mission.json"))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mission_store_deleted_inode_canonical_spelling_is_a_pre_effect_conflict() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("mission.json");
+        stored_mission_fixture(&path);
+        let old_inode = File::open(&path).unwrap();
+        let winner = MissionMutationGuard::acquire(&root, &path, None).unwrap();
+        let mut mission = winner.mission().clone();
+        mission
+            .pause_mission("operator", "replace old inode", 2_000, None)
+            .unwrap();
+        winner.commit(&mut mission).unwrap();
+        let accepted = std::fs::read(&path).unwrap();
+        let stale_name =
+            std::fs::read_link(format!("/proc/self/fd/{}", old_inode.as_raw_fd())).unwrap();
+        let parent = CapDir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let error = verify_tx_contract_canonical_leaf(
+            &parent,
+            std::ffi::OsStr::new("mission.json"),
+            stale_name.file_name().unwrap(),
+            &path,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), TxContractStoreErrorKind::Conflict);
+        assert_eq!(MissionStoreError::from(error), MissionStoreError::Conflict);
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+        verify_tx_contract_canonical_leaf(
+            &parent,
+            std::ffi::OsStr::new("mission.json"),
+            std::ffi::OsStr::new("mission.json"),
+            &path,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn mission_store_faults_preserve_old_or_new_complete_snapshot() {
         for point in [
             TxContractSaveFaultPoint::BeforeWrite,
@@ -7213,7 +7517,10 @@ mod tests {
             TxContractSaveFaultPoint::BeforeAtomicReplace,
             TxContractSaveFaultPoint::ParentDirectorySync,
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
             let path = dir.path().join("mission.json");
             stored_mission_fixture(&path);
             let original = std::fs::read(&path).unwrap();
@@ -7262,7 +7569,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mission_store_rejects_replaced_path_and_revision_overflow() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("mission.json");
         let mut mission = stored_mission_fixture(&path);
         mission.revision = u64::MAX;
@@ -7293,8 +7603,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    static OWNED_MISSION_CHILD_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(unix)]
+    static RETAINED_MISSION_CHILDREN: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
+
+    #[cfg(unix)]
     struct OwnedMissionChild {
-        child: std::process::Child,
+        child: Option<std::process::Child>,
         stdout: PathBuf,
         stderr: PathBuf,
     }
@@ -7304,7 +7620,8 @@ mod tests {
         fn spawn(root: &Path, name: &str, action: &str, expected: &MissionRevisionToken) -> Self {
             let stdout = root.join(format!("{name}.stdout"));
             let stderr = root.join(format!("{name}.stderr"));
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "tx_execution::tests::mission_store_child",
@@ -7320,14 +7637,59 @@ mod tests {
                 )
                 .stdin(std::process::Stdio::null())
                 .stdout(File::create_new(&stdout).unwrap())
-                .stderr(File::create_new(&stderr).unwrap())
-                .spawn()
-                .unwrap();
+                .stderr(File::create_new(&stderr).unwrap());
+            OWNED_MISSION_CHILD_COUNT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    (count < 16).then_some(count + 1)
+                })
+                .expect("finite capacity for live and indeterminate mission children");
+            let child = command.spawn().unwrap_or_else(|error| {
+                OWNED_MISSION_CHILD_COUNT.fetch_sub(1, Ordering::SeqCst);
+                panic!("spawn owned mission child: {error}");
+            });
             Self {
-                child,
+                child: Some(child),
                 stdout,
                 stderr,
             }
+        }
+
+        fn finish_reaped(&mut self) {
+            if self.child.take().is_some() {
+                OWNED_MISSION_CHILD_COUNT.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        fn stop_bounded(&mut self) -> Option<std::process::ExitStatus> {
+            let child = self.child.as_mut()?;
+            if let Ok(Some(status)) = child.try_wait() {
+                self.finish_reaped();
+                return Some(status);
+            }
+            let killed = child.kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(Some(status)) = child.try_wait() {
+                    self.finish_reaped();
+                    return Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let child = self.child.take().expect("unsettled owned child");
+            eprintln!(
+                "owned mission child retained: pid={}, kill={killed:?}, settlement=indeterminate",
+                child.id()
+            );
+            // Retain both the handle and its capacity reservation. Never turn
+            // an unconfirmed kill into a reaping claim or an unbounded wait.
+            RETAINED_MISSION_CHILDREN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(child);
+            None
         }
 
         fn wait(&mut self) -> std::process::ExitStatus {
@@ -7336,20 +7698,24 @@ mod tests {
                 let oversized = [&self.stdout, &self.stderr].iter().any(|path| {
                     std::fs::metadata(path).map_or(true, |metadata| metadata.len() > 256 * 1024)
                 });
-                let poll = self.child.try_wait();
+                let poll = self
+                    .child
+                    .as_mut()
+                    .expect("owned child not yet consumed")
+                    .try_wait();
                 if !oversized {
                     if let Ok(Some(status)) = &poll {
+                        self.finish_reaped();
                         return *status;
                     }
                 }
                 if oversized || poll.is_err() || std::time::Instant::now() >= deadline {
-                    let killed = self.child.kill();
-                    let reaped = self.child.wait();
+                    let reaped = self.stop_bounded();
                     let mut stderr = String::new();
                     let diagnostic = File::open(&self.stderr)
                         .and_then(|file| file.take(64 * 1024).read_to_string(&mut stderr));
                     panic!(
-                        "owned mission child failed: poll={poll:?}, oversized={oversized}, kill={killed:?}, reap={reaped:?}, stderr_read={diagnostic:?}, stderr={stderr}"
+                        "owned mission child failed: poll={poll:?}, oversized={oversized}, bounded_reap={reaped:?}, stderr_read={diagnostic:?}, stderr={stderr}"
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -7360,15 +7726,9 @@ mod tests {
     #[cfg(unix)]
     impl Drop for OwnedMissionChild {
         fn drop(&mut self) {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {}
-                poll => {
-                    let killed = self.child.kill();
-                    let reaped = self.child.wait();
-                    eprintln!(
-                        "owned mission child cleanup: poll={poll:?}, kill={killed:?}, reap={reaped:?}"
-                    );
-                }
+            if self.child.is_some() {
+                let reaped = self.stop_bounded();
+                eprintln!("owned mission child cleanup: bounded_reap={reaped:?}");
             }
         }
     }
@@ -7449,8 +7809,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn mission_store_owned_child_termination_is_bounded_and_reaped() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("mission.json");
+        let mission = stored_mission_fixture(&path);
+        let token = MissionRevisionToken::from_mission(&mission).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut child = OwnedMissionChild::spawn(&root, "stop-before-release", "abort", &token);
+        let pid = child.child.as_ref().unwrap().id();
+        assert!(child.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        let started = std::time::Instant::now();
+        let status = child.stop_bounded().expect("owned waiting child reaped");
+        assert!(!status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+        assert!(child.child.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!root.join("stop-before-release.result.json").exists());
+        println!(
+            "MISSION_CHILD_SETTLEMENT pid={pid} owned_leader_reaped=true before_release=true mission_bytes_preserved=true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn mission_store_process_lock_spans_read_through_commit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("mission.json");
         let mission = stored_mission_fixture(&path);
         let token = MissionRevisionToken::from_mission(&mission).unwrap();
@@ -7464,7 +7850,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "child did not observe held file lock"
             );
-            assert!(child.child.try_wait().unwrap().is_none());
+            assert!(child.child.as_mut().unwrap().try_wait().unwrap().is_none());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(std::fs::read(&path).unwrap(), original);
@@ -7486,7 +7872,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mission_store_two_process_cas_race_preserves_accepted_abort() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("mission.json");
         let mut mission = stored_mission_fixture(&path);
         let guard = MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
@@ -7569,7 +7958,10 @@ mod tests {
             "crash_before_replace",
             "crash_before_directory_sync",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
             let path = dir.path().join("mission.json");
             let mission = stored_mission_fixture(&path);
             let original = std::fs::read(&path).unwrap();
@@ -7745,7 +8137,8 @@ mod tests {
     /// (ft-ehcqr). Canonicalizing the root once keeps these tests testing the
     /// store rather than the host's path layout.
     fn canonical_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().expect("contract store tempdir");
+        let mut dir = tempfile::tempdir().expect("contract store tempdir");
+        dir.disable_cleanup(true);
         let root = dir
             .path()
             .canonicalize()
@@ -7854,7 +8247,7 @@ mod tests {
 
     #[test]
     fn atomic_save_requires_the_matching_contract_lock() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
         let first_path = dir.path().join("first.json");
         let second_path = dir.path().join("second.json");
         let contract = make_test_contract(1);
@@ -7876,7 +8269,7 @@ mod tests {
     fn contract_lock_and_save_reject_symbolic_links() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
         let target = dir.path().join("target.json");
         let link = dir.path().join("link.json");
         let contract = make_test_contract(1);
@@ -7894,7 +8287,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn contract_lock_rejects_contracts_with_multiple_hard_links() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
         let path = dir.path().join("tx.json");
         let second_link = dir.path().join("tx-second-link.json");
         let contract = make_test_contract(1);
@@ -7910,7 +8303,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn contract_lock_rejects_fifo_leaf_without_waiting_for_a_writer() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
         let path = dir.path().join("tx.json");
         let status = std::process::Command::new("mkfifo")
             .arg(&path)
@@ -7929,7 +8322,7 @@ mod tests {
     fn contract_lock_rejects_symbolic_link_sidecar() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
         let path = dir.path().join("tx.json");
         let lock_target = dir.path().join("unrelated.lock");
         let contract = make_test_contract(1);
@@ -7949,7 +8342,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn contract_lock_rejects_parent_namespace_detach_until_original_is_restored() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
         let active_dir = dir.path().join("active");
         let foreign_dir = dir.path().join("foreign");
         let detached_dir = dir.path().join("active-detached");
@@ -7982,8 +8375,8 @@ mod tests {
     fn contract_lock_rejects_symlinked_ancestor_directory() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
+        let (dir, _root) = canonical_tempdir();
+        let (external, _external_root) = canonical_tempdir();
         let sub_dir = dir.path().join("sub");
         let external_sub = external.path().join("external_sub");
         std::fs::create_dir(&external_sub).unwrap();
@@ -7998,6 +8391,104 @@ mod tests {
             .unwrap();
         assert_eq!(err.kind(), TxContractStoreErrorKind::Lock);
         assert!(err.to_string().contains("without following symlinks"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contract_lock_native_case_aliases_share_ownership() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("Active.json");
+        let alias = root.join("ACTIVE.JSON");
+        let contract = make_test_contract(1);
+        write_authoritative_contract(&path, &contract);
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        if alias.exists() {
+            assert_eq!(
+                std_object_identity(&std::fs::metadata(&path).unwrap()).unwrap(),
+                std_object_identity(&std::fs::metadata(&alias).unwrap()).unwrap()
+            );
+            let error = acquire_tx_contract_lock(&root, &alias).err().unwrap();
+            assert_eq!(error.kind(), TxContractStoreErrorKind::InProgress);
+        } else {
+            // Case-sensitive volumes must retain two independent identities.
+            write_authoritative_contract(&alias, &contract);
+            let independent = acquire_tx_contract_lock(&root, &alias).unwrap();
+            assert_ne!(independent.authoritative_path(), guard.authoritative_path());
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&contract).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contract_lock_native_case_rename_refuses_stale_spelling() {
+        for rename_parent in [false, true] {
+            let (_dir, root) = canonical_tempdir();
+            let parent = root.join("Active");
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("Mission.json");
+            let renamed_parent = root.join("ACTIVE");
+            let renamed = if rename_parent {
+                renamed_parent.join("Mission.json")
+            } else {
+                parent.join("MISSION.JSON")
+            };
+            let contract = make_test_contract(1);
+            write_authoritative_contract(&path, &contract);
+            let before = std::fs::read(&path).unwrap();
+            let mut new_guard = None;
+            let result = acquire_tx_contract_lock_supported(&root, &path, || {
+                if rename_parent {
+                    std::fs::rename(&parent, &renamed_parent).unwrap();
+                } else {
+                    std::fs::rename(&path, &renamed).unwrap();
+                }
+                new_guard = Some(acquire_tx_contract_lock(&root, &renamed).unwrap());
+            });
+            let error = result
+                .err()
+                .expect("stale spelling cannot acquire authority");
+            if path.exists() || rename_parent {
+                assert_eq!(error.kind(), TxContractStoreErrorKind::Conflict);
+            } else {
+                // On a case-sensitive volume the old name is simply absent.
+                assert_eq!(error.kind(), TxContractStoreErrorKind::Lock);
+            }
+            let current = new_guard.unwrap();
+            current.authorizes(current.authoritative_path()).unwrap();
+            assert_eq!(std::fs::read(&renamed).unwrap(), before);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contract_lock_native_discovery_rejects_replaced_fifo_without_blocking() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("mission.json");
+        let retained = root.join("retained.json");
+        let contract = make_test_contract(1);
+        write_authoritative_contract(&path, &contract);
+        let parent = CapDir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        assert!(parent.symlink_metadata("mission.json").unwrap().is_file());
+        std::fs::rename(&path, &retained).unwrap();
+        let status = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&path)
+            .status()
+            .expect("create owned FIFO discovery control");
+        assert!(status.success());
+        let started = std::time::Instant::now();
+        let error =
+            discover_native_tx_contract_path(&parent, std::ffi::OsStr::new("mission.json"), &path)
+                .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(error.kind(), TxContractStoreErrorKind::Lock);
+        assert!(error.to_string().contains("is not a regular file"));
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            serde_json::to_vec_pretty(&contract).unwrap()
+        );
     }
 
     #[cfg(unix)]

@@ -510,9 +510,8 @@ impl Error {
                 StorageError::ReservationConflict { .. }
                 | StorageError::LeaseOwnershipConflict { .. },
             ) => NetworkErrorKind::Degraded,
-            Self::Storage(StorageError::Database(_)) | Self::Workflow(_) => {
-                NetworkErrorKind::Transient
-            }
+            Self::Storage(StorageError::Database(_) | StorageError::WriterBusyNotCommitted)
+            | Self::Workflow(_) => NetworkErrorKind::Transient,
         }
     }
 }
@@ -1161,6 +1160,12 @@ pub enum StorageError {
     #[error("Database error: {0}")]
     Database(String),
 
+    /// BEGIN IMMEDIATE returned native SQLITE_BUSY before mutation, and the
+    /// writer verified autocommit. This attempt is known not to have committed.
+    /// Earlier stages of a compound operation may nevertheless have committed.
+    #[error("Storage writer database is locked; transaction attempt did not commit")]
+    WriterBusyNotCommitted,
+
     /// The dedicated writer recovered from a transaction-control failure whose
     /// commit/rollback state cannot be proven.  The connection must never be
     /// reused after this error; callers may retry only after opening a fresh
@@ -1258,6 +1263,12 @@ impl StorageError {
     #[must_use]
     pub fn remediation(&self) -> Remediation {
         match self {
+            Self::WriterBusyNotCommitted => Remediation::new(
+                "The writer could not begin this transaction; this attempt made no mutation.",
+            )
+            .alternative(
+                "Retry only the failed stage with bounded backoff, not an entire multi-stage operation.",
+            ),
             Self::Database(_) => Remediation::new(
                 "Database operation failed. Check workspace permissions and retry.",
             )

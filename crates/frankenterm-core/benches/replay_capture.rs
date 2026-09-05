@@ -20,6 +20,7 @@ fn sample_segment() -> CapturedSegment {
     CapturedSegment {
         pane_id: 42,
         seq: 7,
+        seq_correction: 0,
         content: "cargo test -p frankenterm-core --lib replay_capture".to_string(),
         kind: CapturedSegmentKind::Delta,
         captured_at: 1_710_000_000_000,
@@ -30,7 +31,8 @@ fn bench_capture_overhead_per_event(c: &mut Criterion) {
     let mut group = c.benchmark_group("replay_capture");
     group.throughput(Throughput::Elements(1));
 
-    let adapter = CaptureAdapter::new(Arc::new(NoopCaptureSink), CaptureConfig::default());
+    let adapter = CaptureAdapter::new(Arc::new(NoopCaptureSink), CaptureConfig::default())
+        .expect("valid capture configuration");
     let segment = sample_segment();
 
     group.bench_function("capture_overhead_per_event", |b| {

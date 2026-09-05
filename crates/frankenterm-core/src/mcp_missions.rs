@@ -382,6 +382,7 @@ pub(super) fn mcp_save_mission_tx_contract_to_path(
             }
             TxContractStoreErrorKind::TooLarge
             | TxContractStoreErrorKind::InProgress
+            | TxContractStoreErrorKind::Conflict
             | TxContractStoreErrorKind::Lock
             | TxContractStoreErrorKind::Write
             | TxContractStoreErrorKind::Sync

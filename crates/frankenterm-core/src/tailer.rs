@@ -3469,6 +3469,7 @@ mod tests {
         let seg = CapturedSegment {
             pane_id: 42,
             seq: 10,
+            seq_correction: 0,
             content: "test content".to_string(),
             kind: crate::ingest::CapturedSegmentKind::Delta,
             captured_at,
