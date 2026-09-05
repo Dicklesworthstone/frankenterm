@@ -938,7 +938,7 @@ mod tests {
                     backpressured = true;
                     break;
                 }
-                Err(error) => panic!("unexpected owned-socket fill error: {error}"),
+                Err(error) => panic!("unexpected owned-socket fill error: {}", error),
             }
         }
         assert!(
