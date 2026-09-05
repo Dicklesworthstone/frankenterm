@@ -1787,7 +1787,9 @@ mod tests {
             let fn_count = vector.expected_matches.len() as u32 - tp;
             let fp = actual_ranges
                 .iter()
-                .filter(|(start, end)| !expected_mask[*start..*end].iter().any(|expected| *expected))
+                .filter(|(start, end)| {
+                    !expected_mask[*start..*end].iter().any(|expected| *expected)
+                })
                 .count() as u32;
             let covered = expected_mask
                 .iter()
@@ -1929,7 +1931,8 @@ mod tests {
             );
             fixture.vector.expected_matches[0].start = 0;
             fixture.vector.expected_matches[0].end = 12;
-            let replacement = classify_replacement_spans(&fixture.vector, &[("invalid", start, end)]);
+            let replacement =
+                classify_replacement_spans(&fixture.vector, &[("invalid", start, end)]);
             assert!(!replacement.validation_errors.is_empty());
             assert_eq!(replacement.true_positives, 0);
         }

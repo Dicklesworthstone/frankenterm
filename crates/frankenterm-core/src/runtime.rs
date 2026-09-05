@@ -10167,7 +10167,7 @@ fn route_connector_signal_through_bridge(
 
 fn connector_diagnostic_hash(value: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 fn process_connector_outbound_runtime_event(
@@ -10264,12 +10264,15 @@ fn dispatch_connector_outbound_action(
         action.dispatch_capability(),
     );
     request.target = action.sandbox_target();
-    let error = match bridge.policy_engine().route_connector_operation_through_mesh(
-        &action.target_connector, request, now_ms,
-    ) {
+    let error = match bridge
+        .policy_engine()
+        .route_connector_operation_through_mesh(&action.target_connector, request, now_ms)
+    {
         Ok(_admission) => ConnectorOutboundDeliveryError::TransportUnavailable,
         Err(crate::policy::ConnectorOperationDispatchError::Mesh { reason, .. }) => {
-            ConnectorOutboundDeliveryError::RoutingFailed { reason_code: reason }
+            ConnectorOutboundDeliveryError::RoutingFailed {
+                reason_code: reason,
+            }
         }
         Err(_) => ConnectorOutboundDeliveryError::Denied,
     };
@@ -15078,7 +15081,9 @@ mod tests {
         if scenario == "policy_denied" {
             policy.quarantine_registry_mut().trip_kill_switch(
                 crate::policy_quarantine::KillSwitchLevel::EmergencyHalt,
-                "model-operator", "model-deny", now_ms,
+                "model-operator",
+                "model-deny",
+                now_ms,
             );
         }
         if scenario != "no_registered_hosts" {
@@ -15087,17 +15092,32 @@ mod tests {
             let mut zone = MeshZone::new(config.sandbox.zone_id.clone(), "model");
             zone.active = scenario != "no_active_zone";
             policy.connector_mesh_mut().register_zone(zone).unwrap();
-            policy.connector_mesh_mut().register_host(MeshHost {
-                host_id: config.host_id,
-                zone_id: config.sandbox.zone_id,
-                health: HostHealth::Healthy,
-                capabilities: if scenario == "missing_capability" { vec![] } else { vec![ConnectorCapability::Invoke] },
-                active_connectors: usize::from(scenario == "capacity_exhausted"),
-                max_connectors: 1,
-                last_heartbeat_ms: if scenario == "heartbeat_not_current" { 0 } else { now_ms },
-                phase: if scenario == "no_runnable_hosts" { ConnectorLifecyclePhase::Stopped } else { ConnectorLifecyclePhase::Running },
-                metadata: std::collections::BTreeMap::new(),
-            }).unwrap();
+            policy
+                .connector_mesh_mut()
+                .register_host(MeshHost {
+                    host_id: config.host_id,
+                    zone_id: config.sandbox.zone_id,
+                    health: HostHealth::Healthy,
+                    capabilities: if scenario == "missing_capability" {
+                        vec![]
+                    } else {
+                        vec![ConnectorCapability::Invoke]
+                    },
+                    active_connectors: usize::from(scenario == "capacity_exhausted"),
+                    max_connectors: 1,
+                    last_heartbeat_ms: if scenario == "heartbeat_not_current" {
+                        0
+                    } else {
+                        now_ms
+                    },
+                    phase: if scenario == "no_runnable_hosts" {
+                        ConnectorLifecyclePhase::Stopped
+                    } else {
+                        ConnectorLifecyclePhase::Running
+                    },
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .unwrap();
         }
         bridge
     }
@@ -15129,20 +15149,58 @@ mod tests {
             params: serde_json::json!({}),
             created_at_ms: 50_000,
         };
-        for scenario in ["admitted", "policy_denied", "no_registered_hosts", "no_active_zone", "no_runnable_hosts", "missing_capability", "capacity_exhausted", "heartbeat_not_current"] {
+        for scenario in [
+            "admitted",
+            "policy_denied",
+            "no_registered_hosts",
+            "no_active_zone",
+            "no_runnable_hosts",
+            "missing_capability",
+            "capacity_exhausted",
+            "heartbeat_not_current",
+        ] {
             let mut bridge = connector_outbound_model_fixture(scenario, 50_000);
             let before_mesh = format!("{:?}", bridge.policy_engine().connector_mesh());
             let before_host = bridge.policy_engine().connector_host_runtime().clone();
-            let error = dispatch_connector_outbound_action(&mut bridge, &action, 50_000).unwrap_err();
+            let error =
+                dispatch_connector_outbound_action(&mut bridge, &action, 50_000).unwrap_err();
             match scenario {
-                "admitted" => assert_eq!(error, ConnectorOutboundDeliveryError::TransportUnavailable),
+                "admitted" => {
+                    assert_eq!(error, ConnectorOutboundDeliveryError::TransportUnavailable)
+                }
                 "policy_denied" => assert_eq!(error, ConnectorOutboundDeliveryError::Denied),
-                reason => assert_eq!(error, ConnectorOutboundDeliveryError::RoutingFailed { reason_code: format!("routing failed: {reason}") }),
+                reason => assert_eq!(
+                    error,
+                    ConnectorOutboundDeliveryError::RoutingFailed {
+                        reason_code: format!("routing failed: {reason}")
+                    }
+                ),
             }
-            assert_eq!(format!("{:?}", bridge.policy_engine().connector_mesh()), before_mesh);
-            assert_eq!(bridge.policy_engine().connector_host_runtime(), &before_host);
-            assert_eq!(bridge.policy_engine().reliability_registry().total_dlq_depth(), 0);
-            assert_eq!(bridge.policy_engine().reliability_registry().get("model-connector").unwrap().telemetry_snapshot().operations_succeeded, 0);
+            assert_eq!(
+                format!("{:?}", bridge.policy_engine().connector_mesh()),
+                before_mesh
+            );
+            assert_eq!(
+                bridge.policy_engine().connector_host_runtime(),
+                &before_host
+            );
+            assert_eq!(
+                bridge
+                    .policy_engine()
+                    .reliability_registry()
+                    .total_dlq_depth(),
+                0
+            );
+            assert_eq!(
+                bridge
+                    .policy_engine()
+                    .reliability_registry()
+                    .get("model-connector")
+                    .unwrap()
+                    .telemetry_snapshot()
+                    .operations_succeeded,
+                0
+            );
         }
         let hash = connector_diagnostic_hash("private-model-correlation");
         assert_eq!(hash.len(), 64);
@@ -15156,7 +15214,10 @@ mod tests {
     impl std::io::Write for ConnectorDiagnosticCapture {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             let mut captured = self.0.lock().unwrap();
-            assert!(captured.len() + bytes.len() <= 65_536, "diagnostic capture exceeded its byte limit");
+            assert!(
+                captured.len() + bytes.len() <= 65_536,
+                "diagnostic capture exceeded its byte limit"
+            );
             captured.extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -15192,15 +15253,38 @@ mod tests {
         run_async_test(async {
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.unwrap();
-            for scenario in ["admitted", "policy_denied", "no_registered_hosts", "no_active_zone", "no_runnable_hosts", "missing_capability", "capacity_exhausted", "heartbeat_not_current"] {
+            for scenario in [
+                "admitted",
+                "policy_denied",
+                "no_registered_hosts",
+                "no_active_zone",
+                "no_runnable_hosts",
+                "missing_capability",
+                "capacity_exhausted",
+                "heartbeat_not_current",
+            ] {
                 let bus = Arc::new(EventBus::new(8));
                 let mut runtime = ObservationRuntime::new(
-                    RuntimeConfig::default(), storage.clone(), Arc::new(RwLock::new(PatternEngine::new())),
-                ).with_event_bus(Arc::clone(&bus));
-                let bridge = Arc::new(StdMutex::new(connector_outbound_model_fixture(scenario, epoch_ms_u64())));
+                    RuntimeConfig::default(),
+                    storage.clone(),
+                    Arc::new(RwLock::new(PatternEngine::new())),
+                )
+                .with_event_bus(Arc::clone(&bus));
+                let bridge = Arc::new(StdMutex::new(connector_outbound_model_fixture(
+                    scenario,
+                    epoch_ms_u64(),
+                )));
                 runtime.connector_outbound_bridge = Some(Arc::clone(&bridge));
-                let before_mesh = format!("{:?}", bridge.lock().unwrap().policy_engine().connector_mesh());
-                let before_host = bridge.lock().unwrap().policy_engine().connector_host_runtime().clone();
+                let before_mesh = format!(
+                    "{:?}",
+                    bridge.lock().unwrap().policy_engine().connector_mesh()
+                );
+                let before_host = bridge
+                    .lock()
+                    .unwrap()
+                    .policy_engine()
+                    .connector_host_runtime()
+                    .clone();
                 let capture = ConnectorDiagnosticCapture(Arc::new(StdMutex::new(Vec::new())));
                 let diagnostic_dispatch = tracing::Dispatch::new(
                     tracing_subscriber::fmt()
@@ -15214,16 +15298,25 @@ mod tests {
                 let task = tracing::dispatcher::with_default(&diagnostic_dispatch, || {
                     runtime.spawn_connector_outbound_task().unwrap()
                 });
-                assert_eq!(bus.subscriber_count(), 1, "subscriber must be registered before startup returns");
+                assert_eq!(
+                    bus.subscriber_count(),
+                    1,
+                    "subscriber must be registered before startup returns"
+                );
                 let mut event = connector_outbound_model_event();
-                let Event::PatternDetected { detection, .. } = &mut event else { unreachable!() };
+                let Event::PatternDetected { detection, .. } = &mut event else {
+                    unreachable!()
+                };
                 detection.matched_text = "SYNTHETIC_PRIVATE_PANE_CANARY".to_string();
-                detection.extracted = serde_json::json!({ "synthetic": "SYNTHETIC_PRIVATE_PAYLOAD_CANARY" });
+                detection.extracted =
+                    serde_json::json!({ "synthetic": "SYNTHETIC_PRIVATE_PAYLOAD_CANARY" });
                 assert_eq!(bus.publish(event.clone()), 1);
                 assert_eq!(bus.publish(event), 1);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
-                    if bridge.lock().unwrap().telemetry().events_received == 2 { break; }
+                    if bridge.lock().unwrap().telemetry().events_received == 2 {
+                        break;
+                    }
                     assert!(Instant::now() < deadline, "subscriber stalled: {scenario}");
                     sleep(Duration::from_millis(1)).await;
                 }
@@ -15231,22 +15324,37 @@ mod tests {
                 // treating a sleep interval as evidence that it was polled.
                 let tick_deadline = Instant::now() + Duration::from_secs(5);
                 loop {
-                    if capture.records().iter().any(|record| {
-                        record["fields"]["tick_kind"] == "connector_outbound_idle"
-                    }) { break; }
-                    assert!(Instant::now() < tick_deadline, "subscriber tick missing: {scenario}");
+                    if capture
+                        .records()
+                        .iter()
+                        .any(|record| record["fields"]["tick_kind"] == "connector_outbound_idle")
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < tick_deadline,
+                        "subscriber tick missing: {scenario}"
+                    );
                     sleep(Duration::from_millis(1)).await;
                 }
                 runtime.shutdown_flag.store(true, Ordering::SeqCst);
-                runtime_timeout(&runtime_loop_cx(), Duration::from_secs(5), task).await.unwrap().unwrap();
+                runtime_timeout(&runtime_loop_cx(), Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let records = capture.records();
-                let outcome_records: Vec<_> = records.iter()
-                    .filter(|record| record["fields"]["error_code"].is_string()).collect();
+                let outcome_records: Vec<_> = records
+                    .iter()
+                    .filter(|record| record["fields"]["error_code"].is_string())
+                    .collect();
                 assert_eq!(outcome_records.len(), 1, "once-only outcome: {scenario}");
                 let fields = &outcome_records[0]["fields"];
                 assert_eq!(outcome_records[0]["target"], "frankenterm_core::runtime");
                 assert_eq!(fields["delivered"], false);
-                assert_eq!(fields["correlation_hash"], connector_diagnostic_hash("event:123"));
+                assert_eq!(
+                    fields["correlation_hash"],
+                    connector_diagnostic_hash("event:123")
+                );
                 let expected_code = match scenario {
                     "admitted" => "connector_transport_unavailable",
                     "policy_denied" => "connector_admission_denied",
@@ -15255,8 +15363,17 @@ mod tests {
                 assert_eq!(fields["error_code"], expected_code, "{scenario}");
                 if scenario == "policy_denied" {
                     assert_eq!(fields["rule_hash"], connector_diagnostic_hash("model-rule"));
-                    assert_eq!(fields["denial_hash"], format!("Some({:?})", connector_diagnostic_hash("policy.kill_switch")));
-                    assert_eq!(fields["message"], "connector outbound action denied before planning");
+                    assert_eq!(
+                        fields["denial_hash"],
+                        format!(
+                            "Some({:?})",
+                            connector_diagnostic_hash("policy.kill_switch")
+                        )
+                    );
+                    assert_eq!(
+                        fields["message"],
+                        "connector outbound action denied before planning"
+                    );
                 } else {
                     let expected_reason = if scenario == "admitted" {
                         expected_code.to_string()
@@ -15265,37 +15382,83 @@ mod tests {
                     };
                     assert_eq!(fields["reason_code"], expected_reason, "{scenario}");
                     assert_eq!(fields["error_kind"], "permanent");
-                    assert_eq!(fields["message"], "connector outbound action was not dispatched");
+                    assert_eq!(
+                        fields["message"],
+                        "connector outbound action was not dispatched"
+                    );
                 }
                 let captured = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-                for private in ["SYNTHETIC_PRIVATE_PANE_CANARY", "SYNTHETIC_PRIVATE_PAYLOAD_CANARY", "event:123", "model-rule", "policy.kill_switch"] {
-                    assert!(!captured.contains(private), "runtime diagnostic exposed canary: {scenario}");
+                for private in [
+                    "SYNTHETIC_PRIVATE_PANE_CANARY",
+                    "SYNTHETIC_PRIVATE_PAYLOAD_CANARY",
+                    "event:123",
+                    "model-rule",
+                    "policy.kill_switch",
+                ] {
+                    assert!(
+                        !captured.contains(private),
+                        "runtime diagnostic exposed canary: {scenario}"
+                    );
                 }
-                let idle_ticks = records.iter().filter(|record| record["fields"]["tick_kind"] == "connector_outbound_idle").count();
+                let idle_ticks = records
+                    .iter()
+                    .filter(|record| record["fields"]["tick_kind"] == "connector_outbound_idle")
+                    .count();
                 assert!(idle_ticks > 0);
-                eprintln!("CONNECTOR_SUBSCRIBER_DIAGNOSTIC {}", serde_json::json!({
-                    "scenario": scenario, "error_code": fields["error_code"],
-                    "reason_code": fields["reason_code"], "delivered": fields["delivered"],
-                    "correlation_hash": fields["correlation_hash"], "outcome_records": outcome_records.len(),
-                    "idle_ticks_observed": idle_ticks, "capture_bytes": captured.len()
-                }));
+                eprintln!(
+                    "CONNECTOR_SUBSCRIBER_DIAGNOSTIC {}",
+                    serde_json::json!({
+                        "scenario": scenario, "error_code": fields["error_code"],
+                        "reason_code": fields["reason_code"], "delivered": fields["delivered"],
+                        "correlation_hash": fields["correlation_hash"], "outcome_records": outcome_records.len(),
+                        "idle_ticks_observed": idle_ticks, "capture_bytes": captured.len()
+                    })
+                );
                 let guard = bridge.lock().unwrap();
-                assert_eq!(format!("{:?}", guard.policy_engine().connector_mesh()), before_mesh, "{scenario}");
-                assert_eq!(guard.policy_engine().connector_host_runtime(), &before_host, "{scenario}");
+                assert_eq!(
+                    format!("{:?}", guard.policy_engine().connector_mesh()),
+                    before_mesh,
+                    "{scenario}"
+                );
+                assert_eq!(
+                    guard.policy_engine().connector_host_runtime(),
+                    &before_host,
+                    "{scenario}"
+                );
                 assert_eq!(guard.telemetry().events_deduplicated, 1);
                 assert_eq!(guard.pending_action_count(), 0);
-                assert_eq!(guard.policy_engine().reliability_registry().total_dlq_depth(), 0);
+                assert_eq!(
+                    guard
+                        .policy_engine()
+                        .reliability_registry()
+                        .total_dlq_depth(),
+                    0
+                );
                 if scenario == "policy_denied" {
                     assert_eq!(guard.telemetry().actions_dispatched, 0);
                     assert_eq!(guard.telemetry().actions_blocked_policy, 1);
                     let blocked = &guard.dispatch_history().front().unwrap().blocked[0];
                     assert_eq!(blocked.rule_id, "model-rule");
-                    assert_eq!(blocked.denial.as_ref().unwrap().error_code, "connector.policy_denied");
+                    assert_eq!(
+                        blocked.denial.as_ref().unwrap().error_code,
+                        "connector.policy_denied"
+                    );
                     assert!(!blocked.policy_decision.as_ref().unwrap().is_allowed());
-                    assert!(guard.policy_engine().reliability_registry().get("model-connector").is_none());
+                    assert!(
+                        guard
+                            .policy_engine()
+                            .reliability_registry()
+                            .get("model-connector")
+                            .is_none()
+                    );
                 } else {
                     assert_eq!(guard.telemetry().actions_dispatched, 1);
-                    let feedback = guard.policy_engine().reliability_registry().get("model-connector").unwrap().telemetry_snapshot();
+                    let feedback = guard
+                        .policy_engine()
+                        .reliability_registry()
+                        .get("model-connector")
+                        .unwrap()
+                        .telemetry_snapshot();
                     assert_eq!(feedback.operations_succeeded, 0);
                     assert_eq!(feedback.operations_failed, 1);
                 }

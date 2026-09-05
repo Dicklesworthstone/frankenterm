@@ -242,9 +242,7 @@ fn expected_release_asset_names() -> BTreeSet<String> {
 fn release_asset_size_limit(name: &str) -> Option<u64> {
     match name {
         "FrankenTerm-darwin-arm64.app.tar.xz" => Some(4 * 1024 * 1024 * 1024),
-        name if name.ends_with(".tar.xz") || name.ends_with(".zip") => {
-            Some(1024 * 1024 * 1024)
-        }
+        name if name.ends_with(".tar.xz") || name.ends_with(".zip") => Some(1024 * 1024 * 1024),
         name if name.ends_with(".sha256") => Some(4096),
         name if name.ends_with(".minisig") => Some(65_536),
         "SHA256SUMS" => Some(65_536),
@@ -265,14 +263,12 @@ fn current_release_asset_name() -> anyhow::Result<&'static str> {
 }
 
 fn is_canonical_sha256_digest(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        })
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 fn validate_latest_release_payload(
@@ -41356,13 +41352,51 @@ fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(),
 }
 
 struct IpcRpcArgError {
+    code: &'static str,
     message: String,
     hint: Option<String>,
 }
 
 fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError> {
+    let invalid = || IpcRpcArgError {
+        code: "ipc.rpc_invalid_args",
+        message: "RPC requires valid robot arguments and one JSON response".to_string(),
+        hint: Some("Use `ft robot help` for finite command syntax.".to_string()),
+    };
+    // Validate the original syntax first, including attached short values and
+    // clusters such as -vfjson. Only then force the transport's JSON format.
+    let argv = ["ft", "robot"]
+        .into_iter()
+        .chain(args.iter().map(String::as_str));
+    let matches = <Cli as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .map_err(|_| invalid())?;
+    for option in ["workspace", "config"] {
+        if matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine) {
+            return Err(IpcRpcArgError {
+                code: "ipc.rpc_owned_context_required",
+                message: "RPC cannot override its watcher's workspace or configuration".to_string(),
+                hint: None,
+            });
+        }
+    }
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).map_err(|_| invalid())?;
+    if matches!(
+        cli.command.as_deref(),
+        Some(Commands::Robot {
+            command: Some(RobotCommands::WatchEvents { .. }),
+            ..
+        })
+    ) {
+        return Err(IpcRpcArgError {
+            code: "ipc.rpc_streaming_unsupported",
+            message: "watch-events emits NDJSON and cannot use one-response RPC".to_string(),
+            hint: Some("Use IPC SubscribeEvents for a live stream, or `ft robot events` for a finite JSON response.".to_string()),
+        });
+    }
     let mut sanitized = Vec::with_capacity(args.len());
     let mut skip_next = false;
+    let mut before_command = true;
 
     for arg in args {
         if skip_next {
@@ -41370,91 +41404,175 @@ fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError>
             continue;
         }
 
-        if arg == "--help" || arg == "-h" {
-            return Err(IpcRpcArgError {
-                message: "help flags are not supported over IPC".to_string(),
-                hint: Some("Use `ft robot help` or the `help` command instead.".to_string()),
-            });
-        }
-
-        if arg == "--format" || arg == "-f" {
+        if before_command && (arg == "--format" || arg == "-f") {
             skip_next = true;
             continue;
         }
 
-        if arg.starts_with("--format=") || arg == "--stats" {
+        if before_command && (arg.starts_with("--format=") || arg == "--stats") {
             continue;
         }
 
+        if before_command
+            && let Some(short) = arg.strip_prefix('-')
+            && let Some(format_index) = short.find('f')
+            && short[..format_index].chars().all(|flag| flag == 'v')
+        {
+            if format_index > 0 {
+                sanitized.push(format!("-{}", &short[..format_index]));
+            }
+            skip_next = format_index + 1 == short.len();
+            continue;
+        }
+
+        if !arg.starts_with('-') || arg == "--" {
+            before_command = false;
+        }
         sanitized.push(arg.clone());
     }
-
     Ok(sanitized)
 }
 
 fn build_ipc_rpc_summary(args: &[String]) -> String {
-    if args.is_empty() {
-        return "ft robot".to_string();
-    }
-
-    let redacted: Vec<String> = args.iter().map(|arg| redact_for_output(arg)).collect();
-    format!("ft robot {}", redacted.join(" "))
+    // Arbitrary argument strings are not diagnostics, even after pattern
+    // redaction. Hash the complete argument vector with unambiguous framing.
+    let encoded = serde_json::to_string(args).unwrap_or_default();
+    format!(
+        "ft robot args={}",
+        robot_swarm_capacity_sha256_prefixed(&encoded)
+    )
 }
 
-async fn run_robot_rpc_via_cli(
+fn build_robot_rpc_command(
     args: &[String],
     config_path: Option<&Path>,
     workspace_root: &Path,
-) -> Result<frankenterm_core::ipc::IpcResponse, String> {
-    use std::process::Stdio;
+) -> std::io::Result<frankenterm_core::runtime_async::process::Command> {
+    Ok(build_robot_rpc_command_at(
+        &std::env::current_exe()?,
+        args,
+        config_path,
+        workspace_root,
+    ))
+}
 
-    let exe =
-        std::env::current_exe().map_err(|e| format!("failed to resolve ft executable: {e}"))?;
-    let config_path = config_path.map(PathBuf::from);
-    let workspace_root = workspace_root.to_path_buf();
-    let args = args.to_vec();
-
-    // Keep subprocess ownership explicit here; the runtime only owns the
-    // blocking wait on the child process.
-    let output = frankenterm_core::runtime_async::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(exe);
-
-        if let Some(path) = &config_path {
-            cmd.arg("--config").arg(path);
-        }
-
-        cmd.arg("--workspace").arg(&workspace_root);
-        cmd.arg("robot").arg("--format").arg("json");
-        cmd.args(&args);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        cmd.output()
-    })
-    .await
-    .map_err(|e| format!("failed to run ft robot: {e}"))?
-    .map_err(|e| format!("failed to run ft robot: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        if detail.is_empty() {
-            return Err(format!("ft robot exited with status {}", output.status));
-        }
-        return Err(format!("ft robot failed: {detail}"));
+fn build_robot_rpc_command_at(
+    executable: &Path,
+    args: &[String],
+    config_path: Option<&Path>,
+    workspace_root: &Path,
+) -> frankenterm_core::runtime_async::process::Command {
+    let mut cmd = frankenterm_core::runtime_async::process::Command::new(executable);
+    if let Some(path) = config_path {
+        cmd.arg("--config").arg(path);
     }
+    cmd.arg("--workspace")
+        .arg(workspace_root)
+        .arg("robot")
+        .arg("--format")
+        .arg("json")
+        .args(args);
+    cmd
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let payload = stdout.trim();
-    if payload.is_empty() {
-        return Err("ft robot returned empty output".to_string());
+fn ipc_rpc_failure(code: &'static str) -> frankenterm_core::ipc::IpcResponse {
+    frankenterm_core::ipc::IpcResponse::error_with_code(
+        code,
+        "IPC RPC did not produce a confirmed successful response",
+        Some("Inspect rpc.admission, rpc.settlement, rpc.effects and rpc.audit_delivery. Do not automatically retry an indeterminate mutation.".to_string()),
+    )
+}
+
+fn ipc_rpc_context_failure_code(cx: &frankenterm_core::cx::Cx) -> &'static str {
+    match cx.root_cancel_cause().map(|cause| cause.kind) {
+        Some(
+            frankenterm_core::outcome::CancelKind::Deadline
+            | frankenterm_core::outcome::CancelKind::Timeout,
+        ) => "ipc.rpc_deadline_exceeded",
+        _ => "ipc.rpc_cancelled",
     }
+}
 
-    serde_json::from_str::<frankenterm_core::ipc::IpcResponse>(payload)
-        .map_err(|e| format!("invalid ft robot response: {e}"))
+async fn run_robot_rpc_command(
+    request: &frankenterm_core::ipc::IpcRpcRequest,
+    cmd: &mut frankenterm_core::runtime_async::process::Command,
+    receipt: &mut frankenterm_core::ipc::IpcRpcReceipt,
+) -> frankenterm_core::ipc::IpcResponse {
+    use frankenterm_core::ipc::{IpcRpcAdmission, IpcRpcEffects, IpcRpcSettlement};
+    use frankenterm_core::runtime_async::process::{
+        CommandCancelled, CommandOutputCaptureIncomplete, CommandOutputLimitExceeded,
+        CommandProcessCleanupIncomplete, CommandTimedOut,
+    };
+    use tracing::Instrument;
+    cmd.kill_on_drop(true)
+        .stdout_limit(request.max_output_bytes)
+        .stderr_limit(64 * 1024);
+    let report = cmd
+        .output_with_cx_controlled(&request.cx, request.deadline, &request.cancellation)
+        .instrument(
+            tracing::debug_span!("ipc_rpc_child", correlation_hash = %receipt.correlation_hash),
+        )
+        .await;
+    if let Some(pid) = report.spawned_pid {
+        receipt.admission = IpcRpcAdmission::Started;
+        receipt.effects = IpcRpcEffects::Indeterminate;
+        receipt.settlement = IpcRpcSettlement::Indeterminate;
+        receipt.child_identity_hash = Some(robot_swarm_capacity_sha256_prefixed(&format!(
+            "{}:{pid}",
+            receipt.correlation_hash
+        )));
+    } else if !report.supervisor_settled {
+        receipt.admission = IpcRpcAdmission::Unknown;
+        receipt.effects = IpcRpcEffects::Indeterminate;
+        receipt.settlement = IpcRpcSettlement::Indeterminate;
+    }
+    match report.output {
+        Ok(output) => {
+            receipt.settlement = IpcRpcSettlement::Exited;
+            receipt.stdout_bytes = Some(output.stdout.len());
+            receipt.stderr_bytes = Some(output.stderr.len());
+            if !output.status.success() {
+                return ipc_rpc_failure("ipc.rpc_child_failed");
+            }
+            match serde_json::from_slice::<frankenterm_core::ipc::IpcResponse>(&output.stdout) {
+                Ok(mut response) => {
+                    // The child cannot forge the parent's lifecycle receipt.
+                    response.rpc = None;
+                    receipt.effects = IpcRpcEffects::ResponseReported;
+                    response
+                }
+                Err(_) => ipc_rpc_failure("ipc.rpc_invalid_response"),
+            }
+        }
+        Err(error) => {
+            let cancelled = CommandCancelled::from_io_error(&error).is_some();
+            let timed_out = CommandTimedOut::from_io_error(&error).is_some();
+            let capped = CommandOutputLimitExceeded::from_io_error(&error).is_some();
+            let incomplete = CommandProcessCleanupIncomplete::from_io_error(&error).is_some()
+                || CommandOutputCaptureIncomplete::from_io_error(&error).is_some()
+                || !report.supervisor_settled;
+            if receipt.admission == IpcRpcAdmission::Started
+                && !incomplete
+                && (cancelled || timed_out || capped)
+            {
+                receipt.settlement = IpcRpcSettlement::Terminated;
+            }
+            let code = if incomplete {
+                "ipc.rpc_settlement_indeterminate"
+            } else if timed_out {
+                "ipc.rpc_deadline_exceeded"
+            } else if cancelled {
+                ipc_rpc_context_failure_code(&request.cx)
+            } else if capped {
+                "ipc.rpc_output_limit"
+            } else if receipt.admission == IpcRpcAdmission::NotStarted {
+                "ipc.rpc_start_failed"
+            } else {
+                "ipc.rpc_process_failed"
+            };
+            ipc_rpc_failure(code)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -41860,11 +41978,13 @@ async fn run_ntm_parity_shadow(
 }
 
 async fn record_ipc_rpc_audit(
+    cx: &frankenterm_core::cx::Cx,
     storage: &Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
     request_id: Option<String>,
     summary: String,
     result: &str,
-) {
+    receipt: &frankenterm_core::ipc::IpcRpcReceipt,
+) -> frankenterm_core::ipc::IpcRpcAuditDelivery {
     let timestamp_ms = now_ms_i64();
     let input_summary = Some(summary);
     let decision_context = build_ipc_rpc_decision_context(
@@ -41883,25 +42003,34 @@ async fn record_ipc_rpc_audit(
         pane_id: None,
         domain: None,
         action_kind: "ipc.rpc".to_string(),
-        policy_decision: "allow".to_string(),
+        policy_decision: "observed".to_string(),
         decision_reason: None,
         rule_id: None,
         input_summary,
-        verification_summary: None,
+        verification_summary: serde_json::to_string(receipt).ok(),
         decision_context,
         result: result.to_string(),
     };
 
-    // Clone handle under the outer mutex, then perform async I/O without holding the lock.
-    let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    // ft-xbnl0.2.3 tick 280: cx-first IPC RPC audit write.
-    let ipc_audit_cx =
-        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    if let Err(e) = storage_handle
-        .record_audit_action_redacted_with_cx(&ipc_audit_cx, audit)
-        .await
-    {
-        tracing::warn!("Failed to record IPC RPC audit: {e}");
+    let result = frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        std::time::Duration::from_millis(200),
+        async {
+            let storage_handle = storage.lock_with_cx(cx).await.map_err(|_| ())?.clone();
+            storage_handle
+                .record_audit_action_redacted_with_cx(cx, audit)
+                .await
+                .map_err(|_| ())
+        },
+    )
+    .await;
+    if matches!(result, Ok(Ok(_))) {
+        frankenterm_core::ipc::IpcRpcAuditDelivery::Confirmed
+    } else {
+        // A deadline can race a queued write. Unconfirmed is deliberately not
+        // a claim that no row was written, nor that the RPC was rolled back.
+        tracing::warn!(event = "ipc_rpc_audit_unconfirmed", correlation_hash = %receipt.correlation_hash, "IPC RPC audit delivery unconfirmed");
+        frankenterm_core::ipc::IpcRpcAuditDelivery::Unconfirmed
     }
 }
 
@@ -41911,39 +42040,87 @@ async fn handle_ipc_rpc_request(
     config_path: Option<PathBuf>,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
 ) -> frankenterm_core::ipc::IpcResponse {
-    let summary = build_ipc_rpc_summary(&request.args);
-    tracing::debug!(
-        request_id = request.request_id.as_deref(),
-        command = %summary,
-        "IPC RPC request (redacted)"
-    );
+    execute_ipc_rpc_request(request, storage, move |args| {
+        build_robot_rpc_command(args, config_path.as_deref(), &workspace_root)
+    })
+    .await
+}
 
-    let sanitized = match sanitize_ipc_rpc_args(&request.args) {
-        Ok(args) => args,
-        Err(err) => {
-            let response = frankenterm_core::ipc::IpcResponse::error_with_code(
-                "ipc.rpc_invalid_args",
-                err.message,
-                err.hint,
-            );
-            record_ipc_rpc_audit(&storage, request.request_id, summary, "error").await;
-            return response;
+async fn execute_ipc_rpc_request<F>(
+    request: frankenterm_core::ipc::IpcRpcRequest,
+    storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
+    build_command: F,
+) -> frankenterm_core::ipc::IpcResponse
+where
+    F: FnOnce(&[String]) -> std::io::Result<frankenterm_core::runtime_async::process::Command>
+        + Send,
+{
+    use frankenterm_core::ipc::{
+        IpcRpcAdmission, IpcRpcAuditDelivery, IpcRpcEffects, IpcRpcReceipt, IpcRpcSettlement,
+    };
+    let summary = build_ipc_rpc_summary(&request.args);
+    let correlation_hash = robot_swarm_capacity_sha256_prefixed(&format!(
+        "{}:{summary}",
+        request.request_id.as_deref().unwrap_or_default()
+    ));
+    let mut receipt = IpcRpcReceipt {
+        correlation_hash,
+        child_identity_hash: None,
+        admission: IpcRpcAdmission::NotStarted,
+        settlement: IpcRpcSettlement::NotStarted,
+        effects: IpcRpcEffects::NotAdmitted,
+        audit_delivery: IpcRpcAuditDelivery::Unconfirmed,
+        stdout_bytes: None,
+        stderr_bytes: None,
+    };
+    tracing::debug!(event = "ipc_rpc_admission", correlation_hash = %receipt.correlation_hash, "IPC RPC admitted to bounded evaluation");
+    let mut response = if request.cx.checkpoint().is_err() {
+        ipc_rpc_failure(ipc_rpc_context_failure_code(&request.cx))
+    } else if request.cancellation.is_cancelled() {
+        ipc_rpc_failure("ipc.rpc_cancelled")
+    } else if std::time::Instant::now() >= request.deadline {
+        ipc_rpc_failure("ipc.rpc_deadline_exceeded")
+    } else {
+        match sanitize_ipc_rpc_args(&request.args) {
+            Err(err) => {
+                frankenterm_core::ipc::IpcResponse::error_with_code(err.code, err.message, err.hint)
+            }
+            Ok(args) => match build_command(&args) {
+                Ok(mut command) => {
+                    run_robot_rpc_command(&request, &mut command, &mut receipt).await
+                }
+                Err(_) => ipc_rpc_failure("ipc.rpc_start_failed"),
+            },
         }
     };
-
-    let response =
-        match run_robot_rpc_via_cli(&sanitized, config_path.as_deref(), &workspace_root).await {
-            Ok(resp) => resp,
-            Err(err) => frankenterm_core::ipc::IpcResponse::error_with_code(
-                "ipc.rpc_failed",
-                err,
-                Some("Ensure 'ft robot' can run and outputs JSON.".to_string()),
-            ),
-        };
-
     let result = if response.ok { "success" } else { "error" };
-    record_ipc_rpc_audit(&storage, request.request_id, summary, result).await;
-
+    receipt.audit_delivery = record_ipc_rpc_audit(
+        &request.cx,
+        &storage,
+        Some(receipt.correlation_hash.clone()),
+        summary,
+        result,
+        &receipt,
+    )
+    .await;
+    let diagnostic_code = if receipt.effects == IpcRpcEffects::ResponseReported {
+        if response.ok {
+            "ipc.rpc_response_success"
+        } else {
+            "ipc.rpc_response_failure"
+        }
+    } else {
+        response
+            .error_code
+            .as_deref()
+            .unwrap_or("ipc.rpc_unclassified")
+    };
+    tracing::debug!(event = "ipc_rpc_settled", correlation_hash = %receipt.correlation_hash,
+        child_identity_hash = receipt.child_identity_hash.as_deref(), admission = ?receipt.admission,
+        settlement = ?receipt.settlement, effects = ?receipt.effects,
+        audit_delivery = ?receipt.audit_delivery, error_code = diagnostic_code,
+        "IPC RPC terminal disposition");
+    response.rpc = Some(receipt);
     response
 }
 
@@ -48646,11 +48823,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     // configuration, workspace databases, logging, font installation, and mux
     // state. The public latest-release response and this binary's embedded
     // version are the only authorities needed by `ft version --check`.
-    if let Some(Commands::Version {
-        full,
-        check: true,
-    }) = command.as_ref()
-    {
+    if let Some(Commands::Version { full, check: true }) = command.as_ref() {
         print_version_command(cx, *full, true).await?;
         return Ok(());
     }
@@ -58562,7 +58735,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             // docs/robot-contracts/kill-switch.md.
                             use frankenterm_core::policy_kill_switch_state::{
                                 KILL_SWITCH_STATE_KEY, KillSwitchRestore, KillSwitchTransition,
-                                restore_kill_switch_from_backend, transition_kill_switch_from_backend,
+                                restore_kill_switch_from_backend,
+                                transition_kill_switch_from_backend,
                             };
                             use frankenterm_core::policy_quarantine::KillSwitchLevel;
 
@@ -58639,8 +58813,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     "state_key": KILL_SWITCH_STATE_KEY,
                                 })
                             };
-                            let transition_response = |action: &str, transition: KillSwitchTransition<'_>| {
-                                match transition_kill_switch_from_backend(&backend, transition, now) {
+                            let transition_response =
+                                |action: &str, transition: KillSwitchTransition<'_>| {
+                                    match transition_kill_switch_from_backend(&backend, transition, now) {
                                     Ok(receipt) => RobotResponse::<serde_json::Value>::success(
                                         serde_json::json!({
                                             "action": action,
@@ -58664,13 +58839,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         elapsed_ms(start),
                                     ),
                                 }
-                            };
+                                };
 
                             let response = match command {
                                 RobotKillSwitchCommands::Status => {
                                     // Status is read-only: writing an expired
                                     // cached snapshot could erase a later trip.
-                                    let persisted = matches!(restore, KillSwitchRestore::Restored { auto_disarmed: false, .. });
+                                    let persisted = matches!(
+                                        restore,
+                                        KillSwitchRestore::Restored {
+                                            auto_disarmed: false,
+                                            ..
+                                        }
+                                    );
                                     RobotResponse::<serde_json::Value>::success(
                                         envelope(&engine, "status", persisted),
                                         elapsed_ms(start),
@@ -58679,11 +58860,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 RobotKillSwitchCommands::Trip { level, reason, by } => {
                                     let by = by.unwrap_or_else(|| "operator".to_string());
                                     let level: KillSwitchLevel = level.into();
-                                    transition_response("trip", KillSwitchTransition::Trip { level, by: &by, reason: &reason })
+                                    transition_response(
+                                        "trip",
+                                        KillSwitchTransition::Trip {
+                                            level,
+                                            by: &by,
+                                            reason: &reason,
+                                        },
+                                    )
                                 }
                                 RobotKillSwitchCommands::Reset { by } => {
                                     let by = by.unwrap_or_else(|| "operator".to_string());
-                                    transition_response("reset", KillSwitchTransition::Reset { by: &by })
+                                    transition_response(
+                                        "reset",
+                                        KillSwitchTransition::Reset { by: &by },
+                                    )
                                 }
                             };
                             print_robot_response(&response, format, stats)?;
@@ -58848,7 +59039,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             // Serialize the complete mutation (fresh switch and
                             // lifecycle reads through durable state write) with
                             // operator trips. Status remains read-only.
-                            let _connector_fence = if matches!(&action, ConnectorAction::Status { .. }) {
+                            let _connector_fence = if matches!(
+                                &action,
+                                ConnectorAction::Status { .. }
+                            ) {
                                 None
                             } else {
                                 match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(&layout.db_path) {
@@ -120286,9 +120480,15 @@ printf x > "$MINISIGN_MARKER"
         );
         assert_eq!(pending_receipt["readiness"], "not_run");
         assert_eq!(pending_receipt["activation"], "pending");
-        assert_eq!(pending_receipt["activation_action"], serde_json::Value::Null);
+        assert_eq!(
+            pending_receipt["activation_action"],
+            serde_json::Value::Null
+        );
         assert_eq!(pending_receipt["transaction"]["state"], "pending");
-        assert_eq!(pending_receipt["transaction"]["id"], serde_json::Value::Null);
+        assert_eq!(
+            pending_receipt["transaction"]["id"],
+            serde_json::Value::Null
+        );
         assert_eq!(pending_receipt["transaction"]["operation"], "none");
         assert_eq!(
             pending_receipt["transaction"]["prior_content_id"],
@@ -123453,13 +123653,21 @@ printf x > "$MINISIGN_MARKER"
             let (storage, db_path) = setup_storage("ipc_rpc_audit_ctx").await;
             let shared_storage = Arc::new(frankenterm_core::runtime_async::Mutex::new(storage));
 
-            record_ipc_rpc_audit(
+            let request = ipc_rpc_test_request(&["state"]);
+            let receipt = ipc_rpc_test_receipt();
+            let delivered = record_ipc_rpc_audit(
+                &request.cx,
                 &shared_storage,
                 Some("req-456".to_string()),
                 "ft robot state".to_string(),
                 "success",
+                &receipt,
             )
             .await;
+            assert_eq!(
+                delivered,
+                frankenterm_core::ipc::IpcRpcAuditDelivery::Confirmed
+            );
 
             let storage_handle = shared_storage.lock().await.clone();
             let audits = storage_handle
@@ -123491,6 +123699,745 @@ printf x > "$MINISIGN_MARKER"
 
             cleanup_storage(storage_handle, &db_path).await;
         });
+    }
+
+    fn ipc_rpc_test_request(args: &[&str]) -> frankenterm_core::ipc::IpcRpcRequest {
+        frankenterm_core::ipc::IpcRpcRequest {
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            request_id: Some("private-request-canary".to_string()),
+            cx: frankenterm_core::cx::for_testing(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            cancellation: frankenterm_core::runtime_async::process::CommandCancellation::new(),
+            max_output_bytes: 4096,
+        }
+    }
+
+    fn ipc_rpc_test_receipt() -> frankenterm_core::ipc::IpcRpcReceipt {
+        use frankenterm_core::ipc::*;
+        IpcRpcReceipt {
+            correlation_hash: robot_swarm_capacity_sha256_prefixed("private-request-canary"),
+            child_identity_hash: None,
+            admission: IpcRpcAdmission::NotStarted,
+            settlement: IpcRpcSettlement::NotStarted,
+            effects: IpcRpcEffects::NotAdmitted,
+            audit_delivery: IpcRpcAuditDelivery::Unconfirmed,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn ipc_rpc_shell(
+        script: &str,
+        args: &[&str],
+    ) -> frankenterm_core::runtime_async::process::Command {
+        let mut command = frankenterm_core::runtime_async::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("ipc-owned-test-child")
+            .args(args);
+        command
+    }
+
+    #[test]
+    fn ipc_rpc_validates_single_response_commands_before_launch() {
+        for args in [
+            vec!["watch-events"],
+            vec!["watch-event", "--follow"],
+            vec!["--format", "toon", "watch-events", "--follow"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let error = sanitize_ipc_rpc_args(&args).err().expect("stream rejected");
+            assert_eq!(error.code, "ipc.rpc_streaming_unsupported");
+            assert!(error.hint.unwrap().contains("SubscribeEvents"));
+        }
+        for args in [
+            vec!["help"],
+            vec!["quick-start"],
+            vec!["state"],
+            vec!["events"],
+            vec!["--format", "toon", "help"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                sanitize_ipc_rpc_args(&args).is_ok(),
+                "finite syntax: {args:?}"
+            );
+        }
+        for (args, expected) in [
+            (vec!["-fjson", "help"], vec!["help"]),
+            (vec!["-ftoon", "state"], vec!["state"]),
+            (vec!["-vfjson", "help"], vec!["-v", "help"]),
+            (vec!["-vvf", "toon", "help"], vec!["-vv", "help"]),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                sanitize_ipc_rpc_args(&args).ok(),
+                Some(expected.into_iter().map(str::to_string).collect())
+            );
+        }
+        for args in [
+            vec!["--format"],
+            vec!["--help"],
+            vec!["state", "--workspace", "/private/context"],
+            vec!["--config", "/private/config", "help"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(sanitize_ipc_rpc_args(&args).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_rpc_real_children_capture_limits_and_terminal_dispositions() {
+        run_async_test(async {
+            use frankenterm_core::ipc::*;
+            let good = serde_json::to_string(&IpcResponse::ok_with_data(
+                serde_json::json!({"answer": 42}),
+            ))
+            .unwrap();
+            for (script, stdout_limit, expected) in [
+                ("printf '%s' \"$1\"", good.len(), None),
+                (
+                    "printf '%s' \"$1\"; printf 'private-stderr-canary' >&2",
+                    good.len(),
+                    None,
+                ),
+                (
+                    "printf '%65536s' '' >&2; printf '%s' \"$1\"",
+                    good.len(),
+                    None,
+                ),
+                (
+                    "printf '%65537s' '' >&2; printf '%s' \"$1\"",
+                    good.len(),
+                    Some("limit"),
+                ),
+                ("printf '%s ' \"$1\"", good.len(), Some("limit")),
+                (
+                    "printf 'private-invalid-canary'",
+                    4096,
+                    Some("ipc.rpc_invalid_response"),
+                ),
+                (
+                    "printf 'private-stderr-canary' >&2",
+                    4096,
+                    Some("ipc.rpc_invalid_response"),
+                ),
+                (
+                    "printf '%s' \"$1\"; exit 7",
+                    4096,
+                    Some("ipc.rpc_child_failed"),
+                ),
+                ("while :; do printf '%s' \"$1\"; done", 256, Some("limit")),
+                (
+                    "while :; do printf 'private-stderr-canary' >&2; done",
+                    256,
+                    Some("limit"),
+                ),
+                (
+                    "while :; do printf '%s' \"$1\"; printf 'private-stderr-canary' >&2; done",
+                    256,
+                    Some("limit"),
+                ),
+            ] {
+                let mut request = ipc_rpc_test_request(&["help"]);
+                request.max_output_bytes = stdout_limit;
+                let mut receipt = ipc_rpc_test_receipt();
+                let mut command = ipc_rpc_shell(script, &[&good]);
+                let response = run_robot_rpc_command(&request, &mut command, &mut receipt).await;
+                assert_eq!(receipt.admission, IpcRpcAdmission::Started);
+                assert!(
+                    receipt
+                        .child_identity_hash
+                        .as_ref()
+                        .unwrap()
+                        .starts_with("sha256:")
+                );
+                match expected {
+                    None => {
+                        assert!(response.ok);
+                        assert_eq!(response.data.as_ref().unwrap()["answer"], 42);
+                        assert_eq!(receipt.effects, IpcRpcEffects::ResponseReported);
+                        assert_eq!(receipt.settlement, IpcRpcSettlement::Exited);
+                        assert_eq!(receipt.stdout_bytes, Some(good.len()));
+                    }
+                    Some("limit") => {
+                        assert!(!response.ok);
+                        // Fast finite producers may exit before group cleanup;
+                        // that race must retain uncertainty rather than claim
+                        // a safely signalled process family after PID reuse.
+                        assert!(matches!(
+                            response.error_code.as_deref(),
+                            Some("ipc.rpc_output_limit" | "ipc.rpc_settlement_indeterminate")
+                        ));
+                        assert_eq!(receipt.effects, IpcRpcEffects::Indeterminate);
+                    }
+                    Some(code) => {
+                        assert_eq!(response.error_code.as_deref(), Some(code));
+                        assert_eq!(receipt.effects, IpcRpcEffects::Indeterminate);
+                    }
+                }
+                let serialized = serde_json::to_string(&response).unwrap();
+                assert!(!serialized.contains("private-stderr-canary"));
+                assert!(!serialized.contains("private-invalid-canary"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_rpc_pre_admission_refusals_never_build_a_child_and_audit_truthfully() {
+        run_async_test(async {
+            use frankenterm_core::ipc::*;
+            let (storage, db_path) = setup_storage("ipc_no_admission").await;
+            let shared = Arc::new(frankenterm_core::runtime_async::Mutex::new(storage.clone()));
+            for case in 0..6 {
+                let mut request = ipc_rpc_test_request(if case == 0 {
+                    &["watch-events", "--follow"]
+                } else {
+                    &["help"]
+                });
+                let code = match case {
+                    0 => "ipc.rpc_streaming_unsupported",
+                    1 => {
+                        request.cancellation.cancel();
+                        "ipc.rpc_cancelled"
+                    }
+                    2 => {
+                        request.deadline = std::time::Instant::now();
+                        "ipc.rpc_deadline_exceeded"
+                    }
+                    3 => {
+                        request.cx.cancel_with(
+                            frankenterm_core::outcome::CancelKind::User,
+                            Some("owned request pre-cancel"),
+                        );
+                        "ipc.rpc_cancelled"
+                    }
+                    4 => {
+                        request.cancellation.cancel();
+                        request.deadline = std::time::Instant::now();
+                        "ipc.rpc_cancelled"
+                    }
+                    _ => {
+                        request.cx.cancel_with(
+                            frankenterm_core::outcome::CancelKind::Deadline,
+                            Some("owned request deadline"),
+                        );
+                        "ipc.rpc_deadline_exceeded"
+                    }
+                };
+                let response = execute_ipc_rpc_request(request, Arc::clone(&shared), |_| {
+                    panic!("no child construction before admission")
+                })
+                .await;
+                assert_eq!(response.error_code.as_deref(), Some(code));
+                let receipt = response.rpc.unwrap();
+                assert_eq!(receipt.admission, IpcRpcAdmission::NotStarted);
+                assert_eq!(receipt.settlement, IpcRpcSettlement::NotStarted);
+                assert_eq!(receipt.effects, IpcRpcEffects::NotAdmitted);
+                assert_eq!(
+                    receipt.audit_delivery,
+                    if case == 3 || case == 5 {
+                        IpcRpcAuditDelivery::Unconfirmed
+                    } else {
+                        IpcRpcAuditDelivery::Confirmed
+                    }
+                );
+                assert!(
+                    !serde_json::to_string(&receipt)
+                        .unwrap()
+                        .contains("private-request-canary")
+                );
+            }
+            let response = execute_ipc_rpc_request(
+                ipc_rpc_test_request(&["help"]),
+                Arc::clone(&shared),
+                |_| {
+                    Ok(frankenterm_core::runtime_async::process::Command::new(
+                        "/nonexistent-ft-ipc-test-executable",
+                    ))
+                },
+            )
+            .await;
+            assert_eq!(response.error_code.as_deref(), Some("ipc.rpc_start_failed"));
+            assert_eq!(response.rpc.unwrap().effects, IpcRpcEffects::NotAdmitted);
+            // An actually closed storage writer cannot be called confirmed.
+            storage.shutdown().await.unwrap();
+            let response = execute_ipc_rpc_request(ipc_rpc_test_request(&["help"]), shared, |_| {
+                Ok(ipc_rpc_shell(
+                    "printf '%s' \"$1\"",
+                    &[&serde_json::to_string(&IpcResponse::ok()).unwrap()],
+                ))
+            })
+            .await;
+            assert!(response.ok);
+            assert_eq!(
+                response.rpc.unwrap().audit_delivery,
+                IpcRpcAuditDelivery::Unconfirmed
+            );
+            // The storage has already been shut down; preserve its test file.
+            assert!(Path::new(&db_path).exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_rpc_barriers_cancel_or_expire_before_and_after_effect_without_rollback_claims() {
+        run_async_test(async {
+            use frankenterm_core::ipc::*;
+            for (after_effect, deadline) in [(false, false), (true, false), (false, true)] {
+                for iteration in 0..3 {
+                    let dir = tempfile::tempdir().unwrap();
+                    let ready = dir.path().join("ready");
+                    let release = dir.path().join("release");
+                    let effect = dir.path().join("effect");
+                    let mut request = ipc_rpc_test_request(&["help"]);
+                    if deadline {
+                        request.deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    }
+                    let signal = request.cancellation.clone();
+                    let original_cx = request.cx.clone();
+                    let mut receipt = ipc_rpc_test_receipt();
+                    let script = if after_effect {
+                        "printf committed > \"$3\"; printf ready > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done"
+                    } else {
+                        "printf ready > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; printf late > \"$3\""
+                    };
+                    let mut command = ipc_rpc_shell(
+                        script,
+                        &[
+                            ready.to_str().unwrap(),
+                            release.to_str().unwrap(),
+                            effect.to_str().unwrap(),
+                        ],
+                    );
+                    let observe = async {
+                        let bound = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while !ready.exists() {
+                            assert!(
+                                std::time::Instant::now() < bound,
+                                "child must cross the real start barrier"
+                            );
+                            frankenterm_core::runtime_async::sleep(
+                                std::time::Duration::from_millis(5),
+                            )
+                            .await;
+                        }
+                        if !deadline {
+                            if iteration == 1 {
+                                original_cx.cancel_with(
+                                    frankenterm_core::outcome::CancelKind::User,
+                                    Some("owned child crossed start barrier"),
+                                );
+                            } else {
+                                signal.cancel();
+                            }
+                        }
+                    };
+                    let began = std::time::Instant::now();
+                    let (response, ()) = frankenterm_core::runtime_async::join!(
+                        run_robot_rpc_command(&request, &mut command, &mut receipt),
+                        observe
+                    );
+                    assert!(began.elapsed() < std::time::Duration::from_secs(3));
+                    assert_eq!(
+                        response.error_code.as_deref(),
+                        Some(if deadline {
+                            "ipc.rpc_deadline_exceeded"
+                        } else {
+                            "ipc.rpc_cancelled"
+                        })
+                    );
+                    assert_eq!(receipt.settlement, IpcRpcSettlement::Terminated);
+                    assert_eq!(receipt.effects, IpcRpcEffects::Indeterminate);
+                    std::fs::write(&release, b"release-after-settlement").unwrap();
+                    frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(30))
+                        .await;
+                    assert_eq!(
+                        effect.exists(),
+                        after_effect,
+                        "no late mutation after process settlement; existing effect is never rolled back"
+                    );
+                    if after_effect {
+                        assert_eq!(std::fs::read(&effect).unwrap(), b"committed");
+                    }
+                }
+            }
+            // A child can exit while a descendant retains capture handles.
+            // That is not a successful response or proof of tree termination.
+            let request = ipc_rpc_test_request(&["help"]);
+            let mut receipt = ipc_rpc_test_receipt();
+            let mut command = ipc_rpc_shell(
+                "sleep 0.3 & printf '%s' \"$1\"; exit 0",
+                &[&serde_json::to_string(&IpcResponse::ok()).unwrap()],
+            );
+            let response = run_robot_rpc_command(&request, &mut command, &mut receipt).await;
+            assert_eq!(
+                response.error_code.as_deref(),
+                Some("ipc.rpc_settlement_indeterminate")
+            );
+            assert_eq!(receipt.settlement, IpcRpcSettlement::Indeterminate);
+            assert_eq!(receipt.effects, IpcRpcEffects::Indeterminate);
+            frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(350)).await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn ipc_rpc_socket_exercise(actual_ft: Option<PathBuf>) {
+        use frankenterm_core::ipc::*;
+        use frankenterm_core::runtime_async::{Mutex, RwLock, mpsc};
+        use std::io::Write as _;
+        let dir = tempfile::Builder::new()
+            .prefix("ft-ipc-rpc-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("s");
+        let config = dir.path().join("ft.toml");
+        std::fs::write(&config, b"").unwrap();
+        let cx = frankenterm_core::cx::for_testing();
+        let server = IpcServer::bind_with_cx(&cx, &socket).await.unwrap();
+        let (storage, db_path) = setup_storage("ipc_owned_socket").await;
+        let shared = Arc::new(Mutex::new(storage.clone()));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<IpcResponse>::new()));
+        let handler_observed = Arc::clone(&observed);
+        let handler_storage = Arc::clone(&shared);
+        let handler_dir = dir.path().to_path_buf();
+        let expected_region = cx.region_id();
+        let expected_task = cx.task_id();
+        let expected_caps = frankenterm_core::cx::effective_capability_bits(&cx);
+        let artifact_test = actual_ft.is_some();
+        let handler: IpcRpcHandler = Arc::new(move |request| {
+            assert_eq!(request.cx.region_id(), expected_region);
+            assert_eq!(request.cx.task_id(), expected_task);
+            assert_eq!(
+                frankenterm_core::cx::effective_capability_bits(&request.cx),
+                expected_caps
+            );
+            assert!(request.deadline > std::time::Instant::now());
+            let storage = Arc::clone(&handler_storage);
+            let observed = Arc::clone(&handler_observed);
+            let workspace = handler_dir.clone();
+            let config = config.clone();
+            let executable = actual_ft.clone();
+            Box::pin(async move {
+                let response = execute_ipc_rpc_request(request, storage, move |args| {
+                    if let Some(executable) = executable {
+                        return Ok(build_robot_rpc_command_at(&executable, args, Some(&config), &workspace));
+                    }
+                    if args.first().is_some_and(|arg| arg == "state") {
+                        let case = args.last().unwrap().parse::<usize>().unwrap();
+                        let ready = workspace.join(format!("ready-{case}"));
+                        let release = workspace.join(format!("release-{case}"));
+                        let effect = workspace.join(format!("effect-{case}"));
+                        return Ok(ipc_rpc_shell(
+                            "printf ready > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; printf late > \"$3\"",
+                            &[ready.to_str().unwrap(), release.to_str().unwrap(), effect.to_str().unwrap()],
+                        ));
+                    }
+                    Ok(ipc_rpc_shell("printf '%s' \"$1\"", &[&serde_json::to_string(&IpcResponse::ok_with_data(serde_json::json!({"owned_child":true}))).unwrap()]))
+                }).await;
+                observed.lock().unwrap().push(response.clone());
+                response
+            })
+        });
+        let auth = IpcAuth::new(vec![frankenterm_core::config::IpcAuthToken {
+            token: "owned-ipc-test-token".to_string(),
+            scopes: vec![frankenterm_core::config::IpcScope::All],
+            expires_at_ms: None,
+        }]);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let task_cx = cx.clone();
+        // The server has bound its socket but has not polled accept. Queue a
+        // complete authenticated request and close it first, making EOF
+        // observable before the callback's first poll, without a timing guess.
+        let mut already_closed = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        writeln!(already_closed, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", "99"]})).unwrap();
+        already_closed.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(already_closed);
+        let server_handle = frankenterm_core::runtime_async::task::spawn(async move {
+            server
+                .run_with_registry_auth_and_rpc_with_cx(
+                    &task_cx,
+                    Arc::new(frankenterm_core::events::EventBus::new(16)),
+                    Arc::new(RwLock::new(frankenterm_core::ingest::PaneRegistry::new())),
+                    Some(auth),
+                    Some(handler),
+                    shutdown_rx,
+                )
+                .await;
+        });
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while observed.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < bound,
+                "already closed request must settle"
+            );
+            frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            observed.lock().unwrap()[0].rpc.as_ref().unwrap().admission,
+            IpcRpcAdmission::NotStarted
+        );
+        assert!(!dir.path().join("ready-99").exists());
+        let denied = IpcClient::with_token(&socket, "wrong-owned-test-token")
+            .call_rpc_with_cx(&cx, vec!["help".to_string()], None)
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "unauthorized requests must never reach the child factory"
+        );
+        let client = IpcClient::with_token(&socket, "owned-ipc-test-token");
+        let positive = client
+            .call_rpc_with_cx(
+                &cx,
+                vec!["quick-start".to_string()],
+                Some("private-request-canary".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            positive.ok,
+            "finite owned command must succeed: {positive:?}"
+        );
+        let receipt = positive.rpc.as_ref().unwrap();
+        assert_eq!(receipt.admission, IpcRpcAdmission::Started);
+        assert_eq!(receipt.settlement, IpcRpcSettlement::Exited);
+        assert_eq!(receipt.effects, IpcRpcEffects::ResponseReported);
+        assert_eq!(receipt.audit_delivery, IpcRpcAuditDelivery::Confirmed);
+        assert!(positive.data.is_some());
+        let rejected = client
+            .call_rpc_with_cx(
+                &cx,
+                vec!["watch-events".to_string(), "--follow".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.error_code.as_deref(),
+            Some("ipc.rpc_streaming_unsupported")
+        );
+        assert_eq!(rejected.rpc.unwrap().admission, IpcRpcAdmission::NotStarted);
+        let mut shutdown_stream = None;
+        if !artifact_test {
+            for case in 0..5 {
+                let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+                writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", case.to_string()]})).unwrap();
+                let ready = dir.path().join(format!("ready-{case}"));
+                let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < bound,
+                        "real IPC child must start"
+                    );
+                    frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5))
+                        .await;
+                }
+                drop(stream);
+                while observed.lock().unwrap().len() < case + 4 {
+                    assert!(
+                        std::time::Instant::now() < bound,
+                        "disconnected handler must finish child settlement"
+                    );
+                    frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5))
+                        .await;
+                }
+                let response = observed.lock().unwrap().last().unwrap().clone();
+                assert_eq!(response.error_code.as_deref(), Some("ipc.rpc_cancelled"));
+                let receipt = response.rpc.unwrap();
+                assert_eq!(receipt.settlement, IpcRpcSettlement::Terminated);
+                assert_eq!(receipt.effects, IpcRpcEffects::Indeterminate);
+                std::fs::write(dir.path().join(format!("release-{case}")), b"late release")
+                    .unwrap();
+                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(!dir.path().join(format!("effect-{case}")).exists());
+                assert!(
+                    client.ping_with_cx(&cx).await.unwrap().ok,
+                    "disconnect must not cancel the shared server context"
+                );
+            }
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            writeln!(stream, "{}", serde_json::json!({"type":"rpc", "token":"owned-ipc-test-token", "args":["state", "--tail", "5"]})).unwrap();
+            let bound = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !dir.path().join("ready-5").exists() {
+                assert!(std::time::Instant::now() < bound);
+                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            shutdown_stream = Some(stream);
+        }
+        shutdown_tx.reserve(&cx).await.unwrap().send(());
+        frankenterm_core::runtime_async::timeout_with_cx(
+            &cx,
+            std::time::Duration::from_secs(3),
+            server_handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if let Some(mut stream) = shutdown_stream {
+            use std::io::Read as _;
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            let response: IpcResponse = serde_json::from_str(&body).unwrap();
+            assert_eq!(response.error_code.as_deref(), Some("ipc.rpc_cancelled"));
+            assert_eq!(
+                response.rpc.unwrap().settlement,
+                IpcRpcSettlement::Terminated
+            );
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                9,
+                "shutdown must retain and finish the active RPC callback"
+            );
+            std::fs::write(dir.path().join("release-5"), b"after shutdown settlement").unwrap();
+            frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(!dir.path().join("effect-5").exists());
+        }
+        assert!(!socket.exists());
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_rpc_real_socket_preserves_context_and_settles_disconnected_children() {
+        run_async_test(ipc_rpc_socket_exercise(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_rpc_diagnostics_capture_actual_outcomes_without_private_content() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let mut buffer = self.0.lock().unwrap();
+                if buffer.len().saturating_add(bytes.len()) > 16 * 1024 {
+                    return Err(std::io::Error::other(
+                        "test diagnostic capture exceeded finite cap",
+                    ));
+                }
+                buffer.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Capture(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || capture.clone())
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("ft", tracing::Level::DEBUG)
+                        .with_target(
+                            "frankenterm_core::runtime_async::process",
+                            tracing::Level::DEBUG,
+                        ),
+                ),
+        );
+        run_async_test(
+            async {
+                let (storage, _) = setup_storage("ipc_diagnostic_capture").await;
+                let shared = Arc::new(frankenterm_core::runtime_async::Mutex::new(storage.clone()));
+                let response = execute_ipc_rpc_request(
+                    ipc_rpc_test_request(&["help"]),
+                    Arc::clone(&shared),
+                    |_| {
+                        Ok(ipc_rpc_shell(
+                            "printf private-raw-child-canary >&2; exit 2",
+                            &[],
+                        ))
+                    },
+                )
+                .await;
+                assert_eq!(response.error_code.as_deref(), Some("ipc.rpc_child_failed"));
+                storage.shutdown().await.unwrap();
+                let response = execute_ipc_rpc_request(
+                    ipc_rpc_test_request(&["watch-events", "--follow"]),
+                    shared,
+                    |_| panic!("streaming must not launch"),
+                )
+                .await;
+                assert_eq!(
+                    response.rpc.unwrap().audit_delivery,
+                    frankenterm_core::ipc::IpcRpcAuditDelivery::Unconfirmed
+                );
+            }
+            .with_subscriber(subscriber),
+        );
+        let body = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!body.contains("private-request-canary"));
+        assert!(!body.contains("private-raw-child-canary"));
+        let rows = body
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let settled = rows
+            .iter()
+            .filter(|row| row["fields"]["event"] == "ipc_rpc_settled")
+            .collect::<Vec<_>>();
+        assert_eq!(settled.len(), 2);
+        assert_eq!(settled[0]["fields"]["error_code"], "ipc.rpc_child_failed");
+        assert_eq!(settled[0]["fields"]["effects"], "Indeterminate");
+        assert_eq!(settled[1]["fields"]["admission"], "NotStarted");
+        assert!(
+            rows.iter()
+                .any(|row| row["fields"]["event"] == "ipc_rpc_audit_unconfirmed")
+        );
+        let starts = rows
+            .iter()
+            .filter(|row| row["fields"]["event"] == "command_process_started")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts.len(),
+            1,
+            "only the finite child reached actual spawn"
+        );
+        assert!(
+            starts[0]["span"]["correlation_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row["fields"]["event"] == "command_process_settled"
+                    && row["fields"]["supervisor_settled"] == true)
+        );
+        for row in settled {
+            assert!(
+                row["fields"]["correlation_hash"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("sha256:")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires FT_IPC_TEST_FT_BIN built from the same source fence; run explicitly with --ignored --exact"]
+    fn ipc_rpc_real_ft_artifact_single_response_and_stream_rejection() {
+        let executable = PathBuf::from(
+            std::env::var_os("FT_IPC_TEST_FT_BIN")
+                .expect("set the independently built ft artifact path"),
+        );
+        assert!(executable.is_absolute() && executable.is_file());
+        run_async_test(ipc_rpc_socket_exercise(Some(executable)));
     }
 
     // ---- Triage scoring / ordering tests ----
@@ -137382,7 +138329,10 @@ A  docs/new-proof.md\n";
                 patch: 2,
             })
         );
-        assert_eq!(ReleaseVersion::parse("0.15.2").unwrap().to_string(), "0.15.2");
+        assert_eq!(
+            ReleaseVersion::parse("0.15.2").unwrap().to_string(),
+            "0.15.2"
+        );
         for invalid in [
             "",
             "v",
@@ -137405,11 +138355,19 @@ A  docs/new-proof.md\n";
         let current = validate_latest_release_fixture(&fixture, "0.15.2")
             .expect("exact latest-release fixture");
         assert_eq!(current.current, current.latest);
-        assert!(current.render().contains("already the latest version 0.15.2"));
+        assert!(
+            current
+                .render()
+                .contains("already the latest version 0.15.2")
+        );
 
         let update = validate_latest_release_fixture(&fixture, "0.15.1")
             .expect("older installed version against exact release");
-        assert!(update.render().contains("latest version 0.15.2 is available"));
+        assert!(
+            update
+                .render()
+                .contains("latest version 0.15.2 is available")
+        );
 
         let mut incomplete = fixture.clone();
         incomplete["assets"]

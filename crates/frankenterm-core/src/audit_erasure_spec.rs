@@ -1338,7 +1338,10 @@ mod tests {
         let shards = encode_row(cfg, &[]);
         assert_eq!(shards.len(), cfg.n as usize);
         let recovered = reconstruct(cfg, &shards[0..cfg.k as usize]).unwrap();
-        assert!(recovered.is_empty(), "padding must not escape reconstruction");
+        assert!(
+            recovered.is_empty(),
+            "padding must not escape reconstruction"
+        );
     }
 
     #[test]

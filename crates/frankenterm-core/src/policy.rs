@@ -5132,7 +5132,11 @@ impl PolicyEngine {
         intent: crate::connector_lifecycle::LifecycleIntent,
         now_ms: u64,
     ) -> Result<crate::connector_lifecycle::LifecycleResult, String> {
-        self.authorize_connector_lifecycle_kill_switch(intent.op_name(), intent.connector_id(), now_ms)?;
+        self.authorize_connector_lifecycle_kill_switch(
+            intent.op_name(),
+            intent.connector_id(),
+            now_ms,
+        )?;
 
         let op = intent.op_name();
         let connector_id = intent.connector_id().to_string();
@@ -5196,7 +5200,11 @@ impl PolicyEngine {
         request: crate::connector_host_runtime::ConnectorOperationRequest,
         now_ms: u64,
     ) -> Result<ConnectorMeshOperationAdmission, ConnectorOperationDispatchError> {
-        if !self.quarantine_registry.kill_switch().allows_new_workflows() {
+        if !self
+            .quarantine_registry
+            .kill_switch()
+            .allows_new_workflows()
+        {
             return Err(ConnectorOperationDispatchError::Denied {
                 reason: "connector_kill_switch_active".to_string(),
             });
@@ -8087,7 +8095,10 @@ where
         // through the ordinary kill-switch/audit path without pane feedback.
         let mut transient_switch = None;
         let effect_fence = if let Some(storage) = self.storage.as_ref() {
-            use crate::policy_kill_switch_state::{KillSwitchStateError, acquire_kill_switch_fence, load_kill_switch_state_from_storage_with_cx};
+            use crate::policy_kill_switch_state::{
+                KillSwitchStateError, acquire_kill_switch_fence,
+                load_kill_switch_state_from_storage_with_cx,
+            };
             let fence = acquire_kill_switch_fence(std::path::Path::new(storage.db_path()));
             if matches!(&fence, Err(KillSwitchStateError::FencePending)) {
                 transient_switch = Some(self.engine.kill_switch_state().clone());
@@ -8099,7 +8110,8 @@ where
                 },
                 Err(error) => Err(error.clone()),
             };
-            self.kill_switch_freshness.apply(&mut self.engine, loaded, checked_now_ms_u64());
+            self.kill_switch_freshness
+                .apply(&mut self.engine, loaded, checked_now_ms_u64());
             fence.ok()
         } else {
             None
@@ -8463,18 +8475,23 @@ where
     {
         let mut transient_switch = None;
         let effect_fence = if let Some(storage) = self.storage.as_ref() {
-            use crate::policy_kill_switch_state::{KillSwitchStateError, acquire_kill_switch_fence, load_kill_switch_state_from_path_with_cx};
+            use crate::policy_kill_switch_state::{
+                KillSwitchStateError, acquire_kill_switch_fence,
+                load_kill_switch_state_from_path_with_cx,
+            };
             let fence = acquire_kill_switch_fence(std::path::Path::new(storage.db_path()));
             if matches!(&fence, Err(KillSwitchStateError::FencePending)) {
                 transient_switch = Some(self.engine.kill_switch_state().clone());
             }
             let loaded = match &fence {
-                Ok(guard) => self.kill_switch_freshness.bind(guard).and_then(|()| {
-                    load_kill_switch_state_from_path_with_cx(cx, storage.db_path())
-                }),
+                Ok(guard) => self
+                    .kill_switch_freshness
+                    .bind(guard)
+                    .and_then(|()| load_kill_switch_state_from_path_with_cx(cx, storage.db_path())),
                 Err(error) => Err(error.clone()),
             };
-            self.kill_switch_freshness.apply(&mut self.engine, loaded, checked_now_ms_u64());
+            self.kill_switch_freshness
+                .apply(&mut self.engine, loaded, checked_now_ms_u64());
             fence.ok()
         } else {
             None
@@ -10380,17 +10397,34 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.db");
         let cx = crate::cx::for_request();
-        let storage = crate::storage::StorageHandle::new_with_cx(&cx, path.to_str().unwrap()).await.unwrap();
+        let storage = crate::storage::StorageHandle::new_with_cx(&cx, path.to_str().unwrap())
+            .await
+            .unwrap();
         let mock = crate::wezterm::MockWezterm::new();
         let pane = mock.add_default_pane(42).await;
-        storage.upsert_pane_with_cx(&cx, crate::storage::PaneRecord {
-            pane_id: pane.pane_id, pane_uuid: None, domain: pane.domain,
-            window_id: Some(pane.window_id), tab_id: Some(pane.tab_id),
-            title: Some(pane.title), cwd: Some(pane.cwd), tty_name: None,
-            first_seen_at: 1000, last_seen_at: 1000, observed: true,
-            ignore_reason: None, last_decision_at: Some(1000),
-        }).await.unwrap();
-        let injector = PolicyGatedInjector::with_storage(PolicyEngine::permissive(), mock, storage.clone());
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                crate::storage::PaneRecord {
+                    pane_id: pane.pane_id,
+                    pane_uuid: None,
+                    domain: pane.domain,
+                    window_id: Some(pane.window_id),
+                    tab_id: Some(pane.tab_id),
+                    title: Some(pane.title),
+                    cwd: Some(pane.cwd),
+                    tty_name: None,
+                    first_seen_at: 1000,
+                    last_seen_at: 1000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: Some(1000),
+                },
+            )
+            .await
+            .unwrap();
+        let injector =
+            PolicyGatedInjector::with_storage(PolicyEngine::permissive(), mock, storage.clone());
         (directory, storage, injector)
     }
 
@@ -10409,25 +10443,89 @@ mod tests {
                 let output = transition_in_test_process(&path, "pending");
                 assert!(output.contains("KILL_SWITCH_CHILD_PENDING"));
             }));
-            let baseline = injector.send_text_with_cx(&cx, 42, "echo baseline\n", ActorKind::Workflow, &caps, None).await;
-            assert!(matches!(baseline, InjectionResult::Allowed { audit_action_id: Some(_), .. }), "{baseline:?}");
+            let baseline = injector
+                .send_text_with_cx(&cx, 42, "echo baseline\n", ActorKind::Workflow, &caps, None)
+                .await;
+            assert!(
+                matches!(
+                    baseline,
+                    InjectionResult::Allowed {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{baseline:?}"
+            );
             let before = injector.client.pane_state(42).await.unwrap().content;
             assert!(before.contains("echo baseline"));
             let trip = transition_in_test_process(std::path::Path::new(storage.db_path()), "trip");
             assert!(trip.contains("KILL_SWITCH_CHILD_RECEIPT"));
             assert!(trip.contains("\"revision\":1"));
             for workflow in ["queued-before-trip", "queued-after-trip"] {
-                let denied = injector.send_text_with_cx(&cx, 42, "echo must-not-run\n", ActorKind::Workflow, &caps, Some(workflow)).await;
-                let InjectionResult::Denied { decision, audit_action_id: Some(audit_id), .. } = denied else { panic!("later trip must be audited and denied: {denied:?}"); };
+                let denied = injector
+                    .send_text_with_cx(
+                        &cx,
+                        42,
+                        "echo must-not-run\n",
+                        ActorKind::Workflow,
+                        &caps,
+                        Some(workflow),
+                    )
+                    .await;
+                let InjectionResult::Denied {
+                    decision,
+                    audit_action_id: Some(audit_id),
+                    ..
+                } = denied
+                else {
+                    panic!("later trip must be audited and denied: {denied:?}");
+                };
                 assert_eq!(decision.rule_id(), Some("policy.kill_switch"));
-                let rows = storage.get_audit_actions_with_cx(&cx, crate::storage::AuditQuery { pane_id: Some(42), ..Default::default() }).await.unwrap();
-                assert!(rows.iter().any(|row| row.id == audit_id && row.policy_decision == "deny"));
-                assert_eq!(injector.client.pane_state(42).await.unwrap().content, before);
+                let rows = storage
+                    .get_audit_actions_with_cx(
+                        &cx,
+                        crate::storage::AuditQuery {
+                            pane_id: Some(42),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    rows.iter()
+                        .any(|row| row.id == audit_id && row.policy_decision == "deny")
+                );
+                assert_eq!(
+                    injector.client.pane_state(42).await.unwrap().content,
+                    before
+                );
             }
             transition_in_test_process(std::path::Path::new(storage.db_path()), "reset");
-            assert_eq!(injector.client.pane_state(42).await.unwrap().content, before, "reset must not replay rejected sends");
-            let recovered = injector.send_text_with_cx(&cx, 42, "echo fresh-authorized\n", ActorKind::Workflow, &caps, None).await;
-            assert!(matches!(recovered, InjectionResult::Allowed { audit_action_id: Some(_), .. }), "{recovered:?}");
+            assert_eq!(
+                injector.client.pane_state(42).await.unwrap().content,
+                before,
+                "reset must not replay rejected sends"
+            );
+            let recovered = injector
+                .send_text_with_cx(
+                    &cx,
+                    42,
+                    "echo fresh-authorized\n",
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    recovered,
+                    InjectionResult::Allowed {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{recovered:?}"
+            );
             let after = injector.client.pane_state(42).await.unwrap().content;
             assert!(after.contains("echo fresh-authorized"));
             assert!(!after.contains("must-not-run"));
@@ -10441,18 +10539,76 @@ mod tests {
             let (_directory, storage, mut injector) = persisted_stop_injector().await;
             let cx = crate::cx::for_request();
             let before = injector.client.pane_state(42).await.unwrap().content;
-            storage.set_config_value_with_cx(&cx, crate::policy_kill_switch_state::KILL_SWITCH_STATE_KEY, "{broken").await.unwrap();
-            let denied = injector.send_text_with_cx(&cx, 42, "echo corrupt\n", ActorKind::Workflow, &PaneCapabilities::prompt(), None).await;
-            assert!(matches!(denied, InjectionResult::Denied { audit_action_id: Some(_), .. }), "{denied:?}");
-            assert_eq!(injector.client.pane_state(42).await.unwrap().content, before);
+            storage
+                .set_config_value_with_cx(
+                    &cx,
+                    crate::policy_kill_switch_state::KILL_SWITCH_STATE_KEY,
+                    "{broken",
+                )
+                .await
+                .unwrap();
+            let denied = injector
+                .send_text_with_cx(
+                    &cx,
+                    42,
+                    "echo corrupt\n",
+                    ActorKind::Workflow,
+                    &PaneCapabilities::prompt(),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    denied,
+                    InjectionResult::Denied {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{denied:?}"
+            );
+            assert_eq!(
+                injector.client.pane_state(42).await.unwrap().content,
+                before
+            );
             storage.shutdown_with_cx(&cx).await.unwrap();
-            let unreadable = injector.send_text_with_cx(&cx, 42, "echo unreadable\n", ActorKind::Workflow, &PaneCapabilities::prompt(), None).await;
-            assert!(matches!(unreadable, InjectionResult::Denied { .. }), "{unreadable:?}");
+            let unreadable = injector
+                .send_text_with_cx(
+                    &cx,
+                    42,
+                    "echo unreadable\n",
+                    ActorKind::Workflow,
+                    &PaneCapabilities::prompt(),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(unreadable, InjectionResult::Denied { .. }),
+                "{unreadable:?}"
+            );
             let cancelled = crate::cx::for_request();
-            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("owned cancellation regression"));
-            let result = injector.send_text_with_cx(&cancelled, 42, "echo cancelled\n", ActorKind::Workflow, &PaneCapabilities::prompt(), None).await;
-            assert!(matches!(result, InjectionResult::Denied { .. }), "{result:?}");
-            assert_eq!(injector.client.pane_state(42).await.unwrap().content, before);
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("owned cancellation regression"),
+            );
+            let result = injector
+                .send_text_with_cx(
+                    &cancelled,
+                    42,
+                    "echo cancelled\n",
+                    ActorKind::Workflow,
+                    &PaneCapabilities::prompt(),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, InjectionResult::Denied { .. }),
+                "{result:?}"
+            );
+            assert_eq!(
+                injector.client.pane_state(42).await.unwrap().content,
+                before
+            );
         });
     }
 
@@ -10463,31 +10619,109 @@ mod tests {
             let (_directory, storage, direct) = persisted_stop_injector().await;
             let mock = Arc::new(direct.client);
             let handle: crate::wezterm::WeztermHandle = mock.clone();
-            let wrapper = crate::workflows::CxPolicyInjector::new(PolicyGatedInjector::with_storage(
-                direct.engine, handle, storage.clone(),
-            ));
+            let wrapper = crate::workflows::CxPolicyInjector::new(
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone()),
+            );
             let cx = crate::cx::for_request();
             let caps = PaneCapabilities::prompt();
-            let allowed = wrapper.send_text(&cx, 42, "echo wrapper-baseline\n", ActorKind::Workflow, &caps, Some("before-trip")).await.unwrap();
-            assert!(matches!(allowed, InjectionResult::Allowed { audit_action_id: Some(_), .. }), "{allowed:?}");
+            let allowed = wrapper
+                .send_text(
+                    &cx,
+                    42,
+                    "echo wrapper-baseline\n",
+                    ActorKind::Workflow,
+                    &caps,
+                    Some("before-trip"),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    allowed,
+                    InjectionResult::Allowed {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{allowed:?}"
+            );
             let before = mock.pane_state(42).await.unwrap().content;
             assert!(before.contains("wrapper-baseline"));
             transition_in_test_process(std::path::Path::new(storage.db_path()), "trip");
-            let denied = wrapper.send_text(&cx, 42, "echo wrapper-rejected\n", ActorKind::Workflow, &caps, Some("after-trip")).await.unwrap();
-            assert!(matches!(denied, InjectionResult::Denied { ref decision, audit_action_id: Some(_), .. } if decision.rule_id() == Some("policy.kill_switch")), "{denied:?}");
-            let control = wrapper.send_ctrl_c(&cx, 42, ActorKind::Workflow, &caps, None).await.unwrap();
-            assert!(matches!(control, InjectionResult::Denied { audit_action_id: Some(_), .. }), "{control:?}");
+            let denied = wrapper
+                .send_text(
+                    &cx,
+                    42,
+                    "echo wrapper-rejected\n",
+                    ActorKind::Workflow,
+                    &caps,
+                    Some("after-trip"),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(denied, InjectionResult::Denied { ref decision, audit_action_id: Some(_), .. } if decision.rule_id() == Some("policy.kill_switch")),
+                "{denied:?}"
+            );
+            let control = wrapper
+                .send_ctrl_c(&cx, 42, ActorKind::Workflow, &caps, None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    control,
+                    InjectionResult::Denied {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{control:?}"
+            );
             assert_eq!(mock.pane_state(42).await.unwrap().content, before);
             transition_in_test_process(std::path::Path::new(storage.db_path()), "reset");
             assert_eq!(mock.pane_state(42).await.unwrap().content, before);
-            let recovered = wrapper.send_text(&cx, 42, "echo wrapper-fresh\n", ActorKind::Workflow, &caps, Some("fresh-after-reset")).await.unwrap();
-            assert!(matches!(recovered, InjectionResult::Allowed { audit_action_id: Some(_), .. }), "{recovered:?}");
+            let recovered = wrapper
+                .send_text(
+                    &cx,
+                    42,
+                    "echo wrapper-fresh\n",
+                    ActorKind::Workflow,
+                    &caps,
+                    Some("fresh-after-reset"),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    recovered,
+                    InjectionResult::Allowed {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{recovered:?}"
+            );
             let after = mock.pane_state(42).await.unwrap().content;
             assert!(after.contains("wrapper-fresh"));
             assert!(!after.contains("wrapper-rejected"));
             let cancelled = crate::cx::for_request();
-            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("cancel wrapper request"));
-            assert!(wrapper.send_text(&cancelled, 42, "cancelled", ActorKind::Workflow, &caps, None).await.is_err());
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel wrapper request"),
+            );
+            assert!(
+                wrapper
+                    .send_text(
+                        &cancelled,
+                        42,
+                        "cancelled",
+                        ActorKind::Workflow,
+                        &caps,
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
             assert_eq!(mock.pane_state(42).await.unwrap().content, after);
             storage.shutdown_with_cx(&cx).await.unwrap();
         });
@@ -10500,24 +10734,93 @@ mod tests {
             let (_directory, storage, direct) = persisted_stop_injector().await;
             let mock = Arc::new(direct.client);
             let handle: crate::wezterm::WeztermHandle = mock.clone();
-            let mut injector = PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone());
+            let mut injector =
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone());
             let cx = crate::cx::for_request();
             let caps = PaneCapabilities::prompt();
-            let queued = injector.inject_with_cx_detached(&cx, 42, "echo queued\n", ActionKind::SendText, ActorKind::Workflow, &caps, None);
-            assert!(transition_in_test_process(std::path::Path::new(storage.db_path()), "pending").contains("KILL_SWITCH_CHILD_PENDING"));
+            let queued = injector.inject_with_cx_detached(
+                &cx,
+                42,
+                "echo queued\n",
+                ActionKind::SendText,
+                ActorKind::Workflow,
+                &caps,
+                None,
+            );
+            assert!(
+                transition_in_test_process(std::path::Path::new(storage.db_path()), "pending")
+                    .contains("KILL_SWITCH_CHILD_PENDING")
+            );
             // A second admission cannot overtake the first, but benign
             // contention must not permanently poison the shared engine.
-            let denied = injector.inject_with_cx_detached(&cx, 42, "echo contended\n", ActionKind::SendText, ActorKind::Workflow, &caps, None).await;
-            assert!(matches!(denied, InjectionResult::Denied { .. }), "{denied:?}");
-            assert_eq!(injector.engine().kill_switch_state().level, crate::policy_quarantine::KillSwitchLevel::Disarmed);
+            let denied = injector
+                .inject_with_cx_detached(
+                    &cx,
+                    42,
+                    "echo contended\n",
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(denied, InjectionResult::Denied { .. }),
+                "{denied:?}"
+            );
+            assert_eq!(
+                injector.engine().kill_switch_state().level,
+                crate::policy_quarantine::KillSwitchLevel::Disarmed
+            );
             drop(queued);
-            assert!(mock.pane_state(42).await.unwrap().content.is_empty(), "dropping a queued future must not dispatch");
-            let allowed = injector.inject_with_cx_detached(&cx, 42, "echo fresh\n", ActionKind::SendText, ActorKind::Workflow, &caps, None).await;
-            assert!(matches!(allowed, InjectionResult::Allowed { audit_action_id: Some(_), .. }), "{allowed:?}");
+            assert!(
+                mock.pane_state(42).await.unwrap().content.is_empty(),
+                "dropping a queued future must not dispatch"
+            );
+            let allowed = injector
+                .inject_with_cx_detached(
+                    &cx,
+                    42,
+                    "echo fresh\n",
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    allowed,
+                    InjectionResult::Allowed {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{allowed:?}"
+            );
             let before = mock.pane_state(42).await.unwrap().content;
             transition_in_test_process(std::path::Path::new(storage.db_path()), "trip");
-            let denied = injector.inject_with_cx_detached(&cx, 42, "echo late\n", ActionKind::SendText, ActorKind::Workflow, &caps, None).await;
-            assert!(matches!(denied, InjectionResult::Denied { audit_action_id: Some(_), .. }), "{denied:?}");
+            let denied = injector
+                .inject_with_cx_detached(
+                    &cx,
+                    42,
+                    "echo late\n",
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    denied,
+                    InjectionResult::Denied {
+                        audit_action_id: Some(_),
+                        ..
+                    }
+                ),
+                "{denied:?}"
+            );
             assert_eq!(mock.pane_state(42).await.unwrap().content, before);
             storage.shutdown_with_cx(&cx).await.unwrap();
         });
@@ -16874,20 +17177,31 @@ mod tests {
     fn route_connector_operation_through_mesh_plans_without_host_or_mesh_mutation() {
         let mut engine = PolicyEngine::permissive();
         let host = engine.connector_host_runtime().config().clone();
-        engine.connector_mesh_mut().register_zone(crate::connector_mesh::MeshZone::new(
-            host.sandbox.zone_id.clone(), "explicit model fixture",
-        )).unwrap();
-        engine.connector_mesh_mut().register_host(crate::connector_mesh::MeshHost {
-            host_id: host.host_id.clone(),
-            zone_id: host.sandbox.zone_id.clone(),
-            health: crate::connector_mesh::HostHealth::Healthy,
-            capabilities: host.sandbox.capability_envelope.allowed_capabilities.clone(),
-            active_connectors: 0,
-            max_connectors: 1,
-            last_heartbeat_ms: 10_000,
-            phase: crate::connector_host_runtime::ConnectorLifecyclePhase::Running,
-            metadata: std::collections::BTreeMap::new(),
-        }).unwrap();
+        engine
+            .connector_mesh_mut()
+            .register_zone(crate::connector_mesh::MeshZone::new(
+                host.sandbox.zone_id.clone(),
+                "explicit model fixture",
+            ))
+            .unwrap();
+        engine
+            .connector_mesh_mut()
+            .register_host(crate::connector_mesh::MeshHost {
+                host_id: host.host_id.clone(),
+                zone_id: host.sandbox.zone_id.clone(),
+                health: crate::connector_mesh::HostHealth::Healthy,
+                capabilities: host
+                    .sandbox
+                    .capability_envelope
+                    .allowed_capabilities
+                    .clone(),
+                active_connectors: 0,
+                max_connectors: 1,
+                last_heartbeat_ms: 10_000,
+                phase: crate::connector_host_runtime::ConnectorLifecyclePhase::Running,
+                metadata: std::collections::BTreeMap::new(),
+            })
+            .unwrap();
         let before_mesh = format!("{:?}", engine.connector_mesh());
         let before_host = engine.connector_host_runtime().clone();
 

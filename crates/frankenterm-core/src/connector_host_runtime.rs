@@ -1327,16 +1327,49 @@ mod tests {
         for (capability, target, allowed) in [
             (ConnectorCapability::Invoke, None, true),
             (ConnectorCapability::SecretBroker, None, false),
-            (ConnectorCapability::FilesystemRead, Some("/model/safe/input"), true),
-            (ConnectorCapability::FilesystemRead, Some("/model/safe/../secret"), false),
-            (ConnectorCapability::FilesystemWrite, Some("/model/output/file"), true),
-            (ConnectorCapability::FilesystemWrite, Some("/model/output-other/file"), false),
-            (ConnectorCapability::NetworkEgress, Some("model.example"), true),
-            (ConnectorCapability::NetworkEgress, Some("model.example.attacker"), false),
-            (ConnectorCapability::ProcessExec, Some("model-command"), true),
-            (ConnectorCapability::ProcessExec, Some("model-command --extra"), false),
+            (
+                ConnectorCapability::FilesystemRead,
+                Some("/model/safe/input"),
+                true,
+            ),
+            (
+                ConnectorCapability::FilesystemRead,
+                Some("/model/safe/../secret"),
+                false,
+            ),
+            (
+                ConnectorCapability::FilesystemWrite,
+                Some("/model/output/file"),
+                true,
+            ),
+            (
+                ConnectorCapability::FilesystemWrite,
+                Some("/model/output-other/file"),
+                false,
+            ),
+            (
+                ConnectorCapability::NetworkEgress,
+                Some("model.example"),
+                true,
+            ),
+            (
+                ConnectorCapability::NetworkEgress,
+                Some("model.example.attacker"),
+                false,
+            ),
+            (
+                ConnectorCapability::ProcessExec,
+                Some("model-command"),
+                true,
+            ),
+            (
+                ConnectorCapability::ProcessExec,
+                Some("model-command --extra"),
+                false,
+            ),
         ] {
-            let mut request = ConnectorOperationRequest::new("model.action", "model-correlation", capability);
+            let mut request =
+                ConnectorOperationRequest::new("model.action", "model-correlation", capability);
             request.target = target.map(str::to_string);
             let before = runtime.clone();
             let validation = runtime.validate_operation_request(&request);
@@ -1354,8 +1387,12 @@ mod tests {
             }
         }
         for (action, correlation) in [(" ", "model"), ("model.action", "\t")] {
-            let request = ConnectorOperationRequest::new(action, correlation, ConnectorCapability::Invoke);
-            assert!(matches!(runtime.validate_operation_request(&request), Err(ConnectorHostRuntimeError::InvalidConfig { .. })));
+            let request =
+                ConnectorOperationRequest::new(action, correlation, ConnectorCapability::Invoke);
+            assert!(matches!(
+                runtime.validate_operation_request(&request),
+                Err(ConnectorHostRuntimeError::InvalidConfig { .. })
+            ));
         }
         assert_eq!(runtime.state().phase(), ConnectorLifecyclePhase::Stopped);
         assert!(runtime.sandbox_decision_history().is_empty());
@@ -1369,8 +1406,15 @@ mod tests {
             runtime.operation_seq = operation_seq;
             runtime.sandbox_decision_seq = sandbox_decision_seq;
             let before = runtime.clone();
-            let request = ConnectorOperationRequest::new("model.action", "model-correlation", ConnectorCapability::Invoke);
-            assert!(matches!(runtime.authorize_operation(101, request), Err(ConnectorHostRuntimeError::InvalidConfig { .. })));
+            let request = ConnectorOperationRequest::new(
+                "model.action",
+                "model-correlation",
+                ConnectorCapability::Invoke,
+            );
+            assert!(matches!(
+                runtime.authorize_operation(101, request),
+                Err(ConnectorHostRuntimeError::InvalidConfig { .. })
+            ));
             assert_eq!(runtime, before);
         }
     }

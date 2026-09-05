@@ -626,23 +626,24 @@ impl ConnectorMesh {
         require_candidates(&hosts, "no_registered_hosts")?;
         hosts.retain(|h| self.zones.get(&h.zone_id).is_some_and(|zone| zone.active));
         require_candidates(&hosts, "no_active_zone")?;
-        hosts.retain(|h| {
-            h.health.accepts_work() && h.phase == ConnectorLifecyclePhase::Running
-        });
+        hosts.retain(|h| h.health.accepts_work() && h.phase == ConnectorLifecyclePhase::Running);
         require_candidates(&hosts, "no_runnable_hosts")?;
-        hosts.retain(|h| request.required_capabilities.iter().all(|cap| h.supports(cap)));
+        hosts.retain(|h| {
+            request
+                .required_capabilities
+                .iter()
+                .all(|cap| h.supports(cap))
+        });
         require_candidates(&hosts, "missing_capability")?;
         hosts.retain(|h| h.active_connectors < h.max_connectors);
         require_candidates(&hosts, "capacity_exhausted")?;
         hosts.retain(|h| {
-            now_ms.checked_sub(h.last_heartbeat_ms).is_some_and(|age| {
-                age <= self.config.heartbeat_timeout_ms
-            })
+            now_ms
+                .checked_sub(h.last_heartbeat_ms)
+                .is_some_and(|age| age <= self.config.heartbeat_timeout_ms)
         });
         require_candidates(&hosts, "heartbeat_not_current")?;
-        let mut candidates: Vec<String> = hosts.into_iter()
-            .map(|h| h.host_id.clone())
-            .collect();
+        let mut candidates: Vec<String> = hosts.into_iter().map(|h| h.host_id.clone()).collect();
         candidates.sort_unstable();
         Ok(candidates)
     }
@@ -922,8 +923,10 @@ mod tests {
     fn preview_is_read_only_and_allocation_advances_once() {
         let mut mesh = default_mesh();
         mesh.register_zone(make_zone("model-zone")).unwrap();
-        mesh.register_host(make_host("model-a", "model-zone")).unwrap();
-        mesh.register_host(make_host("model-b", "model-zone")).unwrap();
+        mesh.register_host(make_host("model-a", "model-zone"))
+            .unwrap();
+        mesh.register_host(make_host("model-b", "model-zone"))
+            .unwrap();
         let request = RoutingRequest {
             strategy: Some(RoutingStrategy::RoundRobin),
             ..make_request("model-connector")
@@ -941,7 +944,10 @@ mod tests {
         assert_eq!(mesh.telemetry.routing_successes, 1);
         assert_eq!(mesh.routing_history.len(), 1);
         let after_allocation = format!("{mesh:?}");
-        assert_eq!(mesh.preview_route(&request, 1001).unwrap().host_id, "model-b");
+        assert_eq!(
+            mesh.preview_route(&request, 1001).unwrap().host_id,
+            "model-b"
+        );
         assert_eq!(format!("{mesh:?}"), after_allocation);
     }
 
@@ -973,7 +979,9 @@ mod tests {
             let before = format!("{mesh:?}");
             assert_eq!(
                 mesh.preview_route(&make_request("model-connector"), 30_001),
-                Err(ConnectorMeshError::RoutingFailed { reason: reason.to_string() }),
+                Err(ConnectorMeshError::RoutingFailed {
+                    reason: reason.to_string()
+                }),
                 "{reason}"
             );
             assert_eq!(format!("{mesh:?}"), before, "{reason}");
@@ -984,18 +992,25 @@ mod tests {
     fn preview_heartbeat_boundary_and_future_observations_fail_closed() {
         let mut mesh = default_mesh();
         mesh.register_zone(make_zone("model-zone")).unwrap();
-        mesh.register_host(make_host("model-host", "model-zone")).unwrap();
+        mesh.register_host(make_host("model-host", "model-zone"))
+            .unwrap();
         let before = format!("{mesh:?}");
         let request = make_request("model-connector");
         assert!(mesh.preview_route(&request, 31_000).is_ok());
         for now_ms in [999, 31_001, u64::MAX] {
-            assert_eq!(mesh.preview_route(&request, now_ms), Err(ConnectorMeshError::RoutingFailed {
-                reason: "heartbeat_not_current".to_string(),
-            }));
+            assert_eq!(
+                mesh.preview_route(&request, now_ms),
+                Err(ConnectorMeshError::RoutingFailed {
+                    reason: "heartbeat_not_current".to_string(),
+                })
+            );
         }
         assert_eq!(format!("{mesh:?}"), before);
         assert!(mesh.route(&request, 31_001).is_err());
-        assert_eq!(mesh.get_host("model-host").unwrap().health, HostHealth::Healthy);
+        assert_eq!(
+            mesh.get_host("model-host").unwrap().health,
+            HostHealth::Healthy
+        );
         assert_eq!(mesh.get_host("model-host").unwrap().active_connectors, 0);
         assert_eq!(mesh.telemetry.routing_failures, 1);
         assert_eq!(mesh.telemetry.routing_successes, 0);

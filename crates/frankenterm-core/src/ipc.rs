@@ -35,6 +35,8 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 /// Maximum message size in bytes (128KB).
 /// Overridable via `[tuning.ipc] max_message_size` in ft.toml.
 pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX_MESSAGE_SIZE;
+/// One-response RPC execution budget, measured from authenticated admission.
+pub const IPC_RPC_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(unix, windows))]
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(any(unix, windows))]
@@ -425,6 +427,30 @@ where
         )
     })?;
     Ok(output.bytes)
+}
+
+#[cfg(any(unix, windows))]
+fn serialize_ipc_response_bounded(response: IpcResponse, limit: usize) -> std::io::Result<Vec<u8>> {
+    if let Ok(bytes) = serialize_ipc_json_bounded(&response, limit) {
+        return Ok(bytes);
+    }
+    // The handler already recorded the actual process/effect disposition.
+    // Losing a large response must never erase that receipt or suggest that
+    // the command did not run. If even the receipt cannot fit, fail the write.
+    let mut fallback = IpcResponse::error_with_code(
+        "ipc.response_size_exceeded",
+        "RPC response exceeded the configured wire limit",
+        Some(
+            "The command may have executed; inspect the retained RPC receipt before retrying."
+                .to_string(),
+        ),
+    );
+    fallback.rpc = response.rpc;
+    if let Some(receipt) = &fallback.rpc {
+        tracing::warn!(event = "ipc_rpc_response_encoding_failed", correlation_hash = %receipt.correlation_hash,
+            effects = ?receipt.effects, settlement = ?receipt.settlement, "RPC response delivery exceeded the wire limit");
+    }
+    serialize_ipc_json_bounded(&fallback, limit)
 }
 
 #[cfg(any(unix, windows))]
@@ -843,6 +869,9 @@ pub struct IpcResponse {
     /// Additional data (for status requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Authoritative subprocess/audit observations for RPC requests only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc: Option<IpcRpcReceipt>,
     /// Elapsed time to handle the request (ms)
     pub elapsed_ms: u64,
     /// ft version
@@ -861,6 +890,7 @@ impl IpcResponse {
             error_code: None,
             hint: None,
             data: None,
+            rpc: None,
             elapsed_ms: 0,
             version: crate::VERSION.to_string(),
             now: now_ms(),
@@ -876,6 +906,7 @@ impl IpcResponse {
             error_code: None,
             hint: None,
             data: Some(data),
+            rpc: None,
             elapsed_ms: 0,
             version: crate::VERSION.to_string(),
             now: now_ms(),
@@ -891,6 +922,7 @@ impl IpcResponse {
             error_code: None,
             hint: None,
             data: None,
+            rpc: None,
             elapsed_ms: 0,
             version: crate::VERSION.to_string(),
             now: now_ms(),
@@ -910,6 +942,7 @@ impl IpcResponse {
             error_code: Some(code.into()),
             hint,
             data: None,
+            rpc: None,
             elapsed_ms: 0,
             version: crate::VERSION.to_string(),
             now: now_ms(),
@@ -939,6 +972,59 @@ struct IpcEnvelope {
 pub struct IpcRpcRequest {
     pub args: Vec<String>,
     pub request_id: Option<String>,
+    /// The authentic admitted connection context, including its capabilities.
+    pub cx: crate::cx::Cx,
+    /// Absolute monotonic deadline. Queuing never renews this budget.
+    pub deadline: Instant,
+    /// Request-local cancellation, additive to Cx cancellation.
+    pub cancellation: crate::runtime_async::process::CommandCancellation,
+    pub max_output_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcRpcAdmission {
+    NotStarted,
+    Started,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcRpcSettlement {
+    NotStarted,
+    Exited,
+    Terminated,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcRpcEffects {
+    NotAdmitted,
+    /// The child returned a complete response. This is not rollback proof or
+    /// independent verification of an external service's state.
+    ResponseReported,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcRpcAuditDelivery {
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcRpcReceipt {
+    pub correlation_hash: String,
+    pub child_identity_hash: Option<String>,
+    pub admission: IpcRpcAdmission,
+    pub settlement: IpcRpcSettlement,
+    pub effects: IpcRpcEffects,
+    pub audit_delivery: IpcRpcAuditDelivery,
+    pub stdout_bytes: Option<usize>,
+    pub stderr_bytes: Option<usize>,
 }
 
 pub type IpcRpcHandler = Arc<
@@ -1159,6 +1245,7 @@ pub struct IpcHandlerContext {
     pub watcher_control_handler: Option<IpcWatcherControlHandler>,
     /// Optional search configuration for IPC status enrichment.
     pub search_config: Option<SearchConfig>,
+    rpc_shutdown: crate::runtime_async::process::CommandCancellation,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
@@ -1173,6 +1260,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
+            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 
@@ -1186,6 +1274,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
+            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 
@@ -1203,6 +1292,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
+            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 
@@ -1254,6 +1344,7 @@ impl IpcHandlerContext {
             rpc_handler,
             watcher_control_handler,
             search_config,
+            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 }
@@ -1606,8 +1697,33 @@ impl IpcServer {
             }
         }
 
-        connection_tasks.abort_all();
+        // RPC owners must observe cancellation and finish bounded process
+        // settlement before their connection future can be dropped.
+        ctx.rpc_shutdown.cancel();
         let drain_cx = crate::cx::for_request();
+        let cooperative_drain = crate::runtime_async::timeout_with_cx(
+            &drain_cx,
+            IPC_CONNECTION_TASK_DRAIN_TIMEOUT,
+            async {
+                loop {
+                    match connection_tasks.drain_next_with_cx(&drain_cx).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+            },
+        )
+        .await;
+        if !matches!(cooperative_drain, Ok(Ok(()))) {
+            tracing::warn!(
+                event = "ipc_cooperative_drain_incomplete",
+                process_settlement = "indeterminate",
+                orphan_risk = true,
+                "IPC cooperative settlement failed; abort acknowledgement cannot prove child settlement"
+            );
+        }
+        connection_tasks.abort_all();
         let drain_result = crate::runtime_async::timeout_with_cx(
             &drain_cx,
             IPC_CONNECTION_TASK_DRAIN_TIMEOUT,
@@ -2201,11 +2317,19 @@ async fn handle_client_with_context_with_cx(
         .await;
     }
 
-    let response = handle_request_with_context_with_cx(&cx, envelope, &ctx).await;
+    let response = if matches!(&envelope.request, IpcRequest::Rpc { .. }) {
+        dispatch_rpc_with_disconnect(&cx, envelope, &ctx, limits, async {
+            // This is a one-request connection. EOF, a read failure, or an
+            // extra request ends its ownership; never abandon the RPC future.
+            let _ = socket_transport::next_line_with_cx(&cx, &mut lines).await;
+        })
+        .await
+    } else {
+        handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+    };
     let response = response.with_timing(start);
 
-    let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
-        .unwrap_or_else(|_| br#"{"error":"response exceeded configured message size"}"#.to_vec());
+    let response_json = serialize_ipc_response_bounded(response, limits.max_message_size)?;
     write_ipc_line_with_deadline(
         &cx,
         &mut writer,
@@ -2315,11 +2439,18 @@ async fn handle_client_with_context_with_cx(
     // unix-gated). On Windows a SubscribeEvents request falls through to the
     // single-response dispatcher, which returns a typed
     // `ipc.subscribe_events.not_streamed` error rather than hanging.
-    let response = handle_request_with_context_with_cx(&cx, envelope, &ctx).await;
+    let response = if matches!(&envelope.request, IpcRequest::Rpc { .. }) {
+        dispatch_rpc_with_disconnect(&cx, envelope, &ctx, limits, async {
+            let mut byte = [0_u8; 1];
+            let _ = stream.read(&mut byte).await;
+        })
+        .await
+    } else {
+        handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+    };
     let response = response.with_timing(start);
 
-    let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
-        .unwrap_or_else(|_| br#"{"error":"response exceeded configured message size"}"#.to_vec());
+    let response_json = serialize_ipc_response_bounded(response, limits.max_message_size)?;
     write_ipc_line_with_deadline(
         &cx,
         &mut stream,
@@ -2726,16 +2857,11 @@ async fn handle_request_with_context(
             })
             .await
         }
-        IpcRequest::Rpc { args } => {
-            let Some(handler) = ctx.rpc_handler.as_ref() else {
-                return IpcResponse::error("rpc handler not configured");
-            };
-            handler(IpcRpcRequest {
-                args,
-                request_id: envelope.request_id,
-            })
-            .await
-        }
+        IpcRequest::Rpc { .. } => IpcResponse::error_with_code(
+            "ipc.rpc_context_required",
+            "RPC requires an authenticated connection context",
+            None,
+        ),
         // SubscribeEvents is a streaming request: the connection handler
         // (`handle_client_with_context_with_cx`) intercepts it before the
         // single-response dispatch and never routes it here. Reaching this
@@ -2754,7 +2880,7 @@ async fn handle_request_with_context(
 /// Routes PaneState / SetPanePriority / ClearPanePriority to their
 /// cx-first handler siblings so a cancelled client-handler cx
 /// propagates into the registry RwLock acquires. All other branches
-/// (UserVar, Ping, Status, Rpc) delegate to the legacy dispatcher;
+/// (UserVar, Ping, Status) delegate to the legacy dispatcher;
 /// they don't benefit from cx threading at this layer (Status does
 /// have a registry read but the telemetry-friendly path is
 /// best-effort — cancel-surfaces-as-delay is acceptable there).
@@ -2778,6 +2904,20 @@ async fn handle_request_with_context_with_cx(
         IpcRequest::ClearPanePriority { pane_id } => {
             handle_clear_pane_priority_with_cx(cx, pane_id, ctx).await
         }
+        IpcRequest::Rpc { args } => {
+            let Some(handler) = ctx.rpc_handler.as_ref() else {
+                return IpcResponse::error("rpc handler not configured");
+            };
+            handler(IpcRpcRequest {
+                args,
+                request_id,
+                cx: cx.clone(),
+                deadline: Instant::now() + IPC_RPC_EXECUTION_TIMEOUT,
+                cancellation: crate::runtime_async::process::CommandCancellation::new(),
+                max_output_bytes: MAX_MESSAGE_SIZE.saturating_sub(1024),
+            })
+            .await
+        }
         // Non-lock branches delegate to the legacy dispatcher (the
         // registry-read in the Status branch is best-effort; a
         // cancel-surfaces-as-delay contract is acceptable there).
@@ -2788,6 +2928,60 @@ async fn handle_request_with_context_with_cx(
                 request: other,
             };
             handle_request_with_context(envelope, ctx).await
+        }
+    }
+}
+
+/// Retain the handler after disconnect/shutdown so its owned process reports
+/// settlement. A per-request signal must not cancel the shared server Cx.
+#[cfg(any(unix, windows))]
+async fn dispatch_rpc_with_disconnect<F>(
+    cx: &crate::cx::Cx,
+    envelope: IpcEnvelope,
+    ctx: &IpcHandlerContext,
+    limits: IpcRuntimeLimits,
+    disconnect: F,
+) -> IpcResponse
+where
+    F: std::future::Future<Output = ()>,
+{
+    let IpcRequest::Rpc { args } = envelope.request else {
+        return IpcResponse::error("RPC dispatcher received a non-RPC request");
+    };
+    let Some(handler) = ctx.rpc_handler.as_ref() else {
+        return IpcResponse::error("rpc handler not configured");
+    };
+    let cancellation = crate::runtime_async::process::CommandCancellation::new();
+    let request = IpcRpcRequest {
+        args,
+        request_id: envelope.request_id,
+        cx: cx.clone(),
+        deadline: Instant::now() + IPC_RPC_EXECUTION_TIMEOUT,
+        cancellation: cancellation.clone(),
+        max_output_bytes: limits.max_message_size.saturating_sub(1024),
+    };
+    let stop = async {
+        let shutdown = async {
+            while !ctx.rpc_shutdown.is_cancelled() {
+                if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        };
+        let _ = futures::future::select(Box::pin(disconnect), Box::pin(shutdown)).await;
+    };
+    match futures::future::select(Box::pin(stop), handler(request)).await {
+        futures::future::Either::Right((response, _)) => response,
+        futures::future::Either::Left(((), pending)) => {
+            cancellation.cancel();
+            tracing::debug!(
+                event = "ipc_rpc_connection_cancel_requested",
+                "IPC RPC connection cancellation requested"
+            );
+            pending.await
         }
     }
 }
@@ -4117,6 +4311,38 @@ mod tests {
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("\"error_code\":\"ipc.test_error\""));
         assert!(json.contains("\"hint\":\"try again\""));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rpc_response_wire_cap_preserves_admitted_effect_receipt() {
+        let mut response =
+            IpcResponse::ok_with_data(serde_json::json!({"large": "\"\\\n".repeat(8192)}));
+        response.rpc = Some(IpcRpcReceipt {
+            correlation_hash: "sha256:owned-test-correlation".to_string(),
+            child_identity_hash: Some("sha256:owned-test-child".to_string()),
+            admission: IpcRpcAdmission::Started,
+            settlement: IpcRpcSettlement::Exited,
+            effects: IpcRpcEffects::ResponseReported,
+            audit_delivery: IpcRpcAuditDelivery::Confirmed,
+            stdout_bytes: Some(8192),
+            stderr_bytes: Some(0),
+        });
+        let bytes = serialize_ipc_response_bounded(response.clone(), 1024).unwrap();
+        assert!(bytes.len() <= 1024);
+        let fallback: IpcResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            fallback.error_code.as_deref(),
+            Some("ipc.response_size_exceeded")
+        );
+        let receipt = fallback.rpc.unwrap();
+        assert_eq!(receipt.admission, IpcRpcAdmission::Started);
+        assert_eq!(receipt.effects, IpcRpcEffects::ResponseReported);
+        assert_eq!(receipt.audit_delivery, IpcRpcAuditDelivery::Confirmed);
+        assert!(
+            serialize_ipc_response_bounded(response, 1).is_err(),
+            "never emit a misleading fallback without the disposition"
+        );
     }
 
     #[test]

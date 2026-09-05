@@ -68,7 +68,7 @@ SOCK="$D/mux.sock"
 KILL_SWITCH_SMOKE="${FT_SMOKE_KILL_SWITCH:-0}"
 PYTHON=$(command -v python3) || exit 2
 case "$PYTHON" in /*) ;; *) echo "python3 must resolve to an absolute path" >&2; exit 2 ;; esac
-"$PYTHON" - "$D" "$SOCK" "$KILL_SWITCH_SMOKE" <<'PY'
+if ! "$PYTHON" - "$D" "$SOCK" "$KILL_SWITCH_SMOKE" <<'PY'
 import json, pathlib, sys
 root, socket, stopped = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3] == "1"
 quote = json.dumps
@@ -82,7 +82,9 @@ if stopped:
                'claude_code = "RC3_FENCE_EFFECT\\n"\n')
 (root / "ft.toml").write_text(config)
 PY
-[ "$?" -eq 0 ] || exit 2
+then
+  exit 2
+fi
 chmod 600 "$D/ft.toml"
 HERMETIC_ENV=(
   "PATH=$BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" "LANG=C" "HOME=$D/home"
@@ -94,11 +96,58 @@ HERMETIC_ENV=(
 )
 file_sha() { "$PYTHON" - "$1" <<'PY'
 import hashlib, pathlib, sys
-print(hashlib.file_digest(pathlib.Path(sys.argv[1]).open('rb'), 'sha256').hexdigest())
+digest = hashlib.sha256()
+with pathlib.Path(sys.argv[1]).open('rb') as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b''):
+        digest.update(chunk)
+print(digest.hexdigest())
 PY
 }
 CLI_SHA=$(file_sha "$FT") || exit 2
 MUX_SHA=$(file_sha "$MUX") || exit 2
+run_bounded() {
+  # Drain both streams concurrently with finite byte/time budgets, preserving
+  # actual bytes in the caller's retained files. Failure never retries an
+  # ambiguous mutation; only this wrapper's own child is killed and reaped.
+  env -i "${HERMETIC_ENV[@]}" "$PYTHON" -c '
+import os, selectors, subprocess, sys, time
+child = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+selector = selectors.DefaultSelector()
+selector.register(child.stdout, selectors.EVENT_READ, 1)
+selector.register(child.stderr, selectors.EVENT_READ, 2)
+counts, deadline = {1: 0, 2: 0}, time.monotonic() + 25
+try:
+    while selector.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("25-second command deadline exceeded")
+        for key, _ in selector.select(min(remaining, 0.1)):
+            chunk = os.read(key.fd, 65536)
+            if not chunk:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+                continue
+            counts[key.data] += len(chunk)
+            if counts[key.data] > 1048576:
+                raise RuntimeError("command output exceeded one MiB per stream")
+            target = sys.stdout.buffer if key.data == 1 else sys.stderr.buffer
+            target.write(chunk)
+            target.flush()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("25-second command deadline exceeded")
+    result = child.wait(timeout=remaining)
+except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
+    print(f"owned candidate command failed: {error}; effect not confirmed", file=sys.stderr)
+    sys.exit(124)
+finally:
+    if child.poll() is None:
+        child.kill()
+    child.wait()
+    selector.close()
+sys.exit(result if result >= 0 else 128 - result)
+' "$@"
+}
 LOG="$D/smoke.log"
 RECEIPT="$D/receipt.json"
 STEPS="$D/steps.jsonl"
@@ -143,6 +192,8 @@ stop_children() {
 }
 finish() { # status
   local status="$1"
+  run_bounded "$FT" --version > "$D/cli-version.txt" 2> "$D/cli-version.err" || status=fail
+  run_bounded "$MUX" --version > "$D/mux-version.txt" 2> "$D/mux-version.err" || status=fail
   jq -n \
     --arg schema "ft.smoke.headless-mux-observe.v1" \
     --arg generated_at "$(date -u +%FT%TZ)" \
@@ -152,14 +203,15 @@ finish() { # status
     --arg cli_sha256 "$CLI_SHA" --arg mux_sha256 "$MUX_SHA" \
     --arg private_socket "$SOCK" \
     --argjson codec_version "$CODEC_VERSION" \
-    --arg cli_version "$("$FT" --version 2>/dev/null | head -1)" \
-    --arg mux_version "$("$MUX" --version 2>/dev/null | head -1)" \
+    --arg cli_version "$(head -1 "$D/cli-version.txt")" \
+    --arg mux_version "$(head -1 "$D/mux-version.txt")" \
     --arg bin_dir "$BIN_DIR" \
     --arg status "$status" \
     --slurpfile steps "$STEPS" \
     '{schema:$schema,generated_at:$generated_at,host:$host,commit:$commit,source_authority:$source_authority,cli_sha256:$cli_sha256,mux_sha256:$mux_sha256,private_socket:$private_socket,codec_version:$codec_version,cli_version:$cli_version,mux_version:$mux_version,bin_dir:$bin_dir,status:$status,steps:$steps}' \
-    > "$RECEIPT"
+    > "$RECEIPT" || return 1
   log "receipt: $RECEIPT (status=$status)"
+  [ "$status" = pass ]
 }
 fail() { # step-name detail
   step "$1" fail "$2"
@@ -221,9 +273,10 @@ for _ in $(seq 1 150); do grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null && [ -
 grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null || fail mux_start "server pid $MUX_PID never took the socket lease: $(tail -3 "$D/mux.log" | tr '\n' ' ')"
 step mux_start pass "pid $MUX_PID on $SOCK"
 
-ft() { env -i "${HERMETIC_ENV[@]}" "$FT" -c "$D/ft.toml" "$@"; }
+ft() { run_bounded "$FT" -c "$D/ft.toml" "$@"; }
 
-ft doctor --json > "$D/doctor.json" 2> "$D/doctor.err"
+ft doctor --json > "$D/doctor.json" 2> "$D/doctor.err" \
+  || fail doctor "candidate doctor command failed; see doctor.err"
 SOCK_ROW=$(jq -c '.checks[] | select(.name=="mux socket")' "$D/doctor.json" 2>/dev/null)
 CONN_ROW=$(jq -c '.checks[] | select(.name=="WezTerm connection")' "$D/doctor.json" 2>/dev/null)
 log "$SOCK_ROW"; log "$CONN_ROW"
@@ -231,7 +284,8 @@ jq -e '.checks[] | select(.name=="WezTerm connection") | .status == "ok"' "$D/do
   || fail doctor "did not reach the mux: $(tail -3 "$D/doctor.err" | tr '\n' ' ')"
 step doctor pass "$(jq -r '.checks[] | select(.name=="WezTerm connection") | .detail' "$D/doctor.json")"
 
-ft list --json > "$D/list.json" 2> "$D/list.err"
+ft list --json > "$D/list.json" 2> "$D/list.err" \
+  || fail list "candidate list command failed; see list.err"
 PANE=$(jq -r '.[0].pane_id' "$D/list.json" 2>/dev/null)
 [ -n "$PANE" ] && [ "$PANE" != "null" ] || fail list "no pane listed: $(tail -3 "$D/list.err" | tr '\n' ' ')"
 jq -e 'length == 1' "$D/list.json" > /dev/null || fail list "private fixture must own exactly one pane"
@@ -252,27 +306,47 @@ if [ "$KILL_SWITCH_SMOKE" = 1 ]; then
   await_audit() {
     "$PYTHON" - "$D" "$PANE" "$1" "$2" <<'PY'
 import json, pathlib, sqlite3, sys, time
-root, pane, decision, required = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+root, pane, decision, phase = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 deadline = time.monotonic() + 35
 while time.monotonic() < deadline:
-    with sqlite3.connect(f'file:{root / ".ft" / "ft.db"}?mode=ro', uri=True, timeout=1) as db:
-        rows = db.execute('SELECT id, policy_decision, rule_id, result FROM audit_actions WHERE pane_id=? AND actor_kind=? AND action_kind=? AND policy_decision=? ORDER BY id', (pane, 'workflow', 'send_text', decision)).fetchall()
-    if len(rows) >= required:
+    with sqlite3.connect((root / ".ft" / "ft.db").as_uri() + '?mode=ro', uri=True, timeout=1) as db:
+        candidates = db.execute('SELECT a.id, a.policy_decision, a.rule_id, a.result, a.actor_id, e.extracted FROM audit_actions a JOIN workflow_executions w ON w.id=a.actor_id JOIN events e ON e.id=w.trigger_event_id WHERE a.pane_id=? AND a.actor_kind=? AND a.action_kind=? AND a.policy_decision=? AND w.workflow_name=? ORDER BY a.id', (pane, 'workflow', 'send_text', decision, 'handle_compaction')).fetchall()
+    rows = [row for row in candidates if json.loads(row[5] or '{}').get('tokens_before') == str(9000 + phase) and json.loads(row[5] or '{}').get('tokens_after') == str(4500 + phase)]
+    if rows:
         if decision == 'deny' and rows[-1][2] != 'policy.kill_switch':
             raise RuntimeError(f'wrong denial source: {rows[-1]!r}')
-        print(json.dumps({'decision': decision, 'rows': rows}))
+        print(json.dumps({'decision': decision, 'trigger_phase': phase, 'rows': rows}))
         break
     time.sleep(0.2)
 else:
-    raise RuntimeError(f'no {decision} workflow audit within deadline')
+    raise RuntimeError(f'no {decision} workflow audit tied to real trigger phase {phase} within deadline')
+PY
+  }
+  await_input() {
+    "$PYTHON" - "$D/pane-input.bin" "$1" <<'PY'
+import hashlib, pathlib, sys, time
+path, required = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+deadline, previous, stable_since = time.monotonic() + 10, None, time.monotonic()
+while time.monotonic() < deadline:
+    data = path.read_bytes()
+    count = data.count(b'RC3_FENCE_EFFECT')
+    if count > required:
+        raise RuntimeError(f'duplicate/replayed effect: {count} markers, expected {required}')
+    if data != previous:
+        previous, stable_since = data, time.monotonic()
+    if count == required and time.monotonic() - stable_since >= 0.6:
+        print(hashlib.sha256(data).hexdigest())
+        break
+    time.sleep(0.1)
+else:
+    raise RuntimeError('allowed effect did not reach stable owned PTY input')
 PY
   }
   printf '1\n' > "$D/phase"
   await_audit allow 1 > "$D/baseline-audit.json" 2> "$D/baseline-audit.err" \
     || fail kill_switch_baseline "no real workflow allow; see baseline-audit.err and watch.log"
-  grep -a -q 'RC3_FENCE_EFFECT' "$D/pane-input.bin" \
-    || fail kill_switch_baseline "allowed workflow did not reach owned PTY input"
-  BASE_INPUT_SHA=$(file_sha "$D/pane-input.bin")
+  BASE_INPUT_SHA=$(await_input 1) \
+    || fail kill_switch_baseline "allowed workflow did not reach stable owned PTY input"
   step kill_switch_baseline pass "watcher $WATCH delivered a compaction workflow to owned pane $PANE"
 
   ft robot --format json kill-switch trip --level hard-stop --reason rc3-owned-trip \
@@ -280,7 +354,7 @@ PY
   jq -e '.ok == true and .data.persisted == true and .data.level == "hard_stop" and .data.revision > 0 and .data.fenced_owner == "policy_gated_injector" and .data.pre_admitted_remote_effects == "not_proven_settled"' "$D/trip.json" > /dev/null \
     || fail kill_switch_trip "trip not durably acknowledged with the required scope"
   printf '2\n' > "$D/phase"
-  await_audit deny 1 > "$D/denial-audit.json" 2> "$D/denial-audit.err" \
+  await_audit deny 2 > "$D/denial-audit.json" 2> "$D/denial-audit.err" \
     || fail kill_switch_denial "same watcher did not persist kill-switch denial; see denial-audit.err and watch.log"
   [ "$(file_sha "$D/pane-input.bin")" = "$BASE_INPUT_SHA" ] \
     || fail kill_switch_denial "stopped workflow changed actual PTY input bytes"
@@ -295,8 +369,10 @@ PY
   [ "$(file_sha "$D/pane-input.bin")" = "$BASE_INPUT_SHA" ] \
     || fail kill_switch_reset "reset replayed denied input without a fresh trigger"
   printf '3\n' > "$D/phase"
-  await_audit allow 2 > "$D/recovery-audit.json" 2> "$D/recovery-audit.err" \
+  await_audit allow 3 > "$D/recovery-audit.json" 2> "$D/recovery-audit.err" \
     || fail kill_switch_recovery "fresh workflow did not succeed after reset"
+  await_input 2 > "$D/recovery-input.sha256" \
+    || fail kill_switch_recovery "fresh allowed workflow did not settle in the owned PTY recorder"
   [ "$(file_sha "$D/pane-input.bin")" != "$BASE_INPUT_SHA" ] \
     || fail kill_switch_recovery "fresh allowed workflow did not reach PTY input"
   owned_running "$WATCH" || fail kill_switch_recovery "watcher was replaced or exited"
@@ -304,7 +380,7 @@ PY
     || fail source_identity "candidate binary bytes changed during the run"
   step kill_switch_recovery pass "fresh compaction trigger delivered after reset; no rejected send replay"
   stop_children
-  finish pass
+  finish pass || exit 1
   echo "PASS: owned watcher kill-switch admission (remote settlement remains unproven; evidence in $D)"
   exit 0
 fi
@@ -315,7 +391,8 @@ ft send --no-paste "$PANE" "echo \"You've reached your usage limit. try again at
 step send pass "title set to codex; usage-limit line sent"
 sleep 10
 
-ft events -f json -l 5 > "$D/events.json" 2> "$D/events.err"
+ft events -f json -l 5 > "$D/events.json" 2> "$D/events.err" \
+  || fail detect "candidate events command failed; see events.err"
 jq -c '.[] | {id, rule_id, agent_type, severity, extracted, matched_text}' "$D/events.json" 2>/dev/null | tee -a "$LOG"
 jq -e 'any(.[]; .rule_id == "codex.usage.reached")' "$D/events.json" > /dev/null \
   || fail detect "no codex.usage.reached event ($(grep -c . "$D/watch.log") watch log lines in $D)"
@@ -329,5 +406,5 @@ fi
 step durability pass "dropped segments 0, sequence resyncs 0"
 
 stop_children
-finish pass
+finish pass || exit 1
 echo "PASS: observe->detect on a real headless mux (evidence in $D)"

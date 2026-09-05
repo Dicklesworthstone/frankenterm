@@ -4030,6 +4030,155 @@ pub mod process {
         }
     }
 
+    /// Observations made by the actual process owner, not inferred from an
+    /// outer timeout. A settled supervisor does not imply rollback of effects.
+    #[derive(Debug)]
+    pub struct CommandExecutionReport {
+        pub output: std::io::Result<Output>,
+        pub spawned_pid: Option<u32>,
+        pub supervisor_settled: bool,
+    }
+
+    #[derive(Default)]
+    struct CommandExecutionProbe {
+        spawned_pid: std::sync::atomic::AtomicU32,
+    }
+
+    const CONTROLLED_SUPERVISOR_LIMIT: usize = 16;
+    // Includes the existing process-group signal, leader reap and pipe-drain
+    // budgets, with margin. A stuck native owner remains retained and capped.
+    const CONTROLLED_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
+    static CONTROLLED_SUPERVISORS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    // A forcibly dropped caller cannot join asynchronously in Drop. Retain
+    // its finite owner here, bounded by the same admission permits, and reap
+    // finished owners before the next admission. Never call detachment joined.
+    static ABANDONED_SUPERVISORS: std::sync::Mutex<Vec<RetainedSupervisor>> =
+        std::sync::Mutex::new(Vec::new());
+
+    struct SupervisorPermit;
+
+    impl Drop for SupervisorPermit {
+        fn drop(&mut self) {
+            CONTROLLED_SUPERVISORS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct RetainedSupervisor {
+        worker: std::thread::JoinHandle<std::io::Result<Output>>,
+        _permit: SupervisorPermit,
+    }
+
+    struct ControlledSupervisor {
+        owner: Option<RetainedSupervisor>,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl ControlledSupervisor {
+        async fn wait_for_settlement(
+            &self,
+            cx: &crate::cx::Cx,
+            deadline: OutputCommandDeadline,
+        ) -> std::io::Result<()> {
+            // Only the timer uses a fresh cleanup context; the process retains
+            // the authentic request Cx and original absolute deadline.
+            let settlement_cx = crate::cx::for_request();
+            let mut cutoff = deadline
+                .at
+                .checked_add(CONTROLLED_SETTLEMENT_GRACE)
+                .unwrap_or(deadline.at);
+            let mut cancelled_at = None;
+            while !self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.worker.is_finished())
+            {
+                let now = Instant::now();
+                if cx.checkpoint().is_err() {
+                    self.cancel.store(true, Ordering::SeqCst);
+                }
+                if self.cancel.load(Ordering::SeqCst) && cancelled_at.is_none() {
+                    cancelled_at = Some(now);
+                    cutoff = cutoff.min(
+                        now.checked_add(CONTROLLED_SETTLEMENT_GRACE)
+                            .unwrap_or(now),
+                    );
+                }
+                if now >= cutoff {
+                    self.cancel.store(true, Ordering::SeqCst);
+                    return Err(if cancelled_at.is_some() {
+                        CommandCancelled.into_io_error()
+                    } else {
+                        deadline.into_io_error()
+                    });
+                }
+                if super::sleep_with_cx(&settlement_cx, PROCESS_POLL_INTERVAL)
+                    .await
+                    .is_err()
+                {
+                    self.cancel.store(true, Ordering::SeqCst);
+                    return Err(std::io::Error::other(
+                        "controlled process settlement timer unavailable",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ControlledSupervisor {
+        fn drop(&mut self) {
+            if let Some(owner) = self.owner.take() {
+                self.cancel.store(true, Ordering::SeqCst);
+                ABANDONED_SUPERVISORS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(owner);
+                tracing::warn!(
+                    event = "command_supervisor_retained_after_drop",
+                    settlement = "indeterminate",
+                    "Dropped caller requested cancellation; supervisor ownership retained"
+                );
+            }
+        }
+    }
+
+    fn reap_abandoned_supervisors() {
+        let mut owners = ABANDONED_SUPERVISORS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut index = 0;
+        while index < owners.len() {
+            if owners[index].worker.is_finished() {
+                let owner = owners.swap_remove(index);
+                match owner.worker.join() {
+                    Ok(Ok(_)) => tracing::debug!(
+                        event = "command_supervisor_joined_after_drop",
+                        process_outcome = "exited",
+                        "Retained supervisor joined; no external effect rollback is implied"
+                    ),
+                    Ok(Err(error)) => {
+                        let uncertain = CommandProcessCleanupIncomplete::from_io_error(&error)
+                            .is_some()
+                            || CommandOutputCaptureIncomplete::from_io_error(&error).is_some();
+                        tracing::debug!(
+                            event = "command_supervisor_joined_after_drop",
+                            process_outcome = if uncertain { "indeterminate" } else { "failed" },
+                            "Retained supervisor joined with a process failure"
+                        );
+                    }
+                    Err(_) => tracing::error!(
+                        event = "command_supervisor_joined_after_drop",
+                        process_outcome = "panic_indeterminate",
+                        "Supervisor thread joined after panic; process settlement is unproved"
+                    ),
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct OutputCaptureLimits {
         stdout: usize,
@@ -4046,6 +4195,8 @@ pub mod process {
         stdin_limit: usize,
         limits: OutputCaptureLimits,
         exec_busy_retry_delays: Vec<Duration>,
+        execution_probe: Option<Arc<CommandExecutionProbe>>,
+        request_cx: Option<crate::cx::Cx>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -4707,6 +4858,128 @@ pub mod process {
                 .await
         }
 
+        /// Run under the authentic caller Cx, an absolute monotonic deadline,
+        /// and an additional request-local signal (for example IPC disconnect).
+        /// Always await this future after signalling cancellation to obtain a
+        /// disposition. Dropping it requests cleanup but cannot certify it.
+        pub async fn output_with_cx_controlled(
+            &mut self,
+            cx: &crate::cx::Cx,
+            deadline: Instant,
+            cancellation: &CommandCancellation,
+        ) -> CommandExecutionReport {
+            let refused = |error| CommandExecutionReport {
+                output: Err(error),
+                spawned_pid: None,
+                supervisor_settled: true,
+            };
+            if cx.checkpoint().is_err() || cancellation.is_cancelled() {
+                return refused(CommandCancelled.into_io_error());
+            }
+            let timeout_ms = u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            let deadline = OutputCommandDeadline {
+                at: deadline,
+                timeout_ms,
+            };
+            if deadline.is_elapsed() {
+                return refused(deadline.into_io_error());
+            }
+            reap_abandoned_supervisors();
+            if CONTROLLED_SUPERVISORS
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                    (active < CONTROLLED_SUPERVISOR_LIMIT).then_some(active + 1)
+                })
+                .is_err()
+            {
+                return refused(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "controlled process supervisor capacity exhausted",
+                ));
+            }
+            let permit = SupervisorPermit;
+            let probe = Arc::new(CommandExecutionProbe::default());
+            let mut spec = self.output_spec();
+            spec.execution_probe = Some(Arc::clone(&probe));
+            spec.request_cx = Some(cx.clone());
+            let cancel = cancellation.shared_flag();
+            let worker_cancel = Arc::clone(&cancel);
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let span = tracing::Span::current();
+            let worker = match std::thread::Builder::new()
+                .name("ft-owned-process".to_string())
+                .spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let _entered = span.enter();
+                        run_output_command(spec, worker_cancel, Some(deadline))
+                    })
+                }) {
+                Ok(worker) => worker,
+                Err(error) => return refused(error),
+            };
+            let mut supervisor = ControlledSupervisor {
+                owner: Some(RetainedSupervisor {
+                    worker,
+                    _permit: permit,
+                }),
+                cancel,
+            };
+            if let Err(error) = supervisor.wait_for_settlement(cx, deadline).await {
+                tracing::warn!(
+                    event = "command_supervisor_settlement_unconfirmed",
+                    settlement = "indeterminate",
+                    "Controlled owner did not settle within the finite wait; ownership retained"
+                );
+                return CommandExecutionReport {
+                    output: Err(error),
+                    spawned_pid: match probe.spawned_pid.load(Ordering::SeqCst) {
+                        0 => None,
+                        pid => Some(pid),
+                    },
+                    supervisor_settled: false,
+                };
+            }
+            let owner = supervisor
+                .owner
+                .take()
+                .expect("finished supervisor retains its owner");
+            let joined = owner.worker.join();
+            let supervisor_settled = joined.is_ok();
+            let output = joined.unwrap_or_else(|_| {
+                Err(std::io::Error::other(
+                    "controlled process supervisor panicked",
+                ))
+            });
+            let pid = probe.spawned_pid.load(Ordering::SeqCst);
+            let outcome = match &output {
+                Ok(_) => "exited",
+                Err(error) if CommandCancelled::from_io_error(error).is_some() => "cancelled",
+                Err(error) if CommandTimedOut::from_io_error(error).is_some() => {
+                    "deadline_exceeded"
+                }
+                Err(error) if CommandOutputLimitExceeded::from_io_error(error).is_some() => {
+                    "output_limit"
+                }
+                Err(_) => "failed_or_indeterminate",
+            };
+            tracing::debug!(
+                event = "command_process_settled",
+                outcome,
+                supervisor_settled,
+                spawned = pid != 0,
+                "Controlled process supervisor returned its terminal observation"
+            );
+            CommandExecutionReport {
+                output,
+                spawned_pid: (pid != 0).then_some(pid),
+                supervisor_settled,
+            }
+        }
+
         async fn output_with_cx_deadline(
             &self,
             cx: &crate::cx::Cx,
@@ -4813,6 +5086,8 @@ pub mod process {
                     stderr: self.stderr_limit,
                 },
                 exec_busy_retry_delays: self.exec_busy_retry_delays.clone(),
+                execution_probe: None,
+                request_cx: None,
             }
         }
     }
@@ -4838,7 +5113,14 @@ pub mod process {
             stdin_limit,
             limits,
             exec_busy_retry_delays,
+            execution_probe,
+            request_cx,
         } = spec;
+
+        if let Some(cx) = &request_cx {
+            cx.checkpoint()
+                .map_err(|_| CommandCancelled.into_io_error())?;
+        }
 
         if let Some(error) = stdin_configuration_error {
             return Err(error.into_io_error());
@@ -4898,9 +5180,20 @@ pub mod process {
         // Close the remaining queue/setup window. Cancellation can still race
         // the spawn itself, but the first worker-loop iteration will then
         // terminate that process tree promptly.
+        if let Some(cx) = &request_cx {
+            cx.checkpoint()
+                .map_err(|_| CommandCancelled.into_io_error())?;
+        }
         check_output_command_abort(&cancel, deadline)?;
 
         let mut child = spawn_output_child(&mut cmd, &exec_busy_retry_delays, &cancel, deadline)?;
+        if let Some(probe) = execution_probe {
+            probe.spawned_pid.store(child.id(), Ordering::SeqCst);
+            tracing::debug!(
+                event = "command_process_started",
+                "Controlled process owner observed child admission"
+            );
+        }
         // `Command` retains custom Stdio handles for possible reuse. Drop it
         // and our original write endpoints immediately so only the child (or
         // descendants that deliberately inherit them) can keep either stream
@@ -4925,6 +5218,9 @@ pub mod process {
         let mut post_exit_deadline = None;
 
         loop {
+            if request_cx.as_ref().is_some_and(|cx| cx.checkpoint().is_err()) {
+                cancel.store(true, Ordering::SeqCst);
+            }
             if cancel.load(Ordering::SeqCst) {
                 terminate_and_settle_output_command(
                     &mut child,
@@ -5769,6 +6065,221 @@ pub mod process {
     #[cfg(test)]
     mod output_capture_unit_tests {
         use super::*;
+
+        #[cfg(unix)]
+        #[test]
+        fn controlled_supervisors_bound_admission_cancel_before_spawn_and_retain_dropped_owners() {
+            let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let cx = crate::cx::for_testing();
+                let signal = CommandCancellation::new();
+                let mut owners = Vec::new();
+                for index in 0..CONTROLLED_SUPERVISOR_LIMIT {
+                    let ready = dir.path().join(format!("ready-{index}"));
+                    let child_cx = cx.clone();
+                    let signal = signal.clone();
+                    owners.push(crate::runtime_async::task::spawn(async move {
+                        let mut command = Command::new("/bin/sh");
+                        command
+                            .args([
+                                "-c",
+                                "printf ready > \"$1\"; exec sleep 10",
+                                "owned-supervisor-test",
+                            ])
+                            .arg(ready);
+                        command
+                            .output_with_cx_controlled(
+                                &child_cx,
+                                Instant::now() + Duration::from_secs(5),
+                                &signal,
+                            )
+                            .await
+                    }));
+                }
+                let bound = Instant::now() + Duration::from_secs(3);
+                while !(0..CONTROLLED_SUPERVISOR_LIMIT)
+                    .all(|index| dir.path().join(format!("ready-{index}")).exists())
+                {
+                    assert!(
+                        Instant::now() < bound,
+                        "all real supervisors must cross the start barrier"
+                    );
+                    crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(5))
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(
+                    CONTROLLED_SUPERVISORS.load(Ordering::SeqCst),
+                    CONTROLLED_SUPERVISOR_LIMIT
+                );
+                let forbidden = dir.path().join("must-not-spawn");
+                let mut extra = Command::new("/bin/sh");
+                extra
+                    .args(["-c", "printf unexpected > \"$1\"", "owned-supervisor-test"])
+                    .arg(&forbidden);
+                let rejected = extra
+                    .output_with_cx_controlled(
+                        &cx,
+                        Instant::now() + Duration::from_secs(1),
+                        &CommandCancellation::new(),
+                    )
+                    .await;
+                assert_eq!(
+                    rejected.output.unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(rejected.spawned_pid.is_none() && rejected.supervisor_settled);
+                assert!(!forbidden.exists());
+                signal.cancel();
+                for owner in owners {
+                    let report = owner.await.unwrap();
+                    assert!(report.spawned_pid.is_some() && report.supervisor_settled);
+                    assert!(CommandCancelled::from_io_error(&report.output.unwrap_err()).is_some());
+                }
+                assert_eq!(CONTROLLED_SUPERVISORS.load(Ordering::SeqCst), 0);
+                for pre_cancel in [true, false] {
+                    let signal = CommandCancellation::new();
+                    if pre_cancel {
+                        signal.cancel();
+                    }
+                    let deadline = if pre_cancel {
+                        Instant::now() + Duration::from_secs(1)
+                    } else {
+                        Instant::now()
+                    };
+                    let report = extra
+                        .output_with_cx_controlled(&cx, deadline, &signal)
+                        .await;
+                    let error = report.output.unwrap_err();
+                    assert!(if pre_cancel {
+                        CommandCancelled::from_io_error(&error).is_some()
+                    } else {
+                        CommandTimedOut::from_io_error(&error).is_some()
+                    });
+                    assert!(report.spawned_pid.is_none() && report.supervisor_settled);
+                    assert!(!forbidden.exists());
+                }
+
+                let ready = dir.path().join("dropped-ready");
+                let child_ready = ready.clone();
+                let child_cx = cx.clone();
+                let dropped = crate::runtime_async::task::spawn(async move {
+                    let mut command = Command::new("/bin/sh");
+                    command
+                        .args([
+                            "-c",
+                            "printf ready > \"$1\"; exec sleep 10",
+                            "owned-supervisor-test",
+                        ])
+                        .arg(child_ready);
+                    command
+                        .output_with_cx_controlled(
+                            &child_cx,
+                            Instant::now() + Duration::from_secs(5),
+                            &CommandCancellation::new(),
+                        )
+                        .await
+                });
+                let bound = Instant::now() + Duration::from_secs(2);
+                while !ready.exists() {
+                    assert!(Instant::now() < bound);
+                    crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(5))
+                        .await
+                        .unwrap();
+                }
+                dropped.abort();
+                assert!(dropped.await.is_err());
+                assert_eq!(
+                    ABANDONED_SUPERVISORS.lock().unwrap().len(),
+                    1,
+                    "dropping the future retains its actual owner"
+                );
+                loop {
+                    reap_abandoned_supervisors();
+                    if ABANDONED_SUPERVISORS.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < bound,
+                        "retained owner must actually terminate and join"
+                    );
+                    crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(5))
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(CONTROLLED_SUPERVISORS.load(Ordering::SeqCst), 0);
+
+                // These are real retained native threads, deliberately held
+                // behind a channel barrier. They exercise the production owner
+                // wait cutoff, not subprocess cleanup or external effects.
+                for trigger in 0..3 {
+                    let cx = crate::cx::for_testing();
+                    let signal = CommandCancellation::new();
+                    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                    let worker = std::thread::spawn(move || {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Err(std::io::Error::other("owned thread barrier released"))
+                    });
+                    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    CONTROLLED_SUPERVISORS.fetch_add(1, Ordering::SeqCst);
+                    let supervisor = ControlledSupervisor {
+                        owner: Some(RetainedSupervisor {
+                            worker,
+                            _permit: SupervisorPermit,
+                        }),
+                        cancel: signal.shared_flag(),
+                    };
+                    match trigger {
+                        0 => signal.cancel(),
+                        1 => cx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("owned thread crossed barrier"),
+                        ),
+                        _ => {}
+                    }
+                    let deadline = OutputCommandDeadline::new(if trigger == 2 {
+                        Duration::from_millis(20)
+                    } else {
+                        Duration::from_secs(60)
+                    });
+                    let began = Instant::now();
+                    let error = supervisor
+                        .wait_for_settlement(&cx, deadline)
+                        .await
+                        .unwrap_err();
+                    assert!(began.elapsed() >= CONTROLLED_SETTLEMENT_GRACE);
+                    assert!(began.elapsed() < Duration::from_secs(4));
+                    assert!(if trigger == 2 {
+                        CommandTimedOut::from_io_error(&error).is_some()
+                    } else {
+                        CommandCancelled::from_io_error(&error).is_some()
+                    });
+                    assert!(signal.is_cancelled());
+                    assert!(!supervisor.owner.as_ref().unwrap().worker.is_finished());
+                    assert_eq!(CONTROLLED_SUPERVISORS.load(Ordering::SeqCst), 1);
+                    drop(supervisor);
+                    assert_eq!(ABANDONED_SUPERVISORS.lock().unwrap().len(), 1);
+                    assert_eq!(CONTROLLED_SUPERVISORS.load(Ordering::SeqCst), 1);
+                    release_tx.send(()).unwrap();
+                    let bound = Instant::now() + Duration::from_secs(1);
+                    loop {
+                        reap_abandoned_supervisors();
+                        if ABANDONED_SUPERVISORS.lock().unwrap().is_empty() {
+                            break;
+                        }
+                        assert!(Instant::now() < bound, "released owner must actually join");
+                        crate::runtime_async::sleep(Duration::from_millis(5)).await;
+                    }
+                    assert_eq!(CONTROLLED_SUPERVISORS.load(Ordering::SeqCst), 0);
+                }
+            });
+        }
 
         #[test]
         fn command_capture_defaults_are_finite_and_setters_are_exact() {

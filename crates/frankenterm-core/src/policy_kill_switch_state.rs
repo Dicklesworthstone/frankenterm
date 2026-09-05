@@ -132,7 +132,9 @@ impl KillSwitchStateError {
     pub fn detail(&self) -> &str {
         match self {
             Self::LoadFailed(d) | Self::Corrupt(d) | Self::SaveFailed(d) => d,
-            Self::FencePending => "workspace effect or transition still active; transition not applied",
+            Self::FencePending => {
+                "workspace effect or transition still active; transition not applied"
+            }
             Self::FenceFailed => "workspace effect fence unavailable; transition not applied",
         }
     }
@@ -221,11 +223,16 @@ pub struct KillSwitchFence {
 /// Acquire without blocking an async worker. Contention is an explicit pending
 /// outcome, never permission to dispatch or acknowledge an operator transition.
 pub fn acquire_kill_switch_fence(db_path: &Path) -> Result<KillSwitchFence, KillSwitchStateError> {
-    let canonical = std::fs::canonicalize(db_path).map_err(|_| KillSwitchStateError::FenceFailed)?;
+    let canonical =
+        std::fs::canonicalize(db_path).map_err(|_| KillSwitchStateError::FenceFailed)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(&canonical).map_err(|_| KillSwitchStateError::FenceFailed)?.nlink() != 1 {
+        if std::fs::metadata(&canonical)
+            .map_err(|_| KillSwitchStateError::FenceFailed)?
+            .nlink()
+            != 1
+        {
             return Err(KillSwitchStateError::FenceFailed);
         }
     }
@@ -245,10 +252,15 @@ pub fn acquire_kill_switch_fence(db_path: &Path) -> Result<KillSwitchFence, Kill
             KillSwitchStateError::FenceFailed
         }
     })?;
-    Ok(KillSwitchFence { _file: file, workspace: canonical })
+    Ok(KillSwitchFence {
+        _file: file,
+        workspace: canonical,
+    })
 }
 
-fn backend_fence(backend: &dyn StorageBackend) -> Result<Option<KillSwitchFence>, KillSwitchStateError> {
+fn backend_fence(
+    backend: &dyn StorageBackend,
+) -> Result<Option<KillSwitchFence>, KillSwitchStateError> {
     let path = backend
         .query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
         .map_err(|_| KillSwitchStateError::FenceFailed)?
@@ -271,7 +283,11 @@ pub(crate) struct KillSwitchFreshness {
 
 impl KillSwitchFreshness {
     pub(crate) fn bind(&mut self, fence: &KillSwitchFence) -> Result<(), KillSwitchStateError> {
-        if self.workspace.as_ref().is_some_and(|path| path != &fence.workspace) {
+        if self
+            .workspace
+            .as_ref()
+            .is_some_and(|path| path != &fence.workspace)
+        {
             return Err(KillSwitchStateError::FenceFailed);
         }
         self.workspace = Some(fence.workspace.clone());
@@ -292,12 +308,16 @@ impl KillSwitchFreshness {
                         document.revision < previous.revision
                             || (document.revision == previous.revision && document != *previous)
                     }) {
-                        return Err(KillSwitchStateError::Corrupt("persisted revision regressed or changed without advancement".into()));
+                        return Err(KillSwitchStateError::Corrupt(
+                            "persisted revision regressed or changed without advancement".into(),
+                        ));
                     }
                     self.observed = Some(document);
                 }
                 None if self.observed.is_some() => {
-                    return Err(KillSwitchStateError::Corrupt("previously observed switch disappeared".into()));
+                    return Err(KillSwitchStateError::Corrupt(
+                        "previously observed switch disappeared".into(),
+                    ));
                 }
                 None => {}
             }
@@ -362,12 +382,26 @@ pub fn load_kill_switch_state(
     validate_revision_anchor(state, anchor)
 }
 
-fn validate_revision_anchor(state: Option<String>, anchor: Option<String>) -> Result<Option<String>, KillSwitchStateError> {
-    let revision = state.as_deref().map(decode_kill_switch_document).transpose()?.map(|document| document.revision);
-    let authority = anchor.as_deref().map(str::parse::<u64>).transpose()
-        .map_err(|_| KillSwitchStateError::Corrupt("revision authority is not an unsigned integer".into()))?;
+fn validate_revision_anchor(
+    state: Option<String>,
+    anchor: Option<String>,
+) -> Result<Option<String>, KillSwitchStateError> {
+    let revision = state
+        .as_deref()
+        .map(decode_kill_switch_document)
+        .transpose()?
+        .map(|document| document.revision);
+    let authority = anchor
+        .as_deref()
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|_| {
+            KillSwitchStateError::Corrupt("revision authority is not an unsigned integer".into())
+        })?;
     if !matches!((revision, authority), (None, None) | (Some(0), None)) && revision != authority {
-        return Err(KillSwitchStateError::Corrupt("state and revision authority disagree".into()));
+        return Err(KillSwitchStateError::Corrupt(
+            "state and revision authority disagree".into(),
+        ));
     }
     Ok(state)
 }
@@ -376,9 +410,13 @@ pub(crate) async fn load_kill_switch_state_from_storage_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
 ) -> Result<Option<String>, KillSwitchStateError> {
-    let state = storage.get_config_value_with_cx(cx, KILL_SWITCH_STATE_KEY).await
+    let state = storage
+        .get_config_value_with_cx(cx, KILL_SWITCH_STATE_KEY)
+        .await
         .map_err(|_| KillSwitchStateError::LoadFailed("pre-effect switch read failed".into()))?;
-    let anchor = storage.get_config_value_with_cx(cx, KILL_SWITCH_REVISION_KEY).await
+    let anchor = storage
+        .get_config_value_with_cx(cx, KILL_SWITCH_REVISION_KEY)
+        .await
         .map_err(|_| KillSwitchStateError::LoadFailed("pre-effect revision read failed".into()))?;
     validate_revision_anchor(state, anchor)
 }
@@ -391,16 +429,27 @@ pub(crate) fn load_kill_switch_state_from_path_with_cx(
     path: &str,
 ) -> Result<Option<String>, KillSwitchStateError> {
     use crate::storage_backend_trait::{OpenConfig, RusqliteBackend};
-    cx.checkpoint().map_err(|_| KillSwitchStateError::LoadFailed("cancelled before switch admission".into()))?;
-    let backend = RusqliteBackend::open(path, &OpenConfig {
-        read_only: true,
-        wal_mode: false,
-        ..Default::default()
-    }).map_err(|_| KillSwitchStateError::LoadFailed("pre-effect database open failed".into()))?;
-    backend.set_busy_timeout(std::time::Duration::ZERO)
-        .map_err(|_| KillSwitchStateError::LoadFailed("pre-effect read timeout setup failed".into()))?;
+    cx.checkpoint().map_err(|_| {
+        KillSwitchStateError::LoadFailed("cancelled before switch admission".into())
+    })?;
+    let backend = RusqliteBackend::open(
+        path,
+        &OpenConfig {
+            read_only: true,
+            wal_mode: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| KillSwitchStateError::LoadFailed("pre-effect database open failed".into()))?;
+    backend
+        .set_busy_timeout(std::time::Duration::ZERO)
+        .map_err(|_| {
+            KillSwitchStateError::LoadFailed("pre-effect read timeout setup failed".into())
+        })?;
     let loaded = load_kill_switch_state(&backend)?;
-    cx.checkpoint().map_err(|_| KillSwitchStateError::LoadFailed("cancelled during switch admission".into()))?;
+    cx.checkpoint().map_err(|_| {
+        KillSwitchStateError::LoadFailed("cancelled during switch admission".into())
+    })?;
     Ok(loaded)
 }
 
@@ -412,44 +461,79 @@ fn write_revisioned_state(
     use crate::storage_backend_trait::{BackendError, ToSqlValue};
 
     let mut revision = 0;
-    backend.with_transaction_dyn(&mut |tx| {
-        let previous = tx.query_scalar("SELECT value FROM config WHERE key = 'policy.kill_switch_v1'")?;
-        let anchor = tx.query_scalar("SELECT value FROM config WHERE key = 'policy.kill_switch_revision_v1'")?;
-        let anchor = anchor.as_deref().map(str::parse::<u64>).transpose()
-            .map_err(|_| BackendError::Other("corrupt kill-switch revision authority".into()))?;
-        let prior_revision = match previous.as_deref().map(decode_kill_switch_document).transpose() {
-            Ok(document) => document.map_or(0, |document| document.revision).max(anchor.unwrap_or(0)),
-            Err(_) => anchor.ok_or_else(|| BackendError::Other("corrupt switch has no trusted revision authority".into()))?,
-        };
-        revision = prior_revision.checked_add(1)
-            .ok_or_else(|| BackendError::Other("kill-switch revision exhausted".into()))?;
-        let mut document = PersistedKillSwitch::from(ks);
-        document.revision = revision;
-        let json = serde_json::to_string(&document)
-            .map_err(|_| BackendError::Other("kill-switch encoding failed".into()))?;
-        tx.query_row_cells(
-            "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)
+    backend
+        .with_transaction_dyn(&mut |tx| {
+            let previous =
+                tx.query_scalar("SELECT value FROM config WHERE key = 'policy.kill_switch_v1'")?;
+            let anchor = tx.query_scalar(
+                "SELECT value FROM config WHERE key = 'policy.kill_switch_revision_v1'",
+            )?;
+            let anchor = anchor
+                .as_deref()
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| {
+                    BackendError::Other("corrupt kill-switch revision authority".into())
+                })?;
+            let prior_revision = match previous
+                .as_deref()
+                .map(decode_kill_switch_document)
+                .transpose()
+            {
+                Ok(document) => document
+                    .map_or(0, |document| document.revision)
+                    .max(anchor.unwrap_or(0)),
+                Err(_) => anchor.ok_or_else(|| {
+                    BackendError::Other("corrupt switch has no trusted revision authority".into())
+                })?,
+            };
+            revision = prior_revision
+                .checked_add(1)
+                .ok_or_else(|| BackendError::Other("kill-switch revision exhausted".into()))?;
+            let mut document = PersistedKillSwitch::from(ks);
+            document.revision = revision;
+            let json = serde_json::to_string(&document)
+                .map_err(|_| BackendError::Other("kill-switch encoding failed".into()))?;
+            tx.query_row_cells(
+                "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
              RETURNING value",
-            &[ToSqlValue::Text(KILL_SWITCH_STATE_KEY), ToSqlValue::Text(&json), ToSqlValue::Integer(now_ms)],
-        )?;
-        let anchor = revision.to_string();
-        tx.query_row_cells(
-            "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)
+                &[
+                    ToSqlValue::Text(KILL_SWITCH_STATE_KEY),
+                    ToSqlValue::Text(&json),
+                    ToSqlValue::Integer(now_ms),
+                ],
+            )?;
+            let anchor = revision.to_string();
+            tx.query_row_cells(
+                "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
              RETURNING value",
-            &[ToSqlValue::Text(KILL_SWITCH_REVISION_KEY), ToSqlValue::Text(&anchor), ToSqlValue::Integer(now_ms)],
-        )?;
-        Ok(())
-    }).map_err(|_| KillSwitchStateError::SaveFailed("atomic kill-switch revision write failed".into()))?;
+                &[
+                    ToSqlValue::Text(KILL_SWITCH_REVISION_KEY),
+                    ToSqlValue::Text(&anchor),
+                    ToSqlValue::Integer(now_ms),
+                ],
+            )?;
+            Ok(())
+        })
+        .map_err(|_| {
+            KillSwitchStateError::SaveFailed("atomic kill-switch revision write failed".into())
+        })?;
     Ok(revision)
 }
 
 /// Operator transitions reload under the same authority used by dispatch.
 /// `by` is an audit label; the calling operator surface owns authentication.
 pub enum KillSwitchTransition<'a> {
-    Trip { level: KillSwitchLevel, by: &'a str, reason: &'a str },
-    Reset { by: &'a str },
+    Trip {
+        level: KillSwitchLevel,
+        by: &'a str,
+        reason: &'a str,
+    },
+    Reset {
+        by: &'a str,
+    },
 }
 
 /// The durable transition receipt deliberately names the integrated owner.
@@ -475,21 +559,26 @@ pub fn transition_kill_switch_from_backend(
         Ok(state) => state.unwrap_or_else(KillSwitch::disarmed),
         // Only the explicit operator reset can repair a corrupt state. The
         // atomic writer still requires a trusted, monotone revision anchor.
-        Err(_) if matches!(transition, KillSwitchTransition::Reset { .. }) => KillSwitch::disarmed(),
+        Err(_) if matches!(transition, KillSwitchTransition::Reset { .. }) => {
+            KillSwitch::disarmed()
+        }
         Err(error) => return Err(error),
     };
     state.tick(now_ms);
     match transition {
         KillSwitchTransition::Trip { level, by, reason } => {
             if level <= state.level {
-                return Err(KillSwitchStateError::SaveFailed("trip must raise the current persisted tier".into()));
+                return Err(KillSwitchStateError::SaveFailed(
+                    "trip must raise the current persisted tier".into(),
+                ));
             }
             state.trip(level, by, reason, now_ms);
         }
         KillSwitchTransition::Reset { by } => state.reset(by, now_ms),
     }
-    let timestamp = i64::try_from(now_ms)
-        .map_err(|_| KillSwitchStateError::SaveFailed("transition timestamp out of range".into()))?;
+    let timestamp = i64::try_from(now_ms).map_err(|_| {
+        KillSwitchStateError::SaveFailed("transition timestamp out of range".into())
+    })?;
     let revision = write_revisioned_state(backend, &state, timestamp)?;
     Ok(KillSwitchTransitionReceipt {
         state,
@@ -527,22 +616,38 @@ pub async fn initialize_kill_switch_to_storage_with_cx(
     storage: &crate::storage::StorageHandle,
     ks: &KillSwitch,
 ) -> Result<(), KillSwitchStateError> {
-    cx.checkpoint().map_err(|_| KillSwitchStateError::SaveFailed("cancelled before persistence admission".into()))?;
+    cx.checkpoint().map_err(|_| {
+        KillSwitchStateError::SaveFailed("cancelled before persistence admission".into())
+    })?;
     let _fence = acquire_kill_switch_fence(Path::new(storage.db_path()))?;
-    let loaded = storage.get_config_value_with_cx(cx, KILL_SWITCH_STATE_KEY).await
+    let loaded = storage
+        .get_config_value_with_cx(cx, KILL_SWITCH_STATE_KEY)
+        .await
         .map_err(|_| KillSwitchStateError::LoadFailed("kill-switch revision read failed".into()))?;
-    let anchor = storage.get_config_value_with_cx(cx, KILL_SWITCH_REVISION_KEY).await
-        .map_err(|_| KillSwitchStateError::LoadFailed("kill-switch revision authority read failed".into()))?;
+    let anchor = storage
+        .get_config_value_with_cx(cx, KILL_SWITCH_REVISION_KEY)
+        .await
+        .map_err(|_| {
+            KillSwitchStateError::LoadFailed("kill-switch revision authority read failed".into())
+        })?;
     if loaded.is_some() || anchor.is_some() {
-        return Err(KillSwitchStateError::SaveFailed("kill switch already initialized; use an operator transition".into()));
+        return Err(KillSwitchStateError::SaveFailed(
+            "kill switch already initialized; use an operator transition".into(),
+        ));
     }
     let mut document = PersistedKillSwitch::from(ks);
     document.revision = 1;
     let json = serde_json::to_string(&document)
         .map_err(|_| KillSwitchStateError::SaveFailed("kill-switch encoding failed".into()))?;
-    storage.set_config_value_with_cx(cx, KILL_SWITCH_REVISION_KEY, "1").await
-        .map_err(|_| KillSwitchStateError::SaveFailed("kill-switch revision initialization failed".into()))?;
-    storage.set_config_value_with_cx(cx, KILL_SWITCH_STATE_KEY, &json).await
+    storage
+        .set_config_value_with_cx(cx, KILL_SWITCH_REVISION_KEY, "1")
+        .await
+        .map_err(|_| {
+            KillSwitchStateError::SaveFailed("kill-switch revision initialization failed".into())
+        })?;
+    storage
+        .set_config_value_with_cx(cx, KILL_SWITCH_STATE_KEY, &json)
+        .await
         .map_err(|_| KillSwitchStateError::SaveFailed("kill-switch persistence failed".into()))
 }
 
@@ -565,13 +670,20 @@ pub(crate) mod tests {
             pipe.take(65_537).read_to_end(&mut bytes)?;
             Ok(bytes)
         }
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", "policy_kill_switch_state::tests::kill_switch_fence_subprocess", "--ignored", "--nocapture"])
-            .env("FT_KILL_SWITCH_TEST_DB", path)
-            .env("FT_KILL_SWITCH_TEST_OPERATION", operation)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn().expect("owned transition subprocess");
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "policy_kill_switch_state::tests::kill_switch_fence_subprocess",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FT_KILL_SWITCH_TEST_DB", path)
+                .env("FT_KILL_SWITCH_TEST_OPERATION", operation)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("owned transition subprocess");
         let stdout_pipe = child.stdout.take().unwrap();
         let stderr_pipe = child.stderr.take().unwrap();
         let stdout_reader = std::thread::spawn(move || drain(stdout_pipe));
@@ -579,47 +691,100 @@ pub(crate) mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut timed_out = false;
         let status = loop {
-            match child.try_wait().expect("poll owned child") {
-                Some(status) => break status,
-                None if std::time::Instant::now() >= deadline => {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
                     timed_out = true;
                     if let Err(error) = child.kill() {
                         eprintln!("owned child termination returned: {error}");
                     }
                     break child.wait().expect("reap owned child after deadline");
                 }
-                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => {
+                    eprintln!("owned child polling failed: {error}");
+                    let termination = child.kill();
+                    let reaping = child.wait();
+                    panic!(
+                        "owned child polling failed: {error}; termination={termination:?}; reaping={reaping:?}"
+                    );
+                }
             }
         };
-        let stdout = stdout_reader.join().expect("stdout reader joined").expect("stdout drained");
-        let stderr = stderr_reader.join().expect("stderr reader joined").expect("stderr drained");
-        assert!(!timed_out && status.success(), "child failed or timed out: stdout={} stderr={}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
-        assert!(stdout.len() <= 65_536 && stderr.len() <= 65_536, "owned child exceeded output cap");
-        assert!(stderr.is_empty(), "unexpected child stderr: {}", String::from_utf8_lossy(&stderr));
+        let stdout = stdout_reader
+            .join()
+            .expect("stdout reader joined")
+            .expect("stdout drained");
+        let stderr = stderr_reader
+            .join()
+            .expect("stderr reader joined")
+            .expect("stderr drained");
+        assert!(
+            !timed_out && status.success(),
+            "child failed or timed out: stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            stdout.len() <= 65_536 && stderr.len() <= 65_536,
+            "owned child exceeded output cap"
+        );
+        assert!(
+            stderr.is_empty(),
+            "unexpected child stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
         let stdout = String::from_utf8(stdout).unwrap();
-        assert!(stdout.contains("1 passed"), "child test did not execute: {stdout}");
-        println!("owned transition workspace={} operation={operation}\n{stdout}", path.display());
+        assert!(
+            stdout.contains("1 passed"),
+            "child test did not execute: {stdout}"
+        );
+        println!(
+            "owned transition workspace={} operation={operation}\n{stdout}",
+            path.display()
+        );
         stdout
     }
 
     #[test]
     #[ignore = "owned subprocess fixture; invoked by the fence and injector regressions"]
     fn kill_switch_fence_subprocess() {
-        let path = std::env::var("FT_KILL_SWITCH_TEST_DB").expect("fixture requires an owned database");
+        let path =
+            std::env::var("FT_KILL_SWITCH_TEST_DB").expect("fixture requires an owned database");
         let operation = std::env::var("FT_KILL_SWITCH_TEST_OPERATION").expect("fixture operation");
-        let backend = crate::storage_backend_trait::RusqliteBackend::open(&path, &crate::storage_backend_trait::OpenConfig { wal_mode: false, ..Default::default() }).unwrap();
+        let backend = crate::storage_backend_trait::RusqliteBackend::open(
+            &path,
+            &crate::storage_backend_trait::OpenConfig {
+                wal_mode: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let transition = if operation == "reset" {
-            KillSwitchTransition::Reset { by: "isolated_test_operator" }
+            KillSwitchTransition::Reset {
+                by: "isolated_test_operator",
+            }
         } else {
-            KillSwitchTransition::Trip { level: KillSwitchLevel::HardStop, by: "isolated_test_operator", reason: "cross-process trip" }
+            KillSwitchTransition::Trip {
+                level: KillSwitchLevel::HardStop,
+                by: "isolated_test_operator",
+                reason: "cross-process trip",
+            }
         };
         let result = transition_kill_switch_from_backend(&backend, transition, 5000);
         if operation == "pending" {
-            assert!(matches!(result, Err(KillSwitchStateError::FencePending)), "{result:?}");
+            assert!(
+                matches!(result, Err(KillSwitchStateError::FencePending)),
+                "{result:?}"
+            );
             println!("KILL_SWITCH_CHILD_PENDING pid={}", std::process::id());
         } else {
             let receipt = result.expect("durable transition");
-            println!("KILL_SWITCH_CHILD_RECEIPT pid={} {}", std::process::id(), serde_json::to_string(&receipt).unwrap());
+            println!(
+                "KILL_SWITCH_CHILD_RECEIPT pid={} {}",
+                std::process::id(),
+                serde_json::to_string(&receipt).unwrap()
+            );
         }
     }
 
@@ -627,42 +792,85 @@ pub(crate) mod tests {
     fn kill_switch_fence_serializes_separate_process_trip_and_reset() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.db");
-        let backend = crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default()).unwrap();
+        let backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap();
         backend.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)").unwrap();
         let fence = acquire_kill_switch_fence(&path).unwrap();
         let pending = transition_in_test_process(&path, "pending");
         assert!(pending.contains("KILL_SWITCH_CHILD_PENDING"));
-        assert_eq!(load_kill_switch_state(&backend).unwrap(), None, "pending transition must not claim or persist application");
+        assert_eq!(
+            load_kill_switch_state(&backend).unwrap(),
+            None,
+            "pending transition must not claim or persist application"
+        );
         drop(fence);
         let applied = transition_in_test_process(&path, "trip");
         assert!(applied.contains("\"revision\":1"));
         let first = load_kill_switch_state(&backend).unwrap().unwrap();
-        assert_eq!(decode_kill_switch_state(&first).unwrap().level, KillSwitchLevel::HardStop);
+        assert_eq!(
+            decode_kill_switch_state(&first).unwrap().level,
+            KillSwitchLevel::HardStop
+        );
         let reset = transition_in_test_process(&path, "reset");
         assert!(reset.contains("\"revision\":2"));
-        assert_eq!(decode_kill_switch_state(&load_kill_switch_state(&backend).unwrap().unwrap()).unwrap().level, KillSwitchLevel::Disarmed);
+        assert_eq!(
+            decode_kill_switch_state(&load_kill_switch_state(&backend).unwrap().unwrap())
+                .unwrap()
+                .level,
+            KillSwitchLevel::Disarmed
+        );
     }
 
     #[test]
     fn kill_switch_fence_reset_repairs_corrupt_state_without_reusing_revision() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.db");
-        let backend = crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default()).unwrap();
+        let backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap();
         backend.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)").unwrap();
         transition_in_test_process(&path, "trip");
         let mut watermark = KillSwitchFreshness::default();
         let mut engine = PolicyEngine::permissive();
         watermark.apply(&mut engine, load_kill_switch_state(&backend), 6000);
-        crate::storage_backend_helpers::set_config_kv(&backend, KILL_SWITCH_STATE_KEY, "{broken", 7000).unwrap();
-        assert!(matches!(watermark.apply(&mut engine, load_kill_switch_state(&backend), 7001), KillSwitchRestore::FailedClosed { .. }));
+        crate::storage_backend_helpers::set_config_kv(
+            &backend,
+            KILL_SWITCH_STATE_KEY,
+            "{broken",
+            7000,
+        )
+        .unwrap();
+        assert!(matches!(
+            watermark.apply(&mut engine, load_kill_switch_state(&backend), 7001),
+            KillSwitchRestore::FailedClosed { .. }
+        ));
         let reset = transition_in_test_process(&path, "reset");
         assert!(reset.contains("\"revision\":2"));
         watermark.apply(&mut engine, load_kill_switch_state(&backend), 8000);
         assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::Disarmed);
-        crate::storage_backend_helpers::set_config_kv(&backend, KILL_SWITCH_REVISION_KEY, "not-a-revision", 9000).unwrap();
-        let before = crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_STATE_KEY).unwrap();
-        assert!(transition_kill_switch_from_backend(&backend, KillSwitchTransition::Reset { by: "operator" }, 10000).is_err());
-        assert_eq!(crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_STATE_KEY).unwrap(), before, "invalid revision authority cannot be papered over by reset");
+        crate::storage_backend_helpers::set_config_kv(
+            &backend,
+            KILL_SWITCH_REVISION_KEY,
+            "not-a-revision",
+            9000,
+        )
+        .unwrap();
+        let before =
+            crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_STATE_KEY).unwrap();
+        assert!(
+            transition_kill_switch_from_backend(
+                &backend,
+                KillSwitchTransition::Reset { by: "operator" },
+                10000
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_STATE_KEY).unwrap(),
+            before,
+            "invalid revision authority cannot be papered over by reset"
+        );
     }
 
     #[cfg(unix)]
@@ -670,22 +878,38 @@ pub(crate) mod tests {
     fn kill_switch_fence_aliases_share_authority_and_hardlinks_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.db");
-        let _backend = crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default()).unwrap();
+        let _backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap();
         let alias = directory.path().join("alias.db");
         std::os::unix::fs::symlink(&path, &alias).unwrap();
         let guard = acquire_kill_switch_fence(&path).unwrap();
-        assert!(matches!(acquire_kill_switch_fence(&alias), Err(KillSwitchStateError::FencePending)));
+        assert!(matches!(
+            acquire_kill_switch_fence(&alias),
+            Err(KillSwitchStateError::FencePending)
+        ));
         drop(guard);
         let guard = acquire_kill_switch_fence(&alias).unwrap();
         let mut freshness = KillSwitchFreshness::default();
         freshness.bind(&guard).unwrap();
         drop(guard);
-        freshness.bind(&acquire_kill_switch_fence(&path).unwrap()).unwrap();
+        freshness
+            .bind(&acquire_kill_switch_fence(&path).unwrap())
+            .unwrap();
         let other = directory.path().join("other.db");
-        let _other_backend = crate::storage_backend_trait::RusqliteBackend::open_path(&other, &Default::default()).unwrap();
-        assert!(freshness.bind(&acquire_kill_switch_fence(&other).unwrap()).is_err());
+        let _other_backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&other, &Default::default())
+                .unwrap();
+        assert!(
+            freshness
+                .bind(&acquire_kill_switch_fence(&other).unwrap())
+                .is_err()
+        );
         std::fs::hard_link(&path, directory.path().join("hardlink.db")).unwrap();
-        assert!(matches!(acquire_kill_switch_fence(&path), Err(KillSwitchStateError::FenceFailed)));
+        assert!(matches!(
+            acquire_kill_switch_fence(&path),
+            Err(KillSwitchStateError::FenceFailed)
+        ));
     }
 
     #[test]
@@ -698,19 +922,41 @@ pub(crate) mod tests {
         let stale_raw = serde_json::to_string(&stale).unwrap();
         stale.revision = 2;
         let rewrite = serde_json::to_string(&stale).unwrap();
-        for invalid in [Ok(Some(stale_raw)), Ok(Some(rewrite)), Ok(None), Ok(Some("{broken".into())), Err(KillSwitchStateError::LoadFailed("unreadable".into()))] {
+        for invalid in [
+            Ok(Some(stale_raw)),
+            Ok(Some(rewrite)),
+            Ok(None),
+            Ok(Some("{broken".into())),
+            Err(KillSwitchStateError::LoadFailed("unreadable".into())),
+        ] {
             let mut engine = PolicyEngine::permissive();
             let mut freshness = KillSwitchFreshness::default();
             freshness.apply(&mut engine, Ok(Some(newer_raw.clone())), 6000);
-            assert!(matches!(freshness.apply(&mut engine, invalid, 7000), KillSwitchRestore::FailedClosed { .. }));
-            for action in [crate::policy::ActionKind::SendText, crate::policy::ActionKind::ExecCommand, crate::policy::ActionKind::WriteFile, crate::policy::ActionKind::ConnectorInvoke, crate::policy::ActionKind::WorkflowRun] {
-                let decision = engine.authorize(&crate::policy::PolicyInput::new(action, crate::policy::ActorKind::Robot));
+            assert!(matches!(
+                freshness.apply(&mut engine, invalid, 7000),
+                KillSwitchRestore::FailedClosed { .. }
+            ));
+            for action in [
+                crate::policy::ActionKind::SendText,
+                crate::policy::ActionKind::ExecCommand,
+                crate::policy::ActionKind::WriteFile,
+                crate::policy::ActionKind::ConnectorInvoke,
+                crate::policy::ActionKind::WorkflowRun,
+            ] {
+                let decision = engine.authorize(&crate::policy::PolicyInput::new(
+                    action,
+                    crate::policy::ActorKind::Robot,
+                ));
                 assert_eq!(decision.rule_id(), Some("policy.kill_switch"));
                 assert!(decision.is_denied());
             }
             // Only a newer valid operator transition can recover the engine.
             stale.revision = 3;
-            freshness.apply(&mut engine, Ok(Some(serde_json::to_string(&stale).unwrap())), 8000);
+            freshness.apply(
+                &mut engine,
+                Ok(Some(serde_json::to_string(&stale).unwrap())),
+                8000,
+            );
             assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::Disarmed);
         }
     }
@@ -840,9 +1086,16 @@ pub(crate) mod tests {
                 "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)",
             )
             .expect("config table");
-        transition_kill_switch_from_backend(&backend, KillSwitchTransition::Trip {
-            level: KillSwitchLevel::HardStop, by: "operator", reason: "drill",
-        }, 1_000).expect("persist trip");
+        transition_kill_switch_from_backend(
+            &backend,
+            KillSwitchTransition::Trip {
+                level: KillSwitchLevel::HardStop,
+                by: "operator",
+                reason: "drill",
+            },
+            1_000,
+        )
+        .expect("persist trip");
 
         let mut second = PolicyEngine::permissive();
         let outcome = restore_kill_switch_from_backend(&mut second, &backend, 2_000);
@@ -853,7 +1106,12 @@ pub(crate) mod tests {
         assert_eq!(second.kill_switch_state().level, KillSwitchLevel::HardStop);
         assert_eq!(second.kill_switch_state().reason, "drill");
 
-        transition_kill_switch_from_backend(&backend, KillSwitchTransition::Reset { by: "operator" }, 3_000).expect("persist reset");
+        transition_kill_switch_from_backend(
+            &backend,
+            KillSwitchTransition::Reset { by: "operator" },
+            3_000,
+        )
+        .expect("persist reset");
         let mut third = PolicyEngine::permissive();
         restore_kill_switch_from_backend(&mut third, &backend, 4_000);
         assert_eq!(third.kill_switch_state().level, KillSwitchLevel::Disarmed);
