@@ -36,6 +36,11 @@ fn arb_issue_type() -> impl Strategy<Value = BeadIssueType> {
         Just(BeadIssueType::Feature),
         Just(BeadIssueType::Task),
         Just(BeadIssueType::Bug),
+        Just(BeadIssueType::Chore),
+        Just(BeadIssueType::Docs),
+        Just(BeadIssueType::Question),
+        Just(BeadIssueType::Test),
+        "custom-[a-z]{1,12}".prop_map(BeadIssueType::Custom),
     ]
 }
 
@@ -237,6 +242,9 @@ proptest! {
             Just(BeadResolverReasonCode::MissingDependencyNode),
             Just(BeadResolverReasonCode::CyclicDependencyGraph),
             Just(BeadResolverReasonCode::PartialGraphData),
+            Just(BeadResolverReasonCode::InvalidGraphData),
+            Just(BeadResolverReasonCode::ResourceBudgetExceeded),
+            Just(BeadResolverReasonCode::ActiveOwnership),
         ]
     ) {
         let json = serde_json::to_string(&code).unwrap();
@@ -378,17 +386,22 @@ proptest! {
         prop_assert!(report.ready_ids.is_empty());
     }
 
-    // 16. Standalone actionable issue is always ready
+    // 16. A standalone open issue is ready; in-progress work retains ownership.
     #[test]
-    fn readiness_standalone_is_ready(
+    fn readiness_standalone_respects_active_ownership(
         status in prop_oneof![Just(BeadStatus::Open), Just(BeadStatus::InProgress)],
         priority in arb_priority(),
     ) {
         let issues = vec![make_detail("solo", status, priority, &[])];
         let report = resolve_bead_readiness(&issues);
-        prop_assert_eq!(report.ready_count(), 1);
+        let expected_ready = status == BeadStatus::Open;
+        prop_assert_eq!(report.ready_count(), usize::from(expected_ready));
         let c = &report.candidates[0];
-        prop_assert!(c.ready);
+        prop_assert_eq!(c.ready, expected_ready);
+        prop_assert_eq!(
+            c.degraded_reasons.contains(&BeadResolverReasonCode::ActiveOwnership),
+            status == BeadStatus::InProgress
+        );
         prop_assert_eq!(c.blocker_count, 0);
         prop_assert!(c.blocker_ids.is_empty());
     }
@@ -431,15 +444,18 @@ proptest! {
         }
     }
 
-    // 20. Every candidate with blocker_count == 0 should be ready
+    // 20. Independently derive the ready set from the generated DAG input.
     #[test]
-    fn readiness_zero_blockers_means_ready(issues in arb_dag(8)) {
+    fn readiness_matches_input_status_and_closed_prerequisites(issues in arb_dag(8)) {
         let report = resolve_bead_readiness(&issues);
-        for c in &report.candidates {
-            if c.blocker_count == 0 {
-                prop_assert!(c.ready, "candidate {} has 0 blockers but not ready", c.id);
-            }
-        }
+        let mut expected: Vec<_> = issues.iter().filter(|issue| {
+            issue.status == BeadStatus::Open && issue.dependencies.iter().all(|dependency| {
+                issues.iter().any(|target| target.id == dependency.id && target.status == BeadStatus::Closed)
+            })
+        }).map(|issue| issue.id.clone()).collect();
+        expected.sort();
+        prop_assert_eq!(&report.ready_ids, &expected);
+        prop_assert_eq!(report.candidates.len(), issues.len());
     }
 
     // 21. Every candidate with blocker_count > 0 should NOT be ready
@@ -475,15 +491,14 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
-    // 23. In a DAG with all nodes Open, node 0 (no deps) is always ready
+    // 23. The root has no dependencies, but an in-progress root is still owned.
     #[test]
-    fn readiness_dag_root_always_ready(issues in arb_dag(5)) {
+    fn readiness_dag_root_respects_source_ownership(issues in arb_dag(5)) {
         let report = resolve_bead_readiness(&issues);
-        // Node 0 has no dependencies by construction
-        if let Some(root) = report.candidates.iter().find(|c| c.id == "n0") {
-            prop_assert!(root.ready, "root node n0 should always be ready");
-            prop_assert_eq!(root.blocker_count, 0);
-        }
+        let root = report.candidates.iter().find(|c| c.id == "n0").unwrap();
+        let source = issues.iter().find(|issue| issue.id == "n0").unwrap();
+        prop_assert_eq!(root.ready, source.status == BeadStatus::Open);
+        prop_assert_eq!(root.blocker_count, 0);
     }
 
     // 24. Transitive unblock count >= direct dependent count for root

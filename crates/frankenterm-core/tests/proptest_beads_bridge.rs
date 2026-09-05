@@ -1,7 +1,7 @@
 //! Property-based tests for beads_bridge module.
 //!
 //! Validates backpressure tier determination, config threshold invariants,
-//! status counting, and fail-open degradation across arbitrary inputs.
+//! status counting, and explicit readiness refusal across arbitrary inputs.
 
 #![cfg(feature = "subprocess-bridge")]
 
@@ -35,6 +35,11 @@ fn bead_issue_type_strategy() -> impl Strategy<Value = BeadIssueType> {
         Just(BeadIssueType::Feature),
         Just(BeadIssueType::Task),
         Just(BeadIssueType::Bug),
+        Just(BeadIssueType::Chore),
+        Just(BeadIssueType::Docs),
+        Just(BeadIssueType::Question),
+        Just(BeadIssueType::Test),
+        "custom-[a-z]{1,12}".prop_map(BeadIssueType::Custom),
     ]
 }
 
@@ -402,12 +407,10 @@ proptest! {
         prop_assert!(dep.blocks_readiness());
     }
 
-    /// Any non-parent-child type blocks readiness.
+    /// Unknown dependency types conservatively block; descriptive links do not.
     #[test]
     fn arbitrary_type_blocks_readiness(dep_type in "[a-z_]{3,15}") {
-        if dep_type == "parent-child" {
-            return Ok(());
-        }
+        let expected = !matches!(dep_type.as_str(), "related" | "duplicates" | "supersedes");
         let dep = BeadDependencyRef {
             id: "ft-000".to_string(),
             title: None,
@@ -415,7 +418,7 @@ proptest! {
             priority: None,
             dependency_type: Some(dep_type),
         };
-        prop_assert!(dep.blocks_readiness());
+        prop_assert_eq!(dep.blocks_readiness(), expected);
     }
 }
 
@@ -431,7 +434,7 @@ proptest! {
         let title = summary.title.clone();
         let status = summary.status;
         let priority = summary.priority;
-        let issue_type = summary.issue_type;
+        let issue_type = summary.issue_type.clone();
 
         let detail = BeadIssueDetail::from_summary(summary);
 
@@ -504,17 +507,13 @@ proptest! {
         prop_assert!(report.ready_ids.is_empty());
     }
 
-    /// Standalone open issue with no deps is always ready.
+    /// A complete standalone issue is eligible exactly when its status is open.
     #[test]
-    fn standalone_open_is_ready(detail in bead_detail_strategy()) {
-        if !detail.is_actionable() {
-            return Ok(());
-        }
+    fn standalone_readiness_respects_status(detail in bead_detail_strategy()) {
         let report = resolve_bead_readiness(std::slice::from_ref(&detail));
-        prop_assert!(
+        prop_assert_eq!(
             report.ready_ids.contains(&detail.id),
-            "expected {} to be ready",
-            detail.id
+            detail.status == BeadStatus::Open
         );
     }
 
@@ -539,27 +538,22 @@ proptest! {
         prop_assert_eq!(report.ready_count(), report.ready_ids.len());
     }
 
-    /// Candidates with blocker_count == 0 are exactly the ready ones.
+    /// Independently derive readiness from source statuses, rejecting duplicate identities.
     #[test]
-    fn zero_blockers_iff_ready(
+    fn readiness_matches_complete_source_population(
         details in prop::collection::vec(bead_detail_strategy(), 0..20),
     ) {
         let report = resolve_bead_readiness(&details);
-        for candidate in &report.candidates {
-            if candidate.blocker_count == 0 {
-                prop_assert!(
-                    candidate.ready,
-                    "candidate {} has 0 blockers but not ready",
-                    candidate.id
-                );
-            } else {
-                prop_assert!(
-                    !candidate.ready,
-                    "candidate {} has {} blockers but marked ready",
-                    candidate.id,
-                    candidate.blocker_count
-                );
-            }
+        let unique: std::collections::HashSet<_> = details.iter().map(|issue| &issue.id).collect();
+        if unique.len() != details.len() {
+            prop_assert!(report.ready_ids.is_empty());
+            prop_assert_eq!(report.degraded_reason_codes, vec![BeadResolverReasonCode::InvalidGraphData]);
+        } else {
+            let mut expected: Vec<_> = details.iter().filter(|issue| issue.status == BeadStatus::Open)
+                .map(|issue| issue.id.clone()).collect();
+            expected.sort();
+            prop_assert_eq!(&report.ready_ids, &expected);
+            prop_assert_eq!(report.candidates.len(), details.iter().filter(|issue| issue.is_actionable()).count());
         }
     }
 
@@ -600,6 +594,7 @@ proptest! {
             report.degraded_reason_codes.contains(&BeadResolverReasonCode::PartialGraphData),
             "expected PartialGraphData in degraded reasons"
         );
+        prop_assert!(report.ready_ids.is_empty());
     }
 }
 

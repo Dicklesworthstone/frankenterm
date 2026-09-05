@@ -18,6 +18,98 @@ use crate::beads_types::{
 };
 use crate::subprocess_bridge::SubprocessBridge;
 
+/// Read one exact, bounded `br` JSONL export for advisory work selection. This
+/// does not invoke `br`, flush a database, or attest that the export is current
+/// database state. The caller supplies the reviewed byte revision explicitly.
+#[cfg(unix)]
+pub fn read_bead_work_selection(
+    path: &std::path::Path,
+    expected_sha256: &str,
+    schema_version: u16,
+    now_ms: u64,
+) -> Result<crate::beads_types::BeadWorkSelection, crate::beads_types::BeadWorkSelectionError> {
+    read_bead_work_selection_with_hook(path, expected_sha256, schema_version, now_ms, || {})
+}
+
+#[cfg(unix)]
+fn read_bead_work_selection_with_hook(
+    path: &std::path::Path,
+    expected_sha256: &str,
+    schema_version: u16,
+    now_ms: u64,
+    after_read: impl FnOnce(),
+) -> Result<crate::beads_types::BeadWorkSelection, crate::beads_types::BeadWorkSelectionError> {
+    use crate::beads_types::{
+        BEAD_WORK_GRAPH_MAX_BYTES, BeadWorkSelectionError, select_bead_work_from_jsonl,
+    };
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // O_NONBLOCK prevents an attacker-controlled FIFO replacement from hanging
+    // before fstat can reject it. The same opened regular file is retained for
+    // the complete bounded read and compared with its named entry afterward.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| BeadWorkSelectionError::FileUnavailable)?;
+    let before = file
+        .metadata()
+        .map_err(|_| BeadWorkSelectionError::FileUnavailable)?;
+    if !before.is_file() {
+        return Err(BeadWorkSelectionError::FileUnavailable);
+    }
+    if before.len() > BEAD_WORK_GRAPH_MAX_BYTES as u64 {
+        return Err(BeadWorkSelectionError::BudgetExceeded);
+    }
+    let modified_ms = before
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or(BeadWorkSelectionError::StaleSnapshot)?;
+    let fingerprint = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.is_file(),
+        )
+    };
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(BEAD_WORK_GRAPH_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BeadWorkSelectionError::FileUnavailable)?;
+    if bytes.len() > BEAD_WORK_GRAPH_MAX_BYTES {
+        return Err(BeadWorkSelectionError::BudgetExceeded);
+    }
+    after_read();
+    let after = file
+        .metadata()
+        .map_err(|_| BeadWorkSelectionError::ChangedDuringRead)?;
+    let named =
+        std::fs::symlink_metadata(path).map_err(|_| BeadWorkSelectionError::ChangedDuringRead)?;
+    if fingerprint(&before) != fingerprint(&after) || fingerprint(&after) != fingerprint(&named) {
+        return Err(BeadWorkSelectionError::ChangedDuringRead);
+    }
+    select_bead_work_from_jsonl(&bytes, expected_sha256, schema_version, modified_ms, now_ms)
+}
+
+#[cfg(not(unix))]
+pub fn read_bead_work_selection(
+    _path: &std::path::Path,
+    _expected_sha256: &str,
+    _schema_version: u16,
+    _now_ms: u64,
+) -> Result<crate::beads_types::BeadWorkSelection, crate::beads_types::BeadWorkSelectionError> {
+    Err(crate::beads_types::BeadWorkSelectionError::UnsupportedPlatform)
+}
+
 /// High-level beads bridge wrapping the `br` CLI.
 #[derive(Debug, Clone)]
 pub struct BeadsBridge {
@@ -278,6 +370,73 @@ mod tests {
         BeadDependencyRef, BeadIssueDetail, BeadIssueType, BeadResolverReasonCode, BeadStatus,
     };
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn bead_work_selection_reads_exact_regular_snapshot_and_refuses_replaced_stale_or_oversized_input()
+     {
+        use crate::beads_types::{BEAD_WORK_GRAPH_MAX_BYTES, BeadWorkSelectionError};
+        use sha2::{Digest, Sha256};
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("issues.jsonl");
+        let bytes = br#"{"id":"ready-docs","status":"open","priority":2,"issue_type":"docs","description":"private-body-do-not-log"}
+"#;
+        std::fs::write(&path, bytes).unwrap();
+        let hash = hex::encode(Sha256::digest(bytes));
+        let now = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        };
+        let report = read_bead_work_selection(&path, &hash, 1, now()).unwrap();
+        assert_eq!(report.selected_id(), Some("ready-docs"));
+        assert_eq!(report.input_sha256(), hash);
+        assert_eq!(report.source_bytes, bytes.len());
+        assert_eq!(
+            read_bead_work_selection(&path, &"0".repeat(64), 1, now()).unwrap_err(),
+            BeadWorkSelectionError::RevisionMismatch
+        );
+        let backup = fixture.path().join("retained-prior-issues.jsonl");
+        let result = read_bead_work_selection_with_hook(&path, &hash, 1, now(), || {
+            std::fs::rename(&path, &backup).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            BeadWorkSelectionError::ChangedDuringRead,
+            "same-byte replacement must not inherit the opened file's authority"
+        );
+        assert!(backup.is_file());
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            read_bead_work_selection(&path, &hash, 1, now()).unwrap_err(),
+            BeadWorkSelectionError::StaleSnapshot
+        );
+        file.set_len(BEAD_WORK_GRAPH_MAX_BYTES as u64 + 1).unwrap();
+        assert_eq!(
+            read_bead_work_selection(&path, &hash, 1, now()).unwrap_err(),
+            BeadWorkSelectionError::BudgetExceeded
+        );
+        assert_eq!(
+            read_bead_work_selection(fixture.path(), &hash, 1, now()).unwrap_err(),
+            BeadWorkSelectionError::FileUnavailable
+        );
+        let link = fixture.path().join("symlink.jsonl");
+        std::os::unix::fs::symlink(&backup, &link).unwrap();
+        assert_eq!(
+            read_bead_work_selection(&link, &hash, 1, now()).unwrap_err(),
+            BeadWorkSelectionError::FileUnavailable
+        );
+        println!(
+            "BEAD_GRAPH_FILE hash={hash} selected=ready-docs replacement_stale_oversize_symlink_refused=true live_br_invocations=0"
+        );
+    }
 
     fn sample_bead(id: &str, status: BeadStatus, priority: u8) -> BeadSummary {
         BeadSummary {
