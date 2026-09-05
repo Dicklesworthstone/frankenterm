@@ -835,6 +835,7 @@ Existing G50–G80 remain in the graph; this map does not retire any capability.
 | G90 | Redactor evidence scans original input rather than actual sequential replacements; any overlap receives full secret-removal credit. | Observe production replacements with source-byte provenance; require complete union coverage and reject invalid intervals; plant prefix/suffix/one-byte misses and verify actual output. `ft-xxfwy.60`. |
 | G91 | Webhook configuration uses a prefix/length check that admits `https://` without a host. A general URL parser alone also accepts forms the actual HTTP client rejects. | Validate semantic syntax/host and the exact raw bytes with the canonical transport parser; reject unsupported forms before delivery and omit credential-bearing input from errors. `ft-xxfwy.61` and `.61.1`. |
 | G92 | IPC generic Robot RPC accepts unbounded streaming commands and delegates through `spawn_blocking(cmd.output())`; handler execution has no request deadline, output cap, or cancellation/reap ownership. | Integrate IPC request cancellation/deadlines with owned child lifetime, bounded concurrent output drains, and explicit indeterminate mutation outcomes. Prove timeout/disconnect, flood, descendants, reaping, admission and no unsafe retry. `ft-xxfwy.62` and `.62.1`. |
+| G93 | E2E cleanup deletes root/scenario evidence despite retention options; a generated tmux runner can attach to and kill a pre-existing default-server session. | Preserve evidence unconditionally, avoid unnecessary redaction temporary files, and create a private tmux socket with owned-session teardown. Exercise the existing production shell bodies with isolated recording commands; do not run user actors. `ft-xxfwy.63` and `.63.1`, prerequisite to `.9`. |
 
 ### 11.4 Execution ordering and proof contract
 
@@ -1047,7 +1048,8 @@ the `/tmp` reports are session evidence and are not portable release artifacts.
 | `.58` | Version-2 systematic erasure, typed malformed/singular failures, full metadata/framing checks, and adversarial survivor tests. | No production distributed codec consumer was found. Authentication, durable replication, and recovery are separate requirements. Public `n <= 32` remains unchanged. |
 | `.59` | Summable confidence spending replaces the unsupported bound; support and finite arithmetic are checked. Conformal bands report future-rank coverage and refuse insufficient finite calibration. | IID/exchangeability assumptions, separate benchmark-family error budgets, and real performance experiments remain caller obligations. No p99 or hardware claim follows from a mean bound. |
 | `.60` | Redaction evidence follows actual sequential replacements and original byte provenance; every expected byte must be covered. | This repairs the oracle; it neither establishes a particular prior production secret leak nor substitutes for an external corpus and live read-path qualification. |
-| `.61` | Configuration checks both URL syntax/host and the actual HTTP client's raw-input parser, exposed through `runtime_async`; failures do not echo credentials. | Three real configuration regressions await strict remote proof. This is configuration admission, not endpoint reachability or an SSRF finding. |
+| `.61` | Configuration checks both URL syntax/host and the actual HTTP client's raw-input parser, exposed through `runtime_async`; failures do not echo credentials. | Three real configuration regressions passed in the final core batch below. This is configuration admission, not endpoint reachability or an SSRF finding. |
+| `.63` | Harness evidence is retained unconditionally; generated tmux uses a private socket and empty config with creation-gated teardown. Artifact redaction failures propagate, JSON stays valid, and copied regular descendants are sanitized. | The 1,620-check isolated shell suite proves these decisions and preservation; it does not run the full live harness, native actors, or real agent loop. |
 
 The initial OSC 52 remote compile exposed an ambiguous test macro import; the
 explicit import was repaired. The retained rerun on worker `vmi1227854`, job
@@ -1091,18 +1093,28 @@ cycles. The BV forecast remains unsuitable as a release date.
 Two larger follow-ups found during documentation validation remain explicit.
 `ft-fytns` is reopened with a complete DSR publishing-graph contract: the old
 ten-crate list does not describe the current 19-subcrate graph, and direct
-local Cargo publication is not the project's release path. `ft-xxfwy.9` also
-records that `scripts/e2e_test.sh` contains cleanup paths that delete artifacts
-despite retention options. Repair those paths before executing the retained
-live-loop experiment under this repository's no-deletion rule. Neither
-problem is dismissed as pre-existing or silently represented as fixed.
+local Cargo publication is not the project's release path. The artifact
+retention defect recorded in `ft-xxfwy.9` was subsequently found to fit a
+coherent five-file shell repair, now owned by `.63` with verification `.63.1`.
+The live-loop producer has an explicit prerequisite edge to that repair;
+isolated cleanup proof cannot close its actual agent journey. The generated
+tmux ownership defect was found during the full cleanup-body review and added
+to the same bounded repair. Actual artifact sanitization also had a concrete
+failure: interpolating slash-containing credential patterns into Perl syntax
+could fail while the caller continued as if redaction succeeded. Directory
+copies bypassed sanitization, and the text-redaction path could invalidate
+JSON. The same producer now requires explicit failure propagation, valid
+format-aware JSON handling, and sanitized regular directory descendants with
+unsafe entries refused. These are shell artifact defects, distinct from G90's
+Rust coverage oracle. None is dismissed as pre-existing.
 
 The final UBS sample review added G91/G92 after the original 20-leaf planning
 batch. Both received implementation and companion verification contracts before
 source work; `.62` remains open because correct IPC cancellation crosses the
 request handler, subprocess owner, output drains, and effect-outcome contract.
 A timeout around a detached blocking closure would leave the cause intact.
-The 22 new implementation leaves therefore have 22 verification companions.
+The subsequent G93 retention/ownership repair brings the final planning set to
+23 implementation leaves (`.41`–`.63`), each with its own verification companion.
 
 The first core remote batch passed **106/106 tests**: 41 erasure, 41 statistics,
 20 redactor matrix, three replacement-provenance, and one connector runtime
@@ -1181,8 +1193,26 @@ and no overlay, fingerprint
 `fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195`.
 The property persistence warning did not recur. Transcript:
 `/tmp/ft-reality-20260904-core-property-format-rch-final.log`.
-Required workspace check/clippy remain pending until their retained results
-are recorded; these focused test passes do not stand in for those checks.
+The required `cargo check -j 4 --workspace --all-targets --locked` then passed
+on the same clean baseline, worker `ovh-a`, job `j-30004650170122939`, at
+00:27 UTC on September 5 (September 4 local time). No compiler warnings or
+errors appeared. Transcript:
+`/tmp/ft-reality-20260904-workspace-check-rch-final.log`.
+Workspace Clippy then passed with warnings denied:
+`cargo clippy -j 4 --workspace --all-targets --locked -- -D warnings`, same
+clean baseline and worker, job `j-30004650170122949`, exit 0 at 01:04:18 UTC.
+Transcript: `/tmp/ft-reality-20260904-workspace-clippy-rch-final.log`.
+The complete compiler/lint/format gates and scoped regression receipts close
+`.59`/`.59.1` and `.61`/`.61.1`; their probabilistic assumptions and external
+reachability limits remain as stated above.
+
+Concurrent release work landed installer commit `336f2aa16` and verifier
+commit `ce68e3dfc` while these checks ran; subsequent manifest/lockfile and
+verifier edits also appeared in the shared checkout. Those bytes are preserved.
+The receipts above qualify the audit implementation at `9327f0e4f`, not those
+newer release changes or a newly packaged application. The fresh release-API
+probe retained in `/tmp/ft-reality-20260904-release-latest-closeout.json` still
+reported `v0.15.1`, 12 assets, and no minisign asset.
 
 The final acceptance readback keeps `.46`, `.58`, and `.60` and their companions
 open even if their current selected tests pass. The connector regression passes
@@ -1191,7 +1221,15 @@ configured admission, distinct routing/denial controls and structured refusal
 assertions remain. Its dispatcher currently refuses before mesh routing, so
 the contract's distinct runtime routing result needs additional behavior; do
 not restore synthetic host health or completion to satisfy it. The subscriber
-comment was corrected to match that refusal. Erasure still needs seeded larger
+comment was corrected to match that refusal. The `.46`/`.46.1` contracts now
+specify a read-only admission planner: shared mesh preview and host-request
+validation inspect supplied metadata without starting hosts, fabricating health,
+reserving slots, advancing round-robin, or recording operation success. Runtime
+retains distinct denied, routing-failed and admitted-but-unavailable outcomes.
+Tests must publish through the actual subscriber and compare complete supplied
+model-host/mesh state before and after. This work does not require `.47`'s real
+transport; the dependency stays `.47` → `.46` without a semantic cycle.
+Erasure still needs seeded larger
 configuration recovery and serialization composed with survivor recovery.
 Redactor verification still needs the promised independent byte-mask comparison
 through production output, metadata and the report. Aggregate corpus checks
@@ -1215,3 +1253,46 @@ result SHA-256:
 `575457b44d5d5d159960a9c92b506ce09278e2fb34c9eac3c9d302bd45ef45b1`.
 This verifies calculations, not IID/exchangeability assumptions, production
 calibration, fresh measurements, or a deployed statistical gate.
+
+The final G93 shell repair is committed as `6cb922677`. Its frozen five-file
+suite and an independent root rerun each passed **1,620 checks**, covering
+**31 cleanup bodies and 248 outcome/flag cases**, with identical source
+SHA-256s. The pre-fix `e0be1085bac8f0ce1029f03690c52f8328d24542` control failed
+before cleanup execution. Four shell syntax checks and whitespace checks passed.
+Retained artifacts:
+
+- `/tmp/ft-reality-native-retention-handoff.md`: exact commands, boundaries,
+  and all five source hashes.
+- `/tmp/ft-reality-20260904-retention-final/retention-summary.json` and
+  `/tmp/ft-reality-20260904-retention-root-final/retention-summary.json`:
+  independent successful runs, with per-case checks and recording-command logs.
+- `/tmp/ft-reality-20260904-retention-prefix-negative.log`: pre-fix rejection.
+
+The controls include actual synthetic slash-containing credentials, decoded
+JSON strings and matching-key refusal, sanitization/capture/metadata failures,
+hidden directory descendants, size limits, and symlink/special-file refusal.
+The full live harness, visual detector, environment collector, GUI, real tmux,
+network/services and actual process shutdown were not invoked. No file was
+deleted. `.63` and `.63.1` are closed; `.9` retains its broader real-agent
+acceptance. No Cargo rerun was needed for these shell-only changes; the Rust
+receipts retain their exact `9327f0e4f` source boundary.
+
+**Final audit closeout, September 4 local time / September 5 01:09 UTC:**
+`ft-xxfwy.40` is closed on this assessment and its retained evidence. BR returns
+all **5,036 issues** with no pagination remainder: 4,026 closed, 723 open,
+165 in progress, 117 blocked, and five deferred (**1,010 unfinished**).
+The 23 new producer/verification pairs contain six closed pairs
+(`.41`, `.43`, `.45`, `.59`, `.61`, `.63`) and 17 open pairs. The partial
+`.46`, `.58`, and `.60` implementations have precise remaining acceptance and
+no abandoned audit assignment. Both ordinary and blocking-only active cycle
+checks are empty; all Bead changes are flushed. These counts describe task
+state, not a product completion percentage.
+
+The next safety work is live cross-process kill-switch enforcement (`.42`)
+and owned IPC child cancellation/output limits (`.62`). Same-generation native
+attach and the correlated real-agent loop remain the central product proof;
+trusted release/upgrade evidence and target-specific performance cannot be
+inferred from the source checks above. Connector transport, mission execution,
+extension hosting, and the other retained integration goals still need their
+production implementations and declared acceptance. The audit closes without
+reducing that intended product scope.
