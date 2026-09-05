@@ -12298,7 +12298,7 @@ mod mock_tests {
 #[cfg(test)]
 mod unified_tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(all(feature = "vendored", unix))]
     use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;

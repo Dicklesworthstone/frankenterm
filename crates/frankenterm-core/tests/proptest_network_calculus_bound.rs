@@ -113,9 +113,11 @@ proptest! {
 
         prop_assert!(!is_stable(arrival, service));
         prop_assert_eq!(delay_bound(arrival, service), None);
+        // Both rates are finite and strictly positive: bit identity tests the
+        // exact threshold, including excess lost to floating-point rounding.
         prop_assert_eq!(
             backlog_bound(arrival, service).is_finite(),
-            arrival.rate() == service.rate(),
+            arrival.rate().to_bits() == service.rate().to_bits(),
         );
     }
 
@@ -171,7 +173,9 @@ proptest! {
         } else if pct > TOLERANCE_PCT + 1e-6 {
             prop_assert!(!comparison.within_tolerance());
         }
-        if comparison.empirical_p99_ms == analytical {
+        // The analytical value is finite and strictly positive, so bit
+        // identity detects an exactly collapsed perturbation without epsilon.
+        if comparison.empirical_p99_ms.to_bits() == analytical.to_bits() {
             prop_assert!(!comparison.exceeds_bound());
         } else {
             prop_assert_eq!(comparison.exceeds_bound(), above);
