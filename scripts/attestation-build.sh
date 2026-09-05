@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION="1.5.0"
+GENERATOR_VERSION="1.6.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
 OUT_DIR="${FT_ATTESTATION_OUT_DIR:-$REPO_ROOT/docs/attestations}"
@@ -31,6 +31,8 @@ CHANNEL="dev"
 SIGN_METHOD="unsigned"
 ALLOW_PARTIAL=0
 STRICT_DEFERRED=0
+BUILD_PROFILE=""
+declare -a BUILD_TARGETS=()
 COSIGN_IDENTITY="${COSIGN_IDENTITY:-}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-}"
 ED25519_PRIVATE_KEY_PATH="${ED25519_PRIVATE_KEY_PATH:-}"
@@ -51,6 +53,9 @@ Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|
                   which is the desired release-gate behavior.
   --strict-deferred
                   Treat any deferred slot as an error. Use for release gates that must not ship a deferred set.
+  --profile       Build profile bound by the signature. Releases require release-interactive.
+  --target        Exact Rust target triple bound by the signature; repeat for each shipped target.
+                  Profile and target flags are required together for release verification.
   -h, --help      Show this message.
 
 Environment:
@@ -76,12 +81,17 @@ while [[ $# -gt 0 ]]; do
     --sign)           SIGN_METHOD="${2:?--sign requires a value}"; shift 2 ;;
     --allow-partial)  ALLOW_PARTIAL=1; shift ;;
     --strict-deferred) STRICT_DEFERRED=1; shift ;;
+    --profile)        BUILD_PROFILE="${2:?--profile requires a value}"; shift 2 ;;
+    --target)         BUILD_TARGETS+=("${2:?--target requires a value}"); shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 [[ -n "$VERSION" ]] || { echo "error: --version is required" >&2; exit 2; }
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$ ]] || {
+  echo "error: --version must be a semver without a leading v or path components" >&2; exit 2;
+}
 
 case "$CHANNEL" in
   stable|beta|nightly|dev) ;;
@@ -92,6 +102,21 @@ case "$SIGN_METHOD" in
   cosign|ed25519|unsigned) ;;
   *) echo "error: --sign must be one of cosign|ed25519|unsigned (got: $SIGN_METHOD)" >&2; exit 2 ;;
 esac
+
+if [[ -n "$BUILD_PROFILE" || ${#BUILD_TARGETS[@]} -gt 0 ]]; then
+  [[ "$BUILD_PROFILE" == release-interactive && ${#BUILD_TARGETS[@]} -gt 0 ]] || {
+    echo "error: build binding requires --profile release-interactive and at least one --target" >&2; exit 2;
+  }
+  for target in "${BUILD_TARGETS[@]}"; do
+    [[ "$target" =~ ^[a-z0-9_]+(-[a-z0-9_]+){2,}$ ]] || { echo "error: invalid Rust target triple" >&2; exit 2; }
+  done
+fi
+if [[ "$CHANNEL" != dev ]]; then
+  [[ "$BUILD_PROFILE" == release-interactive && ${#BUILD_TARGETS[@]} -gt 0 && $ALLOW_PARTIAL -eq 0 ]] || {
+    echo "error: releases require --profile release-interactive, --target and complete artifacts" >&2; exit 2;
+  }
+  STRICT_DEFERRED=1
+fi
 
 command -v jq  >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "error: git is required" >&2; exit 1; }
@@ -592,6 +617,11 @@ if [[ -d "$RETRACTIONS_ROOT" ]]; then
   fi
 fi
 
+build_json="null"
+if [[ -n "$BUILD_PROFILE" ]]; then
+  build_targets_json="$(printf '%s\n' "${BUILD_TARGETS[@]}" | jq -Rc -s 'split("\n") | map(select(. != "")) | unique')"
+  build_json="$(jq -cn --arg profile "$BUILD_PROFILE" --argjson targets "$build_targets_json" '{profile:$profile,targets:$targets}')"
+fi
 bundle_no_sig="$(jq -n \
   --arg schema_version "1.0.0" \
   --arg version "$VERSION" \
@@ -608,6 +638,7 @@ bundle_no_sig="$(jq -n \
   --argjson retractions "$retractions_json" \
   --argjson taxonomy_coverage "$taxonomy_coverage_json" \
   --argjson confidence_summary "$confidence_summary_json" \
+  --argjson build "$build_json" \
   '{
     schema_version: $schema_version,
     release: {
@@ -627,7 +658,7 @@ bundle_no_sig="$(jq -n \
     retractions: $retractions,
     taxonomy_coverage: $taxonomy_coverage,
     confidence_summary: $confidence_summary
-  }')"
+  } + (if $build == null then {} else {build:$build} end)')"
 
 repo_relative_output_path() {
   local path="$1"
@@ -717,12 +748,12 @@ case "$SIGN_METHOD" in
     public_key="$(tail -c 32 "$pubkey_der_tmp" | xxd -p -c 256)"
     if [[ ${#public_key} -ne 64 || "$public_key" =~ [^0-9A-Fa-f] ]]; then
       echo "error: failed to derive a 32-byte Ed25519 public key from $ED25519_PRIVATE_KEY_PATH" >&2
-      rm -f "$pubkey_der_tmp" "$sig_bin_tmp"
+      echo "retained public signing intermediates: $pubkey_der_tmp $sig_bin_tmp" >&2
       exit 1
     fi
     openssl pkeyutl -sign -rawin -inkey "$ED25519_PRIVATE_KEY_PATH" -in "$canon_path" -out "$sig_bin_tmp"
     xxd -p -c 256 "$sig_bin_tmp" > "$sig_path"
-    rm -f "$pubkey_der_tmp" "$sig_bin_tmp"
+    echo "retained public signing intermediates: $pubkey_der_tmp $sig_bin_tmp" >&2
 
     signature_rel_path="$(repo_relative_output_path "$sig_path")"
     sig_obj="$(jq -n \

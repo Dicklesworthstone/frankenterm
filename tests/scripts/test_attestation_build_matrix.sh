@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # ft-e87u6.2 -- attestation-build deferred-slot behavior matrix.
+# Cosign cases use an owned no-network metadata fixture; they do not prove
+# cryptographic validity, a publisher identity, or release qualification.
 set -euo pipefail
+unset FT_ATTESTATION_RELEASE_POLICY
+FIXTURE_COSIGN_IDENTITY="https://attestation-fixture.invalid/owned/no-network-signer"
+FIXTURE_COSIGN_ISSUER="https://issuer.attestation-fixture.invalid"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")"
@@ -245,8 +250,8 @@ run_sigstore_cases() {
 
   set +e
   PATH="${fake_bin}:$PATH" \
-  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
-  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  COSIGN_IDENTITY="${FIXTURE_COSIGN_IDENTITY}" \
+  COSIGN_OIDC_ISSUER="${FIXTURE_COSIGN_ISSUER}" \
   FT_ATTESTATION_MANIFEST="${manifest}" \
   FT_ATTESTATION_OUT_DIR="${out_dir}" \
   FT_BEAD_ID="ft-tf6g3.22" \
@@ -254,6 +259,7 @@ run_sigstore_cases() {
     bash "${ROOT_DIR}/scripts/attestation-build.sh" \
       --version "${version}" \
       --channel stable \
+      --profile release-interactive --target aarch64-apple-darwin \
       --sign cosign >"${build_dir}/stdout.txt" 2>"${build_dir}/stderr.txt"
   rc=$?
   set -e
@@ -403,12 +409,14 @@ run_sigstore_cases() {
     --arg sigstore_path "${sigstore_path}" \
     --arg sigstore_hash "${sigstore_hash}" \
     --argjson sigstore_size "${sigstore_size}" \
+    --arg certificate_identity "${FIXTURE_COSIGN_IDENTITY}" \
+    --arg certificate_issuer "${FIXTURE_COSIGN_ISSUER}" \
     '. + {signature: {
       method: "sigstore-cosign-keyless",
       canonical_sha256: $canonical_sha,
       sigstore_bundle: {path: $sigstore_path, sha256: $sigstore_hash, size_bytes: $sigstore_size},
-      certificate_identity: "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
-      certificate_oidc_issuer: "https://token.actions.githubusercontent.com"
+      certificate_identity: $certificate_identity,
+      certificate_oidc_issuer: $certificate_issuer
     }}' <<<"${no_sig}" >"${verify_bundle}"
   jq '.signature.sigstore_bundle.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
     "${verify_bundle}" >"${bad_bundle}"
@@ -470,8 +478,8 @@ run_external_signed_output_case() {
 
   set +e
   PATH="${fake_bin}:$PATH" \
-  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
-  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  COSIGN_IDENTITY="${FIXTURE_COSIGN_IDENTITY}" \
+  COSIGN_OIDC_ISSUER="${FIXTURE_COSIGN_ISSUER}" \
   FT_ATTESTATION_MANIFEST="${manifest}" \
   FT_ATTESTATION_OUT_DIR="${external_out_dir}" \
   FT_BEAD_ID="ft-e87u6.2" \
@@ -479,6 +487,7 @@ run_external_signed_output_case() {
     bash "${ROOT_DIR}/scripts/attestation-build.sh" \
       --version "${version}" \
       --channel stable \
+      --profile release-interactive --target aarch64-apple-darwin \
       --sign cosign >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
   rc=$?
   set -e
@@ -511,8 +520,8 @@ run_parent_signed_output_case() {
 
   set +e
   PATH="${fake_bin}:$PATH" \
-  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
-  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  COSIGN_IDENTITY="${FIXTURE_COSIGN_IDENTITY}" \
+  COSIGN_OIDC_ISSUER="${FIXTURE_COSIGN_ISSUER}" \
   FT_ATTESTATION_MANIFEST="${manifest}" \
   FT_ATTESTATION_OUT_DIR="${parent_out_dir}" \
   FT_BEAD_ID="ft-e87u6.2" \
@@ -520,6 +529,7 @@ run_parent_signed_output_case() {
     bash "${ROOT_DIR}/scripts/attestation-build.sh" \
       --version "${version}" \
       --channel stable \
+      --profile release-interactive --target aarch64-apple-darwin \
       --sign cosign >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
   rc=$?
   set -e
@@ -553,8 +563,8 @@ run_signed_output_relative_guard_case() {
 
   set +e
   PATH="${fake_bin}:$PATH" \
-  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
-  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  COSIGN_IDENTITY="${FIXTURE_COSIGN_IDENTITY}" \
+  COSIGN_OIDC_ISSUER="${FIXTURE_COSIGN_ISSUER}" \
   FT_ATTESTATION_MANIFEST="${manifest}" \
   FT_ATTESTATION_OUT_DIR="${unsafe_out_dir}" \
   FT_BEAD_ID="ft-e87u6.2" \
@@ -562,6 +572,7 @@ run_signed_output_relative_guard_case() {
     bash "${ROOT_DIR}/scripts/attestation-build.sh" \
       --version "${version}" \
       --channel stable \
+      --profile release-interactive --target aarch64-apple-darwin \
       --sign cosign >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
   rc=$?
   set -e
@@ -638,9 +649,144 @@ JSON
   echo "PASS ${name}"
 }
 
+run_release_attestation_admission_cases() {
+  # Real Ed25519 + real release verifier. The empty asset directory is an
+  # intentional second-stage failure: these cases prove attestation admission,
+  # not the 17-asset Minisign release, publication, or installer/canary result.
+  local case_dir="${ARTIFACT_ROOT}/release-attestation-admission"
+  local manifest="${case_dir}/attestation-manifest.json"
+  local dsr_manifest="${case_dir}/dsr-manifest.json"
+  local policy="${case_dir}/operator-policy.json"
+  local key="${case_dir}/owned-key.pem" other_key="${case_dir}/other-key.pem"
+  local now_epoch public_key source_sha
+  mkdir -p "${case_dir}/assets" "${case_dir}/trusted" "${case_dir}/other" "${case_dir}/target"
+  openssl genpkey -algorithm ED25519 -out "${key}"
+  openssl genpkey -algorithm ED25519 -out "${other_key}"
+  write_manifest "${manifest}" "$(json_slot '"docs/attestations/schema.json"' "" "")"
+  ED25519_PRIVATE_KEY_PATH="${key}" FT_ATTESTATION_MANIFEST="${manifest}" \
+    FT_ATTESTATION_OUT_DIR="${case_dir}/trusted" bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version 0.0.0 --channel stable --sign ed25519 --profile release-interactive \
+      --target aarch64-apple-darwin --target aarch64-unknown-linux-gnu \
+      --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc \
+      >"${case_dir}/trusted-build.log" 2>&1
+  openssl pkey -in "${key}" -pubout -outform DER >"${case_dir}/trusted-key.der"
+  public_key="$(tail -c 32 "${case_dir}/trusted-key.der" | xxd -p -c 256)"
+  now_epoch="$(date -u +%s)"
+  source_sha="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+  jq --arg key "${public_key}" --arg hash "$(sha256_file "${manifest}")" --argjson now "${now_epoch}" '{
+    schema_version:"frankenterm.release-attestation-policy.v1",
+    signer:{method:"ed25519",public_key:$key,revoked:false,not_before:($now-3600),not_after:($now+3600)},
+    max_age_seconds:600,release:.release,git:{commit:.git.commit,tree:.git.tree},build:.build,manifest_sha256:$hash
+  }' "${case_dir}/trusted/0.0.0.json" >"${policy}"
+  jq -n --arg sha "${source_sha}" '{
+    tool:"frankenterm",version:"v0.0.0",source:{git_ref:"v0.0.0",git_sha:$sha,dependencies:[]},
+    status:"success",summary:{total:4,success:4,failed:0},artifacts:[
+      {target:"additional",name:"FrankenTerm-darwin-arm64.app.tar.xz"},
+      {target:"darwin/arm64",name:"ft-darwin-arm64.tar.xz"},
+      {target:"linux/amd64",name:"ft-linux-amd64.tar.xz"},
+      {target:"linux/arm64",name:"ft-linux-arm64.tar.xz"},
+      {target:"windows/amd64",name:"ft-windows-amd64.zip"}
+    ] | map(. + {sha256:("0" * 64),size_bytes:1})
+  }' >"${dsr_manifest}"
+
+  # The other signature is valid for exactly the same release bindings. Only
+  # the independent signer pin should reject it in release-policy mode.
+  ED25519_PRIVATE_KEY_PATH="${other_key}" FT_ATTESTATION_MANIFEST="${manifest}" \
+    FT_ATTESTATION_OUT_DIR="${case_dir}/other" bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version 0.0.0 --channel stable --sign ed25519 --profile release-interactive \
+      --target aarch64-apple-darwin --target aarch64-unknown-linux-gnu \
+      --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc \
+      >"${case_dir}/other-build.log" 2>&1
+  FT_ATTESTATION_MANIFEST="${manifest}" bash "${ROOT_DIR}/scripts/attestation-verify.sh" \
+    "${case_dir}/other/0.0.0.json" --json >"${case_dir}/other-integrity.json"
+  jq -e '.ok and (.publisher_authenticated | not)' "${case_dir}/other-integrity.json" >/dev/null
+
+  # A valid trusted signature and matching external policy for only one
+  # target must still fail the DSR four-target cross-binding.
+  ED25519_PRIVATE_KEY_PATH="${key}" FT_ATTESTATION_MANIFEST="${manifest}" \
+    FT_ATTESTATION_OUT_DIR="${case_dir}/target" bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version 0.0.0 --channel stable --sign ed25519 --profile release-interactive \
+      --target aarch64-apple-darwin >"${case_dir}/target-build.log" 2>&1
+  jq '.build.targets = ["aarch64-apple-darwin"]' "${policy}" >"${case_dir}/target-policy.json"
+  jq '.source.git_sha = ("f" * 40)' "${dsr_manifest}" >"${case_dir}/wrong-source-manifest.json"
+
+  local scenario selected_manifest selected_bundle selected_policy expected rc
+  local -a policy_args
+  for scenario in authenticated-admission env-policy-admission artifact-only unknown-signer wrong-source wrong-target missing-policy missing-policy-file missing-bundle; do
+    selected_manifest="${dsr_manifest}"
+    selected_bundle="${case_dir}/trusted/0.0.0.json"
+    selected_policy="${policy}"
+    expected="authenticated attestation matches DSR tag, source, release-interactive profile and four native targets"
+    case "${scenario}" in
+      artifact-only) expected="verification scope: artifact-set verification only; attestation not requested" ;;
+      unknown-signer)
+        selected_bundle="${case_dir}/other/0.0.0.json"
+        expected="requested release attestation failed authentication" ;;
+      wrong-source)
+        selected_manifest="${case_dir}/wrong-source-manifest.json"
+        expected="authenticated attestation does not match DSR release tag, source, profile or native targets" ;;
+      wrong-target)
+        selected_bundle="${case_dir}/target/0.0.0.json"
+        selected_policy="${case_dir}/target-policy.json"
+        expected="authenticated attestation does not match DSR release tag, source, profile or native targets" ;;
+      missing-policy) expected="are required together" ;;
+      missing-policy-file)
+        selected_policy="${case_dir}/absent-policy.json"
+        expected="requested attestation input is missing" ;;
+      missing-bundle)
+        selected_bundle="${case_dir}/absent-bundle.json"
+        expected="requested attestation input is missing" ;;
+    esac
+    policy_args=(--release-policy "${selected_policy}")
+    if [[ "${scenario}" == missing-policy || "${scenario}" == env-policy-admission ]]; then policy_args=(); fi
+    set +e
+    if [[ "${scenario}" == artifact-only ]]; then
+      FT_ATTESTATION_MANIFEST="${manifest}" bash "${ROOT_DIR}/scripts/release/verify-release.sh" \
+        --manifest "${selected_manifest}" --assets-dir "${case_dir}/assets" \
+        >"${case_dir}/${scenario}.out" 2>"${case_dir}/${scenario}.err"
+    elif [[ "${scenario}" == env-policy-admission ]]; then
+      FT_ATTESTATION_RELEASE_POLICY="${selected_policy}" FT_ATTESTATION_MANIFEST="${manifest}" \
+        bash "${ROOT_DIR}/scripts/release/verify-release.sh" --manifest "${selected_manifest}" \
+          --assets-dir "${case_dir}/assets" --attestation-bundle "${selected_bundle}" \
+          >"${case_dir}/${scenario}.out" 2>"${case_dir}/${scenario}.err"
+    else
+      FT_ATTESTATION_MANIFEST="${manifest}" bash "${ROOT_DIR}/scripts/release/verify-release.sh" \
+        --manifest "${selected_manifest}" --assets-dir "${case_dir}/assets" \
+        --attestation-bundle "${selected_bundle}" "${policy_args[@]}" \
+        >"${case_dir}/${scenario}.out" 2>"${case_dir}/${scenario}.err"
+    fi
+    rc=$?
+    set -e
+    total=$((total + 1))
+    if [[ ${rc} -eq 0 ]] || ! grep -Fq "${expected}" "${case_dir}/${scenario}.out" "${case_dir}/${scenario}.err"; then
+      fail=$((fail + 1))
+      record_result "release_${scenario}" "nonzero_with_${expected}" "${rc}" failed "${case_dir}"
+      cat "${case_dir}/${scenario}.out" "${case_dir}/${scenario}.err" >&2
+      continue
+    fi
+    if [[ "${scenario}" == *admission || "${scenario}" == artifact-only ]]; then
+      if ! grep -q 'required release asset is missing' "${case_dir}/${scenario}.out"; then
+        fail=$((fail + 1))
+        record_result "release_${scenario}" "artifact_gate_after_authenticated_admission" "${rc}" failed "${case_dir}"
+        continue
+      fi
+    elif grep -q 'required release asset is missing' "${case_dir}/${scenario}.out"; then
+      fail=$((fail + 1))
+      record_result "release_${scenario}" "reject_before_artifact_gate" "${rc}" failed "${case_dir}"
+      continue
+    fi
+    pass=$((pass + 1))
+    record_result "release_${scenario}" "${expected}" "${rc}" passed "${case_dir}"
+    echo "PASS release_${scenario} (attestation admission only; no complete release proof)"
+  done
+}
+
 require_cmd bash
 require_cmd jq
 require_cmd git
+require_cmd openssl
+require_cmd xxd
+require_cmd minisign
 
 run_case \
   "populated_slot_passes" \
@@ -755,6 +901,7 @@ run_signed_output_relative_guard_case \
   "${ARTIFACT_ROOT}/signed-output-empty//out" \
   "0.0.0-empty-segment-signed-output" \
   "attestation_empty_segment_signed_output_guard"
+run_release_attestation_admission_cases
 
 jq -n \
   --arg bead_id "ft-e87u6.2" \

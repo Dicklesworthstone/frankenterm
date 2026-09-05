@@ -74,6 +74,21 @@
         }
       }
     },
+    "build": {
+      "description": "Signed build identity. Required by external release verification policy; never inferred from the verifier host.",
+      "type": "object",
+      "required": ["profile", "targets"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "const": "release-interactive" },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9_]+(-[a-z0-9_]+){2,}$" }
+        }
+      }
+    },
     "artifacts": {
       "description": "Every artifact referenced by this bundle. Must contain at least one entry per category in required_categories. Dev-channel partial bundles MAY be empty.",
       "type": "array",

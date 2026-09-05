@@ -17,6 +17,12 @@
 #       Offline verification of the same closed asset set. The local manifest
 #       may be in <dir>, but is not counted as a release asset.
 #
+#   Add --attestation-bundle <path> --release-policy <path> to either mode
+#       to authenticate a separate attestation against an operator-owned
+#       policy and bind it to this DSR source, tag and four native targets.
+#       FT_ATTESTATION_RELEASE_POLICY may supply the policy path. Both inputs
+#       are required together and remain outside the exact release asset set.
+#
 # Checks, all fail-closed:
 #   1. exact successful DSR build plan for four native targets plus the app;
 #   2. exact 17-file release set: five artifacts and their .sha256/.minisig
@@ -39,9 +45,11 @@ DSR_STATE_ROOT="${DSR_STATE_DIR:-${XDG_STATE_HOME:-${HOME:?HOME is required}/.lo
 VERSION=""
 MANIFEST=""
 ASSETS_DIR=""
+ATTESTATION_BUNDLE=""
+RELEASE_POLICY="${FT_ATTESTATION_RELEASE_POLICY:-}"
 
 usage() {
-  sed -n '2,30p' "$0"
+  sed -n '2,36p' "$0"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -54,6 +62,11 @@ while [[ $# -gt 0 ]]; do
     --assets-dir)
       [[ $# -ge 2 ]] || { echo "--assets-dir needs a directory" >&2; exit 2; }
       ASSETS_DIR="$2"
+      shift 2
+      ;;
+    --attestation-bundle|--release-policy)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "$1 needs a path" >&2; exit 2; }
+      if [[ "$1" == --attestation-bundle ]]; then ATTESTATION_BUNDLE="$2"; else RELEASE_POLICY="$2"; fi
       shift 2
       ;;
     -h|--help)
@@ -72,6 +85,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$ATTESTATION_BUNDLE" && -z "$RELEASE_POLICY" || -z "$ATTESTATION_BUNDLE" && -n "$RELEASE_POLICY" ]]; then
+  echo "--attestation-bundle and --release-policy (or FT_ATTESTATION_RELEASE_POLICY) are required together" >&2
+  exit 2
+fi
 if [[ -n "$VERSION" && -n "$ASSETS_DIR" ]]; then
   echo "--assets-dir is only valid for offline --manifest verification" >&2
   exit 2
@@ -239,6 +256,58 @@ MANIFEST_PARENT="$(cd "$(dirname "$MANIFEST")" && pwd -P)"
 MANIFEST="$MANIFEST_PARENT/$(basename "$MANIFEST")"
 MANIFEST_SHA="$(jq -r '.source.git_sha' "$MANIFEST")"
 good "local unsigned build manifest binds $TAG to $MANIFEST_SHA and all four targets plus app"
+
+if [[ -n "$ATTESTATION_BUNDLE" ]]; then
+  # Freeze the exact public inputs before authentication and cross-binding.
+  # They are separate evidence, never extra entries in the 17-asset inventory.
+  for input in "$ATTESTATION_BUNDLE" "$RELEASE_POLICY"; do
+    if ! regular_file "$input"; then
+      bad "requested attestation input is missing, a symlink, or not a regular file: $input"
+      finish_failed
+    fi
+    input_size="$(file_size "$input")"
+    if [[ ! "$input_size" =~ ^[0-9]+$ || "$input_size" -le 0 || "$input_size" -gt 1048576 ]]; then
+      bad "requested attestation input is empty or exceeds the 1 MiB bound"
+      finish_failed
+    fi
+  done
+  ATTESTATION_EVIDENCE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-release-attestation.XXXXXX")" || exit 2
+  note "attestation verification evidence retained at: $ATTESTATION_EVIDENCE_DIR"
+  if ! cp "$ATTESTATION_BUNDLE" "$ATTESTATION_EVIDENCE_DIR/bundle.json" || \
+      ! cp "$RELEASE_POLICY" "$ATTESTATION_EVIDENCE_DIR/policy.json"; then
+    bad "could not retain requested attestation inputs"
+    finish_failed
+  fi
+  if ! bash "$ROOT/scripts/attestation-verify.sh" \
+      "$ATTESTATION_EVIDENCE_DIR/bundle.json" --json \
+      --release-policy "$ATTESTATION_EVIDENCE_DIR/policy.json" \
+      > "$ATTESTATION_EVIDENCE_DIR/verdict.json" 2> "$ATTESTATION_EVIDENCE_DIR/verifier.stderr"; then
+    cat "$ATTESTATION_EVIDENCE_DIR/verifier.stderr" >&2
+    bad "requested release attestation failed authentication; see $ATTESTATION_EVIDENCE_DIR/verdict.json"
+    finish_failed
+  fi
+  if ! jq -e --arg sha "$(sha256_file "$ATTESTATION_EVIDENCE_DIR/bundle.json")" '
+    .ok == true and .verdict == "pass" and .verification_mode == "release_policy"
+    and .publisher_authenticated == true and .bundle_sha256 == $sha
+  ' "$ATTESTATION_EVIDENCE_DIR/verdict.json" >/dev/null; then
+    bad "attestation verifier did not authenticate the retained bundle under release policy"
+    finish_failed
+  fi
+  if ! jq -e --arg tag "$TAG" --arg sha "$MANIFEST_SHA" --slurpfile manifest "$MANIFEST" '
+    {"darwin/arm64":"aarch64-apple-darwin", "linux/amd64":"x86_64-unknown-linux-gnu",
+     "linux/arm64":"aarch64-unknown-linux-gnu", "windows/amd64":"x86_64-pc-windows-msvc"} as $triples
+    | ([$manifest[0].artifacts[] | select(.target != "additional") | $triples[.target]] | sort) as $targets
+    | .release.tag == $tag and .release.version == ($tag | ltrimstr("v"))
+      and .release.channel == "stable" and .git.commit == $sha
+      and .build.profile == "release-interactive" and (.build.targets | sort) == $targets
+  ' "$ATTESTATION_EVIDENCE_DIR/bundle.json" >/dev/null; then
+    bad "authenticated attestation does not match DSR release tag, source, profile or native targets"
+    finish_failed
+  fi
+  good "authenticated attestation matches DSR tag, source, release-interactive profile and four native targets"
+else
+  note "verification scope: artifact-set verification only; attestation not requested"
+fi
 
 declare -a BASE_ASSETS=()
 while IFS= read -r name; do
@@ -632,5 +701,10 @@ if [[ "$(sha256_file "$MANIFEST")" != "$MANIFEST_FILE_SHA" || \
   bad "local DSR build manifest changed during verification"
   finish_failed
 fi
-echo "release verification: all checks passed (exact 17-asset strict DSR set for $TAG)"
+if [[ -n "$ATTESTATION_BUNDLE" ]]; then
+  echo "release verification: exact 17-asset strict DSR set and externally authenticated attestation passed for $TAG"
+  echo "scope: artifact integrity and attestation policy bindings; target execution and installer/canary outcomes require their own evidence"
+else
+  echo "release verification: artifact-set checks passed (exact 17-asset strict DSR set for $TAG); attestation not requested"
+fi
 exit 0

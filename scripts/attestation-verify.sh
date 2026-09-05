@@ -20,19 +20,32 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE=""
 JSON_OUTPUT=0
+RELEASE_POLICY="${FT_ATTESTATION_RELEASE_POLICY:-}"
+VERIFICATION_MODE="development_integrity"
+POLICY_JSON="null"
+POLICY_SHA256=""
+MANIFEST_PATH="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
 RETRACTIONS_ROOT="${FT_ATTESTATION_RETRACTIONS_ROOT:-$REPO_ROOT/docs/attestations/retractions}"
 
 usage() {
   cat <<EOF
-Usage: $0 <bundle.json> [--json] [--strict-required] [--strict-deferred]
+Usage: $0 <bundle.json> [--json] [--strict-required] [--strict-deferred] [--release-policy <policy.json>]
 
   --json             Emit machine-readable JSON.
   --strict-required  Fail if the bundle's required_categories list does not match
                      the canonical list in docs/attestations/manifest.json, allowing
                      deferred_slots to satisfy categories in non-release checks.
   --strict-deferred  Fail if the bundle declares any deferred_slots.
+  --release-policy   Require an operator-owned Ed25519 trust policy, exact release,
+                     source, build and manifest bindings, freshness and every slot.
+                     Never derive this policy from an untrusted bundle.
 
 Environment:
+  FT_ATTESTATION_RELEASE_POLICY
+                     Same as --release-policy; also applies through ft attestation
+                     verify. Without a policy, success is development integrity only.
+  FT_ATTESTATION_MANIFEST
+                     Canonical manifest path. Release policy pins its exact hash.
   FT_ATTESTATION_RETRACTIONS_ROOT
                      Override active retraction root. Defaults to
                      docs/attestations/retractions. The verifier also
@@ -47,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --json)             JSON_OUTPUT=1; shift ;;
     --strict-required)  STRICT_REQUIRED=1; shift ;;
     --strict-deferred)  STRICT_DEFERRED=1; shift ;;
+    --release-policy)   [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--release-policy requires a path" >&2; exit 2; }
+                        RELEASE_POLICY="$2"; shift 2 ;;
     -h|--help)          usage; exit 0 ;;
     -*) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
     *) [[ -z "$BUNDLE" ]] || { echo "extra arg: $1" >&2; exit 2; }; BUNDLE="$1"; shift ;;
@@ -63,6 +78,12 @@ if [[ ! -f "$BUNDLE" ]]; then
 fi
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
+
+if [[ -n "$RELEASE_POLICY" ]]; then
+  VERIFICATION_MODE="release_policy"
+  STRICT_REQUIRED=1
+  STRICT_DEFERRED=1
+fi
 
 sha256_file() {
   local f="$1"
@@ -107,7 +128,94 @@ add_retraction_result() {
   retraction_results+=("$obj")
 }
 
-bundle_json="$(cat "$BUNDLE")"
+bundle_json="$(jq -ce 'select(type == "object")' "$BUNDLE")" || {
+  echo "error: bundle must be a JSON object" >&2; exit 1;
+}
+
+# The caller owns this file. Neither a bundle-supplied key nor the checkout's
+# manifest is its own trust root. Expiry/revocation is checked against current
+# time even for offline replay; there is no bundle-controlled clock override.
+if [[ "$VERIFICATION_MODE" == release_policy ]]; then
+  if [[ ! -f "$RELEASE_POLICY" ]] || ! POLICY_JSON="$(jq -ce '
+      def hex($n): type == "string" and test("^[0-9a-f]{" + ($n|tostring) + "}$");
+      def uint: type == "number" and . >= 0 and floor == .;
+      select(type == "object"
+        and .schema_version == "frankenterm.release-attestation-policy.v1"
+        and (.signer.public_key | hex(64)) and .signer.method == "ed25519"
+        and (.signer.revoked | type == "boolean")
+        and (.signer.not_before | uint) and (.signer.not_after | uint)
+        and .signer.not_before < .signer.not_after
+        and (.max_age_seconds | uint) and .max_age_seconds > 0
+        and (.release.version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.-]+)?(\\+[A-Za-z0-9.-]+)?$"))
+        and .release.tag == ("v" + .release.version)
+        and (.release.channel == "stable" or .release.channel == "beta" or .release.channel == "nightly")
+        and (.git.commit | hex(40)) and (.git.tree | hex(40))
+        and .build.profile == "release-interactive"
+        and (.build.targets | type == "array" and length > 0 and unique == .
+          and all(.[]; type == "string" and test("^[a-z0-9_]+(-[a-z0-9_]+){2,}$")))
+        and (.manifest_sha256 | hex(64)))
+    ' "$RELEASE_POLICY")"; then
+    record_check "release_policy" false "missing or malformed external release policy"
+    POLICY_JSON="null"
+  else
+    POLICY_SHA256="$(sha256_file "$RELEASE_POLICY")"
+    record_check "release_policy" true "operator policy sha256=$POLICY_SHA256"
+    now_epoch="$(date -u +%s)"
+    if jq -e --argjson now "$now_epoch" '
+      .signer.revoked == false and .signer.not_before <= $now and $now < .signer.not_after
+    ' <<<"$POLICY_JSON" >/dev/null; then
+      record_check "release_signer_validity" true "pinned signer is active at verification time"
+    else
+      record_check "release_signer_validity" false "pinned signer is revoked, expired or not yet active"
+    fi
+    if jq -e --argjson policy "$POLICY_JSON" '
+      .release == $policy.release
+      and .git.commit == $policy.git.commit and .git.tree == $policy.git.tree
+      and .build == $policy.build
+    ' <<<"$bundle_json" >/dev/null; then
+      record_check "release_binding" true "release, source tree, target set and interactive profile match external policy"
+    else
+      record_check "release_binding" false "release, source tree, target set or profile differs from external policy"
+    fi
+    if jq -e --argjson policy "$POLICY_JSON" --argjson now "$now_epoch" '
+      (try (.generated_at | fromdateiso8601) catch null) as $generated
+      | $generated != null and $generated >= $policy.signer.not_before
+        and $generated < $policy.signer.not_after and $generated <= $now
+        and ($now - $generated) <= $policy.max_age_seconds
+    ' <<<"$bundle_json" >/dev/null; then
+      record_check "release_freshness" true "bundle timestamp is within pinned signer validity and maximum age"
+    else
+      record_check "release_freshness" false "bundle timestamp is stale, future, invalid or outside signer validity"
+    fi
+    manifest_file="$MANIFEST_PATH"
+    if [[ -f "$manifest_file" ]] && [[ "$(sha256_file "$manifest_file")" == "$(jq -r '.manifest_sha256' <<<"$POLICY_JSON")" ]]; then
+      record_check "release_manifest_binding" true "canonical manifest matches external policy hash"
+    else
+      record_check "release_manifest_binding" false "canonical manifest differs from external policy"
+    fi
+  fi
+fi
+
+release_signer_matches() {
+  local signature="$1"
+  [[ "$VERIFICATION_MODE" != release_policy ]] && return 0
+  jq -e --argjson policy "$POLICY_JSON" '
+    .method == "ed25519" and .public_key == $policy.signer.public_key
+      and $policy.signer.revoked == false
+  ' <<<"$signature" >/dev/null
+}
+
+# Retain exact crypto inputs and stderr without unlinking files. These contain
+# public verification material only, never signing keys.
+VERIFY_WORKDIR=""
+ensure_verification_workdir() {
+  if [[ -z "$VERIFY_WORKDIR" ]]; then
+    VERIFY_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-attestation-verify.XXXXXX")"
+    if [[ $JSON_OUTPUT -eq 0 ]]; then
+      printf 'Retained public signature verification evidence: %s\n' "$VERIFY_WORKDIR" >&2
+    fi
+  fi
+}
 
 verify_retraction_signature() {
   local retraction_path="$1"
@@ -127,6 +235,10 @@ verify_retraction_signature() {
   fi
 
   sig_method="$(jq -r '.retraction_signature.method // ""' <<<"$retraction_json")"
+  if ! release_signer_matches "$(jq -c '.retraction_signature' <<<"$retraction_json")"; then
+    record_check "retraction_signature:$affected_slot" false "retraction signer is not authorized by external release policy"
+    return 1
+  fi
   case "$sig_method" in
     sigstore-cosign-keyless)
       local sigstore_path sigstore_expected_hash sigstore_expected_size sigstore_abs
@@ -169,18 +281,17 @@ verify_retraction_signature() {
         return 1
       fi
 
-      canon_tmp="$(mktemp)"
+      ensure_verification_workdir
+      canon_tmp="$(mktemp "$VERIFY_WORKDIR/retraction-payload.XXXXXX")"
       printf '%s' "$canonical_payload" > "$canon_tmp"
       if cosign verify-blob \
           --bundle "$sigstore_abs" \
           --certificate-identity "$cert_identity" \
           --certificate-oidc-issuer "$cert_issuer" \
-          "$canon_tmp" >/dev/null 2>&1; then
+          "$canon_tmp" >"$canon_tmp.verify.log" 2>&1; then
         record_check "retraction_signature:$affected_slot" true "cosign verify-blob ok (identity=$cert_identity)"
-        rm -f "$canon_tmp"
         return 0
       fi
-      rm -f "$canon_tmp"
       record_check "retraction_signature:$affected_slot" false "cosign verify-blob failed for $retraction_path"
       return 1
       ;;
@@ -214,9 +325,10 @@ verify_retraction_signature() {
         return 1
       fi
 
-      canon_tmp="$(mktemp)"
-      pubkey_der_tmp="$(mktemp)"
-      sig_tmp="$(mktemp)"
+      ensure_verification_workdir
+      canon_tmp="$(mktemp "$VERIFY_WORKDIR/retraction-payload.XXXXXX")"
+      pubkey_der_tmp="$(mktemp "$VERIFY_WORKDIR/retraction-key.XXXXXX")"
+      sig_tmp="$(mktemp "$VERIFY_WORKDIR/retraction-signature.XXXXXX")"
       printf '%s' "$canonical_payload" > "$canon_tmp"
       printf '302a300506032b6570032100%s' "$public_key" | xxd -r -p > "$pubkey_der_tmp"
       printf '%s' "$signature_hex" | xxd -r -p > "$sig_tmp"
@@ -227,13 +339,11 @@ verify_retraction_signature() {
           -keyform DER \
           -inkey "$pubkey_der_tmp" \
           -sigfile "$sig_tmp" \
-          -in "$canon_tmp" >/dev/null 2>&1; then
+          -in "$canon_tmp" >"$canon_tmp.verify.log" 2>&1; then
         key_fingerprint="$(printf '%s' "$public_key" | sha256_stdin)"
         record_check "retraction_signature:$affected_slot" true "ed25519 verify ok (public_key_sha256=$key_fingerprint)"
-        rm -f "$canon_tmp" "$pubkey_der_tmp" "$sig_tmp"
         return 0
       fi
-      rm -f "$canon_tmp" "$pubkey_der_tmp" "$sig_tmp"
       record_check "retraction_signature:$affected_slot" false "ed25519 verify failed for $retraction_path"
       return 1
       ;;
@@ -425,7 +535,7 @@ fi
 
 # Strict required-categories check (optional).
 if [[ $STRICT_REQUIRED -eq 1 ]]; then
-  manifest_path="$REPO_ROOT/docs/attestations/manifest.json"
+  manifest_path="$MANIFEST_PATH"
   if [[ -f "$manifest_path" ]]; then
     manifest_required="$(jq -c -S '.required_categories | unique' "$manifest_path")"
     bundle_required="$(jq -c -S '((.required_categories // []) + ((.deferred_slots // []) | map(.category))) | unique' <<<"$bundle_json")"
@@ -439,10 +549,24 @@ if [[ $STRICT_REQUIRED -eq 1 ]]; then
   fi
 fi
 
+if [[ "$VERIFICATION_MODE" == release_policy && -f "$MANIFEST_PATH" ]]; then
+  if jq -e --argjson bundle "$bundle_json" '
+    .required_categories as $required
+    | [.slots[] | select(.category as $category | $required | index($category))] as $slots
+    | ($slots | length > 0) and all($slots[];
+        . as $slot | (.path | type == "string" and length > 0)
+        and ([ $bundle.artifacts[] | select(.category == $slot.category and .path == $slot.path) ] | length == 1))
+  ' "$MANIFEST_PATH" >/dev/null; then
+    record_check "release_required_slots" true "each required manifest slot has exactly one matching artifact"
+  else
+    record_check "release_required_slots" false "required manifest slot is deferred, missing or duplicated"
+  fi
+fi
+
 # Every artifact category in the bundle must be declared by the local
 # attestation manifest. This catches forged or stale slots even when the
 # canonical payload was recomputed by a broken producer.
-manifest_path="$REPO_ROOT/docs/attestations/manifest.json"
+manifest_path="$MANIFEST_PATH"
 if [[ -f "$manifest_path" ]]; then
   manifest_categories="$(jq -c '[.slots[]?.category] | unique' "$manifest_path")"
   unknown_artifact_categories="$(jq -r --argjson allowed "$manifest_categories" '
@@ -571,7 +695,14 @@ fi
 
 # Signature verification.
 sig_method="$(jq -r '.signature.method // ""' <<<"$bundle_json")"
+if ! release_signer_matches "$(jq -c '.signature' <<<"$bundle_json")"; then
+  record_check "release_signer" false "bundle signer is not authorized by external release policy"
+  sig_method="release-untrusted"
+elif [[ "$VERIFICATION_MODE" == release_policy ]]; then
+  record_check "release_signer" true "bundle Ed25519 key matches the external trust root"
+fi
 case "$sig_method" in
+  release-untrusted) ;;
   sigstore-cosign-keyless)
     sigstore_path="$(jq -r '.signature.sigstore_bundle.path // ""' <<<"$bundle_json")"
     sigstore_expected_hash="$(jq -r '.signature.sigstore_bundle.sha256 // ""' <<<"$bundle_json")"
@@ -611,18 +742,18 @@ case "$sig_method" in
       record_check "signature" false "cosign not installed; cannot verify sigstore-cosign-keyless"
     else
       sigstore_abs="$REPO_ROOT/$sigstore_path"
-      canon_tmp="$(mktemp)"
+      ensure_verification_workdir
+      canon_tmp="$(mktemp "$VERIFY_WORKDIR/payload.XXXXXX")"
       printf '%s' "$canonical_payload" > "$canon_tmp"
       if cosign verify-blob \
           --bundle "$sigstore_abs" \
           --certificate-identity "$cert_identity" \
           --certificate-oidc-issuer "$cert_issuer" \
-          "$canon_tmp" >/dev/null 2>&1; then
+          "$canon_tmp" >"$canon_tmp.verify.log" 2>&1; then
         record_check "signature" true "cosign verify-blob ok (identity=$cert_identity)"
       else
         record_check "signature" false "cosign verify-blob failed (identity=$cert_identity, issuer=$cert_issuer)"
       fi
-      rm -f "$canon_tmp"
     fi
     ;;
   ed25519)
@@ -646,9 +777,10 @@ case "$sig_method" in
           if ! is_hex_len "$signature_hex" 128; then
             record_check "signature" false "ed25519 signature file must contain a 64-byte hex signature"
           else
-            canon_tmp="$(mktemp)"
-            pubkey_der_tmp="$(mktemp)"
-            sig_tmp="$(mktemp)"
+            ensure_verification_workdir
+            canon_tmp="$(mktemp "$VERIFY_WORKDIR/payload.XXXXXX")"
+            pubkey_der_tmp="$(mktemp "$VERIFY_WORKDIR/public-key.XXXXXX")"
+            sig_tmp="$(mktemp "$VERIFY_WORKDIR/signature.XXXXXX")"
             printf '%s' "$canonical_payload" > "$canon_tmp"
             # SubjectPublicKeyInfo DER prefix for Ed25519 (RFC 8410) followed by
             # the raw 32-byte public key from the attestation schema.
@@ -661,13 +793,12 @@ case "$sig_method" in
                 -keyform DER \
                 -inkey "$pubkey_der_tmp" \
                 -sigfile "$sig_tmp" \
-                -in "$canon_tmp" >/dev/null 2>&1; then
+                -in "$canon_tmp" >"$canon_tmp.verify.log" 2>&1; then
               key_fingerprint="$(printf '%s' "$public_key" | sha256_stdin)"
               record_check "signature" true "ed25519 verify ok (public_key_sha256=$key_fingerprint)"
             else
               record_check "signature" false "ed25519 verify failed (signature_path=$signature_path)"
             fi
-            rm -f "$canon_tmp" "$pubkey_der_tmp" "$sig_tmp"
           fi
         fi
       fi
@@ -718,14 +849,24 @@ if [[ $JSON_OUTPUT -eq 1 ]]; then
   fi
   jq -n \
     --argjson ok "$output_ok" \
+    --arg verification_mode "$VERIFICATION_MODE" \
+    --arg policy_sha256 "$POLICY_SHA256" \
+    --arg verification_evidence_dir "$VERIFY_WORKDIR" \
     --arg verdict "$verdict" \
     --arg bundle "$BUNDLE" \
     --arg bundle_sha256 "$bundle_file_sha256" \
     --argjson checks "$checks_arr" \
     --argjson errors "$errors_arr" \
     --argjson retractions "$retractions_arr" \
-    '{ok:$ok, verdict:$verdict, bundle:$bundle, bundle_sha256:$bundle_sha256, checks:$checks, errors:$errors, retractions:$retractions}'
+    '{ok:$ok, verdict:$verdict, verification_mode:$verification_mode,
+      publisher_authenticated: ($ok and $verification_mode == "release_policy"),
+      policy_sha256:$policy_sha256, verification_evidence_dir:$verification_evidence_dir,
+      bundle:$bundle, bundle_sha256:$bundle_sha256, checks:$checks, errors:$errors, retractions:$retractions}'
 else
+  printf 'Verification mode: %s\n' "$VERIFICATION_MODE"
+  if [[ "$VERIFICATION_MODE" == development_integrity ]]; then
+    echo 'Development integrity only; publisher identity and release qualification are unproven.'
+  fi
   for c in "${checks[@]}"; do
     cok="$(jq -r '.ok' <<<"$c")"
     cname="$(jq -r '.name' <<<"$c")"

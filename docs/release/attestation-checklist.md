@@ -123,12 +123,18 @@ the build script) or claim coverage that doesn't exist.
 
 ```sh
 ED25519_PRIVATE_KEY_PATH=release-ed25519.pem \
-  scripts/attestation-build.sh --version 0.X.0 --channel stable --sign ed25519
+  scripts/attestation-build.sh --version 0.X.0 --channel stable --sign ed25519 \
+    --profile release-interactive --target aarch64-apple-darwin
 ```
 
-Run this as a retained DSR quality/release step. A DSR installation with an
-explicitly configured non-GitHub OIDC issuer may instead select `--sign
-cosign`; GitHub Actions identities and workflow refs are forbidden.
+Run this as a retained DSR quality/release step, repeating `--target` for every
+shipped Rust target. These flags bind the declared build identity into the
+signature; retain the corresponding DSR build receipts to prove the identity.
+Non-development builds require the interactive profile, target set and complete
+non-deferred artifacts. A DSR installation with an explicitly configured
+non-GitHub OIDC issuer may still build a cosign bundle, but the external release
+policy currently accepts Ed25519 only. GitHub Actions identities and workflow
+refs are forbidden.
 
 Outputs:
 - `docs/attestations/0.X.0.json` — the signed bundle
@@ -152,7 +158,8 @@ drift the schema.
 ## Verify: re-derive every hash
 
 ```sh
-scripts/attestation-verify.sh docs/attestations/0.X.0.json
+scripts/attestation-verify.sh docs/attestations/0.X.0.json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
 ```
 
 The verifier:
@@ -161,26 +168,81 @@ The verifier:
 3. Recomputes the canonical signing payload.
 4. Checks the `taxonomy_coverage` summary from
    `docs/proof-taxonomy.json`.
-5. Verifies the optional sigstore signature against the DSR-configured
-   `COSIGN_IDENTITY`, or verifies the
-   Ed25519 signature against the bundle's `signature.public_key`.
-6. Exits 0 on full pass; non-zero on any check failure.
+5. Requires the Ed25519 key to match the independently configured release
+   policy, then verifies the signature. The same authority applies to retractions.
+6. Checks signer validity and revocation, bundle freshness, exact release,
+   source commit/tree, target set, interactive profile and canonical manifest
+   hash. Every required manifest slot needs one matching artifact; deferred
+   slots are rejected.
+7. Exits 0 on full pass; non-zero on any check failure. Signature verification
+   inputs and crypto diagnostics are retained for offline inspection.
 
 For machine-readable output (DSR quality gates):
 
 ```sh
-scripts/attestation-verify.sh docs/attestations/0.X.0.json --json
+scripts/attestation-verify.sh docs/attestations/0.X.0.json --json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
 ```
 
-The current verifier accepts unsigned development bundles and uses a
-bundle-supplied Ed25519 key. That proves self-consistency, not release-owner
-identity. Externally pinned trust and strict release verification are
-unfinished in `ft-xxfwy.49`; do not close release integrity using exit zero
-from this development verifier alone.
+Without `--release-policy`, the verifier reports
+`verification_mode: development_integrity` and `publisher_authenticated: false`,
+including for a valid self-signature. The DSR development-bundle quality check
+uses this mode. `--strict-required` alone still permits declared deferred
+categories; release policy implies both strict-required and strict-deferred.
 
-The `--strict-required` flag adds: fail if the bundle's
-`required_categories` list doesn't match the canonical
-manifest. Use this in the DSR release gate.
+`FT_ATTESTATION_RELEASE_POLICY` supplies the same policy through the existing
+`ft attestation verify` command. `FT_ATTESTATION_MANIFEST` may select a retained
+manifest for offline replay; its hash must match the external policy. Never
+construct a trusted policy by accepting a downloaded bundle's self-description.
+The operator owns the key, validity interval, expected identities and approved
+manifest digest. The file contains public verification material only:
+
+```json
+{
+  "schema_version": "frankenterm.release-attestation-policy.v1",
+  "signer": {
+    "method": "ed25519",
+    "public_key": "<64 lowercase hex digits from the independent trust root>",
+    "revoked": false,
+    "not_before": 0,
+    "not_after": 0
+  },
+  "max_age_seconds": 86400,
+  "release": {"version": "0.X.0", "tag": "v0.X.0", "channel": "stable"},
+  "git": {"commit": "<40 hex digits>", "tree": "<40 hex digits>"},
+  "build": {"profile": "release-interactive", "targets": ["aarch64-apple-darwin"]},
+  "manifest_sha256": "<64 lowercase hex digits>"
+}
+```
+
+This is an intentionally invalid template: replace the key, identities and UTC
+epoch validity endpoints from operator-owned records. Targets must be sorted
+and unique. Verification checks current time and signed `generated_at`; offline
+replay does not bypass expiry. Rotations and revocations require updating the
+operator's trust configuration. No production policy or key is generated by
+the verifier or its tests.
+
+These checks authenticate signed claims and artifact bytes. Native execution,
+actual build profiles and live-service behavior still require their producing
+receipts. `ft-xxfwy.49` remains open until the DSR release/installer/canary
+closeout invokes this mode with the operator's production trust policy.
+
+The existing release verifier can enforce the policy alongside the exact DSR
+asset set. Pass both inputs for published-release verification:
+
+```sh
+scripts/release/verify-release.sh 0.X.0 \
+  --attestation-bundle docs/attestations/0.X.0.json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
+```
+
+For offline verification, replace the version with `--manifest <DSR-manifest>`
+and `--assets-dir <downloaded-assets>`. The verifier retains bounded copies of
+the policy and bundle, checks the authenticated source, version, profile and
+four Rust targets against the DSR manifest, then verifies the existing signed
+17-file asset set. The attestation inputs stay outside that asset directory.
+Omitting both inputs verifies the artifact set only; supplying just one fails.
+Retain the resulting receipt with the separate installer and canary results.
 
 ## Tag + publish: DSR only
 
@@ -204,15 +266,16 @@ do not create a parallel checkout for this procedure:
 
 ```sh
 git rev-parse HEAD    # must match the candidate identity in the receipt
-scripts/attestation-verify.sh docs/attestations/0.X.0.json --strict-required
+scripts/attestation-verify.sh docs/attestations/0.X.0.json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
 ```
 
-Exit zero establishes the implemented structural/hash checks. It does not
-establish external signing authority, current-source runtime proof, or
-passed target qualification. Finish `ft-xxfwy.49` and retain the configured
-DSR release verification before making those claims. A failed verification
-blocks the candidate; investigate the exact artifact and trust failure
-before deciding on any published-release remediation.
+Retain the policy digest, verified bundle digest, crypto inputs and DSR release
+verification result together. A passing release-policy check authenticates
+the configured signing authority and the declared release bindings. It does
+not establish current-source runtime proof or passed target qualification.
+A failed verification blocks the candidate; investigate the exact artifact
+and trust failure before deciding on any published-release remediation.
 
 ## Demonstration: missing artifact fails the build
 
