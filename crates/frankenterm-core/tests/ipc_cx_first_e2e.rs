@@ -16,7 +16,9 @@
 #![cfg(all(unix, feature = "asupersync-runtime"))]
 
 use frankenterm_core::events::EventBus;
-use frankenterm_core::ipc::{IpcRequest, IpcResponse, IpcServer};
+use frankenterm_core::ipc::{
+    IpcRequest, IpcResponse, IpcRuntimeLimits, IpcServer, MAX_MESSAGE_SIZE,
+};
 use frankenterm_core::runtime_async::unix::{AsyncReadExt, AsyncWriteExt};
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, mpsc, task, unix as ft_unix};
 use std::future::Future;
@@ -229,5 +231,104 @@ fn ipc_cx_first_multiple_concurrent_clients() {
         let _ = frankenterm_core::runtime_async::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server join should not time out");
+    });
+}
+
+#[test]
+fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grace() {
+    run_async_test(async {
+        for mode in ["empty", "partial", "subscription"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("stop.sock");
+            let cx = frankenterm_core::cx::for_testing();
+            let limits = IpcRuntimeLimits {
+                max_message_size: MAX_MESSAGE_SIZE,
+                accept_poll_interval_ms: 10,
+                max_concurrent_connections: 1,
+                initial_request_timeout_ms: 5_000,
+                io_timeout_ms: 1_000,
+            };
+            let server = IpcServer::bind_with_permissions_and_limits_with_cx(
+                &cx,
+                &path,
+                Some(0o600),
+                limits,
+            )
+            .await
+            .unwrap();
+            let event_bus = Arc::new(EventBus::new(16));
+            let server_bus = Arc::clone(&event_bus);
+            let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+            let run_cx = cx.clone();
+            let server_task = task::spawn(async move {
+                server.run_with_cx(&run_cx, server_bus, shutdown_rx).await;
+            });
+
+            let mut client = ft_unix::connect(&path).await.unwrap();
+            match mode {
+                "partial" => client.write_all(br#"{"type":"ping""#).await.unwrap(),
+                "subscription" => {
+                    let mut request = serde_json::to_vec(&IpcRequest::SubscribeEvents {
+                        pane: None,
+                        severity: None,
+                        rule_id: None,
+                        heartbeat_interval_ms: 0,
+                    })
+                    .unwrap();
+                    request.push(b'\n');
+                    client.write_all(&request).await.unwrap();
+                    frankenterm_core::runtime_async::timeout_with_cx(
+                        &cx,
+                        Duration::from_millis(500),
+                        async {
+                            while event_bus.subscriber_count() == 0 {
+                                frankenterm_core::runtime_async::sleep_with_cx(
+                                    &cx,
+                                    Duration::from_millis(1),
+                                )
+                                .await
+                                .unwrap();
+                            }
+                        },
+                    )
+                    .await
+                    .expect("real event subscription must be installed before shutdown");
+                }
+                _ => {}
+            }
+
+            // The second socket can reach EOF this quickly only after the
+            // first has actually occupied the sole connection slot. This
+            // prevents shutdown-before-accept from making the test pass.
+            let mut capacity_probe = ft_unix::connect(&path).await.unwrap();
+            let mut byte = [0u8; 1];
+            let count = frankenterm_core::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_millis(500),
+                capacity_probe.read(&mut byte),
+            )
+            .await
+            .expect("capacity probe must reach the real accept loop")
+            .expect("capacity rejection must close the probe socket");
+            assert_eq!(count, 0, "first {mode} connection must already be accepted");
+
+            frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ())
+                .await
+                .unwrap();
+            frankenterm_core::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_millis(500),
+                server_task,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("accepted {mode} client exhausted idle shutdown budget"))
+            .expect("server task must settle successfully");
+            assert!(!path.exists(), "owned socket must be retired for {mode}");
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "subscription must be dropped"
+            );
+        }
     });
 }

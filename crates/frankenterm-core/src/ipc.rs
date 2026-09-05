@@ -1245,7 +1245,7 @@ pub struct IpcHandlerContext {
     pub watcher_control_handler: Option<IpcWatcherControlHandler>,
     /// Optional search configuration for IPC status enrichment.
     pub search_config: Option<SearchConfig>,
-    rpc_shutdown: crate::runtime_async::process::CommandCancellation,
+    connection_shutdown: crate::runtime_async::process::CommandCancellation,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
@@ -1260,7 +1260,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
-            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 
@@ -1274,7 +1274,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
-            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 
@@ -1292,7 +1292,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
-            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 
@@ -1344,7 +1344,7 @@ impl IpcHandlerContext {
             rpc_handler,
             watcher_control_handler,
             search_config,
-            rpc_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
 }
@@ -1699,7 +1699,7 @@ impl IpcServer {
 
         // RPC owners must observe cancellation and finish bounded process
         // settlement before their connection future can be dropped.
-        ctx.rpc_shutdown.cancel();
+        ctx.connection_shutdown.cancel();
         let drain_cx = crate::cx::for_request();
         let cooperative_drain = crate::runtime_async::timeout_with_cx(
             &drain_cx,
@@ -2222,12 +2222,19 @@ async fn handle_client_with_context_with_cx(
         socket_transport::buffered(bounded_reader),
         IpcRuntimeLimits::line_cap_for(max_message_size),
     );
-    let request_line = crate::runtime_async::timeout_with_cx(
-        &cx,
-        limits.initial_request_timeout(),
-        socket_transport::next_line_with_cx(&cx, &mut lines),
+    let request_line = match futures::future::select(
+        Box::pin(wait_for_ipc_shutdown(&cx, &ctx)),
+        Box::pin(crate::runtime_async::timeout_with_cx(
+            &cx,
+            limits.initial_request_timeout(),
+            socket_transport::next_line_with_cx(&cx, &mut lines),
+        )),
     )
-    .await;
+    .await
+    {
+        futures::future::Either::Left(_) => return Ok(()),
+        futures::future::Either::Right((result, _)) => result,
+    };
     if classify_ipc_line_read_deadline(request_line.is_err())
         == IpcLineReadDeadlineOutcome::TimedOut
     {
@@ -2240,6 +2247,9 @@ async fn handle_client_with_context_with_cx(
     let Some(line) = request_line? else {
         return Ok(());
     };
+    if ctx.connection_shutdown.is_cancelled() || cx.checkpoint().is_err() {
+        return Ok(());
+    }
 
     if line.len() > max_message_size {
         let response = IpcResponse::error("message too large");
@@ -2303,18 +2313,27 @@ async fn handle_client_with_context_with_cx(
         heartbeat_interval_ms,
     } = &envelope.request
     {
-        return stream_subscribe_events(
-            &cx,
-            &mut writer,
-            &ctx,
-            *pane,
-            severity.clone(),
-            rule_id.clone(),
-            *heartbeat_interval_ms,
-            limits.io_timeout(),
-            limits.max_message_size,
+        // A subscription owns no child process. Close it promptly on server
+        // shutdown even while it is waiting for an event or a blocked write.
+        return match futures::future::select(
+            Box::pin(wait_for_ipc_shutdown(&cx, &ctx)),
+            Box::pin(stream_subscribe_events(
+                &cx,
+                &mut writer,
+                &ctx,
+                *pane,
+                severity.clone(),
+                rule_id.clone(),
+                *heartbeat_interval_ms,
+                limits.io_timeout(),
+                limits.max_message_size,
+            )),
         )
-        .await;
+        .await
+        {
+            futures::future::Either::Left(_) => Ok(()),
+            futures::future::Either::Right((result, _)) => result,
+        };
     }
 
     let response = if matches!(&envelope.request, IpcRequest::Rpc { .. }) {
@@ -2362,12 +2381,19 @@ async fn handle_client_with_context_with_cx(
             socket_transport::buffered(bounded_reader),
             IpcRuntimeLimits::line_cap_for(max_message_size),
         );
-        let request_line = crate::runtime_async::timeout_with_cx(
-            &cx,
-            limits.initial_request_timeout(),
-            socket_transport::next_line_with_cx(&cx, &mut lines),
+        let request_line = match futures::future::select(
+            Box::pin(wait_for_ipc_shutdown(&cx, &ctx)),
+            Box::pin(crate::runtime_async::timeout_with_cx(
+                &cx,
+                limits.initial_request_timeout(),
+                socket_transport::next_line_with_cx(&cx, &mut lines),
+            )),
         )
-        .await;
+        .await
+        {
+            futures::future::Either::Left(_) => return Ok(()),
+            futures::future::Either::Right((result, _)) => result,
+        };
         if classify_ipc_line_read_deadline(request_line.is_err())
             == IpcLineReadDeadlineOutcome::TimedOut
         {
@@ -2382,6 +2408,9 @@ async fn handle_client_with_context_with_cx(
         };
         line
     };
+    if ctx.connection_shutdown.is_cancelled() || cx.checkpoint().is_err() {
+        return Ok(());
+    }
 
     if line.len() > max_message_size {
         let response = IpcResponse::error("message too large");
@@ -2932,6 +2961,21 @@ async fn handle_request_with_context_with_cx(
     }
 }
 
+/// Wake both unread connections and admitted RPC owners on the same server
+/// stop signal, without cancelling their shared caller Cx. Only the former
+/// may drop their work immediately; admitted RPCs must await settlement.
+#[cfg(any(unix, windows))]
+async fn wait_for_ipc_shutdown(cx: &crate::cx::Cx, ctx: &IpcHandlerContext) {
+    while !ctx.connection_shutdown.is_cancelled() {
+        if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 /// Retain the handler after disconnect/shutdown so its owned process reports
 /// settlement. A per-request signal must not cancel the shared server Cx.
 #[cfg(any(unix, windows))]
@@ -2961,17 +3005,11 @@ where
         max_output_bytes: limits.max_message_size.saturating_sub(1024),
     };
     let stop = async {
-        let shutdown = async {
-            while !ctx.rpc_shutdown.is_cancelled() {
-                if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        };
-        let _ = futures::future::select(Box::pin(disconnect), Box::pin(shutdown)).await;
+        let _ = futures::future::select(
+            Box::pin(disconnect),
+            Box::pin(wait_for_ipc_shutdown(cx, ctx)),
+        )
+        .await;
     };
     match futures::future::select(Box::pin(stop), handler(request)).await {
         futures::future::Either::Right((response, _)) => response,
