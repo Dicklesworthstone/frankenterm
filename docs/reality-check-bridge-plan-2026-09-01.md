@@ -1142,3 +1142,76 @@ injection or request-controlled webhook URLs. Source reviews and the retained
 scanner reports do **not** assert that every warning in the whole codebase is
 resolved. The CLI scan's detailed JSON is malformed by unescaped samples;
 its summary and raw findings are retained under `/tmp/ft-reality-ubs-4.*`.
+
+The corrected watcher fixture passed **3/3 tests** at
+`115e6fcf60b23ca8ba5dcc7c5ca460c12d7492fb`, clean baseline/no overlay, worker
+`ovh-a`, job `j-30004650170122922`, on September 4 at 23:00 UTC. The production
+factory, configured deny/allowed control with real SQLite audit, and persisted
+switch failure cases all passed; 947 unrelated tests were filtered out.
+Transcript: `/tmp/ft-reality-20260904-watcher-rch-final.log`. This supersedes
+the failed fixture run above. It does not prove cross-process switch freshness
+(`.42`) or the real-agent loop (`.9`).
+
+The first final integration and formatting verification used committed baseline
+`6a70baccfd33ad5b042b88f7e0493de8f3a9d6bb`, containing the final webhook and
+erasure cases. Worker `ovh-a`, job `j-30004650170122931`, ran the connector
+conformance, redactor corpus, statistics properties, and exact workspace-format
+test together. Connector conformance passed **5/5**, statistics properties
+**6/6**, and redactor corpus/report checks **6/6**. The last target failed on
+formatting differences; this combined command exited 101 and is not a format
+pass. The differences were manually applied. Property tests also warned that
+the default source-relative persistence lookup could not find a crate root in
+the generated harness; their configuration now uses the existing project
+pattern of a manifest-relative direct regression file. No persistence was
+disabled. The redactor report emitted informational drift, which remains part
+of `.60`'s outstanding independent-oracle/report verification rather than an
+automatically blessed artifact. Transcript:
+`/tmp/ft-reality-20260904-integration-format-rch-final.log`.
+
+Commit `9327f0e4f5556ec88bb2a9172f932f6519dadd6a` retains those corrections and
+the truthful subscriber comment. Its combined rerun passed **109/109 core
+tests**, **6/6 statistics properties**, and **1/1 workspace-format test** on
+worker `ovh-a`, job `j-30004650170122938`, at 23:51 UTC. The core selection was
+41 erasure, 41 statistics, 20 coverage-matrix, three provenance, one connector
+refusal and three webhook tests; 31,207 unrelated lib tests were filtered out.
+The property and formatting targets had zero filtered tests. The formatter
+emitted `WORKSPACE_FORMAT_PROOF_SUCCESS` for that exact SHA and
+`rch-clean-baseline-no-overlay-v1`; the retained command used clean baseline
+and no overlay, fingerprint
+`fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195`.
+The property persistence warning did not recur. Transcript:
+`/tmp/ft-reality-20260904-core-property-format-rch-final.log`.
+Required workspace check/clippy remain pending until their retained results
+are recorded; these focused test passes do not stand in for those checks.
+
+The final acceptance readback keeps `.46`, `.58`, and `.60` and their companions
+open even if their current selected tests pass. The connector regression passes
+an event value directly to a runtime helper, not through the EventBus subscriber;
+configured admission, distinct routing/denial controls and structured refusal
+assertions remain. Its dispatcher currently refuses before mesh routing, so
+the contract's distinct runtime routing result needs additional behavior; do
+not restore synthetic host health or completion to satisfy it. The subscriber
+comment was corrected to match that refusal. Erasure still needs seeded larger
+configuration recovery and serialization composed with survivor recovery.
+Redactor verification still needs the promised independent byte-mask comparison
+through production output, metadata and the report. Aggregate corpus checks
+alone do not supply that oracle. These are concrete remaining acceptance items,
+not discarded goals or completed test tasks.
+
+Independent arithmetic verification is retained in
+`/tmp/ft-reality-20260904-math-oracle.py` and `.json`: **153 assertions passed**.
+The script checks 25 upper-KL endpoint cases, all 15 documented sample-size
+floors and their predecessor failures, confidence spending, cross-stream alpha
+allocation, and the historical latency arithmetic. Sixty-digit Decimal
+calculation gives the Bernstein fixture endpoint
+`0.634479427757555619541904355730471204858366495552636412008506`, agreeing with
+the production unit test's independently specified constant within `1e-12`.
+The historical `8.5ms` remains above `8 + 10/150ms`, by `5.3719008264%`;
+20% agreement is not bound satisfaction. An initial binary-float residual
+oracle was ill-conditioned near risk one; increasing arithmetic precision
+resolved it without loosening the declared tolerance. Script SHA-256:
+`46164767d2d2dfa002944585f83c8e3352b5da831d95d81f06db7de61371e58a`;
+result SHA-256:
+`575457b44d5d5d159960a9c92b506ce09278e2fb34c9eac3c9d302bd45ef45b1`.
+This verifies calculations, not IID/exchangeability assumptions, production
+calibration, fresh measurements, or a deployed statistical gate.
