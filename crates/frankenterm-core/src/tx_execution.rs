@@ -1938,7 +1938,9 @@ mod mission_revision_wire {
             serde::de::Error::custom("mission revision must be a canonical decimal u64 string")
         })?;
         if text != revision.to_string() {
-            return Err(serde::de::Error::custom("mission revision is not canonical decimal text"));
+            return Err(serde::de::Error::custom(
+                "mission revision is not canonical decimal text",
+            ));
         }
         Ok(revision)
     }
@@ -7086,7 +7088,14 @@ mod tests {
 
     #[test]
     fn mission_store_revision_token_preserves_every_bit_through_json_and_toon() {
-        for revision in [0, 1, (1_u64 << 53) - 1, 1_u64 << 53, (1_u64 << 53) + 1, u64::MAX] {
+        for revision in [
+            0,
+            1,
+            (1_u64 << 53) - 1,
+            1_u64 << 53,
+            (1_u64 << 53) + 1,
+            u64::MAX,
+        ] {
             let token = MissionRevisionToken {
                 mission_id: "mission:wire-control".to_string(),
                 generation: "0123456789abcdef0123456789abcdef".to_string(),
@@ -7095,21 +7104,42 @@ mod tests {
             };
             let json = serde_json::to_value(&token).unwrap();
             assert_eq!(json["revision"], revision.to_string());
-            assert_eq!(serde_json::from_value::<MissionRevisionToken>(json.clone()).unwrap(), token);
+            assert_eq!(
+                serde_json::from_value::<MissionRevisionToken>(json.clone()).unwrap(),
+                token
+            );
             let encoded = toon_rust::encode(json.clone(), None);
             let decoded = toon_rust::try_decode(&encoded, None).unwrap();
-            let decoded_json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
-            assert_eq!(serde_json::from_str::<MissionRevisionToken>(&decoded_json).unwrap(), token);
+            let decoded_json =
+                toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+            assert_eq!(
+                serde_json::from_str::<MissionRevisionToken>(&decoded_json).unwrap(),
+                token
+            );
             let mut lossy_numeric = json;
             lossy_numeric["revision"] = serde_json::json!(revision);
             assert!(serde_json::from_value::<MissionRevisionToken>(lossy_numeric).is_err());
         }
-        for invalid in ["", "-1", "+1", "01", "1.0", "1e0", "18446744073709551616", " 1"] {
+        for invalid in [
+            "",
+            "-1",
+            "+1",
+            "01",
+            "1.0",
+            "1e0",
+            "18446744073709551616",
+            " 1",
+        ] {
             let value = serde_json::json!({"mission_id": "mission:wire-control", "generation": "0".repeat(32),
                 "revision": invalid, "content_sha256": "a".repeat(64)});
-            assert!(serde_json::from_value::<MissionRevisionToken>(value).is_err(), "accepted revision {invalid:?}");
+            assert!(
+                serde_json::from_value::<MissionRevisionToken>(value).is_err(),
+                "accepted revision {invalid:?}"
+            );
         }
-        println!("MISSION_REVISION_WIRE exact_u64_boundaries=6 invalid_text_controls=8 numeric_tokens_refused=true");
+        println!(
+            "MISSION_REVISION_WIRE exact_u64_boundaries=6 invalid_text_controls=8 numeric_tokens_refused=true"
+        );
     }
 
     #[cfg(unix)]

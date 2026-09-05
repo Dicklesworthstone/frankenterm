@@ -13016,7 +13016,7 @@ impl ToolHandler for WaMissionPauseTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "expected_token": { "type": "object", "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected." },
+                    "expected_token": super::mcp_missions::mission_revision_token_schema(),
                     "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
                     "reason": { "type": "string", "description": "Reason code for the pause (required)" },
                     "requested_by": { "type": "string", "description": "Who requested the pause (default: mcp-agent)" }
@@ -13178,7 +13178,7 @@ impl ToolHandler for WaMissionResumeTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "expected_token": { "type": "object", "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected." },
+                    "expected_token": super::mcp_missions::mission_revision_token_schema(),
                     "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
                     "requested_by": { "type": "string", "description": "Who requested the resume (default: mcp-agent)" }
                 },
@@ -13333,7 +13333,7 @@ impl ToolHandler for WaMissionAbortTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "expected_token": { "type": "object", "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected." },
+                    "expected_token": super::mcp_missions::mission_revision_token_schema(),
                     "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
                     "reason": { "type": "string", "description": "Reason code for the abort (required)" },
                     "requested_by": { "type": "string", "description": "Who requested the abort (default: mcp-agent)" },

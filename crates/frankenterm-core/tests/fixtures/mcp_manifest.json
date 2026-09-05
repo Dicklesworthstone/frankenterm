@@ -1134,7 +1134,15 @@
             "type": "string"
           },
           "expected_token": {
-            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected.",
+            "additionalProperties": false,
+            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+            "properties": {
+              "content_sha256": { "maxLength": 64, "minLength": 64, "pattern": "^[0-9a-f]{64}$", "type": "string" },
+              "generation": { "type": "string" },
+              "mission_id": { "type": "string" },
+              "revision": { "maxLength": 20, "pattern": "^(0|[1-9][0-9]{0,19})$", "type": "string" }
+            },
+            "required": ["mission_id", "generation", "revision", "content_sha256"],
             "type": "object"
           },
           "format": {
@@ -1354,7 +1362,15 @@
         "additionalProperties": false,
         "properties": {
           "expected_token": {
-            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected.",
+            "additionalProperties": false,
+            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+            "properties": {
+              "content_sha256": { "maxLength": 64, "minLength": 64, "pattern": "^[0-9a-f]{64}$", "type": "string" },
+              "generation": { "type": "string" },
+              "mission_id": { "type": "string" },
+              "revision": { "maxLength": 20, "pattern": "^(0|[1-9][0-9]{0,19})$", "type": "string" }
+            },
+            "required": ["mission_id", "generation", "revision", "content_sha256"],
             "type": "object"
           },
           "format": {
@@ -1400,7 +1416,15 @@
         "additionalProperties": false,
         "properties": {
           "expected_token": {
-            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected.",
+            "additionalProperties": false,
+            "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+            "properties": {
+              "content_sha256": { "maxLength": 64, "minLength": 64, "pattern": "^[0-9a-f]{64}$", "type": "string" },
+              "generation": { "type": "string" },
+              "mission_id": { "type": "string" },
+              "revision": { "maxLength": 20, "pattern": "^(0|[1-9][0-9]{0,19})$", "type": "string" }
+            },
+            "required": ["mission_id", "generation", "revision", "content_sha256"],
             "type": "object"
           },
           "format": {

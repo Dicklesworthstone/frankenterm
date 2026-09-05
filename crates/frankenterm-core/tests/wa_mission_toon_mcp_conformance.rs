@@ -235,6 +235,14 @@ fn canonicalize(value: &mut Value) {
                 canonicalize(item);
             }
         }
+        Value::Number(number) if number.is_f64() => {
+            let value = number.as_f64().unwrap();
+            // TOON decodes ordinary counters as f64. Normalize only exactly
+            // representable small integers; authority tokens stay strings.
+            if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0 {
+                *number = serde_json::Number::from(value as i64);
+            }
+        }
         _ => {}
     }
 }
@@ -408,6 +416,93 @@ fn seed_paused_mission(harness: &mut TestHarness) {
     );
 }
 
+fn assert_toon_token_can_authorize_exactly_one_mutation() {
+    use frankenterm_core::tx_execution::MissionRevisionToken;
+
+    let mut harness = new_harness();
+    let path = mission_file_path(harness.workspace.path());
+    let mut mission = make_running_mission();
+    mission.revision = (1_u64 << 53) + 1;
+    mission.validate().unwrap();
+    write_json(&path, &mission);
+
+    let state = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.mission_state",
+                json!({
+                    "format": "toon", "mission_file": path
+                }),
+            )
+            .unwrap(),
+        "toon",
+    );
+    assert_success_envelope_shape(&state, "large revision state");
+    let token = state["data"]["revision_token"].clone();
+    assert_eq!(token["revision"], "9007199254740993");
+    assert_eq!(
+        serde_json::from_value::<MissionRevisionToken>(token.clone()).unwrap(),
+        MissionRevisionToken::from_mission(&mission).unwrap()
+    );
+
+    let paused = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.mission_pause",
+                json!({
+                    "format": "toon", "mission_file": path,
+                    "reason": "large_revision_roundtrip", "expected_token": token
+                }),
+            )
+            .unwrap(),
+        "toon",
+    );
+    assert_success_envelope_shape(&paused, "large revision pause");
+    assert_mission_response_authority(&paused, &mission, &path);
+    assert_eq!(
+        paused["data"]["mutation"]["current"]["revision"],
+        "9007199254740994"
+    );
+    let accepted = fs::read(&path).unwrap();
+
+    let stale = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.mission_abort",
+                json!({
+                    "format": "toon", "mission_file": path,
+                    "reason": "stale_large_revision", "expected_token": token
+                }),
+            )
+            .unwrap(),
+        "toon",
+    );
+    assert_common_envelope_fields(&stale, false, "stale large revision");
+    assert_eq!(stale["error_code"], "mission.revision_conflict");
+    assert_eq!(fs::read(&path).unwrap(), accepted);
+
+    let mut numeric_token = paused["data"]["mutation"]["current"].clone();
+    numeric_token["revision"] = json!(mission.revision + 1);
+    let refused = harness
+        .client
+        .call_tool(
+            "wa.mission_resume",
+            json!({
+                "format": "toon", "mission_file": path, "expected_token": numeric_token
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+    assert_boundary_error_contains(&refused, "expected_token.revision");
+    assert_eq!(fs::read(&path).unwrap(), accepted);
+    println!(
+        "MISSION_TOON_AUTHORITY revision=9007199254740993 real_mcp_roundtrip=true durable_pause=true stale_abort_no_write=true numeric_token_refused=true"
+    );
+}
+
 fn assert_mission_response_authority(envelope: &Value, before: &Mission, path: &Path) {
     use frankenterm_core::tx_execution::MissionRevisionToken;
     let after: Mission = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -525,6 +620,7 @@ fn capture_tool_contract(
 
 #[test]
 fn mcp_conformance_wa_mission_toon_and_boundary_contract_matches_golden() {
+    assert_toon_token_can_authorize_exactly_one_mutation();
     let captures = vec![
         capture_tool_contract(
             "wa.mission_state",

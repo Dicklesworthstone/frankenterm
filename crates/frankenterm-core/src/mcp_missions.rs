@@ -16,6 +16,22 @@ use super::{
     McpMissionTransitionInfo, McpTxTransitionInfo, MissionStateParams,
 };
 
+/// A revision is an opaque concurrency authority, not a floating-point counter.
+pub(super) fn mission_revision_token_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+        "additionalProperties": false,
+        "required": ["mission_id", "generation", "revision", "content_sha256"],
+        "properties": {
+            "mission_id": { "type": "string" },
+            "generation": { "type": "string" },
+            "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,19})$", "maxLength": 20 },
+            "content_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64 }
+        }
+    })
+}
+
 // ── Size caps for mission + tx contract file reads ──────────────────────
 //
 // [ft-up6u2] Mission files under `.ft/mission/*.json` have the same

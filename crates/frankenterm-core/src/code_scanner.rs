@@ -121,7 +121,10 @@ pub enum ScanErrorKind {
     #[error("scanner reported incomplete or inconsistent coverage")]
     PartialResult,
     #[error("scan I/O failed ({kind})")]
-    Io { kind: String },
+    Io {
+        #[serde(rename = "io_kind")]
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
