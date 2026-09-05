@@ -120158,7 +120158,7 @@ printf x > "$MINISIGN_MARKER"
             .expect("persisted receipt has one trailing newline");
         let stage_digest = hex::encode(sha2::Sha256::digest(serialized));
         let receipt_stage = destination.join(format!(
-            ".frankenterm-process-family/.install-receipt.{stage_digest}.writing"
+            ".frankenterm-process-family/.install-receipt.{stage_digest}.writing-v2"
         ));
         let victim = fixture.path().join("receipt-stage-symlink-victim");
         std::fs::write(&victim, b"must remain unchanged").expect("write receipt-stage victim");
