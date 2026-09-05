@@ -20,14 +20,17 @@
 # {name, status (pass|fail), detail}. A receipt is `pass` only when every step
 # passed; there is no skipped state.
 #
-# Known limits of the dev mux-server (recorded, not worked around):
-#   - Before ft-xxfwy.35 lands, `--config-file` is silently ignored and the
-#     server always binds RUNTIME_DIR/sock (~/.local/share/frankenterm/sock on
-#     macOS). The script therefore refuses to run if that socket is live.
-#   - Sends use --no-paste: the default bracketed paste is not executed by zsh.
+# FT_SMOKE_KILL_SWITCH=1 additionally exercises one long-lived watcher's real
+# compaction workflow against an owned PTY input recorder, before/after a trip
+# from the real CLI and after reset. This never launches a GUI or a real agent.
+# Every process gets a private workspace, config, home and socket. All evidence
+# is retained. FT_SMOKE_SOURCE_SHA binds an RCH invocation to its retained build
+# transcript; without it the receipt is explicitly only a development signal.
 set -u
+umask 077
 
 BIN_DIR="${1:-target/debug}"
+BIN_DIR=$(cd "$BIN_DIR" && pwd -P) || exit 2
 FT="$BIN_DIR/ft"
 MUX="$BIN_DIR/frankenterm-mux-server"
 for bin in "$FT" "$MUX"; do
@@ -35,22 +38,22 @@ for bin in "$FT" "$MUX"; do
 done
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd -P) || exit 2
-RELEASE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null) || {
-  echo "cannot bind smoke receipt to a release commit" >&2
-  exit 2
-}
+RELEASE_COMMIT="${FT_SMOKE_SOURCE_SHA:-}"
+SOURCE_AUTHORITY=retained_remote_build_transcript
+if [ -z "$RELEASE_COMMIT" ]; then
+  SOURCE_AUTHORITY=development_checkout_only
+  RELEASE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD) || {
+    echo "cannot bind smoke receipt to a release commit" >&2
+    exit 2
+  }
+fi
+[[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "source SHA must contain 40 lowercase hex digits" >&2; exit 2; }
 CODEC_VERSION=$(sed -nE \
   's/^pub const CODEC_VERSION: usize = ([0-9]+);$/\1/p' \
   "$REPO_ROOT/frankenterm/codec/src/lib.rs")
 case "$CODEC_VERSION" in
   ''|*[!0-9]*) echo "cannot bind smoke receipt to one codec version" >&2; exit 2 ;;
 esac
-
-SOCK="${SOCK:-$HOME/.local/share/frankenterm/sock}"
-if [ -S "$SOCK" ] && lsof -U 2>/dev/null | grep -q -- "$SOCK"; then
-  echo "refusing to run: $SOCK is already served by a live process" >&2
-  exit 2
-fi
 
 D="${2:-$(mktemp -d "${TMPDIR:-/tmp}/ft-smoke-XXXXXX")}"
 mkdir -p "$D/.ft"
