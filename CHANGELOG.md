@@ -5,9 +5,9 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.15.0` tag has a published GitHub Release; `backup-before-rewrite` is a tag only. The `v0.15.0` release was source-only and was superseded by the complete `v0.15.1` platform release.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.15.2` tag has a published GitHub Release; `backup-before-rewrite` is a tag only. The `v0.15.0` release was source-only, `v0.15.1` restored the platform matrix, and `v0.15.2` makes that matrix signed and installer-verifiable.
 
-Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) (2026-08-21). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
+Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) (2026-09-05). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
 ## Version Timeline
 
@@ -16,7 +16,7 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main) | HEAD | — | Next release |
-| [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) | Release | 2026-09-04 | Entry ramp: CLI finds the GUI, mux survives connects, `ft web` answers and streams live, signed assets |
+| [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) | Release | 2026-09-05 | Entry ramp: CLI finds the GUI, mux survives connects, `ft web` answers and streams live, signed assets |
 | [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
 | [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
@@ -34,7 +34,7 @@ Nothing yet.
 
 ---
 
-## [0.15.2] -- 2026-09-04 (GitHub Release)
+## [0.15.2] -- 2026-09-05 (GitHub Release)
 
 GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2>
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.15.2>
@@ -54,7 +54,7 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.
 - `codex.usage.reached` matches the shipped Codex binary's message casing ("Try again at …").
 - `ft tx run`/`ft tx rollback` resolve pane capabilities so `PromptActive` preconditions can pass from the CLI; `ft robot profile create` makes `profile apply` reachable; `policy.prompt_unknown` names `ft setup shell`.
 - `frankenterm-mux-server` installs a logger, logs its config source and bound sockets, and refuses an explicit `--config-file` that the config layer would silently skip (Lua files need `FRANKENTERM_LUA_CONFIG=1`; `frankenterm.toml` loads without it).
-- Installer: `--activate <generation> --idle-host-confirmed` promotes a candidate generation on an idle host; `scripts/release/verify-release.sh <tag>` verifies every asset's minisign signature and fails on unsigned artifacts (v0.15.1 fails it).
+- Installer: `--activate <generation> --idle-host-confirmed` promotes a candidate generation on an idle host; `scripts/release/verify-release.sh <tag>` verifies every asset's minisign signature and fails on unsigned artifacts (v0.15.1 fails it). `ft version --check` queries the public latest-release endpoint without loading workspace state and accepts only the exact uploaded, digest-bound 17-asset signed release closure, giving DSR canaries a real update-discovery path.
 - Release gates moved from the retired GitHub workflows to `scripts/release-gates.sh`; the orphan-source guard, `ft robot profile create` contract, and the headless observe smoke (`scripts/smoke/headless-mux-observe.sh`, JSON receipt) are new proof surfaces.
 - Docs: README truth sweep (schema v45, attestation path, DSR-only release wording, `metrics` feature, explicit-state-model wording, paste-vs-typed `ft send` contract, `ft setup shell`).
 
