@@ -162,7 +162,7 @@ impl Osc52ClipboardRequest {
         }
         let permit = Osc52PendingPermit::acquire(decoded_bytes)?;
         let id = OSC52_NEXT_REQUEST
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |id| id.checked_add(1),
@@ -1275,7 +1275,7 @@ mod tests {
                 Ok(())
             }
         }
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(ConsentConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(ConsentConfig);
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 2,
