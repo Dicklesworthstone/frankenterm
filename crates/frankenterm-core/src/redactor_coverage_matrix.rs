@@ -1620,6 +1620,328 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
 mod tests {
     use super::*;
     use crate::redactor::secret_pattern_names;
+    use sha2::{Digest, Sha256};
+
+    // Independent oracle: mark individual ORIGINAL bytes, without sorting,
+    // merging intervals or calling the production coverage classifier.
+    fn original_byte_mask(input: &str, ranges: &[(usize, usize)]) -> Result<Vec<bool>, usize> {
+        let mut mask = vec![false; input.len()];
+        for (index, &(start, end)) in ranges.iter().enumerate() {
+            let Some(span) = input.get(start..end).filter(|span| !span.is_empty()) else {
+                return Err(index);
+            };
+            for covered in &mut mask[start..start + span.len()] {
+                *covered = true;
+            }
+        }
+        Ok(mask)
+    }
+
+    struct ByteOracleFixture {
+        vector: RedactorTestVector,
+        removed: Vec<bool>,
+        output: String,
+    }
+
+    fn byte_oracle_fixture(
+        name: &str,
+        parts: &[(&str, bool)],
+        expect_whole: bool,
+    ) -> ByteOracleFixture {
+        // These fixture annotations specify the expected output and source
+        // mask BEFORE invoking any production redactor or report code.
+        let mut input = String::new();
+        let mut output = String::new();
+        let mut removed = Vec::new();
+        let mut expected_matches = Vec::new();
+        for &(text, redact) in parts {
+            let start = input.len();
+            input.push_str(text);
+            removed.extend(std::iter::repeat_n(redact, text.len()));
+            output.push_str(if redact { "[REDACTED]" } else { text });
+            if redact {
+                expected_matches.push(ExpectedMatch {
+                    pattern_name: "generic_secret".to_string(),
+                    start: u32::try_from(start).unwrap(),
+                    end: u32::try_from(input.len()).unwrap(),
+                });
+            }
+        }
+        if expect_whole {
+            expected_matches = vec![ExpectedMatch {
+                pattern_name: "generic_secret".to_string(),
+                start: 0,
+                end: u32::try_from(input.len()).unwrap(),
+            }];
+        }
+        ByteOracleFixture {
+            vector: RedactorTestVector {
+                name: name.to_string(),
+                input,
+                expected_matches,
+                provider: "byte_oracle".to_string(),
+                rationale: "Owned synthetic original-byte coverage control".to_string(),
+            },
+            removed,
+            output,
+        }
+    }
+
+    #[test]
+    fn independent_byte_mask_agrees_with_real_pipeline_and_serialized_report() {
+        // Twelve bounded fixtures, each < 256 UTF-8 bytes. No file writes,
+        // providers, private data, golden blessing or production-leak claim.
+        let key = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let anthropic = "sk-ant-api03-1234567890123456789012345678901234567890";
+        let pem = concat!(
+            "-----BEGIN PRIVATE KEY-----\n",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+            "-----END PRIVATE KEY-----"
+        );
+        let mut fixtures = vec![
+            byte_oracle_fixture("clean", &[("π ordinary text λ", false)], false),
+            byte_oracle_fixture("empty_clean", &[("", false)], false),
+            byte_oracle_fixture(
+                "unicode_surroundings",
+                &[("πleft ", false), (key, true), (" rightλ", false)],
+                false,
+            ),
+            // The specific Anthropic pass runs first. Two same-prefix
+            // variable-length GitHub tokens without a delimiter would instead
+            // be ambiguous under the token regex's {36,} body grammar.
+            byte_oracle_fixture("adjacent_union", &[(key, true), (anthropic, true)], true),
+            byte_oracle_fixture(
+                "prefix_only",
+                &[(key, true), ("|private_suffix", false)],
+                true,
+            ),
+            byte_oracle_fixture(
+                "suffix_only",
+                &[("private_prefix|", false), (key, true)],
+                true,
+            ),
+            byte_oracle_fixture(
+                "one_byte_hole",
+                &[(key, true), ("|", false), (key, true)],
+                true,
+            ),
+            byte_oracle_fixture(
+                "unicode_hole",
+                &[(key, true), ("秘密", false), (key, true)],
+                true,
+            ),
+            byte_oracle_fixture("nested_pem", &[(pem, true)], true),
+            byte_oracle_fixture("missed_span", &[("synthetic_missed_span", false)], true),
+        ];
+        let mut one_byte = byte_oracle_fixture(
+            "one_byte_overlap",
+            &[("private_prefix|", false), (key, true)],
+            true,
+        );
+        one_byte.vector.expected_matches[0].end = "private_prefix|".len() as u32 + 1;
+        fixtures.push(one_byte);
+        let mut duplicate = byte_oracle_fixture("duplicate_expectations", &[(key, true)], false);
+        duplicate
+            .vector
+            .expected_matches
+            .push(duplicate.vector.expected_matches[0].clone());
+        duplicate.vector.expected_matches.push(ExpectedMatch {
+            pattern_name: "generic_secret".to_string(),
+            start: 1,
+            end: 5,
+        });
+        fixtures.push(duplicate);
+
+        let redactor = Redactor::new();
+        let mut passing = 0;
+        let mut rejected = 0;
+        for fixture in &fixtures {
+            let vector = &fixture.vector;
+            assert!(vector.input.len() < 256);
+            let trace = redactor.redact_with_replacement_spans(&vector.input);
+            let actual_ranges: Vec<_> = trace
+                .replacements
+                .iter()
+                .map(|(_, s, e)| (*s, *e))
+                .collect();
+            let actual_mask = original_byte_mask(&vector.input, &actual_ranges).unwrap();
+            assert_eq!(actual_mask, fixture.removed, "fixture={}", vector.name);
+            assert_eq!(trace.redacted, fixture.output, "fixture={}", vector.name);
+            assert_eq!(redactor.redact(&vector.input), fixture.output);
+            let bytes_result = redactor.redact_bytes_with_evidence(vector.input.as_bytes());
+            assert_eq!(bytes_result.bytes, fixture.output.as_bytes());
+            assert_eq!(
+                bytes_result.evidence.secret_input_bytes_replaced,
+                fixture.removed.iter().filter(|removed| **removed).count() as u64
+            );
+            let expected_ranges: Vec<_> = vector
+                .expected_matches
+                .iter()
+                .map(|expected| (expected.start as usize, expected.end as usize))
+                .collect();
+            let expected_mask = original_byte_mask(&vector.input, &expected_ranges).unwrap();
+            let tp = expected_ranges
+                .iter()
+                .filter(|(start, end)| actual_mask[*start..*end].iter().all(|removed| *removed))
+                .count() as u32;
+            let fn_count = vector.expected_matches.len() as u32 - tp;
+            let fp = actual_ranges
+                .iter()
+                .filter(|(start, end)| !expected_mask[*start..*end].iter().any(|expected| *expected))
+                .count() as u32;
+            let covered = expected_mask
+                .iter()
+                .zip(&actual_mask)
+                .filter(|(expected, removed)| **expected && **removed)
+                .count();
+            let uncovered = expected_mask
+                .iter()
+                .zip(&actual_mask)
+                .filter(|(expected, removed)| **expected && !**removed)
+                .count();
+            let snapshot = MatrixSnapshot::evaluate(std::slice::from_ref(vector));
+            let evaluation = &snapshot.vectors[0];
+            assert!(evaluation.validation_errors.is_empty());
+            assert_eq!(
+                (
+                    evaluation.true_positives,
+                    evaluation.false_negatives,
+                    evaluation.false_positives
+                ),
+                (tp, fn_count, fp)
+            );
+            let gate = snapshot.meets_recall_floor(1.0);
+            assert_eq!(gate, uncovered == 0, "fixture={}", vector.name);
+            let report = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(report["overall"]["true_positives"], tp);
+            assert_eq!(report["overall"]["false_negatives"], fn_count);
+            assert_eq!(report["by_provider"]["byte_oracle"]["false_positives"], fp);
+            let jsonl = render_evaluations_jsonl(&snapshot.vectors);
+            let published = parse_evaluations_jsonl(&jsonl).unwrap();
+            assert_eq!(published[0].true_positives, tp);
+            assert_eq!(published[0].false_negatives, fn_count);
+            let detections = redactor.detect(&vector.input);
+            if vector.name == "nested_pem" {
+                let detection_ranges: Vec<_> =
+                    detections.iter().map(|(_, s, e)| (*s, *e)).collect();
+                assert_ne!(
+                    original_byte_mask(&vector.input, &detection_ranges).unwrap(),
+                    actual_mask
+                );
+                assert_eq!(trace.replacement_count, 2);
+            }
+            if gate {
+                passing += 1;
+            } else {
+                rejected += 1;
+                // Even with the complete original string gone, the known
+                // output and byte mask prove that a fragment remains.
+                if covered > 0 {
+                    assert!(!fixture.output.contains(&vector.input));
+                }
+                assert!(uncovered > 0);
+            }
+            eprintln!(
+                "REDACTOR_BYTE_ORACLE {}",
+                serde_json::json!({
+                "fixture": vector.name,
+                "input_sha256": format!("{:x}", Sha256::digest(vector.input.as_bytes())),
+                "output_sha256": format!("{:x}", Sha256::digest(&bytes_result.bytes)),
+                "expected_spans": expected_ranges.len(), "replacement_spans": actual_ranges.len(),
+                "replacement_operations": trace.replacement_count, "detector_spans": detections.len(),
+                "covered_original_bytes": covered, "uncovered_original_bytes": uncovered,
+                "metadata_valid": evaluation.validation_errors.is_empty(),
+                "true_positives": tp, "false_negatives": fn_count, "false_positives": fp,
+                "coverage_gate": gate
+                })
+            );
+        }
+        assert_eq!(fixtures.len(), 12);
+        assert_eq!((passing, rejected), (6, 6));
+    }
+
+    #[test]
+    fn independent_byte_mask_checks_all_small_interval_pairs() {
+        let vector = RedactorTestVector {
+            name: "all_small_interval_pairs".to_string(),
+            input: "abcdefgh".to_string(),
+            expected_matches: vec![ExpectedMatch {
+                pattern_name: "generic_secret".to_string(),
+                start: 2,
+                end: 6,
+            }],
+            provider: "byte_oracle".to_string(),
+            rationale: "Adjacent, overlapping, duplicate, reordered and gapped interval unions"
+                .to_string(),
+        };
+        let ranges: Vec<_> = (0..8)
+            .flat_map(|start| (start + 1..=8).map(move |end| (start, end)))
+            .collect();
+        let mut fully_covered = 0;
+        let mut partial = 0;
+        for &(a, b) in &ranges {
+            for &(c, d) in &ranges {
+                let mask = original_byte_mask(&vector.input, &[(a, b), (c, d)]).unwrap();
+                let complete = mask[2..6].iter().all(|covered| *covered);
+                let evaluation =
+                    classify_replacement_spans(&vector, &[("first", a, b), ("second", c, d)]);
+                assert!(evaluation.validation_errors.is_empty());
+                assert_eq!(
+                    evaluation.true_positives,
+                    u32::from(complete),
+                    "ranges={a}..{b},{c}..{d}"
+                );
+                assert_eq!(evaluation.false_negatives, u32::from(!complete));
+                if complete {
+                    fully_covered += 1;
+                } else {
+                    partial += 1;
+                }
+            }
+        }
+        assert_eq!(fully_covered + partial, 1296);
+        assert!(fully_covered > 0 && partial > 0);
+        eprintln!(
+            "REDACTOR_INTERVAL_ORACLE cases=1296 complete={fully_covered} incomplete={partial}"
+        );
+    }
+
+    #[test]
+    fn independent_byte_mask_rejects_invalid_unicode_and_empty_metadata() {
+        let mut fixture = byte_oracle_fixture("invalid_metadata", &[("é秘密abcd", false)], true);
+        for (start, end) in [(0, 0), (6, 5), (0, 13), (1, 2), (0, 1)] {
+            assert_eq!(
+                original_byte_mask(&fixture.vector.input, &[(start, end)]),
+                Err(0)
+            );
+            fixture.vector.expected_matches[0].start = start as u32;
+            fixture.vector.expected_matches[0].end = end as u32;
+            let snapshot = MatrixSnapshot::evaluate(std::slice::from_ref(&fixture.vector));
+            assert!(!snapshot.vectors[0].validation_errors.is_empty());
+            assert!(!snapshot.meets_recall_floor(0.0));
+            assert_eq!(snapshot.vectors[0].true_positives, 0);
+            let report = serde_json::to_value(&snapshot).unwrap();
+            assert!(
+                !report["vectors"][0]["validation_errors"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            fixture.vector.expected_matches[0].start = 0;
+            fixture.vector.expected_matches[0].end = 12;
+            let replacement = classify_replacement_spans(&fixture.vector, &[("invalid", start, end)]);
+            assert!(!replacement.validation_errors.is_empty());
+            assert_eq!(replacement.true_positives, 0);
+        }
+        let empty = byte_oracle_fixture("empty_positive", &[("", false)], true);
+        assert_eq!(original_byte_mask("", &[(0, 0)]), Err(0));
+        let snapshot = MatrixSnapshot::evaluate(&[empty.vector]);
+        assert!(!snapshot.vectors[0].validation_errors.is_empty());
+        assert!(!snapshot.meets_recall_floor(0.0));
+        eprintln!(
+            "REDACTOR_METADATA_ORACLE invalid_expected=6 invalid_replacements=5 coverage_gate=false"
+        );
+    }
 
     #[test]
     fn corpus_has_minimum_size() {
