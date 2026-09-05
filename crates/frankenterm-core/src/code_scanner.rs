@@ -379,14 +379,16 @@ impl ScanPolicySource {
         connection
             .busy_timeout(Duration::ZERO)
             .map_err(|_| policy_source_failure())?;
+        let progress_cx = cx.clone();
+        connection
+            .progress_handler(
+                1000,
+                Some(move || checkpoint(&progress_cx, deadline).is_err()),
+            )
+            .map_err(|_| policy_source_failure())?;
         connection
             .pragma_update(None, "trusted_schema", false)
             .map_err(|_| policy_source_failure())?;
-        let progress_cx = cx.clone();
-        connection.progress_handler(
-            1000,
-            Some(move || checkpoint(&progress_cx, deadline).is_err()),
-        );
         let _: i64 = connection
             .query_row("PRAGMA schema_version", [], |row| row.get(0))
             .map_err(|_| {

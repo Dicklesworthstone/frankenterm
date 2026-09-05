@@ -69,16 +69,48 @@ fn overall_precision_meets_floor() {
 }
 
 #[test]
-fn every_corpus_vector_is_either_positive_or_negative() {
-    for v in synthesized_corpus() {
-        let count = v.expected_matches.len();
-        assert!(
-            count == 0 || count >= 1,
-            "vector {} has unexpected expected_matches.len() = {}",
-            v.name,
-            count,
-        );
+fn corpus_has_unique_valid_byte_annotations_and_both_control_classes() {
+    let corpus = synthesized_corpus();
+    let mut names = std::collections::BTreeSet::new();
+    let known_patterns: std::collections::BTreeSet<_> = secret_pattern_names().collect();
+    let mut positives = 0;
+    let mut negatives = 0;
+    for vector in &corpus {
+        assert!(!vector.name.is_empty() && names.insert(&vector.name));
+        assert!(!vector.input.is_empty(), "empty input: {}", vector.name);
+        assert!(!vector.provider.is_empty() && !vector.rationale.is_empty());
+        if vector.expected_matches.is_empty() {
+            negatives += 1;
+        } else {
+            positives += 1;
+        }
+        let mut spans = std::collections::BTreeSet::new();
+        for expected in &vector.expected_matches {
+            let start = expected.start as usize;
+            let end = expected.end as usize;
+            assert!(
+                start < end && end <= vector.input.len(),
+                "invalid span: {}",
+                vector.name
+            );
+            assert!(vector.input.is_char_boundary(start) && vector.input.is_char_boundary(end));
+            assert!(known_patterns.contains(&expected.pattern_name.as_str()));
+            assert!(
+                spans.insert((&expected.pattern_name, start, end)),
+                "duplicate annotation: {}",
+                vector.name
+            );
+        }
     }
+    assert!(
+        positives > 0 && negatives > 0,
+        "both corpus controls are required"
+    );
+    assert_eq!(positives + negatives, corpus.len());
+    println!(
+        "REDACTOR_CORPUS_ANNOTATIONS unique_vectors={} positive_controls={positives} negative_controls={negatives} all_byte_ranges_valid=true",
+        corpus.len()
+    );
 }
 
 #[test]
