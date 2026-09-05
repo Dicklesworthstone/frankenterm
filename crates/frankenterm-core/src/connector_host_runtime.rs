@@ -117,7 +117,9 @@ pub(crate) fn fcp_identity_hash(value: &str) -> String {
 fn valid_fcp_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._:-/".contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/".contains(&byte))
 }
 
 fn valid_input_pointer(input: &serde_json::Value, pointer: &str) -> bool {
@@ -133,8 +135,8 @@ impl FcpTransportConfig {
             return Err(invalid);
         }
         let parsed = url::Url::parse(&self.endpoint).map_err(|_| invalid)?;
-        let canonical = crate::runtime_async::http::ParsedUrl::parse(&self.endpoint)
-            .map_err(|_| invalid)?;
+        let canonical =
+            crate::runtime_async::http::ParsedUrl::parse(&self.endpoint).map_err(|_| invalid)?;
         // No DNS, redirects, userinfo, proxy, or alternate URL spelling can
         // expand the explicitly authorized owned-loopback host boundary.
         let loopback = match parsed.host() {
@@ -175,9 +177,10 @@ impl FcpTransportConfig {
             if !valid_fcp_label(&route.rule.rule_id)
                 || !identities.insert(route.rule.rule_id.as_str())
                 || route.rule.target_connector != route.invoke.connector_id
-                || route.correlation_input_pointer.as_ref().is_some_and(|pointer| {
-                    !valid_input_pointer(&route.invoke.input, pointer)
-                })
+                || route
+                    .correlation_input_pointer
+                    .as_ref()
+                    .is_some_and(|pointer| !valid_input_pointer(&route.invoke.input, pointer))
             {
                 return Err(invalid);
             }
@@ -191,7 +194,10 @@ impl FcpTransportConfig {
                 || subscription.identity_pointer.len() > 1024
                 || !subscription.records_pointer.starts_with('/')
                 || !subscription.identity_pointer.starts_with('/')
-                || !valid_input_pointer(&subscription.invoke.input, &subscription.cursor_input_pointer)
+                || !valid_input_pointer(
+                    &subscription.invoke.input,
+                    &subscription.cursor_input_pointer,
+                )
                 || !(100..=3_600_000).contains(&subscription.poll_interval_ms)
                 || subscription.invoke.capability != ConnectorCapability::ReadState
             {
@@ -205,8 +211,13 @@ impl FcpTransportConfig {
     fn validate_operation(&self, operation: &FcpOperation) -> Result<(), FcpTransportError> {
         if !valid_fcp_label(&operation.connector_id)
             || !valid_fcp_label(&operation.operation)
-            || operation.target.as_ref().is_some_and(|target| target.len() > 4096)
-            || serde_json::to_vec(&operation.input).map_err(|_| FcpTransportError::InvalidConfig)?.len()
+            || operation
+                .target
+                .as_ref()
+                .is_some_and(|target| target.len() > 4096)
+            || serde_json::to_vec(&operation.input)
+                .map_err(|_| FcpTransportError::InvalidConfig)?
+                .len()
                 > self.max_payload_bytes
         {
             return Err(FcpTransportError::InvalidConfig);
@@ -257,7 +268,10 @@ pub struct FcpHostClient {
 }
 
 impl FcpHostClient {
-    pub fn new(config: FcpTransportConfig, host: &ConnectorHostConfig) -> Result<Self, FcpTransportError> {
+    pub fn new(
+        config: FcpTransportConfig,
+        host: &ConnectorHostConfig,
+    ) -> Result<Self, FcpTransportError> {
         config.validate(host)?;
         let http = crate::runtime_async::http::HttpClient::builder()
             .no_redirects()
@@ -269,11 +283,18 @@ impl FcpHostClient {
             .max_body_size(config.max_payload_bytes)
             .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
             .build();
-        Ok(Self { config, zone_id: host.sandbox.zone_id.clone(), http })
+        Ok(Self {
+            config,
+            zone_id: host.sandbox.zone_id.clone(),
+            http,
+        })
     }
 
     pub fn operation_deadline(&self) -> Result<std::time::Instant, FcpTransportError> {
-        std::time::Instant::now().checked_add(std::time::Duration::from_millis(self.config.request_timeout_ms))
+        std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                self.config.request_timeout_ms,
+            ))
             .ok_or(FcpTransportError::InvalidConfig)
     }
 
@@ -286,7 +307,8 @@ impl FcpHostClient {
         idempotency_key: &str,
     ) -> Result<PreparedFcpInvocation, FcpTransportError> {
         self.config.validate_operation(operation)?;
-        if !valid_fcp_label(request_id) || idempotency_key.len() != 64
+        if !valid_fcp_label(request_id)
+            || idempotency_key.len() != 64
             || !idempotency_key.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(FcpTransportError::InvalidConfig);
@@ -300,19 +322,29 @@ impl FcpHostClient {
         let (token, admin_bytes) = crate::runtime_async::spawn_blocking(move || {
             let _scope = crate::cx::Cx::set_current(Some(read_cx.clone()));
             let _capabilities = crate::cx::Cx::push_restriction(read_mask);
-            read_cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            read_cx
+                .checkpoint()
+                .map_err(|_| FcpTransportError::Cancelled)?;
             remaining_fcp_time(deadline)?;
             let token = read_fcp_secret_file(&token_path, 65_536)?;
-            read_cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            read_cx
+                .checkpoint()
+                .map_err(|_| FcpTransportError::Cancelled)?;
             let admin = read_fcp_secret_file(&admin_path, 8192)?;
-            read_cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            read_cx
+                .checkpoint()
+                .map_err(|_| FcpTransportError::Cancelled)?;
             remaining_fcp_time(deadline)?;
             Ok::<_, FcpTransportError>((token, admin))
-        }).await.map_err(|_| FcpTransportError::CredentialUnavailable)??;
+        })
+        .await
+        .map_err(|_| FcpTransportError::CredentialUnavailable)??;
         cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
         let remaining = remaining_fcp_time(deadline)?;
         let admin_token = std::str::from_utf8(&admin_bytes)
-            .map_err(|_| FcpTransportError::CredentialUnavailable)?.trim().to_string();
+            .map_err(|_| FcpTransportError::CredentialUnavailable)?
+            .trim()
+            .to_string();
         if admin_token.is_empty() || !admin_token.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(FcpTransportError::CredentialUnavailable);
         }
@@ -328,8 +360,12 @@ impl FcpHostClient {
             return Err(FcpTransportError::PayloadLimit);
         }
         Ok(PreparedFcpInvocation {
-            body, request_id: request_id.to_string(), connector_id: operation.connector_id.clone(),
-            operation: operation.operation.clone(), idempotency_key: idempotency_key.to_string(), admin_token,
+            body,
+            request_id: request_id.to_string(),
+            connector_id: operation.connector_id.clone(),
+            operation: operation.operation.clone(),
+            idempotency_key: idempotency_key.to_string(),
+            admin_token,
         })
     }
 
@@ -342,23 +378,50 @@ impl FcpHostClient {
         operation: &FcpOperation,
     ) -> Result<(), FcpTransportError> {
         self.config.validate_operation(operation)?;
-        let discovery = self.request_json(cx, deadline, "/rpc/discover", serde_json::json!({}), None).await?;
-        let connectors = discovery.get("connectors").and_then(serde_json::Value::as_array)
+        let discovery = self
+            .request_json(cx, deadline, "/rpc/discover", serde_json::json!({}), None)
+            .await?;
+        let connectors = discovery
+            .get("connectors")
+            .and_then(serde_json::Value::as_array)
             .ok_or(FcpTransportError::ProtocolInvalid)?;
-        let connector = connectors.iter().find(|connector| connector.get("id").and_then(serde_json::Value::as_str)
-            == Some(operation.connector_id.as_str())).ok_or(FcpTransportError::Unavailable)?;
-        if connector.get("enabled").and_then(serde_json::Value::as_bool) != Some(true)
-            || connector.pointer("/health/status").and_then(serde_json::Value::as_str) != Some("healthy")
+        let connector = connectors
+            .iter()
+            .find(|connector| {
+                connector.get("id").and_then(serde_json::Value::as_str)
+                    == Some(operation.connector_id.as_str())
+            })
+            .ok_or(FcpTransportError::Unavailable)?;
+        if connector
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+            || connector
+                .pointer("/health/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("healthy")
         {
             return Err(FcpTransportError::Unavailable);
         }
         let path = format!("/rpc/introspect/{}", operation.connector_id);
-        let response = self.exchange(cx, deadline, crate::runtime_async::http::Method::Get, &path, Vec::new(), None).await?;
-        let operations = response.get("operations").and_then(serde_json::Value::as_array)
+        let response = self
+            .exchange(
+                cx,
+                deadline,
+                crate::runtime_async::http::Method::Get,
+                &path,
+                Vec::new(),
+                None,
+            )
+            .await?;
+        let operations = response
+            .get("operations")
+            .and_then(serde_json::Value::as_array)
             .ok_or(FcpTransportError::ProtocolInvalid)?;
-        if !operations.iter().any(|candidate| candidate.get("id").and_then(serde_json::Value::as_str)
-            == Some(operation.operation.as_str()))
-        {
+        if !operations.iter().any(|candidate| {
+            candidate.get("id").and_then(serde_json::Value::as_str)
+                == Some(operation.operation.as_str())
+        }) {
             return Err(FcpTransportError::Unavailable);
         }
         Ok(())
@@ -372,10 +435,19 @@ impl FcpHostClient {
         deadline: std::time::Instant,
         request: PreparedFcpInvocation,
     ) -> Result<FcpAcknowledgement, FcpTransportError> {
-        let response = self.exchange(cx, deadline, crate::runtime_async::http::Method::Post,
-            "/rpc/invoke", request.body, None).await?;
+        let response = self
+            .exchange(
+                cx,
+                deadline,
+                crate::runtime_async::http::Method::Post,
+                "/rpc/invoke",
+                request.body,
+                None,
+            )
+            .await?;
         if response.get("type").and_then(serde_json::Value::as_str) != Some("response")
-            || response.get("id").and_then(serde_json::Value::as_str) != Some(request.request_id.as_str())
+            || response.get("id").and_then(serde_json::Value::as_str)
+                != Some(request.request_id.as_str())
         {
             return Err(FcpTransportError::ProtocolInvalid);
         }
@@ -384,61 +456,120 @@ impl FcpHostClient {
             Some("error") if response.get("error").is_some_and(|error| !error.is_null()) => false,
             _ => return Err(FcpTransportError::ProtocolInvalid),
         };
-        let receipt_id = response.get("receipt_id").and_then(serde_json::Value::as_str)
+        let receipt_id = response
+            .get("receipt_id")
+            .and_then(serde_json::Value::as_str)
             .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or(FcpTransportError::ReceiptUnconfirmed)?;
         let receipts = self.request_json(cx, deadline, "/rpc/admin/receipts", serde_json::json!({
             "connector_id": request.connector_id, "operation": request.operation, "limit": 256,
         }), Some(&request.admin_token)).await?;
-        let matches: Vec<&serde_json::Value> = receipts.get("receipts")
-            .and_then(serde_json::Value::as_array).ok_or(FcpTransportError::ProtocolInvalid)?
-            .iter().filter(|receipt| receipt.get("receipt_id").and_then(serde_json::Value::as_str) == Some(receipt_id))
+        let matches: Vec<&serde_json::Value> = receipts
+            .get("receipts")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(FcpTransportError::ProtocolInvalid)?
+            .iter()
+            .filter(|receipt| {
+                receipt
+                    .get("receipt_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(receipt_id)
+            })
             .collect();
-        let [receipt] = matches.as_slice() else { return Err(FcpTransportError::ReceiptUnconfirmed); };
-        if receipt.get("connector_id").and_then(serde_json::Value::as_str) != Some(request.connector_id.as_str())
-            || receipt.get("operation").and_then(serde_json::Value::as_str) != Some(request.operation.as_str())
-            || receipt.get("idempotency_key").and_then(serde_json::Value::as_str) != Some(request.idempotency_key.as_str())
+        let [receipt] = matches.as_slice() else {
+            return Err(FcpTransportError::ReceiptUnconfirmed);
+        };
+        if receipt
+            .get("connector_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(request.connector_id.as_str())
+            || receipt.get("operation").and_then(serde_json::Value::as_str)
+                != Some(request.operation.as_str())
+            || receipt
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str)
+                != Some(request.idempotency_key.as_str())
             || receipt.get("success").and_then(serde_json::Value::as_bool) != Some(success)
         {
             return Err(FcpTransportError::ReceiptUnconfirmed);
         }
-        let receipt_json = serde_json::to_string(receipt).map_err(|_| FcpTransportError::ProtocolInvalid)?;
-        Ok(FcpAcknowledgement { receipt_id: receipt_id.to_string(), receipt_hash: fcp_identity_hash(&receipt_json),
-            success, result: response.get("result").cloned() })
+        let receipt_json =
+            serde_json::to_string(receipt).map_err(|_| FcpTransportError::ProtocolInvalid)?;
+        Ok(FcpAcknowledgement {
+            receipt_id: receipt_id.to_string(),
+            receipt_hash: fcp_identity_hash(&receipt_json),
+            success,
+            result: response.get("result").cloned(),
+        })
     }
 
-    async fn request_json(&self, cx: &crate::cx::Cx, deadline: std::time::Instant,
-        path: &str, body: serde_json::Value, admin: Option<&str>)
-        -> Result<serde_json::Value, FcpTransportError>
-    {
+    async fn request_json(
+        &self,
+        cx: &crate::cx::Cx,
+        deadline: std::time::Instant,
+        path: &str,
+        body: serde_json::Value,
+        admin: Option<&str>,
+    ) -> Result<serde_json::Value, FcpTransportError> {
         let body = serde_json::to_vec(&body).map_err(|_| FcpTransportError::ProtocolInvalid)?;
-        self.exchange(cx, deadline, crate::runtime_async::http::Method::Post, path, body, admin).await
+        self.exchange(
+            cx,
+            deadline,
+            crate::runtime_async::http::Method::Post,
+            path,
+            body,
+            admin,
+        )
+        .await
     }
 
-    async fn exchange(&self, cx: &crate::cx::Cx, deadline: std::time::Instant,
+    async fn exchange(
+        &self,
+        cx: &crate::cx::Cx,
+        deadline: std::time::Instant,
         method: crate::runtime_async::http::Method,
-        path: &str, body: Vec<u8>, admin: Option<&str>) -> Result<serde_json::Value, FcpTransportError>
-    {
+        path: &str,
+        body: Vec<u8>,
+        admin: Option<&str>,
+    ) -> Result<serde_json::Value, FcpTransportError> {
         cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
-        if body.len() > self.config.max_payload_bytes { return Err(FcpTransportError::PayloadLimit); }
+        if body.len() > self.config.max_payload_bytes {
+            return Err(FcpTransportError::PayloadLimit);
+        }
         let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         if let Some(token) = admin {
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
             headers.push(("x-fcp-zone".to_string(), "z:owner".to_string()));
         }
         let endpoint = format!("{}{path}", self.config.endpoint.trim_end_matches('/'));
-        let response = self.http.request_with_timeout(cx, method, &endpoint, headers, body,
-            remaining_fcp_time(deadline)?).await
+        let response = self
+            .http
+            .request_with_timeout(
+                cx,
+                method,
+                &endpoint,
+                headers,
+                body,
+                remaining_fcp_time(deadline)?,
+            )
+            .await
             .map_err(|_| FcpTransportError::Unavailable)?;
         cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
-        if response.status != 200 { return Err(FcpTransportError::Unavailable); }
-        if response.body.len() > self.config.max_payload_bytes { return Err(FcpTransportError::PayloadLimit); }
+        if response.status != 200 {
+            return Err(FcpTransportError::Unavailable);
+        }
+        if response.body.len() > self.config.max_payload_bytes {
+            return Err(FcpTransportError::PayloadLimit);
+        }
         serde_json::from_slice(&response.body).map_err(|_| FcpTransportError::ProtocolInvalid)
     }
 }
 
-fn remaining_fcp_time(deadline: std::time::Instant) -> Result<std::time::Duration, FcpTransportError> {
-    deadline.checked_duration_since(std::time::Instant::now())
+fn remaining_fcp_time(
+    deadline: std::time::Instant,
+) -> Result<std::time::Duration, FcpTransportError> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
         .filter(|remaining| remaining.as_millis() > 0)
         .ok_or(FcpTransportError::Unavailable)
 }
@@ -447,11 +578,15 @@ fn read_fcp_secret_file(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, F
     use std::io::Read;
     let denied = FcpTransportError::CredentialUnavailable;
     let metadata = std::fs::symlink_metadata(path).map_err(|_| denied)?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit { return Err(denied); }
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+        return Err(denied);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 { return Err(denied); }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(denied);
+        }
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -467,27 +602,47 @@ fn read_fcp_secret_file(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, F
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() { return Err(denied); }
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err(denied);
+        }
     }
-    if !opened.is_file() || opened.len() > limit { return Err(denied); }
+    if !opened.is_file() || opened.len() > limit {
+        return Err(denied);
+    }
     let mut bytes = Vec::new();
-    (&file).take(limit + 1).read_to_end(&mut bytes).map_err(|_| denied)?;
-    if bytes.is_empty() || u64::try_from(bytes.len()).map_err(|_| denied)? > limit { return Err(denied); }
+    (&file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| denied)?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).map_err(|_| denied)? > limit {
+        return Err(denied);
+    }
     let after = file.metadata().map_err(|_| denied)?;
     let named = std::fs::symlink_metadata(path).map_err(|_| denied)?;
-    if !after.is_file() || !named.is_file() || after.len() != opened.len()
+    if !after.is_file()
+        || !named.is_file()
+        || after.len() != opened.len()
         || after.len() != u64::try_from(bytes.len()).map_err(|_| denied)?
         || named.len() != after.len()
-    { return Err(denied); }
+    {
+        return Err(denied);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if after.dev() != named.dev() || after.ino() != named.ino()
-            || after.dev() != opened.dev() || after.ino() != opened.ino()
-            || after.mode() & 0o077 != 0 || named.mode() & 0o077 != 0
-            || after.mtime() != opened.mtime() || after.mtime_nsec() != opened.mtime_nsec()
-            || after.ctime() != opened.ctime() || after.ctime_nsec() != opened.ctime_nsec()
-        { return Err(denied); }
+        if after.dev() != named.dev()
+            || after.ino() != named.ino()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+            || after.mode() & 0o077 != 0
+            || named.mode() & 0o077 != 0
+            || after.mtime() != opened.mtime()
+            || after.mtime_nsec() != opened.mtime_nsec()
+            || after.ctime() != opened.ctime()
+            || after.ctime_nsec() != opened.ctime_nsec()
+        {
+            return Err(denied);
+        }
     }
     Ok(bytes)
 }

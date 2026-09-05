@@ -5789,9 +5789,7 @@ impl Config {
         if let Some(transport) = &self.safety.connector_transport {
             transport
                 .validate(&self.safety.connector_host_runtime)
-                .map_err(|error| {
-                    crate::error::ConfigError::ValidationError(error.to_string())
-                })?;
+                .map_err(|error| crate::error::ConfigError::ValidationError(error.to_string()))?;
         }
 
         if self.ingest.min_poll_interval_ms == 0 {

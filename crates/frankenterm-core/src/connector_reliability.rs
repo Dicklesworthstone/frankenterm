@@ -47,9 +47,15 @@ impl ConnectorDeliveryState {
     }
 
     pub const fn permits(self, next: Self) -> bool {
-        matches!((self, next),
-            (Self::Admitted, Self::Dispatched | Self::Rejected | Self::Cancelled)
-            | (Self::Dispatched, Self::Completed | Self::Failed | Self::Indeterminate)
+        matches!(
+            (self, next),
+            (
+                Self::Admitted,
+                Self::Dispatched | Self::Rejected | Self::Cancelled
+            ) | (
+                Self::Dispatched,
+                Self::Completed | Self::Failed | Self::Indeterminate
+            )
         )
     }
 }
@@ -115,12 +121,17 @@ pub(crate) enum ConnectorStorageMutation {
         expected_cursor: i64,
         records: Vec<(i64, crate::storage::StoredEvent)>,
     },
-    AcknowledgeIngress { event_ids: Vec<i64> },
+    AcknowledgeIngress {
+        event_ids: Vec<i64>,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) enum ConnectorStorageOutcome {
-    Cursor { after_event_id: i64, cursor_epoch: String },
+    Cursor {
+        after_event_id: i64,
+        cursor_epoch: String,
+    },
     Admitted,
     Transitioned(ConnectorOutboxEntry),
     Ingested(Vec<crate::storage::EventRecordOutcome>),
