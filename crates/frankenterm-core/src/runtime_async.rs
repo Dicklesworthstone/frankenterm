@@ -4186,7 +4186,7 @@ pub mod process {
     struct OutputCommandSpec {
         program: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
-        envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
         current_dir: Option<std::path::PathBuf>,
         stdin: Option<Arc<[u8]>>,
         stdin_configuration_error: Option<CommandInputLimitExceeded>,
@@ -5068,9 +5068,7 @@ pub mod process {
                 envs: self
                     .inner
                     .get_envs()
-                    .filter_map(|(key, value)| {
-                        value.map(|value| (key.to_os_string(), value.to_os_string()))
-                    })
+                    .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
                     .collect(),
                 current_dir: self
                     .inner
@@ -5167,7 +5165,10 @@ pub mod process {
                 .map_err(|error| process_capture_setup_error("stderr child handle", error))?,
         );
         for (k, v) in envs {
-            cmd.env(k, v);
+            match v {
+                Some(value) => cmd.env(k, value),
+                None => cmd.env_remove(k),
+            };
         }
         if let Some(current_dir) = current_dir {
             cmd.current_dir(current_dir);
@@ -6068,6 +6069,106 @@ pub mod process {
         use super::*;
         #[cfg(unix)]
         use crate::runtime_async::CompatRuntime;
+
+        #[cfg(unix)]
+        #[test]
+        fn captured_commands_preserve_inherited_environment_removal() {
+            // Seed only an owned child, never this multithreaded test process.
+            // The ignored helper is selected exactly so a zero-test child
+            // cannot turn environment inheritance into a false positive.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime_async::process::output_capture_unit_tests::inherited_environment_removal_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FT_CAPTURE_INHERITED_CANARY", "inherited")
+                .stdout_limit(64 * 1024)
+                .stderr_limit(64 * 1024)
+                .output_blocking(Duration::from_secs(30))
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "owned environment regression failed: status={}, stdout={}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("1 passed; 0 failed"),
+                "owned helper must execute exactly one passing test"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[ignore = "requires the owned parent's inherited environment canary"]
+        fn inherited_environment_removal_child() {
+            const KEY: &str = "FT_CAPTURE_INHERITED_CANARY";
+            assert_eq!(std::env::var(KEY).unwrap(), "inherited");
+            let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = crate::cx::for_testing();
+                for controlled in [false, true] {
+                    for (case, expected) in [
+                        (0, "x:inherited"),
+                        (1, ":missing"),
+                        (2, "x:override"),
+                        (3, ":missing"),
+                        (4, "x:"),
+                    ] {
+                        let mut command = Command::new("/bin/sh");
+                        command.args([
+                            "-c",
+                            "printf '%s:%s' \"${FT_CAPTURE_INHERITED_CANARY+x}\" \"${FT_CAPTURE_INHERITED_CANARY-missing}\"",
+                        ]);
+                        match case {
+                            1 => {
+                                command.env_remove(KEY);
+                            }
+                            2 => {
+                                command.env_remove(KEY).env(KEY, "override");
+                            }
+                            3 => {
+                                command.env(KEY, "override").env_remove(KEY);
+                            }
+                            4 => {
+                                command.env(KEY, "");
+                            }
+                            _ => {}
+                        }
+                        command.stdout_limit(64).stderr_limit(64);
+                        let output = if controlled {
+                            let report = command
+                                .output_with_cx_controlled(
+                                    &cx,
+                                    Instant::now() + Duration::from_secs(5),
+                                    &CommandCancellation::new(),
+                                )
+                                .await;
+                            assert!(report.supervisor_settled);
+                            assert!(report.spawned_pid.is_some());
+                            report.output.unwrap()
+                        } else {
+                            command.output_blocking(Duration::from_secs(5)).unwrap()
+                        };
+                        assert!(output.status.success());
+                        assert_eq!(
+                            output.stdout,
+                            expected.as_bytes(),
+                            "case {case}, controlled={controlled}"
+                        );
+                        assert!(output.stderr.is_empty());
+                    }
+                }
+            });
+        }
 
         #[cfg(unix)]
         #[test]
