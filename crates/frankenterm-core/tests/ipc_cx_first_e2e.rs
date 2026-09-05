@@ -47,6 +47,16 @@ where
     runtime.block_on(future);
 }
 
+fn runtime_ipc_cx() -> frankenterm_core::cx::Cx {
+    // Match the watcher: accepted sockets must register with this runtime's
+    // reactor. A detached test Cx has no drivers and makes idle socket I/O
+    // immediately self-wake on every poll instead of waiting for readiness.
+    let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned IPC context");
+    assert!(cx.io_driver_handle().is_some(), "real socket I/O driver");
+    assert!(cx.timer_driver().is_some(), "real deadline timer driver");
+    cx
+}
+
 async fn send_ping_request(socket: &std::path::Path) -> std::io::Result<IpcResponse> {
     let mut stream = ft_unix::connect(socket).await?;
     let request = IpcRequest::Ping;
@@ -83,7 +93,7 @@ async fn send_ping_request(socket: &std::path::Path) -> std::io::Result<IpcRespo
 fn ipc_cx_first_bind_run_ping_shutdown_roundtrip() {
     run_async_test(async {
         let path = socket_path("cx-first-bind-run");
-        let cx = frankenterm_core::cx::for_testing();
+        let cx = runtime_ipc_cx();
 
         let server = IpcServer::bind_with_cx(&cx, &path)
             .await
@@ -137,7 +147,7 @@ fn ipc_cx_first_bind_run_ping_shutdown_roundtrip() {
 fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
     run_async_test(async {
         let path = socket_path("cx-first-cancel-teardown");
-        let cx = frankenterm_core::cx::for_testing();
+        let cx = runtime_ipc_cx();
 
         let server = IpcServer::bind_with_cx(&cx, &path)
             .await
@@ -190,7 +200,7 @@ fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
 fn ipc_cx_first_multiple_concurrent_clients() {
     run_async_test(async {
         let path = socket_path("cx-first-concurrent");
-        let cx = frankenterm_core::cx::for_testing();
+        let cx = runtime_ipc_cx();
 
         let server = IpcServer::bind_with_cx(&cx, &path)
             .await
@@ -236,11 +246,13 @@ fn ipc_cx_first_multiple_concurrent_clients() {
 
 #[test]
 fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grace() {
+    use tracing::instrument::WithSubscriber;
+
     run_async_test(async {
         for mode in ["empty", "partial", "subscription"] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("stop.sock");
-            let cx = frankenterm_core::cx::for_testing();
+            let cx = runtime_ipc_cx();
             let limits = IpcRuntimeLimits {
                 max_message_size: MAX_MESSAGE_SIZE,
                 accept_poll_interval_ms: 10,
@@ -261,7 +273,15 @@ fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grac
             let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
             let run_cx = cx.clone();
             let server_task = task::spawn(async move {
-                server.run_with_cx(&run_cx, server_bus, shutdown_rx).await;
+                server
+                    .run_with_cx(&run_cx, server_bus, shutdown_rx)
+                    .with_subscriber(
+                        tracing_subscriber::fmt()
+                            .with_max_level(tracing::Level::DEBUG)
+                            .with_test_writer()
+                            .finish(),
+                    )
+                    .await;
             });
 
             let mut client = ft_unix::connect(&path).await.unwrap();
@@ -308,7 +328,17 @@ fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grac
                 capacity_probe.read(&mut byte),
             )
             .await
-            .expect("capacity probe must reach the real accept loop")
+            .unwrap_or_else(|error| {
+                let mut probe_byte = [0_u8; 1];
+                let mut client_byte = [0_u8; 1];
+                let probe_state =
+                    std::io::Read::read(&mut capacity_probe.as_std(), &mut probe_byte);
+                let client_state = std::io::Read::read(&mut client.as_std(), &mut client_byte);
+                panic!(
+                    "capacity probe must reach the real accept loop: mode={mode}, error={error}, probe={probe_state:?}, client={client_state:?}, server_finished={}",
+                    server_task.is_finished()
+                );
+            })
             .expect("capacity rejection must close the probe socket");
             assert_eq!(count, 0, "first {mode} connection must already be accepted");
 
