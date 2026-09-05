@@ -1,7 +1,111 @@
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use frankenterm_core::runtime_async::process::{Command, CommandCancellation};
 use frankenterm_core::runtime_async::{self, CompatRuntime, RuntimeBuilder, mpsc, watch};
+#[cfg(unix)]
+use std::time::Instant;
+
+#[cfg(unix)]
+#[test]
+fn captured_commands_preserve_inherited_environment_removal() {
+    // Seed only an owned child, never this multithreaded test process.
+    // The ignored helper is selected exactly so a zero-test child
+    // cannot turn environment inheritance into a false positive.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inherited_environment_removal_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("FT_CAPTURE_INHERITED_CANARY", "inherited")
+        .stdout_limit(64 * 1024)
+        .stderr_limit(64 * 1024)
+        .output_blocking(Duration::from_secs(30))
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "owned environment regression failed: status={}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("1 passed; 0 failed"),
+        "owned helper must execute exactly one passing test"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the owned parent's inherited environment canary"]
+fn inherited_environment_removal_child() {
+    const KEY: &str = "FT_CAPTURE_INHERITED_CANARY";
+    assert_eq!(std::env::var(KEY).unwrap(), "inherited");
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = frankenterm_core::cx::for_testing();
+        for controlled in [false, true] {
+            for (case, expected) in [
+                (0, "x:inherited"),
+                (1, ":missing"),
+                (2, "x:override"),
+                (3, ":missing"),
+                (4, "x:"),
+            ] {
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    "printf '%s:%s' \"${FT_CAPTURE_INHERITED_CANARY+x}\" \"${FT_CAPTURE_INHERITED_CANARY-missing}\"",
+                ]);
+                match case {
+                    1 => {
+                        command.env_remove(KEY);
+                    }
+                    2 => {
+                        command.env_remove(KEY).env(KEY, "override");
+                    }
+                    3 => {
+                        command.env(KEY, "override").env_remove(KEY);
+                    }
+                    4 => {
+                        command.env(KEY, "");
+                    }
+                    _ => {}
+                }
+                command.stdout_limit(64).stderr_limit(64);
+                let output = if controlled {
+                    let report = command
+                        .output_with_cx_controlled(
+                            &cx,
+                            Instant::now() + Duration::from_secs(5),
+                            &CommandCancellation::new(),
+                        )
+                        .await;
+                    assert!(report.supervisor_settled);
+                    assert!(report.spawned_pid.is_some());
+                    report.output.unwrap()
+                } else {
+                    command.output_blocking(Duration::from_secs(5)).unwrap()
+                };
+                assert!(output.status.success());
+                assert_eq!(
+                    output.stdout,
+                    expected.as_bytes(),
+                    "case {case}, controlled={controlled}"
+                );
+                assert!(output.stderr.is_empty());
+            }
+        }
+    });
+}
 
 #[test]
 fn runtime_builder_current_thread_runs_future() {
