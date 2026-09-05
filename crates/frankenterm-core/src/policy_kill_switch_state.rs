@@ -398,7 +398,7 @@ fn validate_revision_anchor(
         .map_err(|_| {
             KillSwitchStateError::Corrupt("revision authority is not an unsigned integer".into())
         })?;
-    if !matches!((revision, authority), (None, None) | (Some(0), None)) && revision != authority {
+    if !matches!((revision, authority), (None | Some(0), None)) && revision != authority {
         return Err(KillSwitchStateError::Corrupt(
             "state and revision authority disagree".into(),
         ));
