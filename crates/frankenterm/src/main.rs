@@ -77555,10 +77555,14 @@ fn validate_mission_objective_plan_args(
     if args.beads_graph.is_some() != args.beads_graph_sha256.is_some()
         || (args.beads_graph_version.is_some() && args.beads_graph.is_none())
         || (args.beads_graph.is_some()
-            && (args.target_bead.is_some() || args.candidate_id.is_some() || args.testing_skill_lane))
+            && (args.target_bead.is_some()
+                || args.candidate_id.is_some()
+                || args.testing_skill_lane))
         || args.beads_graph_sha256.as_ref().is_some_and(|hash| {
             hash.len() != 64
-                || !hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
     {
         return Err(MissionCommandError {
@@ -77817,14 +77821,19 @@ fn mission_objective_plain_lines(
     ];
     #[cfg(feature = "subprocess-bridge")]
     if let Some(selection) = &surface.plan.bead_work_selection {
-        lines.push(format!("  Beads snapshot SHA256: {}", selection.input_sha256()));
+        lines.push(format!(
+            "  Beads snapshot SHA256: {}",
+            selection.input_sha256()
+        ));
         lines.push(format!(
             "  Snapshot ready count: {}; live database freshness: not validated",
             selection.ordered_ready_ids().len()
         ));
-        if let Some(selected) = selection.candidates().iter().find(|candidate| {
-            Some(candidate.id.as_str()) == selection.selected_id()
-        }) {
+        if let Some(selected) = selection
+            .candidates()
+            .iter()
+            .find(|candidate| Some(candidate.id.as_str()) == selection.selected_id())
+        {
             lines.push(format!(
                 "  Graph selection: {} priority={} pagerank_billionths={} blockers={}; tie: priority ascending, PageRank descending, id ascending",
                 selected.id, selected.priority, selected.pagerank_billionths, selected.blocker_ids.len()
@@ -102510,8 +102519,8 @@ reason = "overly conservative pending threshold"
         };
         use sha2::{Digest, Sha256};
 
-        let fixture = tempfile::tempdir().unwrap();
-        let path = fixture.path().join("owned-issues.jsonl");
+        let fixture = tempfile::tempdir().unwrap().keep();
+        let path = fixture.join("owned-issues.jsonl");
         let bytes = br#"{"id":"blocked","status":"blocked","priority":0,"issue_type":"bug"}
 {"id":"downstream","status":"open","priority":0,"issue_type":"task","dependencies":[{"issue_id":"downstream","depends_on_id":"blocked","type":"blocks"}]}
 {"id":"ready-docs","status":"open","priority":1,"issue_type":"docs","description":"private-cli-body-canary"}
@@ -102524,47 +102533,87 @@ reason = "overly conservative pending threshold"
             if robot {
                 argv.push("robot".to_string());
             }
-            argv.extend(["mission", "objective-plan", "--objective", "choose eligible work"]
-                .into_iter().map(ToOwned::to_owned));
-            argv.extend(["--beads-graph".to_string(), path.to_string_lossy().into_owned(),
-                "--beads-graph-sha256".to_string(), hash.clone()]);
+            argv.extend(
+                [
+                    "mission",
+                    "objective-plan",
+                    "--objective",
+                    "choose eligible work",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned),
+            );
+            argv.extend([
+                "--beads-graph".to_string(),
+                path.to_string_lossy().into_owned(),
+                "--beads-graph-sha256".to_string(),
+                hash.clone(),
+            ]);
             argv.extend(extra.iter().map(|value| (*value).to_string()));
             Cli::try_parse_from(argv)
         };
         let common = |cli: Cli| match cli.command.map(|command| *command) {
-            Some(Commands::Mission { command: MissionCommands::ObjectivePlan { args } }) => args.common,
-            Some(Commands::Robot { command: Some(RobotCommands::Mission {
-                command: RobotMissionCommands::ObjectivePlan { args },
-            }), .. }) => args.common,
+            Some(Commands::Mission {
+                command: MissionCommands::ObjectivePlan { args },
+            }) => args.common,
+            Some(Commands::Robot {
+                command:
+                    Some(RobotCommands::Mission {
+                        command: RobotMissionCommands::ObjectivePlan { args },
+                    }),
+                ..
+            }) => args.common,
             _ => panic!("expected the real human or Robot objective-plan command"),
         };
 
         for robot in [false, true] {
             let args = common(parse(robot, &[]).unwrap());
-            let source = if robot { "ft.robot.mission" } else { "ft.mission.cli" };
+            let source = if robot {
+                "ft.robot.mission"
+            } else {
+                "ft.mission.cli"
+            };
             let mut manual = args.clone();
             manual.beads_graph = None;
             manual.beads_graph_sha256 = None;
             manual.target_bead = Some("blocked".to_string());
             let before = build_mission_objective_plan_surface(&manual, source).unwrap();
-            assert_eq!(before.plan.plan_steps[0].target_bead_id.as_deref(), Some("blocked"));
+            assert_eq!(
+                before.plan.plan_steps[0].target_bead_id.as_deref(),
+                Some("blocked")
+            );
 
             let surface = build_mission_objective_plan_surface(&args, source).unwrap();
             assert_eq!(surface.plan_status, MissionObjectivePlanStatus::Actionable);
-            assert_eq!(surface.plan.plan_steps[0].target_bead_id.as_deref(), Some("ready-docs"));
+            assert_eq!(
+                surface.plan.plan_steps[0].target_bead_id.as_deref(),
+                Some("ready-docs")
+            );
             assert!(!surface.side_effects_executed);
             let selection = surface.plan.bead_work_selection.as_ref().unwrap();
             assert_eq!(selection.ordered_ready_ids(), &["ready-docs".to_string()]);
             assert_eq!(selection.input_sha256(), hash);
-            let rank = |id: &str| selection.candidates().iter().find(|candidate| candidate.id == id)
-                .unwrap().pagerank_billionths;
+            let rank = |id: &str| {
+                selection
+                    .candidates()
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .unwrap()
+                    .pagerank_billionths
+            };
             assert!(rank("blocked") > rank("ready-docs"));
             let plain = mission_objective_plain_lines(&surface).join("\n");
             assert!(plain.contains(&hash));
             assert!(plain.contains("live database freshness: not validated"));
             let value = serde_json::to_value(RobotResponse::success(surface, 0)).unwrap();
-            assert_eq!(value["data"]["plan"]["bead_work_selection"]["input_sha256"], hash);
-            assert_eq!(value["data"]["plan"]["bead_work_selection"]["live_database_validated"], false);
+            assert_eq!(
+                value["data"]["plan"]["bead_work_selection"]["input_sha256"],
+                hash
+            );
+            assert_eq!(
+                value["data"]["plan"]["bead_work_selection"]["live_database_validated"],
+                false
+            );
             let encoded = serde_json::to_string(&value).unwrap();
             assert!(!encoded.contains("private-cli-body-canary"));
             assert!(!encoded.contains("private-cli-owner-canary"));
@@ -102574,13 +102623,24 @@ reason = "overly conservative pending threshold"
                 match constraint {
                     "owner" => restricted.active_assignee = Some("current-owner".to_string()),
                     "dependency" => restricted.dependency_blocked = true,
-                    "capacity" => restricted.capacity_posture = MissionObjectiveCapacityPostureArg::Pause,
-                    "proof" => restricted.proof_availability = MissionObjectiveProofAvailabilityArg::Blocked,
+                    "capacity" => {
+                        restricted.capacity_posture = MissionObjectiveCapacityPostureArg::Pause
+                    }
+                    "proof" => {
+                        restricted.proof_availability =
+                            MissionObjectiveProofAvailabilityArg::Blocked
+                    }
                     _ => unreachable!(),
                 }
                 let restricted = build_mission_objective_plan_surface(&restricted, source).unwrap();
-                assert_ne!(restricted.plan.plan_steps[0].status, MissionObjectivePlanStatus::Actionable);
-                assert_ne!(restricted.plan.plan_steps[0].action_kind, MissionObjectiveActionKind::ChooseReadyBead);
+                assert_ne!(
+                    restricted.plan.plan_steps[0].status,
+                    MissionObjectivePlanStatus::Actionable
+                );
+                assert_ne!(
+                    restricted.plan.plan_steps[0].action_kind,
+                    MissionObjectiveActionKind::ChooseReadyBead
+                );
                 assert!(!restricted.side_effects_executed);
             }
 
@@ -102591,23 +102651,30 @@ reason = "overly conservative pending threshold"
                 } else {
                     invalid_args.beads_graph_version = Some(2);
                 }
-                let error = build_mission_objective_plan_surface(&invalid_args, source).unwrap_err();
+                let error =
+                    build_mission_objective_plan_surface(&invalid_args, source).unwrap_err();
                 assert_eq!(error.error_code, "mission.objective_plan.graph_unavailable");
-                assert_eq!(robot_mission_error_code(error.error_code), "robot.objective_plan_graph_unavailable");
+                assert_eq!(
+                    robot_mission_error_code(error.error_code),
+                    "robot.objective_plan_graph_unavailable"
+                );
             }
             assert!(parse(robot, &["--target-bead", "blocked"]).is_err());
             assert!(parse(robot, &["--testing-skill-lane"]).is_err());
         }
 
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH)).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
         let mut stale = common(parse(false, &[]).unwrap());
         stale.generated_at_ms = Some(0);
         let error = build_mission_objective_plan_surface(&stale, "ft.mission.cli").unwrap_err();
         assert_eq!(error.error_code, "mission.objective_plan.graph_unavailable");
         assert!(error.message.contains("stale"));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        println!("MISSION_GRAPH_CLI hash={hash} human_and_robot=true prior_manual=blocked selected=ready-docs blocked_higher_rank_excluded=true owner_dependency_capacity_proof_preserved=true invalid_hash_version_stale_refused=true effect_count=0 live_br_invocations=0");
+        println!(
+            "MISSION_GRAPH_CLI hash={hash} human_and_robot=true prior_manual=blocked selected=ready-docs blocked_higher_rank_excluded=true owner_dependency_capacity_proof_preserved=true invalid_hash_version_stale_refused=true effect_count=0 live_br_invocations=0"
+        );
     }
 
     #[test]

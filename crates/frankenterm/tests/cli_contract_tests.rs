@@ -3267,6 +3267,145 @@ fn contract_help_lists_core_commands() {
 // ft tx contract tests
 // =============================================================================
 
+#[cfg(all(unix, feature = "subprocess-bridge"))]
+#[test]
+fn contract_mission_graph_cli_scores_change_actual_plan_and_refuse_invalid_snapshot() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::Builder::new()
+        .prefix("ft-cli-graph-")
+        .tempdir_in("/tmp")
+        .unwrap()
+        .keep();
+    let root = std::fs::canonicalize(root).unwrap();
+    for name in ["bin", "home", "tmp"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    let config = root.join("ft.toml");
+    std::fs::write(
+        &config,
+        frankenterm_core::config::Config::default()
+            .to_toml()
+            .unwrap(),
+    )
+    .unwrap();
+    let flat = br#"{"id":"a","status":"open","priority":1,"issue_type":"docs"}
+{"id":"b","status":"open","priority":1,"issue_type":"test","description":"private-graph-body"}
+{"id":"owned","status":"in_progress","priority":0,"issue_type":"task","assignee":"private-graph-owner"}
+{"id":"blocked","status":"blocked","priority":0,"issue_type":"bug"}
+"#;
+    let linked = br#"{"id":"a","status":"open","priority":1,"issue_type":"docs"}
+{"id":"b","status":"open","priority":1,"issue_type":"test","description":"private-graph-body"}
+{"id":"owned","status":"in_progress","priority":0,"issue_type":"task","assignee":"private-graph-owner","dependencies":[{"issue_id":"owned","depends_on_id":"b","type":"blocks"}]}
+{"id":"blocked","status":"blocked","priority":0,"issue_type":"bug"}
+"#;
+    let snapshots = [
+        ("flat", flat.as_slice(), "a"),
+        ("linked", linked.as_slice(), "b"),
+    ];
+    let command = |robot: bool| {
+        let mut cmd = wa_cmd_for(root.to_str().unwrap());
+        cmd.env_clear()
+            .env("PATH", root.join("bin"))
+            .env("HOME", root.join("home"))
+            .env("TMPDIR", root.join("tmp"))
+            .env("FT_WORKSPACE", &root)
+            .env("FT_WEZTERM_CLI", root.join("bin/no-mux"))
+            .env("FT_RUNTIME_WORKER_THREADS", "2")
+            .current_dir(&root)
+            .arg("--config")
+            .arg(&config)
+            .timeout(std::time::Duration::from_secs(15));
+        if robot {
+            cmd.args(["robot", "--format", "json", "mission", "objective-plan"]);
+        } else {
+            cmd.args(["mission", "objective-plan", "--format", "json"]);
+        }
+        cmd.args(["--objective", "select eligible work"]);
+        cmd
+    };
+    let run = |mut cmd: Command, expected_success: bool| {
+        let output = cmd.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            expected_success,
+            "status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() < 128 * 1024 && output.stderr.len() < 64 * 1024);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    for (name, bytes, selected) in snapshots {
+        let path = root.join(format!("{name}.jsonl"));
+        std::fs::write(&path, bytes).unwrap();
+        let hash = hex::encode(Sha256::digest(bytes));
+        for robot in [false, true] {
+            let mut manual = command(robot);
+            manual.args(["--target-bead", "blocked"]);
+            let before = run(manual, true);
+            assert_eq!(
+                before["data"]["plan"]["plan_steps"][0]["target_bead_id"],
+                "blocked"
+            );
+
+            let graph_command = |hash: &str| {
+                let mut cmd = command(robot);
+                cmd.arg("--beads-graph")
+                    .arg(&path)
+                    .args(["--beads-graph-sha256", hash]);
+                cmd
+            };
+            let value = run(graph_command(&hash), true);
+            let plan = &value["data"]["plan"];
+            assert_eq!(plan["plan_steps"][0]["target_bead_id"], selected);
+            assert_eq!(plan["plan_status"], "actionable");
+            assert_eq!(plan["side_effects_executed"], false);
+            let selection = &plan["bead_work_selection"];
+            assert_eq!(selection["selected_id"], selected);
+            assert_eq!(selection["input_sha256"], hash);
+            assert_eq!(selection["live_database_validated"], false);
+            assert_eq!(selection["ordered_ready_ids"].as_array().unwrap().len(), 2);
+            let encoded = serde_json::to_string(&value).unwrap();
+            assert!(!encoded.contains("private-graph-body"));
+            assert!(!encoded.contains("private-graph-owner"));
+
+            let mut restricted = graph_command(&hash);
+            restricted.args(["--active-assignee", "current-owner"]);
+            let restricted = run(restricted, true);
+            assert_eq!(restricted["data"]["plan_status"], "waiting_owner");
+            assert_eq!(restricted["data"]["side_effects_executed"], false);
+            for invalid_version in [false, true] {
+                let mut invalid = graph_command(if invalid_version {
+                    &hash
+                } else {
+                    &"0".repeat(64)
+                });
+                if invalid_version {
+                    invalid.args(["--beads-graph-version", "2"]);
+                }
+                let refused = run(invalid, false);
+                assert_eq!(refused["ok"], false);
+                assert_eq!(
+                    refused["error_code"],
+                    if robot {
+                        "robot.objective_plan_graph_unavailable"
+                    } else {
+                        "mission.objective_plan.graph_unavailable"
+                    }
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+    assert_eq!(std::fs::read_dir(root.join("bin")).unwrap().count(), 0);
+    println!(
+        "MISSION_GRAPH_ACTUAL_CLI human_and_robot=true changed_edge_changes_selection=a_to_b ownership_preserved=true invalid_hash_version_refused=true input_bytes_unchanged=true empty_executable_path=true"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn contract_mission_cli_durable_lifecycle_and_stale_token_refusal() {

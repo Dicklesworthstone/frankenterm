@@ -417,6 +417,9 @@ fn extract_risk(candidate: &BeadReadyCandidate) -> f64 {
             BeadResolverReasonCode::MissingDependencyNode => 0.4,
             BeadResolverReasonCode::CyclicDependencyGraph => 0.5,
             BeadResolverReasonCode::PartialGraphData => 0.2,
+            BeadResolverReasonCode::InvalidGraphData
+            | BeadResolverReasonCode::ResourceBudgetExceeded
+            | BeadResolverReasonCode::ActiveOwnership => return 1.0,
         };
     }
 
@@ -474,6 +477,11 @@ fn extract_confidence(candidate: &BeadReadyCandidate, context: &PlannerExtractio
             BeadResolverReasonCode::MissingDependencyNode => 0.3,
             BeadResolverReasonCode::CyclicDependencyGraph => 0.2,
             BeadResolverReasonCode::PartialGraphData => 0.4,
+            // Refused graph authority or active ownership cannot be promoted
+            // by staleness metadata or an in-progress confidence bonus.
+            BeadResolverReasonCode::InvalidGraphData
+            | BeadResolverReasonCode::ResourceBudgetExceeded
+            | BeadResolverReasonCode::ActiveOwnership => return 0.0,
         };
     }
 
@@ -2654,14 +2662,15 @@ mod tests {
     }
 
     #[test]
-    fn risk_increases_with_degraded_reasons() {
+    fn risk_is_maximal_when_partial_graph_cannot_establish_readiness() {
         // Use partial graph data warning
         let mut detail = sample_detail("partial", BeadStatus::Open, 0, &[]);
         detail.ingest_warning = Some(BeadResolverReasonCode::PartialGraphData);
         let report = resolve_bead_readiness(&[detail]);
         let c = &report.candidates[0];
         let risk = extract_risk(c);
-        assert!((risk - 0.2).abs() < 1e-10); // PartialGraphData = 0.2
+        assert!(!c.ready);
+        assert_eq!(risk, 1.0);
     }
 
     // ── Fit ─────────────────────────────────────────────────────────────
@@ -2798,15 +2807,50 @@ mod tests {
     }
 
     #[test]
-    fn confidence_boost_for_in_progress() {
+    fn confidence_cannot_promote_actively_owned_work() {
         let issues = vec![sample_detail("wip", BeadStatus::InProgress, 0, &[])];
         let report = resolve_bead_readiness(&issues);
         let c = &report.candidates[0];
         let mut ctx = PlannerExtractionContext::default();
         ctx.staleness_hours.insert("wip".to_string(), 5.0);
         let confidence = extract_confidence(c, &ctx);
-        // 1.0 + 0.05 = 1.05 clamped to 1.0
-        assert!((confidence - 1.0).abs() < 1e-10);
+        assert!(!c.ready);
+        assert!(
+            c.degraded_reasons
+                .contains(&BeadResolverReasonCode::ActiveOwnership)
+        );
+        assert_eq!(confidence, 0.0);
+    }
+
+    #[test]
+    fn graph_refusal_reasons_reach_scoring_without_readiness_promotion() {
+        let report =
+            resolve_bead_readiness(&[sample_detail("candidate", BeadStatus::Open, 0, &[])]);
+        let mut candidate = report.candidates[0].clone();
+        let mut context = PlannerExtractionContext::default();
+        context.staleness_hours.insert(candidate.id.clone(), 10.0);
+        for reason in [
+            BeadResolverReasonCode::InvalidGraphData,
+            BeadResolverReasonCode::ResourceBudgetExceeded,
+            BeadResolverReasonCode::ActiveOwnership,
+        ] {
+            // Contradictory caller data cannot erase the refusal reason.
+            candidate.ready = true;
+            candidate.status = BeadStatus::InProgress;
+            candidate.degraded_reasons = vec![reason];
+            let risk = extract_risk(&candidate);
+            let confidence = extract_confidence(&candidate, &context);
+            assert_eq!(risk, 1.0, "{reason:?}");
+            assert_eq!(confidence, 0.0, "{reason:?}");
+            let input = make_input(
+                make_fv("candidate", 1.0, 1.0, risk, 1.0, confidence),
+                None,
+                vec![],
+            );
+            let scores = score_candidates(&[input], &ScorerConfig::default());
+            assert_eq!(scores.scored[0].final_score, 0.0);
+            assert!(scores.scored[0].below_confidence_threshold);
+        }
     }
 
     // ── Composite scoring ───────────────────────────────────────────────
