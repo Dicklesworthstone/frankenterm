@@ -12,22 +12,14 @@ cd "$PROJECT_ROOT"
 CHECKER="$SCRIPT_DIR/check_resize_performance_gates.sh"
 PASS=0
 FAIL=0
-declare -a TMPDIRS
+TEST_ROOT="$(mktemp -d)"
 
 new_tmpdir() {
-    local d
-    d="$(mktemp -d)"
-    TMPDIRS+=("$d")
-    echo "$d"
+    mktemp -d "$TEST_ROOT/case.XXXXXX"
 }
 
 cleanup() {
-    for d in "${TMPDIRS[@]:-}"; do
-        if [[ -d "$d" ]]; then
-            find "$d" -type f -exec rm -f {} + 2>/dev/null || true
-            find "$d" -depth -type d -exec rmdir {} + 2>/dev/null || true
-        fi
-    done
+    printf 'Retained resize gate fixtures: %s\n' "$TEST_ROOT"
 }
 trap cleanup EXIT
 
@@ -61,7 +53,7 @@ assert_json_eq() {
     local query="$3"
     local expected="$4"
     local actual
-    actual="$(jq -r "$query" "$file" 2>/dev/null || echo "__ERR__")"
+    actual="$(jq -r "$query" "$file" || echo "__ERR__")"
     if [[ "$actual" == "$expected" ]]; then
         echo "  PASS: $name"
         PASS=$((PASS + 1))
@@ -193,6 +185,123 @@ EOF
 assert_fail "baseline drift breach exits non-zero" \
     bash "$CHECKER" --check-only "$INPUT4" --artifacts-dir "$ART4" --baseline-file "$BASE4" --skip-test-lanes
 assert_json_eq "baseline drift classified hard_fail" "$ART4/resize-performance-report.json" '.summary.overall_status' "hard_fail"
+
+echo
+echo "Test 5: real checker admission and RCH guards with command-only fixtures"
+GUARD_DIR="$(new_tmpdir)"
+mkdir -p "$GUARD_DIR/bin" "$GUARD_DIR/no-rch-bin"
+# A closed PATH prevents either fixture from reaching real Cargo, RCH, SSH,
+# or other service tools. These are ordinary shell utilities only.
+for tool in dirname basename date jq mkdir awk sed grep cat tee head tail tr wc sort env sleep; do
+    resolved="$(command -v "$tool")"
+    ln -s "$resolved" "$GUARD_DIR/bin/$tool"
+    ln -s "$resolved" "$GUARD_DIR/no-rch-bin/$tool"
+done
+ln -s "$BASH" "$GUARD_DIR/bin/bash"
+ln -s "$BASH" "$GUARD_DIR/no-rch-bin/bash"
+if command -v timeout >/dev/null 2>&1; then
+    timeout_path="$(command -v timeout)"
+else
+    timeout_path="$(command -v gtimeout)"
+fi
+ln -s "$timeout_path" "$GUARD_DIR/bin/timeout"
+cat >"$GUARD_DIR/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf 'LOCAL_CARGO_EXECUTED\n' >>"$FT_RESIZE_FIXTURE_CALLS"
+printf 'forbidden local Cargo fixture invoked\n' >&2
+exit 97
+EOF
+chmod +x "$GUARD_DIR/bin/cargo"
+ln -s "$GUARD_DIR/bin/cargo" "$GUARD_DIR/no-rch-bin/cargo"
+cat >"$GUARD_DIR/bin/rch" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'required=%s self_healing=%s argv=' "${RCH_REQUIRE_REMOTE:-}" "${RCH_NO_SELF_HEALING:-}" >>"$FT_RESIZE_FIXTURE_CALLS"
+printf '%q ' "$@" >>"$FT_RESIZE_FIXTURE_CALLS"
+printf '\n' >>"$FT_RESIZE_FIXTURE_CALLS"
+case "$*" in
+    '--json workers probe --all')
+        printf '{"workers":[{"id":"vmi-fixture","status":"healthy"}]}\n'
+        ;;
+    '--json workers capabilities')
+        printf '{"workers":[{"capabilities":{"rustc_version":"fixture-only"}}]}\n'
+        ;;
+    'exec -- '*)
+        [[ "$RCH_REQUIRE_REMOTE" == 1 && "$RCH_NO_SELF_HEALING" == 1 ]] || exit 93
+        if [[ "$FT_RESIZE_FIXTURE_MODE" == fallback ]]; then
+            printf '[RCH] local: planted forbidden fallback\n' >&2
+            exit 0
+        fi
+        # Never execute the payload. The last argument is the scenario path.
+        scenario="${!#}"
+        scenario="$(basename "$scenario" .yaml)"
+        printf 'Selected worker: vmi-fixture\n'
+        printf '__FT_RESIZE_GATE_JSON_BEGIN__\n'
+        jq -c . "$FT_RESIZE_FIXTURE_INPUT/$scenario.json"
+        printf '__FT_RESIZE_GATE_JSON_END__\n'
+        printf 'Remote command finished: exit=0 in 1ms\n'
+        ;;
+    *)
+        printf 'unexpected RCH fixture invocation: %s\n' "$*" >&2
+        exit 94
+        ;;
+esac
+EOF
+chmod +x "$GUARD_DIR/bin/rch"
+
+run_guard_case() {
+    local mode="$1" required="$2" fixture_path="$3" case_dir="$GUARD_DIR/$1-$2"
+    local rc
+    mkdir -p "$case_dir"
+    printf 'retain-this-summary\n' >"$case_dir/summary"
+    : >"$case_dir/calls"
+    if env PATH="$fixture_path" BASH_ENV= _LIB_RCH_GUARDS_LOADED= \
+        FT_RESIZE_FIXTURE_MODE="$mode" FT_RESIZE_FIXTURE_INPUT="$INPUT1" \
+        FT_RESIZE_FIXTURE_CALLS="$case_dir/calls" \
+        RCH_REQUIRE_REMOTE="$required" RCH_SKIP_QUEUE_PREFLIGHT=1 \
+        RCH_PROOF_LEDGER_FILE= RCH_MIRROR_REQUIRED_PATHS= \
+        RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS=0 RCH_SELECTED_WORKER_MIRROR_PREFLIGHT=0 \
+        GITHUB_ACTIONS=true FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO=1 \
+        GITHUB_STEP_SUMMARY="$case_dir/summary" \
+        "$BASH" "$CHECKER" --skip-test-lanes --artifacts-dir "$case_dir/artifacts" \
+        --baseline-file "$case_dir/missing.json" >"$case_dir/output.log" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    cat "$case_dir/output.log"
+    # The helper retains the actual stderr-bearing transcript separately.
+    for log in "$case_dir/artifacts/scenarios/"*.log; do
+        [[ ! -f "$log" ]] || cat "$log"
+    done
+    return "$rc"
+}
+
+assert_pass "strict remote transcript fixture completes all scenarios" \
+    run_guard_case remote 1 "$GUARD_DIR/bin"
+assert_json_eq "remote fixture reaches checker run mode" \
+    "$GUARD_DIR/remote-1/artifacts/resize-performance-report.json" '.mode' "run"
+assert_pass "all five scenario payloads routed through RCH fixture" \
+    test "$(grep -c 'argv=exec' "$GUARD_DIR/remote-1/calls")" -eq 5
+assert_fail "remote admission emits no obsolete command-not-found diagnostic" \
+    grep -E 'command not found|rch_github_actions_local_cargo_enabled' "$GUARD_DIR/remote-1/output.log"
+assert_pass "obsolete summary destination stays byte-exact" \
+    test "$(cat "$GUARD_DIR/remote-1/summary")" = retain-this-summary
+assert_fail "exit-zero local fallback transcript is refused" \
+    run_guard_case fallback 1 "$GUARD_DIR/bin"
+assert_pass "fallback refusal retains the explicit policy diagnostic" \
+    grep -F 'refusing offload policy violation' "$GUARD_DIR/fallback-1/output.log"
+assert_fail "RCH_REQUIRE_REMOTE=0 cannot enable local execution" \
+    run_guard_case disabled 0 "$GUARD_DIR/bin"
+assert_pass "disabled remote mode is refused before any runner call" \
+    test ! -s "$GUARD_DIR/disabled-0/calls"
+assert_fail "missing RCH fails even with obsolete hosted bypass variables" \
+    run_guard_case missing 1 "$GUARD_DIR/no-rch-bin"
+assert_pass "missing RCH refusal names the required runner" \
+    grep -F 'rch is required for cargo execution' "$GUARD_DIR/missing-1/output.log"
+for calls in "$GUARD_DIR/"*/calls; do
+    assert_fail "local Cargo poison remains untouched: $calls" grep -F LOCAL_CARGO_EXECUTED "$calls"
+done
 
 echo
 echo "========================================"

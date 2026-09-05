@@ -128,9 +128,7 @@ if [[ "$TARGET_DIR" == /* ]]; then
     TARGET_DIR="$DEFAULT_TARGET_DIR"
 fi
 
-if [[ -z "$CHECK_ONLY_DIR" ]] \
-    && ! rch_github_actions_local_cargo_enabled \
-    && ! command -v rch >/dev/null 2>&1; then
+if [[ -z "$CHECK_ONLY_DIR" ]] && ! command -v rch >/dev/null 2>&1; then
     echo "[resize-gates] ERROR: rch is required for cargo execution" >&2
     exit 5
 fi
@@ -626,20 +624,6 @@ EOF
 
     echo "[resize-gates] baseline refreshed: $BASELINE_FILE"
     echo "[resize-gates] baseline audit log: $BASELINE_AUDIT_LOG"
-fi
-
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    {
-        echo "## Resize Performance Gates"
-        echo ""
-        echo "| Scenario | Status | M1 p95 (ms) | M1 p99 (ms) |"
-        echo "|----------|--------|-------------|-------------|"
-        jq -r '.scenarios[] | "| \(.scenario) | \(.status) | \(.metrics.m1.p95_ms) | \(.metrics.m1.p99_ms) |"' "$REPORT_FILE"
-        echo ""
-        echo "**Overall status:** \`$(jq -r '.summary.overall_status' "$REPORT_FILE")\`"
-        echo ""
-        echo "Report: \`$REPORT_FILE\`"
-    } >>"$GITHUB_STEP_SUMMARY"
 fi
 
 echo "[resize-gates] report: $REPORT_FILE"
