@@ -41576,14 +41576,11 @@ fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError>
             });
         }
     }
-    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).map_err(|_| invalid())?;
-    if matches!(
-        cli.command.as_deref(),
-        Some(Commands::Robot {
-            command: Some(RobotCommands::WatchEvents { .. }),
-            ..
-        })
-    ) {
+    // Clap has already validated the complete syntax and canonicalized aliases.
+    // Inspect its parsed name without constructing the large typed command tree
+    // on the watcher's bounded worker stack.
+    let robot_matches = matches.subcommand_matches("robot").ok_or_else(invalid)?;
+    if robot_matches.subcommand_name() == Some("watch-events") {
         return Err(IpcRpcArgError {
             code: "ipc.rpc_streaming_unsupported",
             message: "watch-events emits NDJSON and cannot use one-response RPC".to_string(),
@@ -124353,6 +124350,17 @@ printf x > "$MINISIGN_MARKER"
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert!(sanitize_ipc_rpc_args(&args).is_err());
         }
+    }
+
+    #[test]
+    fn ipc_rpc_validation_fits_bounded_worker_stack() {
+        std::thread::Builder::new()
+            .name("ipc-validation-stack".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(ipc_rpc_validates_single_response_commands_before_launch)
+            .expect("spawn bounded validation worker")
+            .join()
+            .expect("finite, streaming, alias and context validation on 2 MiB stack");
     }
 
     #[cfg(unix)]
