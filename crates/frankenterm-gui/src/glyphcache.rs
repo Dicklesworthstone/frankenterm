@@ -2110,7 +2110,8 @@ impl GlyphCache {
         let (cell_width, cell_height) = (base_metrics.cell_width, base_metrics.cell_height);
 
         let glyph = if glyph.width == 0 || glyph.height == 0 {
-            // a whitespace glyph
+            // An inkless glyph, such as whitespace or a contextual-ligature
+            // carrier. Preserve its advance without allocating an empty sprite.
             CachedGlyph {
                 brightness_adjust: 1.0,
                 has_color: glyph.has_color,
@@ -3566,10 +3567,16 @@ mod tests {
                     return Err(OracleError::MissingBitmap);
                 }
                 Some((width, height, pixels))
-            } else if info.is_space {
-                None
             } else {
-                return Err(OracleError::MissingBitmap);
+                let source_is_inkless = info.is_space
+                    || font
+                        .rasterize_glyph(info.glyph_pos, info.font_idx)
+                        .is_ok_and(|source| source.width == 0 || source.height == 0);
+                if source_is_inkless {
+                    None
+                } else {
+                    return Err(OracleError::MissingBitmap);
+                }
             };
             let handles = font.clone_handles();
             Ok(GlyphWitness {
