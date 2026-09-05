@@ -50,6 +50,7 @@ use tempfile::TempDir;
 mod scanner_contract {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
     struct Fixture {
@@ -233,7 +234,7 @@ report() {{
         let outside = fixture.base.join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("private.rs"), b"OUTSIDE_SENTINEL").unwrap();
-        std::os::unix::fs::symlink(&outside, fixture.root.join("escaped")).unwrap();
+        symlink(&outside, fixture.root.join("escaped")).unwrap();
         let (success, value) = fixture.run(true, Path::new("escaped"));
         assert!(!success);
         assert_eq!(value["data"]["kind"]["kind"], "path_escape");
@@ -314,21 +315,20 @@ report() {{
                 "absent_row" => {}
                 "leaf_symlink" => {
                     std::fs::rename(&database, database.with_extension("retained")).unwrap();
-                    std::os::unix::fs::symlink(&outside, &database).unwrap();
+                    symlink(&outside, &database).unwrap();
                 }
                 "ancestor_symlink" => {
                     let retained = fixture.base.join("retained-state");
                     std::fs::rename(fixture.root.join(".ft"), &retained).unwrap();
-                    std::os::unix::fs::symlink(&retained, fixture.root.join(".ft")).unwrap();
+                    symlink(&retained, fixture.root.join(".ft")).unwrap();
                 }
                 "hardlink" => {
                     std::fs::hard_link(&database, fixture.base.join("database-link")).unwrap()
                 }
                 "journal_symlink" => {
-                    std::os::unix::fs::symlink(&outside, fixture.root.join(".ft/ft.db-wal"))
-                        .unwrap()
+                    symlink(&outside, fixture.root.join(".ft/ft.db-wal")).unwrap()
                 }
-                "lock_symlink" => std::os::unix::fs::symlink(
+                "lock_symlink" => symlink(
                     &outside,
                     fixture.root.join(".ft/ft.db.policy-kill-switch.lock"),
                 )

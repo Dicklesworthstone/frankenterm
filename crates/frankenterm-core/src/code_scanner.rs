@@ -120,8 +120,8 @@ pub enum ScanErrorKind {
     MalformedOutput { reason: &'static str },
     #[error("scanner reported incomplete or inconsistent coverage")]
     PartialResult,
-    #[error("scan I/O failed ({kind})")]
-    Io { kind: String },
+    #[error("scan I/O failed ({io_kind})")]
+    Io { io_kind: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -380,10 +380,12 @@ impl ScanPolicySource {
             .pragma_update(None, "trusted_schema", false)
             .map_err(|_| policy_source_failure())?;
         let progress_cx = cx.clone();
-        connection.progress_handler(
-            1000,
-            Some(move || checkpoint(&progress_cx, deadline).is_err()),
-        );
+        connection
+            .progress_handler(
+                1000,
+                Some(move || checkpoint(&progress_cx, deadline).is_err()),
+            )
+            .map_err(|_| policy_source_failure())?;
         let _: i64 = connection
             .query_row("PRAGMA schema_version", [], |row| row.get(0))
             .map_err(|_| {
@@ -413,7 +415,7 @@ impl ScanPolicySource {
 
 fn policy_source_failure() -> ScanErrorKind {
     ScanErrorKind::Io {
-        kind: "policy_state_unavailable".to_string(),
+        io_kind: "policy_state_unavailable".to_string(),
     }
 }
 
@@ -878,7 +880,7 @@ fn checkpoint(cx: &Cx, deadline: Instant) -> Result<(), ScanErrorKind> {
 
 fn io_failure(error: std::io::Error) -> ScanErrorKind {
     ScanErrorKind::Io {
-        kind: format!("{:?}", error.kind()),
+        io_kind: format!("{:?}", error.kind()),
     }
 }
 
@@ -902,7 +904,7 @@ where
     })
     .await
     .map_err(|_| ScanErrorKind::Io {
-        kind: "scan filesystem worker failed".to_string(),
+        io_kind: "scan filesystem worker failed".to_string(),
     })?
 }
 
@@ -2106,7 +2108,7 @@ report 0"#,
                 match replacement {
                     "leaf" => {
                         std::fs::rename(&database, database.with_extension("retained")).unwrap();
-                        std::os::unix::fs::symlink(&outside, &database).unwrap();
+                        symlink(&outside, &database).unwrap();
                     }
                     "parent" => {
                         std::fs::rename(
@@ -2130,7 +2132,7 @@ report 0"#,
                     &mut policy,
                 );
                 assert!(
-                    matches!(result, Err(ScanErrorKind::Io { ref kind }) if kind == "policy_state_unavailable"),
+                    matches!(result, Err(ScanErrorKind::Io { ref io_kind }) if io_kind == "policy_state_unavailable"),
                     "{replacement}"
                 );
                 assert_eq!(
