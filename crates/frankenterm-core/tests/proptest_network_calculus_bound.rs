@@ -28,7 +28,14 @@ fn arb_service() -> impl Strategy<Value = ServiceCurve> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig {
+        // Integration tests are siblings of src/, so use the default
+        // fallback path explicitly and keep persisted regression seeds.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..ProptestConfig::with_cases(128)
+    })]
 
     #[test]
     fn proptest_network_calculus_constructors_accept_exactly_finite_non_negative_values(
