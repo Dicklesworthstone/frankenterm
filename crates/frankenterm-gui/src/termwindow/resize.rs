@@ -1264,7 +1264,7 @@ mod tests {
         let config = ConfigHandle::default_config();
         let style = TextStyle::default();
         let fg = resolve_fg_color_attr(&attrs, attrs.foreground(), palette, &config, &style);
-        let cluster = Line::from_text("AVfi", attrs, 0, None)
+        let cluster = Line::from_text("AVfi", &attrs, 0, None)
             .cluster(None)
             .remove(0);
         LineToElementShapeItem {
