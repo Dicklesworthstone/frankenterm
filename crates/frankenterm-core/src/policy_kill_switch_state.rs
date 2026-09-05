@@ -383,6 +383,27 @@ pub(crate) async fn load_kill_switch_state_from_storage_with_cx(
     validate_revision_anchor(state, anchor)
 }
 
+/// The detached workflow adapter must release its injector mutex before any
+/// awaited effect. Its admission phase therefore uses a bounded, read-only
+/// connection with no SQLite busy wait, under the already acquired fence.
+pub(crate) fn load_kill_switch_state_from_path_with_cx(
+    cx: &crate::cx::Cx,
+    path: &str,
+) -> Result<Option<String>, KillSwitchStateError> {
+    use crate::storage_backend_trait::{OpenConfig, RusqliteBackend};
+    cx.checkpoint().map_err(|_| KillSwitchStateError::LoadFailed("cancelled before switch admission".into()))?;
+    let backend = RusqliteBackend::open(path, &OpenConfig {
+        read_only: true,
+        wal_mode: false,
+        ..Default::default()
+    }).map_err(|_| KillSwitchStateError::LoadFailed("pre-effect database open failed".into()))?;
+    backend.set_busy_timeout(std::time::Duration::ZERO)
+        .map_err(|_| KillSwitchStateError::LoadFailed("pre-effect read timeout setup failed".into()))?;
+    let loaded = load_kill_switch_state(&backend)?;
+    cx.checkpoint().map_err(|_| KillSwitchStateError::LoadFailed("cancelled during switch admission".into()))?;
+    Ok(loaded)
+}
+
 fn write_revisioned_state(
     backend: &dyn StorageBackend,
     ks: &KillSwitch,
@@ -538,15 +559,46 @@ pub(crate) mod tests {
     /// Runs the real transition API in a separately owned test process. The
     /// output contains only state/control receipts, never captured pane text.
     pub(crate) fn transition_in_test_process(path: &Path, operation: &str) -> String {
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        use std::io::Read;
+        fn drain(pipe: impl Read) -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            pipe.take(65_537).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", "policy_kill_switch_state::tests::kill_switch_fence_subprocess", "--ignored", "--nocapture"])
             .env("FT_KILL_SWITCH_TEST_DB", path)
             .env("FT_KILL_SWITCH_TEST_OPERATION", operation)
-            .output().expect("owned transition subprocess");
-        assert!(output.status.success(), "child failed: stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(output.stderr.is_empty(), "unexpected child stderr: {}", String::from_utf8_lossy(&output.stderr));
-        let stdout = String::from_utf8(output.stdout).unwrap();
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().expect("owned transition subprocess");
+        let stdout_pipe = child.stdout.take().unwrap();
+        let stderr_pipe = child.stderr.take().unwrap();
+        let stdout_reader = std::thread::spawn(move || drain(stdout_pipe));
+        let stderr_reader = std::thread::spawn(move || drain(stderr_pipe));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait().expect("poll owned child") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    timed_out = true;
+                    if let Err(error) = child.kill() {
+                        eprintln!("owned child termination returned: {error}");
+                    }
+                    break child.wait().expect("reap owned child after deadline");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        let stdout = stdout_reader.join().expect("stdout reader joined").expect("stdout drained");
+        let stderr = stderr_reader.join().expect("stderr reader joined").expect("stderr drained");
+        assert!(!timed_out && status.success(), "child failed or timed out: stdout={} stderr={}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+        assert!(stdout.len() <= 65_536 && stderr.len() <= 65_536, "owned child exceeded output cap");
+        assert!(stderr.is_empty(), "unexpected child stderr: {}", String::from_utf8_lossy(&stderr));
+        let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("1 passed"), "child test did not execute: {stdout}");
+        println!("owned transition workspace={} operation={operation}\n{stdout}", path.display());
         stdout
     }
 
