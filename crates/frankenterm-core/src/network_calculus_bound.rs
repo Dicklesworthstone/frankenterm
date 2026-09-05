@@ -15,10 +15,9 @@
 //! - `delay_bound` — computes the worst-case delay
 //!   `h(α, β) = T + b/R` (horizontal deviation between α and β).
 //! - `backlog_bound` — peak queue depth `b + r·T` (vertical
-//!   deviation at `t=0`).
+//!   deviation at `t=T` when the arrival rate does not exceed service).
 //! - `StageModel` — one stage in the pipeline (capture / extract /
-//!   storage). Holds an `ArrivalCurve` (input) and a
-//!   `ServiceCurve` (this stage's resource).
+//!   storage). Holds a name and a `ServiceCurve` (this stage's resource).
 //! - `compose_serial` — for tandem stages, the end-to-end service
 //!   curve is the min-plus convolution; for two rate-latency
 //!   curves with rates `R1, R2` and latencies `T1, T2`, this is
@@ -181,14 +180,15 @@ impl ServiceCurve {
 /// h(α, β) = T + b/R
 /// ```
 ///
-/// Returns `None` when stable arrival rate exceeds service rate
-/// (`r >= R`) — the system is unstable and the bound diverges.
+/// Requires a strict service margin (`r < R`). Returns `None` when
+/// that margin is absent or the finite bound cannot be represented.
 #[must_use]
 pub fn delay_bound(arrival: ArrivalCurve, service: ServiceCurve) -> Option<f64> {
     if arrival.rate() >= service.rate() {
         return None;
     }
-    Some(service.latency() + arrival.burst() / service.rate())
+    let bound = service.latency() + arrival.burst() / service.rate();
+    bound.is_finite().then_some(bound)
 }
 
 /// Worst-case backlog (queue depth) bound — the vertical deviation
@@ -198,10 +198,15 @@ pub fn delay_bound(arrival: ArrivalCurve, service: ServiceCurve) -> Option<f64> 
 /// v(α, β) = b + r·T
 /// ```
 ///
-/// Always finite (no stability check needed — backlog at `t=T` is
-/// bounded even when rate exceeds capacity over the long run).
+/// The supremum is infinite when arrival rate exceeds service rate.
+/// Equal rates have a finite bound, although `is_stable` deliberately
+/// requires a strict service margin. Arithmetic overflow also returns
+/// positive infinity rather than understating the bound.
 #[must_use]
 pub fn backlog_bound(arrival: ArrivalCurve, service: ServiceCurve) -> f64 {
+    if arrival.rate() > service.rate() {
+        return f64::INFINITY;
+    }
     arrival.rate().mul_add(service.latency(), arrival.burst())
 }
 
@@ -221,22 +226,20 @@ pub fn is_stable(arrival: ArrivalCurve, service: ServiceCurve) -> bool {
 /// latency curves `(R1, T1)` and `(R2, T2)` is the rate-latency
 /// curve `(min(R1, R2), T1 + T2)`.
 ///
-/// Per ft-cjc4l fix: routes through ServiceCurve::new so the
-/// validator catches latency-overflow into +Inf (e.g.,
-/// f64::MAX + f64::MAX) rather than silently producing an
-/// unrepresentable curve.
+/// Returns `None` if the summed latency is unrepresentable, including
+/// when two valid finite inputs overflow. No invalid curve is created.
 #[must_use]
-pub fn compose_serial(a: ServiceCurve, b: ServiceCurve) -> ServiceCurve {
-    ServiceCurve::new(a.rate().min(b.rate()), a.latency() + b.latency())
+pub fn compose_serial(a: ServiceCurve, b: ServiceCurve) -> Option<ServiceCurve> {
+    ServiceCurve::try_new(a.rate().min(b.rate()), a.latency() + b.latency())
 }
 
 /// Compose N service curves in series. Returns `None` if the slice
-/// is empty (no pipeline → no service).
+/// is empty (no pipeline → no service) or the summed latency overflows.
 #[must_use]
 pub fn compose_pipeline(stages: &[ServiceCurve]) -> Option<ServiceCurve> {
     let mut iter = stages.iter().copied();
     let first = iter.next()?;
-    Some(iter.fold(first, compose_serial))
+    iter.try_fold(first, compose_serial)
 }
 
 // ============================================================================
@@ -264,7 +267,8 @@ impl StageModel {
 
 /// Full pipeline delay bound: convolve all stages' service curves
 /// and apply `delay_bound` against the input arrival curve.
-/// Returns `None` if the pipeline is empty or unstable.
+/// Returns `None` if the pipeline is empty, lacks a strict service
+/// margin, or its composed latency or final bound is unrepresentable.
 #[must_use]
 pub fn pipeline_delay_bound(arrival: ArrivalCurve, stages: &[StageModel]) -> Option<f64> {
     let services: Vec<ServiceCurve> = stages.iter().map(|s| s.service).collect();
@@ -289,25 +293,26 @@ pub struct EmpiricalComparison {
 impl EmpiricalComparison {
     /// Percent deviation of empirical from analytical:
     /// `|empirical - analytical| / analytical · 100`.
-    /// Returns `None` if analytical is zero or non-finite.
+    /// Returns `None` for nonpositive analytical, negative empirical,
+    /// non-finite inputs, or an unrepresentable percentage.
     #[must_use]
     pub fn deviation_pct(&self) -> Option<f64> {
         if !self.analytical_bound_ms.is_finite()
             || !self.empirical_p99_ms.is_finite()
-            || self.analytical_bound_ms == 0.0
+            || self.analytical_bound_ms <= 0.0
+            || self.empirical_p99_ms < 0.0
         {
             return None;
         }
-        Some(
-            ((self.empirical_p99_ms - self.analytical_bound_ms).abs() / self.analytical_bound_ms)
-                * 100.0,
-        )
+        let deviation = ((self.empirical_p99_ms - self.analytical_bound_ms).abs()
+            / self.analytical_bound_ms)
+            * 100.0;
+        deviation.is_finite().then_some(deviation)
     }
 
     /// Whether empirical p99 is within the substrate's
     /// `TOLERANCE_PCT` (20%) of the analytical bound.
-    /// Returns `false` for non-finite / zero analytical (defensive
-    /// — the bound is meaningless and the integration should log).
+    /// Undefined or unrepresentable comparisons fail closed.
     #[must_use]
     pub fn within_tolerance(&self) -> bool {
         self.deviation_pct().is_some_and(|d| d <= TOLERANCE_PCT)
@@ -316,9 +321,14 @@ impl EmpiricalComparison {
     /// Whether the empirical reading EXCEEDS the analytical bound
     /// (a stronger signal than just "deviates" — empirical >
     /// analytical means the bound is broken, not just imprecise).
+    /// A zero analytical bound can be exceeded even though its
+    /// percentage comparison is undefined. Invalid inputs return false.
     #[must_use]
     pub fn exceeds_bound(&self) -> bool {
-        self.empirical_p99_ms > self.analytical_bound_ms
+        self.analytical_bound_ms.is_finite()
+            && self.analytical_bound_ms >= 0.0
+            && self.empirical_p99_ms.is_finite()
+            && self.empirical_p99_ms > self.analytical_bound_ms
     }
 }
 
@@ -349,9 +359,10 @@ impl LindleyBoundsArtifact {
         }
     }
 
-    /// Render this artifact as the canonical JSON the
-    /// integration's release script writes to
-    /// `docs/attestations/perf/lindley-bounds.json` (br-ft-rq13w).
+    /// Render a diagnostic artifact for producing-bead review. The
+    /// wrapper retains it in a run directory; promotion to
+    /// `docs/attestations/perf/lindley-bounds.json` requires the
+    /// separate measured-evidence and release verification closeout.
     ///
     /// The substrate ships the rendering — keeps the bead's "pure-
     /// data record" contract while letting us add validating
@@ -359,16 +370,16 @@ impl LindleyBoundsArtifact {
     /// attestation schema. Callers should pair this with a
     /// sigstore signature per BR-RC-FOUNDATION.G3.1.
     ///
-    /// The schema is stable: integrations parse it as JSON and
-    /// trust the field names. A schema change here is an attestation
-    /// version bump.
+    /// Non-finite numeric inputs and undefined deviations render as
+    /// JSON `null`, with `within_tolerance = false`. A diagnostic must
+    /// remain parseable without manufacturing a zero deviation.
     #[must_use]
     pub fn render_attestation_json(&self) -> String {
         let mut out = String::new();
         out.push_str("{\n");
         out.push_str(&format!(
-            "  \"release_version\": \"{}\",\n",
-            escape_json_string(&self.release_version)
+            "  \"release_version\": {},\n",
+            quoted_json_string(&self.release_version)
         ));
         out.push_str("  \"arrival\": {\n");
         out.push_str(&format!("    \"burst\": {},\n", self.arrival.burst()));
@@ -378,8 +389,8 @@ impl LindleyBoundsArtifact {
         for (i, stage) in self.stages.iter().enumerate() {
             out.push_str("    {\n");
             out.push_str(&format!(
-                "      \"name\": \"{}\",\n",
-                escape_json_string(&stage.name)
+                "      \"name\": {},\n",
+                quoted_json_string(&stage.name)
             ));
             out.push_str(&format!(
                 "      \"service_rate\": {},\n",
@@ -400,8 +411,8 @@ impl LindleyBoundsArtifact {
         for (i, stage) in self.stages.iter().enumerate() {
             out.push_str("    {\n");
             out.push_str(&format!(
-                "      \"name\": \"{}\",\n",
-                escape_json_string(&stage.name)
+                "      \"name\": {},\n",
+                quoted_json_string(&stage.name)
             ));
             out.push_str(&format!(
                 "      \"content_sha256\": \"{}\"\n",
@@ -416,14 +427,14 @@ impl LindleyBoundsArtifact {
         out.push_str("  ],\n");
         out.push_str(&format!(
             "  \"analytical_bound_ms\": {},\n",
-            self.analytical_bound_ms
+            serde_json::json!(self.analytical_bound_ms)
         ));
         out.push_str(&format!(
             "  \"empirical_p99_ms\": {},\n",
-            self.empirical_p99_ms
+            serde_json::json!(self.empirical_p99_ms)
         ));
         let comp = self.comparison();
-        let dev = comp.deviation_pct().unwrap_or(0.0);
+        let dev = serde_json::json!(comp.deviation_pct());
         out.push_str(&format!("  \"deviation_pct\": {dev},\n"));
         out.push_str(&format!(
             "  \"within_tolerance\": {},\n",
@@ -435,14 +446,14 @@ impl LindleyBoundsArtifact {
     }
 }
 
-fn escape_json_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn quoted_json_string(value: &str) -> String {
+    serde_json::json!(value).to_string()
 }
 
 fn canonical_lindley_stage_json(stage: &StageModel) -> String {
     format!(
-        "{{\"name\":\"{}\",\"service_rate\":{},\"service_latency\":{}}}",
-        escape_json_string(&stage.name),
+        "{{\"name\":{},\"service_rate\":{},\"service_latency\":{}}}",
+        quoted_json_string(&stage.name),
         stage.service.rate(),
         stage.service.latency()
     )
@@ -457,9 +468,11 @@ fn render_lindley_coverage_status_json() -> String {
     out.push_str("  \"coverage_status\": [\n");
     out.push_str("    {\n");
     out.push_str("      \"claim_surface\": \"capture_4kb_overlap_benchmark\",\n");
-    out.push_str("      \"status\": \"covered\",\n");
+    out.push_str("      \"status\": \"modeled_pending_empirical\",\n");
     out.push_str("      \"stage_source\": \"stages\",\n");
-    out.push_str("      \"empirical_source\": \"headline capture_latency_p99 benchmark\"\n");
+    out.push_str(
+        "      \"empirical_source\": \"pending retained current-source benchmark evidence\"\n",
+    );
     out.push_str("    },\n");
     out.push_str("    {\n");
     out.push_str("      \"claim_surface\": \"end_to_end_capture_path\",\n");
@@ -636,6 +649,37 @@ mod tests {
     }
 
     #[test]
+    fn finite_curve_inputs_handle_composition_and_bound_overflow_without_panicking() {
+        let large = ServiceCurve::new(1.0, f64::MAX);
+        let arrival = ArrivalCurve::new(0.0, 0.0);
+        assert_eq!(delay_bound(arrival, large), Some(f64::MAX));
+        assert!(compose_serial(large, large).is_none());
+        assert!(compose_pipeline(&[large, large]).is_none());
+        assert!(
+            pipeline_delay_bound(
+                arrival,
+                &[StageModel::new("a", large), StageModel::new("b", large)],
+            )
+            .is_none()
+        );
+        assert!(delay_bound(ArrivalCurve::new(f64::MAX, 0.0), large).is_none());
+        assert!(
+            delay_bound(
+                ArrivalCurve::new(f64::MAX, 0.0),
+                ServiceCurve::new(0.5, 0.0),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            backlog_bound(
+                ArrivalCurve::new(f64::MAX, f64::MAX),
+                ServiceCurve::new(f64::MAX, 2.0),
+            ),
+            f64::INFINITY
+        );
+    }
+
+    #[test]
     fn backlog_bound_known_formula() {
         // v = b + r·T
         // burst=10, rate=50, T=2 → 10 + 100 = 110
@@ -646,12 +690,12 @@ mod tests {
     }
 
     #[test]
-    fn backlog_bound_no_stability_dependency() {
-        // Even when unstable, backlog at t=T is finite.
+    fn backlog_bound_rejects_finite_snapshot_of_an_unstable_queue() {
+        // The finite value at t=T is not the supremum of an unstable queue.
         let a = ArrivalCurve::new(10.0, 1000.0);
         let s = ServiceCurve::new(100.0, 2.0);
-        let b = backlog_bound(a, s);
-        assert!(b.is_finite());
+        assert_eq!(backlog_bound(a, s), f64::INFINITY);
+        assert_eq!(backlog_bound(ArrivalCurve::new(10.0, 100.0), s), 210.0);
     }
 
     #[test]
@@ -674,7 +718,7 @@ mod tests {
     fn compose_serial_takes_min_rate_and_summed_latency() {
         let a = ServiceCurve::new(100.0, 2.0);
         let b = ServiceCurve::new(50.0, 3.0);
-        let c = compose_serial(a, b);
+        let c = compose_serial(a, b).unwrap();
         assert!(approx(c.rate(), 50.0));
         assert!(approx(c.latency(), 5.0));
     }
@@ -792,6 +836,41 @@ mod tests {
     }
 
     #[test]
+    fn comparison_uses_stored_measurements_without_relaxing_the_cutoff() {
+        let rounded_above = EmpiricalComparison {
+            analytical_bound_ms: 7.0,
+            empirical_p99_ms: 8.4,
+        };
+        assert!(rounded_above.deviation_pct().unwrap() > TOLERANCE_PCT);
+        assert!(!rounded_above.within_tolerance());
+        let collapsed_percentage = EmpiricalComparison {
+            analytical_bound_ms: 1.0,
+            empirical_p99_ms: 1.0 + f64::from_bits(1) / 100.0,
+        };
+        assert_eq!(collapsed_percentage.empirical_p99_ms, 1.0);
+        assert_eq!(collapsed_percentage.deviation_pct(), Some(0.0));
+        assert!(collapsed_percentage.within_tolerance());
+        assert!(!collapsed_percentage.exceeds_bound());
+    }
+
+    #[test]
+    fn comparison_rejects_subnormal_quantization_outside_tolerance() {
+        let analytical = delay_bound(
+            ArrivalCurve::new(0.0, 1.0),
+            ServiceCurve::new(2.0, f64::from_bits(3)),
+        )
+        .unwrap();
+        let comparison = EmpiricalComparison {
+            analytical_bound_ms: analytical,
+            empirical_p99_ms: analytical * 0.81,
+        };
+        assert_eq!(analytical.to_bits(), 3);
+        assert_eq!(comparison.empirical_p99_ms.to_bits(), 2);
+        assert!(comparison.deviation_pct().unwrap() > 33.0);
+        assert!(!comparison.within_tolerance());
+    }
+
+    #[test]
     fn comparison_zero_analytical_returns_none_dev() {
         let c = EmpiricalComparison {
             analytical_bound_ms: 0.0,
@@ -812,6 +891,50 @@ mod tests {
     }
 
     #[test]
+    fn comparison_rejects_negative_and_unrepresentable_readings() {
+        for (analytical, empirical) in [
+            (-50.0, 8.5),
+            (-50.0, -50.0),
+            (50.0, -1.0),
+            (-0.0, 0.0),
+            (f64::NEG_INFINITY, 8.5),
+            (50.0, f64::INFINITY),
+            (50.0, f64::NAN),
+            (f64::from_bits(1), f64::MAX),
+        ] {
+            let comparison = EmpiricalComparison {
+                analytical_bound_ms: analytical,
+                empirical_p99_ms: empirical,
+            };
+            assert!(comparison.deviation_pct().is_none());
+            assert!(!comparison.within_tolerance());
+        }
+        // A representable input pair can exceed the bound even if its
+        // percentage overflows. Invalid input, however, cannot assert that.
+        assert!(
+            EmpiricalComparison {
+                analytical_bound_ms: f64::from_bits(1),
+                empirical_p99_ms: f64::MAX,
+            }
+            .exceeds_bound()
+        );
+        assert!(
+            !EmpiricalComparison {
+                analytical_bound_ms: -50.0,
+                empirical_p99_ms: 8.5,
+            }
+            .exceeds_bound()
+        );
+        assert!(
+            !EmpiricalComparison {
+                analytical_bound_ms: 50.0,
+                empirical_p99_ms: f64::INFINITY,
+            }
+            .exceeds_bound()
+        );
+    }
+
+    #[test]
     fn comparison_exceeds_bound_when_empirical_higher() {
         let c = EmpiricalComparison {
             analytical_bound_ms: 50.0,
@@ -824,6 +947,27 @@ mod tests {
             empirical_p99_ms: 45.0,
         };
         assert!(!c2.exceeds_bound());
+    }
+
+    #[test]
+    fn positive_empirical_delay_exceeds_a_valid_zero_delay_bound() {
+        let analytical =
+            delay_bound(ArrivalCurve::new(0.0, 1.0), ServiceCurve::new(2.0, 0.0)).unwrap();
+        assert_eq!(analytical, 0.0);
+        let comparison = EmpiricalComparison {
+            analytical_bound_ms: analytical,
+            empirical_p99_ms: 1.0,
+        };
+        assert!(comparison.exceeds_bound());
+        assert!(comparison.deviation_pct().is_none());
+        assert!(!comparison.within_tolerance());
+        assert!(
+            !EmpiricalComparison {
+                empirical_p99_ms: 0.0,
+                ..comparison
+            }
+            .exceeds_bound()
+        );
     }
 
     // ----------------------------------------------------------------
@@ -955,7 +1099,10 @@ mod tests {
             coverage_rows[0]["claim_surface"].as_str(),
             Some("capture_4kb_overlap_benchmark")
         );
-        assert_eq!(coverage_rows[0]["status"].as_str(), Some("covered"));
+        assert_eq!(
+            coverage_rows[0]["status"].as_str(),
+            Some("modeled_pending_empirical")
+        );
         assert_eq!(
             coverage_rows[1]["claim_surface"].as_str(),
             Some("end_to_end_capture_path")
@@ -1041,6 +1188,62 @@ mod tests {
         // string-bearing values.
         assert!(json.contains(r#"0.1.0\\release\"with-quote"#));
         assert!(json.contains(r#"stage\\\"injected"#));
+    }
+
+    #[test]
+    fn render_attestation_json_roundtrips_every_json_control_character() {
+        let controls: String = (0_u8..=31).map(char::from).collect();
+        let text = format!("{controls}\\\"λ🙂");
+        let stage = StageModel::new(&text, ServiceCurve::new(100.0, 1.0));
+        let artifact = LindleyBoundsArtifact {
+            release_version: text.clone(),
+            arrival: ArrivalCurve::new(0.0, 1.0),
+            stages: vec![stage.clone()],
+            analytical_bound_ms: 1.0,
+            empirical_p99_ms: 1.0,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&artifact.render_attestation_json()).unwrap();
+        let canonical: serde_json::Value =
+            serde_json::from_str(&canonical_lindley_stage_json(&stage)).unwrap();
+        assert_eq!(json["release_version"].as_str(), Some(text.as_str()));
+        assert_eq!(json["stages"][0]["name"].as_str(), Some(text.as_str()));
+        assert_eq!(
+            json["stage_content_hashes"][0]["name"].as_str(),
+            Some(text.as_str())
+        );
+        assert_eq!(canonical["name"].as_str(), Some(text.as_str()));
+        assert_eq!(json["within_tolerance"], true);
+    }
+
+    #[test]
+    fn render_invalid_comparison_emits_null_deviation_and_fails_tolerance() {
+        for (analytical, empirical) in [
+            (0.0, 0.0),
+            (-8.5, -8.5),
+            (8.5, -1.0),
+            (f64::NAN, 8.5),
+            (f64::INFINITY, 8.5),
+            (8.5, f64::NEG_INFINITY),
+            (f64::from_bits(1), f64::MAX),
+        ] {
+            let artifact = LindleyBoundsArtifact {
+                release_version: "0.0.0-substrate".to_string(),
+                arrival: ArrivalCurve::new(0.0, 1.0),
+                stages: vec![StageModel::new("capture", ServiceCurve::new(100.0, 1.0))],
+                analytical_bound_ms: analytical,
+                empirical_p99_ms: empirical,
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&artifact.render_attestation_json()).unwrap();
+            assert!(json["deviation_pct"].is_null());
+            assert_eq!(json["within_tolerance"], false);
+            assert_eq!(
+                json["analytical_bound_ms"].is_null(),
+                !analytical.is_finite()
+            );
+            assert_eq!(json["empirical_p99_ms"].is_null(), !empirical.is_finite());
+        }
     }
 
     #[test]

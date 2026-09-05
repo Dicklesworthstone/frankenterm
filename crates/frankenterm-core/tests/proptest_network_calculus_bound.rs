@@ -65,8 +65,13 @@ proptest! {
         prop_assert!(approx_eq(arrival_value, arrival.rate().mul_add(t, arrival.burst())));
 
         let after_latency = service.latency() + t;
+        // Forming and then subtracting a large latency loses precision in t.
+        // Bound that input rounding after scaling by the service rate rather
+        // than demanding an absolute residual independent of conditioning.
+        let roundoff = 4.0 * f64::EPSILON * service.rate() * after_latency;
         prop_assert!(
-            approx_eq(service.rate().mul_add(-t, service.evaluate(after_latency)), 0.0),
+            service.rate().mul_add(-t, service.evaluate(after_latency)).abs()
+                <= roundoff.max(1e-6),
         );
     }
 
@@ -101,7 +106,10 @@ proptest! {
 
         prop_assert!(!is_stable(arrival, service));
         prop_assert_eq!(delay_bound(arrival, service), None);
-        prop_assert!(backlog_bound(arrival, service).is_finite());
+        prop_assert_eq!(
+            backlog_bound(arrival, service).is_finite(),
+            arrival.rate() == service.rate(),
+        );
     }
 
     #[test]
@@ -111,7 +119,7 @@ proptest! {
         b in arb_service(),
         c in arb_service(),
     ) {
-        let composed_pair = compose_serial(a, b);
+        let composed_pair = compose_serial(a, b).expect("bounded generated latencies compose");
         prop_assert!(approx_eq(composed_pair.rate(), a.rate().min(b.rate())));
         prop_assert!(approx_eq(composed_pair.latency(), a.latency() + b.latency()));
 
@@ -147,7 +155,19 @@ proptest! {
         };
 
         prop_assert!((comparison.deviation_pct().unwrap() - pct).abs() <= 1e-6);
-        prop_assert_eq!(comparison.within_tolerance(), pct <= TOLERANCE_PCT);
-        prop_assert_eq!(comparison.exceeds_bound(), above && pct > 0.0);
+        // The generated percentage describes the value before multiplication
+        // rounds the stored empirical input. Exact threshold cases have
+        // separate representable unit fixtures; do not change the production
+        // cutoff to accommodate a generator's lost precision.
+        if pct < TOLERANCE_PCT - 1e-6 {
+            prop_assert!(comparison.within_tolerance());
+        } else if pct > TOLERANCE_PCT + 1e-6 {
+            prop_assert!(!comparison.within_tolerance());
+        }
+        if comparison.empirical_p99_ms == analytical {
+            prop_assert!(!comparison.exceeds_bound());
+        } else {
+            prop_assert_eq!(comparison.exceeds_bound(), above);
+        }
     }
 }

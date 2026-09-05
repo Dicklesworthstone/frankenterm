@@ -1,43 +1,41 @@
 #!/usr/bin/env bash
-# scripts/lindley-bounds-build.sh — build the Lindley-bounds attestation
-# artifact for the per-release `perf/lindley-bounds` slot.
+# scripts/lindley-bounds-build.sh — build a retained Lindley diagnostic via RCH.
 #
 # Bead: br-ft-43x69 (substrate-pass) / parent ft-rq13w.
 #
-# Wired scope: invokes the
-# `crates/frankenterm-core/examples/lindley_bounds_build.rs` example
-# (which consumes live latency-stage telemetry when supplied, otherwise
-# falls back to `docs/perf/latency-derivation.md`) and writes the canonical JSON to
-# `docs/attestations/perf/lindley-bounds.json`. The attestation bundle
-# build (`scripts/attestation-build.sh`) hashes that file into the
-# release bundle.
-#
-# Remaining release-orchestration hooks:
-#   * Sigstore signing per BR-RC-FOUNDATION.G3.1 — runs after the
-#     JSON lands; same shape as the existing
-#     scripts/attestation-build.sh signing path.
-#   * PR-CI cross-check that auto-files a regression bead via
-#     `br create` when deviation_pct > 20%.
+# Invokes crates/frankenterm-core/examples/lindley_bounds_build.rs using
+# direct, locked Cargo with bounded jobs in the default development profile.
+# This profile is for diagnostic model/JSON calculation, with no performance
+# claim. Defaults are HISTORICAL inputs; this script neither runs a benchmark
+# nor promotes a release artifact.
+# Logs and JSON remain in FT_LINDLEY_BOUNDS_ARTIFACT_DIR (a run-specific target
+# directory by default). Bundle promotion requires separate measured evidence.
+# A real FT_RELEASE_VERSION requires explicit model/empirical input and
+# matching FT_LINDLEY_INPUT_SHA256; see the example for exact payload encoding.
+# FT_LINDLEY_INPUT_ORIGIN is only a declared, unverified external origin.
+# Telemetry JSON/file input is limited to 64 KiB of UTF-8 without NUL bytes.
 #
 # Usage:
-#   scripts/lindley-bounds-build.sh                       # writes file
-#   FT_RELEASE_VERSION=0.2.0 scripts/lindley-bounds-build.sh
+#   scripts/lindley-bounds-build.sh                       # historical diagnostic
 #   scripts/lindley-bounds-build.sh --stage-telemetry-json /tmp/stages.json \
 #       --empirical-p99-ms 42.0 --no-write
 #
 # Exit codes:
-#   0  artifact written + within_tolerance check passed
-#   1  tolerance check failed (deviation_pct > TOLERANCE_PCT=20.0)
-#   2  usage error / build error
+#   0  diagnostic comparison is within tolerance; not release proof
+#   1  failed/undefined comparison; diagnostic JSON is retained
+#   2  invalid input, RCH/build failure or invalid/missing JSON
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NO_WRITE=0
-STAGE_TELEMETRY_JSON=""
-EMPIRICAL_P99_MS=""
 RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
-ARTIFACT_DIR="${FT_LINDLEY_BOUNDS_ARTIFACT_DIR:-target/lindley-bounds-build}"
+ARTIFACT_DIR="${FT_LINDLEY_BOUNDS_ARTIFACT_DIR:-target/lindley-bounds-build/${RUN_ID}}"
+CARGO_JOBS="${FT_LINDLEY_BOUNDS_CARGO_JOBS:-1}"
+[[ "$CARGO_JOBS" =~ ^([1-9]|1[0-6])$ ]] || {
+  echo "FT_LINDLEY_BOUNDS_CARGO_JOBS must be between 1 and 16" >&2
+  exit 2
+}
 DEFAULT_RCH_TARGET_DIR="target/rch-lindley-bounds-build-${RUN_ID}"
 REQUESTED_RCH_TARGET_DIR="${FT_LINDLEY_BOUNDS_RCH_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 if [[ -n "$REQUESTED_RCH_TARGET_DIR" ]]; then
@@ -55,16 +53,16 @@ while [[ $# -gt 0 ]]; do
     --no-write) NO_WRITE=1; shift ;;
     --stage-telemetry-json)
       [[ $# -ge 2 ]] || { echo "--stage-telemetry-json requires a path" >&2; exit 2; }
-      STAGE_TELEMETRY_JSON="$2"
+      FT_LINDLEY_STAGE_TELEMETRY_PATH="$2"
       shift 2
       ;;
     --empirical-p99-ms)
       [[ $# -ge 2 ]] || { echo "--empirical-p99-ms requires a value" >&2; exit 2; }
-      EMPIRICAL_P99_MS="$2"
+      export FT_LINDLEY_EMPIRICAL_P99_MS="$2"
       shift 2
       ;;
     -h|--help)
-      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,/^set -/p' "$0" | sed '$d; s/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -76,17 +74,49 @@ cd "$REPO_ROOT"
 source "$REPO_ROOT/tests/e2e/lib_rch_guards.sh"
 mkdir -p "$ARTIFACT_DIR"
 
-if [[ -n "$STAGE_TELEMETRY_JSON" ]]; then
-  [[ -r "$STAGE_TELEMETRY_JSON" ]] || {
-    echo "stage telemetry file is not readable: $STAGE_TELEMETRY_JSON" >&2
+read_bounded_telemetry() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+limit = 64 * 1024
+mode, source = sys.argv[1:]
+try:
+    if mode == "file":
+        with open(source, "rb") as stream:
+            payload = stream.read(limit + 1)
+    else:
+        payload = os.fsencode(source)
+    if len(payload) > limit:
+        raise ValueError("telemetry exceeds 65536-byte limit")
+    if b"\x00" in payload:
+        raise ValueError("telemetry must not contain NUL bytes")
+    try:
+        payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError("telemetry must be valid UTF-8") from None
+except (OSError, ValueError) as error:
+    print(f"lindley-bounds-build: {error}", file=sys.stderr)
+    sys.exit(2)
+# Validate before command substitution can strip NUL bytes. Trailing JSON
+# whitespace may be removed by the shell; the bound applies to original bytes.
+sys.stdout.buffer.write(payload)
+PY
+}
+
+if [[ ${FT_LINDLEY_STAGE_TELEMETRY_PATH+x} ]]; then
+  [[ ! ${FT_LINDLEY_STAGE_TELEMETRY_JSON+x} ]] || {
+    echo "supply one telemetry input: JSON or PATH, not both" >&2
     exit 2
   }
-  export FT_LINDLEY_STAGE_TELEMETRY_JSON
-  FT_LINDLEY_STAGE_TELEMETRY_JSON="$(cat "$STAGE_TELEMETRY_JSON")"
-fi
-
-if [[ -n "$EMPIRICAL_P99_MS" ]]; then
-  export FT_LINDLEY_EMPIRICAL_P99_MS="$EMPIRICAL_P99_MS"
+  [[ -f "$FT_LINDLEY_STAGE_TELEMETRY_PATH" && -r "$FT_LINDLEY_STAGE_TELEMETRY_PATH" ]] || {
+    echo "stage telemetry path must name a readable file" >&2
+    exit 2
+  }
+  # The local path is not a path on the remote worker. Forward bounded JSON.
+  FT_LINDLEY_STAGE_TELEMETRY_JSON="$(read_bounded_telemetry file "$FT_LINDLEY_STAGE_TELEMETRY_PATH")" || exit 2
+elif [[ ${FT_LINDLEY_STAGE_TELEMETRY_JSON+x} ]]; then
+  FT_LINDLEY_STAGE_TELEMETRY_JSON="$(read_bounded_telemetry json "$FT_LINDLEY_STAGE_TELEMETRY_JSON")" || exit 2
 fi
 
 extract_rch_json() {
@@ -94,10 +124,10 @@ extract_rch_json() {
   local out_json="$2"
 
   awk -v begin="$RCH_JSON_BEGIN_MARKER" -v end="$RCH_JSON_END_MARKER" '
-    $0 == begin { capturing = 1; next }
-    $0 == end { found_end = 1; exit }
+    $0 == begin { if (started || ended) exit 1; started = 1; capturing = 1; next }
+    $0 == end { if (!capturing || ended) exit 1; ended = 1; capturing = 0; next }
     capturing { print }
-    END { if (!found_end) exit 1 }
+    END { if (!started || !ended || capturing) exit 1 }
   ' "$input_log" >"$out_json"
 }
 
@@ -105,66 +135,57 @@ rch_log="$ARTIFACT_DIR/lindley_bounds_${RUN_ID}.rch.log"
 artifact_json="$ARTIFACT_DIR/lindley-bounds.json"
 
 rch_init "$ARTIFACT_DIR" "$RUN_ID" "lindley_bounds_build" "$REPO_ROOT"
-ensure_rch_ready
-
 set +e
-# shellcheck disable=SC2016
-run_rch_cargo_logged "$rch_log" \
-  env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
-    FT_LINDLEY_STAGE_TELEMETRY_JSON="${FT_LINDLEY_STAGE_TELEMETRY_JSON:-}" \
-    FT_LINDLEY_EMPIRICAL_P99_MS="${FT_LINDLEY_EMPIRICAL_P99_MS:-}" \
-    FT_LINDLEY_BOUNDS_JSON_BEGIN="$RCH_JSON_BEGIN_MARKER" \
-    FT_LINDLEY_BOUNDS_JSON_END="$RCH_JSON_END_MARKER" \
-    bash -lc '
-      set -euo pipefail
-      json_begin="${FT_LINDLEY_BOUNDS_JSON_BEGIN:?}"
-      json_end="${FT_LINDLEY_BOUNDS_JSON_END:?}"
-      remote_artifact_dir="${CARGO_TARGET_DIR}/ft-lindley-bounds-build"
-      mkdir -p "$remote_artifact_dir"
-      remote_json="${remote_artifact_dir}/lindley-bounds.json"
-      set +e
-      cargo run --release --example lindley_bounds_build \
-        -p frankenterm-core --no-default-features --quiet \
-        >"$remote_json"
-      rc=$?
-      set -e
-      printf "%s\n" "$json_begin"
-      if [[ -f "$remote_json" ]]; then
-        cat "$remote_json"
-      fi
-      printf "\n%s\n" "$json_end"
-      exit "$rc"
-    '
+(set -e; ensure_rch_ready)
+preflight_status=$?
+set -e
+if [[ $preflight_status -ne 0 ]]; then
+  echo "lindley-bounds-build: RCH preflight failed; see $ARTIFACT_DIR" >&2
+  exit 2
+fi
+
+# Only deliberate inputs cross the command boundary. In particular, absence
+# stays absence; an explicit empty value reaches the example and is rejected.
+remote_env=("CARGO_TARGET_DIR=$RCH_TARGET_DIR" "FT_LINDLEY_BOUNDS_EMIT_JSON_MARKERS=1")
+for input_key in FT_RELEASE_VERSION FT_LINDLEY_STAGE_TELEMETRY_JSON \
+  FT_LINDLEY_EMPIRICAL_P99_MS FT_LINDLEY_INPUT_SHA256 FT_LINDLEY_INPUT_ORIGIN; do
+  if [[ ${!input_key+x} ]]; then
+    remote_env+=("$input_key=${!input_key}")
+  fi
+done
+
+echo "lindley-bounds-build: development profile; diagnostic calculation only, no performance claim" >&2
+set +e
+(run_rch_cargo_logged "$rch_log" \
+  env "${remote_env[@]}" \
+    cargo run --locked -j "$CARGO_JOBS" --example lindley_bounds_build \
+      -p frankenterm-core --no-default-features --quiet)
 ec=$?
 set -e
 
 extract_status=0
 extract_rch_json "$rch_log" "$artifact_json" || extract_status=$?
 
-if [[ $ec -ne 0 ]]; then
-  if [[ $ec -eq 1 && $extract_status -eq 0 ]]; then
-    # Tolerance check failed — print the artifact to stderr for
-    # diagnostic visibility and propagate the example's exit code.
-    cat "$artifact_json" >&2
-    exit 1
-  fi
-  echo "lindley-bounds-build: example invocation failed (exit $ec)" >&2
+if [[ $ec -ne 0 && $ec -ne 1 ]]; then
+  echo "lindley-bounds-build: example invocation failed (exit $ec); see $rch_log" >&2
   exit 2
 fi
 
-if [[ $extract_status -ne 0 ]]; then
-  echo "lindley-bounds-build: failed to extract JSON artifact from $rch_log" >&2
+if [[ $extract_status -ne 0 ]] || ! jq -e --argjson exit_code "$ec" '
+  type == "object"
+  and (.within_tolerance | type == "boolean")
+  and (.within_tolerance == ($exit_code == 0))
+  and (.input_provenance.release_ready == false)
+  and (.input_provenance.measurement_provenance_verified == false)
+' "$artifact_json" >/dev/null; then
+  echo "lindley-bounds-build: missing/invalid diagnostic or exit/JSON mismatch; see $rch_log" >&2
   exit 2
 fi
 
+echo "lindley-bounds-build: retained diagnostic $artifact_json (exit $ec)" >&2
 if [[ $NO_WRITE -eq 1 ]]; then
   cat "$artifact_json"
-  exit 0
+else
+  echo "$artifact_json"
 fi
-
-out="docs/attestations/perf/lindley-bounds.json"
-mkdir -p "$(dirname "$out")"
-cp "$artifact_json" "$out"
-
-echo "lindley-bounds-build: wrote $out" >&2
-echo "$out"
+exit "$ec"

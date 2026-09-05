@@ -137,7 +137,7 @@ proptest! {
     }
 
     #[test]
-    fn proptest_lindley_bounds_build_documented_default_stays_release_attestable(
+    fn proptest_lindley_bounds_build_documented_default_stays_explicitly_modeled(
         empirical_p99_ms in 0.0_f64..=20.0,
     ) {
         let model = LindleyTelemetryModel::documented_default();
@@ -160,6 +160,10 @@ proptest! {
         prop_assert!(artifact.analytical_bound_ms.is_finite());
         prop_assert_eq!(json["release_version"].as_str(), Some("0.0.0-substrate"));
         prop_assert_eq!(
+            json["coverage_status"][0]["status"].as_str(),
+            Some("modeled_pending_empirical"),
+        );
+        prop_assert_eq!(
             json["stages"].as_array().expect("stages array").len(),
             LINDLEY_ATTESTATION_STAGES.len()
         );
@@ -171,7 +175,8 @@ proptest! {
 
     #[test]
     fn proptest_lindley_bounds_build_artifact_json_roundtrips_escaped_release_versions(
-        release_version in "[A-Za-z0-9_./\\\\\\\"-]{0,64}",
+        release_version in prop::collection::vec(any::<char>(), 0..64)
+            .prop_map(|chars| chars.into_iter().collect::<String>()),
         burst in 0.0_f64..=100.0,
         arrival_rate in 0.0_f64..=999.0,
         service_margin in 1.0_f64..=10_000.0,
@@ -208,7 +213,18 @@ proptest! {
             json["stages"][0]["name"].as_str(),
             Some(expected_stage_name(LatencyStage::PtyCapture))
         );
-        prop_assert_eq!(json["within_tolerance"].as_bool(), Some(true));
+        if artifact.analytical_bound_ms == 0.0 {
+            prop_assert!(json["deviation_pct"].is_null());
+            prop_assert_eq!(json["within_tolerance"].as_bool(), Some(false));
+        } else if artifact.analytical_bound_ms.is_normal()
+            && empirical_delta_pct.abs() < 20.0 - 1e-6
+        {
+            // Generated boundary percentages can round to stored inputs just
+            // outside the cutoff. Subnormal quantization can change them even
+            // more. Serialization remains checked for every input; exact
+            // boundary and subnormal comparison fixtures live in unit tests.
+            prop_assert_eq!(json["within_tolerance"].as_bool(), Some(true));
+        }
     }
 
     #[test]
