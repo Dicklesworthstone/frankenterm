@@ -204,7 +204,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         BridgeError::Io(err.kind())
     }
 
-    fn resolve_binary(&self) -> Result<PathBuf, BridgeError> {
+    pub(crate) fn resolve_binary(&self) -> Result<PathBuf, BridgeError> {
         let direct = PathBuf::from(&self.binary_name);
         if direct.is_absolute() || direct.components().count() > 1 {
             if is_executable_file(&direct) {

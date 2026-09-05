@@ -421,6 +421,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Scan explicitly selected Rust source with policy-gated UBS
+    #[cfg(feature = "subprocess-bridge")]
+    #[command(
+        after_help = "EXAMPLES:\n    ft scan --project-root /path/to/project --path src\n    ft scan --project-root /path/to/project --staged --json\n\nStaged/diff select Git paths and scan current working-tree bytes.\nCoverage is static Rust only; Cargo checks are excluded. Input snapshots are retained."
+    )]
+    Scan {
+        #[command(flatten)]
+        args: CodeScanArgs,
+
+        /// Return the complete typed result and process diagnostics as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Start the watcher daemon
     #[command(after_help = r#"EXAMPLES:
     ft watch                          Start daemon (backgrounds by default)
@@ -3829,6 +3843,13 @@ enum SavedSearchCommands {
 #[derive(Subcommand)]
 #[command(disable_help_subcommand = true)]
 enum RobotCommands {
+    /// Scan selected Rust source; return coverage, findings or a typed refusal
+    #[cfg(feature = "subprocess-bridge")]
+    Scan {
+        #[command(flatten)]
+        args: CodeScanArgs,
+    },
+
     /// Show robot help as JSON
     Help,
 
@@ -9477,6 +9498,31 @@ fn robot_gui_apply_unify_plan(
         dropped_tabs,
         closed_windows,
     })
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug, Clone, Args)]
+#[command(group(clap::ArgGroup::new("scan_scope").required(true).args(["path", "staged", "diff"])))]
+struct CodeScanArgs {
+    /// Absolute project root containing all selected source
+    #[arg(long)]
+    project_root: PathBuf,
+
+    /// File or directory inside the project root (Rust source only)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Select staged Git paths and scan their current working-tree bytes
+    #[arg(long)]
+    staged: bool,
+
+    /// Select paths changed from HEAD and scan current working-tree bytes
+    #[arg(long)]
+    diff: bool,
+
+    /// Total scanner deadline, including version, selection and capture
+    #[arg(long, default_value = "30000", value_parser = clap::value_parser!(u64).range(1..=120_000))]
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -38888,9 +38934,134 @@ fn build_ntm_not_implemented_response(
     response
 }
 
+#[cfg(feature = "subprocess-bridge")]
+async fn code_scan_command_response(
+    cx: &frankenterm_core::cx::Cx,
+    config: &frankenterm_core::config::Config,
+    workspace_root: &Path,
+    db_path: &Path,
+    args: &CodeScanArgs,
+    actor: frankenterm_core::policy::ActorKind,
+) -> RobotResponse<frankenterm_core::code_scanner::ScanOutcome> {
+    use frankenterm_core::code_scanner::{
+        CodeScanner, ScanError, ScanErrorKind, ScanRequest, ScanScope, ScanStage,
+    };
+
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_millis(args.timeout_ms);
+    let failure = |kind| ScanError {
+        kind,
+        stage: ScanStage::Admission,
+        diagnostics: Vec::new(),
+        retained_snapshot: None,
+    };
+    let scope = match (&args.path, args.staged, args.diff) {
+        (Some(path), false, false) => ScanScope::Path { path: path.clone() },
+        (None, true, false) => ScanScope::Staged,
+        (None, false, true) => ScanScope::Diff,
+        _ => {
+            return code_scan_error_response(
+                failure(ScanErrorKind::InvalidRequest {
+                    reason: "exactly one path, staged or diff scope is required",
+                }),
+                elapsed_ms(start),
+            );
+        }
+    };
+    // The workspace fence stays alive through every scanner process and its
+    // settled cleanup. No SQLite handle or policy mutex crosses scan await.
+    let (mut policy, _policy_fence) = match frankenterm_core::code_scanner::load_scan_policy(
+        cx,
+        config,
+        workspace_root,
+        db_path,
+        deadline,
+    )
+    .await
+    {
+        Ok(admission) => admission,
+        Err(kind) => return code_scan_error_response(failure(kind), elapsed_ms(start)),
+    };
+    let request = ScanRequest {
+        project_root: args.project_root.clone(),
+        scope,
+        timeout_ms: args.timeout_ms,
+    };
+    match CodeScanner::new()
+        .scan(cx, &mut policy, actor, &request, deadline)
+        .await
+    {
+        Ok(outcome) => RobotResponse::success(outcome, elapsed_ms(start)),
+        Err(error) => code_scan_error_response(error, elapsed_ms(start)),
+    }
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn code_scan_error_response(
+    error: frankenterm_core::code_scanner::ScanError,
+    elapsed: u64,
+) -> RobotResponse<frankenterm_core::code_scanner::ScanOutcome> {
+    let diagnostic = serde_json::to_value(&error).unwrap_or_else(|_| {
+        serde_json::json!({
+            "kind": {"kind": "diagnostic_encoding_failed"},
+            "stage": error.stage,
+        })
+    });
+    RobotResponse::error_with_code_and_data(
+        "robot.code_scan",
+        error.to_string(),
+        Some("Review the typed scanner diagnostic, project scope and operator policy before retrying.".to_string()),
+        diagnostic,
+        elapsed,
+    )
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn print_code_scan_plain(response: &RobotResponse<frankenterm_core::code_scanner::ScanOutcome>) {
+    if let Some(outcome) = &response.data {
+        println!(
+            "Static Rust scan: {:?}; {} files, {} critical, {} warning, {} info",
+            outcome.classification,
+            outcome.report.totals.files,
+            outcome.report.totals.critical,
+            outcome.report.totals.warning,
+            outcome.report.totals.info
+        );
+        println!(
+            "Cargo checks excluded; {} non-Rust files excluded",
+            outcome.excluded_non_rust_files
+        );
+        println!(
+            "Retained inputs: {}",
+            bounded_terminal_diagnostic(
+                &outcome.retained_snapshot.to_string_lossy(),
+                4096,
+                16 * 1024
+            )
+        );
+    } else {
+        eprintln!(
+            "Scan failed: {}",
+            response.error.as_deref().unwrap_or("scanner unavailable")
+        );
+        if let Some(diagnostic) = &response.error_data {
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(diagnostic)
+                    .unwrap_or_else(|_| "scanner diagnostic unavailable".to_string())
+            );
+        }
+    }
+}
+
 fn build_robot_help() -> RobotHelp {
     RobotHelp {
         commands: vec![
+            #[cfg(feature = "subprocess-bridge")]
+            RobotCommandInfo {
+                name: "scan",
+                description: "Policy-gated static Rust scan: --project-root ABS and one of --path, --staged, --diff; retains input snapshots",
+            },
             RobotCommandInfo {
                 name: "help",
                 description: "Show this help as JSON",
@@ -49062,6 +49233,53 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     let workspace_path = workspace.as_deref().map(Path::new);
     let workspace_root = config.resolve_workspace_root(workspace_path)?;
     let layout = config.workspace_layout(Some(&workspace_root))?;
+    // Code scanning needs operator policy, but no mux, font installation,
+    // watcher startup or workspace initialization. Keep its effects limited
+    // to the explicitly selected source and retained scanner snapshot.
+    #[cfg(feature = "subprocess-bridge")]
+    match command.as_ref() {
+        Some(Commands::Scan { args, json }) => {
+            let response = code_scan_command_response(
+                cx,
+                &config,
+                &workspace_root,
+                &layout.db_path,
+                args,
+                frankenterm_core::policy::ActorKind::Human,
+            )
+            .await;
+            if *json {
+                print_robot_response(&response, RobotOutputFormat::Json, false)?;
+            } else {
+                print_code_scan_plain(&response);
+            }
+            if !response.ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Commands::Robot {
+            format,
+            stats,
+            command: Some(RobotCommands::Scan { args }),
+        }) => {
+            let response = code_scan_command_response(
+                cx,
+                &config,
+                &workspace_root,
+                &layout.db_path,
+                args,
+                frankenterm_core::policy::ActorKind::Robot,
+            )
+            .await;
+            print_robot_response(&response, resolve_robot_output_format(*format), *stats)?;
+            if !response.ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     let resolved_config_path = frankenterm_core::config::resolve_config_path(config_path);
     let log_file_path = config
         .general
@@ -49081,6 +49299,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     emit_permission_warnings(&permission_warnings);
 
     match command {
+        #[cfg(feature = "subprocess-bridge")]
+        Some(Commands::Scan { .. }) => {
+            unreachable!("scan dispatched before workspace initialization")
+        }
         Some(Commands::Version { full, check }) => {
             print_version_command(cx, full, check).await?;
             return Ok(());
@@ -49396,6 +49618,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let format = resolve_robot_output_format(format);
 
             match command {
+                #[cfg(feature = "subprocess-bridge")]
+                RobotCommands::Scan { .. } => {
+                    unreachable!("scan dispatched before workspace initialization")
+                }
                 RobotCommands::Help => {
                     let response = RobotResponse::success(build_robot_help(), elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
@@ -59404,6 +59630,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         }
                         RobotCommands::Help | RobotCommands::QuickStart => {
                             unreachable!("handled above")
+                        }
+                        #[cfg(feature = "subprocess-bridge")]
+                        RobotCommands::Scan { .. } => {
+                            unreachable!("handled before workspace initialization")
                         }
                         RobotCommands::CoordinationRisk { .. } => unreachable!("handled above"),
                         RobotCommands::BlockerRadar { .. } => unreachable!("handled above"),

@@ -46,6 +46,394 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
+#[cfg(all(unix, feature = "subprocess-bridge"))]
+mod scanner_contract {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+
+    struct Fixture {
+        root: PathBuf,
+        base: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(body: Option<&str>, version: &str, decision: &str) -> Self {
+            let base = tempfile::Builder::new()
+                .prefix("ft-cli-scanner-")
+                .tempdir_in("/tmp")
+                .unwrap()
+                .keep();
+            let base = std::fs::canonicalize(base).unwrap();
+            let root = base.join("project");
+            for path in [
+                root.join("src"),
+                base.join("bin"),
+                base.join("home"),
+                base.join("tmp"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(
+                root.join("src/selected.rs"),
+                b"pub const SELECTED: u8 = 7;\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("unselected.rs"), b"UNSELECTED_SENTINEL").unwrap();
+            let mut configuration = frankenterm_core::config::Config::default();
+            configuration.safety.rules = serde_json::from_value(serde_json::json!({
+                "rules": [{"id":"scanner-contract", "decision":decision,
+                    "match_on":{"actions":["exec_command"], "domains":["code-scanner"]}}]
+            }))
+            .unwrap();
+            let config = base.join("ft.toml");
+            std::fs::write(&config, configuration.to_toml().unwrap()).unwrap();
+            if let Some(body) = body {
+                // Real owned command fixture, not an installed UBS roundtrip.
+                let script = format!(
+                    r#"#!/bin/sh
+set -eu
+base=${{0%/*}}
+printf 'called\n' >> "$base/calls"
+if [ "$1" = --version ]; then
+  printf '%s\n' 'UBS Meta-Runner v{version}'
+  exit 0
+fi
+for snapshot do :; done
+printf '%s\0' "$@" > "$base/argv"
+test "$UBS_SKIP_RUST_BUILD" = 1
+test "$UBS_SKIP_CATEGORIES" = 12,13,14
+test "$UBS_NO_AUTO_UPDATE" = 1
+test -f "$snapshot/src/selected.rs"
+test ! -e "$snapshot/unselected.rs"
+/bin/cat "$snapshot/src/selected.rs" > "$base/received.rs"
+report() {{
+  printf '{{"project":"%s","scanners":[{{"project":"%s","format":"json","language":"rust","files":1,"critical":%s,"warning":0,"info":0}}],"totals":{{"files":1,"critical":%s,"warning":0,"info":0}},"suggestion":"touch %s/should-not-exist"}}\n' "$snapshot" "$snapshot" "$1" "$1" "$base"
+}}
+{body}
+"#
+                );
+                let binary = base.join("bin/ubs");
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self { root, base, config }
+        }
+
+        fn command(&self, robot: bool) -> Command {
+            let mut command = wa_cmd_for(self.root.to_str().unwrap());
+            command
+                .env_clear()
+                .env("PATH", self.base.join("bin"))
+                .env("HOME", self.base.join("home"))
+                .env("TMPDIR", self.base.join("tmp"))
+                .env("FT_WORKSPACE", &self.root)
+                .env("FT_RUNTIME_WORKER_THREADS", "2")
+                .arg("--config")
+                .arg(&self.config)
+                .timeout(std::time::Duration::from_secs(15));
+            if robot {
+                command.args(["robot", "--format", "json", "scan"]);
+            } else {
+                command.args(["scan", "--json"]);
+            }
+            command.arg("--project-root").arg(&self.root);
+            command
+        }
+
+        fn empty_policy_database(&self) -> PathBuf {
+            std::fs::create_dir(self.root.join(".ft")).unwrap();
+            let database = self.root.join(".ft/ft.db");
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("PRAGMA journal_mode=OFF; CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);").unwrap();
+            drop(connection);
+            database
+        }
+
+        fn run(&self, robot: bool, path: &Path) -> (bool, serde_json::Value) {
+            let output = self
+                .command(robot)
+                .arg("--path")
+                .arg(path)
+                .output()
+                .unwrap();
+            let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "scanner envelope invalid: {error}; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            (output.status.success(), value)
+        }
+    }
+
+    #[test]
+    fn code_scan_contract_human_and_robot_return_actual_selected_command_results() {
+        for robot in [false, true] {
+            let fixture = Fixture::new(Some("report 3; exit 1"), "5.2.42", "allow");
+            let (success, value) = fixture.run(robot, Path::new("src"));
+            assert!(success, "{value}");
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["data"]["profile"], "ubs-static-rust-v1");
+            assert_eq!(value["data"]["classification"], "critical");
+            assert_eq!(value["data"]["scanner_exit_code"], 1);
+            assert_eq!(value["data"]["report"]["totals"]["critical"], 3);
+            let original = std::fs::read(fixture.root.join("src/selected.rs")).unwrap();
+            assert_eq!(
+                std::fs::read(fixture.base.join("bin/received.rs")).unwrap(),
+                original
+            );
+            assert_eq!(
+                value["data"]["inputs"][0]["sha256"],
+                hex::encode(Sha256::digest(&original))
+            );
+            assert_eq!(value["data"]["inputs"][0]["origin_path"], "src/selected.rs");
+            let retained = Path::new(value["data"]["retained_snapshot"].as_str().unwrap());
+            assert_eq!(
+                std::fs::read(retained.join("src/selected.rs")).unwrap(),
+                original
+            );
+            assert!(retained.join("ft-scan-inputs.json").is_file());
+            assert_eq!(value["data"]["diagnostics"].as_array().unwrap().len(), 2);
+            assert!(
+                value["data"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["spawned"] == true && item["supervisor_settled"] == true)
+            );
+            assert!(!fixture.base.join("bin/should-not-exist").exists());
+            assert!(!value.to_string().contains("suggestion"));
+            assert!(
+                !fixture.root.join(".ft").exists(),
+                "scan must not initialize a watcher workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn code_scan_contract_errors_remain_typed_and_nonzero() {
+        for (body, version, expected) in [
+            (None, "5.2.42", "unavailable"),
+            (Some("report 0"), "9.0.0", "version_mismatch"),
+            (Some("report 0; exit 2"), "5.2.42", "nonzero_exit"),
+            (Some("printf '{}'"), "5.2.42", "malformed_output"),
+        ] {
+            let fixture = Fixture::new(body, version, "allow");
+            let (success, value) = fixture.run(true, Path::new("src"));
+            assert!(!success, "{value}");
+            assert_eq!(value["ok"], false);
+            assert_eq!(value["error_code"], "robot.code_scan");
+            assert_eq!(value["data"]["kind"]["kind"], expected);
+            assert!(value["data"]["classification"].is_null());
+        }
+        let fixture = Fixture::new(Some("report 0"), "5.2.42", "allow");
+        let outside = fixture.base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("private.rs"), b"OUTSIDE_SENTINEL").unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.root.join("escaped")).unwrap();
+        let (success, value) = fixture.run(true, Path::new("escaped"));
+        assert!(!success);
+        assert_eq!(value["data"]["kind"]["kind"], "path_escape");
+        assert!(!fixture.base.join("bin/received.rs").exists());
+        assert_eq!(
+            std::fs::read(outside.join("private.rs")).unwrap(),
+            b"OUTSIDE_SENTINEL"
+        );
+    }
+
+    #[test]
+    fn code_scan_contract_policy_and_persisted_kill_switch_block_before_child() {
+        for (decision, expected) in [
+            ("deny", "policy_denied"),
+            ("require_approval", "approval_required"),
+        ] {
+            let fixture = Fixture::new(Some("report 0"), "5.2.42", decision);
+            let (success, value) = fixture.run(true, Path::new("src"));
+            assert!(!success);
+            assert_eq!(value["data"]["kind"]["kind"], expected);
+            assert!(!fixture.base.join("bin/calls").exists());
+        }
+        for corrupt in [false, true] {
+            use frankenterm_core::policy_kill_switch_state::{
+                KILL_SWITCH_STATE_KEY, encode_kill_switch_state,
+            };
+            use frankenterm_core::policy_quarantine::{KillSwitch, KillSwitchLevel};
+            let fixture = Fixture::new(Some("report 0"), "5.2.42", "allow");
+            let database = fixture.empty_policy_database();
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode=OFF;")
+                .unwrap();
+            let mut switch = KillSwitch::disarmed();
+            switch.trip(KillSwitchLevel::HardStop, "scanner-test", "owned test", 1);
+            let encoded = if corrupt {
+                "invalid-state".to_string()
+            } else {
+                encode_kill_switch_state(&switch).unwrap()
+            };
+            connection
+                .execute(
+                    "INSERT INTO config (key,value,updated_at) VALUES (?1,?2,1)",
+                    rusqlite::params![KILL_SWITCH_STATE_KEY, encoded],
+                )
+                .unwrap();
+            drop(connection);
+            let before = std::fs::read(&database).unwrap();
+            let (success, value) = fixture.run(true, Path::new("src"));
+            assert!(!success);
+            assert_eq!(value["data"]["kind"]["kind"], "policy_denied");
+            assert!(!fixture.base.join("bin/calls").exists());
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn code_scan_contract_policy_database_authority_refuses_redirects_and_busy_fence() {
+        use frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence;
+        for case in [
+            "absent_row",
+            "leaf_symlink",
+            "ancestor_symlink",
+            "hardlink",
+            "journal_symlink",
+            "lock_symlink",
+            "busy",
+            "malformed_database",
+            "database_directory",
+        ] {
+            let fixture = Fixture::new(Some("report 0"), "5.2.42", "allow");
+            let database = fixture.empty_policy_database();
+            let original = std::fs::read(&database).unwrap();
+            let outside = fixture.base.join("outside.db");
+            std::fs::write(&outside, &original).unwrap();
+            let mut held_fence = None;
+            match case {
+                "absent_row" => {}
+                "leaf_symlink" => {
+                    std::fs::rename(&database, database.with_extension("retained")).unwrap();
+                    std::os::unix::fs::symlink(&outside, &database).unwrap();
+                }
+                "ancestor_symlink" => {
+                    let retained = fixture.base.join("retained-state");
+                    std::fs::rename(fixture.root.join(".ft"), &retained).unwrap();
+                    std::os::unix::fs::symlink(&retained, fixture.root.join(".ft")).unwrap();
+                }
+                "hardlink" => {
+                    std::fs::hard_link(&database, fixture.base.join("database-link")).unwrap()
+                }
+                "journal_symlink" => {
+                    std::os::unix::fs::symlink(&outside, fixture.root.join(".ft/ft.db-wal"))
+                        .unwrap()
+                }
+                "lock_symlink" => std::os::unix::fs::symlink(
+                    &outside,
+                    fixture.root.join(".ft/ft.db.policy-kill-switch.lock"),
+                )
+                .unwrap(),
+                "busy" => held_fence = Some(acquire_kill_switch_fence(&database).unwrap()),
+                "malformed_database" => {
+                    std::fs::write(&database, b"NOT_A_SQLITE_DATABASE").unwrap()
+                }
+                "database_directory" => {
+                    std::fs::rename(&database, database.with_extension("retained")).unwrap();
+                    std::fs::create_dir(&database).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let (success, value) = fixture.run(true, Path::new("src"));
+            if case == "absent_row" {
+                assert!(success, "{case}: {value}");
+                assert_eq!(value["data"]["classification"], "clean");
+                assert_eq!(std::fs::read(&database).unwrap(), original);
+                assert!(
+                    acquire_kill_switch_fence(&database).is_ok(),
+                    "settled scan released its fence"
+                );
+            } else {
+                assert!(!success, "{case}: {value}");
+                assert_eq!(
+                    value["data"]["kind"]["kind"],
+                    if case == "busy" { "policy_busy" } else { "io" },
+                    "{case}: {value}"
+                );
+                assert!(!fixture.base.join("bin/calls").exists(), "{case}");
+            }
+            assert_eq!(std::fs::read(&outside).unwrap(), original, "{case}");
+            drop(held_fence);
+        }
+    }
+
+    #[test]
+    fn code_scan_contract_keeps_policy_fence_until_running_scanner_settles() {
+        use frankenterm_core::policy_kill_switch_state::{
+            KillSwitchStateError, acquire_kill_switch_fence,
+        };
+        let fixture = Fixture::new(
+            Some("printf 'running' > \"$base/running\"; exec /bin/sleep 2"),
+            "5.2.42",
+            "allow",
+        );
+        let database = fixture.empty_policy_database();
+        let marker = fixture.base.join("bin/running");
+        let mut command = fixture.command(true);
+        command.args(["--path", "src"]);
+        let child = std::thread::spawn(move || command.output().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let running = marker.is_file();
+        let fenced = matches!(
+            acquire_kill_switch_fence(&database),
+            Err(KillSwitchStateError::FencePending)
+        );
+        let output = child.join().unwrap();
+        assert!(
+            running,
+            "scanner never reached owned marker; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fenced, "running scanner must retain policy authority");
+        assert!(
+            !output.status.success(),
+            "the sleeping control deliberately emits no scanner report"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["data"]["kind"]["kind"], "malformed_output");
+        assert!(
+            value["data"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["supervisor_settled"] == true)
+        );
+        assert!(
+            acquire_kill_switch_fence(&database).is_ok(),
+            "failed settled scan released its fence"
+        );
+    }
+
+    #[test]
+    fn code_scan_contract_rejects_ambiguous_scope_and_invalid_deadline_before_child() {
+        for args in [
+            vec![],
+            vec!["--path", "src", "--staged"],
+            vec!["--staged", "--diff"],
+            vec!["--path", "src", "--timeout-ms", "0"],
+            vec!["--path", "src", "--timeout-ms", "120001"],
+        ] {
+            let fixture = Fixture::new(Some("report 0"), "5.2.42", "allow");
+            let output = fixture.command(false).args(args).output().unwrap();
+            assert!(!output.status.success());
+            assert!(!fixture.base.join("bin/calls").exists());
+            assert!(!fixture.root.join(".ft").exists());
+        }
+    }
+}
+
 // =============================================================================
 // Test fixture helpers
 // =============================================================================

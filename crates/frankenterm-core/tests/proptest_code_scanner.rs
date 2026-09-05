@@ -139,7 +139,19 @@ proptest! {
     // 4. total() = critical + warning + info
     #[test]
     fn totals_sum_correct(totals in arb_totals()) {
-        prop_assert_eq!(totals.total(), totals.critical + totals.warning + totals.info);
+        prop_assert_eq!(totals.total(), Some(totals.critical + totals.warning + totals.info));
+    }
+
+    #[test]
+    fn totals_overflow_is_explicit(
+        critical in any::<usize>(),
+        warning in any::<usize>(),
+        info in any::<usize>(),
+    ) {
+        let totals = ScanTotals { critical, warning, info, files: 1 };
+        let wide = critical as u128 + warning as u128 + info as u128;
+        let expected = usize::try_from(wide).ok();
+        prop_assert_eq!(totals.total(), expected);
     }
 
     // 5. has_critical() iff critical > 0
@@ -164,7 +176,7 @@ proptest! {
     #[test]
     fn totals_default_zero(_seed in 0..=10u32) {
         let t = ScanTotals::default();
-        prop_assert_eq!(t.total(), 0);
+        prop_assert_eq!(t.total(), Some(0));
         prop_assert!(!t.has_critical());
     }
 }
@@ -302,6 +314,8 @@ proptest! {
             ScanClassification::HighWarning
         } else if warning > 0 {
             ScanClassification::Warning
+        } else if info > 0 {
+            ScanClassification::Info
         } else {
             ScanClassification::Clean
         };
@@ -361,7 +375,7 @@ proptest! {
         prop_assert_eq!(CodeScanner::classify(&report), ScanClassification::Warning);
     }
 
-    // 14. No critical + no warning ⟹ Clean (regardless of info count)
+    // 14. Clean means no findings; informational findings remain explicit.
     #[test]
     fn classify_clean(info in 0..=200usize) {
         let report = ScanReport {
@@ -370,7 +384,11 @@ proptest! {
             totals: ScanTotals { critical: 0, warning: 0, info, files: 0 },
             extra: HashMap::new(),
         };
-        prop_assert_eq!(CodeScanner::classify(&report), ScanClassification::Clean);
+        prop_assert_eq!(CodeScanner::classify(&report), if info == 0 {
+            ScanClassification::Clean
+        } else {
+            ScanClassification::Info
+        });
     }
 
     // 15. classify is deterministic
@@ -381,13 +399,14 @@ proptest! {
         prop_assert_eq!(c1, c2);
     }
 
-    // 16. classify precedence: exactly one of {Clean, Warning, HighWarning, Critical}
+    // 16. classify precedence covers every severity tier.
     #[test]
     fn classify_exhaustive(report in arb_report()) {
         let class = CodeScanner::classify(&report);
         let is_valid = matches!(
             class,
             ScanClassification::Clean
+                | ScanClassification::Info
                 | ScanClassification::Warning
                 | ScanClassification::HighWarning
                 | ScanClassification::Critical
@@ -424,9 +443,10 @@ proptest! {
         fn rank(c: ScanClassification) -> u8 {
             match c {
                 ScanClassification::Clean => 0,
-                ScanClassification::Warning => 1,
-                ScanClassification::HighWarning => 2,
-                ScanClassification::Critical => 3,
+                ScanClassification::Info => 1,
+                ScanClassification::Warning => 2,
+                ScanClassification::HighWarning => 3,
+                ScanClassification::Critical => 4,
             }
         }
         prop_assert!(rank(base_class) <= rank(elevated_class));
