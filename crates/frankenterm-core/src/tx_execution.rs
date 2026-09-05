@@ -1930,7 +1930,7 @@ impl MissionRevisionToken {
             mission_id: mission.mission_id.0.clone(),
             generation: mission.generation.clone(),
             revision: mission.revision,
-            content_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            content_sha256: hex::encode(Sha256::digest(&bytes)),
         })
     }
 }
@@ -2035,7 +2035,7 @@ impl MissionMutationGuard {
             guard,
             mission,
             original,
-            original_bytes_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            original_bytes_sha256: hex::encode(Sha256::digest(&bytes)),
         })
     }
 
@@ -2088,7 +2088,7 @@ impl MissionMutationGuard {
         // Same-UID mutation racing the final read/rename remains outside the
         // shared trusted-anchor model; cooperative writers all take this lock.
         let bytes = self.guard.read_authoritative_contract_bytes()?;
-        if format!("{:x}", Sha256::digest(&bytes)) != self.original_bytes_sha256 {
+        if hex::encode(Sha256::digest(&bytes)) != self.original_bytes_sha256 {
             return Err(MissionStoreError::Conflict);
         }
         let proposed = MissionRevisionToken::from_mission(mission)?;
