@@ -1771,21 +1771,22 @@ impl GlyphCache {
                 }
             };
 
-            let num_cells = request.text.chars().count().clamp(1, u8::MAX as usize) as u8;
-
-            for info in glyphs {
+            for (index, info) in glyphs.iter().enumerate() {
                 if start.elapsed() >= budget {
                     stats.budget_exhausted = true;
                     break;
                 }
 
+                // Use the same key as glyph_infos_to_glyphs during painting.
+                // A request can shape into several glyphs with different spans.
+                let followed_by_space = glyphs.get(index + 1).is_some_and(|next| next.is_space);
                 match self.cached_glyph_for_subpixel_bin_with_status(
-                    &info,
+                    info,
                     &style,
-                    false,
+                    followed_by_space,
                     &font,
                     metrics,
-                    num_cells,
+                    info.num_cells,
                     SubpixelBin::Quarter0,
                 ) {
                     Ok((_, true)) => {
@@ -3257,19 +3258,9 @@ mod tests {
         );
     }
 
-    // Cache-warm equivalence (ft-uroqc warm-rasterize lever). `warm_up_glyphs`
-    // routes every glyph through the SAME `cached_glyph` path a paint uses (same
-    // BorrowedGlyphKey, including `metric: CellMetricKey`), so a warmed glyph is
-    // byte-identical to what lazy rasterization would produce. We prove the
-    // behavioral consequence: after warming, an immediate re-warm of the
-    // identical plan resolves EVERY previously-resolved glyph as a cache hit
-    // (zero new rasterizations) and adds no atlas — i.e. warmed entries satisfy
-    // subsequent identical lookups exactly as a lazily-populated cache would,
-    // with no rebuild. This is the isomorphism guarantee of the apply_scale_change
-    // warm-up: it changes only WHEN glyphs rasterize, never the pixels.
-    //
-    // Run verification deferred: the frankenterm-gui cfg(test) build is blocked
-    // by the mcp_middleware issue p4 is fixing; re-run after that lands.
+    // Repeating the same warmup plan must reuse its entries. This proves
+    // idempotence; the separate zoom_warmup_experiment demand-key test checks
+    // that painting can reuse those entries with unchanged metrics and pixels.
     #[test]
     fn warm_up_glyphs_is_idempotent_and_cache_hit_equivalent() {
         let (mut cache, metrics) = test_glyph_cache_with_atlas_size(1024);
@@ -3611,6 +3602,128 @@ mod tests {
                 Ok(())
             } else {
                 Err(OracleError::StaleOrDifferentOutput)
+            }
+        }
+
+        #[test]
+        fn warmup_populates_paint_keys_without_surplus_or_lazy_misses() {
+            fn keys(cache: &GlyphCache) -> std::collections::HashSet<GlyphKey> {
+                cache.glyph_cache.keys().cloned().collect()
+            }
+
+            for text in ["ab ", "e\u{301}", "ffi"] {
+                let (mut cache, metrics) = fixture();
+                let style = TextStyle::default();
+                let font = cache.fonts.resolve_font(&style).unwrap();
+                let infos = font
+                    .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                    .unwrap();
+                assert!(!infos.is_empty());
+                assert!(infos.iter().all(|info| info.glyph_pos != 0));
+                let request_cells = u8::try_from(text.chars().count()).unwrap();
+                let different_spans = infos.iter().any(|info| info.num_cells != request_cells);
+                let has_following_space = infos.iter().skip(1).any(|info| info.is_space);
+                if text == "ab " {
+                    assert!(different_spans && has_following_space);
+                } else if text == "e\u{301}" {
+                    assert!(different_spans);
+                    assert_eq!(
+                        infos
+                            .iter()
+                            .map(|info| u32::from(info.num_cells))
+                            .sum::<u32>(),
+                        1
+                    );
+                }
+
+                let plan = [GlyphWarmupRequest::new(
+                    text,
+                    GlyphWarmupPriority::CommonLigature,
+                )];
+                let stats = cache.warm_up_glyphs(&plan, &metrics, Duration::from_secs(30));
+                assert!(!stats.budget_exhausted);
+                assert_eq!(stats.failed_glyphs, 0);
+                assert_eq!(stats.attempted_requests, 1);
+                assert_eq!(stats.warmed_glyphs + stats.cache_hits, infos.len());
+
+                // The reference has its own glyph cache and atlas, sharing the
+                // font configuration and loaded-font identity. Populate it
+                // through actual paint keys, independently of warmup.
+                let mut reference = GlyphCache::new_in_memory(&cache.fonts, 2048).unwrap();
+                let mut expected = Vec::new();
+                for (index, info) in infos.iter().enumerate() {
+                    let followed_by_space = infos.get(index + 1).is_some_and(|next| next.is_space);
+                    let glyph = reference
+                        .cached_glyph(
+                            info,
+                            &style,
+                            followed_by_space,
+                            &font,
+                            &metrics,
+                            info.num_cells,
+                        )
+                        .unwrap();
+                    expected.push(witness(&font, info, &glyph).unwrap());
+                }
+                let expected_keys = keys(&reference);
+                // Check before demand can fill missing keys or hide surplus ones.
+                assert_eq!(keys(&cache), expected_keys, "warmup keys for {text:?}");
+                let warmed_len = cache.glyph_cache.len();
+                let warmed_atlas_version = cache.atlas.version();
+                let mut actual = Vec::new();
+                for (index, info) in infos.iter().enumerate() {
+                    let followed_by_space = infos.get(index + 1).is_some_and(|next| next.is_space);
+                    let (glyph, hit) = cache
+                        .cached_glyph_for_subpixel_bin_with_status(
+                            info,
+                            &style,
+                            followed_by_space,
+                            &font,
+                            &metrics,
+                            info.num_cells,
+                            SubpixelBin::Quarter0,
+                        )
+                        .unwrap();
+                    assert!(hit, "paint must reuse the warmed glyph for {text:?}");
+                    actual.push(witness(&font, info, &glyph).unwrap());
+                }
+                assert_eq!(compare(&expected, &actual), Ok(()));
+                assert_eq!(cache.glyph_cache.len(), warmed_len);
+                assert_eq!(cache.atlas.version(), warmed_atlas_version);
+
+                // Independently plant each old key defect. The same key-set
+                // oracle must reject it even if lazy painting could repair it.
+                for (wrong_spans, wrong_spacing) in [(true, false), (false, true)] {
+                    if (wrong_spans && !different_spans) || (wrong_spacing && !has_following_space)
+                    {
+                        continue;
+                    }
+                    let mut planted = GlyphCache::new_in_memory(&cache.fonts, 2048).unwrap();
+                    for (index, info) in infos.iter().enumerate() {
+                        let followed_by_space = !wrong_spacing
+                            && infos.get(index + 1).is_some_and(|next| next.is_space);
+                        let num_cells = if wrong_spans {
+                            request_cells
+                        } else {
+                            info.num_cells
+                        };
+                        planted
+                            .cached_glyph(
+                                info,
+                                &style,
+                                followed_by_space,
+                                &font,
+                                &metrics,
+                                num_cells,
+                            )
+                            .unwrap();
+                    }
+                    assert_ne!(
+                        keys(&planted),
+                        expected_keys,
+                        "old keys must fail for {text:?}"
+                    );
+                }
             }
         }
 
