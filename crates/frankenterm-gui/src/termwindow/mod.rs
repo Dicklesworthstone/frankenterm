@@ -24,6 +24,7 @@ use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
 };
+use crate::termwindow::resize::RenderInvalidationCause;
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
@@ -53,12 +54,10 @@ use frankenterm_gui::floating_panes::{
     GuiFloatingPaneController, emit_floating_pane_a11y_messages, floating_pane_id_to_mux_pane_id,
     mux_pane_id_to_floating_pane_id,
 };
-use frankenterm_gui::triple_buffer_gui::{
-    TerminalStateTripleBufferRegistry,
-};
 use frankenterm_gui::terminal_pane_id_to_u64;
-use futures::future::{AbortHandle, AbortRegistration, Abortable};
+use frankenterm_gui::triple_buffer_gui::TerminalStateTripleBufferRegistry;
 use frankenterm_toast_notification::persistent_toast_notification;
+use futures::future::{AbortHandle, AbortRegistration, Abortable};
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::domain::DomainId;
@@ -180,7 +179,7 @@ pub enum MouseCapture {
 /// Type used together with Window::notify to do something in the
 /// context of the window-specific event loop
 pub enum TermWindowNotif {
-    InvalidateShapeCache,
+    InvalidateShapeCache(RenderInvalidationCause),
     PerformAssignment {
         pane_id: PaneId,
         assignment: KeyAssignment,
@@ -1532,9 +1531,7 @@ impl DamageGeneration {
     }
 
     const fn can_commit(self, captured: Self) -> bool {
-        !self.exhausted
-            && self.value == captured.value
-            && self.exhausted == captured.exhausted
+        !self.exhausted && self.value == captured.value && self.exhausted == captured.exhausted
     }
 }
 
@@ -1575,15 +1572,9 @@ impl RenderFailureStage {
         match self {
             Self::Paint => "paint",
             Self::Draw(stage) => stage.label(),
-            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout) => {
-                "surface_timeout"
-            }
-            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => {
-                "surface_occluded"
-            }
-            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Outdated) => {
-                "surface_outdated"
-            }
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout) => "surface_timeout",
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => "surface_occluded",
+            Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Outdated) => "surface_outdated",
             Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost) => "surface_lost",
             Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation) => {
                 "surface_validation"
@@ -1655,7 +1646,12 @@ impl RenderAttemptFailure {
 
 impl std::fmt::Display for RenderAttemptFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} render failure: {:#}", self.stage.label(), self.source)?;
+        write!(
+            f,
+            "{} render failure: {:#}",
+            self.stage.label(),
+            self.source
+        )?;
         if let Some(secondary) = &self.secondary_finish {
             write!(f, "; frame finish also failed: {secondary:#}")?;
         }
@@ -1935,8 +1931,7 @@ impl TermWindow {
         metrics::counter!("gui.render.damage_settlement", "outcome" => settlement.label())
             .increment(1);
         if self.render_wake_state.cancel() {
-            metrics::counter!("gui.render.retry", "action" => "cancelled_by_success")
-                .increment(1);
+            metrics::counter!("gui.render.retry", "action" => "cancelled_by_success").increment(1);
         }
         self.complete_presented_paint(outcome);
         if settlement.needs_follow_up_paint() {
@@ -1998,13 +1993,16 @@ impl TermWindow {
                         return None;
                     }
                 };
-                reservation.spawn_local(async move {
-                    let _ = Abortable::new(
-                        async move {
-                            sleep(delay).await;
-                            let wake_window = window.clone();
-                            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                                match tw.render_wake_state.dispatch(ticket) {
+                reservation
+                    .spawn_local(async move {
+                        let _ = Abortable::new(
+                            async move {
+                                sleep(delay).await;
+                                let wake_window = window.clone();
+                                window.notify(TermWindowNotif::Apply(Box::new(move |tw| match tw
+                                    .render_wake_state
+                                    .dispatch(ticket)
+                                {
                                     RenderWakeDispatch::Fired(RenderWakeReason::Retry(_stage)) => {
                                         if tw.render_recovery_state.mark_retry_ready(ticket) {
                                             metrics::counter!(
@@ -2036,19 +2034,17 @@ impl TermWindow {
                                         )
                                         .increment(1);
                                     }
-                                }
-                            })));
-                        },
-                        registration,
-                    )
-                    .await;
-                })
-                .detach();
+                                })));
+                            },
+                            registration,
+                        )
+                        .await;
+                    })
+                    .detach();
                 Some(ticket)
             }
             RenderWakePlan::Exhausted => {
-                metrics::counter!("gui.render.wake", "action" => "ticket_exhausted")
-                    .increment(1);
+                metrics::counter!("gui.render.wake", "action" => "ticket_exhausted").increment(1);
                 log::error!("render wake ticket space exhausted; opening renderer circuit");
                 None
             }
@@ -2099,17 +2095,13 @@ impl TermWindow {
             RenderRecoveryDirective::OpenCircuit => {
                 self.render_wake_state.cancel();
                 self.render_recovery_state.open_circuit(stage);
-                metrics::counter!("gui.render.retry", "action" => "circuit_open")
-                    .increment(1);
+                metrics::counter!("gui.render.retry", "action" => "circuit_open").increment(1);
             }
         }
     }
 
     pub(crate) fn note_render_surface_recovery_signal(&mut self) {
-        if self
-            .render_recovery_state
-            .record_surface_recovery_signal()
-        {
+        if self.render_recovery_state.record_surface_recovery_signal() {
             self.render_wake_state.cancel();
             metrics::counter!("gui.render.retry", "action" => "surface_signal_reopened")
                 .increment(1);
@@ -2169,6 +2161,18 @@ impl TermWindow {
         &mut self,
         source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
     ) {
+        use frankenterm_core::dirty_line_telemetry::DirtyEventSource;
+        self.record_render_invalidation(match source {
+            DirtyEventSource::Pty => RenderInvalidationCause::Content,
+            DirtyEventSource::CursorMove => RenderInvalidationCause::Cursor,
+            DirtyEventSource::SelectionChange => RenderInvalidationCause::Selection,
+            DirtyEventSource::Viewport => RenderInvalidationCause::Viewport,
+            DirtyEventSource::StatusTileUpdate => RenderInvalidationCause::Overlay,
+            DirtyEventSource::ThemeSwap => RenderInvalidationCause::Palette,
+            DirtyEventSource::FontSwap => RenderInvalidationCause::FontMetrics,
+            DirtyEventSource::FocusChange => RenderInvalidationCause::Focus,
+            DirtyEventSource::Resize => RenderInvalidationCause::SurfaceSize,
+        });
         self.dirty_marks_by_source.record(source);
         self.advance_damage_generation();
     }
@@ -2614,7 +2618,7 @@ impl TermWindow {
         if focused {
             self.note_render_surface_recovery_signal();
         }
-        self.advance_quad_generation();
+        self.invalidate_render_caches(RenderInvalidationCause::Focus);
         self.mark_all_panes_dirty_with_source(
             frankenterm_core::dirty_line_telemetry::DirtyEventSource::FocusChange,
         );
@@ -2726,12 +2730,7 @@ struct RenderWakeState {
 }
 
 impl RenderWakeState {
-    fn plan(
-        &mut self,
-        reason: RenderWakeReason,
-        due: Instant,
-        now: Instant,
-    ) -> RenderWakePlan {
+    fn plan(&mut self, reason: RenderWakeReason, due: Instant, now: Instant) -> RenderWakePlan {
         if self.exhausted {
             return RenderWakePlan::Exhausted;
         }
@@ -2741,9 +2740,7 @@ impl RenderWakeState {
                 // A retry is the admission gate.  An animation must never
                 // bypass it, and duplicate failures coalesce into its ticket.
                 (RenderWakeReason::Retry(_), _) => true,
-                (RenderWakeReason::Animation, RenderWakeReason::Animation) => {
-                    pending.due <= due
-                }
+                (RenderWakeReason::Animation, RenderWakeReason::Animation) => pending.due <= due,
                 (RenderWakeReason::Animation, RenderWakeReason::Retry(_)) => false,
             };
             if keep_existing {
@@ -2812,7 +2809,9 @@ enum RenderRecoveryMode {
         ticket: RenderWakeTicket,
         stage: RenderFailureStage,
     },
-    RetryReady { stage: RenderFailureStage },
+    RetryReady {
+        stage: RenderFailureStage,
+    },
     Parked {
         stage: RenderFailureStage,
     },
@@ -2862,11 +2861,7 @@ fn apply_failed_render_attempt(
     recovery: &mut RenderRecoveryState,
     stage: RenderFailureStage,
 ) -> (DamageCommitOutcome, RenderRecoveryDirective) {
-    let damage = settle_frame_damage(
-        bitmaps,
-        current_generation,
-        FrameCompletion::Failed(stage),
-    );
+    let damage = settle_frame_damage(bitmaps, current_generation, FrameCompletion::Failed(stage));
     let directive = recovery.record_failure(stage);
     (damage, directive)
 }
@@ -2958,8 +2953,7 @@ impl RenderRecoveryState {
     }
 
     fn record_failure(&mut self, stage: RenderFailureStage) -> RenderRecoveryDirective {
-        self.failed_attempts_since_success =
-            self.failed_attempts_since_success.saturating_add(1);
+        self.failed_attempts_since_success = self.failed_attempts_since_success.saturating_add(1);
         render_recovery_directive(stage, self.failed_attempts_since_success)
     }
 
@@ -3036,12 +3030,8 @@ fn classify_webgpu_surface_error(
     err: &webgpu::WebGpuSurfaceTextureError,
 ) -> WebGpuSurfaceErrorAction {
     match err {
-        webgpu::WebGpuSurfaceTextureError::Outdated => {
-            WebGpuSurfaceErrorAction::ForceConfigure
-        }
-        webgpu::WebGpuSurfaceTextureError::Lost => {
-            WebGpuSurfaceErrorAction::RecreateSurface
-        }
+        webgpu::WebGpuSurfaceTextureError::Outdated => WebGpuSurfaceErrorAction::ForceConfigure,
+        webgpu::WebGpuSurfaceTextureError::Lost => WebGpuSurfaceErrorAction::RecreateSurface,
         webgpu::WebGpuSurfaceTextureError::Timeout
         | webgpu::WebGpuSurfaceTextureError::Occluded
         | webgpu::WebGpuSurfaceTextureError::Validation => {
@@ -3078,30 +3068,22 @@ fn acquire_webgpu_frame_with_repair_using<
     mut recreate_surface: RecreateSurface,
 ) -> Result<T, RenderAttemptFailure>
 where
-    PrepareSurface:
-        FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
-    AcquireSurfaceFrame:
-        FnMut() -> Result<T, webgpu::WebGpuSurfaceTextureError>,
-    ForceConfigure:
-        FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
-    RecreateSurface:
-        FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
+    PrepareSurface: FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
+    AcquireSurfaceFrame: FnMut() -> Result<T, webgpu::WebGpuSurfaceTextureError>,
+    ForceConfigure: FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
+    RecreateSurface: FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
 {
     match prepare_surface(dimensions) {
         Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
         Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
             return Err(RenderAttemptFailure::new(
-                RenderFailureStage::SurfaceAcquire(
-                    webgpu::WebGpuSurfaceTextureError::Occluded,
-                ),
+                RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded),
                 anyhow!("webgpu surface has zero extent; waiting for resize/focus"),
             ));
         }
         Err(err) => {
             return Err(RenderAttemptFailure::new(
-                RenderFailureStage::SurfaceAcquire(
-                    webgpu::WebGpuSurfaceTextureError::Validation,
-                ),
+                RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation),
                 err.context("prepare webgpu surface"),
             ));
         }
@@ -3113,13 +3095,11 @@ where
     };
     let repair = match classify_webgpu_surface_error(&first_error) {
         WebGpuSurfaceErrorAction::ForceConfigure => {
-            metrics::counter!("gui.render.retry", "action" => "force_configure")
-                .increment(1);
+            metrics::counter!("gui.render.retry", "action" => "force_configure").increment(1);
             force_configure(dimensions).context("force-configure outdated webgpu surface")
         }
         WebGpuSurfaceErrorAction::RecreateSurface => {
-            metrics::counter!("gui.render.retry", "action" => "recreate_surface")
-                .increment(1);
+            metrics::counter!("gui.render.retry", "action" => "recreate_surface").increment(1);
             recreate_surface(dimensions).context("recreate lost webgpu surface")
         }
         WebGpuSurfaceErrorAction::DeferToRecoveryPolicy => {
@@ -3134,18 +3114,14 @@ where
         Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
         Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
             return Err(RenderAttemptFailure::new(
-                RenderFailureStage::SurfaceAcquire(
-                    webgpu::WebGpuSurfaceTextureError::Occluded,
-                ),
+                RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded),
                 anyhow!("webgpu repair deferred for zero surface extent"),
             ));
         }
         Err(err) => {
             return Err(RenderAttemptFailure::new(
                 webgpu_repair_failure_stage(),
-                err.context(format!(
-                    "webgpu surface repair failed after {first_error}"
-                )),
+                err.context(format!("webgpu surface repair failed after {first_error}")),
             ));
         }
     }
@@ -3648,6 +3624,7 @@ impl TermWindow {
                     log::trace!("DeadKeyStatus now: {:?}", status);
                 }
                 self.dead_key_status = status;
+                self.record_render_invalidation(RenderInvalidationCause::Ime);
                 self.update_title();
                 // Ensure that we repaint so that any composing
                 // text is updated
@@ -3856,19 +3833,20 @@ impl TermWindow {
         }
 
         match notif {
-            TermWindowNotif::InvalidateShapeCache => {
-                self.advance_shaping_input_generation();
+            TermWindowNotif::InvalidateShapeCache(cause) => {
+                let cause = cause.for_shape_notification();
+                self.invalidate_render_caches(cause);
                 self.invalidate_modal();
-                // ft-mpc9b.1.2: shape-cache invalidation covers
-                // font change and other render-shape-affecting
-                // events. Mark every pane dirty so the next paint
-                // sees the full repaint signal. Per ft-i6k6u: tag
-                // as FontSwap so the per-source aggregator
-                // attributes shape-cache invalidations to font
-                // metrics changes (the dominant cause).
-                self.mark_all_panes_dirty_with_source(
-                    frankenterm_core::dirty_line_telemetry::DirtyEventSource::FontSwap,
-                );
+                use frankenterm_core::dirty_line_telemetry::DirtyEventSource;
+                match cause {
+                    RenderInvalidationCause::Palette => {
+                        self.mark_all_panes_dirty_with_source(DirtyEventSource::ThemeSwap);
+                    }
+                    RenderInvalidationCause::FallbackFont => {
+                        self.mark_all_panes_dirty_with_source(DirtyEventSource::FontSwap);
+                    }
+                    _ => self.mark_all_panes_dirty(),
+                }
                 window.invalidate();
             }
             TermWindowNotif::PerformAssignment {
@@ -3960,311 +3938,315 @@ impl TermWindow {
                 let Some(notification_owner) = mux_owner.upgrade() else {
                     return Ok(());
                 };
-                if !Mux::try_get()
-                    .is_some_and(|current| Arc::ptr_eq(&current, &notification_owner))
+                if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &notification_owner))
                 {
                     // A queued notification from a replaced mux must never act
                     // on same-numbered panes or windows in the new mux.
                     return Ok(());
                 }
                 match n {
-                MuxNotification::Alert {
-                    alert: Alert::SetUserVar { name, value },
-                    pane_id,
-                } => {
-                    self.emit_user_var_event(pane_id, name, value);
-                }
-                MuxNotification::WindowTitleChanged { .. }
-                | MuxNotification::Alert {
-                    alert:
-                        Alert::OutputSinceFocusLost
-                        | Alert::CurrentWorkingDirectoryChanged
-                        | Alert::WindowTitleChanged(_)
-                        | Alert::TabTitleChanged(_)
-                        | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
-                    ..
-                } => {
-                    // Coalesce: agents emitting OSC 7 / OSC 9;4 across multiple
-                    // attached muxes can fire dozens of these per second.
-                    // Schedule one frame-bounded update_title instead. ft-9d60d.
-                    self.schedule_update_title();
-                }
-                MuxNotification::Alert {
-                    alert: Alert::PaletteChanged,
-                    pane_id,
-                } => {
-                    // Shape cache includes color information, so
-                    // ensure that we invalidate that as part of
-                    // this overall invalidation for the palette
-                    self.dispatch_notif(TermWindowNotif::InvalidateShapeCache, window)?;
-                    self.mux_pane_output_event(pane_id);
-                }
-                MuxNotification::Alert {
-                    alert: Alert::ImageAltText { .. },
-                    pane_id,
-                } => {
-                    self.mux_pane_output_event(pane_id);
-                }
-                MuxNotification::Alert {
-                    alert: Alert::Bell,
-                    pane_id,
-                } => {
-                    if !self.window_contains_pane(pane_id) {
-                        return Ok(());
+                    MuxNotification::Alert {
+                        alert: Alert::SetUserVar { name, value },
+                        pane_id,
+                    } => {
+                        self.emit_user_var_event(pane_id, name, value);
                     }
+                    MuxNotification::WindowTitleChanged { .. }
+                    | MuxNotification::Alert {
+                        alert:
+                            Alert::OutputSinceFocusLost
+                            | Alert::CurrentWorkingDirectoryChanged
+                            | Alert::WindowTitleChanged(_)
+                            | Alert::TabTitleChanged(_)
+                            | Alert::IconTitleChanged(_)
+                            | Alert::Progress(_),
+                        ..
+                    } => {
+                        // Coalesce: agents emitting OSC 7 / OSC 9;4 across multiple
+                        // attached muxes can fire dozens of these per second.
+                        // Schedule one frame-bounded update_title instead. ft-9d60d.
+                        self.schedule_update_title();
+                    }
+                    MuxNotification::Alert {
+                        alert: Alert::PaletteChanged,
+                        pane_id,
+                    } => {
+                        // Resolved line colors and quads change. Glyph shaping
+                        // and sprites do not depend on the terminal palette.
+                        self.dispatch_notif(
+                            TermWindowNotif::InvalidateShapeCache(RenderInvalidationCause::Palette),
+                            window,
+                        )?;
+                        self.mux_pane_output_event(pane_id);
+                    }
+                    MuxNotification::Alert {
+                        alert: Alert::ImageAltText { .. },
+                        pane_id,
+                    } => {
+                        self.record_render_invalidation(RenderInvalidationCause::Image);
+                        self.mux_pane_output_event(pane_id);
+                    }
+                    MuxNotification::Alert {
+                        alert: Alert::Bell,
+                        pane_id,
+                    } => {
+                        if !self.window_contains_pane(pane_id) {
+                            return Ok(());
+                        }
 
-                    self.record_idle_event(idle_detector::IdleEvent::Bell);
+                        self.record_idle_event(idle_detector::IdleEvent::Bell);
 
-                    match self.config.audible_bell {
-                        AudibleBell::SystemBeep => {
-                            if let Some(connection) = Connection::get() {
-                                connection.beep();
-                            } else {
-                                log::warn!("cannot play system beep without a GUI connection");
+                        match self.config.audible_bell {
+                            AudibleBell::SystemBeep => {
+                                if let Some(connection) = Connection::get() {
+                                    connection.beep();
+                                } else {
+                                    log::warn!("cannot play system beep without a GUI connection");
+                                }
+                            }
+                            AudibleBell::Disabled => {}
+                        }
+
+                        log::trace!("Ding! (this is the bell) in pane {}", pane_id);
+                        self.emit_window_event("bell", Some(pane_id));
+
+                        let mut per_pane = self.pane_state(pane_id);
+                        per_pane.bell_start.replace(Instant::now());
+                        window.invalidate();
+                    }
+                    MuxNotification::Alert {
+                        alert: Alert::ToastNotification { .. },
+                        ..
+                    } => {}
+                    MuxNotification::Alert {
+                        alert: Alert::SetProfileRequested { .. } | Alert::MouseShapeRequested { .. },
+                        ..
+                    } => {
+                        // ft-fy4ty / ft-7yiu2: surfaced to the embedder
+                        // for a confirmation prompt (SetProfile) or
+                        // native cursor mapping (MouseShape). The GUI
+                        // continuation beads (ft-tzusd / ft-jornq) wire
+                        // the actual UI; the term-layer alert path
+                        // already routes through the alert handler so
+                        // the mux-side notification is intentionally a
+                        // no-op here.
+                    }
+                    MuxNotification::TabAddedToWindow {
+                        window_id: _,
+                        tab_id,
+                    } => {
+                        let mut size = self.terminal_size;
+                        if let Some(tab) = notification_owner.get_tab(tab_id) {
+                            // If we attached to a remote domain and loaded in
+                            // a tab async, we need to fixup its size, either
+                            // by resizing it or resizes ourselves.
+                            // The strategy here is to adjust both by taking
+                            // the maximal size in both horizontal and vertical
+                            // dimensions and applying that. In practice that
+                            // means that a new local client will resize larger
+                            // to adjust to the size of an existing client.
+                            let tab_size = tab.get_size();
+                            size.rows = size.rows.max(tab_size.rows);
+                            size.cols = size.cols.max(tab_size.cols);
+
+                            if size.rows != self.terminal_size.rows
+                                || size.cols != self.terminal_size.cols
+                                || size.pixel_width != self.terminal_size.pixel_width
+                                || size.pixel_height != self.terminal_size.pixel_height
+                            {
+                                self.set_window_size(size, window)?;
+                            } else if tab_size.dpi == 0 {
+                                log::debug!("fixup dpi in newly added tab");
+                                tab.resize(self.terminal_size);
                             }
                         }
-                        AudibleBell::Disabled => {}
                     }
-
-                    log::trace!("Ding! (this is the bell) in pane {}", pane_id);
-                    self.emit_window_event("bell", Some(pane_id));
-
-                    let mut per_pane = self.pane_state(pane_id);
-                    per_pane.bell_start.replace(Instant::now());
-                    window.invalidate();
-                }
-                MuxNotification::Alert {
-                    alert: Alert::ToastNotification { .. },
-                    ..
-                } => {}
-                MuxNotification::Alert {
-                    alert: Alert::SetProfileRequested { .. } | Alert::MouseShapeRequested { .. },
-                    ..
-                } => {
-                    // ft-fy4ty / ft-7yiu2: surfaced to the embedder
-                    // for a confirmation prompt (SetProfile) or
-                    // native cursor mapping (MouseShape). The GUI
-                    // continuation beads (ft-tzusd / ft-jornq) wire
-                    // the actual UI; the term-layer alert path
-                    // already routes through the alert handler so
-                    // the mux-side notification is intentionally a
-                    // no-op here.
-                }
-                MuxNotification::TabAddedToWindow {
-                    window_id: _,
-                    tab_id,
-                } => {
-                    let mut size = self.terminal_size;
-                    if let Some(tab) = notification_owner.get_tab(tab_id) {
-                        // If we attached to a remote domain and loaded in
-                        // a tab async, we need to fixup its size, either
-                        // by resizing it or resizes ourselves.
-                        // The strategy here is to adjust both by taking
-                        // the maximal size in both horizontal and vertical
-                        // dimensions and applying that. In practice that
-                        // means that a new local client will resize larger
-                        // to adjust to the size of an existing client.
-                        let tab_size = tab.get_size();
-                        size.rows = size.rows.max(tab_size.rows);
-                        size.cols = size.cols.max(tab_size.cols);
-
+                    MuxNotification::PaneOutput(pane_id) => {
+                        self.mux_pane_output_event(pane_id);
+                    }
+                    MuxNotification::SynchronizedOutput { pane_id, event } => {
+                        self.mux_synchronized_output_event(pane_id, event);
+                    }
+                    MuxNotification::WindowTopologyChanged(change) => {
+                        if !change.affects_window(self.mux_window_id) {
+                            return Ok(());
+                        }
+                        let mut size = self.terminal_size;
+                        for &(tab_id, window_id) in change.attached_tabs() {
+                            if window_id != self.mux_window_id {
+                                continue;
+                            }
+                            if let Some(tab) = notification_owner.get_tab(tab_id) {
+                                let tab_size = tab.get_size();
+                                size.rows = size.rows.max(tab_size.rows);
+                                size.cols = size.cols.max(tab_size.cols);
+                            }
+                        }
                         if size.rows != self.terminal_size.rows
                             || size.cols != self.terminal_size.cols
                             || size.pixel_width != self.terminal_size.pixel_width
                             || size.pixel_height != self.terminal_size.pixel_height
                         {
                             self.set_window_size(size, window)?;
-                        } else if tab_size.dpi == 0 {
-                            log::debug!("fixup dpi in newly added tab");
-                            tab.resize(self.terminal_size);
-                        }
-                    }
-                }
-                MuxNotification::PaneOutput(pane_id) => {
-                    self.mux_pane_output_event(pane_id);
-                }
-                MuxNotification::SynchronizedOutput { pane_id, event } => {
-                    self.mux_synchronized_output_event(pane_id, event);
-                }
-                MuxNotification::WindowTopologyChanged(change) => {
-                    if !change.affects_window(self.mux_window_id) {
-                        return Ok(());
-                    }
-                    let mut size = self.terminal_size;
-                    for &(tab_id, window_id) in change.attached_tabs() {
-                        if window_id != self.mux_window_id {
-                            continue;
-                        }
-                        if let Some(tab) = notification_owner.get_tab(tab_id) {
-                            let tab_size = tab.get_size();
-                            size.rows = size.rows.max(tab_size.rows);
-                            size.cols = size.cols.max(tab_size.cols);
-                        }
-                    }
-                    if size.rows != self.terminal_size.rows
-                        || size.cols != self.terminal_size.cols
-                        || size.pixel_width != self.terminal_size.pixel_width
-                        || size.pixel_height != self.terminal_size.pixel_height
-                    {
-                        self.set_window_size(size, window)?;
-                    } else {
-                        for &(tab_id, window_id) in change.attached_tabs() {
-                            if window_id != self.mux_window_id {
-                                continue;
-                            }
-                            if let Some(tab) = notification_owner.get_tab(tab_id)
-                                && tab.get_size().dpi == 0
-                            {
-                                log::debug!("fixup dpi in newly attached tab");
-                                tab.resize(self.terminal_size);
-                            }
-                        }
-                    }
-                    self.prune_tab_state_to_live_window();
-                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
-                    window.invalidate();
-                    self.update_title_post_status();
-                }
-                MuxNotification::WindowInvalidated(_)
-                | MuxNotification::WindowOrderChanged { .. } => {
-                    self.prune_tab_state_to_live_window();
-                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
-                    window.invalidate();
-                    self.update_title_post_status();
-                }
-                MuxNotification::FloatingPaneSpawnCommitted(spawn) => {
-                    // The subscription routes this notification using the
-                    // frozen window identity, but the GUI callback may have
-                    // remained queued across a window switch. Never repaint
-                    // the replacement window for stale topology.
-                    if spawn.window_id() != self.mux_window_id {
-                        return Ok(());
-                    }
-
-                    // Focus, tab membership, and floating geometry were all
-                    // committed atomically before this event was published.
-                    // Consume it as one paint/title-status invalidation only;
-                    // queuing numeric-id focus reconciliation here could
-                    // override a newer user action.
-                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
-                    window.invalidate();
-                    self.update_title_post_status();
-                }
-                MuxNotification::WindowRemoved(_window_id) => {
-                    // Handled by frontend
-                }
-                MuxNotification::AssignClipboard { .. } => {
-                    // Handled by frontend
-                }
-                MuxNotification::SaveToDownloads { .. } => {
-                    // Handled by frontend
-                }
-                MuxNotification::PaneFocused(_) => {
-                    // Also handled by clientpane
-                    self.update_title_post_status();
-                }
-                MuxNotification::TabResized(_) => {
-                    // Also handled by frankenterm-client
-                    self.update_title_post_status();
-                }
-                MuxNotification::TabTitleChanged { .. } => {
-                    self.update_title_post_status();
-                }
-                MuxNotification::PaneRemoved(pane_id) => {
-                    if notification_owner.get_pane(pane_id).is_some() {
-                        log::error!(
-                            "refusing PaneRemoved GUI cleanup for live pane {pane_id}; removal fence authority was violated"
-                        );
-                        return Ok(());
-                    }
-                    // ft-mpc9b.1.2: drop the pane's dirty-line
-                    // bitmap. Without this the HashMap leaks an
-                    // entry per closed pane over the session
-                    // lifetime.
-                    self.forget_dirty_lines_for_pane(pane_id);
-                    // Per ft-kyail: also drop the pane's live
-                    // triple-buffer owner and retained health
-                    // snapshot. Both are keyed by the substrate's
-                    // u64 PaneId; cast from the mux's usize PaneId
-                    // here.
-                    self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(pane_id));
-                    self.forget_sync_output_state_for_pane(pane_id);
-                    self.semantic_zones.remove(&pane_id);
-                    self.agent_pane_states.remove(&pane_id);
-                    self.line_quad_cache
-                        .borrow_mut()
-                        .remove_keys_where(|key| key.pane_id == pane_id);
-                    self.line_state_cache
-                        .borrow_mut()
-                        .remove_where(|_, state| state.pane_id == pane_id);
-                    let overlay_to_remove = self
-                        .pane_state
-                        .borrow_mut()
-                        .remove(&pane_id)
-                        .and_then(|state| state.overlay);
-                    if let Some(overlay) = overlay_to_remove {
-                        Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
-                    }
-                    let detached_retired_overlays = {
-                        let mut detached = Vec::new();
-                        for (owner_pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
-                            if state
-                                .overlay
-                                .as_ref()
-                                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
-                            {
-                                if let Some(overlay) = state.overlay.take() {
-                                    detached.push((OverlaySlot::Pane(*owner_pane_id), overlay));
+                        } else {
+                            for &(tab_id, window_id) in change.attached_tabs() {
+                                if window_id != self.mux_window_id {
+                                    continue;
+                                }
+                                if let Some(tab) = notification_owner.get_tab(tab_id)
+                                    && tab.get_size().dpi == 0
+                                {
+                                    log::debug!("fixup dpi in newly attached tab");
+                                    tab.resize(self.terminal_size);
                                 }
                             }
                         }
-                        for (tab_id, state) in self.tab_state.borrow_mut().iter_mut() {
-                            if state
-                                .overlay
-                                .as_ref()
-                                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
-                            {
-                                if let Some(overlay) = state.overlay.take() {
-                                    detached.push((OverlaySlot::Tab(*tab_id), overlay));
-                                }
-                            }
-                        }
-                        detached
-                    };
-                    let detached_retired_overlay = !detached_retired_overlays.is_empty();
-                    for (slot, overlay) in detached_retired_overlays {
-                        Self::retire_overlay_registration(slot, overlay);
-                    }
-                    let captured_pane_id = match self.current_mouse_capture.as_ref() {
-                        Some(MouseCapture::TerminalPane(captured_pane_id)) => {
-                            Some(*captured_pane_id)
-                        }
-                        Some(MouseCapture::UI) | None => None,
-                    };
-                    let mouse_cleanup = frankenterm_gui::removed_pane_mouse_cleanup(
-                        captured_pane_id,
-                        self.active_selection_drag_pane,
-                        pane_id,
-                    );
-                    if mouse_cleanup.clear_terminal_capture {
-                        self.current_mouse_capture = None;
-                        self.current_mouse_buttons.clear();
-                    }
-                    if mouse_cleanup.clear_selection_drag {
-                        self.active_selection_drag_pane = None;
-                    }
-                    self.prune_tab_state_to_live_window();
-                    if detached_retired_overlay {
+                        self.prune_tab_state_to_live_window();
+                        self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
                         window.invalidate();
+                        self.update_title_post_status();
                     }
-                }
-                MuxNotification::PaneAdded(_)
-                | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::WindowWorkspaceChanged { .. }
-                | MuxNotification::ActiveWorkspaceChanged(_)
-                | MuxNotification::Empty
-                | MuxNotification::WindowCreated(_) => {}
+                    MuxNotification::WindowInvalidated(_)
+                    | MuxNotification::WindowOrderChanged { .. } => {
+                        self.prune_tab_state_to_live_window();
+                        self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
+                        window.invalidate();
+                        self.update_title_post_status();
+                    }
+                    MuxNotification::FloatingPaneSpawnCommitted(spawn) => {
+                        // The subscription routes this notification using the
+                        // frozen window identity, but the GUI callback may have
+                        // remained queued across a window switch. Never repaint
+                        // the replacement window for stale topology.
+                        if spawn.window_id() != self.mux_window_id {
+                            return Ok(());
+                        }
+
+                        // Focus, tab membership, and floating geometry were all
+                        // committed atomically before this event was published.
+                        // Consume it as one paint/title-status invalidation only;
+                        // queuing numeric-id focus reconciliation here could
+                        // override a newer user action.
+                        self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
+                        window.invalidate();
+                        self.update_title_post_status();
+                    }
+                    MuxNotification::WindowRemoved(_window_id) => {
+                        // Handled by frontend
+                    }
+                    MuxNotification::AssignClipboard { .. } => {
+                        // Handled by frontend
+                    }
+                    MuxNotification::SaveToDownloads { .. } => {
+                        // Handled by frontend
+                    }
+                    MuxNotification::PaneFocused(_) => {
+                        // Also handled by clientpane
+                        self.update_title_post_status();
+                    }
+                    MuxNotification::TabResized(_) => {
+                        // Also handled by frankenterm-client
+                        self.update_title_post_status();
+                    }
+                    MuxNotification::TabTitleChanged { .. } => {
+                        self.update_title_post_status();
+                    }
+                    MuxNotification::PaneRemoved(pane_id) => {
+                        if notification_owner.get_pane(pane_id).is_some() {
+                            log::error!(
+                                "refusing PaneRemoved GUI cleanup for live pane {pane_id}; removal fence authority was violated"
+                            );
+                            return Ok(());
+                        }
+                        // ft-mpc9b.1.2: drop the pane's dirty-line
+                        // bitmap. Without this the HashMap leaks an
+                        // entry per closed pane over the session
+                        // lifetime.
+                        self.forget_dirty_lines_for_pane(pane_id);
+                        // Per ft-kyail: also drop the pane's live
+                        // triple-buffer owner and retained health
+                        // snapshot. Both are keyed by the substrate's
+                        // u64 PaneId; cast from the mux's usize PaneId
+                        // here.
+                        self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(
+                            pane_id,
+                        ));
+                        self.forget_sync_output_state_for_pane(pane_id);
+                        self.semantic_zones.remove(&pane_id);
+                        self.agent_pane_states.remove(&pane_id);
+                        self.line_quad_cache
+                            .borrow_mut()
+                            .remove_keys_where(|key| key.pane_id == pane_id);
+                        self.line_state_cache
+                            .borrow_mut()
+                            .remove_where(|_, state| state.pane_id == pane_id);
+                        let overlay_to_remove = self
+                            .pane_state
+                            .borrow_mut()
+                            .remove(&pane_id)
+                            .and_then(|state| state.overlay);
+                        if let Some(overlay) = overlay_to_remove {
+                            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
+                        }
+                        let detached_retired_overlays = {
+                            let mut detached = Vec::new();
+                            for (owner_pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
+                                if state
+                                    .overlay
+                                    .as_ref()
+                                    .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+                                {
+                                    if let Some(overlay) = state.overlay.take() {
+                                        detached.push((OverlaySlot::Pane(*owner_pane_id), overlay));
+                                    }
+                                }
+                            }
+                            for (tab_id, state) in self.tab_state.borrow_mut().iter_mut() {
+                                if state
+                                    .overlay
+                                    .as_ref()
+                                    .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+                                {
+                                    if let Some(overlay) = state.overlay.take() {
+                                        detached.push((OverlaySlot::Tab(*tab_id), overlay));
+                                    }
+                                }
+                            }
+                            detached
+                        };
+                        let detached_retired_overlay = !detached_retired_overlays.is_empty();
+                        for (slot, overlay) in detached_retired_overlays {
+                            Self::retire_overlay_registration(slot, overlay);
+                        }
+                        let captured_pane_id = match self.current_mouse_capture.as_ref() {
+                            Some(MouseCapture::TerminalPane(captured_pane_id)) => {
+                                Some(*captured_pane_id)
+                            }
+                            Some(MouseCapture::UI) | None => None,
+                        };
+                        let mouse_cleanup = frankenterm_gui::removed_pane_mouse_cleanup(
+                            captured_pane_id,
+                            self.active_selection_drag_pane,
+                            pane_id,
+                        );
+                        if mouse_cleanup.clear_terminal_capture {
+                            self.current_mouse_capture = None;
+                            self.current_mouse_buttons.clear();
+                        }
+                        if mouse_cleanup.clear_selection_drag {
+                            self.active_selection_drag_pane = None;
+                        }
+                        self.prune_tab_state_to_live_window();
+                        if detached_retired_overlay {
+                            window.invalidate();
+                        }
+                    }
+                    MuxNotification::PaneAdded(_)
+                    | MuxNotification::WorkspaceRenamed { .. }
+                    | MuxNotification::WindowWorkspaceChanged { .. }
+                    | MuxNotification::ActiveWorkspaceChanged(_)
+                    | MuxNotification::Empty
+                    | MuxNotification::WindowCreated(_) => {}
                 }
                 if let Some(cleanup) = pane_removal_cleanup {
                     cleanup.complete();
@@ -4883,10 +4865,8 @@ impl TermWindow {
             .pane_state(pane_id)
             .render_dirty
             .last_observed_source_end();
-        let (source_end, dirty) = pane.get_changed_since_with_source_fence(
-            visible_range.clone(),
-            last_observed_source_end,
-        );
+        let (source_end, dirty) = pane
+            .get_changed_since_with_source_fence(visible_range.clone(), last_observed_source_end);
         self.pane_state(pane_id)
             .render_dirty
             .advance_after_query(source_end);
@@ -4930,10 +4910,8 @@ impl TermWindow {
                 // through the same atomic source fence as render damage so a
                 // reset/regression or saturated source cannot make an old high
                 // selection seqno suppress unrelated replacement content.
-                let (_, selection_dirty) = pane.get_changed_since_with_source_fence(
-                    visible_range,
-                    selection_seqno,
-                );
+                let (_, selection_dirty) =
+                    pane.get_changed_since_with_source_fence(visible_range, selection_seqno);
                 let intersects = selection_rows
                     .clone()
                     .into_iter()
@@ -4993,14 +4971,9 @@ impl TermWindow {
             self.config_overrides
         );
         // ft-mpc9b.1.2: a config reload can change theme, font,
-        // colors, padding, etc. Mark every pane dirty so the next
-        // paint reflects the new config. Per ft-i6k6u: tag as
-        // ThemeSwap (the most common reason an operator reloads
-        // config is to swap themes; FontSwap fires through the
-        // shape-cache notif at the dedicated site above).
-        self.mark_all_panes_dirty_with_source(
-            frankenterm_core::dirty_line_telemetry::DirtyEventSource::ThemeSwap,
-        );
+        // colors, padding, etc. This is an unknown full configuration
+        // transition, not evidence that only the palette changed.
+        self.mark_all_panes_dirty();
         self.key_table_state.clear_stack();
         self.connection_name = Connection::get()
             .map(|c| c.name())
@@ -5062,7 +5035,7 @@ impl TermWindow {
         self.line_to_ele_shape_cache
             .borrow_mut()
             .update_config(&config);
-        self.advance_shaping_input_generation();
+        self.invalidate_render_caches(RenderInvalidationCause::UnknownFull);
         self.fancy_tab_bar.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
@@ -5116,6 +5089,7 @@ impl TermWindow {
 
     fn invalidate_modal(&mut self) {
         if let Some(modal) = self.get_modal() {
+            self.record_render_invalidation(RenderInvalidationCause::Overlay);
             modal.reconfigure(self);
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
@@ -5124,6 +5098,7 @@ impl TermWindow {
     }
 
     pub fn cancel_modal(&self) {
+        self.record_render_invalidation(RenderInvalidationCause::Overlay);
         self.modal.borrow_mut().take();
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -5131,6 +5106,7 @@ impl TermWindow {
     }
 
     pub fn set_modal(&self, modal: Rc<dyn Modal>) {
+        self.record_render_invalidation(RenderInvalidationCause::Overlay);
         self.modal.borrow_mut().replace(modal);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -5939,10 +5915,10 @@ impl TermWindow {
                     "window unify action",
                 )?
                 .spawn(async move {
-                        Self::apply_window_unify_plan(plan);
-                        anyhow::Result::<()>::Ok(())
-                    })
-                    .detach();
+                    Self::apply_window_unify_plan(plan);
+                    anyhow::Result::<()>::Ok(())
+                })
+                .detach();
             }
             Ok(())
         }) {
@@ -6119,27 +6095,27 @@ impl TermWindow {
             16 * 1024,
             "prepare launcher overlay",
             async move {
-            let args = match LauncherArgs::new(
-                &title,
-                flags,
-                mux_window_id,
-                pane_id,
-                domain_id_of_current_pane,
-                &help_text,
-                &fuzzy_help_text,
-                &alphabet,
-            )
-            .await
-            {
-                Ok(args) => args,
-                Err(err) => {
-                    log::error!("failed to prepare launcher overlay: {err:#}");
-                    return;
-                }
-            };
+                let args = match LauncherArgs::new(
+                    &title,
+                    flags,
+                    mux_window_id,
+                    pane_id,
+                    domain_id_of_current_pane,
+                    &help_text,
+                    &fuzzy_help_text,
+                    &alphabet,
+                )
+                .await
+                {
+                    Ok(args) => args,
+                    Err(err) => {
+                        log::error!("failed to prepare launcher overlay: {err:#}");
+                        return;
+                    }
+                };
 
-            let win = window.clone();
-            win.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let win = window.clone();
+                win.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let Some(mux) = Mux::try_get() else {
                     log::warn!("cannot start launcher overlay: mux is no longer active");
                     return;
@@ -6175,7 +6151,7 @@ impl TermWindow {
                     reservation.spawn_local(future).detach();
                 }
             })));
-        },
+            },
         );
     }
 
@@ -7111,16 +7087,17 @@ impl TermWindow {
                         reservation
                             .spawn_local(async move {
                                 let result = async {
-                                    let lifecycle =
-                                        mux_lua::reserve_domain_lifecycle(domain_name.clone())
-                                            .context(
-                                                "reserving ordered manual domain detachment lifecycle",
-                                            )?
-                                            .enter()
-                                            .await
-                                            .context(
-                                                "entering ordered manual domain detachment lifecycle",
-                                            )?;
+                                    let lifecycle = mux_lua::reserve_domain_lifecycle(
+                                        domain_name.clone(),
+                                    )
+                                    .context(
+                                        "reserving ordered manual domain detachment lifecycle",
+                                    )?
+                                    .enter()
+                                    .await
+                                    .context(
+                                        "entering ordered manual domain detachment lifecycle",
+                                    )?;
                                     crate::persist_domain_reconnect_intent(
                                         domain_name.clone(),
                                         DomainAttachmentIntent::Detached,
@@ -7159,10 +7136,8 @@ impl TermWindow {
                         let error = anyhow!(
                             "main-thread scheduler rejected detach before persistence or mutation: {rejected:?}"
                         );
-                        let message = crate::bounded_gui_failure_message(
-                            "Failed to detach domain",
-                            &error,
-                        );
+                        let message =
+                            crate::bounded_gui_failure_message("Failed to detach domain", &error);
                         frankenterm_gui::gui_debug_log::record(
                             log::Level::Error,
                             "frankenterm_gui::manual_domain_detach",
@@ -7188,18 +7163,13 @@ impl TermWindow {
                                 let result = async {
                                     let mux = Mux::try_get()
                                         .ok_or_else(|| {
-                                            anyhow!(
-                                                "cannot attach domain without an active mux"
-                                            )
+                                            anyhow!("cannot attach domain without an active mux")
                                         })
                                         .map_err(|error| (error, false))?;
                                     let domain = mux
                                         .get_domain_by_name(&domain_name)
                                         .ok_or_else(|| {
-                                            anyhow!(
-                                                "{} is not a valid domain name",
-                                                domain_name
-                                            )
+                                            anyhow!("{} is not a valid domain name", domain_name)
                                         })
                                         .map_err(|error| (error, false))?;
                                     match crate::spawn::attach_domain_to_window_or_spawn_recovery(
@@ -7558,10 +7528,9 @@ impl TermWindow {
                                 .await;
                                 window.notify(TermWindowNotif::Apply(Box::new(
                                     move |term_window| {
-                                        let modal =
-                                            crate::termwindow::palette::CommandPalette::new(
-                                                commands,
-                                            );
+                                        let modal = crate::termwindow::palette::CommandPalette::new(
+                                            commands,
+                                        );
                                         term_window.set_modal(Rc::new(modal));
                                     },
                                 )));
@@ -8509,22 +8478,22 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        DamageAdvanceOutcome, DamageCommitOutcome, DamageGeneration, DrawFailure,
-        DrawFailureStage, FrameCompletion, PaintAdmission, RenderAttemptFailure,
-        RenderFailureStage, RenderRecoveryDirective, RenderRecoveryState, RenderWakeDispatch,
-        RenderWakePlan, RenderWakeReason, RenderWakeState,
-        SyncOutputDoctorSnapshot, UIItem, UIItemType, WebGpuSurfaceErrorAction,
-        acquire_webgpu_frame_with_repair_using, a11y_op_kind_from_frame_budget_op,
-        apply_failed_render_attempt, apply_presented_render_attempt,
-        base_policy_for_frame_budget_state, classify_webgpu_surface_error,
-        combine_glium_draw_and_finish, default_frame_budget_cost_ns,
-        evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
+        DamageAdvanceOutcome, DamageCommitOutcome, DamageGeneration, DrawFailure, DrawFailureStage,
+        FrameCompletion, PaintAdmission, RenderAttemptFailure, RenderFailureStage,
+        RenderRecoveryDirective, RenderRecoveryState, RenderWakeDispatch, RenderWakePlan,
+        RenderWakeReason, RenderWakeState, SyncOutputDoctorSnapshot, UIItem, UIItemType,
+        WebGpuSurfaceErrorAction, a11y_op_kind_from_frame_budget_op,
+        acquire_webgpu_frame_with_repair_using, apply_failed_render_attempt,
+        apply_presented_render_attempt, base_policy_for_frame_budget_state,
+        classify_webgpu_surface_error, combine_glium_draw_and_finish, default_frame_budget_cost_ns,
+        evaluate_frame_budget_reduce_motion_gate, frame_budget,
+        is_clean_line_for_cache_hit_accounting, mark_cursor_rows_dirty,
         mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
         pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
         record_frame_budget_execution_outstanding, record_sync_output_mux_event,
         reduce_motion_state_from_preference, render, render_recovery_directive,
-        run_clear_dirty_lines_after_frame, settle_frame_damage, should_force_paint_for_frame_budget,
-        is_clean_line_for_cache_hit_accounting, should_run_frame_budget_decision, webgpu,
+        run_clear_dirty_lines_after_frame, settle_frame_damage,
+        should_force_paint_for_frame_budget, should_run_frame_budget_decision, webgpu,
         webgpu_repair_failure_stage,
     };
     use std::time::{Duration, Instant};
@@ -8550,18 +8519,24 @@ mod tests {
 
     #[test]
     fn pane_removed_gui_cleanup_fails_closed_without_exact_deferred_authority() {
-        assert!(!super::TermWindow::mux_notification_has_deferred_cleanup_authority(
-            &mux::MuxNotification::PaneRemoved(7),
-            false,
-        ));
-        assert!(super::TermWindow::mux_notification_has_deferred_cleanup_authority(
-            &mux::MuxNotification::PaneRemoved(7),
-            true,
-        ));
-        assert!(super::TermWindow::mux_notification_has_deferred_cleanup_authority(
-            &mux::MuxNotification::PaneOutput(7),
-            false,
-        ));
+        assert!(
+            !super::TermWindow::mux_notification_has_deferred_cleanup_authority(
+                &mux::MuxNotification::PaneRemoved(7),
+                false,
+            )
+        );
+        assert!(
+            super::TermWindow::mux_notification_has_deferred_cleanup_authority(
+                &mux::MuxNotification::PaneRemoved(7),
+                true,
+            )
+        );
+        assert!(
+            super::TermWindow::mux_notification_has_deferred_cleanup_authority(
+                &mux::MuxNotification::PaneOutput(7),
+                false,
+            )
+        );
     }
 
     #[test]
@@ -9697,18 +9672,16 @@ mod tests {
             pixel_height: 720,
             dpi: 96,
         };
-        let timeout: Result<u8, RenderAttemptFailure> =
-            acquire_webgpu_frame_with_repair_using(
-                dimensions,
-                |_| Ok(webgpu::SurfaceConfigureOutcome::Ready),
-                || Err(webgpu::WebGpuSurfaceTextureError::Timeout),
-                |_| unreachable!("timeout must not force-configure the surface"),
-                |_| unreachable!("timeout must not recreate the surface"),
-            );
-        let timeout = timeout.expect_err("timeout acquisition must fail");
-        let timeout_stage = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Timeout,
+        let timeout: Result<u8, RenderAttemptFailure> = acquire_webgpu_frame_with_repair_using(
+            dimensions,
+            |_| Ok(webgpu::SurfaceConfigureOutcome::Ready),
+            || Err(webgpu::WebGpuSurfaceTextureError::Timeout),
+            |_| unreachable!("timeout must not force-configure the surface"),
+            |_| unreachable!("timeout must not recreate the surface"),
         );
+        let timeout = timeout.expect_err("timeout acquisition must fail");
+        let timeout_stage =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout);
         assert_eq!(timeout.stage(), timeout_stage);
 
         let generation = DamageGeneration::default();
@@ -9730,12 +9703,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let (damage, directive) = apply_failed_render_attempt(
-                &mut bitmaps,
-                generation,
-                &mut recovery,
-                stage,
-            );
+            let (damage, directive) =
+                apply_failed_render_attempt(&mut bitmaps, generation, &mut recovery, stage);
             assert_eq!(damage, DamageCommitOutcome::RetainedFailure);
             assert_eq!(bitmaps, before, "attempt {attempt} changed dirty rows");
 
@@ -9759,34 +9728,32 @@ mod tests {
 
         let mut acquire_calls = 0;
         let mut recreate_calls = 0;
-        let repaired: Result<u8, RenderAttemptFailure> =
-            acquire_webgpu_frame_with_repair_using(
-                dimensions,
-                |_| Ok(webgpu::SurfaceConfigureOutcome::Ready),
-                || {
-                    acquire_calls += 1;
-                    match acquire_calls {
-                        1 => Err(webgpu::WebGpuSurfaceTextureError::Lost),
-                        2 => Ok(42),
-                        _ => unreachable!("repair may reacquire only once"),
-                    }
-                },
-                |_| unreachable!("lost surface must not use force-configure"),
-                |_| {
-                    recreate_calls += 1;
-                    Ok(webgpu::SurfaceConfigureOutcome::Ready)
-                },
-            );
-        assert_eq!(repaired.expect("lost surface must repair and reacquire"), 42);
+        let repaired: Result<u8, RenderAttemptFailure> = acquire_webgpu_frame_with_repair_using(
+            dimensions,
+            |_| Ok(webgpu::SurfaceConfigureOutcome::Ready),
+            || {
+                acquire_calls += 1;
+                match acquire_calls {
+                    1 => Err(webgpu::WebGpuSurfaceTextureError::Lost),
+                    2 => Ok(42),
+                    _ => unreachable!("repair may reacquire only once"),
+                }
+            },
+            |_| unreachable!("lost surface must not use force-configure"),
+            |_| {
+                recreate_calls += 1;
+                Ok(webgpu::SurfaceConfigureOutcome::Ready)
+            },
+        );
+        assert_eq!(
+            repaired.expect("lost surface must repair and reacquire"),
+            42
+        );
         assert_eq!(acquire_calls, 2);
         assert_eq!(recreate_calls, 1);
 
-        let first_success = apply_presented_render_attempt(
-            &mut bitmaps,
-            generation,
-            &mut recovery,
-            generation,
-        );
+        let first_success =
+            apply_presented_render_attempt(&mut bitmaps, generation, &mut recovery, generation);
         assert_eq!(first_success, DamageCommitOutcome::Cleared);
         assert_eq!(bitmaps.get(&7).expect("pane retained").count(), 0);
         assert_eq!(recovery.failed_attempts_since_success, 0);
@@ -9801,19 +9768,13 @@ mod tests {
         bm.mark(19);
         original.insert(7, bm);
 
-        for stage in [
-            RenderFailureStage::Submission,
-            RenderFailureStage::Present,
-        ] {
+        for stage in [RenderFailureStage::Submission, RenderFailureStage::Present] {
             let mut bitmaps = original.clone();
             let before = bitmaps.clone();
             let generation = DamageGeneration::default();
 
-            let outcome = settle_frame_damage(
-                &mut bitmaps,
-                generation,
-                FrameCompletion::Failed(stage),
-            );
+            let outcome =
+                settle_frame_damage(&mut bitmaps, generation, FrameCompletion::Failed(stage));
 
             assert_eq!(outcome, DamageCommitOutcome::RetainedFailure);
             assert_eq!(bitmaps, before, "{stage:?} changed dirty rows");
@@ -9830,11 +9791,8 @@ mod tests {
         bm.mark(11);
         bitmaps.insert(3, bm);
         let before = bitmaps.clone();
-        let outcome = settle_frame_damage(
-            &mut bitmaps,
-            current,
-            FrameCompletion::Presented(captured),
-        );
+        let outcome =
+            settle_frame_damage(&mut bitmaps, current, FrameCompletion::Presented(captured));
 
         assert_eq!(outcome, DamageCommitOutcome::RetainedStale);
         assert_eq!(bitmaps, before);
@@ -9866,10 +9824,7 @@ mod tests {
         };
         let captured = generation;
         assert_eq!(generation.advance(), DamageAdvanceOutcome::ExhaustedNow);
-        assert_eq!(
-            generation.advance(),
-            DamageAdvanceOutcome::AlreadyExhausted
-        );
+        assert_eq!(generation.advance(), DamageAdvanceOutcome::AlreadyExhausted);
 
         let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(8);
@@ -9888,9 +9843,8 @@ mod tests {
 
     #[test]
     fn render_recovery_backoff_is_bounded_and_permanent_errors_open() {
-        let timeout = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Timeout,
-        );
+        let timeout =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout);
         for (attempt, expected_ms) in [8, 16, 32, 64, 128, 250].into_iter().enumerate() {
             let attempt = u32::try_from(attempt).expect("bounded retry index fits u32") + 1;
             assert_eq!(
@@ -9920,11 +9874,9 @@ mod tests {
 
     #[test]
     fn alternating_stale_surface_stages_cannot_reset_retry_budget() {
-        let outdated = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Outdated,
-        );
-        let lost =
-            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost);
+        let outdated =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Outdated);
+        let lost = RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Lost);
         let mut recovery = RenderRecoveryState::default();
 
         assert_eq!(
@@ -9968,9 +9920,8 @@ mod tests {
 
     #[test]
     fn surface_signal_preserves_incident_evidence_until_present() {
-        let timeout = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Timeout,
-        );
+        let timeout =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout);
         let mut recovery = RenderRecoveryState::default();
         assert_eq!(
             recovery.record_failure(timeout),
@@ -10129,9 +10080,7 @@ mod tests {
 
     #[test]
     fn cooldown_suppresses_external_repaint_until_exact_retry_is_ready() {
-        let stage = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Timeout,
-        );
+        let stage = RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout);
         let ticket = super::RenderWakeTicket(7);
         let mut recovery = RenderRecoveryState::default();
         recovery.enter_cooldown(ticket, stage);
@@ -10144,9 +10093,7 @@ mod tests {
 
     #[test]
     fn occlusion_parks_without_a_self_wake_and_surface_signal_reopens() {
-        let stage = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Occluded,
-        );
+        let stage = RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded);
         let mut recovery = RenderRecoveryState::default();
         assert_eq!(
             recovery.record_failure(stage),
@@ -10162,12 +10109,10 @@ mod tests {
 
     #[test]
     fn parked_repaint_probe_is_limited_to_occlusion() {
-        let occluded = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Occluded,
-        );
-        let timeout = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Timeout,
-        );
+        let occluded =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded);
+        let timeout =
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout);
         let mut recovery = RenderRecoveryState::default();
 
         recovery.park(occluded);
@@ -10182,9 +10127,7 @@ mod tests {
 
     #[test]
     fn parked_occlusion_probe_requires_exact_wake_and_preserves_evidence() {
-        let stage = RenderFailureStage::SurfaceAcquire(
-            webgpu::WebGpuSurfaceTextureError::Occluded,
-        );
+        let stage = RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded);
         let now = Instant::now();
         let mut recovery = RenderRecoveryState::default();
         let mut wakes = RenderWakeState::default();
@@ -10248,11 +10191,9 @@ mod tests {
         );
         assert!(failure.secondary_finish.is_some());
 
-        let finish_only = combine_glium_draw_and_finish(
-            Ok(()),
-            Err(anyhow::anyhow!("finish failed")),
-        )
-        .expect_err("finish failure expected");
+        let finish_only =
+            combine_glium_draw_and_finish(Ok(()), Err(anyhow::anyhow!("finish failed")))
+                .expect_err("finish failure expected");
         assert_eq!(finish_only.stage(), RenderFailureStage::BackendFinish);
     }
 
@@ -10281,9 +10222,7 @@ mod tests {
     fn failed_webgpu_repair_is_a_permanent_validation_stage() {
         assert_eq!(
             webgpu_repair_failure_stage(),
-            RenderFailureStage::SurfaceAcquire(
-                webgpu::WebGpuSurfaceTextureError::Validation,
-            )
+            RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation,)
         );
         assert_eq!(
             render_recovery_directive(webgpu_repair_failure_stage(), 1),

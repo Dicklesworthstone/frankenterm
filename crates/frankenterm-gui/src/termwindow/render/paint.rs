@@ -1,7 +1,7 @@
 use crate::termwindow::frame_budget::{OpKind, OpPriority};
 use crate::termwindow::{DamageGeneration, RenderAttemptFailure};
-use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use ::window::WindowOps;
+use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use anyhow::Context;
 use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
@@ -35,10 +35,7 @@ struct PostPresentWork {
 const MAX_PAINT_PASSES: usize = 16;
 
 impl crate::TermWindow {
-    pub(crate) fn paint_impl<P>(
-        &mut self,
-        present: P,
-    ) -> Result<PaintOutcome, RenderAttemptFailure>
+    pub(crate) fn paint_impl<P>(&mut self, present: P) -> Result<PaintOutcome, RenderAttemptFailure>
     where
         P: FnOnce(&mut Self) -> Result<(), RenderAttemptFailure>,
     {
@@ -69,12 +66,11 @@ impl crate::TermWindow {
 
         let geometry_result = 'pass: {
             for pass in 0..MAX_PAINT_PASSES {
-                let _dirty_quad_budget = self
-                    .frame_budget_should_run_render_op_with_reduce_motion(
-                        OpKind::DirtyQuadRebuild,
-                        OpPriority::Required,
-                        frame_reduce_motion,
-                    );
+                let _dirty_quad_budget = self.frame_budget_should_run_render_op_with_reduce_motion(
+                    OpKind::DirtyQuadRebuild,
+                    OpPriority::Required,
+                    frame_reduce_motion,
+                );
                 match self.paint_pass(frame_reduce_motion) {
                     Ok(_) => match self.render_state.as_mut() {
                         Some(render_state) => {
@@ -152,7 +148,9 @@ impl crate::TermWindow {
                         } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
                             self.invalidate_fancy_tab_bar();
                             self.invalidate_modal();
-                            self.advance_shaping_input_generation();
+                            self.invalidate_render_caches(
+                                crate::termwindow::resize::RenderInvalidationCause::FallbackFont,
+                            );
                         } else {
                             break 'pass Err(err.context("paint_pass"));
                         }

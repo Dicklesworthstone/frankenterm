@@ -1,5 +1,8 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
-use crate::termwindow::render::{LineToEleShapeCacheKey, LineToElementShapeItem};
+use crate::shapecache::{CachedShape, ShapeCacheKey};
+use crate::termwindow::render::{
+    LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShapeItem,
+};
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
@@ -12,12 +15,225 @@ use wezterm_term::TerminalSize;
 
 /// Synchronous glyph warm-up budget applied on a font scale change (ft-uroqc).
 /// Scale changes are rare, user-initiated events (zoom / DPI change), so a
-/// one-frame (60fps) bound keeps the change responsive while pre-rasterizing the
-/// common ASCII/Latin set at the new `CellMetricKey`. The value is a perf knob,
+/// budget pre-rasterizes the common ASCII/Latin set at the new `CellMetricKey`.
+/// It is checked between synchronous operations, so an individual shaping or
+/// raster call can exceed it. The value is a perf knob,
 /// not a correctness parameter — warm-up is idempotent and any unwarmed glyph
-/// still rasterizes lazily on first paint exactly as before. Tunable once the
-/// renderer_slo bench unblocks (mcp_middleware cfg(test) fix, p4).
+/// still rasterizes lazily on first paint exactly as before. Tunable once
+/// a native scale-change-to-present experiment qualifies a replacement.
 const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Finite production reasons, shared by cache mutation, overlay hooks and
+/// content-free render traces. Row-keyed causes retain global caches: line
+/// content/sequence, cursor, selection, composition, position and expiration
+/// remain the existing per-entry authorities. This is not a second damage or
+/// presentation generation, and does not enable sparse painting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RenderInvalidationCause {
+    Content,
+    TerminalGrid,
+    FontMetrics,
+    Palette,
+    Overlay,
+    Cursor,
+    Selection,
+    Ime,
+    Image,
+    SurfaceSize,
+    Projection,
+    DisplayDpi,
+    AtlasResource,
+    FallbackFont,
+    Focus,
+    Viewport,
+    UnknownFull,
+}
+
+impl RenderInvalidationCause {
+    const ALL: [Self; 17] = [
+        Self::Content,
+        Self::TerminalGrid,
+        Self::FontMetrics,
+        Self::Palette,
+        Self::Overlay,
+        Self::Cursor,
+        Self::Selection,
+        Self::Ime,
+        Self::Image,
+        Self::SurfaceSize,
+        Self::Projection,
+        Self::DisplayDpi,
+        Self::AtlasResource,
+        Self::FallbackFont,
+        Self::Focus,
+        Self::Viewport,
+        Self::UnknownFull,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::TerminalGrid => "terminal_grid",
+            Self::FontMetrics => "font_metrics",
+            Self::Palette => "palette",
+            Self::Overlay => "overlay",
+            Self::Cursor => "cursor",
+            Self::Selection => "selection",
+            Self::Ime => "ime",
+            Self::Image => "image",
+            Self::SurfaceSize => "surface_size",
+            Self::Projection => "projection",
+            Self::DisplayDpi => "display_dpi",
+            Self::AtlasResource => "atlas_resource",
+            Self::FallbackFont => "fallback_font",
+            Self::Focus => "focus",
+            Self::Viewport => "viewport",
+            Self::UnknownFull => "unknown_full",
+        }
+    }
+
+    const fn rebuild(self) -> CacheRebuild {
+        match self {
+            Self::Content
+            | Self::Overlay
+            | Self::Cursor
+            | Self::Selection
+            | Self::Ime
+            | Self::Image
+            | Self::Viewport => CacheRebuild::RowKeyed,
+            Self::TerminalGrid | Self::SurfaceSize | Self::Projection | Self::Focus => {
+                CacheRebuild::Quads
+            }
+            Self::Palette => CacheRebuild::ColoredLines,
+            Self::AtlasResource => CacheRebuild::AtlasSprites,
+            Self::FontMetrics | Self::DisplayDpi | Self::FallbackFont | Self::UnknownFull => {
+                CacheRebuild::ShapingInputs
+            }
+        }
+    }
+
+    pub(super) fn for_shape_notification(self) -> Self {
+        match self {
+            Self::Palette | Self::FallbackFont => self,
+            // An unspecified/future notification must not accidentally turn
+            // a whole-shape invalidation into a row-keyed no-op.
+            _ => Self::UnknownFull,
+        }
+    }
+}
+
+/// A cause bundle coalesces before one synchronous cache mutation. No clearing
+/// is deferred across callbacks or frames. Private bits prevent an unknown
+/// value from accidentally selecting the row-keyed fast path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct RenderInvalidationSet(u32);
+
+impl From<RenderInvalidationCause> for RenderInvalidationSet {
+    fn from(cause: RenderInvalidationCause) -> Self {
+        Self(1 << cause as u8)
+    }
+}
+
+impl RenderInvalidationSet {
+    fn with(self, cause: RenderInvalidationCause) -> Self {
+        Self(self.0 | Self::from(cause).0)
+    }
+
+    fn causes(self) -> impl Iterator<Item = RenderInvalidationCause> {
+        let known_bits = (1 << RenderInvalidationCause::ALL.len()) - 1;
+        let bits = if self.0 == 0 || self.0 & !known_bits != 0 {
+            self.0 | Self::from(RenderInvalidationCause::UnknownFull).0
+        } else {
+            self.0
+        };
+        RenderInvalidationCause::ALL
+            .into_iter()
+            .filter(move |cause| bits & Self::from(*cause).0 != 0)
+    }
+
+    fn rebuild(self) -> CacheRebuild {
+        let known_bits = (1 << RenderInvalidationCause::ALL.len()) - 1;
+        if self.0 == 0 || self.0 & !known_bits != 0 {
+            return CacheRebuild::ShapingInputs;
+        }
+        self.causes()
+            .map(RenderInvalidationCause::rebuild)
+            .max()
+            .unwrap_or(CacheRebuild::ShapingInputs)
+    }
+}
+
+/// Nested rebuild sets make invalid combinations (for example retiring glyph
+/// sprites while retaining quads that point into them) unrepresentable.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CacheRebuild {
+    RowKeyed,
+    Quads,
+    ColoredLines,
+    AtlasSprites,
+    ShapingInputs,
+}
+
+impl CacheRebuild {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RowKeyed => "row_keyed",
+            Self::Quads => "quads",
+            Self::ColoredLines => "colored_lines",
+            Self::AtlasSprites => "atlas_sprites",
+            Self::ShapingInputs => "shaping_inputs",
+        }
+    }
+}
+
+/// The exact cache mutation used by TermWindow, separately callable without a
+/// native window so tests exercise real LFU entries and generation fences.
+struct RenderCaches<'a> {
+    shapes: &'a RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
+    lines: &'a RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
+    quads: &'a RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
+}
+
+impl RenderCaches<'_> {
+    fn invalidate(
+        &self,
+        causes: RenderInvalidationSet,
+        shape_generation: &mut usize,
+        quad_generation: &mut usize,
+    ) -> CacheRebuild {
+        let mut rebuild = causes.rebuild();
+        if rebuild == CacheRebuild::RowKeyed {
+            return rebuild;
+        }
+        let advances_shape = rebuild >= CacheRebuild::AtlasSprites;
+        let next = next_cache_generation(if advances_shape {
+            *shape_generation
+        } else {
+            *quad_generation
+        });
+        if next.recycled_epoch {
+            // Unknown prior keys cannot survive either recycled authority.
+            rebuild = CacheRebuild::ShapingInputs;
+        }
+        if rebuild == CacheRebuild::ShapingInputs {
+            self.shapes.borrow_mut().clear();
+        }
+        if rebuild >= CacheRebuild::ColoredLines {
+            clear_generation_keyed_line_shape_cache(self.lines);
+        }
+        self.quads.borrow_mut().clear();
+        if next.recycled_epoch {
+            *shape_generation = 0;
+            *quad_generation = 0;
+        } else if advances_shape {
+            *shape_generation = next.generation;
+        } else {
+            *quad_generation = next.generation;
+        }
+        rebuild
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CacheGenerationAdvance {
@@ -72,43 +288,32 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
-    /// Advance the shaping-input generation and retire every shaping-specific
-    /// cache whose contents depend on those inputs.
-    ///
-    /// Texture-atlas rebuilds intentionally use a separate invalidation path:
-    /// they retain `shape_cache` because HarfBuzz output is atlas-independent,
-    /// while still clearing the line caches whose glyph sprites are not.
-    pub(super) fn advance_shaping_input_generation(&mut self) {
-        let advance = next_cache_generation(self.shape_generation);
-        self.shape_cache.borrow_mut().clear();
-        clear_generation_keyed_line_shape_cache(&self.line_to_ele_shape_cache);
-        self.line_quad_cache.borrow_mut().clear();
-        self.shape_generation = advance.generation;
+    pub(super) fn record_render_invalidation(&self, cause: RenderInvalidationCause) {
+        metrics::counter!("gui.render.invalidation", "cause" => cause.label()).increment(1);
+        log::trace!(
+            "render invalidation cause={} shape_generation={} quad_generation={}",
+            cause.label(),
+            self.shape_generation,
+            self.quad_generation
+        );
     }
 
-    /// Advance atlas-dependent shape authority while retaining atlas-invariant
-    /// HarfBuzz results whenever the generation can advance normally.
-    ///
-    /// At numeric exhaustion, generation zero may still exist in retained
-    /// `CachedShape` entries.  Clear that cache before recycling the epoch so
-    /// an old sprite set can never compare equal to the newly rebuilt atlas.
-    pub(super) fn advance_texture_atlas_shape_generation(&mut self) {
-        let advance = next_cache_generation(self.shape_generation);
-        if advance.recycled_epoch {
-            self.shape_cache.borrow_mut().clear();
+    pub(super) fn invalidate_render_caches(&mut self, causes: impl Into<RenderInvalidationSet>) {
+        let causes = causes.into();
+        let rebuild = RenderCaches {
+            shapes: &self.shape_cache,
+            lines: &self.line_to_ele_shape_cache,
+            quads: &self.line_quad_cache,
         }
-        clear_generation_keyed_line_shape_cache(&self.line_to_ele_shape_cache);
-        self.line_quad_cache.borrow_mut().clear();
-        self.shape_generation = advance.generation;
-    }
-
-    /// Advance whole-quad authority after first retiring every keyed entry.
-    /// Clearing before epoch recycling keeps generation zero unique among all
-    /// live quad-cache records even after numeric exhaustion.
-    pub(super) fn advance_quad_generation(&mut self) {
-        let advance = next_cache_generation(self.quad_generation);
-        self.line_quad_cache.borrow_mut().clear();
-        self.quad_generation = advance.generation;
+        .invalidate(
+            causes,
+            &mut self.shape_generation,
+            &mut self.quad_generation,
+        );
+        for cause in causes.causes() {
+            self.record_render_invalidation(cause);
+        }
+        metrics::counter!("gui.render.cache_rebuild", "scope" => rebuild.label()).increment(1);
     }
 
     pub fn resize(
@@ -255,7 +460,12 @@ impl super::TermWindow {
                 // only entries that survive a `shape_generation` bump are those
                 // that saw an *atlas* rebuild — for which re-resolving sprites
                 // (without re-shaping) is correct.
-                self.advance_shaping_input_generation();
+                let cause = if prior_dpi != dimensions.dpi {
+                    RenderInvalidationCause::DisplayDpi
+                } else {
+                    RenderInvalidationCause::FontMetrics
+                };
+                self.invalidate_render_caches(cause);
                 // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
                 // the NEW CellMetricKey so the first paint after a scale change
                 // finds them already in the atlas instead of synchronously
@@ -324,7 +534,10 @@ impl super::TermWindow {
         );
         let saved_dims = self.dimensions;
         self.dimensions = *dimensions;
-        self.advance_quad_generation();
+        self.invalidate_render_caches(
+            RenderInvalidationSet::from(RenderInvalidationCause::SurfaceSize)
+                .with(RenderInvalidationCause::Projection),
+        );
         self.mark_all_panes_dirty_with_source(
             frankenterm_core::dirty_line_telemetry::DirtyEventSource::Resize,
         );
@@ -497,6 +710,9 @@ impl super::TermWindow {
         self.terminal_size = size;
 
         if grid_size_changed {
+            // The same transition already retired coordinate-dependent quads
+            // above; record the additional cause without invalidating twice.
+            self.record_render_invalidation(RenderInvalidationCause::TerminalGrid);
             if let Some(mux) = Mux::try_get() {
                 if let Some(window) = mux.get_window(self.mux_window_id) {
                     for tab in window.iter() {
@@ -778,14 +994,446 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_generation_keyed_line_shape_cache,
-        next_cache_generation,
+        CacheRebuild, RenderCaches, RenderInvalidationCause as Cause, RenderInvalidationSet,
+        clear_generation_keyed_line_shape_cache, next_cache_generation,
     };
-    use crate::termwindow::render::{LineToEleShapeCacheKey, LineToElementShapeItem};
-    use config::ConfigHandle;
+    use crate::glyphcache::GlyphCache;
+    use crate::quad::HeapQuadAllocator;
+    use crate::shapecache::{CachedShape, ShapeCacheKey, ShapedInfo};
+    use crate::termwindow::render::{
+        LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShape,
+        LineToElementShapeItem, resolve_fg_color_attr,
+    };
+    use crate::utilsprites::RenderMetrics;
+    use config::{ConfigHandle, TextStyle};
+    use frankenterm_font::FontConfiguration;
     use lfucache::LfuCache;
-    use std::cell::RefCell;
+    use ordered_float::NotNan;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+    use wezterm_term::color::ColorPalette;
+    use wezterm_term::{CellAttributes, Line};
+    use window::bitmaps::{BitmapImage, Image, TextureRect};
+
+    struct CacheFixture {
+        shapes: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
+        lines: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
+        quads: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
+        shape_generation: usize,
+        quad_generation: usize,
+    }
+
+    impl CacheFixture {
+        fn new(shape_generation: usize, quad_generation: usize) -> Self {
+            let config = ConfigHandle::default_config();
+            Self {
+                shapes: RefCell::new(LfuCache::new(
+                    "test.shapes.hit",
+                    "test.shapes.miss",
+                    |config| config.shape_cache_size,
+                    &config,
+                )),
+                lines: RefCell::new(LfuCache::new(
+                    "test.lines.hit",
+                    "test.lines.miss",
+                    |config| config.line_to_ele_shape_cache_size,
+                    &config,
+                )),
+                quads: RefCell::new(LfuCache::new(
+                    "test.quads.hit",
+                    "test.quads.miss",
+                    |config| config.line_quad_cache_size,
+                    &config,
+                )),
+                shape_generation,
+                quad_generation,
+            }
+        }
+
+        fn invalidate(&mut self, causes: impl Into<RenderInvalidationSet>) -> CacheRebuild {
+            RenderCaches {
+                shapes: &self.shapes,
+                lines: &self.lines,
+                quads: &self.quads,
+            }
+            .invalidate(
+                causes.into(),
+                &mut self.shape_generation,
+                &mut self.quad_generation,
+            )
+        }
+
+        fn seed(&self) {
+            self.shapes.borrow_mut().put(
+                shape_key(),
+                Ok(Rc::new(CachedShape {
+                    infos: Vec::new(),
+                    glyphs: RefCell::new(Rc::new(Vec::new())),
+                    generation: Cell::new(self.shape_generation),
+                })),
+            );
+            self.lines.borrow_mut().put(
+                line_shape_key(self.shape_generation, 0),
+                empty_line_shape_item(),
+            );
+            self.quads.borrow_mut().put(
+                quad_key(self.shape_generation, self.quad_generation),
+                LineQuadCacheValue {
+                    expires: None,
+                    layers: HeapQuadAllocator::default(),
+                    current_highlight: None,
+                    invalidate_on_hover_change: false,
+                },
+            );
+        }
+
+        fn survivors(&self) -> (bool, bool, bool) {
+            (
+                !self.shapes.borrow().is_empty(),
+                !self.lines.borrow().is_empty(),
+                !self.quads.borrow().is_empty(),
+            )
+        }
+    }
+
+    fn shape_key() -> ShapeCacheKey {
+        ShapeCacheKey {
+            style: TextStyle::default(),
+            text: "AVfi".to_string(),
+        }
+    }
+
+    fn quad_key(shape_generation: usize, quad_generation: usize) -> LineQuadCacheKey {
+        LineQuadCacheKey {
+            config_generation: 0,
+            shape_generation,
+            quad_generation,
+            composing: None,
+            selection: 0..0,
+            shape_hash: [0; 16],
+            top_pixel_y: NotNan::new(0.0).unwrap(),
+            left_pixel_x: NotNan::new(0.0).unwrap(),
+            phys_line_idx: 0,
+            pane_id: 1,
+            pane_is_active: true,
+            cursor: None,
+            reverse_video: false,
+            password_input: false,
+        }
+    }
+
+    #[test]
+    fn invalidation_bundles_preserve_exact_production_cache_survival_sets() {
+        // Independent expected survival table: HarfBuzz/sprites, colored line
+        // elements, coordinate-dependent quads. No simulated renderer is used.
+        let cases = [
+            (Cause::Content, (true, true, true)),
+            (Cause::TerminalGrid, (true, true, false)),
+            (Cause::FontMetrics, (false, false, false)),
+            (Cause::Palette, (true, false, false)),
+            (Cause::Overlay, (true, true, true)),
+            (Cause::Cursor, (true, true, true)),
+            (Cause::Selection, (true, true, true)),
+            (Cause::Ime, (true, true, true)),
+            (Cause::Image, (true, true, true)),
+            (Cause::SurfaceSize, (true, true, false)),
+            (Cause::Projection, (true, true, false)),
+            (Cause::DisplayDpi, (false, false, false)),
+            (Cause::AtlasResource, (true, false, false)),
+            (Cause::FallbackFont, (false, false, false)),
+            (Cause::Focus, (true, true, false)),
+            (Cause::Viewport, (true, true, true)),
+            (Cause::UnknownFull, (false, false, false)),
+        ];
+        assert_eq!(cases.len(), Cause::ALL.len());
+        for (first, left) in cases {
+            for (second, right) in cases {
+                let causes = RenderInvalidationSet::from(first).with(second).with(first);
+                assert_eq!(causes, RenderInvalidationSet::from(second).with(first));
+                let mut fixture = CacheFixture::new(41, 29);
+                fixture.seed();
+                fixture.invalidate(causes);
+                assert_eq!(
+                    fixture.survivors(),
+                    (left.0 && right.0, left.1 && right.1, left.2 && right.2),
+                    "coalesced {first:?} + {second:?}"
+                );
+                // A bundle advances each authority at most once.
+                assert!(fixture.shape_generation == 41 || fixture.shape_generation == 42);
+                assert!(fixture.quad_generation == 29 || fixture.quad_generation == 30);
+                let mut sequential = CacheFixture::new(41, 29);
+                sequential.seed();
+                sequential.invalidate(first);
+                sequential.invalidate(second);
+                assert_eq!(fixture.survivors(), sequential.survivors());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_and_recycled_authority_retire_all_stale_zero_generation_entries() {
+        for cause in Cause::ALL {
+            let expected = match cause {
+                Cause::Palette | Cause::FallbackFont => cause,
+                _ => Cause::UnknownFull,
+            };
+            assert_eq!(cause.for_shape_notification(), expected);
+        }
+        for causes in [
+            RenderInvalidationSet(0),
+            RenderInvalidationSet(1 << 31),
+            RenderInvalidationSet::from(Cause::Palette).with(Cause::UnknownFull),
+        ] {
+            let mut fixture = CacheFixture::new(0, 0);
+            fixture.seed();
+            assert_eq!(fixture.invalidate(causes), CacheRebuild::ShapingInputs);
+            assert_eq!(fixture.survivors(), (false, false, false));
+        }
+        for (shape_generation, quad_generation, cause) in [
+            (usize::MAX, 9, Cause::AtlasResource),
+            (7, usize::MAX, Cause::Palette),
+            (7, usize::MAX, Cause::SurfaceSize),
+        ] {
+            let mut fixture = CacheFixture::new(0, 0);
+            fixture.seed();
+            // Plant live entries from the old zero epoch before recycling.
+            fixture.shape_generation = shape_generation;
+            fixture.quad_generation = quad_generation;
+            assert_eq!(fixture.invalidate(cause), CacheRebuild::ShapingInputs);
+            assert_eq!((fixture.shape_generation, fixture.quad_generation), (0, 0));
+            assert!(fixture.shapes.borrow_mut().get(&shape_key()).is_none());
+            assert!(
+                fixture
+                    .lines
+                    .borrow_mut()
+                    .get(&line_shape_key(0, 0))
+                    .is_none()
+            );
+            assert!(fixture.quads.borrow_mut().get(&quad_key(0, 0)).is_none());
+        }
+    }
+
+    fn rasterized_shape(
+        fonts: &Rc<FontConfiguration>,
+        metrics: &RenderMetrics,
+        generation: usize,
+    ) -> Rc<CachedShape> {
+        let style = TextStyle::default();
+        let font = fonts.resolve_font(&style).unwrap();
+        let infos = font
+            .blocking_shape(
+                "AVfi",
+                None,
+                wezterm_bidi::Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!infos.is_empty());
+        assert!(
+            infos
+                .iter()
+                .all(|info| info.glyph_pos != 0 && !info.is_space)
+        );
+        let mut glyph_cache = GlyphCache::new_in_memory(fonts, 512).unwrap();
+        let glyphs: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                glyph_cache
+                    .cached_glyph(
+                        info,
+                        &style,
+                        infos.get(index + 1).is_some_and(|next| next.is_space),
+                        &font,
+                        metrics,
+                        info.num_cells,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        Rc::new(CachedShape {
+            glyphs: RefCell::new(Rc::new(ShapedInfo::process(&infos, &glyphs))),
+            infos,
+            generation: Cell::new(generation),
+        })
+    }
+
+    fn colored_line(shape: &Rc<CachedShape>, palette: &ColorPalette) -> LineToElementShapeItem {
+        let attrs = CellAttributes::default();
+        let config = ConfigHandle::default_config();
+        let style = TextStyle::default();
+        let fg = resolve_fg_color_attr(&attrs, attrs.foreground(), palette, &config, &style);
+        let cluster = Line::from_text("AVfi", attrs, 0, None)
+            .cluster(None)
+            .remove(0);
+        LineToElementShapeItem {
+            expires: None,
+            shaped: Rc::new(vec![LineToElementShape {
+                underline_tex_rect: TextureRect::zero(),
+                fg_color: fg,
+                bg_color: palette.resolve_bg(cluster.attrs.background()).to_linear(),
+                underline_color: fg,
+                x_pos: 0.0,
+                pixel_width: shape
+                    .glyphs
+                    .borrow()
+                    .iter()
+                    .map(|glyph| glyph.glyph.x_advance.get() as f32)
+                    .sum(),
+                glyph_info: Rc::clone(&shape.glyphs.borrow()),
+                cluster,
+            }]),
+            current_highlight: None,
+            invalidate_on_hover_change: false,
+        }
+    }
+
+    // Exact CPU subroutine witness: production resolved colors, shaped glyph
+    // metrics and sprite-local raster bytes. This is not a GPU/present oracle.
+    fn line_witness(line: &LineToElementShapeItem) -> (Vec<u64>, Vec<Vec<u8>>) {
+        let mut metrics = Vec::new();
+        let mut pixels = Vec::new();
+        for element in line.shaped.iter() {
+            for color in [element.fg_color, element.bg_color, element.underline_color] {
+                let (r, g, b, a) = color.tuple();
+                metrics.extend([r, g, b, a].map(|value| u64::from(value.to_bits())));
+            }
+            for info in element.glyph_info.iter() {
+                assert_ne!(info.pos.glyph_idx, 0);
+                metrics.extend([
+                    u64::from(info.pos.glyph_idx),
+                    u64::from(info.pos.num_cells),
+                    info.glyph.x_advance.get().to_bits(),
+                    info.glyph.x_offset.get().to_bits(),
+                    info.glyph.y_offset.get().to_bits(),
+                    info.glyph.bearing_x.get().to_bits(),
+                    info.glyph.bearing_y.get().to_bits(),
+                    info.glyph.scale.to_bits(),
+                ]);
+                let sprite = info
+                    .glyph
+                    .texture
+                    .as_ref()
+                    .expect("non-space fixture glyph bitmap");
+                let mut image = Image::new(
+                    sprite.coords.size.width as usize,
+                    sprite.coords.size.height as usize,
+                );
+                sprite.texture.read(sprite.coords, &mut image).unwrap();
+                let bitmap = image.pixel_data_slice().to_vec();
+                assert!(bitmap.chunks_exact(4).any(|pixel| pixel[3] != 0));
+                pixels.push(bitmap);
+            }
+        }
+        (metrics, pixels)
+    }
+
+    #[test]
+    fn palette_retains_real_glyphs_rebuilds_colors_and_rejects_stale_line_plant() {
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        assert_eq!(
+            fonts.config().font_locator,
+            config::FontLocatorSelection::ConfigDirsOnly
+        );
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let shape = rasterized_shape(&fonts, &metrics, 41);
+        let reference = rasterized_shape(&fonts, &metrics, 41);
+        let old_palette = ColorPalette::default();
+        let mut new_palette = old_palette.clone();
+        new_palette.foreground = (0x12, 0xe4, 0x76).into();
+        new_palette.background = (0x31, 0x14, 0x88).into();
+        let expected = line_witness(&colored_line(&reference, &new_palette));
+        let old = line_witness(&colored_line(&shape, &old_palette));
+        assert_ne!(
+            old.0, expected.0,
+            "negative control must actually change colors"
+        );
+        assert_eq!(old.1, expected.1, "palette-independent raster bytes");
+
+        let mut fixture = CacheFixture::new(41, 29);
+        fixture.seed();
+        fixture
+            .shapes
+            .borrow_mut()
+            .put(shape_key(), Ok(Rc::clone(&shape)));
+        fixture
+            .lines
+            .borrow_mut()
+            .put(line_shape_key(41, 0), colored_line(&shape, &old_palette));
+        assert_eq!(
+            fixture.invalidate(Cause::Palette),
+            CacheRebuild::ColoredLines
+        );
+        assert_eq!(
+            (fixture.shape_generation, fixture.quad_generation),
+            (41, 30)
+        );
+        assert_eq!(fixture.survivors(), (true, false, false));
+        let cached = Rc::clone(
+            fixture
+                .shapes
+                .borrow_mut()
+                .get(&shape_key())
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+        );
+        assert!(Rc::ptr_eq(&cached, &shape), "no HarfBuzz cache rebuild");
+        assert_eq!(cached.generation.get(), fixture.shape_generation);
+        assert!(
+            Rc::ptr_eq(&cached.glyphs.borrow(), &shape.glyphs.borrow()),
+            "no sprite re-resolution"
+        );
+        let rebuilt = colored_line(&cached, &new_palette);
+        assert_eq!(line_witness(&rebuilt), expected);
+        fixture
+            .lines
+            .borrow_mut()
+            .put(line_shape_key(41, 0), rebuilt);
+        assert_eq!(
+            line_witness(
+                fixture
+                    .lines
+                    .borrow_mut()
+                    .get(&line_shape_key(41, 0))
+                    .unwrap()
+            ),
+            expected
+        );
+
+        // Reintroducing a formerly valid color-bearing entry under the current
+        // key must fail the unchanged positive oracle, even though its glyphs
+        // are exactly the same. This catches an omitted colored-line clear.
+        fixture
+            .lines
+            .borrow_mut()
+            .put(line_shape_key(41, 0), colored_line(&shape, &old_palette));
+        assert_ne!(
+            line_witness(
+                fixture
+                    .lines
+                    .borrow_mut()
+                    .get(&line_shape_key(41, 0))
+                    .unwrap()
+            ),
+            expected
+        );
+
+        assert_eq!(
+            fixture.invalidate(Cause::FallbackFont),
+            CacheRebuild::ShapingInputs
+        );
+        assert_eq!(fixture.survivors(), (false, false, false));
+        assert_eq!(fixture.shape_generation, 42);
+        let reshaped = rasterized_shape(&fonts, &metrics, fixture.shape_generation);
+        assert!(!Rc::ptr_eq(&reshaped, &shape));
+        assert_eq!(
+            line_witness(&colored_line(&reshaped, &new_palette)),
+            expected
+        );
+    }
 
     fn line_shape_key(shape_generation: usize, index: usize) -> LineToEleShapeCacheKey {
         LineToEleShapeCacheKey {
@@ -893,9 +1541,10 @@ mod tests {
         let old_generation = 41;
 
         for index in 0..capacity {
-            cache
-                .borrow_mut()
-                .put(line_shape_key(old_generation, index), empty_line_shape_item());
+            cache.borrow_mut().put(
+                line_shape_key(old_generation, index),
+                empty_line_shape_item(),
+            );
         }
         // Make every stale entry hot. Without a generation-boundary clear,
         // these unreachable entries would beat fresh frequency-zero entries
@@ -916,9 +1565,10 @@ mod tests {
 
         let new_generation = next_cache_generation(old_generation).generation;
         for index in 0..capacity {
-            cache
-                .borrow_mut()
-                .put(line_shape_key(new_generation, index), empty_line_shape_item());
+            cache.borrow_mut().put(
+                line_shape_key(new_generation, index),
+                empty_line_shape_item(),
+            );
         }
         assert_eq!(cache.borrow().len(), capacity);
         for index in 0..capacity {

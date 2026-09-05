@@ -360,9 +360,7 @@ impl<'a> BitmapImage for DecodedImageHandle<'a> {
                 data,
             } => match &**data {
                 ImageDataType::Rgba8 { data, .. } => data.as_ptr(),
-                ImageDataType::AnimRgba8 { frames, .. } => {
-                    frames[current_frame.get()].as_ptr()
-                }
+                ImageDataType::AnimRgba8 { frames, .. } => frames[current_frame.get()].as_ptr(),
                 ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
                     "ft-82pp1: DecodedImageHandle::pixel_data called with encoded variant; \
                      the cache should only hold decoded images"
@@ -488,18 +486,10 @@ static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLoc
 fn try_reserve_bounded_atomic(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
     let mut current = counter.load(Ordering::Acquire);
     loop {
-        let Some(next) = current
-            .checked_add(amount)
-            .filter(|next| *next <= limit)
-        else {
+        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -515,12 +505,7 @@ fn try_release_atomic(counter: &AtomicUsize, amount: usize) -> bool {
         let Some(next) = current.checked_sub(amount) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -755,43 +740,38 @@ impl FrameDecoder {
             .into_data();
         let mut frame_count = 0usize;
         let mut decoded_bytes = 0usize;
-        let mut send_frame = |
-            data: Vec<u8>,
-            hash: [u8; 32],
-            duration: Duration,
-            width: u32,
-            height: u32,
-        | {
-            if cancelled.load(Ordering::Acquire) {
-                anyhow::bail!("image frame decode was cancelled");
-            }
-            let expected_bytes = checked_decoded_frame_bytes(width as usize, height as usize)
-                .context("decoded-frame dimensions overflow")?;
-            if data.len() != expected_bytes {
-                anyhow::bail!(
-                    "decoded-frame byte length mismatch: expected {expected_bytes}, got {}",
-                    data.len()
-                );
-            }
-            decoded_bytes = decoded_bytes
-                .checked_add(data.len())
-                .context("decoded-frame byte total overflow")?;
-            frame_count = frame_count
-                .checked_add(1)
-                .context("decoded-frame count overflow")?;
-            let bytes = data.len();
-            let frame = DecodedFrame {
-                pixels: Arc::new(data),
-                hash,
-                duration,
-                width: width as usize,
-                height: height as usize,
+        let mut send_frame =
+            |data: Vec<u8>, hash: [u8; 32], duration: Duration, width: u32, height: u32| {
+                if cancelled.load(Ordering::Acquire) {
+                    anyhow::bail!("image frame decode was cancelled");
+                }
+                let expected_bytes = checked_decoded_frame_bytes(width as usize, height as usize)
+                    .context("decoded-frame dimensions overflow")?;
+                if data.len() != expected_bytes {
+                    anyhow::bail!(
+                        "decoded-frame byte length mismatch: expected {expected_bytes}, got {}",
+                        data.len()
+                    );
+                }
+                decoded_bytes = decoded_bytes
+                    .checked_add(data.len())
+                    .context("decoded-frame byte total overflow")?;
+                frame_count = frame_count
+                    .checked_add(1)
+                    .context("decoded-frame count overflow")?;
+                let bytes = data.len();
+                let frame = DecodedFrame {
+                    pixels: Arc::new(data),
+                    hash,
+                    duration,
+                    width: width as usize,
+                    height: height as usize,
+                };
+                let budget = queued_budget.split(bytes)?;
+                tx.send(QueuedDecodedFrame { frame, budget })
+                    .context("sending decoded frame")?;
+                Ok::<(), anyhow::Error>(())
             };
-            let budget = queued_budget.split(bytes)?;
-            tx.send(QueuedDecodedFrame { frame, budget })
-                .context("sending decoded frame")?;
-            Ok::<(), anyhow::Error>(())
-        };
 
         match decoded {
             ImageDataType::Rgba8 {
@@ -1172,11 +1152,7 @@ impl DecodedImage {
             expected_revision,
             trusted_decoded_image_authority_limits(),
         ) {
-            return Self::loaded_decoded(
-                image_data,
-                expected_revision,
-                summary.decoded_bytes,
-            );
+            return Self::loaded_decoded(image_data, expected_revision, summary.decoded_bytes);
         }
 
         let data = image_data
@@ -1189,11 +1165,9 @@ impl DecodedImage {
         };
         drop(data);
         match encoded_source_retained_bytes {
-            Some(source_retained_bytes) => Self::start_frame_decoder(
-                image_data,
-                expected_revision,
-                source_retained_bytes,
-            ),
+            Some(source_retained_bytes) => {
+                Self::start_frame_decoder(image_data, expected_revision, source_retained_bytes)
+            }
             None => Self::start_decoded_validator(image_data, expected_revision),
         }
     }
@@ -1373,11 +1347,7 @@ impl GlyphCache {
         });
     }
 
-    fn image_revision_is_rejected(
-        &self,
-        key: &ImageCacheKey,
-        image: &Arc<ImageData>,
-    ) -> bool {
+    fn image_revision_is_rejected(&self, key: &ImageCacheKey, image: &Arc<ImageData>) -> bool {
         key.object == ImageObjectKey::of(image)
             && self
                 .image_revision_owners
@@ -1389,11 +1359,7 @@ impl GlyphCache {
                 })
     }
 
-    fn record_image_validation_rejection(
-        &mut self,
-        key: ImageCacheKey,
-        image: &Arc<ImageData>,
-    ) {
+    fn record_image_validation_rejection(&mut self, key: ImageCacheKey, image: &Arc<ImageData>) {
         let should_record = self
             .image_revision_owners
             .get_mut(&key.object)
@@ -1417,14 +1383,14 @@ impl GlyphCache {
             let Some(expired) = self.image_validation_rejection_order.pop_front() else {
                 break;
             };
-            let matches_expired = self
-                .image_revision_owners
-                .get(&expired.object)
-                .is_some_and(|owner| {
-                    owner.image.as_ptr() == expired.object.0
-                        && owner.revision == expired.revision
-                        && owner.validation_rejected
-                });
+            let matches_expired =
+                self.image_revision_owners
+                    .get(&expired.object)
+                    .is_some_and(|owner| {
+                        owner.image.as_ptr() == expired.object.0
+                            && owner.revision == expired.revision
+                            && owner.validation_rejected
+                    });
             if matches_expired {
                 if self.image_cache.contains_key(&expired) {
                     if let Some(owner) = self.image_revision_owners.get_mut(&expired.object) {
@@ -2355,9 +2321,8 @@ impl GlyphCache {
                     // its neighbor while we are rendering the entire terminal
                     // frame, so we want to avoid that.
                     // <https://github.com/wezterm/wezterm/issues/3260>
-                    let mut next_due = decoded_frame_start.checked_add(
-                        durations[*decoded_current_frame].max(min_frame_duration),
-                    );
+                    let mut next_due = decoded_frame_start
+                        .checked_add(durations[*decoded_current_frame].max(min_frame_duration));
                     if next_due.is_some_and(|due| now >= due) {
                         // Advance to next frame
                         *decoded_current_frame = *decoded_current_frame + 1;
@@ -2369,9 +2334,8 @@ impl GlyphCache {
                             }
                         }
                         *decoded_frame_start = now;
-                        next_due = decoded_frame_start.checked_add(
-                            durations[*decoded_current_frame].max(min_frame_duration),
-                        );
+                        next_due = decoded_frame_start
+                            .checked_add(durations[*decoded_current_frame].max(min_frame_duration));
                         handle.set_current_frame(*decoded_current_frame);
                     }
 
@@ -2484,8 +2448,8 @@ impl GlyphCache {
         // dropping frames. With a 1 ms delay, neighboring cells may also switch
         // frames while the terminal frame is being rendered.
         // <https://github.com/wezterm/wezterm/issues/3260>
-        let Some(mut next_due) = decoded_frame_start
-            .checked_add(frames.frame_duration().max(min_frame_duration))
+        let Some(mut next_due) =
+            decoded_frame_start.checked_add(frames.frame_duration().max(min_frame_duration))
         else {
             frames.load_state = LoadState::Failed;
             let sprite = Self::cached_blank_frame_sprite(
@@ -2525,8 +2489,8 @@ impl GlyphCache {
             // from a fresh timestamp after sprite lookup/allocation below; a
             // cold atlas allocation must not make the published retry stale.
             *decoded_frame_start = now;
-            let Some(updated_due) = decoded_frame_start
-                .checked_add(frames.frame_duration().max(min_frame_duration))
+            let Some(updated_due) =
+                decoded_frame_start.checked_add(frames.frame_duration().max(min_frame_duration))
             else {
                 frames.load_state = LoadState::Failed;
                 let sprite = Self::cached_blank_frame_sprite(
@@ -2561,11 +2525,7 @@ impl GlyphCache {
                 frames.load_state = LoadState::Failed;
                 return Ok((sprite, None, LoadState::Failed));
             };
-            return Ok((
-                sprite,
-                frames.next_frame_due(next_due),
-                LoadState::Loading,
-            ));
+            return Ok((sprite, frames.next_frame_due(next_due), LoadState::Loading));
         }
 
         let key = FrameSpriteKey {
@@ -2643,11 +2603,7 @@ impl GlyphCache {
             return Ok((sprite, None, LoadState::Failed));
         };
 
-        Ok((
-            sprite,
-            frames.next_frame_due(next_due),
-            frames.load_state,
-        ))
+        Ok((sprite, frames.next_frame_due(next_due), frames.load_state))
     }
 
     fn cached_blank_frame_sprite(
@@ -3816,7 +3772,13 @@ mod tests {
             cache.glyph_cache.insert(key.clone(), stale);
             let (corrupt, hit) = cache
                 .cached_glyph_for_subpixel_bin_with_status(
-                    &info, &style, false, &font, &metrics, 1, SubpixelBin::Quarter0,
+                    &info,
+                    &style,
+                    false,
+                    &font,
+                    &metrics,
+                    1,
+                    SubpixelBin::Quarter0,
                 )
                 .unwrap();
             assert!(hit);
@@ -4550,8 +4512,7 @@ mod tests {
         assert_eq!(state.retained_bytes(), 8);
 
         let source = Arc::new(ImageData::with_data(ImageDataType::EncodedLease(
-            wezterm_blob_leases::BlobManager::store(&[0xaa])
-                .expect("store encoded source lease"),
+            wezterm_blob_leases::BlobManager::store(&[0xaa]).expect("store encoded source lease"),
         )));
         let decoded = DecodedImage {
             frame_start: RefCell::new(Instant::now()),
@@ -4634,7 +4595,9 @@ mod tests {
         )
         .expect_err("a mutation after snapshot rendering invalidates the old revision");
         assert!(
-            error.downcast_ref::<DecodedImageRevisionMismatch>().is_some(),
+            error
+                .downcast_ref::<DecodedImageRevisionMismatch>()
+                .is_some(),
             "the post-render revision probe must fail closed"
         );
         assert!(!source.cached_content_revision_is(expected_revision));
@@ -4761,7 +4724,10 @@ mod tests {
         .expect("zero-duration root renders a nonblocking transparent placeholder");
         assert_eq!(first_state, LoadState::Loading);
         assert!(first_due.is_some());
-        assert!(cache.frame_cache.is_empty(), "root pixels were not uploaded");
+        assert!(
+            cache.frame_cache.is_empty(),
+            "root pixels were not uploaded"
+        );
         assert_eq!(cache.blank_frame_cache.len(), 1);
 
         let visible = decoder_test_frame(0x42, Duration::from_millis(20));
@@ -5072,10 +5038,7 @@ mod tests {
         assert!(validation.replacement.is_none());
         assert!(
             image
-                .validated_summary_for_content_revision(
-                    revision,
-                    decoded_image_validation_limits()
-                )
+                .validated_summary_for_content_revision(revision, decoded_image_validation_limits())
                 .is_none(),
             "the 64 MiB fallback validator must remain fail-closed"
         );
@@ -5196,10 +5159,7 @@ mod tests {
         let revision = image.current_content_hash();
         assert!(
             image
-                .validated_summary_for_content_revision(
-                    revision,
-                    decoded_image_validation_limits()
-                )
+                .validated_summary_for_content_revision(revision, decoded_image_validation_limits())
                 .is_none()
         );
 
@@ -5286,7 +5246,10 @@ mod tests {
 
         assert_eq!(state, LoadState::Loading);
         assert!(next_due.is_some(), "pending work must schedule a repaint");
-        assert!(cache.frame_cache.is_empty(), "source pixels were not uploaded");
+        assert!(
+            cache.frame_cache.is_empty(),
+            "source pixels were not uploaded"
+        );
         assert_eq!(cache.blank_frame_cache.len(), 1);
         drop(sender);
     }
@@ -5316,7 +5279,10 @@ mod tests {
         let first_retry = cache
             .cached_image(&image, None, AllowImage::Yes)
             .expect("unattested mutation enters bounded validation");
-        assert!(matches!(first_retry.2, LoadState::Loading | LoadState::Loaded));
+        assert!(matches!(
+            first_retry.2,
+            LoadState::Loading | LoadState::Loaded
+        ));
         let (_, _, settled_state) = if first_retry.2 == LoadState::Loading {
             wait_for_image_to_settle(&mut cache, &image)
         } else {
@@ -5400,8 +5366,7 @@ mod tests {
         old_cache
             .cached_image(&image, None, AllowImage::Yes)
             .expect("decoded image primes the old atlas cache");
-        let prior_registration_count =
-            old_cache.image_revision_owner_registrations_since_prune;
+        let prior_registration_count = old_cache.image_revision_owner_registrations_since_prune;
         assert!(old_cache.image_cache.contains_key(&old_key));
         assert_eq!(old_cache.image_cache_entry_bytes.get(&old_key), Some(&4));
         assert_eq!(old_cache.image_cache_retained_bytes, 4);
@@ -5413,10 +5378,7 @@ mod tests {
         assert!(old_cache.image_cache_entry_bytes.is_empty());
         assert_eq!(old_cache.image_cache_retained_bytes, 0);
         assert!(old_cache.image_revision_owners.is_empty());
-        assert_eq!(
-            old_cache.image_revision_owner_registrations_since_prune,
-            0
-        );
+        assert_eq!(old_cache.image_revision_owner_registrations_since_prune, 0);
         assert!(replacement_cache.image_cache.contains_key(&old_key));
         assert_eq!(
             replacement_cache.image_cache_entry_bytes.get(&old_key),
@@ -5527,7 +5489,11 @@ mod tests {
         assert_eq!(load_attempts, 2);
         assert!(!replacement_cache.image_cache.contains_key(&rejected_key));
         assert!(replacement_cache.image_cache.contains_key(&valid_key));
-        assert!(replacement_cache.image_validation_rejection_order.is_empty());
+        assert!(
+            replacement_cache
+                .image_validation_rejection_order
+                .is_empty()
+        );
         assert!(!replacement_cache.image_revision_is_rejected(&valid_key, &image));
     }
 

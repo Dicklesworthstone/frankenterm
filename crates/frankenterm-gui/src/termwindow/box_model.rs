@@ -618,7 +618,9 @@ impl super::TermWindow {
                     &s,
                     move || {
                         if let Some(window) = window.as_ref() {
-                            window.notify(TermWindowNotif::InvalidateShapeCache);
+                            window.notify(TermWindowNotif::InvalidateShapeCache(
+                                super::resize::RenderInvalidationCause::FallbackFont,
+                            ));
                         }
                     },
                     BlockKey::filter_out_synthetic,

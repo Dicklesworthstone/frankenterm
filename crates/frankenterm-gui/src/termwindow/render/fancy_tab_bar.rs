@@ -53,6 +53,9 @@ const PLUS_BUTTON: &[Poly] = &[
 
 impl crate::TermWindow {
     pub fn invalidate_fancy_tab_bar(&mut self) {
+        self.record_render_invalidation(
+            crate::termwindow::resize::RenderInvalidationCause::Overlay,
+        );
         self.fancy_tab_bar.take();
     }
 

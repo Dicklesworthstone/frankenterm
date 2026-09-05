@@ -200,8 +200,7 @@ fn image_padding_fits_cell(
     cell_width: isize,
     cell_height: isize,
 ) -> bool {
-    let (Ok(cell_width), Ok(cell_height)) =
-        (u64::try_from(cell_width), u64::try_from(cell_height))
+    let (Ok(cell_width), Ok(cell_height)) = (u64::try_from(cell_width), u64::try_from(cell_height))
     else {
         return false;
     };
@@ -983,7 +982,9 @@ impl crate::TermWindow {
                     shape_text,
                     move || {
                         if let Some(window) = window.as_ref() {
-                            window.notify(TermWindowNotif::InvalidateShapeCache);
+                            window.notify(TermWindowNotif::InvalidateShapeCache(
+                                super::resize::RenderInvalidationCause::FallbackFont,
+                            ));
                         }
                     },
                     BlockKey::filter_out_synthetic,
@@ -1056,7 +1057,7 @@ impl crate::TermWindow {
     }
 
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
-        self.advance_texture_atlas_shape_generation();
+        self.invalidate_render_caches(super::resize::RenderInvalidationCause::AtlasResource);
         // Do NOT clear `shape_cache` here: the cached HarfBuzz output is
         // atlas-invariant. The `shape_generation` bump makes each surviving
         // entry re-resolve its glyph sprites (cheap) on next access instead of
@@ -1091,9 +1092,9 @@ impl crate::TermWindow {
         let id = match id {
             Some(id) => id,
             None => {
-                let Some(id) = frankenterm_gui::take_monotonic_cache_id(
-                    &mut self.next_line_state_id,
-                ) else {
+                let Some(id) =
+                    frankenterm_gui::take_monotonic_cache_id(&mut self.next_line_state_id)
+                else {
                     // Cache identity can no longer advance. Compute directly
                     // instead of wrapping into a live entry's identity.
                     return line.compute_shape_hash();
@@ -1119,7 +1120,7 @@ impl crate::TermWindow {
     }
 }
 
-fn resolve_fg_color_attr(
+pub(super) fn resolve_fg_color_attr(
     attrs: &CellAttributes,
     fg: ColorAttribute,
     palette: &ColorPalette,
