@@ -5327,9 +5327,10 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
         let loop_cx = runtime_loop_cx();
+        // Register before returning the task handle. Events published after
+        // startup must not race the spawned task's first poll and disappear.
+        let mut subscriber = event_bus.subscribe();
         Some(spawn_runtime_task(&loop_cx, move |loop_cx| async move {
-            let mut subscriber = event_bus.subscribe();
-
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     break;
@@ -10152,6 +10153,11 @@ fn route_connector_signal_through_bridge(
     guard.route_signal(signal)
 }
 
+fn connector_diagnostic_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 fn process_connector_outbound_runtime_event(
     bridge: &mut ConnectorOutboundBridge,
     event: &Event,
@@ -10170,6 +10176,18 @@ fn process_connector_outbound_runtime_event(
                     "connector outbound event deduplicated"
                 );
             }
+            for blocked in &result.actions_blocked {
+                // Keep the full rule/denial envelope in bridge history;
+                // diagnostics expose only hashes and closed classification.
+                warn!(
+                    correlation_hash = %connector_diagnostic_hash(&result.correlation_id),
+                    rule_hash = %connector_diagnostic_hash(&blocked.rule_id),
+                    denial_hash = ?blocked.denial.as_ref().map(|denial| connector_diagnostic_hash(&denial.reason_code)),
+                    error_code = "connector_admission_denied",
+                    delivered = false,
+                    "connector outbound action denied before planning"
+                );
+            }
         }
         Err(_error) => {
             warn!(
@@ -10186,6 +10204,8 @@ fn process_connector_outbound_runtime_event(
         if let Err(error) = dispatch_connector_outbound_action(bridge, &action, now_ms) {
             warn!(
                 error_code = error.code(),
+                reason_code = error.reason_code(),
+                correlation_hash = %connector_diagnostic_hash(&action.correlation_id),
                 error_kind = "permanent",
                 delivered = false,
                 "connector outbound action was not dispatched"
@@ -10194,16 +10214,29 @@ fn process_connector_outbound_runtime_event(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 enum ConnectorOutboundDeliveryError {
+    #[error("connector admission denied")]
+    Denied,
+    #[error("connector placement failed: {reason_code}")]
+    RoutingFailed { reason_code: String },
     #[error("connector transport is unavailable; the action was not dispatched")]
     TransportUnavailable,
 }
 
 impl ConnectorOutboundDeliveryError {
-    const fn code(self) -> &'static str {
+    const fn code(&self) -> &'static str {
         match self {
+            Self::Denied => "connector_admission_denied",
+            Self::RoutingFailed { .. } => "connector_routing_failed",
             Self::TransportUnavailable => "connector_transport_unavailable",
+        }
+    }
+
+    fn reason_code(&self) -> &str {
+        match self {
+            Self::RoutingFailed { reason_code } => reason_code,
+            _ => self.code(),
         }
     }
 }
@@ -10213,10 +10246,23 @@ fn dispatch_connector_outbound_action(
     action: &ConnectorAction,
     now_ms: u64,
 ) -> std::result::Result<(), ConnectorOutboundDeliveryError> {
-    // The policy host/mesh APIs model admission and return an envelope; they
-    // do not execute a connector. Do not synthesize host health or count that
-    // envelope as delivery. Actual transport and receipts are ft-xxfwy.47.
-    let error = ConnectorOutboundDeliveryError::TransportUnavailable;
+    let mut request = crate::connector_host_runtime::ConnectorOperationRequest::new(
+        action.action_kind.to_string(),
+        action.correlation_id.clone(),
+        action.dispatch_capability(),
+    );
+    request.target = action.sandbox_target();
+    let error = match bridge.policy_engine().route_connector_operation_through_mesh(
+        &action.target_connector, request, now_ms,
+    ) {
+        Ok(_admission) => ConnectorOutboundDeliveryError::TransportUnavailable,
+        Err(crate::policy::ConnectorOperationDispatchError::Mesh { reason, .. }) => {
+            ConnectorOutboundDeliveryError::RoutingFailed { reason_code: reason }
+        }
+        Err(_) => ConnectorOutboundDeliveryError::Denied,
+    };
+    // Planning has no external effect. Authentic dispatch and completion
+    // receipts are ft-xxfwy.47; missing transport cannot recover by retrying.
     bridge.record_action_failure(action, error.code(), ConnectorErrorKind::Permanent, now_ms);
     // Missing implementation cannot recover by retrying this action. Permanent
     // classification records the refusal without feeding the retry/DLQ loop.
@@ -15000,6 +15046,150 @@ mod tests {
             1,
             "replaying the same event does not retry an unavailable transport"
         );
+    }
+
+    fn connector_outbound_model_fixture(scenario: &str, now_ms: u64) -> ConnectorOutboundBridge {
+        use crate::connector_host_runtime::{ConnectorCapability, ConnectorLifecyclePhase};
+        use crate::connector_mesh::{HostHealth, MeshHost, MeshZone};
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.add_rule(OutboundRoutingRule {
+            rule_id: "model-rule".to_string(),
+            source_filter: None,
+            event_type_prefix: Some("pattern.".to_string()),
+            min_severity: None,
+            target_connector: "model-connector".to_string(),
+            action_kind: crate::connector_outbound_bridge::ConnectorActionKind::Invoke,
+            enabled: true,
+            priority: 0,
+        });
+        let policy = bridge.policy_engine_mut();
+        if scenario == "policy_denied" {
+            policy.quarantine_registry_mut().trip_kill_switch(
+                crate::policy_quarantine::KillSwitchLevel::EmergencyHalt,
+                "model-operator", "model-deny", now_ms,
+            );
+        }
+        if scenario != "no_registered_hosts" {
+            // Explicit model metadata; never a real observed host or transport.
+            let config = policy.connector_host_runtime().config().clone();
+            let mut zone = MeshZone::new(config.sandbox.zone_id.clone(), "model");
+            zone.active = scenario != "no_active_zone";
+            policy.connector_mesh_mut().register_zone(zone).unwrap();
+            policy.connector_mesh_mut().register_host(MeshHost {
+                host_id: config.host_id,
+                zone_id: config.sandbox.zone_id,
+                health: HostHealth::Healthy,
+                capabilities: if scenario == "missing_capability" { vec![] } else { vec![ConnectorCapability::Invoke] },
+                active_connectors: usize::from(scenario == "capacity_exhausted"),
+                max_connectors: 1,
+                last_heartbeat_ms: if scenario == "heartbeat_not_current" { 0 } else { now_ms },
+                phase: if scenario == "no_runnable_hosts" { ConnectorLifecyclePhase::Stopped } else { ConnectorLifecyclePhase::Running },
+                metadata: std::collections::BTreeMap::new(),
+            }).unwrap();
+        }
+        bridge
+    }
+
+    fn connector_outbound_model_event() -> Event {
+        Event::PatternDetected {
+            pane_id: 7,
+            pane_uuid: None,
+            event_id: Some(123),
+            detection: Detection {
+                rule_id: "model.rule".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "model.trigger".to_string(),
+                severity: Severity::Warning,
+                confidence: 1.0,
+                extracted: serde_json::json!({}),
+                matched_text: "[redacted]".to_string(),
+                span: (0, 10),
+            },
+        }
+    }
+
+    #[test]
+    fn connector_outbound_delivery_classifies_model_admission_without_mutation() {
+        let action = ConnectorAction {
+            target_connector: "model-connector".to_string(),
+            action_kind: crate::connector_outbound_bridge::ConnectorActionKind::Invoke,
+            correlation_id: "model-correlation".to_string(),
+            params: serde_json::json!({}),
+            created_at_ms: 50_000,
+        };
+        for scenario in ["admitted", "policy_denied", "no_registered_hosts", "no_active_zone", "no_runnable_hosts", "missing_capability", "capacity_exhausted", "heartbeat_not_current"] {
+            let mut bridge = connector_outbound_model_fixture(scenario, 50_000);
+            let before_mesh = format!("{:?}", bridge.policy_engine().connector_mesh());
+            let before_host = bridge.policy_engine().connector_host_runtime().clone();
+            let error = dispatch_connector_outbound_action(&mut bridge, &action, 50_000).unwrap_err();
+            match scenario {
+                "admitted" => assert_eq!(error, ConnectorOutboundDeliveryError::TransportUnavailable),
+                "policy_denied" => assert_eq!(error, ConnectorOutboundDeliveryError::Denied),
+                reason => assert_eq!(error, ConnectorOutboundDeliveryError::RoutingFailed { reason_code: format!("routing failed: {reason}") }),
+            }
+            assert_eq!(format!("{:?}", bridge.policy_engine().connector_mesh()), before_mesh);
+            assert_eq!(bridge.policy_engine().connector_host_runtime(), &before_host);
+            assert_eq!(bridge.policy_engine().reliability_registry().total_dlq_depth(), 0);
+            assert_eq!(bridge.policy_engine().reliability_registry().get("model-connector").unwrap().telemetry_snapshot().operations_succeeded, 0);
+        }
+        let hash = connector_diagnostic_hash("private-model-correlation");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!hash.contains("private"));
+    }
+
+    #[test]
+    fn connector_outbound_subscriber_preserves_admission_and_never_delivers_model_events() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            for scenario in ["admitted", "policy_denied", "no_registered_hosts", "no_active_zone", "no_runnable_hosts", "missing_capability", "capacity_exhausted", "heartbeat_not_current"] {
+                let bus = Arc::new(EventBus::new(8));
+                let mut runtime = ObservationRuntime::new(
+                    RuntimeConfig::default(), storage.clone(), Arc::new(RwLock::new(PatternEngine::new())),
+                ).with_event_bus(Arc::clone(&bus));
+                let bridge = Arc::new(StdMutex::new(connector_outbound_model_fixture(scenario, epoch_ms_u64())));
+                runtime.connector_outbound_bridge = Some(Arc::clone(&bridge));
+                let before_mesh = format!("{:?}", bridge.lock().unwrap().policy_engine().connector_mesh());
+                let before_host = bridge.lock().unwrap().policy_engine().connector_host_runtime().clone();
+                let task = runtime.spawn_connector_outbound_task().unwrap();
+                assert_eq!(bus.subscriber_count(), 1, "subscriber must be registered before startup returns");
+                assert_eq!(bus.publish(connector_outbound_model_event()), 1);
+                assert_eq!(bus.publish(connector_outbound_model_event()), 1);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if bridge.lock().unwrap().telemetry().events_received == 2 { break; }
+                    assert!(Instant::now() < deadline, "subscriber stalled: {scenario}");
+                    sleep(Duration::from_millis(1)).await;
+                }
+                // Cross an actual subscriber timeout tick, then settle its
+                // owned task before checking that no retry appeared.
+                sleep(Duration::from_millis(CONNECTOR_OUTBOUND_BRIDGE_TICK_MS + 10)).await;
+                runtime.shutdown_flag.store(true, Ordering::SeqCst);
+                runtime_timeout(&runtime_loop_cx(), Duration::from_secs(5), task).await.unwrap().unwrap();
+                let guard = bridge.lock().unwrap();
+                assert_eq!(format!("{:?}", guard.policy_engine().connector_mesh()), before_mesh, "{scenario}");
+                assert_eq!(guard.policy_engine().connector_host_runtime(), &before_host, "{scenario}");
+                assert_eq!(guard.telemetry().events_deduplicated, 1);
+                assert_eq!(guard.pending_action_count(), 0);
+                assert_eq!(guard.policy_engine().reliability_registry().total_dlq_depth(), 0);
+                if scenario == "policy_denied" {
+                    assert_eq!(guard.telemetry().actions_dispatched, 0);
+                    assert_eq!(guard.telemetry().actions_blocked_policy, 1);
+                    let blocked = &guard.dispatch_history().front().unwrap().blocked[0];
+                    assert_eq!(blocked.rule_id, "model-rule");
+                    assert_eq!(blocked.denial.as_ref().unwrap().error_code, "connector.policy_denied");
+                    assert!(!blocked.policy_decision.as_ref().unwrap().is_allowed());
+                    assert!(guard.policy_engine().reliability_registry().get("model-connector").is_none());
+                } else {
+                    assert_eq!(guard.telemetry().actions_dispatched, 1);
+                    let feedback = guard.policy_engine().reliability_registry().get("model-connector").unwrap().telemetry_snapshot();
+                    assert_eq!(feedback.operations_succeeded, 0);
+                    assert_eq!(feedback.operations_failed, 1);
+                }
+            }
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]

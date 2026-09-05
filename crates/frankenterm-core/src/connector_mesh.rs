@@ -296,6 +296,7 @@ impl Default for ConnectorMeshConfig {
 // =============================================================================
 
 /// The connector mesh federation engine.
+#[derive(Debug)]
 pub struct ConnectorMesh {
     config: ConnectorMeshConfig,
     hosts: HashMap<String, MeshHost>,
@@ -448,23 +449,22 @@ impl ConnectorMesh {
 
     // ---- Routing ----
 
-    /// Route a connector to an appropriate host.
-    pub fn route(
-        &mut self,
+    /// Plan placement from the supplied observations without reserving capacity,
+    /// advancing round-robin, updating health, or recording a successful route.
+    /// A plan is not dispatch authority: dispatch must revalidate and reserve.
+    pub fn preview_route(
+        &self,
         request: &RoutingRequest,
         now_ms: u64,
     ) -> Result<RoutingDecision, ConnectorMeshError> {
-        self.telemetry.routing_requests = self.telemetry.routing_requests.saturating_add(1);
-        let strategy = request.strategy.unwrap_or(self.config.default_strategy);
-
-        let candidates = self.find_candidates(request);
-
-        if candidates.is_empty() {
-            self.telemetry.routing_failures = self.telemetry.routing_failures.saturating_add(1);
-            return Err(ConnectorMeshError::RoutingFailed {
-                reason: "no eligible hosts found".to_string(),
+        if request.connector_id.trim().is_empty() {
+            return Err(ConnectorMeshError::InvalidConfig {
+                reason: "connector_id must not be empty".to_string(),
             });
         }
+        let strategy = request.strategy.unwrap_or(self.config.default_strategy);
+
+        let candidates = self.find_candidates(request, now_ms)?;
 
         let selected = match strategy {
             RoutingStrategy::LeastLoaded => self.select_least_loaded(&candidates),
@@ -475,20 +475,39 @@ impl ConnectorMesh {
         };
 
         let Some(host_id) = selected else {
-            self.telemetry.routing_failures = self.telemetry.routing_failures.saturating_add(1);
             return Err(ConnectorMeshError::RoutingFailed {
-                reason: format!("strategy {} found no suitable host", strategy),
+                reason: "preferred_zone_unavailable".to_string(),
             });
         };
 
         let host = &self.hosts[&host_id];
-        let decision = RoutingDecision {
+        Ok(RoutingDecision {
             connector_id: request.connector_id.clone(),
-            host_id: host_id.clone(),
+            host_id,
             zone_id: host.zone_id.clone(),
             strategy_used: strategy,
             decided_at_ms: now_ms,
+        })
+    }
+
+    /// Route a connector and reserve one host slot. Unlike preview, this
+    /// advances allocation telemetry, history, and the round-robin cursor.
+    pub fn route(
+        &mut self,
+        request: &RoutingRequest,
+        now_ms: u64,
+    ) -> Result<RoutingDecision, ConnectorMeshError> {
+        self.telemetry.routing_requests = self.telemetry.routing_requests.saturating_add(1);
+        let decision = match self.preview_route(request, now_ms) {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.telemetry.routing_failures = self.telemetry.routing_failures.saturating_add(1);
+                return Err(error);
+            }
         };
+        if decision.strategy_used == RoutingStrategy::RoundRobin {
+            self.round_robin_counter = self.round_robin_counter.wrapping_add(1);
+        }
 
         self.routing_history.push_back(decision.clone());
         while self.routing_history.len() > self.config.max_routing_history {
@@ -496,7 +515,7 @@ impl ConnectorMesh {
         }
 
         // Increment host load
-        if let Some(h) = self.hosts.get_mut(&host_id) {
+        if let Some(h) = self.hosts.get_mut(&decision.host_id) {
             h.active_connectors = h.active_connectors.saturating_add(1);
         }
 
@@ -586,22 +605,46 @@ impl ConnectorMesh {
 
     // ---- Private routing helpers ----
 
-    fn find_candidates(&self, request: &RoutingRequest) -> Vec<String> {
-        let mut candidates: Vec<String> = self
-            .hosts
-            .values()
-            .filter(|h| {
-                h.can_accept()
-                    && self.zones.get(&h.zone_id).is_some_and(|zone| zone.active)
-                    && request
-                        .required_capabilities
-                        .iter()
-                        .all(|cap| h.supports(cap))
+    fn find_candidates(
+        &self,
+        request: &RoutingRequest,
+        now_ms: u64,
+    ) -> Result<Vec<String>, ConnectorMeshError> {
+        // Diagnose the first unsatisfied admission stage using finite reason
+        // codes. Do not mark stale observations unreachable as a planning side
+        // effect; the heartbeat owner alone updates observed host health.
+        let mut hosts: Vec<&MeshHost> = self.hosts.values().collect();
+        let require_candidates = |hosts: &[&MeshHost], reason: &str| {
+            if hosts.is_empty() {
+                Err(ConnectorMeshError::RoutingFailed {
+                    reason: reason.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        require_candidates(&hosts, "no_registered_hosts")?;
+        hosts.retain(|h| self.zones.get(&h.zone_id).is_some_and(|zone| zone.active));
+        require_candidates(&hosts, "no_active_zone")?;
+        hosts.retain(|h| {
+            h.health.accepts_work() && h.phase == ConnectorLifecyclePhase::Running
+        });
+        require_candidates(&hosts, "no_runnable_hosts")?;
+        hosts.retain(|h| request.required_capabilities.iter().all(|cap| h.supports(cap)));
+        require_candidates(&hosts, "missing_capability")?;
+        hosts.retain(|h| h.active_connectors < h.max_connectors);
+        require_candidates(&hosts, "capacity_exhausted")?;
+        hosts.retain(|h| {
+            now_ms.checked_sub(h.last_heartbeat_ms).is_some_and(|age| {
+                age <= self.config.heartbeat_timeout_ms
             })
+        });
+        require_candidates(&hosts, "heartbeat_not_current")?;
+        let mut candidates: Vec<String> = hosts.into_iter()
             .map(|h| h.host_id.clone())
             .collect();
         candidates.sort_unstable();
-        candidates
+        Ok(candidates)
     }
 
     fn select_least_loaded(&self, candidates: &[String]) -> Option<String> {
@@ -636,12 +679,11 @@ impl ConnectorMesh {
         self.select_least_loaded(candidates)
     }
 
-    fn select_round_robin(&mut self, candidates: &[String]) -> Option<String> {
+    fn select_round_robin(&self, candidates: &[String]) -> Option<String> {
         if candidates.is_empty() {
             return None;
         }
         let idx = self.round_robin_counter % candidates.len();
-        self.round_robin_counter = self.round_robin_counter.wrapping_add(1);
         Some(candidates[idx].clone())
     }
 }
@@ -875,6 +917,89 @@ mod tests {
     // ========================================================================
     // Routing
     // ========================================================================
+
+    #[test]
+    fn preview_is_read_only_and_allocation_advances_once() {
+        let mut mesh = default_mesh();
+        mesh.register_zone(make_zone("model-zone")).unwrap();
+        mesh.register_host(make_host("model-a", "model-zone")).unwrap();
+        mesh.register_host(make_host("model-b", "model-zone")).unwrap();
+        let request = RoutingRequest {
+            strategy: Some(RoutingStrategy::RoundRobin),
+            ..make_request("model-connector")
+        };
+        let before = format!("{mesh:?}");
+        let plan = mesh.preview_route(&request, 1000).unwrap();
+        assert_eq!(plan.host_id, "model-a");
+        for _ in 0..20 {
+            assert_eq!(mesh.preview_route(&request, 1000).unwrap(), plan);
+            assert_eq!(format!("{mesh:?}"), before);
+        }
+        assert_eq!(mesh.route(&request, 1000).unwrap(), plan);
+        assert_eq!(mesh.round_robin_counter, 1);
+        assert_eq!(mesh.get_host("model-a").unwrap().active_connectors, 1);
+        assert_eq!(mesh.telemetry.routing_successes, 1);
+        assert_eq!(mesh.routing_history.len(), 1);
+        let after_allocation = format!("{mesh:?}");
+        assert_eq!(mesh.preview_route(&request, 1001).unwrap().host_id, "model-b");
+        assert_eq!(format!("{mesh:?}"), after_allocation);
+    }
+
+    #[test]
+    fn preview_rejects_each_ineligible_model_without_mutating_observations() {
+        for reason in [
+            "no_registered_hosts",
+            "no_active_zone",
+            "no_runnable_hosts",
+            "missing_capability",
+            "capacity_exhausted",
+            "heartbeat_not_current",
+        ] {
+            let mut mesh = default_mesh();
+            let mut zone = make_zone("model-zone");
+            zone.active = reason != "no_active_zone";
+            mesh.register_zone(zone).unwrap();
+            if reason != "no_registered_hosts" {
+                let mut host = make_host("model-host", "model-zone");
+                match reason {
+                    "no_runnable_hosts" => host.phase = ConnectorLifecyclePhase::Stopped,
+                    "missing_capability" => host.capabilities.clear(),
+                    "capacity_exhausted" => host.active_connectors = host.max_connectors,
+                    "heartbeat_not_current" => host.last_heartbeat_ms = 0,
+                    _ => {}
+                }
+                mesh.register_host(host).unwrap();
+            }
+            let before = format!("{mesh:?}");
+            assert_eq!(
+                mesh.preview_route(&make_request("model-connector"), 30_001),
+                Err(ConnectorMeshError::RoutingFailed { reason: reason.to_string() }),
+                "{reason}"
+            );
+            assert_eq!(format!("{mesh:?}"), before, "{reason}");
+        }
+    }
+
+    #[test]
+    fn preview_heartbeat_boundary_and_future_observations_fail_closed() {
+        let mut mesh = default_mesh();
+        mesh.register_zone(make_zone("model-zone")).unwrap();
+        mesh.register_host(make_host("model-host", "model-zone")).unwrap();
+        let before = format!("{mesh:?}");
+        let request = make_request("model-connector");
+        assert!(mesh.preview_route(&request, 31_000).is_ok());
+        for now_ms in [999, 31_001, u64::MAX] {
+            assert_eq!(mesh.preview_route(&request, now_ms), Err(ConnectorMeshError::RoutingFailed {
+                reason: "heartbeat_not_current".to_string(),
+            }));
+        }
+        assert_eq!(format!("{mesh:?}"), before);
+        assert!(mesh.route(&request, 31_001).is_err());
+        assert_eq!(mesh.get_host("model-host").unwrap().health, HostHealth::Healthy);
+        assert_eq!(mesh.get_host("model-host").unwrap().active_connectors, 0);
+        assert_eq!(mesh.telemetry.routing_failures, 1);
+        assert_eq!(mesh.telemetry.routing_successes, 0);
+    }
 
     #[test]
     fn route_least_loaded() {

@@ -900,18 +900,13 @@ impl ConnectorHostRuntime {
         )
     }
 
-    /// Authorize a connector operation against sandbox zone and capability envelope.
-    pub fn authorize_operation(
-        &mut self,
-        now_ms: u64,
-        request: ConnectorOperationRequest,
-    ) -> Result<ConnectorOperationEnvelope, ConnectorHostRuntimeError> {
-        if self.state.phase() != ConnectorLifecyclePhase::Running {
-            return Err(ConnectorHostRuntimeError::HostNotRunnable {
-                phase: self.state.phase(),
-            });
-        }
-
+    /// Validate request identity and sandbox predicates without changing host
+    /// lifecycle, sequences, or decision history. This is admission only;
+    /// runnable phase and dispatch authority are separate requirements.
+    pub fn validate_operation_request(
+        &self,
+        request: &ConnectorOperationRequest,
+    ) -> Result<(), ConnectorHostRuntimeError> {
         if request.action.trim().is_empty() {
             return Err(ConnectorHostRuntimeError::InvalidConfig {
                 reason: "action must not be empty".to_string(),
@@ -935,6 +930,49 @@ impl ConnectorHostRuntime {
             .capability_envelope
             .allows_target(request.capability, request.target.as_deref());
 
+        if !capability_allowed || !target_allowed {
+            return Err(ConnectorHostRuntimeError::SandboxViolation {
+                zone_id: self.config.sandbox.zone_id.clone(),
+                capability: request.capability,
+                reason_code: if !capability_allowed {
+                    format!("sandbox.denied.capability.{}", request.capability)
+                } else {
+                    format!("sandbox.denied.target.{}", request.capability)
+                },
+            });
+        }
+        Ok(())
+    }
+
+    /// Authorize a connector operation against sandbox zone and capability envelope.
+    pub fn authorize_operation(
+        &mut self,
+        now_ms: u64,
+        request: ConnectorOperationRequest,
+    ) -> Result<ConnectorOperationEnvelope, ConnectorHostRuntimeError> {
+        if self.state.phase() != ConnectorLifecyclePhase::Running {
+            return Err(ConnectorHostRuntimeError::HostNotRunnable {
+                phase: self.state.phase(),
+            });
+        }
+        let denied_reason = match self.validate_operation_request(&request) {
+            Ok(()) => None,
+            Err(ConnectorHostRuntimeError::SandboxViolation { reason_code, .. }) => {
+                Some(reason_code)
+            }
+            Err(error) => return Err(error),
+        };
+        // Preflight both counters before recording an allowed decision. Failed
+        // envelope allocation must not leave a successful sandbox receipt.
+        let next_operation_seq = if denied_reason.is_none() {
+            self.operation_seq.checked_add(1).ok_or_else(|| {
+                ConnectorHostRuntimeError::InvalidConfig {
+                    reason: "operation sequence overflow".to_string(),
+                }
+            })?
+        } else {
+            self.operation_seq
+        };
         self.sandbox_decision_seq = self.sandbox_decision_seq.checked_add(1).ok_or_else(|| {
             ConnectorHostRuntimeError::InvalidConfig {
                 reason: "sandbox decision sequence overflow".to_string(),
@@ -945,12 +983,7 @@ impl ConnectorHostRuntime {
             self.config.host_id, self.sandbox_decision_seq
         );
 
-        if !capability_allowed || !target_allowed {
-            let reason_code = if !capability_allowed {
-                format!("sandbox.denied.capability.{}", request.capability)
-            } else {
-                format!("sandbox.denied.target.{}", request.capability)
-            };
+        if let Some(reason_code) = denied_reason {
             let decision = ConnectorSandboxDecision {
                 decision_id: decision_id.clone(),
                 at_ms: now_ms,
@@ -996,11 +1029,7 @@ impl ConnectorHostRuntime {
         };
         self.record_sandbox_decision(allowed_decision);
 
-        self.operation_seq = self.operation_seq.checked_add(1).ok_or_else(|| {
-            ConnectorHostRuntimeError::InvalidConfig {
-                reason: "operation sequence overflow".to_string(),
-            }
-        })?;
+        self.operation_seq = next_operation_seq;
         let operation_id = format!("{}-op-{:016x}", self.config.host_id, self.operation_seq);
 
         Ok(ConnectorOperationEnvelope {
@@ -1276,6 +1305,74 @@ mod tests {
         assert_eq!(op1.zone_id, "zone.default");
         assert_eq!(op1.capability, ConnectorCapability::Invoke);
         assert!(op1.decision_id < op2.decision_id);
+    }
+
+    #[test]
+    fn request_validation_is_read_only_and_shares_authorization_predicates() {
+        let mut config = ConnectorHostConfig::default();
+        config.sandbox.capability_envelope = ConnectorCapabilityEnvelope {
+            allowed_capabilities: vec![
+                ConnectorCapability::Invoke,
+                ConnectorCapability::FilesystemRead,
+                ConnectorCapability::FilesystemWrite,
+                ConnectorCapability::NetworkEgress,
+                ConnectorCapability::ProcessExec,
+            ],
+            filesystem_read_prefixes: vec!["/model/safe".to_string()],
+            filesystem_write_prefixes: vec!["/model/output".to_string()],
+            network_allow_hosts: vec!["model.example".to_string()],
+            allowed_exec_commands: vec!["model-command".to_string()],
+        };
+        let runtime = ConnectorHostRuntime::new(config).unwrap();
+        for (capability, target, allowed) in [
+            (ConnectorCapability::Invoke, None, true),
+            (ConnectorCapability::SecretBroker, None, false),
+            (ConnectorCapability::FilesystemRead, Some("/model/safe/input"), true),
+            (ConnectorCapability::FilesystemRead, Some("/model/safe/../secret"), false),
+            (ConnectorCapability::FilesystemWrite, Some("/model/output/file"), true),
+            (ConnectorCapability::FilesystemWrite, Some("/model/output-other/file"), false),
+            (ConnectorCapability::NetworkEgress, Some("model.example"), true),
+            (ConnectorCapability::NetworkEgress, Some("model.example.attacker"), false),
+            (ConnectorCapability::ProcessExec, Some("model-command"), true),
+            (ConnectorCapability::ProcessExec, Some("model-command --extra"), false),
+        ] {
+            let mut request = ConnectorOperationRequest::new("model.action", "model-correlation", capability);
+            request.target = target.map(str::to_string);
+            let before = runtime.clone();
+            let validation = runtime.validate_operation_request(&request);
+            assert_eq!(validation.is_ok(), allowed, "{capability:?} {target:?}");
+            assert_eq!(runtime, before);
+            let mut dispatch = runtime.clone();
+            dispatch.start(100).unwrap();
+            let authorized = dispatch.authorize_operation(101, request);
+            if allowed {
+                assert!(authorized.is_ok());
+                assert_eq!(dispatch.operation_seq, 1);
+            } else {
+                assert_eq!(authorized.unwrap_err(), validation.unwrap_err());
+                assert_eq!(dispatch.operation_seq, 0);
+            }
+        }
+        for (action, correlation) in [(" ", "model"), ("model.action", "\t")] {
+            let request = ConnectorOperationRequest::new(action, correlation, ConnectorCapability::Invoke);
+            assert!(matches!(runtime.validate_operation_request(&request), Err(ConnectorHostRuntimeError::InvalidConfig { .. })));
+        }
+        assert_eq!(runtime.state().phase(), ConnectorLifecyclePhase::Stopped);
+        assert!(runtime.sandbox_decision_history().is_empty());
+    }
+
+    #[test]
+    fn operation_sequence_exhaustion_preserves_host_and_sandbox_receipts() {
+        for (operation_seq, sandbox_decision_seq) in [(u64::MAX, 0), (0, u64::MAX)] {
+            let mut runtime = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
+            runtime.start(100).unwrap();
+            runtime.operation_seq = operation_seq;
+            runtime.sandbox_decision_seq = sandbox_decision_seq;
+            let before = runtime.clone();
+            let request = ConnectorOperationRequest::new("model.action", "model-correlation", ConnectorCapability::Invoke);
+            assert!(matches!(runtime.authorize_operation(101, request), Err(ConnectorHostRuntimeError::InvalidConfig { .. })));
+            assert_eq!(runtime, before);
+        }
     }
 
     #[test]

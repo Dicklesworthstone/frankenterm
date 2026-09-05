@@ -5933,7 +5933,7 @@ impl From<RobotKillSwitchLevelArg> for frankenterm_core::policy_quarantine::Kill
 enum RobotKillSwitchCommands {
     /// Show the persisted kill switch as every ft process will restore it
     Status,
-    /// Arm the kill switch at a tier (recorded in the policy audit chain)
+    /// Atomically arm the workspace kill switch at a tier
     Trip {
         /// Tier to arm
         #[arg(long, value_enum)]
@@ -58561,8 +58561,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             // construction. Contract:
                             // docs/robot-contracts/kill-switch.md.
                             use frankenterm_core::policy_kill_switch_state::{
-                                KILL_SWITCH_STATE_KEY, KillSwitchRestore,
-                                persist_kill_switch_state, restore_kill_switch_from_backend,
+                                KILL_SWITCH_STATE_KEY, KillSwitchRestore, KillSwitchTransition,
+                                restore_kill_switch_from_backend, transition_kill_switch_from_backend,
                             };
                             use frankenterm_core::policy_quarantine::KillSwitchLevel;
 
@@ -58639,44 +58639,38 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     "state_key": KILL_SWITCH_STATE_KEY,
                                 })
                             };
-                            let persist = |engine: &frankenterm_core::policy::PolicyEngine| {
-                                persist_kill_switch_state(
-                                    &backend,
-                                    engine.kill_switch_state(),
-                                    now_epoch_ms(),
-                                )
-                            };
-                            let save_failed = |engine: &frankenterm_core::policy::PolicyEngine,
-                                               action: &str,
-                                               err: frankenterm_core::policy_kill_switch_state::KillSwitchStateError| {
-                                RobotResponse::<serde_json::Value>::error_with_code(
-                                    err.code(),
-                                    format!(
-                                        "kill switch {action} applied in this process but not persisted: {}",
-                                        err.detail()
+                            let transition_response = |action: &str, transition: KillSwitchTransition<'_>| {
+                                match transition_kill_switch_from_backend(&backend, transition, now) {
+                                    Ok(receipt) => RobotResponse::<serde_json::Value>::success(
+                                        serde_json::json!({
+                                            "action": action,
+                                            "level": receipt.state.level,
+                                            "changed_at_ms": receipt.state.changed_at_ms,
+                                            "changed_by": receipt.state.changed_by,
+                                            "reason": receipt.state.reason,
+                                            "auto_disarm_at_ms": receipt.state.auto_disarm_at_ms,
+                                            "persisted": true,
+                                            "state_key": KILL_SWITCH_STATE_KEY,
+                                            "revision": receipt.revision,
+                                            "fenced_owner": receipt.fenced_owner,
+                                            "pre_admitted_remote_effects": receipt.pre_admitted_remote_effects,
+                                        }),
+                                        elapsed_ms(start),
                                     ),
-                                    Some(format!(
-                                        "Other ft processes still see the previous state; retry. Envelope: {}",
-                                        envelope(engine, action, false)
-                                    )),
-                                    elapsed_ms(start),
-                                )
+                                    Err(err) => RobotResponse::<serde_json::Value>::error_with_code(
+                                        err.code(),
+                                        format!("kill switch {action} not confirmed: {}", err.detail()),
+                                        Some("Inspect 'ft robot kill-switch status' before retrying. A pending fence does not acknowledge a transition or cancel previously admitted remote work.".to_string()),
+                                        elapsed_ms(start),
+                                    ),
+                                }
                             };
 
                             let response = match command {
                                 RobotKillSwitchCommands::Status => {
-                                    // A lapsed auto-disarm observed during
-                                    // restore is written back so every other
-                                    // process agrees with what this one saw.
-                                    let persisted = match &restore {
-                                        KillSwitchRestore::Restored {
-                                            auto_disarmed: true,
-                                            ..
-                                        } => persist(&engine).is_ok(),
-                                        KillSwitchRestore::Restored { .. } => true,
-                                        KillSwitchRestore::Absent
-                                        | KillSwitchRestore::FailedClosed { .. } => false,
-                                    };
+                                    // Status is read-only: writing an expired
+                                    // cached snapshot could erase a later trip.
+                                    let persisted = matches!(restore, KillSwitchRestore::Restored { auto_disarmed: false, .. });
                                     RobotResponse::<serde_json::Value>::success(
                                         envelope(&engine, "status", persisted),
                                         elapsed_ms(start),
@@ -58685,39 +58679,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 RobotKillSwitchCommands::Trip { level, reason, by } => {
                                     let by = by.unwrap_or_else(|| "operator".to_string());
                                     let level: KillSwitchLevel = level.into();
-                                    if !engine.trip_kill_switch(level, &by, &reason, now) {
-                                        let current = engine.kill_switch_state().level;
-                                        RobotResponse::<serde_json::Value>::error_with_code(
-                                            "robot.kill_switch.trip_rejected",
-                                            format!(
-                                                "kill switch is already at {current}; a trip must raise the tier ({level} does not)"
-                                            ),
-                                            Some(
-                                                "Use 'ft robot kill-switch reset' to disarm, then trip the wanted tier."
-                                                    .to_string(),
-                                            ),
-                                            elapsed_ms(start),
-                                        )
-                                    } else {
-                                        match persist(&engine) {
-                                            Ok(()) => RobotResponse::<serde_json::Value>::success(
-                                                envelope(&engine, "trip", true),
-                                                elapsed_ms(start),
-                                            ),
-                                            Err(err) => save_failed(&engine, "trip", err),
-                                        }
-                                    }
+                                    transition_response("trip", KillSwitchTransition::Trip { level, by: &by, reason: &reason })
                                 }
                                 RobotKillSwitchCommands::Reset { by } => {
                                     let by = by.unwrap_or_else(|| "operator".to_string());
-                                    engine.quarantine_registry_mut().reset_kill_switch(&by, now);
-                                    match persist(&engine) {
-                                        Ok(()) => RobotResponse::<serde_json::Value>::success(
-                                            envelope(&engine, "reset", true),
-                                            elapsed_ms(start),
-                                        ),
-                                        Err(err) => save_failed(&engine, "reset", err),
-                                    }
+                                    transition_response("reset", KillSwitchTransition::Reset { by: &by })
                                 }
                             };
                             print_robot_response(&response, format, stats)?;
@@ -58876,6 +58842,24 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         );
                                     print_robot_response(&response, format, stats)?;
                                     return Ok(());
+                                }
+                            };
+
+                            // Serialize the complete mutation (fresh switch and
+                            // lifecycle reads through durable state write) with
+                            // operator trips. Status remains read-only.
+                            let _connector_fence = if matches!(&action, ConnectorAction::Status { .. }) {
+                                None
+                            } else {
+                                match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(&layout.db_path) {
+                                    Ok(fence) => Some(fence),
+                                    Err(error) => {
+                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                            error.code(), error.detail(), None, elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
                                 }
                             };
 
@@ -122191,7 +122175,7 @@ printf x > "$MINISIGN_MARKER"
         use frankenterm_core::config::Config;
         use frankenterm_core::policy::{ActionKind, ActorKind, PaneCapabilities, PolicyInput};
         use frankenterm_core::policy_kill_switch_state::{
-            FAIL_CLOSED_ACTOR, KILL_SWITCH_STATE_KEY, persist_kill_switch_to_storage_with_cx,
+            FAIL_CLOSED_ACTOR, KILL_SWITCH_STATE_KEY, initialize_kill_switch_to_storage_with_cx,
         };
         use frankenterm_core::policy_quarantine::{KillSwitch, KillSwitchLevel};
 
@@ -122209,7 +122193,7 @@ printf x > "$MINISIGN_MARKER"
 
             let mut switch = KillSwitch::disarmed();
             switch.trip(KillSwitchLevel::HardStop, "operator", "test", 1);
-            persist_kill_switch_to_storage_with_cx(&cx, &storage, &switch)
+            initialize_kill_switch_to_storage_with_cx(&cx, &storage, &switch)
                 .await
                 .unwrap();
             let mut engine = build_watcher_policy_engine(&config, &storage).await;

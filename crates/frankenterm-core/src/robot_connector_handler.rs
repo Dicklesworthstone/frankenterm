@@ -1,7 +1,7 @@
 //! Handler for the `robot connector` family (ft-pohny).
 //!
 //! Wires [`PolicyEngine::run_connector_lifecycle_intent`] — the single gated
-//! production boundary for connector lifecycle administration (emergency
+//! production boundary for connector lifecycle administration (graduated
 //! kill-switch fail-closed, `op_counter` telemetry) — into a typed operator
 //! surface. Contract: `docs/robot-contracts/connector.md`.
 //!
@@ -251,7 +251,7 @@ impl RobotConnectorError {
     pub fn message(&self) -> String {
         match self {
             Self::KillSwitchActive => {
-                "connector lifecycle denied: emergency kill switch active".to_string()
+                "connector lifecycle denied: kill switch active".to_string()
             }
             Self::NotFound { connector_id } => {
                 format!("connector '{connector_id}' is not in managed state")
@@ -283,7 +283,7 @@ impl RobotConnectorError {
     pub fn hint(&self) -> Option<&'static str> {
         match self {
             Self::KillSwitchActive => {
-                Some("Clear the emergency kill switch before retrying lifecycle mutations.")
+                Some("An authorized operator must reset the kill switch before retrying lifecycle mutations.")
             }
             Self::NotFound { .. } => {
                 Some("Run 'ft robot connector status' to list managed connectors.")
@@ -400,7 +400,7 @@ pub fn handle_connector_action(
     }
 
     // ── kill switch: typed fail-closed front ─────────────────────────────
-    if kill_switch_emergency {
+    if engine.authorize_connector_lifecycle_kill_switch(&operation, &connector_id, now_ms).is_err() {
         return Err(RobotConnectorError::KillSwitchActive);
     }
 
@@ -715,6 +715,56 @@ mod tests {
             panic!("expected dry-run receipt");
         };
         assert!(data.kill_switch_emergency);
+    }
+
+    #[test]
+    fn graduated_stop_lifecycle_handler_blocks_without_state_or_counter_changes() {
+        for level in [KillSwitchLevel::HardStop, KillSwitchLevel::EmergencyHalt] {
+            let mut engine = PolicyEngine::permissive();
+            install(&mut engine, "slack");
+            engine.trip_kill_switch(level, "operator", "drill", 2000);
+            let before = encode_connector_state(&engine.lifecycle_manager().managed_connectors()).unwrap();
+            let count = engine.lifecycle_manager().op_counter();
+            let audit_before = engine.audit_chain().len();
+            for action in [
+                ConnectorAction::Install { manifest: Box::new(test_manifest("github")), dry_run: false },
+                ConnectorAction::Update { connector_id: "slack".into(), manifest: Box::new(test_manifest("slack")), dry_run: false },
+                ConnectorAction::Enable { connector_id: "slack".into(), dry_run: false },
+                ConnectorAction::Restart { connector_id: "slack".into(), dry_run: false },
+                ConnectorAction::Disable { connector_id: "slack".into(), reason: "unapproved recovery".into(), dry_run: false },
+            ] {
+                let error = handle_connector_action(&mut engine, action, 3000).expect_err("stopped lifecycle mutation");
+                assert_eq!(error.code(), "robot.connector.kill_switch_active");
+                assert_eq!(engine.lifecycle_manager().op_counter(), count);
+                assert_eq!(encode_connector_state(&engine.lifecycle_manager().managed_connectors()).unwrap(), before);
+            }
+            assert_eq!(engine.audit_chain().len(), audit_before + 5);
+            // The public lower-level production boundary must enforce the
+            // identical gate even when the typed robot front is not involved.
+            engine.run_connector_lifecycle_intent(LifecycleIntent::Enable { connector_id: "slack".into() }, 3000)
+                .expect_err("direct boundary must deny too");
+            assert_eq!(engine.lifecycle_manager().op_counter(), count);
+            engine.quarantine_registry_mut().reset_kill_switch("operator", 4000);
+            let recovered = handle_connector_action(&mut engine, ConnectorAction::Disable {
+                connector_id: "slack".into(), reason: "authorized recovery after reset".into(), dry_run: false,
+            }, 5000).expect("reset authorizes a fresh recovery action");
+            assert!(matches!(recovered, ConnectorActionOutcome::Mutated(ref result) if result.success && result.admin_state == "disabled"));
+            assert_eq!(engine.lifecycle_manager().op_counter(), count + 1);
+        }
+    }
+
+    #[test]
+    fn corrupt_persisted_switch_blocks_lifecycle_and_soft_stop_allows_admin_drain() {
+        let mut engine = PolicyEngine::permissive();
+        install(&mut engine, "slack");
+        let before = encode_connector_state(&engine.lifecycle_manager().managed_connectors()).unwrap();
+        crate::policy_kill_switch_state::apply_persisted_kill_switch(&mut engine, Ok(Some("{broken".into())), 2000);
+        assert!(matches!(handle_connector_action(&mut engine, ConnectorAction::Enable { connector_id: "slack".into(), dry_run: false }, 3000), Err(RobotConnectorError::KillSwitchActive)));
+        assert_eq!(encode_connector_state(&engine.lifecycle_manager().managed_connectors()).unwrap(), before);
+        engine.quarantine_registry_mut().reset_kill_switch("operator", 4000);
+        engine.trip_kill_switch(KillSwitchLevel::SoftStop, "operator", "drain", 4001);
+        let outcome = handle_connector_action(&mut engine, ConnectorAction::Disable { connector_id: "slack".into(), reason: "drain".into(), dry_run: false }, 5000).unwrap();
+        assert!(matches!(outcome, ConnectorActionOutcome::Mutated(ref result) if result.success && result.admin_state == "disabled"));
     }
 
     #[test]

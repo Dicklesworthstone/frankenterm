@@ -212,7 +212,7 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
                     "self.lifecycle_manager_mut().execute(intent, now_ms)",
                     "connector lifecycle intent executed via production boundary",
                     "pub fn route_connector_operation_through_mesh",
-                    ".route(&routing_request, now_ms)",
+                    ".preview_route(&routing_request, now_ms)",
                 ],
             ) && contains_all(
                 &runtime,
@@ -224,8 +224,8 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
             "fail_closed": contains_all(
                 &policy,
                 &[
-                    "kill_switch().is_emergency()",
-                    "connector lifecycle denied: emergency kill switch active",
+                    "authorize_connector_lifecycle_kill_switch",
+                    "kill_switch().allows_inflight()",
                     "ConnectorOperationDispatchError::Denied",
                     "ConnectorOperationDispatchError::from_mesh_error",
                     "ConnectorOperationDispatchError::from_host_runtime_error",
@@ -245,9 +245,9 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
                 &[
                     "connector lifecycle intent executed via production boundary",
                     "connector lifecycle intent failed at production boundary",
-                    "connector operation routed through production mesh boundary",
-                    "record_failure(crate::connector_mesh::MeshFailureEvent",
-                    ".release_connector(&routing_decision.host_id)",
+                    "Ok(ConnectorMeshOperationAdmission",
+                    ".validate_operation_request(&request)",
+                    ".preview_route(&routing_request, now_ms)",
                     "Err(err.to_string())",
                 ],
             ) && contains_all(
@@ -446,10 +446,10 @@ fn lifecycle_routes_through_policy_engine_boundary() -> TestResult {
         "the lifecycle boundary must drive the owned ConnectorLifecycleManager (ft-7h5da.5.11)"
     );
     assert!(
-        src.contains("kill_switch().is_emergency()")
-            && src.contains("connector lifecycle denied: emergency kill switch active"),
+        src.contains("self.authorize_connector_lifecycle_kill_switch(")
+            && src.contains("kill_switch().allows_inflight()"),
         "the lifecycle boundary must fail closed before mutating the manager when the \
-         emergency kill switch is active (ft-7h5da.5.11)"
+         hard-stop or emergency kill switch is active (ft-7h5da.5.11)"
     );
     assert!(
         src.contains("connector lifecycle intent executed via production boundary")
@@ -459,17 +459,18 @@ fn lifecycle_routes_through_policy_engine_boundary() -> TestResult {
     );
     assert!(
         src.contains("pub fn route_connector_operation_through_mesh")
-            && src.contains(".route(&routing_request, now_ms)")
+            && src.contains(".preview_route(&routing_request, now_ms)")
+            && src.contains("pub struct ConnectorMeshOperationAdmission")
             && src.contains("ConnectorOperationDispatchError::from_mesh_error")
             && src.contains("ConnectorOperationDispatchError::from_host_runtime_error"),
-        "policy.rs must expose a fail-closed mesh route boundary that drives ConnectorMesh and \
-         ConnectorHostRuntime for connector actions (ft-7h5da.5.11)"
+        "policy.rs must expose read-only placement and shared sandbox validation"
     );
     let runtime = core_src("runtime.rs")?;
     assert!(
         runtime.contains("ConnectorOutboundDeliveryError::TransportUnavailable")
             && runtime.contains("ConnectorErrorKind::Permanent")
-            && !runtime.contains(".route_connector_operation_through_mesh(")
+            && runtime.contains(".route_connector_operation_through_mesh(")
+            && runtime.contains("ConnectorOutboundDeliveryError::RoutingFailed")
             && !runtime.contains("record_action_success(action, now_ms)"),
         "runtime outbound delivery must fail closed; mesh admission is not transport execution"
     );
