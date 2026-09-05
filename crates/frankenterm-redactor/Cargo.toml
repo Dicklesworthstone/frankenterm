@@ -24,6 +24,6 @@ serde = { workspace = true, features = ["derive", "std", "alloc"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-hex.workspace = true
+hex = { workspace = true, features = ["alloc"] }
 proptest = "1.8.0"
 sha2.workspace = true

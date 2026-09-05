@@ -4632,10 +4632,12 @@ name = "frankenterm-redactor"
 version = "0.15.2"
 dependencies = [
  "aho-corasick",
+ "hex",
  "proptest",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
