@@ -77,9 +77,104 @@
     },
     "artifact_paths": {
       "$ref": "#/$defs/string_array"
+    },
+    "bead_work_selection": {
+      "$ref": "#/$defs/bead_work_selection"
     }
   },
   "$defs": {
+    "bead_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "bead_status": {
+      "enum": ["open", "in_progress", "blocked", "deferred", "closed"]
+    },
+    "bead_exclusion": {
+      "enum": ["closed", "deferred", "blocked_status", "active_ownership", "unfinished_dependency"]
+    },
+    "bead_ids": {
+      "type": "array",
+      "maxItems": 8192,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/bead_id"}
+    },
+    "bead_work_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "issue_type", "priority", "pagerank_billionths", "blocker_ids", "exclusions"],
+      "properties": {
+        "id": {"$ref": "#/$defs/bead_id"},
+        "status": {"$ref": "#/$defs/bead_status"},
+        "issue_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "priority": {"type": "integer", "minimum": 0, "maximum": 4},
+        "pagerank_billionths": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "blocker_ids": {"$ref": "#/$defs/bead_ids"},
+        "exclusions": {
+          "type": "array",
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/bead_exclusion"}
+        }
+      }
+    },
+    "bead_work_selection": {
+      "type": "object",
+      "description": "Advisory selection from every record in the exact supplied br JSONL export; file age and input hash do not establish current database state or ownership authority.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "input_format", "input_sha256", "source_bytes",
+        "snapshot_modified_at_ms", "evaluated_at_ms", "live_database_validated",
+        "node_count", "edge_count", "type_population", "status_population",
+        "exclusion_population", "selected_id", "ordered_ready_ids", "candidates",
+        "pagerank_iterations", "tie_break"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "input_format": {"const": "br-jsonl-v1"},
+        "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_bytes": {"type": "integer", "minimum": 0, "maximum": 67108864},
+        "snapshot_modified_at_ms": {"type": "integer", "minimum": 0},
+        "evaluated_at_ms": {"type": "integer", "minimum": 0},
+        "live_database_validated": {"const": false},
+        "node_count": {"type": "integer", "minimum": 0, "maximum": 8192},
+        "edge_count": {"type": "integer", "minimum": 0, "maximum": 65536},
+        "type_population": {
+          "type": "object",
+          "maxProperties": 8192,
+          "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.-]+$"},
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 8192}
+        },
+        "status_population": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/bead_status"},
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 8192}
+        },
+        "exclusion_population": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/bead_exclusion"},
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 8192}
+        },
+        "selected_id": {
+          "anyOf": [{"$ref": "#/$defs/bead_id"}, {"type": "null"}]
+        },
+        "ordered_ready_ids": {"$ref": "#/$defs/bead_ids"},
+        "candidates": {
+          "type": "array",
+          "maxItems": 8192,
+          "items": {"$ref": "#/$defs/bead_work_candidate"}
+        },
+        "pagerank_iterations": {"type": "integer", "minimum": 0, "maximum": 100},
+        "tie_break": {"const": "priority_ascending,pagerank_billionths_descending,id_ascending"}
+      }
+    },
     "string_array": {
       "type": "array",
       "items": {

@@ -21794,7 +21794,7 @@ mod tests {
         let token = initial["data"]["revision_token"].clone();
         let paused = parse_json_content(pause.call(&context, serde_json::json!({"mission_file": path, "reason": "owned-test-pause", "expected_token": token})).unwrap());
         assert_eq!(paused["ok"], true, "{paused}");
-        assert_eq!(paused["data"]["mutation"]["current"]["revision"], 1);
+        assert_eq!(paused["data"]["mutation"]["current"]["revision"], "1");
         let loaded = super::mcp_load_mission_from_path(&path).unwrap();
         assert_eq!(loaded.lifecycle_state, MissionLifecycleState::Paused);
         assert!(loaded.pause_resume_state.current_checkpoint.is_some());
@@ -21807,10 +21807,10 @@ mod tests {
 
         let resumed = parse_json_content(resume.call(&context, serde_json::json!({"mission_file": path, "expected_token": paused["data"]["mutation"]["current"]})).unwrap());
         assert_eq!(resumed["ok"], true, "{resumed}");
-        assert_eq!(resumed["data"]["mutation"]["current"]["revision"], 2);
+        assert_eq!(resumed["data"]["mutation"]["current"]["revision"], "2");
         let aborted = parse_json_content(abort.call(&context, serde_json::json!({"mission_file": path, "reason": "owned-test-abort", "expected_token": resumed["data"]["mutation"]["current"]})).unwrap());
         assert_eq!(aborted["ok"], true, "{aborted}");
-        assert_eq!(aborted["data"]["mutation"]["current"]["revision"], 3);
+        assert_eq!(aborted["data"]["mutation"]["current"]["revision"], "3");
         assert_eq!(
             aborted["data"]["mutation"]["owner_acknowledgement"],
             "unavailable_no_mission_driver"

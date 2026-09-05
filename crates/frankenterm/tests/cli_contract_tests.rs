@@ -3319,7 +3319,7 @@ fn contract_mission_cli_durable_lifecycle_and_stale_token_refusal() {
     );
     let run = call("run", Some(&initial), true);
     assert_eq!(run["data"]["lifecycle_state"], "running");
-    assert_eq!(run["data"]["mutation"]["current"]["revision"], 1);
+    assert_eq!(run["data"]["mutation"]["current"]["revision"], "1");
     let paused = call("pause", Some(&run["data"]["mutation"]["current"]), true);
     assert_eq!(paused["data"]["lifecycle_state"], "paused");
     let loaded: Mission = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -3327,7 +3327,7 @@ fn contract_mission_cli_durable_lifecycle_and_stale_token_refusal() {
     let resumed = call("resume", Some(&paused["data"]["mutation"]["current"]), true);
     assert_eq!(resumed["data"]["lifecycle_state"], "running");
     let aborted = call("abort", Some(&resumed["data"]["mutation"]["current"]), true);
-    assert_eq!(aborted["data"]["mutation"]["current"]["revision"], 4);
+    assert_eq!(aborted["data"]["mutation"]["current"]["revision"], "4");
     assert_eq!(
         aborted["data"]["mutation"]["owner_acknowledgement"],
         "unavailable_no_mission_driver"
@@ -3415,7 +3415,7 @@ fn contract_mission_cli_process_race_has_one_revision_winner() {
         (&resume, &abort)
     };
     assert_eq!(winner["data"]["mutation"]["previous"], token);
-    assert_eq!(winner["data"]["mutation"]["current"]["revision"], 1);
+    assert_eq!(winner["data"]["mutation"]["current"]["revision"], "1");
     assert!(matches!(
         loser["error_code"].as_str(),
         Some("mission.revision_conflict" | "mission.mutation_in_progress")
@@ -3423,7 +3423,7 @@ fn contract_mission_cli_process_race_has_one_revision_winner() {
     if abort["ok"] == false {
         let fresh_abort = call("abort", &winner["data"]["mutation"]["current"]);
         assert_eq!(fresh_abort["ok"], true);
-        assert_eq!(fresh_abort["data"]["mutation"]["current"]["revision"], 2);
+        assert_eq!(fresh_abort["data"]["mutation"]["current"]["revision"], "2");
     }
     let accepted = std::fs::read(&path).unwrap();
     let stale_resume = call("resume", &token);

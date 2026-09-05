@@ -224,6 +224,67 @@ fn top_step_field(surface_value: &Value, field: &str) -> String {
     string_field(first, &format!("/{field}"))
 }
 
+#[cfg(all(feature = "subprocess-bridge", unix))]
+#[test]
+fn mission_objective_graph_snapshot_real_reader_plan_and_schema_preserve_decision() {
+    use frankenterm_core::beads_bridge::read_bead_work_selection;
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("issues.jsonl");
+    let bytes = br#"{"id":"blocked","status":"blocked","priority":0,"issue_type":"bug"}
+{"id":"blocked-dependent","status":"open","priority":0,"issue_type":"test","dependencies":[{"issue_id":"blocked-dependent","depends_on_id":"blocked","type":"blocks"}]}
+{"id":"ready-docs","status":"open","priority":2,"issue_type":"docs","description":"private-body-schema-negative"}
+"#;
+    fs::write(&path, bytes).unwrap();
+    let hash = hex::encode(Sha256::digest(bytes));
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let selection = read_bead_work_selection(&path, &hash, 1, now_ms).unwrap();
+    assert_eq!(selection.selected_id(), Some("ready-docs"));
+    let input =
+        MissionObjectivePlannerInput::new(now_ms, "owned-snapshot-test", "choose eligible work")
+            .with_bead_work_selection(selection);
+    let plan = plan_mission_objective(&input);
+    assert_eq!(
+        plan.plan_steps[0].target_bead_id.as_deref(),
+        Some("ready-docs")
+    );
+    assert_eq!(plan.plan_status, MissionObjectivePlanStatus::Actionable);
+    assert!(!plan.side_effects_executed);
+    let value = serde_json::to_value(&plan).unwrap();
+    let validator = schema_validator();
+    assert_schema_accepts("owned-beads-snapshot", &validator, &value);
+    assert_eq!(value["bead_work_selection"]["input_sha256"], hash);
+    assert_eq!(
+        value["bead_work_selection"]["ordered_ready_ids"],
+        serde_json::json!(["ready-docs"])
+    );
+    assert_eq!(value["bead_work_selection"]["type_population"]["test"], 1);
+    assert_eq!(value["bead_work_selection"]["type_population"]["docs"], 1);
+    assert!(
+        !serde_json::to_string(&value)
+            .unwrap()
+            .contains("private-body-schema-negative")
+    );
+    let mut forged_live = value.clone();
+    forged_live["bead_work_selection"]["live_database_validated"] = true.into();
+    assert!(!validator.is_valid(&forged_live));
+    let mut forged_hash = value.clone();
+    forged_hash["bead_work_selection"]["input_sha256"] = "not-a-sha256".into();
+    assert!(!validator.is_valid(&forged_hash));
+    let mut leaked_body = value;
+    leaked_body["bead_work_selection"]["candidates"][0]["description"] =
+        "private-body-schema-negative".into();
+    assert!(!validator.is_valid(&leaked_body));
+    println!(
+        "MISSION_GRAPH_SCHEMA hash={hash} selected=ready-docs actual_file_reader=true blocked_high_score_excluded=true live_claim_hash_body_negatives_rejected=true"
+    );
+}
+
 #[test]
 fn mission_objective_capacity_admit_defer_matrix_is_deterministic() {
     #[derive(Debug)]
