@@ -422,6 +422,11 @@ pub struct MissionObjectivePlannerInput {
     pub source_snapshots: Vec<MissionObjectiveSourceSnapshot>,
     pub dirty_paths: Vec<MissionObjectiveDirtyPath>,
     pub candidates: Vec<MissionObjectiveCandidateWork>,
+    /// Only the validated byte parser can populate the product's graph input;
+    /// deserialized caller assertions never masquerade as a verified snapshot.
+    #[cfg(feature = "subprocess-bridge")]
+    #[serde(skip)]
+    bead_work_selection: Option<crate::beads_types::BeadWorkSelection>,
 }
 
 impl MissionObjectivePlannerInput {
@@ -439,6 +444,8 @@ impl MissionObjectivePlannerInput {
             source_snapshots: Vec::new(),
             dirty_paths: Vec::new(),
             candidates: Vec::new(),
+            #[cfg(feature = "subprocess-bridge")]
+            bead_work_selection: None,
         }
     }
 
@@ -463,6 +470,59 @@ impl MissionObjectivePlannerInput {
     #[must_use]
     pub fn with_candidate(mut self, candidate: MissionObjectiveCandidateWork) -> Self {
         self.candidates.push(candidate);
+        self
+    }
+
+    /// Use the highest ranked eligible snapshot task as this request's proposed
+    /// work. The ordinary planner still applies source, path, proof and capacity
+    /// restrictions. A snapshot recommendation does not claim or dispatch it.
+    #[cfg(feature = "subprocess-bridge")]
+    pub fn with_bead_work_selection(
+        mut self,
+        selection: crate::beads_types::BeadWorkSelection,
+    ) -> Self {
+        let prior_candidates = std::mem::take(&mut self.candidates);
+        if let Some(selected) = selection.selected_id.as_ref().and_then(|id| {
+            selection
+                .candidates
+                .iter()
+                .find(|candidate| &candidate.id == id)
+        }) {
+            let mut candidate = prior_candidates
+                .into_iter()
+                .find(|candidate| {
+                    candidate.candidate_id == selected.id
+                        || candidate.target_bead_id.as_deref() == Some(selected.id.as_str())
+                })
+                .unwrap_or_else(|| {
+                    MissionObjectiveCandidateWork::new(
+                        &selected.id,
+                        MissionObjectiveCandidateReadiness::ReadyBead,
+                    )
+                    .title(&selected.id)
+                });
+            candidate.dependency_ready &= selected.exclusions.is_empty();
+            self.candidates.push(
+                candidate
+                    .target_bead_id(&selected.id)
+                    .priority(selected.priority)
+                    .with_reason_code("beads.graph_snapshot.selected")
+                    .with_reason_code("beads.graph_snapshot.live_database_not_validated"),
+            );
+        }
+        self.source_snapshots.push(
+            MissionObjectiveSourceSnapshot::new(
+                format!("beads.graph.{}", selection.input_sha256),
+                MissionObjectiveSourceKind::Beads,
+            ).with_evidence(
+                MissionObjectiveEvidenceItem::new(
+                    MissionObjectiveEvidenceCategory::BeadsReadyQueue,
+                    format!("complete supplied snapshot: nodes={} edges={} ready={}; live database not queried",
+                        selection.node_count, selection.edge_count, selection.ordered_ready_ids.len()),
+                ).with_reason_code("beads.graph_snapshot.exact_bytes"),
+            ).with_reason_code("beads.graph_snapshot.live_database_not_validated"),
+        );
+        self.bead_work_selection = Some(selection);
         self
     }
 }
@@ -505,6 +565,8 @@ pub struct MissionObjectivePlan {
     pub plan_steps: Vec<MissionObjectivePlanStep>,
     pub fallback_steps: Vec<MissionObjectivePlanStep>,
     pub reason_codes: Vec<String>,
+    #[cfg(feature = "subprocess-bridge")]
+    pub bead_work_selection: Option<crate::beads_types::BeadWorkSelection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -563,6 +625,9 @@ struct MissionObjectivePlanArtifact {
     redaction_policy: MissionObjectiveRedactionPolicyArtifact,
     raw_pane_content_stored: bool,
     artifact_paths: Vec<String>,
+    #[cfg(feature = "subprocess-bridge")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bead_work_selection: Option<crate::beads_types::BeadWorkSelection>,
 }
 
 impl MissionObjectivePlanArtifact {
@@ -603,6 +668,8 @@ impl MissionObjectivePlanArtifact {
             redaction_policy: MissionObjectiveRedactionPolicyArtifact::default(),
             raw_pane_content_stored: false,
             artifact_paths: Vec::new(),
+            #[cfg(feature = "subprocess-bridge")]
+            bead_work_selection: plan.bead_work_selection.clone(),
         }
     }
 }
@@ -918,6 +985,8 @@ pub fn plan_mission_objective(input: &MissionObjectivePlannerInput) -> MissionOb
         plan_steps,
         fallback_steps,
         reason_codes,
+        #[cfg(feature = "subprocess-bridge")]
+        bead_work_selection: input.bead_work_selection.clone(),
     }
 }
 
@@ -2029,6 +2098,82 @@ mod tests {
             input = input.with_source_snapshot(source);
         }
         input
+    }
+
+    #[cfg(feature = "subprocess-bridge")]
+    #[test]
+    fn mission_objective_graph_selection_changes_real_plan_and_retains_policy_restrictions() {
+        use sha2::{Digest, Sha256};
+        let bytes = br#"{"id":"blocked","status":"blocked","priority":0,"issue_type":"bug"}
+{"id":"blocked-dependent","status":"open","priority":0,"issue_type":"test","dependencies":[{"issue_id":"blocked-dependent","depends_on_id":"blocked","type":"blocks"}]}
+{"id":"ready","status":"open","priority":1,"issue_type":"docs"}
+"#;
+        let hash = hex::encode(Sha256::digest(bytes));
+        let selection =
+            crate::beads_types::select_bead_work_from_jsonl(bytes, &hash, 1, NOW_MS, NOW_MS)
+                .unwrap();
+        let before_input = input_with_sources().with_candidate(
+            MissionObjectiveCandidateWork::new(
+                "blocked",
+                MissionObjectiveCandidateReadiness::ReadyBead,
+            )
+            .priority(0)
+            .target_bead_id("blocked"),
+        );
+        let before = plan_mission_objective(&before_input);
+        assert_eq!(
+            before.plan_steps[0].target_bead_id.as_deref(),
+            Some("blocked"),
+            "the prior manual request trusts caller readiness"
+        );
+        let after =
+            plan_mission_objective(&before_input.with_bead_work_selection(selection.clone()));
+        assert_eq!(after.plan_steps.len(), 1);
+        assert_eq!(after.plan_steps[0].target_bead_id.as_deref(), Some("ready"));
+        assert_eq!(after.plan_status, MissionObjectivePlanStatus::Actionable);
+        assert!(!after.side_effects_executed);
+        let json = serde_json::to_value(&after).unwrap();
+        assert_eq!(json["bead_work_selection"]["input_sha256"], hash);
+        assert_eq!(json["bead_work_selection"]["selected_id"], "ready");
+        assert_eq!(
+            json["bead_work_selection"]["live_database_validated"],
+            false
+        );
+        for restricted in [
+            MissionObjectiveCandidateWork::new(
+                "ready",
+                MissionObjectiveCandidateReadiness::ActiveSameDomain,
+            )
+            .active_owner("current-owner", 0),
+            MissionObjectiveCandidateWork::new(
+                "ready",
+                MissionObjectiveCandidateReadiness::BlockedDependency,
+            )
+            .dependency_ready(false),
+            MissionObjectiveCandidateWork::new(
+                "ready",
+                MissionObjectiveCandidateReadiness::ReadyBead,
+            )
+            .capacity_posture(MissionObjectiveCapacityPosture::Pause),
+        ] {
+            let plan = plan_mission_objective(
+                &input_with_sources()
+                    .with_candidate(restricted)
+                    .with_bead_work_selection(selection.clone()),
+            );
+            assert_ne!(
+                plan.plan_steps[0].status,
+                MissionObjectivePlanStatus::Actionable
+            );
+            assert_ne!(
+                plan.plan_steps[0].action_kind,
+                MissionObjectiveActionKind::ChooseReadyBead
+            );
+            assert!(!plan.side_effects_executed);
+        }
+        println!(
+            "MISSION_GRAPH_SELECTION hash={hash} prior_manual_target=blocked graph_target=ready explicit_owner_dependency_capacity_preserved=true effect_count=0"
+        );
     }
 
     #[test]

@@ -1,17 +1,64 @@
 # Robot Family Contract: `mission objective-plan`
 
 **Bead:** `ft-auy2g.4`
-**Status:** dry-run CLI, Robot, and MCP surfaces are shipped. Source adapters
-are still caller-supplied summaries; this surface does not collect raw pane text
-or mutate Beads, panes, services, or proof infrastructure.
+**Status:** dry-run CLI, Robot, and MCP surfaces are shipped. CLI and Robot
+requests can also rank a supplied complete Beads JSONL snapshot (`ft-xxfwy.53`).
+Other inputs remain caller-supplied summaries. This surface does not collect raw
+pane text or mutate Beads, panes, services, or proof infrastructure.
 
 ## Purpose
 
 The existing `ft mission plan` command validates a mission file and computes a
-mission contract hash. This contract defines a separate future surface:
+mission contract hash. This contract defines the separate surface:
 `mission objective-plan`. Its job is to compile an operator objective into a
 read-only, auditable plan before any pane mutation, service action, or work
 assignment occurs.
+
+## Beads snapshot selection
+
+Human and Robot objective-plan requests accept an explicit complete `br` JSONL
+export and its reviewed byte hash:
+
+```text
+ft mission objective-plan --objective "choose ready work" --beads-graph /path/issues.jsonl --beads-graph-sha256 <lowercase-sha256> --format json
+ft robot mission objective-plan --objective "choose ready work" --beads-graph /path/issues.jsonl --beads-graph-sha256 <lowercase-sha256>
+```
+
+The input contract is `br-jsonl-v1`; `--beads-graph-version` defaults to `1`.
+Every supplied record participates, including closed, deferred, test, docs,
+question, chore and bounded custom issue types. `br list` summaries and BV
+triage envelopes are not complete graph inputs. Explicit partial/count-mismatched
+records, unsupported statuses or edge predicates, missing dependencies, duplicate
+identities, cycles, changed byte hashes and unsupported versions are refused.
+Hierarchy and descriptive relations do not block readiness; `blocks` edges do.
+Conditional or unknown dependency semantics require a qualified evaluator and
+currently return unavailable.
+
+Selection first excludes closed, deferred, blocked, in-progress and assigned
+tasks, and tasks with unfinished prerequisites. It then orders eligible tasks by
+priority ascending, PageRank mass in integer billionths descending, and issue ID
+ascending. The graph score uses dependent-to-prerequisite blocking edges. A high
+score cannot erase an ownership or dependency exclusion. The ordinary objective
+planner still applies explicit caller ownership, path overlap, proof and capacity
+restrictions to the proposed task. Graph mode cannot be combined with a manual
+`--target-bead` or `--candidate-id` assertion.
+
+The plan's `bead_work_selection` field records the exact input SHA256, byte count,
+schema, file modification and evaluation times, every candidate's score and
+exclusions, type/status populations, ready ordering and selected ID. Task bodies,
+titles and assignee names are not copied into this graph report. A missing or
+invalid input produces a typed error, not an empty healthy queue.
+
+The reader admits regular files on Unix, with nonblocking no-follow open and
+identity revalidation; other platforms refuse this reader. Bounds are 64 MiB per
+snapshot, 1 MiB per JSONL record, 8,192 nodes and 65,536 edges. File modification
+time must be no more than five minutes old and cannot be in the future. These
+checks establish the supplied snapshot's identity and file age. They do not prove
+that an export matches the current Beads database, a live Agent Mail ownership
+check, or scheduler dispatch. `live_database_validated` therefore remains
+`false`. The command never invokes `br` or BV and never silently exports a
+database. Existing MCP inputs remain summary-based; this CLI/Robot option does
+not add an MCP graph adapter.
 
 The output contract is `ft.mission_objective_plan.v1`, defined in
 `docs/json-schema/ft-mission-objective-plan.json`.

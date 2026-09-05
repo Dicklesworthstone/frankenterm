@@ -101,7 +101,8 @@
 /// recorder events are now enqueued in the same transaction as their owning
 /// output segment, so a process loss between the primary commit and recorder
 /// append cannot permanently omit the event.
-pub const SCHEMA_VERSION: i32 = 45;
+/// Bumped 45 -> 46 for serialized connector dispatch ownership and ingress cursors.
+pub const SCHEMA_VERSION: i32 = 46;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -216,6 +217,35 @@ CREATE TABLE IF NOT EXISTS recorder_delivery_ledger (
 
 CREATE INDEX IF NOT EXISTS idx_recorder_delivery_ledger_created
     ON recorder_delivery_ledger(created_at, segment_id);
+
+-- Connector effects never reuse an expiring delivery lease: a dispatched
+-- operation remains non-retryable until its authoritative receipt is settled.
+CREATE TABLE IF NOT EXISTS connector_outbox_cursors (
+    generation TEXT PRIMARY KEY CHECK(length(generation) = 64),
+    after_event_id INTEGER NOT NULL CHECK(after_event_id >= 0),
+    cursor_epoch TEXT NOT NULL CHECK(length(cursor_epoch) = 32),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+);
+CREATE TABLE IF NOT EXISTS connector_outbox (
+    item_key TEXT PRIMARY KEY CHECK(length(item_key) = 64),
+    generation TEXT NOT NULL REFERENCES connector_outbox_cursors(generation),
+    source_event_id INTEGER NOT NULL CHECK(source_event_id > 0),
+    state TEXT NOT NULL CHECK(state IN
+        ('admitted','dispatched','completed','rejected','failed','cancelled','indeterminate')),
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    due_at INTEGER NOT NULL CHECK(due_at >= 0),
+    record_json TEXT NOT NULL CHECK(length(CAST(record_json AS BLOB)) <= 1048576)
+);
+CREATE INDEX IF NOT EXISTS idx_connector_outbox_pending
+    ON connector_outbox(generation, state, due_at, item_key);
+CREATE TABLE IF NOT EXISTS connector_ingress_cursors (
+    subscription_key TEXT PRIMARY KEY CHECK(length(subscription_key) = 64),
+    after_record_id INTEGER NOT NULL CHECK(after_record_id >= 0)
+);
+CREATE TABLE IF NOT EXISTS connector_ingress_delivery (
+    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE RESTRICT,
+    record_json TEXT NOT NULL CHECK(length(CAST(record_json AS BLOB)) <= 1048576)
+);
 
 -- Exact retained-segment metadata for bounded snapshot projection (ft-0yuxe.4).
 --

@@ -3,7 +3,7 @@
 //! These mirror the JSON output of `br list --json` and `br show --json`
 //! without depending on the `beads_rust` crate directly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,13 +31,36 @@ impl std::fmt::Display for BeadStatus {
 }
 
 /// Bead issue type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeadIssueType {
     Epic,
     Feature,
     Task,
     Bug,
+    Chore,
+    Docs,
+    Question,
+    Test,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl<'de> Deserialize<'de> for BeadIssueType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(match name.as_str() {
+            "epic" => Self::Epic,
+            "feature" => Self::Feature,
+            "task" => Self::Task,
+            "bug" => Self::Bug,
+            "chore" => Self::Chore,
+            "docs" => Self::Docs,
+            "question" => Self::Question,
+            "test" => Self::Test,
+            _ => Self::Custom(name),
+        })
+    }
 }
 
 /// Priority level (0 = highest).
@@ -106,6 +129,9 @@ pub enum BeadResolverReasonCode {
     MissingDependencyNode,
     CyclicDependencyGraph,
     PartialGraphData,
+    InvalidGraphData,
+    ResourceBudgetExceeded,
+    ActiveOwnership,
 }
 
 /// Dependency or dependent edge reference from `br show --json`.
@@ -128,7 +154,9 @@ impl BeadDependencyRef {
     /// `parent-child` is treated as a taxonomy edge and does not block.
     #[must_use]
     pub fn blocks_readiness(&self) -> bool {
-        !matches!(self.dependency_type.as_deref(), Some("parent-child"))
+        self.dependency_type
+            .as_deref()
+            .map_or(true, |kind| work_graph_blocks(kind).unwrap_or(true))
     }
 }
 
@@ -220,9 +248,33 @@ impl BeadReadinessReport {
 /// Resolve actionable/ready issue candidates from detailed Beads DAG data.
 #[must_use]
 pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport {
+    let edge_count = issues.iter().try_fold(0usize, |count, issue| {
+        count.checked_add(issue.dependencies.len())
+    });
+    if issues.len() > BEAD_WORK_GRAPH_MAX_NODES
+        || edge_count.is_none_or(|edges| {
+            edges > BEAD_WORK_GRAPH_MAX_EDGES
+                || issues
+                    .len()
+                    .saturating_mul(issues.len().saturating_add(edges))
+                    > 20_000_000
+        })
+    {
+        return BeadReadinessReport {
+            candidates: Vec::new(),
+            ready_ids: Vec::new(),
+            degraded_reason_codes: vec![BeadResolverReasonCode::ResourceBudgetExceeded],
+        };
+    }
     let mut issue_by_id: HashMap<String, &BeadIssueDetail> = HashMap::new();
     for issue in issues {
-        issue_by_id.insert(issue.id.clone(), issue);
+        if issue_by_id.insert(issue.id.clone(), issue).is_some() {
+            return BeadReadinessReport {
+                candidates: Vec::new(),
+                ready_ids: Vec::new(),
+                degraded_reason_codes: vec![BeadResolverReasonCode::InvalidGraphData],
+            };
+        }
     }
 
     // Build reverse graph: dependency -> dependents (blocking edges only).
@@ -245,18 +297,7 @@ pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport
         children.dedup();
     }
 
-    let mut depth_memo: HashMap<String, usize> = HashMap::new();
-    let mut cycle_seen = false;
-    for issue in issues {
-        let mut visiting = HashSet::new();
-        let _ = compute_depth(
-            &issue.id,
-            &downstream,
-            &mut depth_memo,
-            &mut visiting,
-            &mut cycle_seen,
-        );
-    }
+    let (depth_memo, cycle_seen) = compute_depths(&downstream);
 
     let mut candidates = Vec::new();
     let mut ready_ids = Vec::new();
@@ -272,6 +313,14 @@ pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport
 
         if let Some(reason) = issue.ingest_warning {
             degraded.insert(reason);
+        }
+        if issue.status == BeadStatus::InProgress
+            || issue
+                .assignee
+                .as_ref()
+                .is_some_and(|owner| !owner.trim().is_empty())
+        {
+            degraded.insert(BeadResolverReasonCode::ActiveOwnership);
         }
 
         for dep in &issue.dependencies {
@@ -295,7 +344,7 @@ pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport
             degraded.insert(BeadResolverReasonCode::CyclicDependencyGraph);
         }
 
-        let ready = blockers.is_empty();
+        let ready = blockers.is_empty() && degraded.is_empty();
         if ready {
             ready_ids.push(issue.id.clone());
         }
@@ -338,39 +387,36 @@ pub fn resolve_bead_readiness(issues: &[BeadIssueDetail]) -> BeadReadinessReport
     }
 }
 
-fn compute_depth(
-    issue_id: &str,
-    downstream: &HashMap<String, Vec<String>>,
-    memo: &mut HashMap<String, usize>,
-    visiting: &mut HashSet<String>,
-    cycle_seen: &mut bool,
-) -> usize {
-    if let Some(depth) = memo.get(issue_id) {
-        return *depth;
-    }
-
-    let key = issue_id.to_string();
-    if !visiting.insert(key.clone()) {
-        *cycle_seen = true;
-        return 0;
-    }
-
-    let children = downstream.get(issue_id).cloned().unwrap_or_default();
-    let depth = if children.is_empty() {
-        0
-    } else {
-        let mut max_child = 0usize;
-        for child in children {
-            max_child = max_child.max(compute_depth(
-                &child, downstream, memo, visiting, cycle_seen,
-            ));
+fn compute_depths(downstream: &HashMap<String, Vec<String>>) -> (HashMap<String, usize>, bool) {
+    let mut remaining = HashMap::new();
+    let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut ready = VecDeque::new();
+    let mut depths = HashMap::new();
+    for (id, children) in downstream {
+        remaining.insert(id.as_str(), children.len());
+        if children.is_empty() {
+            ready.push_back(id.as_str());
         }
-        1 + max_child
-    };
-
-    visiting.remove(&key);
-    memo.insert(key, depth);
-    depth
+        for child in children {
+            parents.entry(child.as_str()).or_default().push(id.as_str());
+        }
+    }
+    let mut visited = 0;
+    while let Some(id) = ready.pop_front() {
+        visited += 1;
+        let depth = *depths.entry(id.to_string()).or_insert(0usize);
+        for parent in parents.get(id).into_iter().flatten() {
+            let parent_depth = depths.entry((*parent).to_string()).or_insert(0);
+            *parent_depth = (*parent_depth).max(depth + 1);
+            if let Some(count) = remaining.get_mut(parent) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.push_back(parent);
+                }
+            }
+        }
+    }
+    (depths, visited != downstream.len())
 }
 
 fn count_transitive_descendants(
@@ -392,6 +438,395 @@ fn count_transitive_descendants(
     }
 
     seen.len()
+}
+
+pub const BEAD_WORK_GRAPH_SCHEMA_VERSION: u16 = 1;
+pub const BEAD_WORK_GRAPH_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const BEAD_WORK_GRAPH_MAX_LINE_BYTES: usize = 1024 * 1024;
+pub const BEAD_WORK_GRAPH_MAX_NODES: usize = 8_192;
+pub const BEAD_WORK_GRAPH_MAX_EDGES: usize = 65_536;
+pub const BEAD_WORK_GRAPH_MAX_AGE_MS: u64 = 300_000;
+
+/// A graph refusal never supplies an empty, apparently healthy ready queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BeadWorkSelectionError {
+    #[error("unsupported Beads JSONL snapshot schema")]
+    UnsupportedSchema,
+    #[error("Beads snapshot SHA256 does not match the requested revision")]
+    RevisionMismatch,
+    #[error("Beads snapshot modification time is stale or in the future")]
+    StaleSnapshot,
+    #[error("Beads snapshot exceeds the byte, node, edge or scoring budget")]
+    BudgetExceeded,
+    #[error("Beads snapshot contains malformed or unsupported records")]
+    InvalidRecord,
+    #[error("Beads snapshot declares partial or count-inconsistent graph records")]
+    PartialGraph,
+    #[error("Beads snapshot contains duplicate node or edge identities")]
+    DuplicateIdentity,
+    #[error("Beads snapshot refers to a missing dependency node")]
+    MissingDependency,
+    #[error("Beads snapshot contains a blocking dependency cycle")]
+    CyclicGraph,
+    #[error("Beads snapshot has unsupported dependency semantics")]
+    UnsupportedDependency,
+    #[error("Beads graph scoring did not produce a converged finite result")]
+    ScoringUnavailable,
+    #[error("Beads snapshot is not an available regular file")]
+    FileUnavailable,
+    #[error("Beads snapshot changed during the bounded read")]
+    ChangedDuringRead,
+    #[error("bounded regular-file snapshot reading is unavailable on this platform")]
+    UnsupportedPlatform,
+}
+
+/// Minimal source projection: descriptions, notes, labels and titles are neither
+/// retained nor emitted by work selection. Every issue type remains in scope.
+#[derive(Debug, Deserialize)]
+struct WorkGraphIssue {
+    id: String,
+    status: BeadStatus,
+    priority: u8,
+    issue_type: String,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<WorkGraphDependency>,
+    #[serde(default)]
+    dependency_count: Option<usize>,
+    #[serde(default)]
+    ingest_warning: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkGraphDependency {
+    issue_id: String,
+    depends_on_id: String,
+    #[serde(rename = "type")]
+    dependency_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadWorkExclusion {
+    Closed,
+    Deferred,
+    BlockedStatus,
+    ActiveOwnership,
+    UnfinishedDependency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BeadWorkCandidate {
+    pub id: String,
+    pub status: BeadStatus,
+    pub issue_type: String,
+    pub priority: u8,
+    /// Rounded PageRank mass, in billionths. This exact integer is the ranking
+    /// component, so displayed equality also means a deterministic ID tie.
+    pub pagerank_billionths: u64,
+    pub blocker_ids: Vec<String>,
+    pub exclusions: Vec<BeadWorkExclusion>,
+}
+
+/// Decision from all records of the supplied JSONL bytes. This is advisory
+/// snapshot selection, never a live database check, ownership claim or dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BeadWorkSelection {
+    pub(crate) schema_version: u16,
+    pub(crate) input_format: String,
+    pub(crate) input_sha256: String,
+    pub(crate) source_bytes: usize,
+    pub(crate) snapshot_modified_at_ms: u64,
+    pub(crate) evaluated_at_ms: u64,
+    pub(crate) live_database_validated: bool,
+    pub(crate) node_count: usize,
+    pub(crate) edge_count: usize,
+    pub(crate) type_population: BTreeMap<String, usize>,
+    pub(crate) status_population: BTreeMap<String, usize>,
+    pub(crate) exclusion_population: BTreeMap<BeadWorkExclusion, usize>,
+    pub(crate) selected_id: Option<String>,
+    pub(crate) ordered_ready_ids: Vec<String>,
+    pub(crate) candidates: Vec<BeadWorkCandidate>,
+    pub(crate) pagerank_iterations: usize,
+    pub(crate) tie_break: String,
+}
+
+impl BeadWorkSelection {
+    pub fn selected_id(&self) -> Option<&str> {
+        self.selected_id.as_deref()
+    }
+    pub fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+    pub fn candidates(&self) -> &[BeadWorkCandidate] {
+        &self.candidates
+    }
+    pub fn ordered_ready_ids(&self) -> &[String] {
+        &self.ordered_ready_ids
+    }
+}
+
+struct WorkScoringGraph {
+    successors: Vec<Vec<usize>>,
+    predecessors: Vec<Vec<usize>>,
+}
+
+impl crate::graph_scoring::GraphView for WorkScoringGraph {
+    fn node_count(&self) -> usize {
+        self.successors.len()
+    }
+    fn nodes(&self) -> Vec<usize> {
+        (0..self.successors.len()).collect()
+    }
+    fn successors(&self, node: usize) -> Vec<usize> {
+        self.successors[node].clone()
+    }
+    fn predecessors(&self, node: usize) -> Vec<usize> {
+        self.predecessors[node].clone()
+    }
+}
+
+fn work_graph_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn work_graph_blocks(kind: &str) -> Result<bool, BeadWorkSelectionError> {
+    match kind {
+        "blocks" => Ok(true),
+        // This project explicitly treats hierarchy as taxonomy, not readiness.
+        "parent-child" | "related" | "discovered-from" | "replies-to" | "relates-to"
+        | "duplicates" | "supersedes" | "caused-by" => Ok(false),
+        // Conditional/wait predicates need their own evaluation; treating them
+        // as satisfied or silently dropping them would invent readiness.
+        _ => Err(BeadWorkSelectionError::UnsupportedDependency),
+    }
+}
+
+/// Validate and rank one complete supplied `br` JSONL snapshot. The hash binds
+/// exact bytes, including record order and omitted display-only fields. The
+/// five-minute check is file-age evidence only; it does not attest DB freshness.
+pub fn select_bead_work_from_jsonl(
+    bytes: &[u8],
+    expected_sha256: &str,
+    schema_version: u16,
+    snapshot_modified_at_ms: u64,
+    now_ms: u64,
+) -> Result<BeadWorkSelection, BeadWorkSelectionError> {
+    use sha2::{Digest, Sha256};
+    if schema_version != BEAD_WORK_GRAPH_SCHEMA_VERSION {
+        return Err(BeadWorkSelectionError::UnsupportedSchema);
+    }
+    if bytes.len() > BEAD_WORK_GRAPH_MAX_BYTES {
+        return Err(BeadWorkSelectionError::BudgetExceeded);
+    }
+    if now_ms
+        .checked_sub(snapshot_modified_at_ms)
+        .is_none_or(|age| age > BEAD_WORK_GRAPH_MAX_AGE_MS)
+    {
+        return Err(BeadWorkSelectionError::StaleSnapshot);
+    }
+    let input_sha256 = hex::encode(Sha256::digest(bytes));
+    if input_sha256 != expected_sha256 {
+        return Err(BeadWorkSelectionError::RevisionMismatch);
+    }
+    let mut by_id = BTreeMap::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > BEAD_WORK_GRAPH_MAX_LINE_BYTES || by_id.len() >= BEAD_WORK_GRAPH_MAX_NODES {
+            return Err(BeadWorkSelectionError::BudgetExceeded);
+        }
+        let issue: WorkGraphIssue =
+            serde_json::from_slice(line).map_err(|_| BeadWorkSelectionError::InvalidRecord)?;
+        if issue.ingest_warning.is_some()
+            || issue
+                .dependency_count
+                .is_some_and(|count| count != issue.dependencies.len())
+        {
+            return Err(BeadWorkSelectionError::PartialGraph);
+        }
+        if !work_graph_identifier(&issue.id, 128)
+            || !work_graph_identifier(&issue.issue_type, 64)
+            || issue.priority > 4
+            || issue
+                .assignee
+                .as_ref()
+                .is_some_and(|owner| owner.len() > 1024)
+        {
+            return Err(BeadWorkSelectionError::InvalidRecord);
+        }
+        if by_id.insert(issue.id.clone(), issue).is_some() {
+            return Err(BeadWorkSelectionError::DuplicateIdentity);
+        }
+    }
+    let issues: Vec<_> = by_id.into_values().collect();
+    let indexes: BTreeMap<_, _> = issues
+        .iter()
+        .enumerate()
+        .map(|(index, issue)| (issue.id.as_str(), index))
+        .collect();
+    let mut graph = WorkScoringGraph {
+        successors: vec![Vec::new(); issues.len()],
+        predecessors: vec![Vec::new(); issues.len()],
+    };
+    let mut blockers = vec![Vec::new(); issues.len()];
+    let mut edge_count = 0usize;
+    for (index, issue) in issues.iter().enumerate() {
+        let mut seen = BTreeSet::new();
+        for dependency in &issue.dependencies {
+            edge_count += 1;
+            if edge_count > BEAD_WORK_GRAPH_MAX_EDGES {
+                return Err(BeadWorkSelectionError::BudgetExceeded);
+            }
+            if dependency.issue_id != issue.id {
+                return Err(BeadWorkSelectionError::InvalidRecord);
+            }
+            let target = *indexes
+                .get(dependency.depends_on_id.as_str())
+                .ok_or(BeadWorkSelectionError::MissingDependency)?;
+            if !seen.insert((target, dependency.dependency_type.as_str())) {
+                return Err(BeadWorkSelectionError::DuplicateIdentity);
+            }
+            if work_graph_blocks(&dependency.dependency_type)? {
+                // Dependent -> prerequisite gives unfinished unblockers more
+                // PageRank. Closed prerequisites still resolve blocker state.
+                graph.successors[index].push(target);
+                graph.predecessors[target].push(index);
+                if issues[target].status != BeadStatus::Closed {
+                    blockers[index].push(dependency.depends_on_id.clone());
+                }
+            }
+        }
+        blockers[index].sort();
+    }
+    // Iterative Kahn traversal covers all nodes, including closed nodes. No
+    // recursive walk can overflow the stack on an admissible long chain.
+    let mut incoming: Vec<_> = graph.predecessors.iter().map(Vec::len).collect();
+    let mut queue: VecDeque<_> = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect();
+    let mut visited = 0;
+    while let Some(node) = queue.pop_front() {
+        visited += 1;
+        for &next in &graph.successors[node] {
+            incoming[next] -= 1;
+            if incoming[next] == 0 {
+                queue.push_back(next);
+            }
+        }
+    }
+    if visited != issues.len() {
+        return Err(BeadWorkSelectionError::CyclicGraph);
+    }
+    let scores =
+        crate::graph_scoring::pagerank(&graph, &Default::default()).map_err(
+            |error| match error {
+                crate::graph_scoring::GraphScoreError::BudgetExceeded => {
+                    BeadWorkSelectionError::BudgetExceeded
+                }
+                _ => BeadWorkSelectionError::ScoringUnavailable,
+            },
+        )?;
+    if !scores.converged {
+        return Err(BeadWorkSelectionError::ScoringUnavailable);
+    }
+    let mut type_population = BTreeMap::new();
+    let mut status_population = BTreeMap::new();
+    let mut exclusion_population = BTreeMap::new();
+    let mut candidates = Vec::with_capacity(issues.len());
+    for (index, issue) in issues.iter().enumerate() {
+        *type_population.entry(issue.issue_type.clone()).or_insert(0) += 1;
+        *status_population
+            .entry(issue.status.to_string())
+            .or_insert(0) += 1;
+        let score = *scores
+            .scores
+            .get(&index)
+            .ok_or(BeadWorkSelectionError::ScoringUnavailable)?;
+        if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+            return Err(BeadWorkSelectionError::ScoringUnavailable);
+        }
+        let mut exclusions = Vec::new();
+        match issue.status {
+            BeadStatus::Closed => exclusions.push(BeadWorkExclusion::Closed),
+            BeadStatus::Deferred => exclusions.push(BeadWorkExclusion::Deferred),
+            BeadStatus::Blocked => exclusions.push(BeadWorkExclusion::BlockedStatus),
+            BeadStatus::InProgress => exclusions.push(BeadWorkExclusion::ActiveOwnership),
+            BeadStatus::Open => {}
+        }
+        if issue
+            .assignee
+            .as_ref()
+            .is_some_and(|owner| !owner.trim().is_empty())
+            && !exclusions.contains(&BeadWorkExclusion::ActiveOwnership)
+        {
+            exclusions.push(BeadWorkExclusion::ActiveOwnership);
+        }
+        if !blockers[index].is_empty() {
+            exclusions.push(BeadWorkExclusion::UnfinishedDependency);
+        }
+        for reason in &exclusions {
+            *exclusion_population.entry(*reason).or_insert(0) += 1;
+        }
+        candidates.push(BeadWorkCandidate {
+            id: issue.id.clone(),
+            status: issue.status,
+            issue_type: issue.issue_type.clone(),
+            priority: issue.priority,
+            pagerank_billionths: (score * 1_000_000_000.0).round() as u64,
+            blocker_ids: std::mem::take(&mut blockers[index]),
+            exclusions,
+        });
+    }
+    let mut ready: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.exclusions.is_empty())
+        .collect();
+    ready.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.pagerank_billionths.cmp(&left.pagerank_billionths))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let ordered_ready_ids: Vec<_> = ready.iter().map(|candidate| candidate.id.clone()).collect();
+    let selected_id = ordered_ready_ids.first().cloned();
+    tracing::info!(
+        schema_version,
+        input_sha256,
+        nodes = candidates.len(),
+        edge_count,
+        ready = ordered_ready_ids.len(),
+        selected_id = selected_id.as_deref().unwrap_or("none"),
+        live_database_validated = false,
+        "Beads snapshot work selection"
+    );
+    Ok(BeadWorkSelection {
+        schema_version,
+        input_format: "br-jsonl-v1".to_string(),
+        input_sha256,
+        source_bytes: bytes.len(),
+        snapshot_modified_at_ms,
+        evaluated_at_ms: now_ms,
+        live_database_validated: false,
+        node_count: candidates.len(),
+        edge_count,
+        type_population,
+        status_population,
+        exclusion_population,
+        selected_id,
+        ordered_ready_ids,
+        candidates,
+        pagerank_iterations: scores.iterations,
+        tie_break: "priority_ascending,pagerank_billionths_descending,id_ascending".to_string(),
+    })
 }
 
 /// Counts of beads by status (returned by `bead_count_by_status`).
@@ -436,6 +871,269 @@ impl BeadStatusCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn work_issue(
+        id: &str,
+        status: &str,
+        issue_type: &str,
+        priority: u8,
+        dependencies: &[&str],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "status": status, "issue_type": issue_type, "priority": priority,
+            "description": "private-body-canary-must-not-be-retained",
+            "dependencies": dependencies.iter().map(|dependency| serde_json::json!({
+                "issue_id": id, "depends_on_id": dependency, "type": "blocks"
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    fn work_bytes(issues: &[serde_json::Value]) -> (Vec<u8>, String) {
+        use sha2::{Digest, Sha256};
+        let mut bytes = Vec::new();
+        for issue in issues {
+            serde_json::to_writer(&mut bytes, issue).unwrap();
+            bytes.push(b'\n');
+        }
+        let hash = hex::encode(Sha256::digest(&bytes));
+        (bytes, hash)
+    }
+
+    fn select_work(
+        issues: &[serde_json::Value],
+    ) -> Result<BeadWorkSelection, BeadWorkSelectionError> {
+        let (bytes, hash) = work_bytes(issues);
+        select_bead_work_from_jsonl(&bytes, &hash, 1, 100, 100)
+    }
+
+    #[test]
+    fn bead_work_selection_filters_blocked_owned_and_closed_before_scoring() {
+        let mut owned = work_issue("owned", "open", "feature", 0, &[]);
+        owned["assignee"] = "active-owner-canary".into();
+        let issues = vec![
+            work_issue("ready", "open", "test", 2, &["closed"]),
+            work_issue("blocked", "blocked", "bug", 0, &[]),
+            work_issue("downstream", "open", "docs", 0, &["blocked"]),
+            work_issue("closed", "closed", "epic", 0, &[]),
+            work_issue("deferred", "deferred", "question", 0, &[]),
+            work_issue("in-progress", "in_progress", "chore", 0, &[]),
+            owned,
+            work_issue("custom", "blocked", "custom-review", 4, &[]),
+        ];
+        let report = select_work(&issues).unwrap();
+        // Independent readiness oracle: the fixture has exactly one open,
+        // unassigned row whose sole prerequisite is explicitly closed.
+        assert_eq!(report.ordered_ready_ids, ["ready"]);
+        assert_eq!(report.selected_id.as_deref(), Some("ready"));
+        assert_eq!(report.candidates.len(), issues.len());
+        assert_eq!(report.type_population.len(), 8);
+        let candidate = |id: &str| {
+            report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .unwrap()
+        };
+        assert!(candidate("blocked").pagerank_billionths > candidate("ready").pagerank_billionths);
+        assert_eq!(candidate("downstream").blocker_ids, ["blocked"]);
+        assert!(
+            candidate("owned")
+                .exclusions
+                .contains(&BeadWorkExclusion::ActiveOwnership)
+        );
+        assert!(
+            candidate("in-progress")
+                .exclusions
+                .contains(&BeadWorkExclusion::ActiveOwnership)
+        );
+        assert!(
+            candidate("closed")
+                .exclusions
+                .contains(&BeadWorkExclusion::Closed)
+        );
+        assert!(!report.live_database_validated);
+        let output = serde_json::to_string(&report).unwrap();
+        assert!(!output.contains("private-body-canary"));
+        assert!(!output.contains("active-owner-canary"));
+        println!(
+            "BEAD_GRAPH_SELECTION hash={} nodes={} selected=ready blocked_high_score=true scope=snapshot_only",
+            report.input_sha256, report.node_count
+        );
+    }
+
+    #[test]
+    fn bead_work_selection_graph_structure_changes_choice_and_order_is_deterministic() {
+        let base = vec![
+            work_issue("a", "open", "task", 1, &[]),
+            work_issue("b", "open", "docs", 1, &[]),
+        ];
+        let before = select_work(&base).unwrap();
+        assert_eq!(
+            before.selected_id.as_deref(),
+            Some("a"),
+            "equal score uses the documented lexical tie"
+        );
+        let mut after_rows = base;
+        after_rows.push(work_issue("b-dependent", "open", "test", 1, &["b"]));
+        let after = select_work(&after_rows).unwrap();
+        assert_eq!(
+            after.selected_id.as_deref(),
+            Some("b"),
+            "a real graph edge changes selected work"
+        );
+        assert_eq!(after.ordered_ready_ids, ["b", "a"]);
+        after_rows.reverse();
+        let reordered = select_work(&after_rows).unwrap();
+        assert_eq!(after.candidates, reordered.candidates);
+        assert_eq!(after.ordered_ready_ids, reordered.ordered_ready_ids);
+        assert_ne!(
+            after.input_sha256, reordered.input_sha256,
+            "input identity binds exact bytes, including order"
+        );
+        println!(
+            "BEAD_GRAPH_SELECTION before={} after={} selected_before=a selected_after=b permutation_stable=true",
+            before.input_sha256, after.input_sha256
+        );
+    }
+
+    #[test]
+    fn bead_work_selection_rejects_stale_version_cycle_missing_and_partial_input() {
+        let rows = vec![work_issue("a", "open", "docs", 1, &[])];
+        let (bytes, hash) = work_bytes(&rows);
+        assert_eq!(
+            select_bead_work_from_jsonl(&bytes, &hash, 2, 100, 100).unwrap_err(),
+            BeadWorkSelectionError::UnsupportedSchema
+        );
+        assert_eq!(
+            select_bead_work_from_jsonl(&bytes, &"0".repeat(64), 1, 100, 100).unwrap_err(),
+            BeadWorkSelectionError::RevisionMismatch
+        );
+        for (modified, now) in [(100, 100 + BEAD_WORK_GRAPH_MAX_AGE_MS + 1), (101, 100)] {
+            assert_eq!(
+                select_bead_work_from_jsonl(&bytes, &hash, 1, modified, now).unwrap_err(),
+                BeadWorkSelectionError::StaleSnapshot
+            );
+        }
+        let cycle = [
+            work_issue("a", "open", "task", 1, &["b"]),
+            work_issue("b", "closed", "task", 1, &["a"]),
+        ];
+        assert_eq!(
+            select_work(&cycle).unwrap_err(),
+            BeadWorkSelectionError::CyclicGraph
+        );
+        assert_eq!(
+            select_work(&[work_issue("a", "open", "task", 1, &["missing"])]).unwrap_err(),
+            BeadWorkSelectionError::MissingDependency
+        );
+        assert_eq!(
+            select_work(&[rows[0].clone(), rows[0].clone()]).unwrap_err(),
+            BeadWorkSelectionError::DuplicateIdentity
+        );
+        let envelope = serde_json::json!({"issues": rows, "has_more": true});
+        assert_eq!(
+            select_work(&[envelope]).unwrap_err(),
+            BeadWorkSelectionError::InvalidRecord
+        );
+        let mut summary = work_issue("summary", "open", "test", 0, &[]);
+        summary["dependency_count"] = 1.into();
+        assert_eq!(
+            select_work(&[summary]).unwrap_err(),
+            BeadWorkSelectionError::PartialGraph
+        );
+        let mut degraded = work_issue("fallback", "open", "docs", 0, &[]);
+        degraded["ingest_warning"] = "partial_graph_data".into();
+        assert_eq!(
+            select_work(&[degraded]).unwrap_err(),
+            BeadWorkSelectionError::PartialGraph
+        );
+        let unsupported_status = work_issue("a", "unsupported-status", "task", 1, &[]);
+        assert_eq!(
+            select_work(&[unsupported_status]).unwrap_err(),
+            BeadWorkSelectionError::InvalidRecord
+        );
+        let mut conditional = work_issue("a", "open", "task", 1, &["b"]);
+        conditional["dependencies"][0]["type"] = "conditional-blocks".into();
+        assert_eq!(
+            select_work(&[conditional, work_issue("b", "closed", "task", 1, &[])]).unwrap_err(),
+            BeadWorkSelectionError::UnsupportedDependency
+        );
+        let invalid_utf8 = [0xff];
+        use sha2::{Digest, Sha256};
+        let hash = hex::encode(Sha256::digest(invalid_utf8));
+        assert_eq!(
+            select_bead_work_from_jsonl(&invalid_utf8, &hash, 1, 0, 0).unwrap_err(),
+            BeadWorkSelectionError::InvalidRecord
+        );
+    }
+
+    #[test]
+    fn bead_work_selection_rejects_byte_line_and_node_overflow_without_truncation() {
+        let oversized = vec![b' '; BEAD_WORK_GRAPH_MAX_BYTES + 1];
+        assert_eq!(
+            select_bead_work_from_jsonl(&oversized, "", 1, 0, 0).unwrap_err(),
+            BeadWorkSelectionError::BudgetExceeded
+        );
+        drop(oversized);
+        use sha2::{Digest, Sha256};
+        let oversized_line = vec![b' '; BEAD_WORK_GRAPH_MAX_LINE_BYTES + 1];
+        let hash = hex::encode(Sha256::digest(&oversized_line));
+        assert_eq!(
+            select_bead_work_from_jsonl(&oversized_line, &hash, 1, 0, 0).unwrap_err(),
+            BeadWorkSelectionError::BudgetExceeded
+        );
+        let nodes: Vec<_> = (0..=BEAD_WORK_GRAPH_MAX_NODES)
+            .map(|index| work_issue(&format!("n-{index}"), "open", "test", 2, &[]))
+            .collect();
+        assert_eq!(
+            select_work(&nodes).unwrap_err(),
+            BeadWorkSelectionError::BudgetExceeded
+        );
+        let clean = select_work(&[work_issue("after-refusal", "open", "test", 2, &[])]).unwrap();
+        assert_eq!(clean.selected_id.as_deref(), Some("after-refusal"));
+    }
+
+    #[test]
+    fn readiness_partial_duplicate_owned_and_deep_inputs_fail_closed_or_settle_iteratively() {
+        let partial = BeadIssueDetail::from_summary(sample_bead("partial", BeadStatus::Open, 0));
+        assert!(resolve_bead_readiness(&[partial]).ready_ids.is_empty());
+        let mut owned = sample_detail("owned", BeadStatus::Open, 0, &[]);
+        owned.assignee = Some("current-owner".to_string());
+        assert!(resolve_bead_readiness(&[owned]).ready_ids.is_empty());
+        let duplicate = sample_detail("duplicate", BeadStatus::Open, 0, &[]);
+        let report = resolve_bead_readiness(&[duplicate.clone(), duplicate]);
+        assert!(report.ready_ids.is_empty());
+        assert_eq!(
+            report.degraded_reason_codes,
+            [BeadResolverReasonCode::InvalidGraphData]
+        );
+        let chain: Vec<_> = (0..1_000)
+            .map(|index| {
+                let mut issue = sample_detail(&format!("n-{index}"), BeadStatus::Open, 2, &[]);
+                if index > 0 {
+                    issue.dependencies.push(BeadDependencyRef {
+                        id: format!("n-{}", index - 1),
+                        title: None,
+                        status: None,
+                        priority: None,
+                        dependency_type: Some("blocks".to_string()),
+                    });
+                }
+                issue
+            })
+            .collect();
+        let report = resolve_bead_readiness(&chain);
+        assert_eq!(report.ready_ids, ["n-0"]);
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == "n-0")
+                .unwrap()
+                .critical_path_depth_hint,
+            999
+        );
+    }
 
     fn sample_bead(id: &str, status: BeadStatus, priority: u8) -> BeadSummary {
         BeadSummary {
@@ -561,6 +1259,11 @@ mod tests {
             BeadIssueType::Feature,
             BeadIssueType::Task,
             BeadIssueType::Bug,
+            BeadIssueType::Chore,
+            BeadIssueType::Docs,
+            BeadIssueType::Question,
+            BeadIssueType::Test,
+            BeadIssueType::Custom("verification-special".to_string()),
         ] {
             let json = serde_json::to_string(&issue_type).unwrap();
             let back: BeadIssueType = serde_json::from_str(&json).unwrap();
@@ -888,11 +1591,16 @@ mod tests {
     }
 
     #[test]
-    fn readiness_single_in_progress_is_ready() {
+    fn readiness_single_in_progress_retains_owner_exclusion() {
         let issues = vec![sample_detail("wip", BeadStatus::InProgress, 0, &[])];
         let report = resolve_bead_readiness(&issues);
-        assert_eq!(report.ready_count(), 1);
-        assert_eq!(report.ready_ids, vec!["wip"]);
+        assert_eq!(report.ready_count(), 0);
+        assert!(report.ready_ids.is_empty());
+        assert!(
+            report.candidates[0]
+                .degraded_reasons
+                .contains(&BeadResolverReasonCode::ActiveOwnership)
+        );
     }
 
     #[test]
@@ -1189,6 +1897,15 @@ mod tests {
             dependency_type: Some("parent-child".to_string()),
         };
         assert!(!parent_child.blocks_readiness());
+
+        for relation in ["related", "relates-to", "discovered-from"] {
+            let mut nonblocking = parent_child.clone();
+            nonblocking.dependency_type = Some(relation.to_string());
+            assert!(
+                !nonblocking.blocks_readiness(),
+                "descriptive relation {relation} must not block ready work"
+            );
+        }
 
         let no_type = BeadDependencyRef {
             id: "z".to_string(),

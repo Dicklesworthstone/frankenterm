@@ -19,6 +19,116 @@ pub use frankenterm_core_connector_types::{
     ConnectorReliabilitySnapshot, DeadLetterTelemetrySnapshot,
 };
 
+/// Persisted provider-effect state. Only `Admitted` can acquire dispatch
+/// ownership; no lease expiry can make `Dispatched` eligible again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorDeliveryState {
+    Admitted,
+    Dispatched,
+    Completed,
+    Rejected,
+    Failed,
+    Cancelled,
+    Indeterminate,
+}
+
+impl ConnectorDeliveryState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Dispatched => "dispatched",
+            Self::Completed => "completed",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+
+    pub const fn permits(self, next: Self) -> bool {
+        matches!((self, next),
+            (Self::Admitted, Self::Dispatched | Self::Rejected | Self::Cancelled)
+            | (Self::Dispatched, Self::Completed | Self::Failed | Self::Indeterminate)
+        )
+    }
+}
+
+/// Durable outbox item. The configured input has already passed classification
+/// and policy before insertion; credentials and raw provider responses are absent.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ConnectorOutboxEntry {
+    pub key: String,
+    pub generation: String,
+    pub source_event_id: i64,
+    pub rule_id: String,
+    pub invoke: crate::connector_host_runtime::FcpOperation,
+    pub action_kind: crate::connector_outbound_bridge::ConnectorActionKind,
+    pub correlation_id: String,
+    pub state: ConnectorDeliveryState,
+    pub revision: i64,
+    pub due_at_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub receipt_id: Option<String>,
+    pub receipt_hash: Option<String>,
+    pub reason_code: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectorOutboxEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorOutboxEntry")
+            .field("key", &self.key)
+            .field("state", &self.state)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Atomic storage requests use the existing serialized writer and transaction
+/// failure receipts. Payloads have no Debug implementation by design.
+pub(crate) enum ConnectorStorageMutation {
+    Initialize {
+        generation: String,
+        now_ms: i64,
+    },
+    Admit {
+        generation: String,
+        expected_cursor: i64,
+        through_event_id: i64,
+        entries: Vec<ConnectorOutboxEntry>,
+        max_pending: usize,
+        max_retained: usize,
+    },
+    Transition {
+        key: String,
+        expected_revision: i64,
+        expected_state: ConnectorDeliveryState,
+        next_state: ConnectorDeliveryState,
+        now_ms: i64,
+        receipt_id: Option<String>,
+        receipt_hash: Option<String>,
+        reason_code: Option<String>,
+    },
+    Ingest {
+        subscription_key: String,
+        expected_cursor: i64,
+        records: Vec<(i64, crate::storage::StoredEvent)>,
+    },
+    AcknowledgeIngress { event_ids: Vec<i64> },
+}
+
+#[derive(Debug)]
+pub(crate) enum ConnectorStorageOutcome {
+    Cursor { after_event_id: i64, cursor_epoch: String },
+    Admitted,
+    Transitioned(ConnectorOutboxEntry),
+    Ingested(Vec<crate::storage::EventRecordOutcome>),
+    IngressAcknowledged,
+    Conflict,
+    Saturated,
+}
+
 // =============================================================================
 // Connector error classification
 // =============================================================================
@@ -41,6 +151,9 @@ pub enum ConnectorErrorKind {
     Timeout,
     /// Caller-initiated cancellation — not a connector failure.
     Cancelled,
+    /// Dispatch may have produced an effect, but no authoritative receipt was
+    /// confirmed. This must never feed automatic retry or dead-letter replay.
+    Indeterminate,
     /// Unknown error — classify as transient for safety.
     Unknown,
 }
@@ -87,6 +200,7 @@ impl ConnectorErrorKind {
             Self::ServiceUnavailable => "service_unavailable",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
+            Self::Indeterminate => "indeterminate",
             Self::Unknown => "unknown",
         }
     }
