@@ -75,7 +75,8 @@ Per-provider:
 ### In-tree (this bead)
 
 `crates/frankenterm-core/src/redactor_coverage_matrix.rs::synthesized_corpus`
-provides **112 hand-curated test vectors**:
+provides **122 hand-curated test vectors** (105 positive and 17 negative
+controls, checked by `corpus_has_unique_valid_byte_annotations_and_both_control_classes`):
 
 - 3 positive vectors per live pattern class, exercising the canonical
   shape, common embeddings (env-var assignment, log line, URL,

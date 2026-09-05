@@ -47,4 +47,6 @@ recovery_*/
 *.rebuild_*
 .write.lock
 *.tmp
+*.tmp-fsqlite-ns-gate
+*.tmp-fsqlite-ns-use
 *.orphan_*

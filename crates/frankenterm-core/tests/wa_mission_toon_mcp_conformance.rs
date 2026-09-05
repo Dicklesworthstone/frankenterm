@@ -277,14 +277,26 @@ fn read_or_update_golden(path: &Path, actual: &str) -> String {
     }
 
     fs::read_to_string(path).unwrap_or_else(|err| {
-        let actual_path = path.with_extension("actual.json");
-        fs::write(&actual_path, actual).expect("retain actual contract for manual review");
+        let actual_path = retain_actual_contract(actual);
         panic!(
             "missing MCP mission TOON conformance golden at {}: {err}. Review actual contract at {} before adding the expected artifact.",
             path.display(),
             actual_path.display()
         )
     })
+}
+
+fn retain_actual_contract(actual: &str) -> PathBuf {
+    // RCH may retire its source mirror after the command. Keep evidence in the
+    // worker's temporary directory, independently of that mirror's lifetime.
+    let directory = tempfile::Builder::new()
+        .prefix("ft-mcp-mission-toon-actual-")
+        .tempdir()
+        .expect("create retained contract evidence directory")
+        .keep();
+    let path = directory.join("wa_mission_toon_conformance.actual.json");
+    fs::write(&path, actual).expect("retain actual contract for manual review");
+    path
 }
 
 fn assert_matches_golden(name: &str, captures: &[ToolContractCapture]) {
@@ -294,8 +306,7 @@ fn assert_matches_golden(name: &str, captures: &[ToolContractCapture]) {
     let expected = read_or_update_golden(&path, &actual_text);
 
     if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
-        let actual_path = path.with_extension("actual.json");
-        let _ = fs::write(&actual_path, &actual_text);
+        let actual_path = retain_actual_contract(&actual_text);
         panic!(
             "MCP mission TOON conformance golden drift detected. Review the diff between:\n  \
              expected: {}\n  actual:   {}\n\n\

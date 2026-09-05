@@ -3347,7 +3347,7 @@ fn contract_mission_graph_cli_scores_change_actual_plan_and_refuse_invalid_snaps
             manual.args(["--target-bead", "blocked"]);
             let before = run(manual, true);
             assert_eq!(
-                before["data"]["plan"]["plan_steps"][0]["target_bead_id"],
+                before["data"]["plan"]["steps"][0]["target"],
                 "blocked"
             );
 
@@ -3360,9 +3360,9 @@ fn contract_mission_graph_cli_scores_change_actual_plan_and_refuse_invalid_snaps
             };
             let value = run(graph_command(&hash), true);
             let plan = &value["data"]["plan"];
-            assert_eq!(plan["plan_steps"][0]["target_bead_id"], selected);
+            assert_eq!(plan["steps"][0]["target"], selected);
             assert_eq!(plan["plan_status"], "actionable");
-            assert_eq!(plan["side_effects_executed"], false);
+            assert_eq!(value["data"]["side_effects_executed"], false);
             let selection = &plan["bead_work_selection"];
             assert_eq!(selection["selected_id"], selected);
             assert_eq!(selection["input_sha256"], hash);
