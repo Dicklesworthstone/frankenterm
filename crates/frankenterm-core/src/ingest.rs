@@ -3655,10 +3655,11 @@ pub fn has_alt_screen_change(text: &str) -> bool {
 // model where `kind: Delta` carries the incremental text and `kind: Gap`
 // carries a full snapshot when continuity is broken.
 //
-// The vendored subscribe_output API delivers chunks of bytes as they arrive
-// at the PTY. These are decoded to UTF-8 (lossy) and wrapped in StreamEvent
-// for channel delivery. The StreamIngester then maps each event through a
-// PaneCursor to assign monotonic seq numbers and detect gaps.
+// This standalone StreamEvent utility accepts decoded delta strings and maps
+// them through private PaneCursors. The production vendored path instead
+// delivers PaneDelta render-change projections (not raw PTY byte chunks) to
+// StreamingBridge, which issues through the runtime-owned cursor so durable
+// resume and persistence sequence corrections reach the actual producer.
 //
 // ## Backpressure Strategy
 //
