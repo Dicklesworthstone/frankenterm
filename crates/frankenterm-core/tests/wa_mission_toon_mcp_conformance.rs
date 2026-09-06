@@ -338,7 +338,12 @@ fn assert_matches_golden(name: &str, captures: &[ToolContractCapture]) {
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
 
-    if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
+    // Schema objects preserve every constraint but their member order is not
+    // part of the JSON contract. Compare parsed values, preserving array order
+    // and exact scalar types, rather than incidental map insertion order.
+    let expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    let canonical_value: Value = serde_json::from_str(&actual_text).expect("parse actual capture");
+    if expected_value != canonical_value {
         let actual_path = retain_actual_contract(&actual_text);
         panic!(
             "MCP mission TOON conformance golden drift detected. Review the diff between:\n  \

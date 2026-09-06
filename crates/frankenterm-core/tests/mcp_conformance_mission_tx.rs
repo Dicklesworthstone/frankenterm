@@ -144,10 +144,25 @@ impl LiveTxFixture {
         let (observer, ipc_task, ipc_shutdown, pane_ids) = runtime.block_on(async {
             let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned context");
             let client = mux.client();
-            let panes = client.list_panes_with_cx(&cx).await.unwrap();
-            assert_eq!(panes.len(), 1, "owned initial pane");
+            // Socket publication precedes initial domain attachment. Poll only
+            // the read side until that owned pane exists; never retry spawn.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let first = loop {
+                let panes = client.list_panes_with_cx(&cx).await.unwrap();
+                assert!(panes.len() <= 1, "unexpected panes in owned mux");
+                if let Some(pane) = panes.first() {
+                    break pane.pane_id;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "initial mux pane missing"
+                );
+                frankenterm_core::runtime_async::sleep_with_cx(&cx, Duration::from_millis(25))
+                    .await
+                    .unwrap();
+            };
             let second = client.spawn_with_cx(&cx, None, None).await.unwrap();
-            let pane_ids = [panes[0].pane_id, second];
+            let pane_ids = [first, second];
             assert_ne!(pane_ids[0], pane_ids[1]);
             let storage = frankenterm_core::storage::StorageHandle::new_with_cx(
                 &cx,
@@ -490,7 +505,11 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
 
-    if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
+    // Preserve schema constraints and response types; JSON object member order
+    // is not part of either contract. Array order remains significant.
+    let expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    let canonical_value: Value = serde_json::from_str(&actual_text).expect("parse actual capture");
+    if expected_value != canonical_value {
         let capture_dir = tempfile::Builder::new()
             .prefix("ft-mcp-mission-tx-capture-")
             .tempdir()

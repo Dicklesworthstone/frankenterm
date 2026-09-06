@@ -191,9 +191,18 @@ stop_children() {
   return 0
 }
 finish() { # status
-  local status="$1"
+  local status="$1" final_cli_sha final_mux_sha
   run_bounded "$FT" --version > "$D/cli-version.txt" 2> "$D/cli-version.err" || status=fail
   run_bounded "$MUX" --version > "$D/mux-version.txt" 2> "$D/mux-version.err" || status=fail
+  if ! final_cli_sha=$(file_sha "$FT") || ! final_mux_sha=$(file_sha "$MUX"); then
+    step source_identity fail "candidate binary bytes could not be reread at closeout"
+    status=fail
+  elif [ "$final_cli_sha" != "$CLI_SHA" ] || [ "$final_mux_sha" != "$MUX_SHA" ]; then
+    step source_identity fail "candidate binary bytes changed during the run"
+    status=fail
+  else
+    step source_identity pass "candidate binary hashes unchanged through closeout"
+  fi
   jq -n \
     --arg schema "ft.smoke.headless-mux-observe.v1" \
     --arg generated_at "$(date -u +%FT%TZ)" \
@@ -376,8 +385,6 @@ PY
   [ "$(file_sha "$D/pane-input.bin")" != "$BASE_INPUT_SHA" ] \
     || fail kill_switch_recovery "fresh allowed workflow did not reach PTY input"
   owned_running "$WATCH" || fail kill_switch_recovery "watcher was replaced or exited"
-  [ "$(file_sha "$FT")" = "$CLI_SHA" ] && [ "$(file_sha "$MUX")" = "$MUX_SHA" ] \
-    || fail source_identity "candidate binary bytes changed during the run"
   step kill_switch_recovery pass "fresh compaction trigger delivered after reset; no rejected send replay"
   stop_children
   finish pass || exit 1

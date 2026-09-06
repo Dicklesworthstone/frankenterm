@@ -21,7 +21,7 @@ record_command() {
 record_command "bash -n tests/e2e/test_e2e_shell_script_contract.sh"
 bash -n "${BASH_SOURCE[0]}"
 
-record_command "python3 isolated retention contract (extracted production shell; no real actors)"
+record_command "python3 isolated retention and smoke identity contracts (extracted production shell; no real actors)"
 python3 - "${ROOT_DIR}" "${ARTIFACT_DIR}" <<'PY'
 import hashlib
 import itertools
@@ -39,7 +39,7 @@ work = Path(tempfile.mkdtemp(prefix="retention-", dir=artifacts))
 checks = []
 paths = ["scripts/e2e_test.sh", "scripts/lib/e2e_artifacts.sh",
          "scripts/test_e2e_artifacts.sh", "tests/e2e/test_e2e_shell_script_contract.sh",
-         "docs/e2e-harness-spec.md"]
+         "docs/e2e-harness-spec.md", "scripts/smoke/headless-mux-observe.sh"]
 sources = {path: (root / path).read_text() for path in paths}
 baseline_ref = os.environ.get("FT_E2E_RETENTION_BASELINE_REF", "")
 if baseline_ref:
@@ -345,6 +345,57 @@ run("directory-redaction-failure", library + 'e2e_redact_secrets() { return 23; 
     {**pack_env, "TREE": tree}, expected=23)
 check((tree / ".hidden/credentials.txt").read_text() == "password=synthetic-secret\n",
       "directory:source_unchanged_after_failed_sanitization")
+
+# Exercise the actual common smoke finish and SHA reader against owned byte
+# fixtures. Only version output and step logging are fixture adapters; this
+# proves receipt identity rejection, never a real mux/CLI smoke result.
+smoke_source = sources["scripts/smoke/headless-mux-observe.sh"]
+def smoke_function(name):
+    start = smoke_source.index(f"{name}() {{")
+    end = smoke_source.index("\n}", start) + 2
+    return smoke_source[start:end] + "\n"
+
+smoke_body = smoke_function("file_sha") + smoke_function("finish") + r'''
+run_bounded() { printf '%s\n' 'isolated version fixture'; }
+log() { printf '%s\n' "$*"; }
+step() {
+    jq -cn --arg name "$1" --arg status "$2" --arg detail "$3" \
+        '{name:$name,status:$status,detail:$detail}' >> "$STEPS"
+}
+finish pass
+'''
+for mode, change in itertools.product(["0", "1"], ["unchanged", "cli", "mux", "unreadable"]):
+    fixture = Path(tempfile.mkdtemp(prefix="smoke-identity-", dir=work))
+    cli, mux = fixture / "ft", fixture / "frankenterm-mux-server"
+    cli.write_bytes(b"owned original CLI fixture\n")
+    mux.write_bytes(b"owned original mux fixture\n")
+    cli_sha = hashlib.sha256(cli.read_bytes()).hexdigest()
+    mux_sha = hashlib.sha256(mux.read_bytes()).hexdigest()
+    if change == "cli":
+        cli.write_bytes(b"replaced CLI bytes\n")
+    elif change == "mux":
+        mux.write_bytes(b"replaced mux bytes\n")
+    elif change == "unreadable":
+        # An absent path rejects the real SHA reader even for root; do not
+        # delete the original fixture or depend on permission-bit behavior.
+        cli = fixture / "missing-cli"
+    steps, receipt = fixture / "steps.jsonl", fixture / "receipt.json"
+    steps.write_text("")
+    run("smoke-identity-" + change, smoke_body, {
+        "D": fixture, "FT": cli, "MUX": mux, "PYTHON": sys.executable,
+        "CLI_SHA": cli_sha, "MUX_SHA": mux_sha, "STEPS": steps,
+        "RECEIPT": receipt, "KILL_SWITCH_SMOKE": mode,
+        "RELEASE_COMMIT": "0" * 40, "SOURCE_AUTHORITY": "isolated-shell-fixture",
+        "SOCK": fixture / "unused.socket", "CODEC_VERSION": "1", "BIN_DIR": fixture,
+    }, expected=0 if change == "unchanged" else 1)
+    recorded = json.loads(receipt.read_text())
+    expected = "pass" if change == "unchanged" else "fail"
+    check(recorded["status"] == expected, f"smoke_identity:{mode}:{change}:receipt_status")
+    check(recorded["cli_sha256"] == cli_sha and recorded["mux_sha256"] == mux_sha,
+          f"smoke_identity:{mode}:{change}:original_hashes_retained")
+    check(len(recorded["steps"]) == 1 and recorded["steps"][0]["name"] == "source_identity"
+          and recorded["steps"][0]["status"] == expected,
+          f"smoke_identity:{mode}:{change}:explicit_identity_step")
 
 check(all((root / path).read_text() == text for path, text in sources.items()),
       "source_files_unchanged_during_proof")
