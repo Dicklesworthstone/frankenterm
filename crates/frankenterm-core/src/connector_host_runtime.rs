@@ -122,6 +122,53 @@ fn valid_fcp_label(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/".contains(&byte))
 }
 
+// This client uses one identity for both the string-valued request ID and the
+// host's UUID-valued correlation ID. Accept the hyphenated UUID representation
+// only, so every accepted identity can deserialize as both upstream types.
+fn valid_fcp_request_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn validate_fcp_introspection(
+    response: &serde_json::Value,
+    operation: &FcpOperation,
+) -> Result<(), FcpTransportError> {
+    // FCP IntrospectionResponse wraps its operation descriptors in tools, and
+    // ToolDescriptor names are OperationInfo IDs. Bind the enclosing connector
+    // too: a matching operation name from another connector is not authority.
+    if response
+        .pointer("/connector/id")
+        .and_then(serde_json::Value::as_str)
+        != Some(operation.connector_id.as_str())
+    {
+        return Err(FcpTransportError::ProtocolInvalid);
+    }
+    let tools = response
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(FcpTransportError::ProtocolInvalid)?;
+    let mut found = false;
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(FcpTransportError::ProtocolInvalid)?;
+        found |= name == operation.operation;
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(FcpTransportError::Unavailable)
+    }
+}
+
 fn valid_input_pointer(input: &serde_json::Value, pointer: &str) -> bool {
     pointer.len() <= 1024 && pointer.starts_with('/') && input.pointer(pointer).is_some()
 }
@@ -298,6 +345,7 @@ impl FcpHostClient {
             .ok_or(FcpTransportError::InvalidConfig)
     }
 
+    /// `request_id` must be a hyphenated UUID; it is also the FCP correlation ID.
     pub async fn prepare_invocation(
         &self,
         cx: &crate::cx::Cx,
@@ -307,7 +355,7 @@ impl FcpHostClient {
         idempotency_key: &str,
     ) -> Result<PreparedFcpInvocation, FcpTransportError> {
         self.config.validate_operation(operation)?;
-        if !valid_fcp_label(request_id)
+        if !valid_fcp_request_id(request_id)
             || idempotency_key.len() != 64
             || !idempotency_key.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -414,17 +462,7 @@ impl FcpHostClient {
                 None,
             )
             .await?;
-        let operations = response
-            .get("operations")
-            .and_then(serde_json::Value::as_array)
-            .ok_or(FcpTransportError::ProtocolInvalid)?;
-        if !operations.iter().any(|candidate| {
-            candidate.get("id").and_then(serde_json::Value::as_str)
-                == Some(operation.operation.as_str())
-        }) {
-            return Err(FcpTransportError::Unavailable);
-        }
-        Ok(())
+        validate_fcp_introspection(&response, operation)
     }
 
     /// Call only after durable dispatch ownership is acquired. Any error,
@@ -1792,6 +1830,164 @@ pub enum ConnectorHostRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn introspection_operation() -> FcpOperation {
+        FcpOperation {
+            connector_id: "fcp.sqlite".to_string(),
+            operation: "sqlite.query".to_string(),
+            capability: ConnectorCapability::ReadState,
+            target: None,
+            input: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn fcp_wire_introspection_accepts_host_envelope() {
+        // Shape from fcp-host discovery.rs at 465f54120a806a1160b918e775710a6afd9a15bf.
+        // This is parser coverage, not a live host or provider receipt.
+        let response = serde_json::json!({
+            "connector": {"id": "fcp.sqlite"},
+            "tools": [{"name": "sqlite.execute"}, {"name": "sqlite.query"}],
+            "introspection": {"operations": [{"id": "sqlite.query"}]},
+        });
+        assert_eq!(
+            validate_fcp_introspection(&response, &introspection_operation()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fcp_wire_introspection_binds_connector_identity() {
+        for connector in [
+            serde_json::json!({"id": "fcp.other"}),
+            serde_json::json!({"id": 1}),
+            serde_json::json!({}),
+            serde_json::json!("fcp.sqlite"),
+            serde_json::Value::Null,
+        ] {
+            let response = serde_json::json!({
+                "connector": connector, "tools": [{"name": "sqlite.query"}],
+            });
+            assert_eq!(
+                validate_fcp_introspection(&response, &introspection_operation()),
+                Err(FcpTransportError::ProtocolInvalid)
+            );
+        }
+    }
+
+    #[test]
+    fn fcp_wire_introspection_rejects_legacy_root_operations() {
+        let response = serde_json::json!({
+            "connector": {"id": "fcp.sqlite"},
+            "operations": [{"id": "sqlite.query"}],
+        });
+        assert_eq!(
+            validate_fcp_introspection(&response, &introspection_operation()),
+            Err(FcpTransportError::ProtocolInvalid)
+        );
+    }
+
+    #[test]
+    fn fcp_wire_introspection_rejects_malformed_tools_even_after_match() {
+        for malformed in [
+            serde_json::json!({"name": 1}),
+            serde_json::json!({"id": "sqlite.query"}),
+            serde_json::Value::Null,
+        ] {
+            let response = serde_json::json!({
+                "connector": {"id": "fcp.sqlite"},
+                "tools": [{"name": "sqlite.query"}, malformed],
+            });
+            assert_eq!(
+                validate_fcp_introspection(&response, &introspection_operation()),
+                Err(FcpTransportError::ProtocolInvalid)
+            );
+        }
+    }
+
+    #[test]
+    fn fcp_wire_introspection_requires_requested_tool() {
+        for tools in [
+            serde_json::json!([]),
+            serde_json::json!([{"name": "sqlite.execute"}]),
+        ] {
+            let response = serde_json::json!({"connector": {"id": "fcp.sqlite"}, "tools": tools});
+            assert_eq!(
+                validate_fcp_introspection(&response, &introspection_operation()),
+                Err(FcpTransportError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn fcp_wire_request_id_accepts_hyphenated_uuid() {
+        assert!(valid_fcp_request_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(valid_fcp_request_id("550E8400-E29B-41D4-A716-446655440000"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fcp_wire_prepare_rejects_label_before_async_credential_work() {
+        use std::future::Future;
+
+        let mut operation = introspection_operation();
+        operation.input = serde_json::json!({"cursor": 0});
+        let config = FcpTransportConfig {
+            endpoint: "http://127.0.0.1:9".to_string(),
+            // A character device can never be an authorized regular secret
+            // file. This path must not be inspected for an invalid request ID.
+            capability_token_file: "/dev/null".into(),
+            admin_token_file: "/dev/null".into(),
+            request_timeout_ms: 30_000,
+            max_payload_bytes: 4096,
+            max_pending_actions: 1,
+            max_retained_actions: 1,
+            max_ingress_batch: 1,
+            outbound: Vec::new(),
+            inbound: vec![FcpInboundSubscription {
+                subscription_id: "poll".to_string(),
+                invoke: operation.clone(),
+                pane_id: 0,
+                records_pointer: "/rows".to_string(),
+                identity_pointer: "/id".to_string(),
+                cursor_input_pointer: "/cursor".to_string(),
+                poll_interval_ms: 100,
+            }],
+        };
+        let client = FcpHostClient::new(config, &ConnectorHostConfig::default()).unwrap();
+        let cx = crate::cx::Cx::for_testing();
+        let key = "a".repeat(64);
+        // No executor or I/O task is started: invalid identity must settle on
+        // its first poll before spawn_blocking or any credential/network work.
+        let mut future = std::pin::pin!(client.prepare_invocation(
+            &cx,
+            client.operation_deadline().unwrap(),
+            &operation,
+            "request-1",
+            &key,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(FcpTransportError::InvalidConfig))
+        ));
+    }
+
+    #[test]
+    fn fcp_wire_request_id_rejects_labels_and_malformed_uuid() {
+        for value in [
+            "request-1",
+            "",
+            "550e8400e29b41d4a716446655440000",
+            "550e8400_e29b-41d4-a716-446655440000",
+            "550e8400-e29b-41d4-a716-44665544000g",
+            "550e8400-e29b-41d4-a716-44665544000",
+            "550e8400-e29b-41d4-a716-4466554400000",
+            "é50e8400-e29b-41d4-a716-44665544000",
+        ] {
+            assert!(!valid_fcp_request_id(value), "accepted {value:?}");
+        }
+    }
 
     fn usage_within_budget() -> ConnectorRuntimeUsage {
         ConnectorRuntimeUsage {
