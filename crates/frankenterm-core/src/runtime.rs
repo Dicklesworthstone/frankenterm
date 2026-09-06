@@ -2016,9 +2016,16 @@ async fn forward_vendored_streaming_delta(
             Ok(event) => event,
             Err(error) => return Some(format!("capture authority rejected stream: {error}")),
         };
-        permit
+        if permit
             .expect("nonempty streaming capture reserves ingress capacity")
-            .send(event);
+            .try_send(event)
+            .is_err()
+        {
+            // The receiver can close after reservation, including while we
+            // wait for the cursor lock. Never report this capture as sent or
+            // rewind an issued sequence that persistence may have corrected.
+            return Some("capture ingress closed".to_string());
+        }
     }
 
     exit_reason
@@ -17097,6 +17104,56 @@ mod tests {
             assert_eq!(exit_reason.as_deref(), Some("capture ingress closed"));
             assert_eq!(cursors.read().await[&9].next_seq, 41);
             assert_eq!(bridge.events_processed(), 0);
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn forward_vendored_streaming_reports_receiver_close_after_reservation() {
+        run_async_test(async {
+            let (capture_tx, capture_rx) = mpsc::channel::<CaptureEvent>(1);
+            let loop_cx = runtime_loop_cx();
+            let mut bridge = StreamingBridge::new();
+            let lease = test_capture_lease(9, CaptureSourceKind::VendoredStreaming);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(
+                9,
+                PaneCursor::from_seq(9, 41),
+            )])));
+            let identity = test_streaming_identity(9, 9, 0, 0, &lease);
+            let cursor_guard = cursors.write().await;
+            let exit_reason = {
+                let mut forward = std::pin::pin!(forward_vendored_streaming_delta(
+                    &loop_cx,
+                    &mut bridge,
+                    &capture_tx,
+                    &cursors,
+                    &identity,
+                    &lease,
+                    PaneDelta::Output {
+                        pane_id: 9,
+                        seqno: 1,
+                        delta_text: "receiver closes after reservation".to_string(),
+                        title: "bash".to_string(),
+                        dirty_range_count: 1,
+                        dirty_row_count: 1,
+                    },
+                ));
+                assert!(futures::poll!(&mut forward).is_pending());
+                assert_eq!(
+                    capture_tx
+                        .telemetry_snapshot(9)
+                        .reserved_uncommitted_obligations,
+                    1,
+                    "forward must hold the send slot"
+                );
+                assert_eq!(cursor_guard[&9].next_seq, 41);
+                drop(capture_rx);
+                drop(cursor_guard);
+                forward.await
+            };
+            assert_eq!(exit_reason.as_deref(), Some("capture ingress closed"));
+            assert_eq!(cursors.read().await[&9].next_seq, 42);
+            assert_eq!(bridge.events_processed(), 1);
         });
     }
 
