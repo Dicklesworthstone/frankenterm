@@ -12,6 +12,16 @@ use frankenterm_core::tailer::{
 };
 use std::time::Duration;
 
+fn tailer_proptest_config(cases: u32) -> ProptestConfig {
+    let mut config = ProptestConfig::with_cases(cases);
+    // Integration tests are siblings of src/, so retain the default fallback
+    // regression path explicitly instead of searching ancestors for lib.rs.
+    config.failure_persistence = Some(Box::new(
+        proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+    ));
+    config
+}
+
 // ─── Strategies ──────────────────────────────────────────────────────
 
 fn arb_capture_budget() -> impl Strategy<Value = CaptureBudgetConfig> {
@@ -106,7 +116,7 @@ fn arb_ready_panes() -> impl Strategy<Value = Vec<(u64, u32)>> {
 // ─── SchedulerSnapshot serde roundtrip ──────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     #[test]
     fn scheduler_snapshot_serde_roundtrip(snap in arb_scheduler_snapshot()) {
@@ -130,7 +140,7 @@ proptest! {
 
 #[cfg(feature = "semantic-search")]
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     #[test]
     fn scheduler_snapshot_serde_msgpack_roundtrip(snap in arb_scheduler_snapshot()) {
@@ -155,7 +165,7 @@ proptest! {
 // ─── CaptureScheduler: unlimited budget allows everything ───────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     #[test]
     fn unlimited_budget_allows_all_panes(
@@ -218,7 +228,7 @@ proptest! {
 // ─── CaptureScheduler: select_panes invariants ──────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(300))]
+    #![proptest_config(tailer_proptest_config(300))]
 
     #[test]
     fn select_panes_never_exceeds_permits(
@@ -377,7 +387,7 @@ proptest! {
 // ─── CaptureScheduler: budget depletion monotonicity ────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     #[test]
     fn capture_budget_depletes_monotonically(
@@ -456,7 +466,7 @@ proptest! {
 // ─── CaptureScheduler: metrics invariants ───────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     #[test]
     fn throttle_events_geq_rate_limited_plus_byte_exceeded(
@@ -542,7 +552,7 @@ proptest! {
 // ─── CaptureScheduler: per-pane tracking ────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     #[test]
     fn record_capture_tracks_all_panes(
@@ -608,7 +618,7 @@ proptest! {
 // ─── CaptureScheduler: update_budget preserves window ───────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(tailer_proptest_config(100))]
 
     #[test]
     fn update_budget_preserves_metrics(
@@ -648,7 +658,7 @@ proptest! {
 // ─── TailerConfig structural invariants ─────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(tailer_proptest_config(100))]
 
     #[test]
     fn tailer_config_min_leq_max(config in arb_tailer_config()) {
@@ -723,7 +733,7 @@ fn tailer_mode_equality() {
 // ─── StreamingBridge counter monotonicity ────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(tailer_proptest_config(100))]
 
     #[test]
     fn streaming_bridge_fallback_count_monotonic(n in 1u32..100) {
@@ -779,7 +789,7 @@ fn streaming_bridge_default_eq_new() {
 // ─── CaptureScheduler: combined stress test ─────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(tailer_proptest_config(100))]
 
     /// Interleaved select_panes + record_capture + check_global_budget
     /// should never panic and metrics should remain consistent.
@@ -899,7 +909,7 @@ fn arb_mixed_priority_panes() -> impl Strategy<Value = Vec<(u64, u32)>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(tailer_proptest_config(200))]
 
     /// Low-priority panes (priority > 50) get at least 20% of slots
     /// when they exist and there are enough permits.
@@ -1049,7 +1059,7 @@ fn arb_streaming_health() -> impl Strategy<Value = StreamingHealth> {
 // ─── TailerMode serde ─────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(tailer_proptest_config(100))]
 
     /// TailerMode serde JSON roundtrip.
     #[test]
@@ -1091,7 +1101,7 @@ proptest! {
 // ─── StreamingHealth serde ────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(tailer_proptest_config(50))]
 
     /// StreamingHealth serde JSON roundtrip preserves all fields.
     #[test]
