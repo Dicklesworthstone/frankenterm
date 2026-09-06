@@ -123,7 +123,7 @@ fn time_small_recover(skip: bool, idx: usize) -> (u128, WalRecoveryAction) {
     let (_writer, path) = small_dirty_wal(&dir, &format!("small_{skip}_{idx}.db"));
     let db_path = path.to_string_lossy().to_string();
     let conn = Connection::open(&path).expect("open backend conn");
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("install WAL startup fixture authorizer");
     let start = Instant::now();
     let action = check_and_recover_wal_inner(&backend, &db_path, skip).expect("recover ok");
     let ns = start.elapsed().as_nanos();
@@ -197,11 +197,13 @@ fn wal_skip_startup_time_ab_and_no_regression() {
     let clean_path = clean_db(&clean_dir, "clean.db");
     let clean_db_path = clean_path.to_string_lossy().to_string();
     let clean_off = {
-        let backend = RusqliteBackend::new(Connection::open(&clean_path).unwrap());
+        let backend = RusqliteBackend::new(Connection::open(&clean_path).unwrap())
+            .expect("install clean WAL fixture authorizer");
         check_and_recover_wal_inner(&backend, &clean_db_path, false).expect("clean off")
     };
     let clean_on = {
-        let backend = RusqliteBackend::new(Connection::open(&clean_path).unwrap());
+        let backend = RusqliteBackend::new(Connection::open(&clean_path).unwrap())
+            .expect("install clean WAL fixture authorizer");
         check_and_recover_wal_inner(&backend, &clean_db_path, true).expect("clean on")
     };
     assert_eq!(
@@ -213,14 +215,16 @@ fn wal_skip_startup_time_ab_and_no_regression() {
     let (_lw_off, large_off_path) = large_dirty_wal(&large_dir, "large_off.db");
     let large_off_db = large_off_path.to_string_lossy().to_string();
     let large_off = {
-        let backend = RusqliteBackend::new(Connection::open(&large_off_path).unwrap());
+        let backend = RusqliteBackend::new(Connection::open(&large_off_path).unwrap())
+            .expect("install large WAL fixture authorizer");
         check_and_recover_wal_inner(&backend, &large_off_db, false).expect("large off")
     };
     let large_dir2 = tempfile::tempdir().expect("tempdir");
     let (_lw_on, large_on_path) = large_dirty_wal(&large_dir2, "large_on.db");
     let large_on_db = large_on_path.to_string_lossy().to_string();
     let large_on = {
-        let backend = RusqliteBackend::new(Connection::open(&large_on_path).unwrap());
+        let backend = RusqliteBackend::new(Connection::open(&large_on_path).unwrap())
+            .expect("install large WAL fixture authorizer");
         check_and_recover_wal_inner(&backend, &large_on_db, true).expect("large on")
     };
     assert_eq!(

@@ -288,10 +288,14 @@ fn bocpd_chunks() -> [&'static str; 4] {
 
 fn recover_wal_once(path: &Path) {
     let conn = Connection::open(path).expect("open WAL recovery profile DB");
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("install WAL recovery profile authorizer");
     let db_path = path.to_string_lossy();
     check_and_recover_wal(&backend, &db_path).expect("WAL recovery must succeed");
-    black_box(backend.into_connection());
+    black_box(
+        backend
+            .into_connection()
+            .expect("reclaim reusable WAL recovery profile connection"),
+    );
 }
 
 fn clean_wal_case(idx: usize) -> WalCase {

@@ -15415,7 +15415,7 @@ mod writer_io_scheduler_tests {
     fn real_writer_backend_with_panes(pane_ids: &[u64]) -> RusqliteBackend {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory writer database");
         initialize_schema(&conn).expect("initialize writer test schema");
-        let backend = RusqliteBackend::new(conn);
+        let backend = RusqliteBackend::new(conn).expect("install writer test authorizer");
         seed_writer_test_panes(&backend, pane_ids);
         backend
     }
@@ -16321,7 +16321,8 @@ mod writer_io_scheduler_tests {
         reset_storage_writer_panics_total_for_test();
 
         run_storage_async_test(async {
-            let backend = RusqliteBackend::new(rusqlite::Connection::open_in_memory().unwrap());
+            let backend = RusqliteBackend::new(rusqlite::Connection::open_in_memory().unwrap())
+                .expect("install writer test authorizer");
             let mut gate = tiny_writer_gate();
             let mut should_break = false;
             let mut mmap_mirror = None;
@@ -32771,9 +32772,9 @@ fn memory_backend() -> RusqliteBackend {
         ..OpenConfig::default()
     };
     let backend = RusqliteBackend::open(":memory:", &config).unwrap();
-    let conn = backend.into_connection();
+    let conn = backend.into_connection().expect("reclaim FTS test connection");
     initialize_schema(&conn).unwrap();
-    RusqliteBackend::new(conn)
+    RusqliteBackend::new(conn).expect("install FTS test authorizer")
 }
 
 fn seed_pane_backend(backend: &dyn StorageBackend, pane_id: i64, now_ms: i64) {

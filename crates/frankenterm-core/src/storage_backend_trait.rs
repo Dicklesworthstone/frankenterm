@@ -861,11 +861,22 @@ impl Drop for AuthorizerPhaseReset<'_> {
 pub type RusqliteAuthorizerPolicy =
     dyn for<'r> Fn(AuthContext<'r>) -> Authorization + Send + Sync + 'static;
 
+#[cfg(test)]
+thread_local! {
+    // Inject only the next installation on this test thread. This exercises
+    // propagation, not a claim that an owned SQLite handle failed natively.
+    static FAIL_NEXT_AUTHORIZER_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn install_rusqlite_backend_authorizer(
     conn: &rusqlite::Connection,
     phase: Arc<AtomicU8>,
     policy: Arc<RusqliteAuthorizerPolicy>,
 ) -> rusqlite::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_AUTHORIZER_INSTALL.with(|fail| fail.replace(false)) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     conn.authorizer(Some(move |context: AuthContext<'_>| {
         let control = callback_transaction_control_is_forbidden(context);
         match (phase.load(Ordering::Acquire), control) {
@@ -1659,7 +1670,9 @@ impl RusqliteBackend {
     /// Call [`Self::new_with_authorizer`] instead when the transferred
     /// connection must retain an application policy alongside the backend's
     /// transaction-control fence.
-    pub fn new(conn: rusqlite::Connection) -> Self {
+    /// Installation failure drops the transferred connection and returns an
+    /// error; a backend without its authorizer is never exposed.
+    pub fn new(conn: rusqlite::Connection) -> Result<Self, BackendError> {
         Self::new_with_authorizer(conn, |_| Authorization::Allow)
     }
 
@@ -1670,7 +1683,10 @@ impl RusqliteBackend {
     /// backend's own outer BEGIN/COMMIT/ROLLBACK are admitted in a separate
     /// internal phase. Every unrelated action is delegated to `policy` in all
     /// phases, and external transaction control is delegated normally.
-    pub fn new_with_authorizer<F>(conn: rusqlite::Connection, policy: F) -> Self
+    pub fn new_with_authorizer<F>(
+        conn: rusqlite::Connection,
+        policy: F,
+    ) -> Result<Self, BackendError>
     where
         F: for<'r> Fn(AuthContext<'r>) -> Authorization + Send + Sync + 'static,
     {
@@ -1681,9 +1697,11 @@ impl RusqliteBackend {
             Arc::clone(&authorizer_phase),
             Arc::clone(&authorizer_policy),
         )
-        .unwrap_or_else(|error| panic!("failed to install storage authorizer: {error}"));
+        .map_err(|error| {
+            BackendError::Connect(format!("failed to install storage authorizer: {error}"))
+        })?;
 
-        Self {
+        Ok(Self {
             conn: Mutex::new(conn),
             transaction_active: AtomicBool::new(false),
             authorizer_phase,
@@ -1691,7 +1709,7 @@ impl RusqliteBackend {
             quarantined: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_rollback: AtomicBool::new(false),
-        }
+        })
     }
 
     /// Reclaim the wrapped `rusqlite::Connection`. Used by the
@@ -1701,22 +1719,14 @@ impl RusqliteBackend {
     ///
     /// An ordinary mutex poison is recoverable only when SQLite authoritatively
     /// reports autocommit. Reclaiming a quarantined or transaction-active
-    /// connection panics instead of leaking an unsafe handle through this
-    /// legacy infallible API.
-    #[must_use]
-    pub fn into_connection(self) -> rusqlite::Connection {
-        self.try_into_connection().unwrap_or_else(|_| {
-            panic!("refusing to reclaim quarantined or transaction-active storage connection")
-        })
-    }
-
-    /// Reclaim the connection only when its backend epoch is proven reusable.
+    /// connection returns [`BackendError::TxPoisoned`] instead of leaking an
+    /// unsafe handle or panicking.
     ///
     /// On error the rejected connection is dropped, which lets SQLite close
     /// and roll back without exposing an indeterminate epoch to a caller or
-    /// pool. Use this fallible form at cleanup boundaries that must preserve an
+    /// pool. Use this at cleanup boundaries that must preserve an
     /// already-caught callback panic.
-    pub fn try_into_connection(self) -> Result<rusqlite::Connection, BackendError> {
+    pub fn into_connection(self) -> Result<rusqlite::Connection, BackendError> {
         let quarantined = self.quarantined.load(Ordering::Acquire);
         let authorizer_policy = Arc::clone(&self.authorizer_policy);
         let conn = match self.conn.into_inner() {
@@ -1911,7 +1921,7 @@ impl RusqliteBackend {
             conn.pragma_update(None, "page_size", page_size as i64)
                 .map_err(|e| BackendError::Connect(format!("page_size pragma: {e}")))?;
         }
-        Ok(Self::new(conn))
+        Self::new(conn)
     }
 }
 
@@ -1929,7 +1939,11 @@ where
         ))
     })?;
     let original = std::mem::replace(conn, placeholder);
-    let backend = RusqliteBackend::new(original);
+    let backend = RusqliteBackend::new(original).map_err(|error| {
+        crate::error::StorageError::Database(format!(
+            "failed to wrap connection for storage test loan: {error}"
+        ))
+    })?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&backend)));
     let mut callback_leaked_transaction = false;
     let cleanup = match backend.transaction_state() {
@@ -1940,7 +1954,7 @@ where
         }
         Err(error) => Err(error),
     };
-    let restoration_failed = match backend.try_into_connection() {
+    let restoration_failed = match backend.into_connection() {
         Ok(restored) => {
             let placeholder = std::mem::replace(conn, restored);
             drop(placeholder);
@@ -2444,7 +2458,8 @@ mod tests {
         // poisons the mutex deliberately and pins the new
         // poison-recovering behavior.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let backend = std::sync::Arc::new(RusqliteBackend::new(conn));
+        let backend =
+            std::sync::Arc::new(RusqliteBackend::new(conn).expect("install test authorizer"));
 
         // Poison the mutex by panicking inside a held lock from
         // another thread. After this, `Mutex::into_inner` would
@@ -2464,7 +2479,9 @@ mod tests {
 
         // The pre-fix `expect()` would have panicked here. The
         // post-fix recovery path returns the Connection.
-        let recovered = backend.into_connection();
+        let recovered = backend
+            .into_connection()
+            .expect("reclaim autocommit connection");
         // Connection is functional — we can run a trivial query.
         let one: i64 = recovered
             .query_row("SELECT 1", [], |row| row.get(0))
@@ -2845,6 +2862,100 @@ mod tests {
 
     fn open_memory() -> RusqliteBackend {
         RusqliteBackend::open(":memory:", &OpenConfig::default()).expect("open in-memory rusqlite")
+    }
+
+    fn with_authorizer_install_failure<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_NEXT_AUTHORIZER_INSTALL.with(|fail| fail.set(false));
+            }
+        }
+        assert!(!FAIL_NEXT_AUTHORIZER_INSTALL.with(|fail| fail.replace(true)));
+        let _reset = Reset;
+        let result = f();
+        assert!(
+            !FAIL_NEXT_AUTHORIZER_INSTALL.with(std::cell::Cell::get),
+            "the public constructor must reach the installation boundary"
+        );
+        result
+    }
+
+    #[test]
+    fn rusqlite_backend_constructors_propagate_injected_authorizer_failure() {
+        // Propagation-only fault injection: an ordinary owned SQLite handle
+        // does not provide a safe native trigger for authorizer-install failure.
+        let config = OpenConfig {
+            wal_mode: false,
+            ..OpenConfig::default()
+        };
+        for constructor in 0..4 {
+            let result = with_authorizer_install_failure(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match constructor {
+                    0 => RusqliteBackend::new(rusqlite::Connection::open_in_memory().unwrap()),
+                    1 => RusqliteBackend::new_with_authorizer(
+                        rusqlite::Connection::open_in_memory().unwrap(),
+                        |_| Authorization::Allow,
+                    ),
+                    2 => RusqliteBackend::open(":memory:", &config),
+                    _ => RusqliteBackend::open_path(Path::new(":memory:"), &config),
+                }))
+                .expect("installation failure must not unwind")
+            });
+            assert!(matches!(result, Err(BackendError::Connect(message))
+                if message.starts_with("failed to install storage authorizer:")));
+
+            // A subsequent real construction must work, including reclaim.
+            let backend = open_memory();
+            backend
+                .execute("CREATE TABLE healthy (id INTEGER)")
+                .unwrap();
+            backend.execute("INSERT INTO healthy VALUES (7)").unwrap();
+            let conn = backend
+                .into_connection()
+                .expect("reclaim healthy connection");
+            let value: i64 = conn
+                .query_row("SELECT id FROM healthy", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, 7);
+        }
+    }
+
+    #[test]
+    fn rusqlite_backend_reclaim_rejects_active_transaction_without_unwinding() {
+        for begin_before_wrap in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("active-reclaim.sqlite3");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE preserved (id INTEGER);")
+                .unwrap();
+            if begin_before_wrap {
+                conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO preserved VALUES (1);")
+                    .unwrap();
+            }
+            let backend = RusqliteBackend::new(conn).expect("install authorizer");
+            if !begin_before_wrap {
+                backend
+                    .execute_batch("BEGIN IMMEDIATE; INSERT INTO preserved VALUES (1);")
+                    .unwrap();
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backend.into_connection()
+            }))
+            .expect("active connection reclaim must return an error without unwinding");
+            assert!(matches!(result, Err(BackendError::TxPoisoned)));
+            let observer = rusqlite::Connection::open(&path).unwrap();
+            let count: i64 = observer
+                .query_row("SELECT COUNT(*) FROM preserved", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "rejecting the handle must roll back its uncommitted writes"
+            );
+            observer
+                .execute("INSERT INTO preserved VALUES (2)", [])
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3240,7 +3351,8 @@ mod tests {
             } else {
                 Authorization::Allow
             }
-        });
+        })
+        .expect("install deletion policy");
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
         let callback_result = backend.with_transaction(|tx| {
             tx.execute("INSERT INTO t VALUES (1)")?;
@@ -3279,7 +3391,8 @@ mod tests {
             } else {
                 Authorization::Allow
             }
-        });
+        })
+        .expect("install transaction policy");
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
 
         assert!(matches!(
@@ -3363,7 +3476,8 @@ mod tests {
                 policy_reads.fetch_add(1, Ordering::AcqRel);
             }
             Authorization::Allow
-        });
+        })
+        .expect("install prepare-counting policy");
         const QUERY: &str = "SELECT id FROM t WHERE id = 1";
 
         assert_eq!(backend.query_scalar(QUERY).unwrap().as_deref(), Some("1"));
@@ -3507,11 +3621,12 @@ mod tests {
             } else {
                 Authorization::Allow
             }
-        });
+        })
+        .expect("install deletion policy");
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
         backend.execute("INSERT INTO t VALUES (1)").unwrap();
 
-        let conn = backend.try_into_connection().unwrap();
+        let conn = backend.into_connection().unwrap();
         assert!(conn.execute("DELETE FROM t", []).is_err());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
@@ -3717,14 +3832,10 @@ mod tests {
             Err(BackendError::TxPoisoned)
         ));
 
-        let reclaim = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = backend.into_connection();
-        }));
-        let payload = reclaim.expect_err("quarantined connection must not escape");
-        assert_eq!(
-            payload.downcast_ref::<&'static str>().copied(),
-            Some("refusing to reclaim quarantined or transaction-active storage connection")
-        );
+        let reclaim =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.into_connection()))
+                .expect("quarantined reclaim must return an error without unwinding");
+        assert!(matches!(reclaim, Err(BackendError::TxPoisoned)));
     }
 
     #[test]

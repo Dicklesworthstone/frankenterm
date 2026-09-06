@@ -63,7 +63,7 @@ fn test_pane(pane_id: u64) -> PaneRecord {
 fn memory_pane_backend() -> RusqliteBackend {
     let conn = Connection::open_in_memory().expect("open in-memory pane query database");
     initialize_schema(&conn).expect("initialize pane query schema");
-    RusqliteBackend::new(conn)
+    RusqliteBackend::new(conn).expect("initialize pane query backend")
 }
 
 fn test_event(pane_id: u64) -> StoredEvent {
@@ -453,7 +453,8 @@ fn query_panes_by_ids_empty_does_not_touch_the_backend() {
     // the empty-input fast path returns before attempting a SQL query.
     let backend = RusqliteBackend::new(
         Connection::open_in_memory().expect("open schema-free in-memory database"),
-    );
+    )
+    .expect("initialize schema-free backend");
 
     let panes =
         query_panes_by_ids_backend(&backend, Vec::new()).expect("empty query should succeed");
@@ -546,7 +547,8 @@ fn query_panes_by_ids_rejects_out_of_range_id_before_querying() {
     // before any prefix query is issued.
     let backend = RusqliteBackend::new(
         Connection::open_in_memory().expect("open schema-free in-memory database"),
-    );
+    )
+    .expect("initialize schema-free backend");
 
     let out_of_range = u64::MAX;
     let error = query_panes_by_ids_backend(&backend, vec![1, out_of_range])
@@ -1472,7 +1474,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
     );
     drop(tx);
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize storage test backend");
     let queued_depth = AtomicUsize::new(3);
     let terminal_drain_wakeup = WriterWakeup::new();
     let terminal_state = AtomicU8::new(WRITER_TERMINAL_HEALTHY);
@@ -1489,7 +1491,9 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
         None,
         false,
     );
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim storage test connection");
 
     let segment_count: i64 = conn
         .query_row(
@@ -2455,7 +2459,7 @@ fn checkpoint_backend_works_directly() {
             )
             .unwrap();
 
-        let backend = RusqliteBackend::new(conn);
+        let backend = RusqliteBackend::new(conn).expect("initialize storage test backend");
         let result = checkpoint_backend(&backend).unwrap();
         assert!(result.wal_pages >= 0);
         assert!(result.optimized);
@@ -2681,11 +2685,13 @@ fn fts_integrity_check_on_healthy_db() {
             [],
         ).unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize storage test backend");
     let ok = check_fts_integrity_backend(&backend).unwrap();
     assert!(ok, "Healthy FTS should pass integrity check");
 
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim storage test connection");
     drop(conn);
     let _ = std::fs::remove_file(&db_path);
 }

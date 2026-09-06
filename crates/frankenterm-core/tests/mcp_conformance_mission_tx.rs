@@ -17,11 +17,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[cfg(all(unix, feature = "vendored"))]
+#[path = "common/wezterm_subprocess.rs"]
+mod owned_mux;
+
 struct TestHarness {
-    _cwd_lock: MutexGuard<'static, ()>,
-    _workspace_guard: WorkspaceRootGuard,
-    workspace: tempfile::TempDir,
     client: FrameworkTestClient,
+    #[cfg(all(unix, feature = "vendored"))]
+    live: Option<LiveTxFixture>,
+    workspace: tempfile::TempDir,
+    _workspace_guard: WorkspaceRootGuard,
+    // Fields drop in declaration order: restore cwd before another test can
+    // acquire this process-wide lock and enter its own workspace.
+    _cwd_lock: MutexGuard<'static, ()>,
 }
 
 #[derive(Serialize)]
@@ -59,10 +67,8 @@ fn workspace_root_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let mut config = Config::default();
-    config.safety.require_prompt_active = false;
-    let server = build_server_with_db(&config, db_path).expect("build MCP server");
+fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> FrameworkTestClient {
+    let server = build_server_with_db(config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
         server.run_transport_returning(server_transport);
@@ -77,16 +83,254 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
 
 fn new_harness() -> TestHarness {
     let cwd_lock = workspace_root_lock();
-    let workspace = tempfile::tempdir().expect("create temp workspace");
+    let workspace = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .expect("create retained temp workspace");
     fs::create_dir_all(workspace.path().join(".ft/mission")).expect("create mission dir");
     let workspace_guard = WorkspaceRootGuard::new(workspace.path());
-    let client = spawn_client(Some(workspace.path().join("mcp.sqlite3")));
+    let mut config = Config::default();
+    config.safety.require_prompt_active = false;
+    config.general.workspace = Some(workspace.path().display().to_string());
+    let client = spawn_client(
+        &config,
+        Some(config.workspace_layout(None).unwrap().db_path),
+    );
     TestHarness {
+        #[cfg(all(unix, feature = "vendored"))]
+        live: None,
         _cwd_lock: cwd_lock,
         _workspace_guard: workspace_guard,
         workspace,
         client,
     }
+}
+
+/// Uses the actual mux, observation runtime, persisted capture and IPC server.
+/// No pane records or capabilities are planted. The explicit mux artifact must
+/// be built from the same source by the invoking RCH/DSR proof lane.
+#[cfg(all(unix, feature = "vendored"))]
+struct LiveTxFixture {
+    runtime: frankenterm_core::runtime_async::Runtime,
+    observer: Option<frankenterm_core::runtime::RuntimeHandle>,
+    ipc_task: Option<frankenterm_core::watchdog::WatchdogHandle>,
+    ipc_shutdown: frankenterm_core::runtime_async::mpsc::Sender<()>,
+    mux: owned_mux::WeztermSubprocessFixture,
+    pane_ids: [u64; 2],
+}
+
+#[cfg(all(unix, feature = "vendored"))]
+impl LiveTxFixture {
+    fn start(config: &mut Config) -> Self {
+        use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Disable terminal echo so readback proves the PTY program consumed
+        // each complete command, rather than merely observing input echo.
+        let mux = owned_mux::WeztermSubprocessFixture::spawn_with_default_prog(&[
+            "/bin/sh",
+            "-c",
+            "stty -echo; printf 'TX_READY\\n'; while IFS= read -r line; do printf 'TX_ACK:%s\\n' \"$line\"; done",
+        ])
+        .expect("same-source owned mux artifact required");
+        config.vendored.mux_socket_path = Some(mux.socket_path().display().to_string());
+        let layout = config.workspace_layout(None).unwrap();
+        let runtime = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build live transaction runtime");
+        let (observer, ipc_task, ipc_shutdown, pane_ids) = runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned context");
+            let client = mux.client();
+            let panes = client.list_panes_with_cx(&cx).await.unwrap();
+            assert_eq!(panes.len(), 1, "owned initial pane");
+            let second = client.spawn_with_cx(&cx, None, None).await.unwrap();
+            let pane_ids = [panes[0].pane_id, second];
+            assert_ne!(pane_ids[0], pane_ids[1]);
+            let storage = frankenterm_core::storage::StorageHandle::new_with_cx(
+                &cx,
+                layout.db_path.to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            let event_bus = Arc::new(frankenterm_core::events::EventBus::new(64));
+            let server =
+                frankenterm_core::ipc::IpcServer::bind_with_cx(&cx, &layout.ipc_socket_path)
+                    .await
+                    .unwrap();
+            let mut observation = frankenterm_core::runtime::ObservationRuntime::new(
+                frankenterm_core::runtime::RuntimeConfig {
+                    discovery_interval: Duration::from_millis(50),
+                    capture_interval: Duration::from_millis(50),
+                    min_capture_interval: Duration::from_millis(25),
+                    vendored_mux_socket_paths: vec![mux.socket_path().to_path_buf()],
+                    ..Default::default()
+                },
+                storage,
+                Arc::new(RwLock::new(frankenterm_core::patterns::PatternEngine::new())),
+            )
+            .with_wezterm_handle(mux.handle())
+            .with_event_bus(Arc::clone(&event_bus));
+            let observer = observation.start_with_cx(&cx).await.unwrap();
+            let registry = Arc::clone(&observer.registry);
+            let (ipc_shutdown, shutdown_rx) = mpsc::channel(1);
+            let ipc_task = frankenterm_core::runtime_async::task::spawn(async move {
+                server
+                    .run_with_registry_with_cx(&cx, event_bus, registry, shutdown_rx)
+                    .await;
+            });
+            let ipc_task = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                ipc_task,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            (observer, ipc_task, ipc_shutdown, pane_ids)
+        });
+        let fixture = Self {
+            runtime,
+            observer: Some(observer),
+            ipc_task: Some(ipc_task),
+            ipc_shutdown,
+            mux,
+            pane_ids,
+        };
+        fixture.wait_for_ready(&layout.ipc_socket_path);
+        fixture
+    }
+
+    fn wait_for_ready(&self, socket: &Path) {
+        use frankenterm_core::runtime_async::{CompatRuntime, sleep_with_cx};
+        use std::time::{Duration, Instant};
+        self.runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut ipc = frankenterm_core::ipc::IpcClient::new(socket);
+            ipc.set_token(None);
+            let storage = &self.observer.as_ref().unwrap().storage;
+            for pane_id in self.pane_ids {
+                loop {
+                    let state = ipc.pane_state_with_cx(&cx, pane_id).await.unwrap();
+                    let data = state.data.as_ref().unwrap();
+                    let segments = storage.get_segments(pane_id, 16).await.unwrap();
+                    if state.ok
+                        && data["known"] == true
+                        && data["observed"] == true
+                        && data["in_gap"] == false
+                        && (data["cursor_alt_screen"] == false
+                            || (data["last_status_at"].is_number() && data["alt_screen"] == false))
+                        && segments
+                            .iter()
+                            .any(|segment| segment.content.contains("TX_READY"))
+                    {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "live pane not ready: {state:?}");
+                    sleep_with_cx(&cx, Duration::from_millis(25)).await.unwrap();
+                }
+            }
+        });
+    }
+
+    fn assert_consumed(&self, step: usize, text: &str, expected_count: usize) {
+        use frankenterm_core::runtime_async::{CompatRuntime, sleep_with_cx};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        static BARRIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        self.runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().unwrap();
+            let client = self.mux.client();
+            // Read a consumer acknowledgement after all earlier PTY input.
+            // This makes absence and exactly-once checks causal rather than
+            // assuming a sleeping child had enough time to process its queue.
+            let barrier = format!(
+                "__TX_BARRIER_{}",
+                BARRIER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            client
+                .send_text_no_paste_with_cx(&cx, self.pane_ids[step], &format!("{barrier}\n"))
+                .await
+                .unwrap();
+            let expected_ack = format!("TX_ACK:{text}");
+            let barrier_ack = format!("TX_ACK:{barrier}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let output = client
+                    .get_text_with_cx(&cx, self.pane_ids[step], false)
+                    .await
+                    .unwrap();
+                if output.lines().any(|line| line.trim_end() == barrier_ack) {
+                    assert_eq!(
+                        output
+                            .lines()
+                            .filter(|line| line.trim_end() == expected_ack)
+                            .count(),
+                        expected_count,
+                        "PTY input count for {text}: {output:?}"
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY did not consume {text}: {output:?}"
+                );
+                sleep_with_cx(&cx, Duration::from_millis(25)).await.unwrap();
+            }
+        });
+    }
+
+    fn finish(&mut self) {
+        use frankenterm_core::runtime_async::CompatRuntime;
+        let observer = self.observer.take();
+        let ipc_task = self.ipc_task.take();
+        if observer.is_none() && ipc_task.is_none() {
+            return;
+        }
+        let panicking = std::thread::panicking();
+        self.runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().unwrap();
+            let signal = self.ipc_shutdown.try_send(());
+            let ipc_result = match ipc_task {
+                Some(task) => task.join_with_cx(&cx).await,
+                None => Ok(()),
+            };
+            let summary = match observer {
+                Some(observer) => Some(observer.shutdown_with_summary_with_cx(&cx).await),
+                None => None,
+            };
+            eprintln!(
+                "LIVE_TX_SETTLEMENT signal={signal:?} ipc={ipc_result:?} runtime={summary:?}"
+            );
+            if !panicking {
+                assert!(ipc_result.is_ok(), "IPC owner did not settle");
+                assert!(summary.as_ref().is_some_and(|summary| summary.is_clean()));
+            }
+        });
+        if !panicking {
+            self.mux.kill_mux();
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "vendored"))]
+impl Drop for LiveTxFixture {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[cfg(all(unix, feature = "vendored"))]
+fn enable_live_tx(harness: &mut TestHarness) {
+    let mut config = Config::default();
+    config.general.workspace = Some(harness.workspace.path().display().to_string());
+    // The owned program is a line-reading application, not a shell prompt.
+    config.safety.require_prompt_active = false;
+    let live = LiveTxFixture::start(&mut config);
+    harness.client = spawn_client(
+        &config,
+        Some(config.workspace_layout(None).unwrap().db_path),
+    );
+    harness.live = Some(live);
 }
 
 fn mission_file_path(workspace: &Path) -> PathBuf {
@@ -153,16 +397,22 @@ fn canonicalize(value: &mut Value, workspace_root: &Path) {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
-                    "now" | "elapsed_ms" => *child = Value::from(0_u64),
-                    "mission_file" => *child = Value::String("<mission_file>".to_string()),
-                    "contract_file" => *child = Value::String("<contract_file>".to_string()),
-                    "mission_hash" | "content_sha256" => {
+                    // Schema objects are authority, never response noise.
+                    "input_schema" => {}
+                    "now" | "elapsed_ms" if child.is_number() => *child = Value::from(0_u64),
+                    "mission_file" if child.is_string() => {
+                        *child = Value::String("<mission_file>".to_string());
+                    }
+                    "contract_file" if child.is_string() => {
+                        *child = Value::String("<contract_file>".to_string());
+                    }
+                    "mission_hash" | "content_sha256" if child.is_string() => {
                         *child = Value::String("<verified_content_hash>".to_string())
                     }
-                    "checkpoint_id" if !child.is_null() => {
+                    "checkpoint_id" if child.is_string() => {
                         *child = Value::String("<checkpoint_id>".to_string());
                     }
-                    _ if key.ends_with("_ms") => *child = Value::from(0_i64),
+                    _ if key.ends_with("_ms") && child.is_number() => *child = Value::from(0_i64),
                     _ => canonicalize(child, workspace_root),
                 }
             }
@@ -241,8 +491,13 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
     let expected = read_or_update_golden(&path, &actual_text);
 
     if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
-        let actual_path = path.with_extension("actual.json");
-        let _ = fs::write(&actual_path, &actual_text);
+        let capture_dir = tempfile::Builder::new()
+            .prefix("ft-mcp-mission-tx-capture-")
+            .tempdir()
+            .expect("create retained conformance capture directory")
+            .keep();
+        let actual_path = capture_dir.join(format!("{name}.actual.json"));
+        fs::write(&actual_path, &actual_text).expect("retain actual conformance capture");
         panic!(
             "MCP mission/tx golden drift detected. Review the diff between:\n  \
              expected: {}\n  actual:   {}\n\n\
@@ -258,10 +513,32 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
-        pretty_canonical(actual_schema, Path::new("<workspace_root>")),
-        pretty_canonical(&expected_schema, Path::new("<workspace_root>")),
+        actual_schema, &expected_schema,
         "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
+}
+
+#[test]
+fn mission_tx_canonicalization_preserves_schemas_and_malformed_response_types() {
+    let mut schema = manifest_tool_schema("wa.mission_pause");
+    schema["properties"]["mission_file"]["maxLength"] = json!(3);
+    let mut capture = json!({
+        "input_schema": schema.clone(),
+        "success_envelope": {"data": {
+            "revision": "9007199254740993",
+            "mission_file": {"invalid": true},
+            "contract_file": ["invalid"],
+            "content_sha256": 7,
+            "checkpoint_id": false,
+            "created_at_ms": "invalid",
+            "updated_at_ms": null,
+            "elapsed_ms": "invalid"
+        }}
+    });
+    let original = capture.clone();
+    canonicalize(&mut capture, Path::new("/owned-workspace"));
+    assert_eq!(capture, original);
+    assert_ne!(schema, manifest_tool_schema("wa.mission_pause"));
 }
 
 fn make_candidate(id: &str, pane_id: u64, text: &str, created_at_ms: i64) -> CandidateAction {
@@ -486,6 +763,10 @@ fn capture_tool_contract(
     invalid_args: impl FnOnce(&TestHarness) -> Value,
 ) -> ToolGoldenCapture {
     let mut harness = new_harness();
+    #[cfg(all(unix, feature = "vendored"))]
+    if matches!(tool_name, "wa.tx_run" | "wa.tx_rollback") {
+        enable_live_tx(&mut harness);
+    }
     success_setup(&mut harness);
     let mission_path = mission_file_path(harness.workspace.path());
     let before = tool_name
@@ -502,6 +783,19 @@ fn capture_tool_contract(
     );
     if let Some(before) = &before {
         assert_mission_response_authority(&success_envelope, before, &mission_path);
+    }
+    #[cfg(all(unix, feature = "vendored"))]
+    if let Some(live) = &harness.live {
+        assert_eq!(success_envelope["ok"], true, "{success_envelope}");
+        live.assert_consumed(0, "/do-step-1", 1);
+        live.assert_consumed(0, "/undo-step-1", 1);
+        if tool_name == "wa.tx_rollback" {
+            live.assert_consumed(1, "/do-step-2", 1);
+            live.assert_consumed(1, "/undo-step-2", 1);
+        } else {
+            live.assert_consumed(1, "/do-step-2", 0);
+            live.assert_consumed(1, "/undo-step-2", 0);
+        }
     }
 
     invalid_setup(&mut harness);
@@ -544,12 +838,39 @@ fn seed_cancelled_mission(harness: &TestHarness) {
 }
 
 fn seed_planned_tx(harness: &TestHarness) {
-    write_json(&tx_file_path(harness.workspace.path()), &make_tx_contract());
+    let contract = make_tx_contract();
+    #[cfg(all(unix, feature = "vendored"))]
+    let contract = if let Some(live) = &harness.live {
+        let mut contract = contract;
+        // App input deliberately has no shell-prompt precondition. Discovery,
+        // reservation, capture continuity, alt-screen and policy checks remain
+        // the real production preparation path.
+        contract.plan.preconditions.clear();
+        for (index, step) in contract.plan.steps.iter_mut().enumerate() {
+            let StepAction::SendText { pane_id, text, .. } = &mut step.action else {
+                panic!("expected send-text step");
+            };
+            *pane_id = live.pane_ids[index];
+            text.push('\n');
+        }
+        for (index, compensation) in contract.plan.compensations.iter_mut().enumerate() {
+            let StepAction::SendText { pane_id, text, .. } = &mut compensation.action else {
+                panic!("expected send-text compensation");
+            };
+            *pane_id = live.pane_ids[index];
+            text.push('\n');
+        }
+        contract
+    } else {
+        contract
+    };
+    write_json(&tx_file_path(harness.workspace.path()), &contract);
 }
 
+#[cfg(all(unix, feature = "vendored"))]
 fn seed_committed_tx(harness: &mut TestHarness) {
     seed_planned_tx(harness);
-    let _ = harness
+    let contents = harness
         .client
         .call_tool(
             "wa.tx_run",
@@ -559,6 +880,17 @@ fn seed_committed_tx(harness: &mut TestHarness) {
             }),
         )
         .expect("seed tx_run success");
+    let envelope = parse_tool_envelope(&contents);
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["data"]["final_state"], "committed", "{envelope}");
+    let persisted = read_tx_contract(harness.workspace.path());
+    assert_eq!(persisted.lifecycle_state, MissionTxState::Committed);
+    assert_eq!(persisted.receipts.len(), 2);
+    #[cfg(all(unix, feature = "vendored"))]
+    if let Some(live) = &harness.live {
+        live.assert_consumed(0, "/do-step-1", 1);
+        live.assert_consumed(1, "/do-step-2", 1);
+    }
 }
 
 fn read_tx_contract(workspace: &Path) -> MissionTxContract {
@@ -755,6 +1087,8 @@ fn mcp_conformance_wa_tx_show_contract_matches_golden() {
 }
 
 #[test]
+#[cfg(all(unix, feature = "vendored"))]
+#[ignore = "requires an explicit same-source FT_WEZTERM_MUX_SERVER artifact under RCH/DSR"]
 fn mcp_conformance_wa_tx_run_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_run",
@@ -779,6 +1113,8 @@ fn mcp_conformance_wa_tx_run_contract_matches_golden() {
 }
 
 #[test]
+#[cfg(all(unix, feature = "vendored"))]
+#[ignore = "requires an explicit same-source FT_WEZTERM_MUX_SERVER artifact under RCH/DSR"]
 fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_rollback",
@@ -789,7 +1125,7 @@ fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
                 "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
             })
         },
-        seed_committed_tx,
+        |_| {},
         |harness| {
             json!({
                 "format": "json",
@@ -802,8 +1138,11 @@ fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
 }
 
 #[test]
+#[cfg(all(unix, feature = "vendored"))]
+#[ignore = "requires an explicit same-source FT_WEZTERM_MUX_SERVER artifact under RCH/DSR"]
 fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
     let mut harness = new_harness();
+    enable_live_tx(&mut harness);
     seed_planned_tx(&harness);
 
     let contract_file = tx_file_path(harness.workspace.path());
@@ -830,6 +1169,41 @@ fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
     assert_eq!(planned_contract.lifecycle_state, MissionTxState::Planned);
     assert_eq!(planned_contract.outcome, TxOutcome::Pending);
     assert_eq!(planned_contract.receipts.len(), 0);
+
+    // One missing target must prevent even the ready first pane from receiving
+    // input. Give this refusal its own durable identity so the success case
+    // cannot be satisfied by an idempotency replay from the negative control.
+    let mut refused_contract = planned_contract.clone();
+    refused_contract.intent.tx_id = TxId("tx:missing-target".to_string());
+    refused_contract.plan.tx_id = refused_contract.intent.tx_id.clone();
+    refused_contract.plan.plan_id = TxPlanId("tx-plan:missing-target".to_string());
+    let StepAction::SendText { pane_id, .. } = &mut refused_contract.plan.steps[1].action else {
+        panic!("expected send-text step");
+    };
+    *pane_id = harness.live.as_ref().unwrap().pane_ids[1] + 10_000;
+    let refused_path = harness
+        .workspace
+        .path()
+        .join(".ft/mission/missing-target.json");
+    write_json(&refused_path, &refused_contract);
+    let refused_envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.tx_run",
+                json!({"contract_file": refused_path, "format": "json"}),
+            )
+            .expect("real missing-target refusal"),
+    );
+    assert_eq!(refused_envelope["ok"], true, "{refused_envelope}");
+    assert_eq!(refused_envelope["data"]["final_state"], "failed");
+    assert!(refused_envelope["data"]["commit_report"].is_null());
+    let refused_persisted: MissionTxContract =
+        serde_json::from_slice(&fs::read(&refused_path).unwrap()).unwrap();
+    assert!(refused_persisted.receipts.is_empty());
+    let live = harness.live.as_ref().unwrap();
+    live.assert_consumed(0, "/do-step-1", 0);
+    live.assert_consumed(1, "/do-step-2", 0);
 
     let run_envelope = parse_tool_envelope(
         &harness
@@ -862,6 +1236,9 @@ fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
     );
     assert_eq!(committed_contract.outcome, TxOutcome::Committed);
     assert_eq!(committed_contract.receipts.len(), 2);
+    let live = harness.live.as_ref().unwrap();
+    live.assert_consumed(0, "/do-step-1", 1);
+    live.assert_consumed(1, "/do-step-2", 1);
 
     let rollback_envelope = parse_tool_envelope(
         &harness
@@ -893,4 +1270,8 @@ fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
     );
     assert_eq!(rolled_back_contract.outcome, TxOutcome::Compensated);
     assert_eq!(rolled_back_contract.receipts.len(), 4);
+    let live = harness.live.as_mut().unwrap();
+    live.assert_consumed(0, "/undo-step-1", 1);
+    live.assert_consumed(1, "/undo-step-2", 1);
+    live.finish();
 }

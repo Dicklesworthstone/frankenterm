@@ -8,9 +8,9 @@
 //! ```ignore
 //! let placeholder = Connection::open_in_memory().expect(...);
 //! let owned = std::mem::replace(conn, placeholder);
-//! let backend = RusqliteBackend::new(owned);
+//! let backend = RusqliteBackend::new(owned).expect("install benchmark backend authorizer");
 //! let result = f(&backend);
-//! *conn = backend.into_connection();
+//! *conn = backend.into_connection().expect("reclaim reusable benchmark connection");
 //! result
 //! ```
 //!
@@ -115,10 +115,13 @@ fn bench_bridge_with_placeholder_alloc(c: &mut Criterion) {
             let placeholder =
                 Connection::open_in_memory().expect("placeholder Connection for bridge dance");
             let owned = std::mem::replace(&mut conn, placeholder);
-            let backend = RusqliteBackend::new(owned);
+            let backend =
+                RusqliteBackend::new(owned).expect("install benchmark backend authorizer");
             execute_typed(&backend, UPDATE_SQL, &[ToSqlValue::Text(SESSION_ID)])
                 .expect("backend execute_typed");
-            conn = backend.into_connection();
+            conn = backend
+                .into_connection()
+                .expect("reclaim reusable benchmark connection");
             black_box(&conn);
         });
     });
@@ -147,14 +150,20 @@ fn bench_bridge_without_placeholder_alloc(c: &mut Criterion) {
             // Wrap the live conn into a backend. The placeholder
             // sits in the conn slot for the duration of f().
             let owned = std::mem::replace(&mut conn, placeholder);
-            let backend = RusqliteBackend::new(owned);
+            let backend =
+                RusqliteBackend::new(owned).expect("install benchmark backend authorizer");
             execute_typed(&backend, UPDATE_SQL, &[ToSqlValue::Text(SESSION_ID)])
                 .expect("backend execute_typed");
             // Pull the live conn back out and recover the
             // placeholder from the slot in a single swap. Now
             // the placeholder is in `recovered_placeholder` and
             // can go back into the cache for the next iter.
-            let recovered_placeholder = std::mem::replace(&mut conn, backend.into_connection());
+            let recovered_placeholder = std::mem::replace(
+                &mut conn,
+                backend
+                    .into_connection()
+                    .expect("reclaim reusable benchmark connection"),
+            );
             cached_placeholder = Some(recovered_placeholder);
             black_box(&conn);
         });

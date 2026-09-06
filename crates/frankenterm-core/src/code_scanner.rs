@@ -395,7 +395,8 @@ impl ScanPolicySource {
             })?;
         self.verify()?;
         self.verify_auxiliaries()?;
-        let backend = crate::storage_backend_trait::RusqliteBackend::new(connection);
+        let backend = crate::storage_backend_trait::RusqliteBackend::new(connection)
+            .map_err(|_| policy_source_failure())?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| policy_source_failure())?;

@@ -7639,7 +7639,7 @@ mod tests {
                 .stdout(File::create_new(&stdout).unwrap())
                 .stderr(File::create_new(&stderr).unwrap());
             OWNED_MISSION_CHILD_COUNT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                     (count < 16).then_some(count + 1)
                 })
                 .expect("finite capacity for live and indeterminate mission children");

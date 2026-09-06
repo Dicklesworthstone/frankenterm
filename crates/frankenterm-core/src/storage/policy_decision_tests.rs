@@ -42,9 +42,12 @@ fn sync_fts_for_pane_for_conn(
 }
 
 fn check_and_recover_wal_for_conn(conn: Connection, db_path: &str) -> Result<Connection> {
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn)
+        .map_err(|error| storage_backend_error("Initialize WAL recovery backend", error))?;
     check_and_recover_wal(&backend, db_path)?;
-    Ok(backend.into_connection())
+    backend
+        .into_connection()
+        .map_err(|error| storage_backend_error("Reclaim WAL recovery connection", error).into())
 }
 
 fn typed_decision_context_json(
@@ -995,7 +998,9 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
     };
     let backend =
         RusqliteBackend::open_path(&db_path, &config).expect("open fresh policy_denied_audit DB");
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
     initialize_schema(&conn).unwrap();
 
     // Invariant 1: the version stamp matches the constant.
@@ -1056,7 +1061,9 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
 
     let read_backend =
         RusqliteBackend::open_path(&db_path, &config).expect("reopen policy_denied_audit DB");
-    let read_conn = read_backend.into_connection();
+    let read_conn = read_backend
+        .into_connection()
+        .expect("reclaim policy read connection");
     let matching_rows: i64 = read_conn
         .query_row(
             "SELECT COUNT(*)
@@ -1106,7 +1113,9 @@ fn policy_denied_audit_roundtrips_all_fields_and_variants() {
     {
         let backend = RusqliteBackend::open_path(&db_path, &config)
             .expect("open fresh policy_denied_audit DB");
-        let conn = backend.into_connection();
+        let conn = backend
+            .into_connection()
+            .expect("reclaim policy test connection");
         initialize_schema(&conn).unwrap();
     }
 
@@ -1149,7 +1158,9 @@ fn policy_denied_audit_roundtrips_all_fields_and_variants() {
 
     let read_backend =
         RusqliteBackend::open_path(&db_path, &config).expect("reopen policy_denied_audit DB");
-    let read_conn = read_backend.into_connection();
+    let read_conn = read_backend
+        .into_connection()
+        .expect("reclaim policy read connection");
 
     // Read the require_approval row back column-for-column and assert exact
     // equality against what we wrote (with the id the insert returned).
@@ -1335,7 +1346,7 @@ fn query_pane_rejects_invalid_observed_flag() {
     )
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let err = query_pane_backend(&backend, 42).expect_err("invalid observed flag");
     let message = err.to_string();
     assert!(message.contains("panes.observed"), "{message}");
@@ -1420,7 +1431,7 @@ fn fts_search_returns_snippet_and_highlight() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let results = search_fts_with_snippets_backend(&backend, "world", &SearchOptions::default())
         .expect("search should succeed");
     assert_eq!(results.len(), 1);
@@ -1464,7 +1475,7 @@ fn fts_search_scopes_by_pane_and_limit() {
         ..Default::default()
     };
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let results = search_fts_with_snippets_backend(&backend, "needle", &options)
         .expect("search should succeed");
     assert_eq!(results.len(), 1);
@@ -1476,7 +1487,7 @@ fn fts_search_invalid_query_is_structured_error() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let err =
         search_fts_with_snippets_backend(&backend, "\"unterminated", &SearchOptions::default())
             .expect_err("expected invalid query error");
@@ -1583,7 +1594,7 @@ fn fts_search_order_is_deterministic_on_ties() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let results = search_fts_with_snippets_backend(&backend, "needle", &SearchOptions::default())
         .expect("search should succeed");
     assert_eq!(results.len(), 2);
@@ -1924,7 +1935,7 @@ fn can_insert_and_query_audit_actions() {
         action_kind: Some("send_text".to_string()),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let rows = query_audit_actions_backend(&backend, &query).unwrap();
 
     assert_eq!(rows.len(), 1);
@@ -1980,7 +1991,7 @@ fn action_history_includes_undo_metadata() {
     })
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let rows = query_action_history_backend(&backend, &ActionHistoryQuery::default()).unwrap();
     assert!(!rows.is_empty());
 
@@ -2060,7 +2071,7 @@ fn action_history_orders_by_ts_and_id() {
     )
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let rows = query_action_history_backend(
         &backend,
         &ActionHistoryQuery {
@@ -2149,7 +2160,7 @@ fn action_history_filters_undoable() {
     })
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let undoable = query_action_history_backend(
         &backend,
         &ActionHistoryQuery {
@@ -2218,7 +2229,7 @@ fn action_history_includes_workflow_step_info() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let rows = query_action_history_backend(&backend, &ActionHistoryQuery::default()).unwrap();
     let row = rows.iter().find(|row| row.id == action_id).unwrap();
     assert_eq!(row.workflow_id.as_deref(), Some("wf-1"));
@@ -2330,7 +2341,7 @@ fn purge_audit_actions_removes_old_entries() {
     // br-ft-l1jgo: purge_audit_actions_sync was migrated to
     // purge_audit_actions_backend at c64527d9c. Wrap the test
     // conn into a RusqliteBackend for the backend-trait call.
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let deleted =
         purge_audit_actions_backend(&backend, 1_500, AUXILIARY_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 1);
@@ -2382,7 +2393,7 @@ fn audit_query_filters_and_limits() {
     record_audit_action_for_conn(&mut conn, &allow).unwrap();
     record_audit_action_for_conn(&mut conn, &deny).unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let last_one = query_audit_actions_backend(
         &backend,
         &AuditQuery {
@@ -2476,7 +2487,7 @@ fn audit_stream_query_pages_with_cursor() {
     )
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let page1 = query_audit_actions_stream_backend(
         &backend,
         &AuditStreamQuery {
@@ -2509,7 +2520,7 @@ fn audit_stream_query_empty_returns_none_cursor() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let page = query_audit_actions_stream_backend(&backend, &AuditStreamQuery::default()).unwrap();
     assert!(page.records.is_empty());
     assert!(page.next_cursor.is_none());
@@ -2555,7 +2566,7 @@ fn audit_stream_query_respects_limit() {
     )
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let page = query_audit_actions_stream_backend(
         &backend,
         &AuditStreamQuery {
@@ -2655,11 +2666,13 @@ fn retention_prunes_old_segments_and_fts() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let deleted =
         prune_segments_backend(&backend, now_ms, SEGMENT_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 1);
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
 
     let remaining: i64 = conn
         .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
@@ -2725,11 +2738,13 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
         .expect("progress row present before prune");
     assert_eq!(progress_before.last_indexed_seq, 5);
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let deleted =
         prune_segments_backend(&backend, old_ts, SEGMENT_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 6, "full pre-prune chain must be removed");
-    let mut conn = backend.into_connection();
+    let mut conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
 
     let progress_after = get_fts_pane_progress_for_conn(&mut conn, pane as u64).unwrap();
     assert!(
@@ -2818,11 +2833,13 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
     )
     .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let deleted =
         prune_segments_backend(&backend, boundary_ts, SEGMENT_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 3, "only pre-boundary rows must be pruned");
-    let mut conn = backend.into_connection();
+    let mut conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
 
     let progress_after = get_fts_pane_progress_for_conn(&mut conn, pane as u64).unwrap();
     assert!(
@@ -2836,7 +2853,7 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
 fn maintenance_log_records_event() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     let record = MaintenanceRecord {
         id: 0,
@@ -2849,7 +2866,9 @@ fn maintenance_log_records_event() {
     let id = record_maintenance_backend(&backend, &record).unwrap();
     assert!(id > 0);
 
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
     let event_type: String = conn
         .query_row(
             "SELECT event_type FROM maintenance_log WHERE id = ?1",
@@ -2864,7 +2883,7 @@ fn maintenance_log_records_event() {
 fn secret_scan_report_roundtrip() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     let record = SecretScanReportRecord {
         id: 0,
@@ -3152,7 +3171,8 @@ fn approval_token_query_rejects_negative_pane_id() {
     // it — `conn` is not used past this point) and call the backend
     // sibling `query_approval_token_by_hash_backend` defined alongside
     // it in storage.rs. Reduces direct rusqlite::Connection refs by 1.
-    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn)
+        .expect("initialize policy test backend");
     let err = query_approval_token_by_hash_backend(&backend, "sha256:bad-token")
         .expect_err("negative approval pane id");
     let message = err.to_string();
@@ -3185,7 +3205,7 @@ fn can_record_gap_on_discontinuity() {
             ).unwrap();
     }
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     // Record a gap (simulating a discontinuity detected)
     let gap = record_gap_backend(&backend, 1, "sequence_jump")
@@ -3198,7 +3218,9 @@ fn can_record_gap_on_discontinuity() {
     assert_eq!(gap.seq_after, 3); // Next expected would be 3
     assert_eq!(gap.reason, "sequence_jump");
 
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
 
     // Query the gap from the database
     let (id, pane_id, seq_before, seq_after, reason): (i64, i64, i64, i64, String) = conn
@@ -3244,7 +3266,7 @@ fn gap_reasons_are_stable() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     // Record gaps with different reasons
     let reasons = vec![
@@ -3258,7 +3280,9 @@ fn gap_reasons_are_stable() {
         record_gap_backend(&backend, 1, reason).unwrap();
     }
 
-    let conn = backend.into_connection();
+    let conn = backend
+        .into_connection()
+        .expect("reclaim policy test connection");
 
     // Verify all gaps were recorded with stable reasons
     let mut stmt = conn
@@ -3290,7 +3314,7 @@ fn distributed_explicit_gap_reason_preserves_reported_bounds() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     let gap = record_gap_backend(&backend, 1, "distributed_gap:timeout:1:4")
         .unwrap()
@@ -3313,7 +3337,7 @@ fn distributed_explicit_gap_reason_records_start_of_stream_gap() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     let gap = record_gap_backend(&backend, 1, "distributed_gap:startup_replay:0:3")
         .unwrap()
@@ -3336,7 +3360,7 @@ fn distributed_explicit_gap_reason_allows_colons_in_reason_text() {
         )
         .unwrap();
 
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
 
     let gap = record_gap_backend(&backend, 1, "distributed_gap:session:restart:4:9")
         .unwrap()
@@ -3374,7 +3398,7 @@ fn last_n_segments_returns_deterministic_order() {
     }
 
     // Query last 3 segments
-    let backend = RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn).expect("initialize policy test backend");
     let segments = query_segments_backend(&backend, 1, 3).unwrap();
 
     // Should return in descending seq order: 8, 5, 3
@@ -3453,7 +3477,8 @@ fn can_insert_agent_session() {
         estimated_cost_usd: None,
     };
 
-    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn)
+        .expect("initialize policy test backend");
     let session_id = upsert_agent_session_backend(&backend, &session).unwrap();
     assert!(session_id > 0, "Session should have been assigned an ID");
 
@@ -3476,7 +3501,8 @@ fn can_update_agent_session() {
             params![1i64, "local", now_ms, now_ms, 1],
         ).unwrap();
 
-    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn)
+        .expect("initialize policy test backend");
     let session = AgentSessionRecord::new_start(1, "codex");
     let session_id = upsert_agent_session_backend(&backend, &session).unwrap();
 
@@ -3506,7 +3532,8 @@ fn query_active_sessions_filters_ended() {
         ).unwrap();
 
     // Active session
-    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn)
+        .expect("initialize policy test backend");
     let active = AgentSessionRecord::new_start(1, "claude");
     upsert_agent_session_backend(&backend, &active).unwrap();
 

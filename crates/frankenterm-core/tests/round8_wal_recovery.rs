@@ -143,12 +143,18 @@ fn recover(path: &Path, skip_enabled: bool) -> frankenterm_core::error::Result<W
     // Mirror the production writer-open path (storage.rs:1644), which sets a 5s
     // busy_timeout before WAL recovery so a transient lock waits instead of
     // failing immediately.
-    let _ = conn.busy_timeout(Duration::from_secs(5));
-    let backend = RusqliteBackend::new(conn);
+    conn.busy_timeout(Duration::from_secs(5)).map_err(|error| {
+        StorageError::Database(format!("install WAL recovery busy timeout: {error}"))
+    })?;
+    let backend = RusqliteBackend::new(conn).map_err(|error| {
+        StorageError::Database(format!("install WAL recovery authorizer: {error}"))
+    })?;
     let db_path = path.to_string_lossy();
     let action = check_and_recover_wal_inner(&backend, &db_path, skip_enabled);
     // Drop the backend connection deterministically after recovery.
-    let _ = backend.into_connection();
+    let _ = backend.into_connection().map_err(|error| {
+        StorageError::Database(format!("reclaim WAL recovery connection: {error}"))
+    })?;
     action
 }
 
