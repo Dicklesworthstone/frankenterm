@@ -91,11 +91,13 @@ fn new_harness() -> TestHarness {
     let workspace_guard = WorkspaceRootGuard::new(workspace.path());
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
-    config.general.workspace = Some(workspace.path().display().to_string());
-    let client = spawn_client(
-        &config,
-        Some(config.workspace_layout(None).unwrap().db_path),
+    let layout = config.workspace_layout(None).unwrap();
+    assert_eq!(
+        layout.root.canonicalize().unwrap(),
+        workspace.path().canonicalize().unwrap(),
+        "unset FT_WORKSPACE before running owned workspace conformance tests"
     );
+    let client = spawn_client(&config, Some(layout.db_path));
     TestHarness {
         #[cfg(all(unix, feature = "vendored"))]
         live: None,
@@ -121,11 +123,17 @@ struct LiveTxFixture {
 
 #[cfg(all(unix, feature = "vendored"))]
 impl LiveTxFixture {
-    fn start(config: &mut Config) -> Self {
+    fn start(config: &mut Config, workspace: &Path) -> Self {
         use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc};
         use std::sync::Arc;
         use std::time::Duration;
 
+        let layout = config.workspace_layout(None).unwrap();
+        assert_eq!(
+            layout.root.canonicalize().unwrap(),
+            workspace.canonicalize().unwrap(),
+            "live transaction fixture must stay in its owned workspace"
+        );
         // Disable terminal echo so readback proves the PTY program consumed
         // each complete command, rather than merely observing input echo.
         let mux = owned_mux::WeztermSubprocessFixture::spawn_with_default_prog(&[
@@ -135,7 +143,6 @@ impl LiveTxFixture {
         ])
         .expect("same-source owned mux artifact required");
         config.vendored.mux_socket_path = Some(mux.socket_path().display().to_string());
-        let layout = config.workspace_layout(None).unwrap();
         let runtime = RuntimeBuilder::multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -337,10 +344,9 @@ impl Drop for LiveTxFixture {
 #[cfg(all(unix, feature = "vendored"))]
 fn enable_live_tx(harness: &mut TestHarness) {
     let mut config = Config::default();
-    config.general.workspace = Some(harness.workspace.path().display().to_string());
     // The owned program is a line-reading application, not a shell prompt.
     config.safety.require_prompt_active = false;
-    let live = LiveTxFixture::start(&mut config);
+    let live = LiveTxFixture::start(&mut config, harness.workspace.path());
     harness.client = spawn_client(
         &config,
         Some(config.workspace_layout(None).unwrap().db_path),

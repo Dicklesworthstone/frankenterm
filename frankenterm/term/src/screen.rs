@@ -6220,6 +6220,44 @@ mod tests {
     }
 
     #[test]
+    fn tiered_scrollback_without_cold_sink_preserves_unaccepted_rows() {
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: None,
+                ..TestTermConfig::default()
+            },
+        );
+        let attrs = CellAttributes::blank();
+        for seq in 1..=8 {
+            let bottom = screen.phys_row(1);
+            screen.lines[bottom] = Line::from_text(&format!("line-{seq}"), &attrs, seq, None);
+            screen.scroll_up(&(0..2), 1, seq, attrs.clone(), bidi_mode());
+        }
+        let retained: Vec<_> = screen
+            .lines
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .filter(|line| line.starts_with("line-"))
+            .collect();
+        assert_eq!(
+            retained,
+            (1..=8).map(|seq| format!("line-{seq}")).collect::<Vec<_>>()
+        );
+        assert_eq!(screen.stable_row_index_offset, 0);
+        assert_eq!(screen.scrollback_tiering.warm_spill_lines_total, 0);
+        assert_eq!(screen.scrollback_tiering.cold_spill_lines_total, 0);
+    }
+
+    #[test]
     fn tiered_scrollback_bounds_hot_memory_during_high_output() {
         let cold_sink = Arc::new(TestColdScrollbackSink::default());
         let hot_lines = 8;
