@@ -1961,6 +1961,7 @@ async fn forward_vendored_streaming_delta(
     runtime_cx: &RuntimeLoopCx,
     bridge: &mut StreamingBridge,
     capture_tx: &mpsc::Sender<CaptureEvent>,
+    cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     identity: &StreamingSubscriptionIdentity,
     lease: &CaptureLease,
     delta: PaneDelta,
@@ -1978,15 +1979,46 @@ async fn forward_vendored_streaming_delta(
         PaneDelta::Ended { reason, .. } => Some(reason.clone()),
         _ => None,
     };
-
-    for segment in bridge.process_delta(delta) {
+    // Reserve before issuing a sequence. Backpressure or a closed receiver
+    // must not consume a number that never entered the durable pipeline.
+    // Metadata-only render updates do not need capture-channel capacity.
+    let permit = if matches!(&delta, PaneDelta::Output { delta_text, .. } if delta_text.is_empty())
+    {
+        None
+    } else {
+        match capture_tx.reserve(runtime_cx).await {
+            Ok(permit) => Some(permit),
+            Err(_) if runtime_cx.checkpoint().is_err() => return Some("cancelled".to_string()),
+            Err(_) => return Some("capture ingress closed".to_string()),
+        }
+    };
+    let segment = {
+        let mut cursors = match cursors.write_with_cx(runtime_cx).await {
+            Ok(cursors) => cursors,
+            Err(_) => return Some("capture cursor lock failed".to_string()),
+        };
+        if runtime_cx.checkpoint().is_err() {
+            return Some("cancelled".to_string());
+        }
+        let Some(cursor) = cursors.get_mut(&identity.global_pane_id) else {
+            return Some("capture cursor missing".to_string());
+        };
+        // The same cursor is seeded from storage, advanced by polling/native
+        // capture and corrected by persistence. A private stream cursor would
+        // ignore both durable resume and later lost-segment corrections.
+        match bridge.process_delta(delta, cursor) {
+            Ok(segment) => segment,
+            Err(reason) => return Some(reason),
+        }
+    };
+    if let Some(segment) = segment {
         let event = match CaptureEvent::from_producer(segment, &producer_guard) {
             Ok(event) => event,
             Err(error) => return Some(format!("capture authority rejected stream: {error}")),
         };
-        if !send_runtime_channel(runtime_cx, capture_tx, event).await {
-            return Some("capture ingress closed".to_string());
-        }
+        permit
+            .expect("nonempty streaming capture reserves ingress capacity")
+            .send(event);
     }
 
     exit_reason
@@ -8210,6 +8242,7 @@ impl ObservationRuntime {
                                 }
 
                                 let capture_tx = capture_tx.clone();
+                                let stream_cursors = Arc::clone(&cursors);
                                 let stream_exit_tx = stream_exit_tx.clone();
                                 let shutdown_flag = Arc::clone(&shutdown_flag);
                                 let subscription_config = subscription_config.clone();
@@ -8226,6 +8259,7 @@ impl ObservationRuntime {
                                             subscription_config,
                                             capture_tx,
                                             lease_for_task,
+                                            stream_cursors,
                                         ))
                                         .await;
                                         let final_reason = if shutdown_flag.load(Ordering::SeqCst)
@@ -9931,6 +9965,7 @@ async fn run_vendored_streaming_capture(
     subscription_config: SubscriptionConfig,
     capture_tx: mpsc::Sender<CaptureEvent>,
     capture_lease: CaptureLease,
+    cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
 ) -> String {
     let runtime_cx = runtime_loop_cx();
 
@@ -9971,6 +10006,7 @@ async fn run_vendored_streaming_capture(
                     &runtime_cx,
                     &mut bridge,
                     &capture_tx,
+                    &cursors,
                     &identity,
                     &capture_lease,
                     delta,
@@ -16884,12 +16920,14 @@ mod tests {
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
             let lease = test_capture_lease(17, CaptureSourceKind::VendoredStreaming);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(17, PaneCursor::new(17))])));
             let identity = test_streaming_identity(17, 17, 0, 0, &lease);
 
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &cursors,
                 &identity,
                 &lease,
                 PaneDelta::Output {
@@ -16907,6 +16945,8 @@ mod tests {
             let event = recv_mpsc(&mut capture_rx).await;
             assert_eq!(event.segment.pane_id, 17);
             assert_eq!(event.segment.content, "hello from vendored stream");
+            assert_eq!(event.segment.seq, 0);
+            assert_eq!(cursors.read().await[&17].last_seq(), 0);
             assert!(matches!(
                 event.segment.kind,
                 crate::ingest::CapturedSegmentKind::Delta
@@ -16922,12 +16962,17 @@ mod tests {
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
             let lease = test_capture_lease(19, CaptureSourceKind::VendoredStreaming);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(
+                19,
+                PaneCursor::from_seq(19, 41),
+            )])));
             let identity = test_streaming_identity(19, 19, 0, 0, &lease);
 
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &cursors,
                 &identity,
                 &lease,
                 PaneDelta::Output {
@@ -16944,7 +16989,8 @@ mod tests {
             assert!(exit_reason.is_none());
             assert!(capture_rx.try_recv().is_err());
             assert_eq!(bridge.events_processed(), 1);
-            assert_eq!(bridge.ingester().active_panes(), 0);
+            assert_eq!(bridge.active_panes(), 0);
+            assert_eq!(cursors.read().await[&19].next_seq, 41);
             assert_eq!(
                 bridge
                     .render_metadata(19)
@@ -16962,12 +17008,14 @@ mod tests {
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
             let lease = test_capture_lease(21, CaptureSourceKind::VendoredStreaming);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(21, PaneCursor::new(21))])));
             let identity = test_streaming_identity(21, 21, 0, 0, &lease);
 
             let output_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &cursors,
                 &identity,
                 &lease,
                 PaneDelta::Output {
@@ -16987,6 +17035,7 @@ mod tests {
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &cursors,
                 &identity,
                 &lease,
                 PaneDelta::Ended {
@@ -16999,6 +17048,8 @@ mod tests {
             assert_eq!(exit_reason.as_deref(), Some("mux socket disconnected"));
             let event = recv_mpsc(&mut capture_rx).await;
             assert_eq!(event.segment.pane_id, 21);
+            assert_eq!(event.segment.seq, 1);
+            assert_eq!(cursors.read().await[&21].last_seq(), 1);
             assert!(
                 matches!(
                     &event.segment.kind,
@@ -17020,11 +17071,16 @@ mod tests {
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
             let lease = test_capture_lease(9, CaptureSourceKind::VendoredStreaming);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(
+                9,
+                PaneCursor::from_seq(9, 41),
+            )])));
             let identity = test_streaming_identity(9, 9, 0, 0, &lease);
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &cursors,
                 &identity,
                 &lease,
                 PaneDelta::Output {
@@ -17039,12 +17095,263 @@ mod tests {
             .await;
 
             assert_eq!(exit_reason.as_deref(), Some("capture ingress closed"));
+            assert_eq!(cursors.read().await[&9].next_seq, 41);
+            assert_eq!(bridge.events_processed(), 0);
         });
     }
 
     async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
         let cx = crate::cx::for_testing();
         rx.recv(&cx).await.expect("test mpsc recv should succeed")
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_uses_durable_resume_and_reconciles_repeated_queued_losses() {
+        run_async_test_isolated(|| async {
+            for baseline in [0_u64, 41] {
+                let pane_id = 29;
+                let (_dir, db_path) = temp_db_path();
+                let storage = StorageHandle::new(&db_path).await.unwrap();
+                storage
+                    .upsert_pane(test_pane_record(pane_id))
+                    .await
+                    .unwrap();
+                for seq in 0..baseline {
+                    assert_eq!(
+                        storage
+                            .append_segment(pane_id, "retained", None)
+                            .await
+                            .unwrap()
+                            .seq,
+                        seq
+                    );
+                }
+                let cx = runtime_loop_cx();
+                let checkpoint = load_capture_checkpoint_from_storage(
+                    &cx,
+                    &storage,
+                    pane_id,
+                    DiscoveryRevision(1),
+                )
+                .await
+                .unwrap();
+                assert_eq!(checkpoint.next_seq, baseline);
+                let cursors = Arc::new(RwLock::new(HashMap::from([(
+                    pane_id,
+                    PaneCursor::from_seq(pane_id, checkpoint.next_seq),
+                )])));
+                let authority = CaptureAuthority::new();
+                let pane = authority.activate_pane(pane_id).unwrap();
+                let lease = authority
+                    .issue_source(pane, CaptureSourceKind::VendoredStreaming)
+                    .unwrap();
+                let identity = test_streaming_identity(pane_id, pane_id, 0, 0, &lease);
+                let (tx, mut rx) = mpsc::channel(3);
+                let mut bridge = StreamingBridge::new();
+                let mut durable_next = baseline;
+
+                // Deliberately lose one admitted capture per round. The two
+                // queued successors must correct the actual producer once,
+                // even when no matching acknowledgement separates losses.
+                for round in 0..3_u64 {
+                    for offset in 0..3_u64 {
+                        assert!(
+                            forward_vendored_streaming_delta(
+                                &cx,
+                                &mut bridge,
+                                &tx,
+                                &cursors,
+                                &identity,
+                                &lease,
+                                PaneDelta::Output {
+                                    pane_id,
+                                    seqno: round * 3 + offset + 1,
+                                    delta_text: format!("round-{round}-item-{offset}"),
+                                    title: String::new(),
+                                    dirty_range_count: 1,
+                                    dirty_row_count: 1,
+                                },
+                            )
+                            .await
+                            .is_none()
+                        );
+                    }
+                    let lost = recv_mpsc(&mut rx).await;
+                    assert_eq!(lost.segment.seq, durable_next);
+                    drop(lost);
+                    for offset in 0..2 {
+                        let event = recv_mpsc(&mut rx).await;
+                        let guard = authority
+                            .try_acquire_persistence(event.stamp(), pane_id)
+                            .unwrap();
+                        let persisted = persist_captured_segment_for_runtime(
+                            &cx,
+                            &storage,
+                            &event.segment,
+                            4096,
+                            None,
+                            None,
+                            &guard,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(persisted.segment.seq, durable_next);
+                        let shift = cursors
+                            .write()
+                            .await
+                            .get_mut(&pane_id)
+                            .unwrap()
+                            .realign_next_seq(&event.segment, persisted.segment.seq);
+                        assert_eq!(shift, if offset == 0 { -1 } else { 0 });
+                        durable_next += 1;
+                    }
+                    assert_eq!(cursors.read().await[&pane_id].next_seq, durable_next);
+                }
+                assert!(
+                    forward_vendored_streaming_delta(
+                        &cx,
+                        &mut bridge,
+                        &tx,
+                        &cursors,
+                        &identity,
+                        &lease,
+                        PaneDelta::Output {
+                            pane_id,
+                            seqno: 10,
+                            delta_text: "fresh converged output".to_string(),
+                            title: String::new(),
+                            dirty_range_count: 1,
+                            dirty_row_count: 1,
+                        },
+                    )
+                    .await
+                    .is_none()
+                );
+                let fresh = recv_mpsc(&mut rx).await;
+                assert_eq!(fresh.segment.seq, durable_next);
+                assert_eq!(fresh.segment.seq_correction, -3);
+                let guard = authority
+                    .try_acquire_persistence(fresh.stamp(), pane_id)
+                    .unwrap();
+                let persisted = persist_captured_segment_for_runtime(
+                    &cx,
+                    &storage,
+                    &fresh.segment,
+                    4096,
+                    None,
+                    None,
+                    &guard,
+                )
+                .await
+                .unwrap();
+                assert_eq!(persisted.segment.seq, fresh.segment.seq);
+                assert!(
+                    persisted.gap.is_none(),
+                    "fresh stream must stop reporting discontinuities"
+                );
+                assert_eq!(
+                    cursors.read().await[&pane_id].last_seq(),
+                    i64::try_from(durable_next).unwrap()
+                );
+                assert_eq!(
+                    storage.get_max_seq_with_cx(&cx, pane_id).await.unwrap(),
+                    Some(durable_next)
+                );
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_refusals_do_not_issue_sequences_or_mutate_metadata() {
+        run_async_test(async {
+            let pane_id = 31;
+            let authority = CaptureAuthority::new();
+            let pane = authority.activate_pane(pane_id).unwrap();
+            let lease = authority
+                .issue_source(pane, CaptureSourceKind::VendoredStreaming)
+                .unwrap();
+            let identity = test_streaming_identity(pane_id, pane_id, 0, 0, &lease);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let (tx, mut rx) = mpsc::channel(1);
+            let mut bridge = StreamingBridge::new();
+            let cx = runtime_loop_cx();
+            let output = || PaneDelta::Output {
+                pane_id,
+                seqno: 1,
+                delta_text: "not admitted".to_string(),
+                title: "must not publish".to_string(),
+                dirty_range_count: 1,
+                dirty_row_count: 1,
+            };
+            assert_eq!(
+                forward_vendored_streaming_delta(
+                    &cx,
+                    &mut bridge,
+                    &tx,
+                    &cursors,
+                    &identity,
+                    &lease,
+                    output(),
+                )
+                .await
+                .as_deref(),
+                Some("capture cursor missing")
+            );
+            assert!(
+                cursors.read().await.is_empty(),
+                "stream must not create an unproven baseline"
+            );
+            cursors
+                .write()
+                .await
+                .insert(pane_id, PaneCursor::from_seq(pane_id, 41));
+            let cancelled = crate::cx::for_testing();
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancelled stream fixture"),
+            );
+            assert!(
+                forward_vendored_streaming_delta(
+                    &cancelled,
+                    &mut bridge,
+                    &tx,
+                    &cursors,
+                    &identity,
+                    &lease,
+                    output(),
+                )
+                .await
+                .is_some()
+            );
+            let revocation = authority
+                .begin_source_revocation(pane, lease.stamp())
+                .unwrap();
+            revocation
+                .wait_with_cx(&cx, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(
+                forward_vendored_streaming_delta(
+                    &cx,
+                    &mut bridge,
+                    &tx,
+                    &cursors,
+                    &identity,
+                    &lease,
+                    output(),
+                )
+                .await
+                .unwrap()
+                .contains("capture authority rejected")
+            );
+            assert_eq!(cursors.read().await[&pane_id].next_seq, 41);
+            assert_eq!(bridge.events_processed(), 0);
+            assert!(bridge.render_metadata(pane_id).is_none());
+            assert!(rx.try_recv().is_err());
+        });
     }
 
     fn test_capture_event(seq: u64) -> CaptureEvent {
@@ -22143,11 +22450,16 @@ mod tests {
             let loop_cx = runtime_loop_cx();
             let mut bridge_zero = StreamingBridge::new();
             let mut bridge_one = StreamingBridge::new();
+            runtime.cursors.write().await.extend([
+                (global_zero, PaneCursor::new(global_zero)),
+                (global_one, PaneCursor::new(global_one)),
+            ]);
             assert!(
                 forward_vendored_streaming_delta(
                     &loop_cx,
                     &mut bridge_zero,
                     &capture_tx,
+                    &runtime.cursors,
                     &identity_zero,
                     &lease_zero,
                     PaneDelta::Output {
@@ -22167,6 +22479,7 @@ mod tests {
                     &loop_cx,
                     &mut bridge_one,
                     &capture_tx,
+                    &runtime.cursors,
                     &identity_one,
                     &lease_one,
                     PaneDelta::Output {
@@ -22230,6 +22543,10 @@ mod tests {
             assert_eq!(shard_one_segments[0].content, "output from shard one");
             assert_eq!(runtime.metrics.segments_persisted(), 2);
             assert_eq!(runtime.metrics.capture_authority_rejections(), 0);
+            let cursors = runtime.cursors.read().await;
+            assert_eq!(cursors[&global_zero].last_seq(), 0);
+            assert_eq!(cursors[&global_one].last_seq(), 0);
+            drop(cursors);
 
             storage.shutdown().await.expect("shutdown test storage");
         });
@@ -22261,11 +22578,16 @@ mod tests {
             let (capture_tx, mut capture_rx) = mpsc::channel(1);
             let loop_cx = runtime_loop_cx();
             let mut bridge = StreamingBridge::new();
+            let cursors = Arc::new(RwLock::new(HashMap::from([(
+                global_pane_id,
+                PaneCursor::from_seq(global_pane_id, 41),
+            )])));
 
             let exit_reason = forward_vendored_streaming_delta(
                 &loop_cx,
                 &mut bridge,
                 &capture_tx,
+                &cursors,
                 &identity,
                 &lease,
                 PaneDelta::Output {
@@ -22284,6 +22606,7 @@ mod tests {
             assert!(exit_reason.contains("received local pane 8"));
             assert_eq!(bridge.events_processed(), 0);
             assert!(capture_rx.try_recv().is_err());
+            assert_eq!(cursors.read().await[&global_pane_id].next_seq, 41);
         });
     }
 
