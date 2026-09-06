@@ -18,6 +18,9 @@ crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
 crates/frankenterm-core/src/scrollback_mmap_writer.rs	use std::os::unix::fs::PermissionsExt as _;
+# ft-xxfwy.48: inside #[cfg(unix)] mission_store_late_leaf_attack_refuses_and_releases_lock_registry;
+# the function-level gate precedes this closure by more than the eight-line lookback.
+crates/frankenterm-core/src/tx_execution.rs	std::os::unix::fs::symlink(&retained, &path).unwrap();
 crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&sentinel_path, &ledger_path)
 crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
 crates/frankenterm-core/src/vendored/mux_client.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix socket");

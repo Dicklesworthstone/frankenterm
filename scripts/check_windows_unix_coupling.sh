@@ -6,8 +6,8 @@
 # live behind a `#[cfg(unix)]` (or equivalent `target_os` / `target_family`)
 # gate, or behind a `[target.'cfg(unix)'.dependencies]` table for crate deps.
 #
-# The `windows-check.yml` `cargo check --target x86_64-pc-windows-msvc` job is the
-# authoritative gate — it physically fails to compile on an ungated coupling in
+# A strict remote RCH `cargo check --all-targets --target x86_64-pc-windows-msvc`
+# is the authoritative development gate — it fails on an ungated coupling in
 # Windows-reachable code. THIS script is a fast, build-free pre-flight that:
 #   1. catches the common mistake (a new top-level `use std::os::unix` /
 #      `std::os::fd`, or a new unix-only crate dependency) without waiting for a
@@ -178,8 +178,8 @@ cat >&2 <<EOF
 ─── ft-51fde guard: NEW unconditional Unix coupling detected ───
 
 Epic ft-azsnz requires the Windows port to be ADDITIVE and Unix-gated. The
-following coupling(s) are not behind a #[cfg(unix)] gate (for source paths) or a
-[target.'cfg(unix)'.dependencies] table (for crate deps), and are not in the
+following coupling(s) have no gate recognized by the bounded source lookback or
+[target.'cfg(unix)'.dependencies] table check, and are not in the
 accepted baseline (${BASELINE}):
 
 ${NEW}
@@ -199,8 +199,10 @@ What to do:
     the gate (e.g. a large gated fn), re-bless the baseline IN THE SAME COMMIT and
     say why:  BLESS=1 $0
 
-The authoritative check is the Windows job:
-  rustup target add x86_64-pc-windows-msvc
-  cargo check -p <crate> --target x86_64-pc-windows-msvc
+The authoritative development check runs on an admissible Windows RCH worker:
+  RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=wsurf \\
+    rch --no-self-healing exec -- cargo check -j 2 -p <crate> \\
+    --all-targets --target x86_64-pc-windows-msvc --locked
+Native release builds and release verification use DSR exclusively.
 EOF
 exit 1
