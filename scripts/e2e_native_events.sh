@@ -568,7 +568,8 @@ BASE_HERMETIC_ENV=(
     "WEZTERM_UNIX_SOCKET=$PRIVATE_MUX_SOCKET_PATH"
     "FT_WEZTERM_CLI=$PRIVATE_MUX_DIR/not-created-cli"
     "FT_WORKSPACE=$WORKSPACE_DIR"
-    "FT_STORAGE_DB_PATH=$WORKSPACE_DIR/frankenterm.db"
+    # Storage paths are relative to the owned workspace's .ft directory.
+    "FT_STORAGE_DB_PATH=frankenterm.db"
     "FT_METRICS_ENABLED=false"
 )
 
