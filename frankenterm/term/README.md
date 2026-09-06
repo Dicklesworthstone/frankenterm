@@ -1,9 +1,7 @@
-# wezterm-term
+# frankenterm-term
 
-This crate provides the core of the virtual terminal emulator implementation
-used by [wezterm](https://wezterm.org/).  The home for this
-crate is in the wezterm repo and development is tracked at
-<https://github.com/wezterm/wezterm/>.
+This crate provides FrankenTerm's virtual terminal emulator. It is maintained
+in this repository and derives from the WezTerm terminal implementation.
 
 It is full featured, providing terminal escape sequence parsing, keyboard
 and mouse input encoding, a model for the screen cells including scrollback,
@@ -15,7 +13,20 @@ manage a PTY; you provide a `std::io::Write` implementation that
 could connect to a PTY, and supply bytes to the model via the
 `advance_bytes` method.
 
-The entrypoint to the crate is the [Terminal](terminal/struct.Terminal.html)
+The entrypoint to the crate is the [Terminal](src/terminal.rs)
 struct.
+
+The `byte_to_grid` benchmark includes `reflow_cpu` cases that call the real
+`Terminal::resize` path with ASCII and Unicode scrollback. They measure cold
+resize and repeated width changes, exclude parsing from timed resize, and
+check generated text and cursor bounds. These CPU measurements do not measure
+GUI presentation, font rasterization or GPU work. Run them through the strict
+RCH development lane, for example:
+
+```sh
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo bench -j2 --locked -p frankenterm-term --bench byte_to_grid \
+  --profile release-perf -- reflow_cpu
+```
 
 License: MIT

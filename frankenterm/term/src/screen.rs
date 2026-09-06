@@ -3071,6 +3071,9 @@ impl Screen {
         seqno: SequenceNo,
         is_conpty: bool,
     ) -> CursorPosition {
+        // A resize may return early or reuse cached wraps without recording a
+        // fresh viewport batch. Never attribute an earlier resize's work to it.
+        self.last_viewport_first_reflow_us = 0;
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
@@ -3263,6 +3266,7 @@ impl Screen {
 
     /// Microseconds spent reflowing viewport and near-viewport batches during
     /// the most recent resize before cold scrollback convergence began.
+    /// Zero when that resize skipped fresh viewport batch reflow.
     pub fn last_viewport_first_reflow_us(&self) -> u64 {
         self.last_viewport_first_reflow_us
     }
@@ -5497,6 +5501,35 @@ mod tests {
     }
 
     #[test]
+    fn viewport_reflow_metric_does_not_reuse_a_prior_resize_sample() {
+        for size in [
+            test_size(4, 8, 96),
+            test_size(5, 8, 96),
+            test_size(4, 8, 120),
+            test_size(4, 12, 96),
+        ] {
+            let mut screen = test_screen(4, 8, 96);
+            screen.last_viewport_first_reflow_us = u64::MAX;
+            screen.resize(size, test_cursor(0, 3, 1), 2, false);
+            assert_eq!(screen.last_viewport_first_reflow_us(), 0);
+        }
+
+        let mut screen = test_screen(4, 8, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(
+            (0..4)
+                .map(|_| Line::from_text("abcdefgh", &attrs, 0, None))
+                .collect::<Vec<_>>(),
+        );
+        let _ = screen.logical_wraps_for_resize(4, 2);
+        let (_, _, _, wrap_cache_hit, _) = screen.logical_wraps_for_resize(4, 2);
+        assert!(wrap_cache_hit, "exercise an actual cached wrap");
+        screen.last_viewport_first_reflow_us = u64::MAX;
+        screen.resize(test_size(4, 4, 96), test_cursor(0, 3, 1), 2, false);
+        assert_eq!(screen.last_viewport_first_reflow_us(), 0);
+    }
+
+    #[test]
     fn viewport_first_reflow_records_last_viewport_first_reflow_us() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();
@@ -6067,6 +6100,7 @@ mod tests {
                     hot_lines: 2,
                     warm_max_bytes: 0,
                 },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
                 ..TestTermConfig::default()
             },
         );
@@ -6339,6 +6373,7 @@ mod tests {
                     hot_lines: 2,
                     warm_max_bytes,
                 },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
                 ..TestTermConfig::default()
             },
         );
@@ -6376,6 +6411,7 @@ mod tests {
                     hot_lines: 2,
                     warm_max_bytes,
                 },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
                 ..TestTermConfig::default()
             },
         );
@@ -6424,6 +6460,7 @@ mod tests {
                     hot_lines: 2,
                     warm_max_bytes,
                 },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
                 ..TestTermConfig::default()
             },
         );
@@ -6587,6 +6624,7 @@ mod tests {
                     hot_lines: 2,
                     warm_max_bytes,
                 },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
                 ..TestTermConfig::default()
             },
         );
@@ -6655,6 +6693,7 @@ mod tests {
                     hot_lines: 2,
                     warm_max_bytes,
                 },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
                 ..TestTermConfig::default()
             },
         );

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use serde_json::json;
@@ -218,6 +218,163 @@ fn bench_byte_to_grid(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Debug)]
+struct ReflowTermConfig;
+
+impl TerminalConfiguration for ReflowTermConfig {
+    fn scrollback_size(&self) -> usize {
+        // Keep every generated row even at the narrowest measured width.
+        131_072
+    }
+
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
+    }
+}
+
+const REFLOW_WIDTHS: [usize; 4] = [61, 200, 79, 120];
+
+fn reflow_size(cols: usize) -> TerminalSize {
+    TerminalSize {
+        rows: 32,
+        cols,
+        pixel_width: cols * 8,
+        pixel_height: 512,
+        dpi: 96,
+    }
+}
+
+fn reflow_payload(logical_lines: usize, unicode: bool) -> (Vec<u8>, String) {
+    let body = if unicode {
+        "界👩‍💻e\u{301}אב".repeat(32)
+    } else {
+        "abcdefghijklmnopqrstuvwxyz0123456789".repeat(6)
+    };
+    let mut input = Vec::new();
+    let mut expected = String::new();
+    for index in 0..logical_lines {
+        let row = format!("row-{index:05}:{body}");
+        expected.push_str(&row);
+        input.extend_from_slice(row.as_bytes());
+        input.extend_from_slice(b"\r\n");
+    }
+    (input, expected)
+}
+
+fn make_reflow_terminal(input: &[u8]) -> Terminal {
+    let mut term = Terminal::new(
+        reflow_size(120),
+        Arc::new(ReflowTermConfig),
+        "frankenterm-reflow-cpu",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(std::io::sink()),
+    );
+    term.advance_bytes(input);
+    term
+}
+
+fn assert_reflow_content(term: &Terminal, cols: usize, expected: &str) {
+    let mut actual = String::with_capacity(expected.len());
+    let screen = term.screen();
+    screen.with_phys_lines(0..screen.scrollback_rows(), |lines| {
+        for line in lines {
+            // The generated corpus contains no spaces. Ignore only terminal
+            // padding; preserve combining characters, bidi text and ZWJ bytes.
+            actual.extend(line.as_str().chars().filter(|ch| *ch != ' '));
+        }
+    });
+    if actual != expected {
+        let first_difference = actual
+            .bytes()
+            .zip(expected.bytes())
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or(actual.len().min(expected.len()));
+        panic!(
+            "reflow text mismatch at byte {first_difference}: actual_bytes={} expected_bytes={}",
+            actual.len(),
+            expected.len()
+        );
+    }
+    let cursor = term.cursor_pos();
+    assert!(cursor.x < cols, "cursor outside resized columns");
+    assert!((0..32).contains(&cursor.y), "cursor outside resized rows");
+}
+
+fn verify_reflow_workload(label: &str, input: &[u8], expected: &str) {
+    let mut term = make_reflow_terminal(input);
+    assert_reflow_content(&term, 120, expected);
+    // Independent input-text oracle runs at every width, outside Criterion's
+    // timer. These real CPU milestones are not GUI or presented-frame timing.
+    for cycle in 0..2 {
+        for cols in REFLOW_WIDTHS {
+            let started = Instant::now();
+            term.resize(reflow_size(cols));
+            let total_us = started.elapsed().as_micros();
+            let viewport_near_us = term.screen().last_viewport_first_reflow_us();
+            assert!(
+                u128::from(viewport_near_us) <= total_us,
+                "viewport batch timing must belong to this resize"
+            );
+            assert_reflow_content(&term, cols, expected);
+            println!(
+                "REFLOW_CPU_CALIBRATION {}",
+                json!({
+                    "workload": label,
+                    "input_bytes": input.len(),
+                    "cycle": cycle,
+                    "cols": cols,
+                    "resize_return_us": total_us,
+                    "viewport_near_cpu_us": viewport_near_us,
+                    "retained_physical_rows": term.screen().scrollback_rows(),
+                    "content_oracle": "exact_generated_text_excluding_padding",
+                    "presentation_proven": false,
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                })
+            );
+        }
+    }
+}
+
+fn bench_resize_reflow(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reflow_cpu");
+    for logical_lines in [1_000, 10_000] {
+        for (kind, unicode) in [("ascii", false), ("unicode", true)] {
+            let label = format!("{kind}_{logical_lines}");
+            let (input, expected) = reflow_payload(logical_lines, unicode);
+            verify_reflow_workload(&label, &input, &expected);
+            group.throughput(Throughput::Elements(1));
+            group.bench_function(format!("{label}/cold_resize"), |b| {
+                b.iter_batched_ref(
+                    || make_reflow_terminal(&input),
+                    |term| {
+                        term.resize(reflow_size(61));
+                        black_box(term.cursor_pos());
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+            group.throughput(Throughput::Elements(
+                u64::try_from(REFLOW_WIDTHS.len()).expect("bounded width count"),
+            ));
+            group.bench_function(format!("{label}/repeated_width_cycle"), |b| {
+                let mut term = make_reflow_terminal(&input);
+                for cols in REFLOW_WIDTHS {
+                    term.resize(reflow_size(cols));
+                }
+                b.iter(|| {
+                    for cols in REFLOW_WIDTHS {
+                        term.resize(reflow_size(cols));
+                    }
+                    black_box(term.cursor_pos());
+                });
+                assert_reflow_content(&term, 120, &expected);
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     measure_payload("ascii_agent_output", ascii_agent_payload());
     measure_payload("wrapped_agent_output", wrapped_agent_payload());
@@ -228,6 +385,6 @@ fn bench_config() -> Criterion {
 criterion_group!(
     name = benches;
     config = bench_config();
-    targets = bench_byte_to_grid
+    targets = bench_byte_to_grid, bench_resize_reflow
 );
 criterion_main!(benches);
