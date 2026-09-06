@@ -31,16 +31,20 @@ EXEMPT_FILES=(
 # NOT code call-sites — they're meta-references about the migration.
 #
 # Use ripgrep if available; fall back to git grep.
+scan_status=0
 if command -v rg >/dev/null 2>&1; then
     matches="$(rg --count-matches --no-heading 'runtime_compat' \
         --glob 'crates/**/*.rs' --glob 'frankenterm/**/*.rs' \
         --glob 'crates/**/Cargo.toml' --glob 'frankenterm/**/Cargo.toml' \
-        --glob '!target/**' \
-        || true)"
+        --glob '!target/**')" || scan_status=$?
 else
     matches="$(git grep -c 'runtime_compat' -- 'crates/**/*.rs' \
         'frankenterm/**/*.rs' 'crates/**/Cargo.toml' \
-        'frankenterm/**/Cargo.toml' || true)"
+        'frankenterm/**/Cargo.toml')" || scan_status=$?
+fi
+if [[ "$scan_status" -gt 1 ]]; then
+    echo "ft-y378j.4 guard: source scan failed (exit $scan_status); cleanliness is unknown." >&2
+    exit "$scan_status"
 fi
 
 if [[ -z "${matches}" ]]; then

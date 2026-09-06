@@ -40,17 +40,21 @@ ALLOWED_FILES=(
 #   dyn WeztermInterface    — direct trait-object on the alias name
 # Word-boundary protected so identifiers like `WeztermInterfaceFactory`
 # don't accidentally match.
-PATTERN='dyn[[:space:]]+(Mux|Wezterm)Interface\b'
+# POSIX ERE boundary: git grep's regex implementation need not support \b.
+PATTERN='dyn[[:space:]]+(Mux|Wezterm)Interface([^[:alnum:]_]|$)'
 
 # Use ripgrep if available (faster, respects .gitignore by default), fall
 # back to git-grep otherwise.
+scan_status=0
 if command -v rg >/dev/null 2>&1; then
     matches="$(rg --line-number --no-heading --pcre2 "${PATTERN}" \
-        --glob '!target/**' --glob '!.beads/**' \
-        || true)"
+        --glob '!target/**' --glob '!.beads/**')" || scan_status=$?
 else
-    matches="$(git grep -n -E "${PATTERN}" -- '*.rs' '*.sh' '*.md' \
-        || true)"
+    matches="$(git grep -n -E "${PATTERN}" -- '*.rs' '*.sh' '*.md')" || scan_status=$?
+fi
+if [[ "$scan_status" -gt 1 ]]; then
+    echo "ft-zoxxq.4 guard: source scan failed (exit $scan_status); cleanliness is unknown." >&2
+    exit "$scan_status"
 fi
 
 if [[ -z "${matches}" ]]; then
@@ -74,7 +78,12 @@ for f in "${ALLOWED_FILES[@]}"; do
 done
 
 # Use grep -Ev to drop allowed lines; what remains are violations.
-violations="$(printf '%s\n' "${matches}" | grep -Ev "${allow_regex}" || true)"
+filter_status=0
+violations="$(printf '%s\n' "${matches}" | grep -Ev "${allow_regex}")" || filter_status=$?
+if [[ "$filter_status" -gt 1 ]]; then
+    echo "ft-zoxxq.4 guard: allowlist filtering failed (exit $filter_status)." >&2
+    exit "$filter_status"
+fi
 
 if [[ -z "${violations}" ]]; then
     echo "ft-zoxxq.4 guard: all \`dyn (Mux|Wezterm)Interface\` references are inside the allowlist — clean."

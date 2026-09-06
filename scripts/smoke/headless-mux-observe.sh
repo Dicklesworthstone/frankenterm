@@ -171,24 +171,32 @@ stop_children() {
   # Never `kill 0`: an unset pid would signal the whole process group (the
   # script included) before the receipt is written.
   if [ "$KILL_SWITCH_SMOKE" = 1 ] && [ -f "$D/phase" ]; then printf 'stop\n' > "$D/phase"; fi
-  [ -n "${WATCH:-}" ] && owned_running "$WATCH" && kill -TERM "$WATCH"
-  [ -n "${MUX_PID:-}" ] && owned_running "$MUX_PID" && kill -TERM "$MUX_PID"
   # A watcher whose mux is already gone does not honour SIGTERM (ft-yykm1)
   # and keeps polling, leaking a defunct child per poll; nine such orphans
   # once exhausted the maintainer Mac's process limit. Escalate to SIGKILL
   # after a short grace and report what was left behind.
-  local pid deadline
+  local pid deadline child_status status=0
+  # Settle the watcher while its mux is still available for final capture.
   for pid in ${WATCH:-} ${MUX_PID:-}; do
+    owned_running "$pid" && kill -TERM "$pid"
     deadline=$((SECONDS + 5))
     while owned_running "$pid" && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
     if owned_running "$pid"; then
       log "child $pid ignored SIGTERM for 5s; sending SIGKILL"
       kill -9 "$pid"
+      status=1
     fi
-    wait "$pid"
-    log "owned child $pid reaped with status $?"
+    if wait "$pid"; then child_status=0; else child_status=$?; fi
+    log "owned child $pid reaped with status $child_status"
+    if [ "$pid" = "${WATCH:-}" ] && [ "$child_status" -ne 0 ]; then
+      status=1
+    elif [ "$child_status" -ne 0 ] && [ "$child_status" -ne 143 ]; then
+      status=1
+    fi
   done
-  return 0
+  WATCH=""
+  MUX_PID=""
+  return "$status"
 }
 finish() { # status
   local status="$1" final_cli_sha final_mux_sha
@@ -386,7 +394,7 @@ PY
     || fail kill_switch_recovery "fresh allowed workflow did not reach PTY input"
   owned_running "$WATCH" || fail kill_switch_recovery "watcher was replaced or exited"
   step kill_switch_recovery pass "fresh compaction trigger delivered after reset; no rejected send replay"
-  stop_children
+  stop_children || fail shutdown "owned watcher did not settle cleanly or a child required SIGKILL"
   finish pass || exit 1
   echo "PASS: owned watcher kill-switch admission (remote settlement remains unproven; evidence in $D)"
   exit 0
@@ -405,6 +413,10 @@ jq -e 'any(.[]; .rule_id == "codex.usage.reached")' "$D/events.json" > /dev/null
   || fail detect "no codex.usage.reached event ($(grep -c . "$D/watch.log") watch log lines in $D)"
 step detect pass "$(jq -c '[.[] | select(.rule_id=="codex.usage.reached")][0] | {id, extracted}' "$D/events.json")"
 
+# Drain the watcher before assessing durability. Captures still queued when
+# detection succeeds can fail during shutdown and must not escape this gate.
+stop_children || fail shutdown "owned watcher did not settle cleanly or a child required SIGKILL"
+
 DROPPED=$(grep -a -c 'Failed to persist segment' "$D/watch.log")
 RESYNCS=$(grep -a -c 'Sequence discontinuity' "$D/watch.log")
 if [ "$DROPPED" != "0" ] || [ "$RESYNCS" != "0" ]; then
@@ -412,6 +424,5 @@ if [ "$DROPPED" != "0" ] || [ "$RESYNCS" != "0" ]; then
 fi
 step durability pass "dropped segments 0, sequence resyncs 0"
 
-stop_children
 finish pass || exit 1
 echo "PASS: observe->detect on a real headless mux (evidence in $D)"

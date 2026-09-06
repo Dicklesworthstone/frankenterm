@@ -397,6 +397,72 @@ for mode, change in itertools.product(["0", "1"], ["unchanged", "cli", "mux", "u
           and recorded["steps"][0]["status"] == expected,
           f"smoke_identity:{mode}:{change}:explicit_identity_step")
 
+# Run the actual ordinary-mode closeout with an owned shell child whose TERM
+# handler writes a late durability error. This proves log assessment follows
+# watcher drain; it does not stand in for a real terminal or storage failure.
+ordinary_closeout = smoke_source.rsplit('\nstep detect pass ', 1)[1].split('\n', 1)[1]
+durability_body = smoke_function("owned_running") + smoke_function("stop_children") + smoke_function("fail") + r'''
+# Unlike the retention-only cases, this case owns a real shell child. Restore
+# builtins for its exact PID and match the production script's non-errexit mode.
+unset -f kill wait
+set +e
+log() { printf '%s\n' "$*"; }
+step() { printf '%s %s\n' "$1" "$2" >> "$STEPS"; }
+finish() { printf '%s\n' "$1" > "$RECEIPT"; [ "$1" = pass ]; }
+bash -c '
+    if [ "$STOP_MODE" = ignore ]; then
+        trap "" TERM
+    else
+        trap '\''printf "%s\n" "$LATE_ERROR" >> "$D/watch.log"; exit "$CHILD_EXIT"'\'' TERM
+    fi
+    printf "%s\n" "$$" > "$D/child.pid"
+    printf ready > "$D/ready"
+    deadline=$((SECONDS + 8))
+    while [ "$SECONDS" -lt "$deadline" ]; do sleep 0.05; done
+    exit 98
+' &
+WATCH=$!
+MUX_PID=""
+trap stop_children EXIT
+for _ in {1..100}; do
+    [ -f "$D/ready" ] && break
+    sleep 0.02
+done
+[ -f "$D/ready" ] || exit 97
+''' + ordinary_closeout
+for name, late_error, child_exit, stop_mode in [
+    ("clean", "", 0, "handle"),
+    ("late-drop", "Failed to persist segment", 0, "handle"),
+    ("late-discontinuity", "Sequence discontinuity", 0, "handle"),
+    ("watcher-failed", "", 7, "handle"),
+    ("watcher-forced", "", 0, "ignore"),
+]:
+    fixture = Path(tempfile.mkdtemp(prefix="smoke-drain-", dir=work))
+    (fixture / "watch.log").write_text("")
+    steps, receipt = fixture / "steps.txt", fixture / "receipt.txt"
+    steps.write_text("")
+    run("smoke-drain-durability", durability_body, {
+        "D": fixture, "STEPS": steps, "RECEIPT": receipt,
+        "KILL_SWITCH_SMOKE": "0", "LATE_ERROR": late_error,
+        "CHILD_EXIT": str(child_exit), "STOP_MODE": stop_mode,
+    }, expected=0 if name == "clean" else 1)
+    expected = "pass" if name == "clean" else "fail"
+    check(receipt.read_text().strip() == expected,
+          f"smoke_drain:{name}:receipt_status")
+    stage = "shutdown" if child_exit or stop_mode == "ignore" else "durability"
+    check(f"{stage} {expected}" in steps.read_text().splitlines(),
+          f"smoke_drain:{name}:explicit_failure_stage")
+    check((fixture / "watch.log").read_text() == ("" if stop_mode == "ignore" else late_error + "\n"),
+          f"smoke_drain:{name}:owned_child_teardown_observed")
+    child_pid = int((fixture / "child.pid").read_text())
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        reaped = True
+    else:
+        reaped = False
+    check(reaped, f"smoke_drain:{name}:owned_child_reaped")
+
 check(all((root / path).read_text() == text for path, text in sources.items()),
       "source_files_unchanged_during_proof")
 summary = {"bead_id": "ft-xxfwy.63.1", "status": "passed", "checks": len(checks),

@@ -29,13 +29,23 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 violations=()
+if ! files="$(git ls-files -- 'crates/**/*.rs' 'frankenterm/**/*.rs' 'tests/**/*.rs')"; then
+    echo "[asupersync-test-only] supported-path file enumeration failed." >&2
+    exit 2
+fi
 while IFS= read -r file; do
     [[ -z "$file" ]] && continue
+    scan_status=0
+    hits="$(grep -nE '^[[:space:]]*#\[tokio::test' "$file")" || scan_status=$?
+    if [[ "$scan_status" -gt 1 ]]; then
+        echo "[asupersync-test-only] failed to scan supported-path file: $file" >&2
+        exit "$scan_status"
+    fi
     while IFS= read -r hit; do
         [[ -z "$hit" ]] && continue
         violations+=("${file}:${hit}")
-    done < <(grep -nE '^[[:space:]]*#\[tokio::test' "$file" || true)
-done < <(git ls-files -- 'crates/**/*.rs' 'frankenterm/**/*.rs' 'tests/**/*.rs')
+    done <<< "$hits"
+done <<< "$files"
 
 if [[ "${#violations[@]}" -gt 0 ]]; then
     echo "[asupersync-test-only] active #[tokio::test] attributes are forbidden in supported paths." >&2
