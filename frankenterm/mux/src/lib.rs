@@ -12407,7 +12407,8 @@ impl Mux {
                 .try_reserve(prepared.len())
                 .map_err(|error| anyhow!("reserve prepared window identities: {error}"))?;
             for (window_id, _) in &prepared {
-                debug_assert!(prepared_window_ids.insert(*window_id));
+                let inserted = prepared_window_ids.insert(*window_id);
+                debug_assert!(inserted);
             }
         }
 
@@ -12480,9 +12481,9 @@ impl Mux {
                         "window transaction gives tab {} more than one final parent",
                         tab.tab_id()
                     );
-                    debug_assert!(
-                        final_tab_memberships.insert((*window_id, Arc::as_ptr(tab) as usize))
-                    );
+                    let inserted =
+                        final_tab_memberships.insert((*window_id, Arc::as_ptr(tab) as usize));
+                    debug_assert!(inserted);
                 }
             }
         }
@@ -15895,7 +15896,8 @@ impl Mux {
                         let revision_offset = u64::try_from(live.len())
                             .map_err(|_| anyhow!("tab pane retirement revision offset overflow"))?;
                         lifecycle_ids.push(*pane_id);
-                        debug_assert!(removed_ids.insert(*pane_id));
+                        let inserted = removed_ids.insert(*pane_id);
+                        debug_assert!(inserted);
                         live.push(PreparedTabPaneRetirementCandidate {
                             group_index,
                             pane_id: *pane_id,

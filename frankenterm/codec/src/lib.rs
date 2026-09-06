@@ -8204,8 +8204,9 @@ impl ValidatedOrderedSerializationScope {
 impl Drop for ValidatedOrderedSerializationScope {
     fn drop(&mut self) {
         VALIDATED_ORDERED_SERIALIZATION.with(|active| {
+            let previous = active.replace(None);
             debug_assert!(
-                active.replace(None).is_some(),
+                previous.is_some(),
                 "validated ordered serialization scope lost its exact-object target"
             );
         });
