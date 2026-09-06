@@ -893,19 +893,19 @@
         "cosmetic": 14,
         "feat": 49,
         "fix": 81,
-        "other": 28,
+        "other": 30,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 44
+        "test": 45
       },
-      "fork_side_commit_count": 232,
+      "fork_side_commit_count": 235,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-05T05:18:03-04:00",
-        "sha": "1a616c697ab217c3fd8d23a6461434876b450e8f",
-        "subject": "fix(clipboard): compile the terminal retirement regression on nightly"
+        "classification": "other",
+        "committed_at": "2026-09-05T23:25:39-04:00",
+        "sha": "24f68723a6f204976694f5a46893709584fd9eae",
+        "subject": "perf(term): cache immutable text-wrap signatures after measured hashing"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2396,
-  "generated_at": "2026-09-05T13:08:01.366978Z",
+  "fork_side_commit_total": 2399,
+  "generated_at": "2026-09-06T16:24:00Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

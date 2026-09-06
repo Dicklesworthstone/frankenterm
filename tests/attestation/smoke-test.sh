@@ -65,6 +65,86 @@ fi
 echo
 echo "=== positive verify: artifact count OK ==="
 
+echo
+echo "=== strict categories: declared required and optional deferrals ==="
+DEFERRED_MANIFEST="$WORKDIR/deferred-manifest.json"
+jq '
+  .required_categories = ["doctrine/agents-md-counts", "perf/lindley-bounds"]
+  | .slots = [
+      {category:"doctrine/agents-md-counts", path:"docs/attestations/schema.json",
+       media_type:"application/json", produced_by_bead:"ft-fixture", proof_categories:[5]},
+      {category:"perf/lindley-bounds", path:null, media_type:"application/json",
+       deferred_to_bead:"ft-required", deferred_reason:"owned required fixture", proof_categories:[8]},
+      {category:"security/redaction-hygiene", path:null, media_type:"application/json",
+       deferred_to_bead:"ft-optional", deferred_reason:"owned optional fixture", proof_categories:[7]}]
+' "$ART_DIR/manifest.json" >"$DEFERRED_MANIFEST"
+invalid_taxonomy_id="$(jq '[.categories[].id] | max + 1' docs/proof-taxonomy.json)"
+for slot in 0 1 2; do
+  invalid_manifest="$WORKDIR/unknown-taxonomy-$slot.manifest.json"
+  jq --argjson slot "$slot" --argjson id "$invalid_taxonomy_id" \
+    '.slots[$slot].proof_categories += [$id]' "$DEFERRED_MANIFEST" >"$invalid_manifest"
+  if FT_ATTESTATION_MANIFEST="$invalid_manifest" FT_ATTESTATION_OUT_DIR="$OUT_DIR" \
+    bash scripts/attestation-build.sh --version "0.0.0-unknown-taxonomy-$slot" \
+    --channel dev --sign unsigned >"$WORKDIR/unknown-taxonomy-$slot.log" 2>&1; then
+    echo "FAIL: builder accepted unknown taxonomy id in slot $slot" >&2
+    exit 1
+  fi
+  grep -Fq "unknown proof taxonomy id(s): $invalid_taxonomy_id" "$WORKDIR/unknown-taxonomy-$slot.log"
+  test ! -e "$OUT_DIR/0.0.0-unknown-taxonomy-$slot.json"
+  printf 'TAXONOMY_NEGATIVE slot=%s unknown_id=%s rejected_before_bundle\n' "$slot" "$invalid_taxonomy_id"
+done
+FT_ATTESTATION_MANIFEST="$DEFERRED_MANIFEST" FT_ATTESTATION_OUT_DIR="$OUT_DIR" \
+  bash scripts/attestation-build.sh --version 0.0.0-deferred-smoke --channel dev --sign unsigned \
+  >"$WORKDIR/deferred-build.log" 2>&1
+DEFERRED_BUNDLE="$OUT_DIR/0.0.0-deferred-smoke.json"
+FT_ATTESTATION_MANIFEST="$DEFERRED_MANIFEST" bash scripts/attestation-verify.sh \
+  "$DEFERRED_BUNDLE" --strict-required --json >"$WORKDIR/deferred-positive.json"
+jq -e '.ok and (.publisher_authenticated | not)
+  and any(.checks[]; .name == "required_categories_match_manifest" and .ok)' \
+  "$WORKDIR/deferred-positive.json" >/dev/null
+printf 'DEFERRED_CATEGORY_POSITIVE declared_required_and_optional\n'
+
+# Recompute the unsigned canonical hash after each mutation, so the intended
+# category/deferral check must reject it independently of payload tampering.
+for mutation in missing-required extra-required unknown-deferred wrong-producer wrong-reason wrong-taxonomy strict-deferred; do
+  case "$mutation" in
+    missing-required) filter='.deferred_slots |= map(select(.category != "perf/lindley-bounds"))' ;;
+    extra-required) filter='.required_categories += ["security/redaction-hygiene"]' ;;
+    unknown-deferred) filter='.deferred_slots[1].category = "unknown/fixture"' ;;
+    wrong-producer) filter='.deferred_slots[0].deferred_to_bead = "ft-other"' ;;
+    wrong-reason) filter='.deferred_slots[0].deferred_reason = "unapproved deferral"' ;;
+    wrong-taxonomy) filter='.deferred_slots[0].proof_categories = [1]' ;;
+    strict-deferred) filter='.' ;;
+  esac
+  payload="$WORKDIR/deferred-$mutation.payload.json"
+  canonical="$WORKDIR/deferred-$mutation.canonical.json"
+  candidate="$WORKDIR/deferred-$mutation.json"
+  jq "$filter" "$DEFERRED_BUNDLE" >"$payload"
+  jq -S -c 'del(.signature)' "$payload" | tr -d '\n' >"$canonical"
+  canonical_sha="$(shasum -a 256 "$canonical" | awk '{print $1}')"
+  jq --arg sha "$canonical_sha" '.signature.canonical_sha256 = $sha' "$payload" >"$candidate"
+  flags=(--strict-required)
+  check=required_categories_match_manifest
+  case "$mutation" in
+    unknown-deferred) check=deferred_slot:unknown/fixture ;;
+    wrong-producer|wrong-reason|wrong-taxonomy) check=deferred_slot:perf/lindley-bounds ;;
+    strict-deferred) flags+=(--strict-deferred); check=deferred_slots_strict ;;
+  esac
+  if FT_ATTESTATION_MANIFEST="$DEFERRED_MANIFEST" bash scripts/attestation-verify.sh \
+    "$candidate" "${flags[@]}" --json >"$WORKDIR/deferred-$mutation.verdict.json" \
+    2>"$WORKDIR/deferred-$mutation.stderr"; then
+    echo "FAIL: deferred category verifier accepted $mutation" >&2
+    exit 1
+  fi
+  cat "$WORKDIR/deferred-$mutation.stderr"
+  jq -e --arg check "$check" '
+    (.ok | not) and (.publisher_authenticated | not)
+    and any(.checks[]; .name == $check and (.ok | not))
+    and any(.checks[]; .name == "canonical_sha256" and .ok)
+  ' "$WORKDIR/deferred-$mutation.verdict.json" >/dev/null
+  printf 'DEFERRED_CATEGORY_NEGATIVE %s rejected_by=%s\n' "$mutation" "$check"
+done
+
 if command -v openssl >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
   ED_KEY="$WORKDIR/ed25519.pem"
   ED_BUILD_VERSION="0.0.0-smoke-ed25519"

@@ -224,7 +224,8 @@ unknown_proof_categories="$(jq -rn \
   --slurpfile taxonomy "$TAXONOMY_PATH" \
   --argjson slots "$SLOTS_JSON" \
   '($taxonomy[0].categories // [] | map(.id)) as $ids
-   | [($slots[]?.proof_categories // [])[] | select(($ids | index(.)) | not)] | unique | map(tostring) | join(", ")')"
+   | [($slots[]?.proof_categories // [])[] as $id | $id | select(($ids | index($id)) | not)]
+   | unique | map(tostring) | join(", ")')"
 if [[ -n "$unknown_proof_categories" ]]; then
   echo "error: manifest references unknown proof taxonomy id(s): $unknown_proof_categories" >&2
   exit 1

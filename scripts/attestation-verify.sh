@@ -538,7 +538,14 @@ if [[ $STRICT_REQUIRED -eq 1 ]]; then
   manifest_path="$MANIFEST_PATH"
   if [[ -f "$manifest_path" ]]; then
     manifest_required="$(jq -c -S '.required_categories | unique' "$manifest_path")"
-    bundle_required="$(jq -c -S '((.required_categories // []) + ((.deferred_slots // []) | map(.category))) | unique' <<<"$bundle_json")"
+    # Optional deferred slots remain visible without becoming required. The
+    # deferred-slot audit below separately binds every deferral to its exact
+    # manifest declaration; this intersection does not authorize new deferrals.
+    bundle_required="$(jq -c -S --argjson required "$manifest_required" '
+      ((.required_categories // []) +
+       ((.deferred_slots // []) | map(.category | select(. as $category | $required | index($category)))))
+      | unique
+    ' <<<"$bundle_json")"
     if [[ "$manifest_required" == "$bundle_required" ]]; then
       record_check "required_categories_match_manifest" true "matches docs/attestations/manifest.json via artifacts + deferred_slots"
     else
@@ -609,6 +616,17 @@ for ((i=0; i<deferred_count; i++)); do
   fi
   if [[ ! "$deferred_to_bead" =~ ^ft-[a-z0-9.]+$ ]]; then
     record_check "deferred_slot:$category" false "invalid deferred_to_bead: $deferred_to_bead"
+    continue
+  fi
+  if [[ ! -f "$MANIFEST_PATH" ]] || ! jq -e --argjson deferred "$def" '
+    any(.slots[]?;
+      .category == $deferred.category and .path == null
+      and .deferred_to_bead == $deferred.deferred_to_bead
+      and .deferred_reason == $deferred.deferred_reason
+      and .media_type == $deferred.media_type
+      and (.proof_categories // []) == ($deferred.proof_categories // []))
+  ' "$MANIFEST_PATH" >/dev/null; then
+    record_check "deferred_slot:$category" false "does not match a declared deferred manifest slot"
     continue
   fi
   record_check "deferred_slot:$category" true "deferred to $deferred_to_bead"
