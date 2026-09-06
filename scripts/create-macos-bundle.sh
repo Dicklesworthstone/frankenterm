@@ -75,18 +75,34 @@ case "$TARGET_TRIPLE" in
         ;;
 esac
 
+if [[ -n "${DSR_RELEASE_GIT_SHA:-}" && "$(pwd -P)" != "$(cd "$PROJECT_ROOT" && pwd -P)" ]]; then
+    # DSR compiles a Gitless archive. Verify every source byte against immutable
+    # Git objects, then take all bundled assets from that same archive. Concurrent
+    # edits in the canonical checkout cannot enter the candidate.
+    DSR_SOURCE_ROOT="$(pwd -P)"
+    if [[ -z "${CARGO_TARGET_DIR:-}" || ! -d "$CARGO_TARGET_DIR" || -e "$DSR_SOURCE_ROOT/.git" \
+        || "$DSR_SOURCE_ROOT" != "$(cd "$CARGO_TARGET_DIR/.." && pwd -P)/source" ]]; then
+        echo "Error: DSR packaging requires its source archive and sibling Cargo target directory" >&2
+        exit 1
+    fi
+    bash "$PROJECT_ROOT/scripts/atomic-component-manifest.sh" verify-source \
+        --root "$DSR_SOURCE_ROOT" --repository "$PROJECT_ROOT" \
+        --source-revision "$DSR_RELEASE_GIT_SHA"
+    PROJECT_ROOT="$DSR_SOURCE_ROOT"
+    SOURCE_REVISION="$DSR_RELEASE_GIT_SHA"
+else
+    SOURCE_REVISION=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
+    if ! git -C "$PROJECT_ROOT" diff --quiet -- || ! git -C "$PROJECT_ROOT" diff --cached --quiet --; then
+        echo "Error: tracked source changes are present; refusing to mint a commit-bound package identity"
+        echo "Commit the intended source snapshot, then rebuild all components together."
+        exit 1
+    fi
+fi
 VERSION=$(grep -m1 '^version' "$PROJECT_ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-SOURCE_REVISION=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
 if [[ ! "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
     echo "Error: cannot resolve a full source revision for atomic packaging"
     exit 1
 fi
-if ! git -C "$PROJECT_ROOT" diff --quiet -- || ! git -C "$PROJECT_ROOT" diff --cached --quiet --; then
-    echo "Error: tracked source changes are present; refusing to mint a commit-bound package identity"
-    echo "Commit the intended source snapshot, then rebuild all components together."
-    exit 1
-fi
-
 ATOMIC_MANIFEST_TOOL="$PROJECT_ROOT/scripts/atomic-component-manifest.sh"
 if [[ ! -f "$ATOMIC_MANIFEST_TOOL" ]]; then
     echo "Error: atomic component manifest tool not found at $ATOMIC_MANIFEST_TOOL"

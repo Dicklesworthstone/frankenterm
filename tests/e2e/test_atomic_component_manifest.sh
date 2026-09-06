@@ -793,5 +793,59 @@ if [[ "$MANIFEST_A" == "$MANIFEST_B" ]]; then
   exit 1
 fi
 
+# A runtime parser's prefix constant is not a second identity record. This
+# occurs in real Mach-O CLI/guardian binaries when the linker pools strings.
+PREFIX_LITERAL="$TEST_ROOT/runtime-prefix-literal"
+make_fixture "$PREFIX_LITERAL"
+printf '\000FT_ATOMIC_COMPONENT_IDENTITY_V1:frankenterm-guifrankenterm-pty-guardian\000' \
+  >> "$PREFIX_LITERAL/package/bin/ft"
+generate_fixture "$PREFIX_LITERAL" >/dev/null
+verify_fixture "$PREFIX_LITERAL" >/dev/null
+
+DUPLICATE_RECORD="$TEST_ROOT/duplicate-identity-record"
+make_fixture "$DUPLICATE_RECORD"
+cat "$DUPLICATE_RECORD/package/bin/frankenterm-gui" >> "$DUPLICATE_RECORD/package/bin/ft"
+expect_failure component_identity_mismatch "$DUPLICATE_RECORD/error.log" \
+  generate_fixture "$DUPLICATE_RECORD"
+
+# Inert Git objects supply source authority without a second project checkout.
+SOURCE_OBJECTS="$TEST_ROOT/source-objects.git"
+SOURCE_ARCHIVE="$TEST_ROOT/source-archive"
+git init --bare -q "$SOURCE_OBJECTS"
+mkdir "$SOURCE_ARCHIVE"
+printf 'font fixture\n' > "$SOURCE_ARCHIVE/font,wght=300(1).ttf"
+printf 'executable fixture\n' > "$SOURCE_ARCHIVE/tool"
+chmod 0755 "$SOURCE_ARCHIVE/tool"
+FONT_OBJECT=$(git --git-dir="$SOURCE_OBJECTS" hash-object -w "$SOURCE_ARCHIVE/font,wght=300(1).ttf")
+TOOL_OBJECT=$(git --git-dir="$SOURCE_OBJECTS" hash-object -w "$SOURCE_ARCHIVE/tool")
+SOURCE_TREE=$(printf '100644 blob %s\tfont,wght=300(1).ttf\n100755 blob %s\ttool\n' \
+  "$FONT_OBJECT" "$TOOL_OBJECT" | git --git-dir="$SOURCE_OBJECTS" mktree)
+SOURCE_COMMIT=$(printf 'Inert source fixture\n' | git --git-dir="$SOURCE_OBJECTS" \
+  -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree "$SOURCE_TREE")
+verify_source_fixture() {
+  GIT_DIR=/nonexistent-ambient-git GIT_WORK_TREE=/nonexistent-ambient-tree \
+    bash "$TOOL" verify-source --root "$1" --repository "$SOURCE_OBJECTS" \
+    --source-revision "$SOURCE_COMMIT"
+}
+verify_source_fixture "$SOURCE_ARCHIVE" > "$TEST_ROOT/source-valid.json"
+jq -e '.ok and .file_count == 2' "$TEST_ROOT/source-valid.json" >/dev/null
+for source_case in changed mode extra symlink directory; do
+  SOURCE_BAD="$TEST_ROOT/source-$source_case"
+  cp -Rp "$SOURCE_ARCHIVE" "$SOURCE_BAD"
+  case "$source_case" in
+    changed) printf 'different bytes\n' >> "$SOURCE_BAD/tool" ;;
+    mode) chmod 0644 "$SOURCE_BAD/tool" ;;
+    extra) printf 'extra\n' > "$SOURCE_BAD/extra" ;;
+    symlink) ln -s tool "$SOURCE_BAD/link" ;;
+    directory) mkdir "$SOURCE_BAD/extra-directory" ;;
+  esac
+  case "$source_case" in
+    changed|mode) SOURCE_ERROR=source_content_mismatch ;;
+    *) SOURCE_ERROR=source_inventory_mismatch ;;
+  esac
+  expect_failure "$SOURCE_ERROR" "$TEST_ROOT/source-$source_case.log" \
+    verify_source_fixture "$SOURCE_BAD"
+done
+
 printf 'FT_ATOMIC_COMPONENT_MANIFEST_MATRIX_SUCCESS root=%s build_id=%s manifest_id=%s\n' \
   "$TEST_ROOT" "$BUILD_A" "$(jq -r .manifest_id "$CLEAN/manifest.json")"

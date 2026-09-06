@@ -49,24 +49,40 @@ for command in curl git ln python3 shasum; do
         exit 2
     fi
 done
+if [[ -n "${DSR_RELEASE_GIT_SHA:-}" && "$(pwd -P)" != "$(cd "$PROJECT_ROOT" && pwd -P)" ]]; then
+    # Keep browser lock data and verifier bytes in the source archive DSR built.
+    # The canonical repository supplies immutable Git objects, not live assets.
+    DSR_SOURCE_ROOT="$(pwd -P)"
+    if [[ -z "${CARGO_TARGET_DIR:-}" || ! -d "$CARGO_TARGET_DIR" || -e "$DSR_SOURCE_ROOT/.git" \
+        || "$DSR_SOURCE_ROOT" != "$(cd "$CARGO_TARGET_DIR/.." && pwd -P)/source" ]]; then
+        echo "Error: DSR assembly requires its source archive and sibling Cargo target directory" >&2
+        exit 2
+    fi
+    bash "$MANIFEST_TOOL" verify-source --root "$DSR_SOURCE_ROOT" \
+        --repository "$PROJECT_ROOT" --source-revision "$DSR_RELEASE_GIT_SHA"
+    PROJECT_ROOT="$DSR_SOURCE_ROOT"
+    LOCK_FILE="$PROJECT_ROOT/docs/release/browser-runtime-lock.v1.json"
+    MANIFEST_TOOL="$PROJECT_ROOT/scripts/atomic-component-manifest.sh"
+    SOURCE_REVISION="$DSR_RELEASE_GIT_SHA"
+else
+    SOURCE_REVISION=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
+    UNTRACKED_SOURCE=$(git -C "$PROJECT_ROOT" ls-files --others --exclude-standard)
+    if ! git -C "$PROJECT_ROOT" diff --quiet -- \
+        || ! git -C "$PROJECT_ROOT" diff --cached --quiet -- \
+        || [[ -n "$UNTRACKED_SOURCE" ]]; then
+        echo "Error: source changes are present; refusing commit-bound browser assembly" >&2
+        echo "Commit the intended source snapshot, then assemble the browser runtime." >&2
+        exit 2
+    fi
+fi
 if [[ ! -f "$LOCK_FILE" || ! -x "$MANIFEST_TOOL" ]]; then
     echo "Error: browser lock or atomic manifest tool is unavailable" >&2
     exit 2
 fi
-SOURCE_REVISION=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
 if [[ ! "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
     echo "Error: cannot resolve a full source revision for browser runtime assembly" >&2
     exit 2
 fi
-UNTRACKED_SOURCE=$(git -C "$PROJECT_ROOT" ls-files --others --exclude-standard)
-if ! git -C "$PROJECT_ROOT" diff --quiet -- \
-    || ! git -C "$PROJECT_ROOT" diff --cached --quiet -- \
-    || [[ -n "$UNTRACKED_SOURCE" ]]; then
-    echo "Error: source changes are present; refusing commit-bound browser assembly" >&2
-    echo "Commit the intended source snapshot, then assemble the browser runtime." >&2
-    exit 2
-fi
-
 LOCK_VALUES=()
 while IFS= read -r lock_value_record; do
     LOCK_VALUES+=("$lock_value_record")

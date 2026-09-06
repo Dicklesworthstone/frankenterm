@@ -28,8 +28,11 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import stat
+import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -204,6 +207,7 @@ class ReadEvidence:
     markers: tuple[dict[str, str], ...]
     payload: bytes | None
     identity: StatIdentity
+    git_blob_sha1: str | None = None
 
 
 @dataclass(frozen=True)
@@ -405,13 +409,17 @@ class AnchoredRoot:
         finally:
             os.close(parent_fd)
 
-    def read_regular(self, relative: str, scan_markers: bool = False) -> ReadEvidence:
+    def read_regular(
+        self, relative: str, scan_markers: bool = False, git_blob: bool = False
+    ) -> ReadEvidence:
         with self.open_regular(relative) as (fd, before):
             digest = hashlib.sha256()
+            blob_digest = hashlib.sha1() if git_blob else None
+            if blob_digest is not None:
+                blob_digest.update(f"blob {before.st_size}\0".encode("ascii"))
             length = 0
             carry = b""
             marker_records: list[dict[str, str]] = []
-            marker_prefix_count = 0
             retained = bytearray() if before.st_size <= MAX_MANIFEST_BYTES else None
             while True:
                 chunk = os.read(fd, 1024 * 1024)
@@ -419,31 +427,30 @@ class AnchoredRoot:
                     break
                 previous_length = length
                 digest.update(chunk)
+                if blob_digest is not None:
+                    blob_digest.update(chunk)
                 length += len(chunk)
                 if retained is not None:
                     retained.extend(chunk)
                 if scan_markers:
                     payload = carry + chunk
                     payload_offset = previous_length - len(carry)
-                    prefix_offset = 0
-                    while True:
-                        prefix_offset = payload.find(MARKER_PREFIX, prefix_offset)
-                        if prefix_offset < 0:
-                            break
-                        absolute_end = payload_offset + prefix_offset + len(MARKER_PREFIX)
-                        if absolute_end > previous_length:
-                            marker_prefix_count += 1
-                            if marker_prefix_count > 1:
-                                fail(
-                                    "duplicate_component_identity_marker",
-                                    f"component {relative} contains more than one raw atomic identity marker",
-                                    path=relative,
-                                )
-                        prefix_offset += 1
+                    # Runtime marker parsers also embed the bare prefix as a
+                    # string constant. Only complete records carry identity;
+                    # counting prefix literals rejects correctly sealed native
+                    # binaries depending on linker string pooling.
                     for match in MARKER_RE.finditer(payload):
                         absolute_end = payload_offset + match.end()
                         if absolute_end > previous_length:
                             marker_records.append(decode_marker(match))
+                            if len(marker_records) > 1:
+                                fail(
+                                    "component_identity_mismatch",
+                                    f"component {relative} contains more than one atomic identity record",
+                                    path=relative,
+                                    found=marker_records,
+                                    remedy=REMEDY_REBUILD,
+                                )
                     carry = payload[-2048:]
             after = os.fstat(fd)
             if stable_stat_identity(before) != stable_stat_identity(after) or length != before.st_size:
@@ -460,6 +467,7 @@ class AnchoredRoot:
                 markers=tuple(marker_records),
                 payload=bytes(retained) if retained is not None else None,
                 identity=stable_stat_identity(before),
+                git_blob_sha1=blob_digest.hexdigest() if blob_digest is not None else None,
             )
 
     def scan_inventory(self, ignored: set[str]) -> InventorySnapshot:
@@ -1988,6 +1996,94 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def source_git(repository: str, *arguments: str) -> bytes:
+    # Explicit repository objects are the authority, never an ambient index,
+    # worktree, replace ref, diff driver, or the caller's Git environment.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    command = ["git", "--no-replace-objects", "-C", repository, *arguments]
+    try:
+        with subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment
+        ) as process:
+            try:
+                assert process.stdout is not None
+                output = bytearray()
+                deadline = time.monotonic() + 30
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not selector.select(remaining):
+                            fail("source_git_timeout", "Git source inventory exceeded 30 seconds")
+                        chunk = os.read(process.stdout.fileno(), 65536)
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                        if len(output) > MAX_MANIFEST_BYTES:
+                            fail("source_git_limit", "Git source inventory exceeds the byte limit")
+                if process.wait(timeout=max(0.001, deadline - time.monotonic())) != 0:
+                    fail("source_git_failed", "cannot read the requested immutable Git objects")
+                return bytes(output)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail("source_git_failed", f"cannot read the requested immutable Git objects: {exc}")
+
+
+def verify_source(args: argparse.Namespace) -> dict[str, Any]:
+    revision = validate_source_revision(args.source_revision)
+    try:
+        repository = str(Path(args.repository).resolve(strict=True))
+    except OSError as exc:
+        fail("source_git_failed", f"source repository is unavailable: {exc}")
+    resolved = source_git(repository, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    if resolved.decode("ascii").strip() != revision:
+        fail("source_revision_mismatch", "source revision must identify the commit itself")
+    inventory = source_git(repository, "ls-tree", "-rz", "--full-tree", revision)
+    expected: dict[str, tuple[str, bool]] = {}
+    directories: set[str] = set()
+    for record in inventory.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.decode("ascii").split()
+        path = normalized_relative(raw_path.decode("utf-8"), "source path")
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            fail("unsupported_source_entry", "source archives require regular Git blobs", path=path)
+        if path in expected or not SOURCE_REVISION_RE.fullmatch(object_id):
+            fail("invalid_source_inventory", "invalid or duplicate Git source entry", path=path)
+        expected[path] = (object_id, mode == "100755")
+        directories.update(str(parent) for parent in PurePosixPath(path).parents if str(parent) != ".")
+        if len(expected) > MAX_FILES or len(directories) + len(expected) > MAX_INVENTORY_ENTRIES:
+            fail("source_inventory_limit", "Git source inventory exceeds entry limits")
+    with AnchoredRoot(Path(args.root), "source root") as root:
+        initial = root.scan_inventory(set())
+        if (
+            set(initial.files) != set(expected)
+            or set(initial.directories) != directories
+            or initial.symlinks
+            or initial.invalid
+        ):
+            fail("source_inventory_mismatch", "source archive does not exactly match the Git tree")
+        for path, (object_id, executable) in expected.items():
+            evidence = root.read_regular(path, git_blob=True)
+            require_inventory_identity(evidence, initial.files[path], path)
+            if evidence.git_blob_sha1 != object_id or evidence.executable != executable:
+                fail("source_content_mismatch", "source bytes or executable mode differ from Git", path=path)
+        require_stable_inventory(initial, root.scan_inventory(set()))
+        root.assert_path_identity()
+        return {
+            "ok": True,
+            "operation": "verify-source",
+            "source_revision": revision,
+            "root": str(root.path),
+            "file_count": len(expected),
+            "offline": True,
+        }
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="atomic-component-manifest.sh",
@@ -2037,6 +2133,10 @@ def parser() -> argparse.ArgumentParser:
     verify_parser = sub.add_parser("verify", help="verify a package and manifest without network access")
     verify_parser.add_argument("--root", required=True)
     verify_parser.add_argument("--manifest", required=True)
+    source_parser = sub.add_parser("verify-source", help="verify a Gitless source archive against Git objects")
+    source_parser.add_argument("--root", required=True)
+    source_parser.add_argument("--repository", required=True)
+    source_parser.add_argument("--source-revision", required=True)
     return root
 
 
@@ -2053,7 +2153,10 @@ def main() -> int:
             )
             print(result)
             return 0
-        result = generate(args) if args.command == "generate" else verify(args)
+        if args.command == "verify-source":
+            result = verify_source(args)
+        else:
+            result = generate(args) if args.command == "generate" else verify(args)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except ManifestError as exc:
