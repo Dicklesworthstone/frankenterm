@@ -1905,11 +1905,9 @@ pub enum MissionFailureCode {
 impl MissionFailureCode {
     /// Every `MissionFailureCode` variant, in declaration order.
     ///
-    /// The explicit length makes this the single source of truth for variant
-    /// enumeration: adding a variant to the enum without extending this array
-    /// is a compile error, so derived surfaces (e.g.
-    /// `mcp_mission_failure_catalog`) and their anti-drift tests cannot silently
-    /// fall out of sync (ft-dfnoe).
+    /// Derived surfaces (e.g. `mcp_mission_failure_catalog`) enumerate this
+    /// array. Keep it in sync when adding variants: its explicit length checks
+    /// the number of array entries, not exhaustiveness over the enum (ft-dfnoe).
     pub const ALL: [MissionFailureCode; 9] = [
         Self::PolicyDenied,
         Self::ReservationConflict,
