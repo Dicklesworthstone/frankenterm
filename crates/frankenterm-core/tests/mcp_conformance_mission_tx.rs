@@ -119,6 +119,7 @@ struct LiveTxFixture {
     ipc_shutdown: frankenterm_core::runtime_async::mpsc::Sender<()>,
     mux: owned_mux::WeztermSubprocessFixture,
     pane_ids: [u64; 2],
+    db_path: PathBuf,
 }
 
 #[cfg(all(unix, feature = "vendored"))]
@@ -216,6 +217,7 @@ impl LiveTxFixture {
             ipc_shutdown,
             mux,
             pane_ids,
+            db_path: layout.db_path.clone(),
         };
         fixture.wait_for_ready(&layout.ipc_socket_path);
         fixture
@@ -309,7 +311,7 @@ impl LiveTxFixture {
             return;
         }
         let panicking = std::thread::panicking();
-        self.runtime.block_on(async {
+        let summary = self.runtime.block_on(async {
             let cx = frankenterm_core::cx::Cx::current().unwrap();
             let signal = self.ipc_shutdown.try_send(());
             let ipc_result = match ipc_task {
@@ -327,9 +329,70 @@ impl LiveTxFixture {
                 assert!(ipc_result.is_ok(), "IPC owner did not settle");
                 assert!(summary.as_ref().is_some_and(|summary| summary.is_clean()));
             }
+            summary
         });
         if !panicking {
             self.mux.kill_mux();
+            let summary = summary.expect("observer must return a shutdown summary");
+            use frankenterm_core::storage_backend_trait::{
+                OpenConfig, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
+            };
+            // Independently reopen the retained database read-only after the
+            // observation writer has settled. Do not infer durability from
+            // the producer counter or a cached StorageHandle checkpoint.
+            let database = RusqliteBackend::open_path(
+                &self.db_path,
+                &OpenConfig {
+                    read_only: true,
+                    wal_mode: false,
+                    page_size_hint: None,
+                },
+            )
+            .expect("reopen actual capture database read-only");
+            assert_eq!(summary.last_seq_by_pane.len(), self.pane_ids.len());
+            let mut total_rows = 0_u64;
+            for pane_id in self.pane_ids {
+                let row = database
+                    .query_row_cells(
+                        "SELECT COUNT(*), MIN(seq), MAX(seq) FROM output_segments WHERE pane_id = ?1",
+                        &[ToSqlValue::Integer(i64::try_from(pane_id).unwrap())],
+                    )
+                    .expect("read actual persisted sequence range")
+                    .expect("aggregate must return one row");
+                let [
+                    SqlCell::Integer(count),
+                    SqlCell::Integer(first),
+                    SqlCell::Integer(last),
+                ] = row.as_slice()
+                else {
+                    panic!("pane {pane_id} must have actual integer capture rows: {row:?}");
+                };
+                assert!(
+                    *count > 0,
+                    "pane {pane_id} must persist real captured output"
+                );
+                assert_eq!(*first, 0, "owned fixture starts with an empty database");
+                assert_eq!(
+                    *last,
+                    count - 1,
+                    "durable sequence range must be contiguous"
+                );
+                let cursor_sequences: Vec<_> = summary
+                    .last_seq_by_pane
+                    .iter()
+                    .filter_map(|(id, seq)| (*id == pane_id).then_some(*seq))
+                    .collect();
+                assert_eq!(
+                    cursor_sequences,
+                    vec![*last],
+                    "pane {pane_id} shutdown cursor must equal its actual persisted MAX(seq)"
+                );
+                total_rows += u64::try_from(*count).unwrap();
+                eprintln!(
+                    "LIVE_TX_CURSOR_DURABILITY pane_id={pane_id} rows={count} durable_last_seq={last} cursor_last_seq={last}"
+                );
+            }
+            assert_eq!(summary.segments_persisted, total_rows);
         }
     }
 }
