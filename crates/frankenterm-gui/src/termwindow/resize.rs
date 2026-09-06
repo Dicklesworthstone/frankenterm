@@ -690,22 +690,12 @@ impl super::TermWindow {
 
         log::trace!("apply_dimensions computed size {:?}, dims {:?}", size, dims);
 
-        // ft-t9l62: coalesce reshape storms. During a live-resize drag macOS
-        // fires `resize()` at 60-120Hz, but a cell is ~8x16px, so consecutive
-        // events usually map to the SAME rows x cols (`avail / cell_size`,
-        // integer division). `Tab::resize` is NOT a no-op on an unchanged size
-        // — it tree-walks the width+height constraints and reshapes every pane
-        // (mux/tab.rs:3007) — so re-running it for every sub-cell drag pixel is
-        // pure waste. Skip the grid reshape (and the overlay reshape, which is
-        // also sized to the grid) whenever the freshly recomputed `size` is
-        // byte-identical to what the tabs were last sized to: resizing a
-        // terminal to its current dimensions is idempotent, so the grid is
-        // identical either way. Scale/DPI changes alter `cell_size`, hence
-        // `size.pixel_*`, so they never compare equal here and are never
-        // skipped. The window pixel dimensions (`self.dimensions`) were already
-        // updated above and the panes marked dirty, so letterboxing + re-render
-        // at the new pixel size still happen — only the redundant reflow is
-        // elided.
+        // ft-t9l62: consecutive pixel resize events can map to the same terminal
+        // geometry. Tab::resize already returns early for an unchanged size;
+        // this check also avoids repeated window/tab locks and overlay work.
+        // Compare the complete TerminalSize, including pixels and DPI. The
+        // window pixel dimensions were updated above, so rendering still uses
+        // the new window bounds even when the terminal geometry is unchanged.
         let grid_size_changed = size != self.terminal_size;
         self.terminal_size = size;
 
