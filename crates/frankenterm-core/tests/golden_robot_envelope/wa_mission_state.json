@@ -19,6 +19,7 @@
         "type": "string"
       },
       "format": {
+        "maxLength": 16,
         "description": "Optional output format override for this call",
         "enum": [
           "json",
@@ -31,7 +32,10 @@
         "minimum": 1,
         "type": "integer"
       },
-      "mission_file": "<mission_file>",
+      "mission_file": {
+        "type": "string",
+        "description": "Optional path to mission JSON (default: .ft/mission/active.json)"
+      },
       "mission_state": {
         "description": "Filter by lifecycle state (e.g., running, paused, completed)",
         "type": "string"
@@ -51,7 +55,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": false,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "success_envelope": {
     "data": {
@@ -125,16 +129,23 @@
       "lifecycle_state": "running",
       "matched_assignment_count": 2,
       "mission_file": "<mission_file>",
-      "mission_hash": "sha256:bee30a70245cdcafe53f64880b33f42b",
+      "mission_hash": "<verified_content_hash>",
       "mission_id": "mission:qiba0",
+      "owner_acknowledgement": "unavailable_no_mission_driver",
       "returned_assignment_count": 2,
+      "revision_token": {
+        "content_sha256": "<verified_content_hash>",
+        "generation": "0123456789abcdef0123456789abcdef",
+        "mission_id": "mission:qiba0",
+        "revision": "0"
+      },
       "title": "Mission MCP Conformance"
     },
     "elapsed_ms": 0,
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "tool": "wa.mission_state"
 }

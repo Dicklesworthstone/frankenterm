@@ -2,7 +2,10 @@
   "input_schema": {
     "additionalProperties": false,
     "properties": {
-      "contract_file": "<contract_file>",
+      "contract_file": {
+        "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
+        "type": "string"
+      },
       "fail_step": {
         "description": "Deterministic commit failure injection step_id",
         "type": "string"
@@ -13,6 +16,7 @@
           "json",
           "toon"
         ],
+        "maxLength": 16,
         "type": "string"
       },
       "kill_switch": {
@@ -35,7 +39,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": false,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "success_envelope": {
     "data": {
@@ -57,9 +61,9 @@
             "outcome": "committed",
             "phase": "commit",
             "plan_id": "tx-plan:qiba0",
-            "reason_code": "commit_step_succeeded",
+            "reason_code": "send_text_succeeded",
             "seq": 1,
-            "state": "prepared",
+            "state": "committing",
             "step_id": "tx-step:1",
             "tx_id": "tx:qiba0"
           },
@@ -72,7 +76,7 @@
             "plan_id": "tx-plan:qiba0",
             "reason_code": "commit_step_failed_injected",
             "seq": 2,
-            "state": "prepared",
+            "state": "committing",
             "step_id": "tx-step:2",
             "tx_id": "tx:qiba0"
           }
@@ -85,7 +89,7 @@
             "ordinal": 1,
             "outcome": {
               "committed": {
-                "reason_code": "commit_step_succeeded"
+                "reason_code": "send_text_succeeded"
               }
             },
             "step_id": "tx-step:1"
@@ -121,7 +125,7 @@
             "outcome": "compensated",
             "phase": "compensate",
             "plan_id": "tx-plan:qiba0",
-            "reason_code": "compensation_succeeded",
+            "reason_code": "send_text_succeeded",
             "seq": 3,
             "state": "compensating",
             "step_id": "tx-step:1",
@@ -136,7 +140,7 @@
             "ordinal": 1,
             "outcome": {
               "committed": {
-                "reason_code": "compensation_succeeded"
+                "reason_code": "send_text_succeeded"
               }
             },
             "step_id": "tx-step:1"
@@ -150,16 +154,18 @@
         "gate_inputs": [
           {
             "approval_satisfied": true,
-            "pane_id": 11,
+            "pane_id": 0,
             "policy_passed": true,
+            "preconditions_satisfied": true,
             "reservation_available": true,
             "step_id": "tx-step:1",
             "target_liveness": true
           },
           {
             "approval_satisfied": true,
-            "pane_id": 12,
+            "pane_id": 1,
             "policy_passed": true,
+            "preconditions_satisfied": true,
             "reservation_available": true,
             "step_id": "tx-step:2",
             "target_liveness": true
@@ -173,7 +179,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "tool": "wa.tx_run"
 }

@@ -287,16 +287,50 @@ fn migration_plan_empty_when_at_target() {
 #[test]
 fn downgrade_below_forward_only_floor_fails_closed() {
     // The newest forward-only migration defines the rollback floor from head.
-    // V45 owns pending recorder-delivery evidence, so current head cannot roll
-    // back at all. The historical v35 index-only tail remains independently
-    // reversible when planning from v35 to the v34 retention-evidence floor.
+    // V45 owns pending recorder-delivery evidence; v46 owns connector dispatch
+    // and ingress evidence. Neither boundary may become reversible. A later
+    // reversible tail may roll back to, but never below, the newest floor.
+    // The historical v35 index-only tail remains independently reversible.
+    for version in [45, 46] {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == version)
+            .expect("durable delivery migrations must remain in the catalog");
+        assert!(
+            migration.down_sql.is_none(),
+            "v{version} must not discard durable delivery authority on rollback"
+        );
+    }
     let forward_only_floor = MIGRATIONS
         .iter()
         .filter(|migration| migration.down_sql.is_none())
         .map(|migration| migration.version)
         .max()
         .expect("the v1 baseline is forward-only");
-    assert_eq!(forward_only_floor, 45, "v45 is the current rollback floor");
+    let head_tail = build_migration_plan(SCHEMA_VERSION, forward_only_floor)
+        .expect("head may roll back to the newest forward-only floor");
+    assert_eq!(head_tail.from_version, SCHEMA_VERSION);
+    assert_eq!(head_tail.to_version, forward_only_floor);
+    let expected_tail: Vec<_> = MIGRATIONS
+        .iter()
+        .rev()
+        .filter(|migration| {
+            migration.version > forward_only_floor && migration.version <= SCHEMA_VERSION
+        })
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(
+        head_tail
+            .steps
+            .iter()
+            .map(|step| step.migration_version)
+            .collect::<Vec<_>>(),
+        expected_tail,
+        "every reversible migration above the floor must be planned exactly once"
+    );
+    assert!(head_tail.steps.iter().all(|step| {
+        step.migration_version > forward_only_floor && step.resulting_version >= forward_only_floor
+    }));
 
     let reversible_tail = build_migration_plan(35, 34)
         .expect("the historical v35 index-only tail must remain reversible");
@@ -304,7 +338,7 @@ fn downgrade_below_forward_only_floor_fails_closed() {
     assert_eq!(reversible_tail.steps[0].migration_version, 35);
     assert_eq!(reversible_tail.steps[0].resulting_version, 34);
 
-    for target in [44, 34, 17, 1] {
+    for target in 1..forward_only_floor {
         let err = build_migration_plan(SCHEMA_VERSION, target)
             .expect_err("downgrade from the forward-only head must fail closed");
         assert!(

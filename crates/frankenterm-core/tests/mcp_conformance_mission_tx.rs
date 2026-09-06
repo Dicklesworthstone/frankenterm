@@ -494,9 +494,9 @@ fn read_or_update_golden(path: &Path, actual: &str) -> String {
 
     fs::read_to_string(path).unwrap_or_else(|err| {
         panic!(
-            "missing MCP conformance golden at {}: {err}. Regenerate with:\n  \
-             UPDATE_GOLDEN=1 cargo test -p frankenterm-core --test mcp_conformance_mission_tx \
-             --features mcp,asupersync-runtime",
+            "missing MCP conformance golden at {}: {err}. Review the actual tool contract, \
+             add the expected capture, then rerun this target under strict RCH with \
+             --locked --features mcp,vendored",
             path.display()
         )
     })
@@ -526,9 +526,8 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
         panic!(
             "MCP mission/tx golden drift detected. Review the diff between:\n  \
              expected: {}\n  actual:   {}\n\n\
-             If intentional, regenerate with:\n  \
-             UPDATE_GOLDEN=1 cargo test -p frankenterm-core --test mcp_conformance_mission_tx \
-             --features mcp,asupersync-runtime",
+             Review each semantic change before editing the expected capture, then rerun \
+             this target under strict RCH with --locked --features mcp,vendored",
             path.display(),
             actual_path.display()
         );
@@ -824,6 +823,8 @@ fn capture_tool_contract(
     }
 
     invalid_setup(&mut harness);
+    let invalid_contract_before = (tool_name == "wa.tx_rollback")
+        .then(|| fs::read(tx_file_path(harness.workspace.path())).unwrap());
     let invalid_args = invalid_args(&harness);
     let invalid_args_envelope = parse_tool_envelope(
         &harness
@@ -831,6 +832,20 @@ fn capture_tool_contract(
             .call_tool(tool_name, invalid_args)
             .unwrap_or_else(|err| panic!("call {tool_name} invalid case: {err}")),
     );
+    if let Some(before) = invalid_contract_before {
+        assert_eq!(invalid_args_envelope["ok"], false);
+        assert_eq!(
+            fs::read(tx_file_path(harness.workspace.path())).unwrap(),
+            before
+        );
+        #[cfg(all(unix, feature = "vendored"))]
+        if let Some(live) = &harness.live {
+            live.assert_consumed(0, "/do-step-1", 1);
+            live.assert_consumed(1, "/do-step-2", 1);
+            live.assert_consumed(0, "/undo-step-1", 1);
+            live.assert_consumed(1, "/undo-step-2", 1);
+        }
+    }
 
     ToolGoldenCapture {
         workspace_root: harness.workspace.path().to_path_buf(),
@@ -1152,10 +1167,12 @@ fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
         },
         |_| {},
         |harness| {
+            // Repeating a completed rollback must refuse without another effect.
+            // The unknown-step argument is checked separately while committed
+            // in the live roundtrip, before this terminal-state gate applies.
             json!({
                 "format": "json",
-                "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
-                "fail_compensation_for_step": "tx-step:missing"
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
             })
         },
     );
@@ -1252,7 +1269,7 @@ fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
     );
     assert_eq!(
         run_envelope["data"]["commit_report"]["outcome"],
-        "committed"
+        "fully_committed"
     );
     assert!(run_envelope["data"]["compensation_report"].is_null());
     assert_eq!(
@@ -1264,6 +1281,37 @@ fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
     let live = harness.live.as_ref().unwrap();
     live.assert_consumed(0, "/do-step-1", 1);
     live.assert_consumed(1, "/do-step-2", 1);
+
+    let committed_bytes = fs::read(&contract_file).unwrap();
+    let unknown_step = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.tx_rollback",
+                json!({
+                    "format": "json",
+                    "contract_file": contract_file.display().to_string(),
+                    "fail_compensation_for_step": "tx-step:missing"
+                }),
+            )
+            .expect("wa.tx_rollback unknown-step refusal"),
+    );
+    assert_eq!(unknown_step["ok"], false, "{unknown_step}");
+    assert_eq!(unknown_step["error_code"], "FT-MCP-0001");
+    assert_eq!(
+        unknown_step["error"],
+        "Unknown fail_compensation_for_step: tx-step:missing"
+    );
+    assert_eq!(
+        unknown_step["hint"],
+        "Use a committed step ID from wa.tx_show(include_contract=true)."
+    );
+    assert_eq!(fs::read(&contract_file).unwrap(), committed_bytes);
+    let live = harness.live.as_ref().unwrap();
+    live.assert_consumed(0, "/do-step-1", 1);
+    live.assert_consumed(1, "/do-step-2", 1);
+    live.assert_consumed(0, "/undo-step-1", 0);
+    live.assert_consumed(1, "/undo-step-2", 0);
 
     let rollback_envelope = parse_tool_envelope(
         &harness

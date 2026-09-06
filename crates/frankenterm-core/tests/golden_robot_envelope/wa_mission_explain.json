@@ -7,6 +7,7 @@
         "type": "string"
       },
       "format": {
+        "maxLength": 16,
         "description": "Optional output format override for this call",
         "enum": [
           "json",
@@ -14,7 +15,10 @@
         ],
         "type": "string"
       },
-      "mission_file": "<mission_file>"
+      "mission_file": {
+        "type": "string",
+        "description": "Optional path to mission JSON (default: .ft/mission/active.json)"
+      }
     },
     "type": "object"
   },
@@ -26,7 +30,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": false,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "success_envelope": {
     "data": {
@@ -77,38 +81,48 @@
       "failure_catalog": [
         {
           "code": "PolicyDenied",
-          "error_code": "mission.failure.policy_denied",
-          "reason_code": "policy_denied"
+          "error_code": "robot.mission_policy_denied",
+          "reason_code": "mission.policy_denied"
+        },
+        {
+          "code": "ReservationConflict",
+          "error_code": "robot.mission_reservation_conflict",
+          "reason_code": "mission.reservation_conflict"
+        },
+        {
+          "code": "RateLimited",
+          "error_code": "robot.mission_rate_limited",
+          "reason_code": "mission.rate_limited"
+        },
+        {
+          "code": "StaleState",
+          "error_code": "robot.mission_stale_state",
+          "reason_code": "mission.stale_state"
+        },
+        {
+          "code": "DispatchError",
+          "error_code": "robot.mission_dispatch_error",
+          "reason_code": "mission.dispatch_error"
+        },
+        {
+          "code": "ApprovalRequired",
+          "error_code": "robot.mission_approval_required",
+          "reason_code": "mission.approval_required"
         },
         {
           "code": "ApprovalDenied",
-          "error_code": "mission.failure.approval_denied",
-          "reason_code": "approval_denied"
+          "error_code": "robot.mission_approval_denied",
+          "reason_code": "mission.approval_denied"
         },
         {
           "code": "ApprovalExpired",
-          "error_code": "mission.failure.approval_expired",
-          "reason_code": "approval_expired"
-        },
-        {
-          "code": "DispatchFailed",
-          "error_code": "mission.failure.dispatch_failed",
-          "reason_code": "dispatch_failed"
-        },
-        {
-          "code": "ExecutionFailed",
-          "error_code": "mission.failure.execution_failed",
-          "reason_code": "execution_failed"
-        },
-        {
-          "code": "Timeout",
-          "error_code": "mission.failure.timeout",
-          "reason_code": "timeout"
+          "error_code": "robot.mission_approval_expired",
+          "reason_code": "mission.approval_expired"
         },
         {
           "code": "KillSwitchActivated",
-          "error_code": "mission.failure.kill_switch",
-          "reason_code": "kill_switch"
+          "error_code": "robot.mission_kill_switch_activated",
+          "reason_code": "mission.kill_switch_activated"
         }
       ],
       "lifecycle_state": "running",
@@ -120,7 +134,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "tool": "wa.mission_explain"
 }

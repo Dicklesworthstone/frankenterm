@@ -6209,7 +6209,9 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // migration-safe; v43 keeps legacy orphan cleanup executable without
     // weakening retained-size authority for live sessions; v44 protects the
     // trigger-invalidated recovery-usability cache and its durable bounded
-    // cursor. V44 is therefore the current downgrade floor.
+    // cursor; v45 protects pending recorder deliveries; v46 protects connector
+    // dispatch ownership and durable ingress. The newest forward-only migration
+    // crossed by the requested path determines its downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {

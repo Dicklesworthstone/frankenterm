@@ -2,7 +2,29 @@
   "input_schema": {
     "additionalProperties": false,
     "properties": {
+      "expected_token": {
+        "type": "object",
+        "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+        "additionalProperties": false,
+        "required": ["mission_id", "generation", "revision", "content_sha256"],
+        "properties": {
+          "mission_id": { "type": "string" },
+          "generation": { "type": "string" },
+          "revision": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]{0,19})$",
+            "maxLength": 20
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "minLength": 64,
+            "maxLength": 64
+          }
+        }
+      },
       "format": {
+        "maxLength": 16,
         "description": "Optional output format override for this call",
         "enum": [
           "json",
@@ -10,7 +32,10 @@
         ],
         "type": "string"
       },
-      "mission_file": "<mission_file>",
+      "mission_file": {
+        "type": "string",
+        "description": "Optional path to mission JSON (default: .ft/mission/active.json)"
+      },
       "requested_by": {
         "description": "Who requested the resume (default: mcp-agent)",
         "type": "string"
@@ -26,7 +51,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": false,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "success_envelope": {
     "data": {
@@ -36,15 +61,32 @@
       "lifecycle_from": "paused",
       "lifecycle_to": "running",
       "mission_file": "<mission_file>",
-      "mission_hash": "sha256:bee30a70245cdcafe53f64880b33f42b",
+      "mission_hash": "<verified_content_hash>",
       "mission_id": "mission:qiba0",
+      "mutation": {
+        "changed": true,
+        "current": {
+          "content_sha256": "<verified_content_hash>",
+          "generation": "0123456789abcdef0123456789abcdef",
+          "mission_id": "mission:qiba0",
+          "revision": "1"
+        },
+        "durability": "file_and_directory_synced",
+        "owner_acknowledgement": "unavailable_no_mission_driver",
+        "previous": {
+          "content_sha256": "<verified_content_hash>",
+          "generation": "0123456789abcdef0123456789abcdef",
+          "mission_id": "mission:qiba0",
+          "revision": "0"
+        }
+      },
       "reason_code": "resumed"
     },
     "elapsed_ms": 0,
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "tool": "wa.mission_resume"
 }

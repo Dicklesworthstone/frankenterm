@@ -2,8 +2,12 @@
   "input_schema": {
     "additionalProperties": false,
     "properties": {
-      "contract_file": "<contract_file>",
+      "contract_file": {
+        "type": "string",
+        "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)"
+      },
       "format": {
+        "maxLength": 16,
         "description": "Optional output format override for this call",
         "enum": [
           "json",
@@ -22,7 +26,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": false,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "success_envelope": {
     "data": {
@@ -44,7 +48,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "tool": "wa.tx_plan"
 }

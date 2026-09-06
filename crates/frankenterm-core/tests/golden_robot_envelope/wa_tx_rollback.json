@@ -2,7 +2,10 @@
   "input_schema": {
     "additionalProperties": false,
     "properties": {
-      "contract_file": "<contract_file>",
+      "contract_file": {
+        "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
+        "type": "string"
+      },
       "fail_compensation_for_step": {
         "description": "Deterministic compensation failure injection step_id",
         "type": "string"
@@ -13,6 +16,7 @@
           "json",
           "toon"
         ],
+        "maxLength": 16,
         "type": "string"
       }
     },
@@ -20,13 +24,13 @@
   },
   "invalid_args_envelope": {
     "elapsed_ms": 0,
-    "error": "Unknown fail_compensation_for_step: tx-step:missing",
+    "error": "rollback is not allowed for terminal tx state rolled_back",
     "error_code": "FT-MCP-0001",
-    "hint": "Use a committed step ID from wa.tx_show(include_contract=true).",
+    "hint": "Use wa.tx_show(include_contract=true) to inspect persisted commit receipts. Do not rerun the commit or rollback solely to repair missing receipts: durable state may represent an external effect that was already dispatched. Reconcile the contract with the workspace .ft/tx_ledgers records; do not fabricate receipts.",
     "mcp_version": "v1",
     "now": 0,
     "ok": false,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "success_envelope": {
     "data": {
@@ -47,7 +51,7 @@
             "outcome": "compensated",
             "phase": "compensate",
             "plan_id": "tx-plan:qiba0",
-            "reason_code": "compensation_succeeded",
+            "reason_code": "send_text_succeeded",
             "seq": 3,
             "state": "compensating",
             "step_id": "tx-step:2",
@@ -60,7 +64,7 @@
             "outcome": "compensated",
             "phase": "compensate",
             "plan_id": "tx-plan:qiba0",
-            "reason_code": "compensation_succeeded",
+            "reason_code": "send_text_succeeded",
             "seq": 4,
             "state": "compensating",
             "step_id": "tx-step:1",
@@ -75,7 +79,7 @@
             "ordinal": 2,
             "outcome": {
               "committed": {
-                "reason_code": "compensation_succeeded"
+                "reason_code": "send_text_succeeded"
               }
             },
             "step_id": "tx-step:2"
@@ -86,7 +90,7 @@
             "ordinal": 1,
             "outcome": {
               "committed": {
-                "reason_code": "compensation_succeeded"
+                "reason_code": "send_text_succeeded"
               }
             },
             "step_id": "tx-step:1"
@@ -102,7 +106,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.15.2"
   },
   "tool": "wa.tx_rollback"
 }
