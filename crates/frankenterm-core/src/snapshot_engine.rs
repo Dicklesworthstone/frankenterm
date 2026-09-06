@@ -7088,6 +7088,8 @@ impl SnapshotAuthorityWorkFailure for crate::session_retention::SessionCleanupEr
 /// Execute one SQLite transaction with an explicit proof boundary. Work errors
 /// are retry-safe only after an acknowledged rollback; commit errors remain
 /// indeterminate even if rusqlite's drop path later attempts a rollback.
+/// Acquire writer admission before schema/witness reads: a deferred WAL read
+/// snapshot cannot wait its way through a concurrent writer's committed change.
 fn run_snapshot_authority_transaction<T, F>(
     conn: &Connection,
     work: F,
@@ -7095,8 +7097,7 @@ fn run_snapshot_authority_transaction<T, F>(
 where
     F: FnOnce(&rusqlite::Transaction<'_>) -> std::result::Result<T, rusqlite::Error>,
 {
-    let tx = conn
-        .unchecked_transaction()
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(SnapshotAuthorityDbError::retry_safe)?;
     match work(&tx) {
         Ok(value) => tx
@@ -7117,6 +7118,7 @@ where
 /// explicitly acknowledged no-op path. Returning `Ok(None)` from `work` is a
 /// contract that no statement mutated durable state; the transaction is rolled
 /// back instead of crossing a commit boundary for a read-only miss.
+/// Writer admission still precedes the reads deciding whether to mutate.
 fn run_optional_snapshot_authority_transaction<T, F>(
     conn: &Connection,
     work: F,
@@ -7124,8 +7126,7 @@ fn run_optional_snapshot_authority_transaction<T, F>(
 where
     F: FnOnce(&rusqlite::Transaction<'_>) -> std::result::Result<Option<T>, rusqlite::Error>,
 {
-    let tx = conn
-        .unchecked_transaction()
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(SnapshotAuthorityDbError::retry_safe)?;
     match work(&tx) {
         Ok(Some(value)) => tx
@@ -13102,6 +13103,234 @@ mod tests {
                 ));
             }
         });
+    }
+
+    fn setup_authority_transaction_wal_db() -> (tempfile::NamedTempFile, Connection, Connection) {
+        let (tmp, db_path) = setup_test_db();
+        let authority = Connection::open(db_path.as_str()).unwrap();
+        let journal_mode: String = authority
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        authority
+            .execute_batch("CREATE TABLE authority_admission_probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let competitor = Connection::open(db_path.as_str()).unwrap();
+        authority.busy_timeout(Duration::ZERO).unwrap();
+        competitor.busy_timeout(Duration::ZERO).unwrap();
+        (tmp, authority, competitor)
+    }
+
+    #[test]
+    fn authority_transactions_admit_writer_before_observing_wal_state() {
+        for optional in [false, true] {
+            let (_tmp, authority, competitor) = setup_authority_transaction_wal_db();
+            let work = |tx: &rusqlite::Transaction<'_>| {
+                let observed: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM authority_admission_probe",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(observed, 0);
+                let busy = competitor
+                    .execute("INSERT INTO authority_admission_probe VALUES (2)", [])
+                    .expect_err("writer admission must precede the authority observation");
+                assert_eq!(
+                    busy.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                assert!(competitor.is_autocommit());
+                tx.execute("INSERT INTO authority_admission_probe VALUES (1)", [])
+            };
+            let inserted = if optional {
+                run_optional_snapshot_authority_transaction(&authority, |tx| work(tx).map(Some))
+                    .unwrap()
+                    .expect("optional authority mutation commits Some")
+            } else {
+                run_snapshot_authority_transaction(&authority, work).unwrap()
+            };
+            assert_eq!(inserted, 1);
+            assert!(authority.is_autocommit());
+            assert!(competitor.is_autocommit());
+            let rows: Vec<i64> = competitor
+                .prepare("SELECT id FROM authority_admission_probe ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows, vec![1]);
+        }
+    }
+
+    #[test]
+    fn authority_transactions_refuse_held_writer_before_invoking_work() {
+        for optional in [false, true] {
+            let (_tmp, authority, competitor) = setup_authority_transaction_wal_db();
+            competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let invoked = std::cell::Cell::new(false);
+            let work = |tx: &rusqlite::Transaction<'_>| {
+                invoked.set(true);
+                tx.execute("INSERT INTO authority_admission_probe VALUES (1)", [])
+            };
+            let error = if optional {
+                run_optional_snapshot_authority_transaction(&authority, |tx| work(tx).map(Some))
+                    .expect_err("held writer refuses optional authority admission")
+            } else {
+                run_snapshot_authority_transaction(&authority, work)
+                    .expect_err("held writer refuses authority admission")
+            };
+            assert!(
+                matches!(error, SnapshotAuthorityDbError::RetrySafe { ref source }
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
+            );
+            assert!(!invoked.get());
+            assert!(authority.is_autocommit());
+            assert!(!competitor.is_autocommit());
+            let rows: i64 = competitor
+                .query_row(
+                    "SELECT COUNT(*) FROM authority_admission_probe",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0);
+            competitor.execute_batch("ROLLBACK").unwrap();
+            assert!(competitor.is_autocommit());
+            let rows: i64 = authority
+                .query_row(
+                    "SELECT COUNT(*) FROM authority_admission_probe",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
+    }
+
+    #[test]
+    fn authority_transaction_legacy_deferred_read_cannot_upgrade_after_wal_commit() {
+        let (_tmp, authority, competitor) = setup_authority_transaction_wal_db();
+        // Direct legacy-mechanism control, independent of either helper: the
+        // competing commit makes this deferred read snapshot unwritable.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &authority,
+            rusqlite::TransactionBehavior::Deferred,
+        )
+        .unwrap();
+        let observed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM authority_admission_probe",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observed, 0);
+        assert_eq!(
+            competitor
+                .execute("INSERT INTO authority_admission_probe VALUES (2)", [])
+                .unwrap(),
+            1
+        );
+        assert!(competitor.is_autocommit());
+        let busy = tx
+            .execute("INSERT INTO authority_admission_probe VALUES (1)", [])
+            .expect_err("a stale WAL read snapshot cannot become a writer");
+        assert_eq!(
+            busy.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(
+            busy.sqlite_error().unwrap().extended_code,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT
+        );
+        tx.rollback().unwrap();
+        assert!(authority.is_autocommit());
+        let rows: Vec<i64> = authority
+            .prepare("SELECT id FROM authority_admission_probe ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![2]);
+    }
+
+    #[test]
+    fn authority_transaction_optional_none_explicitly_rolls_back_without_writes() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let (_tmp, authority, competitor) = setup_authority_transaction_wal_db();
+        let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_operations = Arc::clone(&operations);
+        authority
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if let AuthAction::Transaction { operation } = context.action {
+                    observed_operations.lock().unwrap().push(operation);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        let result = run_optional_snapshot_authority_transaction(&authority, |tx| {
+            let observed: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM authority_admission_probe",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(observed, 0);
+            Ok(None::<usize>)
+        })
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![TransactionOperation::Begin, TransactionOperation::Rollback]
+        );
+        assert!(authority.is_autocommit());
+        let rows: i64 = competitor
+            .query_row(
+                "SELECT COUNT(*) FROM authority_admission_probe",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn authority_transactions_failed_work_rolls_back_real_mutation() {
+        for optional in [false, true] {
+            let (_tmp, authority, competitor) = setup_authority_transaction_wal_db();
+            let work = |tx: &rusqlite::Transaction<'_>| {
+                assert_eq!(
+                    tx.execute("INSERT INTO authority_admission_probe VALUES (1)", [])?,
+                    1
+                );
+                // A real second insert violates the primary key after the
+                // first mutation, requiring rollback rather than commit.
+                tx.execute("INSERT INTO authority_admission_probe VALUES (1)", [])
+            };
+            let error = if optional {
+                run_optional_snapshot_authority_transaction(&authority, |tx| work(tx).map(Some))
+                    .expect_err("optional failed work rolls back")
+            } else {
+                run_snapshot_authority_transaction(&authority, work)
+                    .expect_err("failed work rolls back")
+            };
+            assert!(
+                matches!(error, SnapshotAuthorityDbError::RetrySafe { ref source }
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation))
+            );
+            assert!(authority.is_autocommit());
+            let rows: i64 = competitor
+                .query_row(
+                    "SELECT COUNT(*) FROM authority_admission_probe",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
     }
 
     #[test]
