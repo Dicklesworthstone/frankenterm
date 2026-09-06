@@ -296,8 +296,11 @@ fn assert_reflow_content(term: &Terminal, cols: usize, expected: &str) {
         );
     }
     let cursor = term.cursor_pos();
-    assert!(cursor.x < cols, "cursor outside resized columns");
-    assert!((0..32).contains(&cursor.y), "cursor outside resized rows");
+    // General terminal cursors may use x == cols for soft-wrap affinity.
+    // This corpus ends in CRLF, so its stronger independent oracle is the
+    // start of the blank final row, even after repeated width reversals.
+    assert_eq!(cursor.x, 0, "hard-newline cursor moved at width {cols}");
+    assert_eq!(cursor.y, 31, "hard-newline row moved at width {cols}");
 }
 
 fn verify_reflow_workload(label: &str, input: &[u8], expected: &str) {

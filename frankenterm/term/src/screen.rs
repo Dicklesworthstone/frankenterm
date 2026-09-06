@@ -623,15 +623,24 @@ struct CachedWrappedLine {
 }
 
 #[derive(Debug, Clone)]
+struct CachedResizeLines {
+    lines: Vec<Arc<[Line]>>,
+    layout_signature: Option<u64>,
+    has_images: bool,
+    scorecard: Option<ResizeWrapScorecard>,
+    gate_payload: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct LogicalLineWrapCache {
     source_signature: u64,
     logical_lines: Vec<Line>,
-    wrapped_by_key: HashMap<WrapCacheKey, Vec<Arc<[Line]>>>,
+    wrapped_by_key: HashMap<WrapCacheKey, CachedResizeLines>,
     wrap_key_order: VecDeque<WrapCacheKey>,
 }
 
 enum WrappedResizeLines {
-    Cached(Vec<Arc<[Line]>>),
+    Cached(CachedResizeLines),
     Scratch { logical_count: usize },
 }
 
@@ -801,7 +810,7 @@ impl LogicalLineWrapCache {
         self.wrap_key_order.push_back(key);
     }
 
-    fn get_wrapped(&mut self, key: WrapCacheKey) -> Option<Vec<Arc<[Line]>>> {
+    fn get_wrapped(&mut self, key: WrapCacheKey) -> Option<CachedResizeLines> {
         let wrapped = self.wrapped_by_key.get(&key).cloned();
         if wrapped.is_some() {
             self.touch_key(key);
@@ -809,7 +818,13 @@ impl LogicalLineWrapCache {
         wrapped
     }
 
-    fn insert_wrapped(&mut self, key: WrapCacheKey, wrapped: Vec<Arc<[Line]>>) {
+    fn insert_wrapped(
+        &mut self,
+        key: WrapCacheKey,
+        wrapped: Vec<Arc<[Line]>>,
+        scorecard: Option<ResizeWrapScorecard>,
+        gate_payload: Option<String>,
+    ) {
         if !self.wrapped_by_key.contains_key(&key)
             && self.wrapped_by_key.len() >= MAX_WRAP_CACHE_ENTRIES
         {
@@ -817,7 +832,22 @@ impl LogicalLineWrapCache {
                 self.wrapped_by_key.remove(&evicted);
             }
         }
-        self.wrapped_by_key.insert(key, wrapped);
+        // ImageData may change behind an Arc without mutating a cached Line.
+        // Its content-derived shape hash must continue to be computed fresh.
+        let has_images = wrapped
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .any(Line::has_image_attachments);
+        self.wrapped_by_key.insert(
+            key,
+            CachedResizeLines {
+                lines: wrapped,
+                layout_signature: None,
+                has_images,
+                scorecard,
+                gate_payload,
+            },
+        );
         self.touch_key(key);
     }
 
@@ -1470,6 +1500,15 @@ impl Screen {
         config: &Arc<dyn TerminalConfiguration>,
         resize_wrap_policy: ResizeWrapPolicy,
     ) {
+        if self.resize_wrap_policy != resize_wrap_policy {
+            // Width/DPI cache keys describe results under the previous policy.
+            // Keep the logical content, but recompute wraps and quality evidence.
+            if let Some(cache) = self.rewrap_cache.as_mut() {
+                cache.clear_wraps();
+            }
+            self.last_resize_wrap_scorecard = None;
+            self.last_resize_wrap_gate_payload = None;
+        }
         self.config = Arc::clone(config);
         self.resize_wrap_policy = resize_wrap_policy;
         self.clear_rewrap_line_cache();
@@ -1635,8 +1674,8 @@ impl Screen {
 
     #[cfg(test)]
     pub(crate) fn set_resize_wrap_policy(&mut self, policy: ResizeWrapPolicy) {
-        self.resize_wrap_policy = policy;
-        self.clear_rewrap_line_cache();
+        let config = Arc::clone(&self.config);
+        self.install_prepared_config(&config, policy);
     }
 
     #[cfg(test)]
@@ -2543,8 +2582,12 @@ impl Screen {
             if entry.source_signature == source_signature {
                 logical_cache_hit = true;
                 let logical_count = entry.logical_lines.len();
-                if let Some(wrapped) = entry.get_wrapped(wrap_key) {
+                if let Some(mut wrapped) = entry.get_wrapped(wrap_key) {
                     wrap_cache_hit = true;
+                    // Quality evidence belongs to this target layout, just as
+                    // its cells do. A different cached width has different totals.
+                    self.last_resize_wrap_scorecard = wrapped.scorecard.take();
+                    self.last_resize_wrap_gate_payload = wrapped.gate_payload.take();
                     let cache_entries = entry.wrapped_by_key.len();
                     self.rewrap_cache = cache;
                     return (
@@ -2562,7 +2605,12 @@ impl Screen {
                     seqno,
                     Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
                 );
-                entry.insert_wrapped(wrap_key, self.clone_wrapped_from_scratch(logical_count));
+                entry.insert_wrapped(
+                    wrap_key,
+                    self.clone_wrapped_from_scratch(logical_count),
+                    self.last_resize_wrap_scorecard.clone(),
+                    self.last_resize_wrap_gate_payload.clone(),
+                );
                 let cache_entries = entry.wrapped_by_key.len();
                 self.rewrap_cache = cache;
                 return (
@@ -2597,7 +2645,12 @@ impl Screen {
             .map(|line| line.clone_line(&self.lines))
             .collect();
         let mut new_cache = LogicalLineWrapCache::new(source_signature, cache_logical_lines);
-        new_cache.insert_wrapped(wrap_key, self.clone_wrapped_from_scratch(logical_count));
+        new_cache.insert_wrapped(
+            wrap_key,
+            self.clone_wrapped_from_scratch(logical_count),
+            self.last_resize_wrap_scorecard.clone(),
+            self.last_resize_wrap_gate_payload.clone(),
+        );
         let cache_entries = new_cache.wrapped_by_key.len();
         self.rewrap_cache = Some(new_cache);
         (
@@ -2913,12 +2966,16 @@ impl Screen {
         let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
             self.logical_wraps_for_resize(physical_cols, seqno);
-        match &wrapped {
-            WrappedResizeLines::Cached(wrapped) => self.rebuild_rewrap_row_prefix_scratch(wrapped),
+        let cached_layout_signature = match &wrapped {
+            WrappedResizeLines::Cached(wrapped) => {
+                self.rebuild_rewrap_row_prefix_scratch(&wrapped.lines);
+                wrapped.layout_signature
+            }
             WrappedResizeLines::Scratch { logical_count } => {
                 self.rebuild_rewrap_row_prefix_scratch_from_slots(*logical_count);
+                None
             }
-        }
+        };
         let mut adjusted_cursor = (cursor_x, cursor_y);
         let wrapped_count = self.rewrap_row_prefix_scratch.last().copied().unwrap_or(0);
         if let Some((logical_idx, logical_x)) = logical_cursor {
@@ -2931,12 +2988,13 @@ impl Screen {
                 .unwrap_or(wrapped_count);
             adjusted_cursor = (last_x, row_base + num_lines);
 
-            // Special case: if the cursor lands in column zero, we'll
-            // lose track of its logical association with the wrapped
-            // line and it won't resize with the line correctly.
+            // Special case: if the cursor lands in column zero within a
+            // logical line, retain its association with that wrapped line.
+            // A zero logical offset starts a distinct hard-newline row and
+            // must never be moved onto the preceding record.
             // Put it back on the prior line. The cursor is now
             // technically outside of the viewport width.
-            if adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
+            if logical_x > 0 && adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
                 if physical_cols < self.physical_cols {
                     // getting smaller: preserve its original position
                     // on the prior line
@@ -2961,7 +3019,7 @@ impl Screen {
                 if additional > 0 {
                     rewrapped.reserve(additional);
                 }
-                for chunk in wrapped {
+                for chunk in wrapped.lines {
                     for line in chunk.iter() {
                         let mut line = line.clone();
                         line.update_last_change_seqno(seqno);
@@ -3031,9 +3089,22 @@ impl Screen {
         if pruned_rows > 0 {
             self.rewrap_cache = None;
         } else {
-            let layout_signature = self.compute_layout_signature();
+            // Source content was freshly validated before selecting a cache
+            // entry. Cloning its immutable text Lines and changing only seqno
+            // preserves the exact target hash already computed on first use.
+            let layout_signature =
+                cached_layout_signature.unwrap_or_else(|| self.compute_layout_signature());
             if let Some(cache) = self.rewrap_cache.as_mut() {
                 cache.source_signature = layout_signature;
+                let key = WrapCacheKey {
+                    physical_cols,
+                    dpi: self.dpi,
+                };
+                if let Some(wrapped) = cache.wrapped_by_key.get_mut(&key) {
+                    if !wrapped.has_images {
+                        wrapped.layout_signature = Some(layout_signature);
+                    }
+                }
             }
         }
 
@@ -4119,7 +4190,9 @@ impl Screen {
         for line in &first[first_range] {
             lines.push(line);
         }
-        for line in &second[second_range] {
+        for line in &second[second_range.start.saturating_sub(first.len())
+            ..second_range.end.saturating_sub(first.len())]
+        {
             lines.push(line);
         }
         func(&lines)
@@ -5072,6 +5145,116 @@ mod tests {
     }
 
     #[test]
+    fn cached_target_signatures_match_fresh_hashing_and_complete_line_state() {
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::new(
+            frankenterm_escape_parser::hyperlink::Hyperlink::new_with_id(
+                "https://example.invalid/reflow",
+                "stable-link",
+            ),
+        )));
+        for text in [
+            "abcdefghijklmnopqrstuvwxyz0123456789ABCDE".to_string(),
+            "界👩‍💻e\u{301}אב".repeat(5),
+        ] {
+            let mut screen = test_screen(3, 20, 96);
+            screen.lines = (0..3)
+                .map(|_| Line::from_text(&text, &attrs, 1, None))
+                .collect();
+            let mut cursor = test_cursor(0, 0, 1);
+            let mut reused = 0;
+            for (index, cols) in [7, 19, 11, 23, 7, 19, 11, 23].iter().copied().enumerate() {
+                let key = WrapCacheKey {
+                    physical_cols: cols,
+                    dpi: 96,
+                };
+                if screen
+                    .rewrap_cache
+                    .as_ref()
+                    .and_then(|cache| cache.wrapped_by_key.get(&key))
+                    .and_then(|wrapped| wrapped.layout_signature)
+                    .is_some()
+                {
+                    reused += 1;
+                }
+                let mut fresh = screen.clone();
+                if let Some(cache) = fresh.rewrap_cache.as_mut() {
+                    for wrapped in cache.wrapped_by_key.values_mut() {
+                        wrapped.layout_signature = None;
+                    }
+                }
+                let seqno = index + 2;
+                let expected = fresh.resize(test_size(3, cols, 96), cursor, seqno, false);
+                cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
+                assert_eq!(cursor, expected);
+                // Line equality includes cells, attributes, wrap bits and seqno.
+                assert_eq!(screen.lines, fresh.lines);
+                assert_eq!(
+                    screen.stable_row_index_offset,
+                    fresh.stable_row_index_offset
+                );
+                let full_hash = screen.compute_layout_signature();
+                let cache = screen.rewrap_cache.as_ref().unwrap();
+                assert_eq!(cache.source_signature, full_hash);
+                assert_eq!(cache.wrapped_by_key[&key].layout_signature, Some(full_hash));
+            }
+            assert!(reused >= 4, "must exercise repeated target signatures");
+        }
+    }
+
+    #[test]
+    fn image_wraps_keep_fresh_signatures_after_shared_content_mutation() {
+        use frankenterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        )));
+        let mut attrs = CellAttributes::blank();
+        attrs.set_image(Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&image),
+        )));
+        let mut screen = test_screen(3, 10, 96);
+        screen.lines = (0..3)
+            .map(|_| Line::from_text("abcdefghijklmnopqrstuvwx", &attrs, 1, None))
+            .collect();
+        let mut cursor = test_cursor(0, 0, 1);
+        for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
+            cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
+            let cache = screen.rewrap_cache.as_ref().unwrap();
+            assert_eq!(cache.source_signature, screen.compute_layout_signature());
+            assert!(cache
+                .wrapped_by_key
+                .values()
+                .all(|wrapped| { wrapped.has_images && wrapped.layout_signature.is_none() }));
+        }
+        let before = screen.compute_layout_signature();
+        {
+            let mut payload = image.data_mut();
+            let ImageDataType::Rgba8 { data, .. } = &mut *payload else {
+                panic!("expected RGBA payload");
+            };
+            data[0] = 9;
+        }
+        assert_ne!(screen.compute_layout_signature(), before);
+        let _ = screen.resize(test_size(3, 5, 96), cursor, 5, false);
+        let cache = screen.rewrap_cache.as_ref().unwrap();
+        assert_eq!(cache.source_signature, screen.compute_layout_signature());
+        assert_eq!(
+            cache.wrapped_by_key.len(),
+            1,
+            "changed image invalidates old wraps"
+        );
+        assert!(cache
+            .wrapped_by_key
+            .values()
+            .all(|wrapped| { wrapped.has_images && wrapped.layout_signature.is_none() }));
+    }
+
+    #[test]
     fn rewrap_cache_rebuilds_after_content_mutation() {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
@@ -5999,6 +6182,46 @@ mod tests {
     }
 
     #[test]
+    fn read_only_physical_lines_handles_wrapped_ring_storage() {
+        let mut screen = test_screen(2, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::with_capacity(4);
+        for text in ["a", "b", "c", "d"] {
+            screen
+                .lines
+                .push_back(Line::from_text(text, &attrs, 1, None));
+        }
+        screen.lines.pop_front();
+        screen.lines.pop_front();
+        for text in ["e", "f"] {
+            screen
+                .lines
+                .push_back(Line::from_text(text, &attrs, 1, None));
+        }
+        let (first, second) = screen.lines.as_slices();
+        assert!(!first.is_empty() && !second.is_empty());
+
+        for (range, expected) in [
+            (0..4, vec!["c", "d", "e", "f"]),
+            (1..3, vec!["d", "e"]),
+            (2..4, vec!["e", "f"]),
+            (0..1, vec!["c"]),
+            (3..3, vec![]),
+        ] {
+            let mut calls = 0;
+            screen.with_phys_lines(range, |lines| {
+                calls += 1;
+                let text: Vec<_> = lines
+                    .iter()
+                    .map(|line| line.as_str().into_owned())
+                    .collect();
+                assert_eq!(text, expected);
+            });
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
     fn resize_returns_cursor_position() {
         let mut screen = test_screen(4, 6, 96);
         let attrs = CellAttributes::blank();
@@ -6869,6 +7092,61 @@ mod tests {
 
     // --- Resize quality / readability gate tests ---
 
+    #[test]
+    fn config_change_recomputes_cached_wraps_under_current_policy() {
+        let mut screen = test_screen(3, 10, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcdefghij", &attrs, 1),
+            Line::from_text_with_wrapped_last_col("klmnopqrst", &attrs, 1),
+            Line::from_text("uvwx", &attrs, 1, None),
+        ]);
+        let mut cursor = test_cursor(0, 0, 1);
+        for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
+            cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
+        }
+        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5);
+        assert!(cached, "exercise a previously cached target width");
+        assert!(screen.last_resize_wrap_scorecard.is_none());
+
+        // Installing the same policy must keep useful whole-line wraps.
+        let unchanged = Arc::clone(&screen.config);
+        screen.set_config(&unchanged);
+        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5);
+        assert!(cached, "unchanged policy should retain cached wraps");
+
+        let scored: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            scorecard_enabled: true,
+            ..TestTermConfig::default()
+        });
+        screen.set_config(&scored);
+        let mut uncached = screen.clone();
+        uncached.rewrap_cache = None;
+        let _ = uncached.resize(test_size(3, 5, 96), cursor, 6, false);
+        let _ = screen.resize(test_size(3, 5, 96), cursor, 6, false);
+        let scorecard = screen
+            .last_resize_wrap_scorecard
+            .as_ref()
+            .expect("newly enabled scoring must execute even at a previously cached width");
+        assert!(scorecard.scored_lines > 0);
+        assert_eq!(
+            screen.last_resize_wrap_scorecard,
+            uncached.last_resize_wrap_scorecard
+        );
+        let text = |screen: &Screen| {
+            screen
+                .lines
+                .iter()
+                .map(|line| (line.as_str().into_owned(), line.last_cell_was_wrapped()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(&screen), text(&uncached));
+
+        screen.set_config(&unchanged);
+        assert!(screen.last_resize_wrap_scorecard.is_none());
+        assert!(screen.last_resize_wrap_gate_payload.is_none());
+    }
+
     fn test_screen_with_scorecard(rows: usize, cols: usize) -> Screen {
         test_screen_with_config(
             rows,
@@ -6888,6 +7166,40 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn cached_width_restores_its_readability_scorecard_and_gate_payload() {
+        let mut screen = test_screen_with_scorecard(3, 20);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text(
+                "alpha beta gamma delta epsilon zeta eta theta",
+                &attrs,
+                1,
+                None,
+            ),
+            Line::from_text("one two three four five six seven eight", &attrs, 1, None),
+            Line::new(1),
+        ]);
+        let mut cursor = screen.resize(test_size(3, 8, 96), test_cursor(0, 0, 1), 2, false);
+        let narrow_scorecard = screen.last_resize_wrap_scorecard.clone();
+        let narrow_payload = screen.last_resize_wrap_gate_payload.clone();
+        assert!(narrow_scorecard.as_ref().unwrap().scored_lines > 0);
+        cursor = screen.resize(test_size(3, 80, 96), cursor, 3, false);
+        assert_ne!(screen.last_resize_wrap_scorecard, narrow_scorecard);
+        assert!(screen
+            .rewrap_cache
+            .as_ref()
+            .unwrap()
+            .wrapped_by_key
+            .contains_key(&WrapCacheKey {
+                physical_cols: 8,
+                dpi: 96,
+            }));
+        let _ = screen.resize(test_size(3, 8, 96), cursor, 4, false);
+        assert_eq!(screen.last_resize_wrap_scorecard, narrow_scorecard);
+        assert_eq!(screen.last_resize_wrap_gate_payload, narrow_payload);
     }
 
     #[test]

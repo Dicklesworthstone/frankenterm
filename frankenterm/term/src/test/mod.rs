@@ -1417,6 +1417,43 @@ fn test_resize_wrap() {
 }
 
 #[test]
+fn test_resize_hard_newline_cursor_preserves_following_output() {
+    let widths = [4, 16, 5, 8, 4, 16, 5, 8];
+    // Each prefix ends with real parser output. A misplaced cursor must not
+    // silently overwrite the preceding hard-newline-delimited record.
+    for prefix in 1..=widths.len() {
+        let mut term = TestTerm::new(8, 8, 64);
+        term.print("abcdefghijkl\r\n");
+        for &cols in &widths[..prefix] {
+            term.resize(TerminalSize {
+                rows: 8,
+                cols,
+                ..Default::default()
+            });
+            let cursor = term.cursor_pos();
+            std::assert_eq!(cursor.x, 0, "prefix={prefix} cols={cols}");
+            std::assert_eq!(
+                cursor.y,
+                12usize.div_ceil(cols) as i64,
+                "hard newline must retain its own row: prefix={prefix} cols={cols}"
+            );
+        }
+        term.print("Z");
+        term.resize(TerminalSize {
+            rows: 8,
+            cols: 16,
+            ..Default::default()
+        });
+        assert_visible_contents(
+            &term,
+            file!(),
+            line!(),
+            &["abcdefghijkl", "Z", "", "", "", "", "", ""],
+        );
+    }
+}
+
+#[test]
 fn test_resize_wrap_roundtrip_with_dpi_and_mutation() {
     const LINES: usize = 8;
     let mut term = TestTerm::new(LINES, 4, 0);
