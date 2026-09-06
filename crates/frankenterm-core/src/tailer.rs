@@ -2406,17 +2406,20 @@ pub struct StreamingRenderMetadata {
     pub dirty_row_count: usize,
 }
 
-/// Bridges vendored `PaneDelta` events into the existing `StreamIngester`
-/// pipeline, producing `CapturedSegment`s with monotonic seq.
+/// Bridges vendored `PaneDelta` events through the caller's shared capture
+/// cursor, retaining persistence sequence corrections across capture sources.
 ///
 /// The bridge converts each delta kind:
-/// - `Output` → `StreamEvent::OutputData` only when `delta_text` contains
+/// - `Output` → a delta segment only when `delta_text` contains
 ///   actual best-effort terminal text; empty projections remain typed metadata
-/// - `Gap` → `StreamEvent::OutputData` with overflow flag and empty payload;
-///   the ingester converts that into a GAP-only segment
-/// - `Ended` → `StreamEvent::PaneClosed`
+/// - `Gap` → an explicit overflow gap without a fabricated empty delta
+/// - `Ended` → a closing gap only for an active streaming pane; shared cursor
+///   retirement belongs to the transition coordinator, not this bridge
 pub struct StreamingBridge {
-    ingester: crate::ingest::StreamIngester,
+    /// Diagnostic streaming membership, not ownership of capture cursors.
+    active_panes: HashSet<u64>,
+    segments_emitted: u64,
+    gaps_emitted: u64,
     /// Number of PaneDelta events processed.
     events_processed: u64,
     /// Number of fallback-to-polling transitions.
@@ -2444,7 +2447,9 @@ impl StreamingBridge {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            ingester: crate::ingest::StreamIngester::new(),
+            active_panes: HashSet::new(),
+            segments_emitted: 0,
+            gaps_emitted: 0,
             events_processed: 0,
             fallback_count: 0,
             dirty_range_total: 0,
@@ -2457,12 +2462,37 @@ impl StreamingBridge {
         }
     }
 
-    /// Convert a PaneDelta into CapturedSegments via the StreamIngester.
+    /// Issue at most one capture through the caller's authoritative cursor.
     ///
-    /// The caller is responsible for persisting the returned segments.
+    /// The caller must retain exclusive cursor access through issuance and is
+    /// responsible for persisting the returned segment. A pane identity mismatch
+    /// is refused before any cursor or bridge state changes.
     #[cfg(feature = "vendored")]
-    pub fn process_delta(&mut self, delta: crate::vendored::PaneDelta) -> Vec<CapturedSegment> {
-        use crate::ingest::StreamEvent;
+    pub fn process_delta(
+        &mut self,
+        delta: crate::vendored::PaneDelta,
+        cursor: &mut PaneCursor,
+    ) -> Result<Option<CapturedSegment>, String> {
+        let pane_id = match &delta {
+            crate::vendored::PaneDelta::Output { pane_id, .. }
+            | crate::vendored::PaneDelta::Gap { pane_id, .. }
+            | crate::vendored::PaneDelta::Ended { pane_id, .. } => *pane_id,
+        };
+        if cursor.pane_id != pane_id {
+            return Err("streaming delta pane does not match capture cursor".to_string());
+        }
+        // Preserve ingest-stage telemetry for capture-bearing events without
+        // counting metadata-only projections as capture work.
+        let capacity_timer = (!matches!(
+            &delta,
+            crate::vendored::PaneDelta::Output { delta_text, .. } if delta_text.is_empty()
+        ))
+        .then(|| {
+            crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                crate::runtime_telemetry::SwarmCapacityStage::IngestCapture,
+                u64::try_from(self.active_panes()).unwrap_or(u64::MAX),
+            )
+        });
         self.events_processed = self.events_processed.saturating_add(1);
 
         let now_ms = std::time::SystemTime::now()
@@ -2471,7 +2501,7 @@ impl StreamingBridge {
             .and_then(|d| i64::try_from(d.as_millis()).ok())
             .unwrap_or(0);
 
-        let event = match delta {
+        let segment = match delta {
             crate::vendored::PaneDelta::Output {
                 pane_id,
                 seqno,
@@ -2499,38 +2529,37 @@ impl StreamingBridge {
                 if delta_text.is_empty() {
                     None
                 } else {
-                    Some(StreamEvent::OutputData {
-                        pane_id,
-                        data: delta_text,
-                        received_at: now_ms,
-                        overflow: false,
-                    })
+                    self.active_panes.insert(pane_id);
+                    Some(cursor.capture_delta(delta_text, now_ms))
                 }
             }
             crate::vendored::PaneDelta::Gap { pane_id, reason: _ } => {
                 // After an explicit upstream gap we reset local seq tracking so
                 // the next output delta establishes a fresh baseline.
                 self.last_mux_seqno.remove(&pane_id);
-                // Explicit upstream gaps are bridged as overflow + empty data.
-                // StreamIngester recognizes that pair and emits only a GAP
-                // instead of fabricating an empty delta segment.
-                Some(StreamEvent::OutputData {
-                    pane_id,
-                    data: String::new(),
-                    received_at: now_ms,
-                    overflow: true,
-                })
+                self.active_panes.insert(pane_id);
+                Some(cursor.emit_gap("stream_overflow"))
             }
             crate::vendored::PaneDelta::Ended { pane_id, reason: _ } => {
                 self.last_mux_seqno.remove(&pane_id);
                 self.last_render_metadata.remove(&pane_id);
-                Some(StreamEvent::PaneClosed { pane_id })
+                self.active_panes
+                    .remove(&pane_id)
+                    .then(|| cursor.emit_gap("pane_closed"))
             }
         };
 
-        let segments = event.map_or_else(Vec::new, |event| self.ingester.process(event));
+        if let Some(segment) = &segment {
+            self.segments_emitted = self.segments_emitted.saturating_add(1);
+            if matches!(segment.kind, crate::ingest::CapturedSegmentKind::Gap { .. }) {
+                self.gaps_emitted = self.gaps_emitted.saturating_add(1);
+            }
+        }
+        if let Some(capacity_timer) = capacity_timer {
+            capacity_timer.finish_completion();
+        }
         StreamingHealth::update_global(self.snapshot_health());
-        segments
+        Ok(segment)
     }
 
     /// Record that a fallback to polling occurred.
@@ -2582,10 +2611,22 @@ impl StreamingBridge {
         self.last_render_metadata.get(&pane_id)
     }
 
-    /// Access the underlying ingester for diagnostics.
+    /// Number of streaming panes with a capture and no closing event.
     #[must_use]
-    pub fn ingester(&self) -> &crate::ingest::StreamIngester {
-        &self.ingester
+    pub fn active_panes(&self) -> usize {
+        self.active_panes.len()
+    }
+
+    /// Total issued captures, including gaps.
+    #[must_use]
+    pub fn total_segments(&self) -> u64 {
+        self.segments_emitted
+    }
+
+    /// Total issued gap captures.
+    #[must_use]
+    pub fn total_gaps(&self) -> u64 {
+        self.gaps_emitted
     }
 
     #[cfg(feature = "vendored")]
@@ -2609,9 +2650,9 @@ impl StreamingBridge {
             events_processed: self.events_processed,
             dirty_ranges_total: self.dirty_range_total,
             dirty_rows_total: self.dirty_row_total,
-            gaps_emitted: self.ingester.total_gaps(),
+            gaps_emitted: self.total_gaps(),
             fallback_count: self.fallback_count,
-            active_panes: self.ingester.active_panes(),
+            active_panes: self.active_panes(),
         }
     }
 }
@@ -2637,7 +2678,7 @@ pub struct StreamingHealth {
     pub gaps_emitted: u64,
     /// Number of times streaming fell back to polling.
     pub fallback_count: u64,
-    /// Active panes in the streaming ingester.
+    /// Streaming panes with an issued capture and no closing event.
     pub active_panes: usize,
 }
 
@@ -5412,7 +5453,9 @@ mod tests {
         assert_eq!(bridge.seq_anomaly_count(), 0);
         #[cfg(feature = "vendored")]
         assert!(bridge.render_metadata(1).is_none());
-        assert_eq!(bridge.ingester().active_panes(), 0);
+        assert_eq!(bridge.active_panes(), 0);
+        assert_eq!(bridge.total_segments(), 0);
+        assert_eq!(bridge.total_gaps(), 0);
     }
 
     #[test]
@@ -5424,6 +5467,9 @@ mod tests {
         assert_eq!(a.dirty_range_total(), b.dirty_range_total());
         assert_eq!(a.dirty_row_total(), b.dirty_row_total());
         assert_eq!(a.seq_anomaly_count(), b.seq_anomaly_count());
+        assert_eq!(a.active_panes(), b.active_panes());
+        assert_eq!(a.total_segments(), b.total_segments());
+        assert_eq!(a.total_gaps(), b.total_gaps());
     }
 
     #[test]
@@ -5442,6 +5488,7 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(1);
         let delta = PaneDelta::Output {
             pane_id: 1,
             seqno: 5,
@@ -5451,7 +5498,11 @@ mod tests {
             dirty_row_count: 8,
         };
 
-        let segments = bridge.process_delta(delta);
+        let segments: Vec<_> = bridge
+            .process_delta(delta, &mut cursor)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].pane_id, 1);
         assert_eq!(segments[0].seq, 0); // first segment for this pane
@@ -5477,23 +5528,33 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
-        let segments = bridge.process_delta(PaneDelta::Output {
-            pane_id: 5,
-            seqno: 9,
-            delta_text: String::new(),
-            title: "metadata-only".to_string(),
-            dirty_range_count: 3,
-            dirty_row_count: 11,
-        });
+        let mut cursor = PaneCursor::from_seq(5, 41);
+        let cursor_before = format!("{cursor:?}");
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 5,
+                    seqno: 9,
+                    delta_text: String::new(),
+                    title: "metadata-only".to_string(),
+                    dirty_range_count: 3,
+                    dirty_row_count: 11,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
 
         assert!(segments.is_empty());
         assert_eq!(bridge.events_processed(), 1);
         assert_eq!(bridge.dirty_range_total(), 3);
         assert_eq!(bridge.dirty_row_total(), 11);
         assert_eq!(bridge.seq_anomaly_count(), 0);
-        assert_eq!(bridge.ingester().active_panes(), 0);
-        assert_eq!(bridge.ingester().total_segments(), 0);
-        assert_eq!(bridge.ingester().total_gaps(), 0);
+        assert_eq!(bridge.active_panes(), 0);
+        assert_eq!(bridge.total_segments(), 0);
+        assert_eq!(bridge.total_gaps(), 0);
+        assert_eq!(format!("{cursor:?}"), cursor_before);
         assert_eq!(
             bridge.render_metadata(5),
             Some(&StreamingRenderMetadata {
@@ -5512,23 +5573,37 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
-        bridge.process_delta(PaneDelta::Output {
-            pane_id: 7,
-            seqno: 10,
-            delta_text: "base".to_string(),
-            title: "bash".to_string(),
-            dirty_range_count: 1,
-            dirty_row_count: 2,
-        });
+        let mut cursor = PaneCursor::new(7);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 7,
+                    seqno: 10,
+                    delta_text: "base".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 2,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("initial output capture");
 
-        let segments = bridge.process_delta(PaneDelta::Output {
-            pane_id: 7,
-            seqno: 13,
-            delta_text: "jump".to_string(),
-            title: "bash".to_string(),
-            dirty_range_count: 1,
-            dirty_row_count: 2,
-        });
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 7,
+                    seqno: 13,
+                    delta_text: "jump".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 2,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
@@ -5543,23 +5618,37 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
-        bridge.process_delta(PaneDelta::Output {
-            pane_id: 11,
-            seqno: 50,
-            delta_text: "newest".to_string(),
-            title: "bash".to_string(),
-            dirty_range_count: 1,
-            dirty_row_count: 1,
-        });
+        let mut cursor = PaneCursor::new(11);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 11,
+                    seqno: 50,
+                    delta_text: "newest".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("initial output capture");
 
-        let segments = bridge.process_delta(PaneDelta::Output {
-            pane_id: 11,
-            seqno: 49,
-            delta_text: "older".to_string(),
-            title: "bash".to_string(),
-            dirty_range_count: 1,
-            dirty_row_count: 1,
-        });
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 11,
+                    seqno: 49,
+                    delta_text: "older".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
@@ -5574,28 +5663,48 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
-        bridge.process_delta(PaneDelta::Output {
-            pane_id: 23,
-            seqno: 3,
-            delta_text: "before-gap".to_string(),
-            title: "bash".to_string(),
-            dirty_range_count: 1,
-            dirty_row_count: 1,
-        });
+        let mut cursor = PaneCursor::new(23);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 23,
+                    seqno: 3,
+                    delta_text: "before-gap".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("initial output capture");
 
-        let _ = bridge.process_delta(PaneDelta::Gap {
-            pane_id: 23,
-            reason: "bounded transport loss".to_string(),
-        });
+        let _ = bridge
+            .process_delta(
+                PaneDelta::Gap {
+                    pane_id: 23,
+                    reason: "bounded transport loss".to_string(),
+                },
+                &mut cursor,
+            )
+            .unwrap();
+        assert!(!bridge.last_mux_seqno.contains_key(&23));
 
-        let segments = bridge.process_delta(PaneDelta::Output {
-            pane_id: 23,
-            seqno: 100,
-            delta_text: "after-gap".to_string(),
-            title: "bash".to_string(),
-            dirty_range_count: 1,
-            dirty_row_count: 1,
-        });
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 23,
+                    seqno: 100,
+                    delta_text: "after-gap".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
@@ -5610,6 +5719,7 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(1);
 
         // First, send a normal output to establish the pane cursor
         let output = PaneDelta::Output {
@@ -5620,14 +5730,21 @@ mod tests {
             dirty_range_count: 1,
             dirty_row_count: 4,
         };
-        bridge.process_delta(output);
+        bridge
+            .process_delta(output, &mut cursor)
+            .unwrap()
+            .expect("initial output capture");
 
         // Now send a gap
         let gap = PaneDelta::Gap {
             pane_id: 1,
             reason: "bounded transport loss".to_string(),
         };
-        let segments = bridge.process_delta(gap);
+        let segments: Vec<_> = bridge
+            .process_delta(gap, &mut cursor)
+            .unwrap()
+            .into_iter()
+            .collect();
 
         assert_eq!(segments.len(), 1);
         assert!(
@@ -5644,6 +5761,7 @@ mod tests {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(1);
 
         // Establish cursor
         let output = PaneDelta::Output {
@@ -5654,14 +5772,21 @@ mod tests {
             dirty_range_count: 1,
             dirty_row_count: 4,
         };
-        bridge.process_delta(output);
+        bridge
+            .process_delta(output, &mut cursor)
+            .unwrap()
+            .expect("initial output capture");
 
         // End the subscription
         let ended = PaneDelta::Ended {
             pane_id: 1,
             reason: "cancelled".to_string(),
         };
-        let segments = bridge.process_delta(ended);
+        let segments: Vec<_> = bridge
+            .process_delta(ended, &mut cursor)
+            .unwrap()
+            .into_iter()
+            .collect();
 
         // PaneClosed → final gap segment
         assert_eq!(segments.len(), 1);
@@ -5685,12 +5810,174 @@ mod tests {
 
     #[cfg(feature = "vendored")]
     #[test]
+    fn streaming_bridge_rejects_mismatched_cursor_without_any_state_change() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut matching = PaneCursor::new(7);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 7,
+                    seqno: 10,
+                    delta_text: "established".to_string(),
+                    title: "original".to_string(),
+                    dirty_range_count: 2,
+                    dirty_row_count: 3,
+                },
+                &mut matching,
+            )
+            .unwrap()
+            .expect("initial capture");
+        bridge.record_fallback();
+        let mut wrong = PaneCursor::from_seq(8, 41);
+        let previous = wrong.capture_delta("prior capture".to_string(), 0);
+        assert_eq!(wrong.realign_next_seq(&previous, 40), -1);
+        let cursor_before = format!("{wrong:?}");
+        let health_before = bridge.snapshot_health();
+        let active_before = bridge.active_panes.clone();
+        let metadata_before = bridge.last_render_metadata.clone();
+        let versions_before = bridge.last_mux_seqno.clone();
+        let segments_before = bridge.total_segments();
+        let anomalies_before = bridge.seq_anomaly_count();
+
+        for delta in [
+            PaneDelta::Output {
+                pane_id: 7,
+                seqno: 1,
+                delta_text: "must not capture".to_string(),
+                title: "must not replace metadata".to_string(),
+                dirty_range_count: 99,
+                dirty_row_count: 99,
+            },
+            PaneDelta::Gap {
+                pane_id: 7,
+                reason: "must not reset version".to_string(),
+            },
+            PaneDelta::Ended {
+                pane_id: 7,
+                reason: "must not close".to_string(),
+            },
+        ] {
+            assert_eq!(
+                bridge.process_delta(delta, &mut wrong).unwrap_err(),
+                "streaming delta pane does not match capture cursor"
+            );
+            assert_eq!(format!("{wrong:?}"), cursor_before);
+            assert_eq!(bridge.snapshot_health(), health_before);
+            assert_eq!(bridge.active_panes, active_before);
+            assert_eq!(bridge.last_render_metadata, metadata_before);
+            assert_eq!(bridge.last_mux_seqno, versions_before);
+            assert_eq!(bridge.total_segments(), segments_before);
+            assert_eq!(bridge.seq_anomaly_count(), anomalies_before);
+        }
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_uses_resumed_cursor_and_preserves_external_correction() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        // Cursor-state control: external persistence realignment is exercised
+        // directly here; this test does not claim a database write occurred.
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::from_seq(7, 41);
+        let output = |seqno, text: &str| PaneDelta::Output {
+            pane_id: 7,
+            seqno,
+            delta_text: text.to_string(),
+            title: "resumed".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 2,
+        };
+        let first = bridge
+            .process_delta(output(10, "first"), &mut cursor)
+            .unwrap()
+            .expect("resumed capture");
+        assert_eq!((first.pane_id, first.seq, first.seq_correction), (7, 41, 0));
+        assert_eq!(first.content, "first");
+        assert!(matches!(first.kind, CapturedSegmentKind::Delta));
+        assert_eq!(cursor.next_seq, 42);
+        assert_eq!(cursor.realign_next_seq(&first, 40), -1);
+        assert_eq!((cursor.next_seq, cursor.seq_correction()), (41, -1));
+
+        let second = bridge
+            .process_delta(output(20, "second"), &mut cursor)
+            .unwrap()
+            .expect("corrected capture");
+        assert_eq!((second.seq, second.seq_correction), (41, -1));
+        assert_eq!(second.content, "second");
+        assert!(matches!(second.kind, CapturedSegmentKind::Delta));
+        let gap = bridge
+            .process_delta(
+                PaneDelta::Gap {
+                    pane_id: 7,
+                    reason: "transport loss".to_string(),
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("explicit gap");
+        assert_eq!((gap.seq, gap.seq_correction), (42, -1));
+        assert!(
+            matches!(gap.kind, CapturedSegmentKind::Gap { ref reason } if reason == "stream_overflow")
+        );
+        assert!(!bridge.last_mux_seqno.contains_key(&7));
+        let closed = bridge
+            .process_delta(
+                PaneDelta::Ended {
+                    pane_id: 7,
+                    reason: "cancelled".to_string(),
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("active pane close gap");
+        assert_eq!((closed.seq, closed.seq_correction), (43, -1));
+        assert!(
+            matches!(closed.kind, CapturedSegmentKind::Gap { ref reason } if reason == "pane_closed")
+        );
+        assert_eq!(bridge.active_panes(), 0);
+        assert!(bridge.render_metadata(7).is_none());
+        assert_eq!((cursor.next_seq, cursor.seq_correction()), (44, -1));
+        let cursor_after_close = format!("{cursor:?}");
+        assert!(
+            bridge
+                .process_delta(
+                    PaneDelta::Ended {
+                        pane_id: 7,
+                        reason: "already ended".to_string(),
+                    },
+                    &mut cursor
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(format!("{cursor:?}"), cursor_after_close);
+        assert_eq!((bridge.total_segments(), bridge.total_gaps()), (4, 2));
+
+        let resumed = bridge
+            .process_delta(output(1, "resumed again"), &mut cursor)
+            .unwrap()
+            .expect("shared cursor survives stream close");
+        assert_eq!((resumed.seq, resumed.seq_correction), (44, -1));
+        assert_eq!(resumed.content, "resumed again");
+        assert_eq!((cursor.next_seq, cursor.seq_correction()), (45, -1));
+        assert_eq!(bridge.active_panes(), 1);
+        assert_eq!((bridge.total_segments(), bridge.total_gaps()), (5, 2));
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
     fn streaming_bridge_multiple_panes() {
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
 
         for pane_id in [1, 2, 3] {
+            let mut cursor = PaneCursor::new(pane_id);
             let delta = PaneDelta::Output {
                 pane_id,
                 seqno: 1,
@@ -5699,13 +5986,16 @@ mod tests {
                 dirty_range_count: 1,
                 dirty_row_count: 4,
             };
-            bridge.process_delta(delta);
+            bridge
+                .process_delta(delta, &mut cursor)
+                .unwrap()
+                .expect("pane output capture");
         }
 
         assert_eq!(bridge.events_processed(), 3);
         assert_eq!(bridge.dirty_range_total(), 3);
         assert_eq!(bridge.dirty_row_total(), 12);
-        assert_eq!(bridge.ingester().active_panes(), 3);
+        assert_eq!(bridge.active_panes(), 3);
     }
 
     #[test]
@@ -5716,9 +6006,9 @@ mod tests {
             events_processed: bridge.events_processed(),
             dirty_ranges_total: bridge.dirty_range_total(),
             dirty_rows_total: bridge.dirty_row_total(),
-            gaps_emitted: bridge.ingester().total_gaps(),
+            gaps_emitted: bridge.total_gaps(),
             fallback_count: bridge.fallback_count(),
-            active_panes: bridge.ingester().active_panes(),
+            active_panes: bridge.active_panes(),
         };
         assert_eq!(health.mode, TailerMode::Streaming);
         assert_eq!(health.events_processed, 0);
