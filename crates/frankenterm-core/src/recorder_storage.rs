@@ -1817,7 +1817,14 @@ impl RecorderStorage for RusqliteRecorderStorage {
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
         let mut inner = self.inner.lock().await;
         let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-            let existing = read_sqlite_checkpoint(&inner.conn, &checkpoint.consumer)?;
+            // The async mutex covers this instance only. Acquire SQLite writer
+            // authority before reading so another connection cannot advance the
+            // checkpoint between our comparison and upsert (or noop receipt).
+            let transaction = inner
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_error)?;
+            let existing = read_sqlite_checkpoint(&transaction, &checkpoint.consumer)?;
             let outcome = match existing {
                 Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
                     return Err(RecorderStorageError::CheckpointRegression {
@@ -1835,8 +1842,7 @@ impl RecorderStorage for RusqliteRecorderStorage {
             };
 
             if outcome == CheckpointCommitOutcome::Advanced {
-                inner
-                    .conn
+                transaction
                     .execute(
                         "INSERT INTO recorder_checkpoints (
                              consumer, segment_id, byte_offset, ordinal,
@@ -1860,6 +1866,7 @@ impl RecorderStorage for RusqliteRecorderStorage {
                     )
                     .map_err(sqlite_error)?;
             }
+            transaction.commit().map_err(sqlite_error)?;
             Ok(outcome)
         })();
         match result {
@@ -3103,10 +3110,10 @@ recorder_backend = "frankensqlite"
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
             .unwrap();
-            let count: u64 = reader
+            let count: i64 = reader
                 .query_row("SELECT COUNT(*) FROM recorder_events", [], |row| row.get(0))
                 .unwrap();
-            let checkpoint: u64 = reader
+            let checkpoint: i64 = reader
                 .query_row(
                     "SELECT ordinal FROM recorder_checkpoints WHERE consumer = 'durability-reader'",
                     [],
@@ -3116,8 +3123,8 @@ recorder_backend = "frankensqlite"
             let integrity: String = reader
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count, ordinal + 1);
-            assert_eq!(checkpoint, ordinal);
+            assert_eq!(count, i64::try_from(ordinal + 1).unwrap());
+            assert_eq!(checkpoint, i64::try_from(ordinal).unwrap());
             assert_eq!(integrity, "ok");
             eprintln!(
                 "recorder durability reopen: mode={expected_mode}, events={count}, checkpoint={checkpoint}, integrity={integrity}"
@@ -3177,7 +3184,7 @@ recorder_backend = "frankensqlite"
             assert_eq!(actual, mode.to_ascii_lowercase());
             let error = configure_rusqlite_durability(&conn).unwrap_err();
             assert!(matches!(error, RecorderStorageError::InvalidRequest { .. }));
-            let count: u64 = conn
+            let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(
@@ -3191,6 +3198,124 @@ recorder_backend = "frankensqlite"
             configure_rusqlite_durability(&temporary),
             Err(RecorderStorageError::InvalidRequest { .. })
         ));
+    }
+
+    #[test]
+    fn rusqlite_checkpoint_contention_never_rewinds_delete() {
+        rusqlite_checkpoint_contention_never_rewinds("DELETE");
+    }
+
+    #[test]
+    fn rusqlite_checkpoint_contention_never_rewinds_wal() {
+        rusqlite_checkpoint_contention_never_rewinds("WAL");
+    }
+
+    fn rusqlite_checkpoint_contention_never_rewinds(mode: &str) {
+        use std::cell::RefCell;
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use std::time::Duration;
+
+        // Only SQLite's real lock-contention callback releases the coordinator.
+        // TLS keeps concurrent test cases independent; no callback re-enters SQL.
+        thread_local! {
+            static BUSY_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+        }
+        for iteration in 0..10 {
+            let dir = tempdir().unwrap();
+            let config = recorder_test_config(dir.path()).rusqlite;
+            let mut blocker = Connection::open(&config.db_path).unwrap();
+            let actual_mode: String = blocker
+                .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual_mode, mode.to_ascii_lowercase());
+            let storage = RusqliteRecorderStorage::open(config).unwrap();
+            let initial = RecorderCheckpoint {
+                consumer: CheckpointConsumerId("contended-reader".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: 0,
+            };
+            run_async_test(async {
+                storage
+                    .append_batch(AppendRequest {
+                        batch_id: "checkpoint-contention".to_string(),
+                        events: (0..3)
+                            .map(|ordinal| {
+                                sample_event(&format!("event-{ordinal}"), 7, ordinal, "data")
+                            })
+                            .collect(),
+                        required_durability: DurabilityLevel::Fsync,
+                        producer_ts_ms: 0,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    storage.commit_checkpoint(initial.clone()).await.unwrap(),
+                    CheckpointCommitOutcome::Advanced
+                );
+            });
+            let mut newer = initial.clone();
+            newer.upto_offset.ordinal = 2;
+            newer.committed_at_ms = 2;
+            let mut delayed = initial;
+            delayed.upto_offset.ordinal = 1;
+            delayed.committed_at_ms = 1;
+
+            let transaction = blocker
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(transaction.execute(
+                "UPDATE recorder_checkpoints SET ordinal = 2, committed_at_ms = 2 WHERE consumer = ?1",
+                [&newer.consumer.0],
+            ).unwrap(), 1);
+            let (busy_tx, busy_rx) = channel();
+            let (resume_tx, resume_rx) = channel();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(move || {
+                    BUSY_GATE.with(|gate| *gate.borrow_mut() = Some((busy_tx, resume_rx)));
+                    run_async_test(async {
+                        {
+                            let inner = storage.inner.lock().await;
+                            inner.conn.busy_handler(Some(|_| {
+                                BUSY_GATE.with(|gate| {
+                                    let Some((entered, resume)) = gate.borrow_mut().take() else {
+                                        return false;
+                                    };
+                                    entered.send(()).is_ok()
+                                        && resume.recv_timeout(Duration::from_secs(10)).is_ok()
+                                })
+                            })).unwrap();
+                        }
+                        let result = storage.commit_checkpoint(delayed).await;
+                        let persisted = storage.read_checkpoint(&newer.consumer).await.unwrap();
+                        let outcome = match &result {
+                            Err(RecorderStorageError::CheckpointRegression { .. }) => "regression",
+                            Ok(CheckpointCommitOutcome::Advanced) => "advanced",
+                            _ => "unexpected",
+                        };
+                        eprintln!("recorder checkpoint contention: mode={mode}, iteration={iteration}, outcome={outcome}, persisted_ordinal={:?}", persisted.as_ref().map(|cp| cp.upto_offset.ordinal));
+                        assert_eq!(persisted, Some(newer.clone()), "delayed writer must not overwrite newer checkpoint");
+                        assert!(matches!(result, Err(RecorderStorageError::CheckpointRegression {
+                            current_ordinal: 2, attempted_ordinal: 1, ..
+                        })));
+                        assert_eq!(storage.commit_checkpoint(newer).await.unwrap(), CheckpointCommitOutcome::NoopAlreadyAdvanced);
+                        assert!(!storage.health().await.degraded);
+                    });
+                });
+                busy_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("writer must reach actual SQLite lock contention");
+                transaction.commit().unwrap();
+                resume_tx.send(()).unwrap();
+                writer.join().unwrap();
+            });
+        }
     }
 
     #[test]
