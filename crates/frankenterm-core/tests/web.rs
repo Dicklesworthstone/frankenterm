@@ -20,7 +20,7 @@ mod web_tests {
         net::{TcpListener, TcpStream},
         sleep, task, timeout,
     };
-    use frankenterm_core::storage::{PaneRecord, StorageHandle};
+    use frankenterm_core::storage::{EventQuery, PaneRecord, StorageHandle, StoredEvent};
 
     use frankenterm_core::web::{WebRuntimeLimits, WebServerConfig, start_web_server};
     #[cfg(feature = "asupersync-runtime")]
@@ -114,7 +114,10 @@ mod web_tests {
         })
         .await
         .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP fixture exchange timed out")
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP fixture exchange timed out",
+            )
         })?
     }
 
@@ -309,7 +312,10 @@ mod web_tests {
                 )
                 .await
                 .context("live discovery request must succeed")?;
-                ensure!(extract_status(&raw) == 200, "discovery must return HTTP 200");
+                ensure!(
+                    extract_status(&raw) == 200,
+                    "discovery must return HTTP 200"
+                );
                 let (headers, document) = raw.split_once("\r\n\r\n").context("response headers")?;
                 ensure!(
                     headers.lines().any(|line| {
@@ -328,6 +334,48 @@ mod web_tests {
                     "application version must match"
                 );
                 let paths = spec["paths"].as_object().context("live paths object")?;
+                let expected: std::collections::BTreeSet<_> = [
+                    "/health",
+                    "/panes",
+                    "/events",
+                    "/search",
+                    "/bookmarks",
+                    "/ruleset-profile",
+                    "/saved-searches",
+                    "/stream/events",
+                    "/stream/deltas",
+                ]
+                .into_iter()
+                .map(|path| (path, "get"))
+                .collect();
+                let mut documented = std::collections::BTreeSet::new();
+                let mut operation_ids = std::collections::BTreeSet::new();
+                for (path, item) in paths {
+                    for (method, operation) in item.as_object().context("path item")? {
+                        documented.insert((path.as_str(), method.as_str()));
+                        let id = operation["operationId"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .context("nonempty operation ID")?;
+                        ensure!(operation_ids.insert(id), "operation IDs must be unique");
+                        ensure!(
+                            operation.get("security").is_none(),
+                            "auth is not implemented yet"
+                        );
+                    }
+                }
+                ensure!(
+                    documented == expected,
+                    "live document must describe exactly nine GET routes"
+                );
+                ensure!(
+                    spec.get("security").is_none(),
+                    "global auth is not implemented yet"
+                );
+                ensure!(
+                    spec["components"].get("securitySchemes").is_none(),
+                    "no unwired auth schemes"
+                );
                 let (health_path, _) = paths
                     .iter()
                     .find(|(_, item)| item["get"]["operationId"] == "get_health")
@@ -336,7 +384,10 @@ mod web_tests {
                     health_path == "/health",
                     "health operation must map to /health"
                 );
-                ensure!(paths.len() == 9, "review missing or newly exposed operations");
+                ensure!(
+                    paths.len() == 9,
+                    "review missing or newly exposed operations"
+                );
                 ensure!(
                     !paths.contains_key("/openapi.json"),
                     "document route must not describe itself"
@@ -347,7 +398,10 @@ mod web_tests {
                 let health = fetch_raw(addr, request.as_bytes())
                     .await
                     .context("advertised route must answer")?;
-                ensure!(extract_status(&health) == 200, "health must return HTTP 200");
+                ensure!(
+                    extract_status(&health) == 200,
+                    "health must return HTTP 200"
+                );
                 let body: serde_json::Value = serde_json::from_str(extract_body(&health))
                     .context("health response must be JSON")?;
                 ensure!(body["ok"] == true, "health must report success");
@@ -423,6 +477,229 @@ mod web_tests {
                     None => assert_eq!(result.expect(name).len(), response_len, "{name}"),
                 }
             }
+        });
+    }
+
+    #[test]
+    fn web_redaction_depth_limit_protects_stored_events() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (storage, _directory) =
+                timeout(Duration::from_secs(5), create_test_storage_with_pane(71))
+                    .await
+                    .expect("owned database startup deadline")
+                    .expect("owned database starts");
+            let startup = timeout(
+                Duration::from_secs(5),
+                start_web_server(
+                    WebServerConfig::default()
+                        .with_port(0)
+                        .with_storage(storage.clone())
+                        .with_storage_event_tail(false),
+                ),
+            )
+            .await;
+            if !matches!(&startup, Ok(Ok(_))) {
+                let _ = timeout(Duration::from_secs(5), storage.shutdown()).await;
+            }
+            let server = startup
+                .expect("owned HTTP server startup deadline")
+                .expect("owned HTTP server starts");
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(5), async {
+                let canary = "sk-livetest1234567890abcdefghij";
+                let mut nested = serde_json::Value::String(canary.to_owned());
+                for _ in 0..70 {
+                    nested = serde_json::Value::Array(vec![nested]);
+                }
+                // Seed a real legacy/unredacted row. This deliberately tests
+                // read-side protection, independently of capture redaction.
+                let event_id = storage.record_event(StoredEvent {
+                    id: 0, pane_id: 71,
+                    rule_id: "test.web.depth".to_owned(),
+                    agent_type: "codex".to_owned(),
+                    event_type: "depth_control".to_owned(),
+                    severity: "info".to_owned(), confidence: 1.0,
+                    extracted: Some(serde_json::json!({ "safe": "keep-me", "nested": nested })),
+                    matched_text: Some("ordinary event".to_owned()),
+                    segment_id: None, detected_at: epoch_ms_now(), dedupe_key: None,
+                    handled_at: None, handled_by_workflow_id: None, handled_status: None,
+                }).await.context("seed legacy event")?;
+                let rows = storage.get_events(EventQuery {
+                    pane_id: Some(71), limit: Some(1), ..EventQuery::default()
+                }).await.context("verify real stored precondition")?;
+                ensure!(rows.len() == 1 && rows[0].id == event_id, "real row must exist");
+                ensure!(
+                    serde_json::to_string(&rows[0].extracted)?.contains(canary),
+                    "precondition must contain the canary before HTTP redaction"
+                );
+                let raw = fetch_raw(
+                    addr,
+                    b"GET /events?pane_id=71 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                ).await.context("live event read")?;
+                ensure!(extract_status(&raw) == 200, "event read must succeed");
+                ensure!(!raw.contains(canary), "HTTP response must not disclose deep secret");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                ensure!(body["data"]["total"] == 1, "must return the actual event");
+                let event = &body["data"]["events"][0];
+                ensure!(event["id"] == event_id, "must return the seeded event ID");
+                ensure!(event["extracted"]["safe"] == "keep-me", "shallow safe data must survive");
+                ensure!(event["matched_text"] == "ordinary event", "ordinary text must survive");
+                ensure!(raw.contains("[REDACTED: depth limit]"), "omitted subtree must be explicit");
+                Ok::<_, anyhow::Error>(raw.len())
+            }).await;
+            let http_shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let storage_shutdown = timeout(Duration::from_secs(5), storage.shutdown()).await;
+            let response_bytes = scenario
+                .expect("HTTP scenario deadline")
+                .expect("HTTP redaction assertions");
+            http_shutdown
+                .expect("HTTP teardown deadline")
+                .expect("HTTP teardown");
+            storage_shutdown
+                .expect("database teardown deadline")
+                .expect("database teardown");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.21", "scenario": "stored_event_http_depth",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "response_bytes": response_bytes, "teardown": "clean",
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn web_redaction_depth_limit_protects_live_sse() {
+        use anyhow::{Context, ensure};
+        use base64::Engine as _;
+
+        run_async_test(async {
+            let event_bus = Arc::new(EventBus::new(8));
+            let server = timeout(
+                Duration::from_secs(5),
+                start_web_server(
+                    WebServerConfig::default()
+                        .with_port(0)
+                        .with_event_bus(Arc::clone(&event_bus)),
+                ),
+            )
+            .await
+            .expect("owned SSE server startup deadline")
+            .expect("owned SSE server starts");
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(5), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream.write_all(b"GET /stream/events?channel=all&pane_id=72&max_hz=100 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+                let canary = "sk-livetest1234567890abcdefghij";
+                let mut response = Vec::new();
+                let mut sent = false;
+                loop {
+                    let mut chunk = [0_u8; 2048];
+                    let count = read(&mut stream, &mut chunk).await?;
+                    ensure!(count != 0, "SSE must not close before delivering the event");
+                    ensure!(response.len() + count <= 64 * 1024, "SSE proof byte budget");
+                    response.extend_from_slice(&chunk[..count]);
+                    let raw = std::str::from_utf8(&response).context("ASCII synthetic SSE response")?;
+                    // The actual ready frame, not a timing sleep, proves that
+                    // this stream subscribed before its two synthetic events.
+                    if !sent && stream_frame_kind_count(raw, "ready") == 1 {
+                        ensure!(extract_status(raw) == 200, "SSE must return HTTP 200");
+                        ensure!(raw.contains("text/event-stream"), "SSE content type");
+                        let mut nested = serde_json::Value::String(canary.to_owned());
+                        for _ in 0..70 {
+                            nested = serde_json::Value::Array(vec![nested]);
+                        }
+                        let delivered = event_bus.publish(Event::PatternDetected {
+                            pane_id: 72, pane_uuid: None, event_id: None,
+                            detection: Detection {
+                                rule_id: "test.web.depth".to_owned(),
+                                agent_type: AgentType::Codex,
+                                event_type: "depth_control".to_owned(),
+                                severity: Severity::Info, confidence: 1.0,
+                                extracted: serde_json::json!({ "safe": "keep-me", "nested": nested }),
+                                matched_text: "ordinary event".to_owned(), span: (0, 0),
+                            },
+                        });
+                        ensure!(delivered == 1, "one owned subscriber must receive the detection");
+                        let decoded = serde_json::json!({
+                            "safe": "keep-me",
+                            "secret": canary,
+                            "padding": "x".repeat(13_000),
+                        });
+                        let source = serde_json::to_string(&decoded)?
+                            .replace("sk-", r"\u0073\u006b-");
+                        ensure!(!source.contains(canary), "raw JSON source hides the token from text-only matching");
+                        ensure!(serde_json::from_str::<serde_json::Value>(&source)?["secret"] == canary,
+                            "the browser-visible parsed transport must contain the canary before redaction");
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(source);
+                        ensure!(encoded.len() > 16_384, "encoded precondition exceeds the old shortcut");
+                        let delivered = event_bus.publish(Event::UserVarReceived {
+                            pane_id: 72,
+                            name: "FT_EVENT".to_owned(),
+                            payload: frankenterm_core::events::UserVarPayload {
+                                value: encoded,
+                                event_type: Some("encoded_control".to_owned()),
+                                event_data: Some(decoded),
+                            },
+                        });
+                        ensure!(delivered == 1, "one owned subscriber must receive the user-var");
+                        sent = true;
+                    }
+                    if stream_frame_kind_count(raw, "event") == 2 {
+                        ensure!(sent, "only the published events may satisfy the oracle");
+                        ensure!(!raw.contains(canary), "SSE must not disclose deep secret");
+                        ensure!(raw.contains("[REDACTED: depth limit]"), "SSE truncation marker");
+                        ensure!(raw.contains("keep-me") && raw.contains("ordinary event"), "safe event fields survive");
+                        let user_var = raw.lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .find(|frame| frame["data"]["event"]["type"] == "user_var_received")
+                            .context("the actual user-var event must be delivered")?;
+                        let payload = &user_var["data"]["event"]["payload"];
+                        let encoded = payload["value"].as_str().context("encoded value stays a string")?;
+                        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+                        let decoded: serde_json::Value = serde_json::from_slice(&decoded)?;
+                        ensure!(decoded["safe"] == "keep-me", "encoded safe data survives");
+                        ensure!(decoded["secret"] == "[REDACTED]", "encoded secret must be redacted");
+                        ensure!(decoded["padding"] == "x".repeat(13_000), "large benign transport data must not be lost");
+                        ensure!(payload["event_data"]["safe"] == "keep-me", "decoded safe data survives");
+                        ensure!(payload["event_data"]["secret"] == "[REDACTED]", "decoded view is redacted too");
+                        return Ok::<_, anyhow::Error>(response.len());
+                    }
+                }
+            }).await;
+            let shutdown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                // Receiver drop wakes the independently scheduled producer;
+                // keep its release inside the same teardown deadline.
+                while event_bus.subscriber_count() != 0 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            let bytes = scenario
+                .expect("SSE scenario deadline")
+                .expect("SSE redaction assertions");
+            shutdown
+                .expect("SSE teardown deadline")
+                .expect("SSE teardown");
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "owned subscription released"
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.21", "scenario": "live_event_sse_depth",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "response_bytes": bytes, "teardown": "clean",
+                })
+            );
         });
     }
 

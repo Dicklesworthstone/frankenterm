@@ -3936,6 +3936,7 @@ name = "frankenterm-core"
 version = "0.15.2"
 dependencies = [
  "aho-corasick",
+ "anyhow",
  "asupersync 0.3.10",
  "base64 0.23.1",
  "bloomfilter",

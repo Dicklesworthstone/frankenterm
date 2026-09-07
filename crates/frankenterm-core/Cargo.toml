@@ -191,6 +191,7 @@ rustix = { workspace = true, features = ["process"] }
 xattr.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 syn = { workspace = true, features = ["full", "visit"] }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 tokio = { workspace = true, features = ["test-util"] }
