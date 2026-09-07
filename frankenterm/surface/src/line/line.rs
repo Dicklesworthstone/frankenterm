@@ -422,12 +422,12 @@ impl Line {
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
-            let shape_hash = compute_wrap_shape_hash(self.bits, &cells);
+            let geometry_hash = compute_wrap_geometry_hash(self.bits, &cells);
             let tokens: Vec<Cell> = cells.into_iter().map(|cell| cell.as_cell()).collect();
 
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
             let cache_key = MemoizedWrapPointCacheKey {
-                shape_hash,
+                geometry_hash,
                 width,
                 cost_model,
             };
@@ -1948,7 +1948,7 @@ const MAX_MEMOIZED_WRAP_POINT_CACHE_ENTRIES: usize = 16_384;
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MemoizedWrapPointCacheKey {
-    shape_hash: [u8; 16],
+    geometry_hash: [u8; 16],
     width: usize,
     cost_model: MonospaceKpCostModel,
 }
@@ -2085,7 +2085,7 @@ fn memoized_wrap_point_cache_key_for_test(
     let end_idx = cells.iter().rposition(|c| c.str() != " ")?;
     cells.truncate(end_idx + 1);
     Some(MemoizedWrapPointCacheKey {
-        shape_hash: compute_wrap_shape_hash(line.bits, &cells),
+        geometry_hash: compute_wrap_geometry_hash(line.bits, &cells),
         width,
         cost_model,
     })
@@ -2158,11 +2158,26 @@ impl LineWrapReport {
 }
 
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
-fn compute_wrap_shape_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16] {
+fn compute_wrap_geometry_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16] {
+    static CONTENT_KEY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_content_key = *CONTENT_KEY.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_WRAP_GEOMETRY_KEY").is_some_and(|value| value == "1")
+    });
     let mut hasher = SipHasher::new();
-    bits.bits().hash(&mut hasher);
+    if use_content_key {
+        bits.bits().hash(&mut hasher);
+    } else {
+        // The planner, scorer and tie-breaker use only the ordered widths,
+        // token count, target width and cost model. Cache only their offsets
+        // and scorecard; materialization always reads the caller's current
+        // cells, including colors, links and mutable image attachments.
+        // Hashing display attributes here needlessly defeats geometry reuse.
+        cells.len().hash(&mut hasher);
+    }
     for cell in cells {
-        cell.compute_shape_hash(&mut hasher);
+        if use_content_key {
+            cell.compute_shape_hash(&mut hasher);
+        }
         cell.width().hash(&mut hasher);
     }
     hasher.finish128().as_bytes()
@@ -3068,6 +3083,54 @@ mod tests {
     ) -> MemoizedWrapPointCacheEntry {
         memoized_wrap_point_cache_entry_for_test(line, width, cost_model)
             .unwrap_or_else(|| panic!("missing memoized wrap entry after {}", label))
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn wrap_geometry_reuse_keeps_current_text_and_attributes() {
+        let _guard = memoized_wrap_point_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let model = MonospaceKpCostModel::terminal_default();
+        let width = 4;
+        let first = Line::from_text("alpha beta", &CellAttributes::default(), 1, None);
+        let mut attrs = CellAttributes::default();
+        attrs.set_italic(true);
+        attrs.set_hyperlink(Some(alloc::sync::Arc::new(
+            crate::hyperlink::Hyperlink::new_implicit("https://current.example/"),
+        )));
+        let current = Line::from_text("other text", &attrs, 2, None);
+        memoized_wrap_point_cache_clear_for_test();
+        let _ = first.wrap_with_report(width, 7, model);
+        let hits_before = memoized_wrap_point_cache_key_hits_for_test(&current, width, model);
+        let reused = current.clone().wrap_with_report(width, 7, model);
+        assert!(
+            memoized_wrap_point_cache_key_hits_for_test(&current, width, model) > hits_before,
+            "equal cell widths must reuse geometry across different text and attributes"
+        );
+        memoized_wrap_point_cache_clear_for_test();
+        let fresh = current.wrap_with_report(width, 7, model);
+        assert_eq!(
+            reused.lines, fresh.lines,
+            "cache must not retain the earlier cells"
+        );
+        assert_eq!(reused.scorecard, fresh.scorecard);
+        assert_eq!(
+            reused
+                .lines
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect::<String>(),
+            "other text"
+        );
+        for line in reused.lines {
+            for cell in line.visible_cells() {
+                assert_eq!(
+                    cell.attrs().hyperlink().unwrap().uri(),
+                    "https://current.example/"
+                );
+            }
+        }
     }
 
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
