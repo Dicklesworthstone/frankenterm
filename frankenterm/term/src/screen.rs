@@ -27,6 +27,14 @@ fn logical_len_exceeds_limit(current: usize, additional: usize, limit: usize) ->
     }
 }
 
+fn reuse_unlinked_scan_state_for_reflow() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_REFLOW_SCAN_STATE_REUSE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// Holds the model of a screen.  This can either be the primary screen
 /// which includes lines of scrollback text, or the alternate screen
 /// which holds no scrollback.  The intent is to have one instance of
@@ -2211,7 +2219,20 @@ impl Screen {
     fn hash_layout_line(hasher: &mut DefaultHasher, line: &Line) {
         line.len().hash(hasher);
         line.last_cell_was_wrapped().hash(hasher);
-        line.compute_shape_hash().hash(hasher);
+        if reuse_unlinked_scan_state_for_reflow()
+            && !line.has_hyperlink()
+            && line.implicit_hyperlinks_are_scanned()
+        {
+            // A no-match scan changes no cell or layout attribute. Normalize
+            // only that derived bit. Linked lines keep their exact hash, and
+            // cached materialization below clears the no-match scan state so
+            // a changed rule epoch can never inherit an old "already scanned".
+            let mut unscanned = line.clone();
+            unscanned.invalidate_implicit_hyperlinks(line.current_seqno());
+            unscanned.compute_shape_hash().hash(hasher);
+        } else {
+            line.compute_shape_hash().hash(hasher);
+        }
     }
 
     fn compute_layout_signature(&self) -> u64 {
@@ -3042,6 +3063,14 @@ impl Screen {
                 rewrapped
             }
         };
+
+        if logical_cache_hit && reuse_unlinked_scan_state_for_reflow() {
+            for line in &mut self.lines {
+                if !line.has_hyperlink() {
+                    line.invalidate_implicit_hyperlinks(seqno);
+                }
+            }
+        }
 
         // Map through the actual chosen rows, not logical_x / window_width.
         // Wide graphemes and bounded wrap plans can leave a row underfull;
@@ -5090,6 +5119,97 @@ mod tests {
     }
 
     #[test]
+    fn no_match_hyperlink_scans_preserve_cached_resize_layouts() {
+        let mut screen = test_screen(3, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcd", &attrs, 0),
+            Line::from_text("ef", &attrs, 0, None),
+            Line::new(0),
+        ]);
+        let rules = vec![frankenterm_surface::hyperlink::Rule::new(r"https?://\S+", "$0").unwrap()];
+        let mut cursor = test_cursor(1, 1, 1);
+        for cols in [3, 4, 3] {
+            cursor = screen.resize(test_size(3, cols, 96), cursor, 1, false);
+            for line in &mut screen.lines {
+                line.scan_and_create_hyperlinks(&rules);
+                assert!(!line.has_hyperlink());
+            }
+        }
+        assert_eq!(
+            screen.rewrap_cache.as_ref().unwrap().wrapped_by_key.len(),
+            2,
+            "painting no-match hyperlinks must not throw away unchanged resize layouts"
+        );
+    }
+
+    #[test]
+    fn cached_no_match_scan_cannot_suppress_a_new_rule_epoch() {
+        use frankenterm_surface::hyperlink::Rule;
+        let mut screen = test_screen(4, 6, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcdef", &attrs, 1, None),
+            Line::from_text("xy", &attrs, 1, None),
+            Line::new(1),
+            Line::new(1),
+        ]);
+        let old_rules = vec![Rule::new("never-matches", "$0").unwrap()];
+        for line in &mut screen.lines {
+            line.scan_and_create_hyperlinks(&old_rules);
+        }
+        let cursor = screen.resize(test_size(4, 4, 96), test_cursor(0, 0, 1), 1, false);
+        assert!(screen.rewrap_cache.as_ref().unwrap().logical_lines[0]
+            .implicit_hyperlinks_are_scanned());
+        let cursor = screen.resize(test_size(4, 3, 96), cursor, 1, false);
+        // Rule epochs can change at the SAME sequence. The cache contains a
+        // valid old no-match result, but the current lines need the new rules.
+        for line in &mut screen.lines {
+            line.invalidate_implicit_hyperlinks(1);
+        }
+        let mut fresh = screen.clone();
+        fresh.rewrap_cache = None;
+        let actual_cursor = screen.resize(test_size(4, 4, 96), cursor, 1, false);
+        let fresh_cursor = fresh.resize(test_size(4, 4, 96), cursor, 1, false);
+        assert_eq!(actual_cursor, fresh_cursor);
+        assert_eq!(
+            screen.rewrap_cache.as_ref().unwrap().wrapped_by_key.len(),
+            2
+        );
+        let new_rules = vec![Rule::new("abcdef|xy", "https://new.example/$0").unwrap()];
+        for target in [&mut screen, &mut fresh] {
+            for range in Screen::logical_line_physical_ranges(&target.lines) {
+                let mut lines: Vec<_> = target
+                    .lines
+                    .iter_mut()
+                    .skip(range.start)
+                    .take(range.len())
+                    .collect();
+                Line::apply_hyperlink_rules(&new_rules, &mut lines);
+            }
+        }
+        assert_eq!(screen.lines, fresh.lines);
+        let links: Vec<_> = screen
+            .lines
+            .iter()
+            .flat_map(Line::visible_cells)
+            .filter_map(|cell| cell.attrs().hyperlink().cloned())
+            .collect();
+        assert_eq!(
+            links.len(),
+            8,
+            "new rules must reach wrapped and unwrapped records"
+        );
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| link.uri() == "https://new.example/xy")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn rewrap_cache_tracks_width_and_dpi_keys() {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
@@ -6243,7 +6363,9 @@ mod tests {
                 screen.lines[cursor.1]
                     .visible_cells()
                     .any(|cell| cell.cell_index() == cursor.0),
-                "width {cols} mapped cursor {cursor:?} onto a spacer or past the line"
+                "width {} mapped cursor {:?} onto a spacer or past the line",
+                cols,
+                cursor
             );
         }
     }
