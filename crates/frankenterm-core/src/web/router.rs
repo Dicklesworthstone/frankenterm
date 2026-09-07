@@ -13,7 +13,7 @@ use super::sse::{handle_stream_deltas, handle_stream_events};
 use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
-use crate::web_framework::{App, Method, Request, RequestContext};
+use crate::web_framework::{App, Method, Request, RequestContext, WebStreamLifecycle};
 use std::sync::Arc;
 
 pub(super) fn build_app(
@@ -21,6 +21,7 @@ pub(super) fn build_app(
     event_bus: Option<Arc<EventBus>>,
     runtime_limits: WebRuntimeLimits,
 ) -> App {
+    let streams = WebStreamLifecycle::new();
     let state = AppState {
         storage,
         event_bus,
@@ -30,6 +31,8 @@ pub(super) fn build_app(
 
     App::builder()
         .openapi(super::openapi::config())
+        .state(streams.clone())
+        .middleware(streams)
         .middleware(BodySizeGuard::new(runtime_limits.max_request_body_bytes))
         .middleware(RequestSpanLogger)
         .middleware(StateInjector { state })

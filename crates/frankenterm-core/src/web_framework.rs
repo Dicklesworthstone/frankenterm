@@ -54,6 +54,72 @@ const WEB_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(1);
 const WEB_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const WEB_CONNECTION_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// One-way shutdown authority shared by the server and its streaming bodies.
+/// This is deliberately separate from a caller's Cx: cancelling a cloned Cx
+/// would cancel the caller too, and FastAPI's connection task has its own Cx.
+#[derive(Clone)]
+pub(crate) struct WebStreamLifecycle {
+    stop: Arc<crate::runtime_async::watch::Sender<bool>>,
+}
+
+impl WebStreamLifecycle {
+    pub(crate) fn new() -> Self {
+        let (stop, _) = crate::runtime_async::watch::channel(false);
+        Self {
+            stop: Arc::new(stop),
+        }
+    }
+
+    fn signal_shutdown(&self) {
+        // The pinned watch retains the latest value even with zero receivers,
+        // so a stream first polled after shutdown cannot miss this transition.
+        if self.stop.send(true).is_err() {
+            warn!(target: "wa.web", "web_stream_shutdown_signal_failed");
+        }
+    }
+
+    pub(crate) fn shutdown_waiter(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        let mut stop = self.stop.subscribe();
+        let cx = cx.clone();
+        Box::pin(async move {
+            loop {
+                if *stop.borrow() {
+                    return;
+                }
+                if stop.changed(&cx).await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
+
+impl Middleware for WebStreamLifecycle {
+    fn before<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> BoxFuture<'a, ControlFlow> {
+        req.insert_extension(self.clone());
+        Box::pin(async { ControlFlow::Continue })
+    }
+
+    fn name(&self) -> &'static str {
+        "WebStreamLifecycle"
+    }
+}
+
+struct WebStreamShutdownGuard(Arc<WebStreamLifecycle>);
+
+impl Drop for WebStreamShutdownGuard {
+    fn drop(&mut self) {
+        self.0.signal_shutdown();
+    }
+}
+
 /// Framework-owned runtime state for the feature-gated web server.
 ///
 /// This keeps `fastapi` server/app internals inside the framework seam so the
@@ -469,6 +535,12 @@ impl FrameworkWebRuntime {
             let serve_server = Arc::clone(&server);
             let serve_app = Arc::clone(&app);
             match task::try_spawn_with_cx(cx, move |child_cx| async move {
+                // Also wake streams if the accept future exits or is dropped.
+                // Explicit shutdown signals before FastAPI's internal drain;
+                // this guard covers exits before our post-join drain phase.
+                let _streams = serve_app
+                    .get_state::<WebStreamLifecycle>()
+                    .map(WebStreamShutdownGuard);
                 serve_server
                     .serve_on_app_concurrent(&child_cx, listener, serve_app)
                     .await
@@ -511,6 +583,9 @@ impl FrameworkWebRuntime {
     /// Signal server shutdown and wake a potentially blocked accept loop.
     pub fn signal_shutdown(&self) {
         self.server.shutdown();
+        if let Some(streams) = self.app.get_state::<WebStreamLifecycle>() {
+            streams.signal_shutdown();
+        }
         if !self.join.is_finished() {
             wake_listener(self.bound_addr);
         }
@@ -570,7 +645,7 @@ impl FrameworkWebRuntime {
         // FastAPI's public `drain()` helper: it sleeps the executor thread and
         // would prevent connection tasks from making progress on a
         // current-thread runtime.
-        self.server.shutdown();
+        self.signal_shutdown();
         let deferred_drain_error = match wait_for_connections_to_drain(cx, &self.server).await {
             ConnectionDrainOutcome::Drained => None,
             ConnectionDrainOutcome::TimedOut {
@@ -668,6 +743,58 @@ mod tests {
         resolve_unauthenticated_bind_addr, validate_unauthenticated_bind_candidates,
         validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with, web_cx_error,
     };
+
+    #[test]
+    fn stream_shutdown_wakes_parked_waiters_and_is_retained_for_late_subscribers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let lifecycle = super::WebStreamLifecycle::new();
+        let cx = crate::cx::for_request();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut poll_cx = Context::from_waker(&waker);
+        let mut parked = lifecycle.shutdown_waiter(&cx);
+        assert!(parked.as_mut().poll(&mut poll_cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        lifecycle.signal_shutdown();
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > 0,
+            "parked waiter must be woken"
+        );
+        assert!(parked.as_mut().poll(&mut poll_cx).is_ready());
+        drop(parked);
+        lifecycle.signal_shutdown();
+        let mut late = lifecycle.shutdown_waiter(&cx);
+        assert!(late.as_mut().poll(&mut poll_cx).is_ready());
+    }
+
+    #[test]
+    fn stream_shutdown_waiter_fails_closed_on_cancelled_connection_context() {
+        use std::task::{Context, Waker};
+
+        let lifecycle = super::WebStreamLifecycle::new();
+        let cx = crate::cx::for_request();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("synthetic stream cancellation"),
+        );
+        let mut waiter = lifecycle.shutdown_waiter(&cx);
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
 
     /// Liveness when the server starts a while after the runtime clock began,
     /// which is what every real `ft web` does (storage opens first).

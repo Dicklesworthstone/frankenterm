@@ -10,11 +10,14 @@ use super::{
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_async::{mpsc, select, sleep, task};
+use crate::runtime_async::{mpsc, sleep, task};
 use crate::storage::{SegmentScanQuery, StorageHandle};
-use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_stream_response};
+use crate::web_framework::{
+    QueryString, Request, Response, StatusCode, WebStreamLifecycle, sse_stream_response,
+};
 use asupersync::stream::Stream;
 use serde_json::json;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -310,23 +313,13 @@ where
     }
 }
 
-/// Returns a future that completes when the receiver side of the channel is
-/// dropped (i.e. the client disconnected). This bridges the richer
-/// `Sender::closed()` API for runtimes that only expose `is_closed()`.
-async fn sender_closed<T>(tx: &mpsc::Sender<T>) {
-    // Poll periodically rather than truly registering a waker, since
-    // asupersync `Sender::is_closed` is a simple atomic load.
-    loop {
-        if tx.is_closed() {
-            return;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
 struct SseByteStream {
-    rx: mpsc::Receiver<SseEvent>,
+    rx: Option<mpsc::Receiver<SseEvent>>,
     recv_state: SseRecvState,
+    // The body owns this future directly: no detached producer task, delayed
+    // receiver-closed polling, or unobserved JoinHandle survives body Drop.
+    producer: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 struct SseRecvState {
@@ -334,23 +327,10 @@ struct SseRecvState {
 }
 
 impl SseRecvState {
-    fn new() -> Self {
-        Self {
-            // Inherit the ambient handler Cx so a cancellation propagated
-            // from the web server's parent — an HTTP client disconnect, a
-            // graceful-shutdown signal from `shutdown_with_cx`, or a
-            // parent-scope cancel — reaches the inner `poll_recv` on this
-            // SSE stream. The earlier revision unconditionally called
-            // `crate::cx::for_request()`, which produces a detached
-            // request-scoped Cx with no parent chain; `poll_recv(&self.cx,
-            // …)` would then wait for events until the upstream Sender
-            // dropped, delaying cleanup of the mpsc receiver and its
-            // associated channels past the point where the HTTP client
-            // already gave up. Matches the inherit-or-fallback idiom at
-            // sse.rs:343 / :440 / :680, handlers.rs:208 / :317, and the
-            // tailer fix landed in dfbf0a31.
-            cx: crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request),
-        }
+    fn new(cx: crate::cx::Cx) -> Self {
+        // Runtime-backed connection context, not server shutdown authority.
+        // The separate lifecycle waiter supplies the latter explicitly.
+        Self { cx }
     }
 
     fn poll_recv(
@@ -373,11 +353,24 @@ impl SseRecvState {
 }
 
 impl SseByteStream {
-    fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
+    fn new(
+        cx: crate::cx::Cx,
+        rx: mpsc::Receiver<SseEvent>,
+        producer: Pin<Box<dyn Future<Output = ()> + Send>>,
+        shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Self {
         Self {
-            rx,
-            recv_state: SseRecvState::new(),
+            rx: Some(rx),
+            recv_state: SseRecvState::new(cx),
+            producer: Some(producer),
+            shutdown,
         }
+    }
+
+    fn finish(&mut self) -> Poll<Option<Vec<u8>>> {
+        self.producer = None;
+        self.rx = None;
+        Poll::Ready(None)
     }
 }
 
@@ -386,9 +379,24 @@ impl Stream for SseByteStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.recv_state.poll_recv(&mut this.rx, cx) {
+        if this.rx.is_none() || this.shutdown.as_mut().poll(cx).is_ready() {
+            return this.finish();
+        }
+        if let Some(producer) = this.producer.as_mut()
+            && producer.as_mut().poll(cx).is_ready()
+        {
+            this.producer = None;
+        }
+        // A signal observed during production wins over buffered output.
+        if this.shutdown.as_mut().poll(cx).is_ready() {
+            return this.finish();
+        }
+        let Some(rx) = this.rx.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match this.recv_state.poll_recv(rx, cx) {
             Poll::Ready(Some(event)) => Poll::Ready(Some(event.to_bytes())),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => this.finish(),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -623,12 +631,30 @@ pub(super) fn handle_stream_events(
         Err(resp) => return Box::pin(async move { resp }),
     };
     let result = require_event_bus(req);
+    let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
 
     Box::pin(async move {
         let (event_bus, redactor) = match result {
             Ok(r) => r,
             Err(resp) => return resp,
         };
+
+        let Some(lifecycle) = lifecycle else {
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_lifecycle_unavailable",
+                "Stream lifecycle is unavailable",
+            );
+        };
+        let Some(stream_cx) = crate::cx::Cx::current() else {
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_context_unavailable",
+                "Stream runtime context is unavailable",
+            );
+        };
+        let shutdown = lifecycle.shutdown_waiter(&stream_cx);
+        let recv_cx = stream_cx.clone();
 
         let mut subscriber = match channel {
             EventStreamChannel::All => event_bus.subscribe(),
@@ -638,127 +664,131 @@ pub(super) fn handle_stream_events(
         };
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-        {
-            let stream_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            task::spawn_with_cx(&stream_cx, move |child_cx| async move {
-                let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
-                let mut next_emit_at = Instant::now();
-                let mut seq = 0_u64;
-                let mut consecutive_drops = 0_u64;
+        let producer = async move {
+            let child_cx = stream_cx;
+            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+            let mut next_emit_at = Instant::now();
+            let mut seq = 0_u64;
+            let mut consecutive_drops = 0_u64;
 
-                seq += 1;
-                let ready = make_stream_frame(
-                    "events",
-                    "ready",
-                    seq,
-                    json!({
-                        "channel": format!("{channel:?}").to_lowercase(),
-                        "max_hz": max_hz,
-                        "pane_id": pane_filter
-                    }),
-                );
-                if let Some(event) = frame_to_sse("ready", seq, ready) {
-                    if !send_rate_limited_sse(
-                        &tx,
-                        event,
-                        &mut next_emit_at,
-                        min_interval,
-                        &mut consecutive_drops,
-                    )
-                    .await
-                    {
-                        return;
-                    }
+            seq += 1;
+            let ready = make_stream_frame(
+                "events",
+                "ready",
+                seq,
+                json!({
+                    "channel": format!("{channel:?}").to_lowercase(),
+                    "max_hz": max_hz,
+                    "pane_id": pane_filter
+                }),
+            );
+            if let Some(event) = frame_to_sse("ready", seq, ready) {
+                if !send_rate_limited_sse(
+                    &tx,
+                    event,
+                    &mut next_emit_at,
+                    min_interval,
+                    &mut consecutive_drops,
+                )
+                .await
+                {
+                    return;
                 }
+            }
 
-                loop {
-                    let recv_result = select! {
-                        () = sender_closed(&tx) => break,
-                        recv = crate::runtime_async::timeout_with_cx(
-                            &child_cx,
-                            Duration::from_secs(runtime_limits.stream_keepalive_secs),
-                            subscriber.recv_cx(&child_cx),
-                        ) => recv,
-                    };
+            loop {
+                if child_cx.checkpoint().is_err() {
+                    break;
+                }
+                let recv_result = crate::runtime_async::timeout_with_cx(
+                    &child_cx,
+                    Duration::from_secs(runtime_limits.stream_keepalive_secs),
+                    subscriber.recv_cx(&child_cx),
+                )
+                .await;
 
-                    match recv_result {
-                        Ok(Ok(event)) => {
-                            if !event_matches_pane(&event, pane_filter) {
-                                continue;
-                            }
-
-                            let mut event_json =
-                                serde_json::to_value(&event).unwrap_or_else(|_| {
-                                    json!({
-                                        "error": "event_serialization_failed"
-                                    })
-                                });
-                            redact_json_value(&mut event_json, &redactor);
-
-                            seq += 1;
-                            let frame = make_stream_frame(
-                                "events",
-                                "event",
-                                seq,
-                                json!({ "event": event_json }),
-                            );
-                            if let Some(event) = frame_to_sse("event", seq, frame) {
-                                if !send_rate_limited_sse(
-                                    &tx,
-                                    event,
-                                    &mut next_emit_at,
-                                    min_interval,
-                                    &mut consecutive_drops,
-                                )
-                                .await
-                                {
-                                    break;
-                                }
-                            }
+                match recv_result {
+                    Ok(Ok(event)) => {
+                        if !event_matches_pane(&event, pane_filter) {
+                            continue;
                         }
-                        Ok(Err(RecvError::Lagged { missed_count })) => {
-                            seq += 1;
-                            let frame = make_stream_frame(
-                                "events",
-                                "lag",
-                                seq,
-                                json!({ "missed_count": missed_count }),
-                            );
-                            if let Some(event) = frame_to_sse("lag", seq, frame) {
-                                if !send_rate_limited_sse(
-                                    &tx,
-                                    event,
-                                    &mut next_emit_at,
-                                    min_interval,
-                                    &mut consecutive_drops,
-                                )
-                                .await
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(Err(RecvError::Cancelled)) => break,
-                        Ok(Err(RecvError::Closed)) => break,
-                        Err(_) => {
-                            if tx.try_send(SseEvent::comment("keepalive")).is_err() {
+
+                        let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
+                            json!({
+                                "error": "event_serialization_failed"
+                            })
+                        });
+                        redact_json_value(&mut event_json, &redactor);
+
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "events",
+                            "event",
+                            seq,
+                            json!({ "event": event_json }),
+                        );
+                        if let Some(event) = frame_to_sse("event", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
                                 break;
                             }
                         }
                     }
+                    Ok(Err(RecvError::Lagged { missed_count })) => {
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "events",
+                            "lag",
+                            seq,
+                            json!({ "missed_count": missed_count }),
+                        );
+                        if let Some(event) = frame_to_sse("lag", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Err(RecvError::Cancelled)) => break,
+                    Ok(Err(RecvError::Closed)) => break,
+                    Err(_) => {
+                        if tx.try_send(SseEvent::comment("keepalive")).is_err() {
+                            break;
+                        }
+                    }
                 }
-            });
-        }
+            }
+        };
 
-        SseResponse::new(SseByteStream::new(rx)).into_response()
+        SseResponse::new(SseByteStream::new(
+            recv_cx,
+            rx,
+            Box::pin(producer),
+            shutdown,
+        ))
+        .into_response()
     })
 }
 
 pub(super) fn handle_stream_deltas(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
-    // br-ft-x2oyy: function-level delta SSE keepalive contract. The spawned
-    // stream task may opportunistically enqueue comments while waiting for
+    // br-ft-x2oyy: function-level delta SSE keepalive contract. The body-owned
+    // producer may opportunistically enqueue comments while waiting for
     // runtime events; dropped keepalives are acceptable when the client is
     // already backpressured or disconnected.
     let qs_raw = req.query().unwrap_or("").to_string();
@@ -767,6 +797,7 @@ pub(super) fn handle_stream_deltas(
     let runtime_limits = request_runtime_limits(req);
     let max_hz = parse_stream_max_hz(&qs, runtime_limits);
     let result = require_storage_and_event_bus(req);
+    let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
 
     Box::pin(async move {
         let (storage, event_bus, redactor) = match result {
@@ -774,175 +805,120 @@ pub(super) fn handle_stream_deltas(
             Err(resp) => return resp,
         };
 
+        let Some(lifecycle) = lifecycle else {
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_lifecycle_unavailable",
+                "Stream lifecycle is unavailable",
+            );
+        };
+        let Some(stream_cx) = crate::cx::Cx::current() else {
+            return json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_context_unavailable",
+                "Stream runtime context is unavailable",
+            );
+        };
+        let shutdown = lifecycle.shutdown_waiter(&stream_cx);
+        let recv_cx = stream_cx.clone();
+
         let mut subscriber = event_bus.subscribe_deltas();
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
         let started_at_ms = epoch_ms_now();
-        {
-            let stream_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            task::spawn_with_cx(&stream_cx, move |child_cx| async move {
-                let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
-                let mut next_emit_at = Instant::now();
-                let mut seq = 0_u64;
-                let mut consecutive_drops = 0_u64;
-                let mut after_id: Option<i64> = None;
+        let producer = async move {
+            let child_cx = stream_cx;
+            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+            let mut next_emit_at = Instant::now();
+            let mut seq = 0_u64;
+            let mut consecutive_drops = 0_u64;
+            let mut after_id: Option<i64> = None;
 
-                seq += 1;
-                let ready = make_stream_frame(
-                    "deltas",
-                    "ready",
-                    seq,
-                    json!({
-                        "max_hz": max_hz,
-                        "pane_id": pane_filter
-                    }),
-                );
-                if let Some(event) = frame_to_sse("ready", seq, ready) {
-                    if !send_rate_limited_sse(
-                        &tx,
-                        event,
-                        &mut next_emit_at,
-                        min_interval,
-                        &mut consecutive_drops,
-                    )
-                    .await
-                    {
-                        return;
-                    }
+            seq += 1;
+            let ready = make_stream_frame(
+                "deltas",
+                "ready",
+                seq,
+                json!({
+                    "max_hz": max_hz,
+                    "pane_id": pane_filter
+                }),
+            );
+            if let Some(event) = frame_to_sse("ready", seq, ready) {
+                if !send_rate_limited_sse(
+                    &tx,
+                    event,
+                    &mut next_emit_at,
+                    min_interval,
+                    &mut consecutive_drops,
+                )
+                .await
+                {
+                    return;
                 }
+            }
 
-                loop {
-                    let recv_result = select! {
-                        () = sender_closed(&tx) => break,
-                        recv = crate::runtime_async::timeout_with_cx(
-                            &child_cx,
-                            Duration::from_secs(runtime_limits.stream_keepalive_secs),
-                            subscriber.recv_cx(&child_cx),
-                        ) => recv,
-                    };
+            loop {
+                if child_cx.checkpoint().is_err() {
+                    break;
+                }
+                let recv_result = crate::runtime_async::timeout_with_cx(
+                    &child_cx,
+                    Duration::from_secs(runtime_limits.stream_keepalive_secs),
+                    subscriber.recv_cx(&child_cx),
+                )
+                .await;
 
-                    match recv_result {
-                        Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
-                            if pane_filter.is_some_and(|pid| pid != pane_id) {
-                                continue;
-                            }
-                            if !drain_new_segment_frames(
-                                &storage,
-                                pane_filter,
-                                started_at_ms,
-                                &mut after_id,
-                                runtime_limits,
-                                &redactor,
-                                &tx,
-                                &mut seq,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
+                match recv_result {
+                    Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
+                        if pane_filter.is_some_and(|pid| pid != pane_id) {
+                            continue;
                         }
-                        Ok(Ok(Event::GapDetected {
-                            pane_id,
-                            seq_before,
-                            seq_after,
-                            reason,
-                            detected_at_ms,
-                        })) => {
-                            if pane_filter.is_some_and(|pid| pid != pane_id) {
-                                continue;
-                            }
-
-                            seq += 1;
-                            let frame = make_stream_frame(
-                                "deltas",
-                                "gap",
-                                seq,
-                                json!({
-                                    "pane_id": pane_id,
-                                    "seq_before": seq_before,
-                                    "seq_after": seq_after,
-                                    "reason": redactor.redact(&reason),
-                                    "detected_at_ms": detected_at_ms,
-                                }),
-                            );
-                            if let Some(event) = frame_to_sse("gap", seq, frame) {
-                                if !send_rate_limited_sse(
-                                    &tx,
-                                    event,
-                                    &mut next_emit_at,
-                                    min_interval,
-                                    &mut consecutive_drops,
-                                )
-                                .await
-                                {
-                                    break;
-                                }
-                            }
+                        if !drain_new_segment_frames(
+                            &storage,
+                            pane_filter,
+                            started_at_ms,
+                            &mut after_id,
+                            runtime_limits,
+                            &redactor,
+                            &tx,
+                            &mut seq,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            break;
                         }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(RecvError::Lagged { missed_count })) => {
-                            seq += 1;
-                            let frame = make_stream_frame(
-                                "deltas",
-                                "lag",
-                                seq,
-                                json!({ "missed_count": missed_count }),
-                            );
-                            if let Some(event) = frame_to_sse("lag", seq, frame) {
-                                if !send_rate_limited_sse(
-                                    &tx,
-                                    event,
-                                    &mut next_emit_at,
-                                    min_interval,
-                                    &mut consecutive_drops,
-                                )
-                                .await
-                                {
-                                    break;
-                                }
-                            }
-
-                            if !drain_new_segment_frames(
-                                &storage,
-                                pane_filter,
-                                started_at_ms,
-                                &mut after_id,
-                                runtime_limits,
-                                &redactor,
-                                &tx,
-                                &mut seq,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
+                    }
+                    Ok(Ok(Event::GapDetected {
+                        pane_id,
+                        seq_before,
+                        seq_after,
+                        reason,
+                        detected_at_ms,
+                    })) => {
+                        if pane_filter.is_some_and(|pid| pid != pane_id) {
+                            continue;
                         }
-                        Ok(Err(RecvError::Cancelled)) => break,
-                        Ok(Err(RecvError::Closed)) => break,
-                        Err(_) => {
-                            // br-ft-x2oyy: intentional best-effort keepalive;
-                            // try_send failure means the SSE client is backpressured or gone.
-                            match tx
-                                .try_send(SseEvent::comment("keepalive"))
-                                .map_err(mpsc::TrySendError::from)
-                            {
-                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                                Err(mpsc::TrySendError::Closed(_)) => break,
-                            }
-                            if !drain_new_segment_frames(
-                                &storage,
-                                pane_filter,
-                                started_at_ms,
-                                &mut after_id,
-                                runtime_limits,
-                                &redactor,
+
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "deltas",
+                            "gap",
+                            seq,
+                            json!({
+                                "pane_id": pane_id,
+                                "seq_before": seq_before,
+                                "seq_after": seq_after,
+                                "reason": redactor.redact(&reason),
+                                "detected_at_ms": detected_at_ms,
+                            }),
+                        );
+                        if let Some(event) = frame_to_sse("gap", seq, frame) {
+                            if !send_rate_limited_sse(
                                 &tx,
-                                &mut seq,
+                                event,
                                 &mut next_emit_at,
                                 min_interval,
                                 &mut consecutive_drops,
@@ -953,11 +929,88 @@ pub(super) fn handle_stream_deltas(
                             }
                         }
                     }
-                }
-            });
-        }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(RecvError::Lagged { missed_count })) => {
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "deltas",
+                            "lag",
+                            seq,
+                            json!({ "missed_count": missed_count }),
+                        );
+                        if let Some(event) = frame_to_sse("lag", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
 
-        SseResponse::new(SseByteStream::new(rx)).into_response()
+                        if !drain_new_segment_frames(
+                            &storage,
+                            pane_filter,
+                            started_at_ms,
+                            &mut after_id,
+                            runtime_limits,
+                            &redactor,
+                            &tx,
+                            &mut seq,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Err(RecvError::Cancelled)) => break,
+                    Ok(Err(RecvError::Closed)) => break,
+                    Err(_) => {
+                        // br-ft-x2oyy: intentional best-effort keepalive;
+                        // try_send failure means the SSE client is backpressured or gone.
+                        match tx
+                            .try_send(SseEvent::comment("keepalive"))
+                            .map_err(mpsc::TrySendError::from)
+                        {
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Closed(_)) => break,
+                        }
+                        if !drain_new_segment_frames(
+                            &storage,
+                            pane_filter,
+                            started_at_ms,
+                            &mut after_id,
+                            runtime_limits,
+                            &redactor,
+                            &tx,
+                            &mut seq,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        SseResponse::new(SseByteStream::new(
+            recv_cx,
+            rx,
+            Box::pin(producer),
+            shutdown,
+        ))
+        .into_response()
     })
 }
 
@@ -970,6 +1023,70 @@ mod tests {
     use crate::runtime_async::CompatRuntime;
     use crate::web_framework::QueryString;
 
+    struct ProducerDropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for ProducerDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn owned_stream_fixture(
+        shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> (
+        super::SseByteStream,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (tx, rx) = mpsc::channel(2);
+        tx.try_send(SseEvent::comment("synthetic queued item"))
+            .expect("queue fixture item");
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = ProducerDropProbe(std::sync::Arc::clone(&drops));
+        let producer = Box::pin(async move {
+            let _owned = (tx, probe);
+            std::future::pending::<()>().await;
+        });
+        (
+            super::SseByteStream::new(crate::cx::for_request(), rx, producer, shutdown),
+            drops,
+        )
+    }
+
+    #[test]
+    fn stream_shutdown_before_first_poll_discards_queue_and_drops_producer_once() {
+        use asupersync::stream::Stream;
+        use std::pin::Pin;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll, Waker};
+
+        let (mut stream, drops) = owned_stream_fixture(Box::pin(std::future::ready(())));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        drop(stream);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn response_drop_disposes_parked_producer_without_a_detached_task() {
+        use asupersync::stream::Stream;
+        use std::pin::Pin;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll, Waker};
+
+        let (mut stream, drops) = owned_stream_fixture(Box::pin(std::future::pending()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(_))
+        ));
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(stream);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     fn default_limits() -> super::super::WebRuntimeLimits {
         super::super::resolve_runtime_limits(None)
     }
@@ -977,10 +1094,8 @@ mod tests {
     /// Per ft-22x4r: every async test in supported paths must drive the
     /// project asupersync runtime instead of `#[tokio::test]`. This
     /// helper builds a thread-isolated current-thread runtime, runs the
-    /// future to completion, and absorbs the asupersync TLS destructor
-    /// panics that fire when the runtime is dropped after the future
-    /// has spawned `Sleep`/`Cx` cleanup tasks. Mirrors the helper used
-    /// in `runtime.rs` and `snapshot_engine.rs` test modules.
+    /// future to completion, and clears the retained runtime handle after
+    /// teardown. A teardown panic fails the test; it is not passing evidence.
     fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
     where
         F: std::future::Future<Output = ()>,
@@ -996,12 +1111,16 @@ mod tests {
                     runtime.block_on(f());
                 }));
 
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(runtime);
-                }));
+                let teardown_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(runtime);
+                    }));
                 crate::runtime_async::clear_runtime_handle();
 
                 if let Err(payload) = test_result {
+                    std::panic::resume_unwind(payload);
+                }
+                if let Err(payload) = teardown_result {
                     std::panic::resume_unwind(payload);
                 }
             })
