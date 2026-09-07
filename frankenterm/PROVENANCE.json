@@ -156,21 +156,21 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 51,
-        "fix": 70,
+        "fix": 74,
         "other": 16,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 23
+        "test": 24
       },
-      "fork_side_commit_count": 195,
+      "fork_side_commit_count": 200,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-04T08:12:55-04:00",
-        "sha": "02bcda4cd80e0413d11e4c416be7f1661ed3f7ac",
-        "subject": "fix(client): classify legacy frames before body admission"
+        "committed_at": "2026-09-07T02:02:58-04:00",
+        "sha": "1ebee81cdca80676da6a25932f1408205c41c9e5",
+        "subject": "fix(client): preserve title updates across remote window remapping"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -184,7 +184,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 43,
-        "fix": 55,
+        "fix": 58,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 238,
+      "fork_side_commit_count": 241,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-04T08:27:39-04:00",
-        "sha": "532ff73b5a70e9f269b471bf2b6fd1460f8d4961",
-        "subject": "style(codec): satisfy release rustfmt proof"
+        "classification": "fix",
+        "committed_at": "2026-09-06T23:42:03-04:00",
+        "sha": "8044f0d6fab99d93741ca96e2f8b5dcf374a21bc",
+        "subject": "fix(codec): collapse identical legacy46 PDU25 cursor rows, keep conflicts invalid"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -638,7 +638,7 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 185,
-        "fix": 188,
+        "fix": 190,
         "other": 34,
         "refactor": 11,
         "rename": 2,
@@ -646,13 +646,13 @@
         "security-fix": 7,
         "test": 69
       },
-      "fork_side_commit_count": 544,
+      "fork_side_commit_count": 546,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-05T05:20:57-04:00",
-        "sha": "426b47857960f817698666146ef3d82172b1611b",
-        "subject": "test(clipboard): format socket failures correctly in Rust 2018"
+        "classification": "fix",
+        "committed_at": "2026-09-06T21:01:44-04:00",
+        "sha": "691aafc1afe1000cad9b9c0866689aa87e742b6a",
+        "subject": "fix(gui): restore legacy remote startup and persistent window state"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2399,
-  "generated_at": "2026-09-06T16:24:00Z",
+  "fork_side_commit_total": 2409,
+  "generated_at": "2026-09-07T06:07:03.046411Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
