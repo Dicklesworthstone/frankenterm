@@ -29,6 +29,7 @@ pub(super) fn build_app(
     };
 
     App::builder()
+        .openapi(super::openapi::config())
         .middleware(BodySizeGuard::new(runtime_limits.max_request_body_bytes))
         .middleware(RequestSpanLogger)
         .middleware(StateInjector { state })

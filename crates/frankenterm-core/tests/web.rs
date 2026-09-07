@@ -45,7 +45,17 @@ mod web_tests {
 
     /// Extract the HTTP response body from a raw HTTP response string.
     fn extract_body(raw: &str) -> &str {
-        raw.split("\r\n\r\n").nth(1).unwrap_or("")
+        raw.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+    }
+
+    #[test]
+    fn web_openapi_discovery_http_fixture_preserves_body() {
+        assert_eq!(
+            extract_body("HTTP/1.1 200 OK\r\n\r\nfirst\r\n\r\nsecond"),
+            "first\r\n\r\nsecond"
+        );
+        assert_eq!(extract_body("HTTP/1.1 200 OK\r\n\r\n"), "");
+        assert_eq!(extract_body("incomplete headers"), "");
     }
 
     /// Extract the HTTP status code from a raw HTTP response string.
@@ -58,47 +68,54 @@ mod web_tests {
 
     async fn fetch_health(addr: SocketAddr) -> std::io::Result<String> {
         let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let mut last_err = None;
-
-        for _ in 0..50 {
-            match TcpStream::connect(addr).await {
-                Ok(mut stream) => {
-                    stream.write_all(request).await?;
-                    let mut buf = Vec::new();
-                    stream.read_to_end(&mut buf).await?;
-                    return Ok(String::from_utf8_lossy(&buf).to_string());
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                    sleep(Duration::from_millis(20)).await;
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
-        }))
+        fetch_raw(addr, request).await
     }
 
     async fn fetch_raw(addr: SocketAddr, raw_request: &[u8]) -> std::io::Result<String> {
-        let mut last_err = None;
-        for _ in 0..50 {
-            match TcpStream::connect(addr).await {
-                Ok(mut stream) => {
-                    stream.write_all(raw_request).await?;
-                    let mut buf = Vec::new();
-                    stream.read_to_end(&mut buf).await?;
-                    return Ok(String::from_utf8_lossy(&buf).to_string());
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                    sleep(Duration::from_millis(20)).await;
+        // These are finite JSON/error responses, not SSE. Bound the entire
+        // exchange (including connect/write/EOF), not just connection retries.
+        const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+        timeout(Duration::from_secs(5), async {
+            let mut last_err = None;
+            for _ in 0..50 {
+                match TcpStream::connect(addr).await {
+                    Ok(mut stream) => {
+                        stream.write_all(raw_request).await?;
+                        let mut buf = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        loop {
+                            let count = read(&mut stream, &mut chunk).await?;
+                            if count == 0 {
+                                return String::from_utf8(buf).map_err(|_| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "HTTP fixture response is not UTF-8",
+                                    )
+                                });
+                            }
+                            if count > MAX_RESPONSE_BYTES - buf.len() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "HTTP fixture response exceeds 1 MiB limit",
+                                ));
+                            }
+                            buf.extend_from_slice(&chunk[..count]);
+                        }
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        sleep(Duration::from_millis(20)).await;
+                    }
                 }
             }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
-        }))
+            Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
+            }))
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP fixture exchange timed out")
+        })?
     }
 
     async fn fetch_stream_prefix(
@@ -265,6 +282,147 @@ mod web_tests {
 
             assert!(response.contains("200"));
             assert!(response.contains("\"ok\":true"));
+        });
+    }
+
+    #[test]
+    fn web_openapi_discovery_invokes_advertised_health() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let started = Instant::now();
+            let server = timeout(
+                Duration::from_secs(5),
+                start_web_server(WebServerConfig::default().with_port(0)),
+            )
+            .await
+            .expect("owned loopback startup exceeded its deadline")
+            .expect("owned loopback server must start");
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(5), async {
+                // Return failures instead of panicking while the server is
+                // live: both failed and successful scenarios attempt cleanup.
+                ensure!(addr.ip().is_loopback(), "server must remain loopback-only");
+                let raw = fetch_raw(
+                    addr,
+                    b"GET /openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .context("live discovery request must succeed")?;
+                ensure!(extract_status(&raw) == 200, "discovery must return HTTP 200");
+                let (headers, document) = raw.split_once("\r\n\r\n").context("response headers")?;
+                ensure!(
+                    headers.lines().any(|line| {
+                        line.split_once(':').is_some_and(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-type")
+                                && value.trim().eq_ignore_ascii_case("application/json")
+                        })
+                    }),
+                    "discovery must have JSON content type"
+                );
+                let spec: serde_json::Value =
+                    serde_json::from_str(document).context("live document must be JSON")?;
+                ensure!(spec["openapi"] == "3.1.0", "OpenAPI version must match");
+                ensure!(
+                    spec["info"]["version"] == frankenterm_core::VERSION,
+                    "application version must match"
+                );
+                let paths = spec["paths"].as_object().context("live paths object")?;
+                let (health_path, _) = paths
+                    .iter()
+                    .find(|(_, item)| item["get"]["operationId"] == "get_health")
+                    .context("health operation must be discoverable")?;
+                ensure!(
+                    health_path == "/health",
+                    "health operation must map to /health"
+                );
+                ensure!(paths.len() == 9, "review missing or newly exposed operations");
+                ensure!(
+                    !paths.contains_key("/openapi.json"),
+                    "document route must not describe itself"
+                );
+                let request = format!(
+                    "GET {health_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                );
+                let health = fetch_raw(addr, request.as_bytes())
+                    .await
+                    .context("advertised route must answer")?;
+                ensure!(extract_status(&health) == 200, "health must return HTTP 200");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&health))
+                    .context("health response must be JSON")?;
+                ensure!(body["ok"] == true, "health must report success");
+                Ok::<_, anyhow::Error>((paths.len(), document.len()))
+            })
+            .await;
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let (routes, document_bytes) = scenario
+                .expect("discovery scenario exceeded its deadline")
+                .expect("live discovery/health assertions must pass");
+            shutdown
+                .expect("owned server shutdown exceeded its deadline")
+                .expect("owned server must shut down cleanly");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.2.1",
+                    "scenario": "live_route_then_health",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "routes": routes, "document_bytes": document_bytes,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "teardown": "clean", "status": "passed",
+                })
+            );
+        });
+    }
+
+    /// These synthetic TCP responses test the client fixture's bounds, not
+    /// FrankenTerm's production HTTP parser or request-body admission policy.
+    #[test]
+    fn web_openapi_discovery_http_fixture_response_limits() {
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        run_async_test(async {
+            for (name, response, expected_error) in [
+                ("at_cap", vec![b'a'; 1024 * 1024], None),
+                (
+                    "over_cap",
+                    vec![b'a'; 1024 * 1024 + 1],
+                    Some("HTTP fixture response exceeds 1 MiB limit"),
+                ),
+                (
+                    "invalid_utf8",
+                    vec![0xff],
+                    Some("HTTP fixture response is not UTF-8"),
+                ),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let response_len = response.len();
+                let server_task = task::spawn(async move {
+                    timeout(Duration::from_secs(5), async {
+                        let (mut stream, _) = listener.accept().await?;
+                        let mut request = [0_u8; REQUEST.len()];
+                        stream.read_exact(&mut request).await?;
+                        stream.write_all(&response).await
+                    })
+                    .await
+                });
+                let result = fetch_raw(addr, REQUEST).await;
+                // Join the owned peer before assertions, including failure cases.
+                let peer = timeout(Duration::from_secs(5), server_task).await;
+                peer.expect("fixture peer join deadline")
+                    .expect("fixture peer task")
+                    .expect("fixture peer exchange deadline")
+                    .expect("fixture peer must send the complete response");
+                match expected_error {
+                    Some(message) => {
+                        let error = result.expect_err(name);
+                        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{name}");
+                        assert_eq!(error.to_string(), message, "{name}");
+                    }
+                    None => assert_eq!(result.expect(name).len(), response_len, "{name}"),
+                }
+            }
         });
     }
 
