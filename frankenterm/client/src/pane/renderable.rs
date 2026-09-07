@@ -3569,7 +3569,14 @@ mod tests {
             (110..114, [106..110, 114..114]),
             (120..124, [112..112, 124..124]),
             (100..100, [0..0, 0..0]),
-            (104..100, [0..0, 0..0]),
+            // Malformed input is deliberately reversed; it must not prefetch.
+            (
+                Range {
+                    start: 104,
+                    end: 100,
+                },
+                [0..0, 0..0],
+            ),
         ] {
             assert_eq!(super::prefetch_ranges(&request, &dimensions), expected);
         }
