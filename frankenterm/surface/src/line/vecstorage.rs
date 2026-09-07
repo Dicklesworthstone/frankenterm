@@ -14,11 +14,38 @@ pub(crate) struct HyperlinkCellMatch {
 }
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Debug, PartialEq)]
 pub(crate) struct VecStorage {
     // Render snapshots and cached reflows usually change only Line metadata.
     // Share their cell payload until a caller actually edits it.
-    cells: Arc<Vec<Cell>>,
+    cells: Arc<CellBuffer>,
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "use_serde", serde(transparent))]
+#[derive(Clone)]
+struct CellBuffer {
+    cells: Vec<Cell>,
+    // All cell mutations pass through this type. Keeping the cache beside
+    // the payload makes invalidation independent of callers' sequence numbers.
+    #[cfg(feature = "std")]
+    #[cfg_attr(feature = "use_serde", serde(skip))]
+    // None marks image-bearing buffers: image payloads can mutate through a
+    // shared handle without any cell edit, so their hashes must stay live.
+    shape_hash: std::sync::OnceLock<Option<(u16, [u8; 16])>>,
+}
+
+impl core::fmt::Debug for VecStorage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VecStorage")
+            .field("cells", &self.cells.cells)
+            .finish()
+    }
+}
+
+impl PartialEq for VecStorage {
+    fn eq(&self, other: &Self) -> bool {
+        self.cells.cells == other.cells.cells
+    }
 }
 
 impl Clone for VecStorage {
@@ -27,32 +54,80 @@ impl Clone for VecStorage {
         // operational rollback. Resolve it once, never during individual cell
         // edits; both arms have identical serialization and mutation semantics.
         #[cfg(feature = "std")]
-        {
+        let cells = {
             static EAGER_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *EAGER_COPY.get_or_init(|| {
                 std::env::var_os("FT_DISABLE_SHARED_LINE_CELLS").is_some_and(|v| v == "1")
             }) {
-                return Self::new(self.cells.as_ref().clone());
+                Arc::new(self.cells.as_ref().clone())
+            } else {
+                Arc::clone(&self.cells)
             }
-        }
-        Self {
-            cells: Arc::clone(&self.cells),
-        }
+        };
+        #[cfg(not(feature = "std"))]
+        let cells = Arc::clone(&self.cells);
+        Self { cells }
     }
 }
 
 impl VecStorage {
     pub(crate) fn new(cells: Vec<Cell>) -> Self {
         Self {
-            cells: Arc::new(cells),
+            cells: Arc::new(CellBuffer {
+                cells,
+                #[cfg(feature = "std")]
+                shape_hash: std::sync::OnceLock::new(),
+            }),
         }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn cached_shape_hash(
+        &self,
+        line_bits: u16,
+        compute: impl FnOnce() -> [u8; 16],
+    ) -> [u8; 16] {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED.get_or_init(|| {
+            std::env::var_os("FT_DISABLE_LINE_SHAPE_HASH_CACHE").is_some_and(|v| v == "1")
+        }) {
+            return compute();
+        }
+        if let Some(entry) = self.cells.shape_hash.get() {
+            if let Some((bits, hash)) = entry {
+                if *bits == line_bits {
+                    return *hash;
+                }
+            }
+            // Metadata can change without touching cells. Never reuse a hash
+            // for different bits; retaining the first key bounds cache memory.
+            return compute();
+        }
+        let cacheable = !self
+            .cells
+            .cells
+            .iter()
+            .any(|cell| cell.attrs().has_image_attachments());
+        let hash = compute();
+        let _ = self
+            .cells
+            .shape_hash
+            .set(cacheable.then_some((line_bits, hash)));
+        hash
+    }
+
+    fn cells_mut(&mut self) -> &mut Vec<Cell> {
+        let buffer = Arc::make_mut(&mut self.cells);
+        #[cfg(feature = "std")]
+        buffer.shape_hash.take();
+        &mut buffer.cells
     }
 
     #[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]
     pub(crate) fn set_cell(&mut self, idx: usize, mut cell: Cell, clear_image_placement: bool) {
         #[cfg(feature = "use_image")]
         if !clear_image_placement {
-            if let Some(images) = self.cells[idx].attrs().images() {
+            if let Some(images) = self.cells.cells[idx].attrs().images() {
                 for image in images {
                     if image.has_placement_id() {
                         cell.attrs_mut().attach_image(Box::new(image));
@@ -60,14 +135,14 @@ impl VecStorage {
                 }
             }
         }
-        Arc::make_mut(&mut self.cells)[idx] = cell;
+        self.cells_mut()[idx] = cell;
     }
 
     pub(crate) fn scan_and_create_hyperlinks(&mut self, matches: Vec<HyperlinkCellMatch>) -> bool {
         let mut has_implicit_hyperlinks = false;
         for matched in matches {
             for cell_idx in matched.cell_indices {
-                let Some(cell) = Arc::make_mut(&mut self.cells).get_mut(cell_idx) else {
+                let Some(cell) = self.cells_mut().get_mut(cell_idx) else {
                     continue;
                 };
                 let attrs = cell.attrs_mut();
@@ -87,13 +162,13 @@ impl core::ops::Deref for VecStorage {
     type Target = Vec<Cell>;
 
     fn deref(&self) -> &Vec<Cell> {
-        &self.cells
+        &self.cells.cells
     }
 }
 
 impl core::ops::DerefMut for VecStorage {
     fn deref_mut(&mut self) -> &mut Vec<Cell> {
-        Arc::make_mut(&mut self.cells)
+        self.cells_mut()
     }
 }
 
@@ -177,6 +252,34 @@ mod tests {
         let vs = VecStorage::new(make_cells("test"));
         let vs2 = vs.clone();
         assert_eq!(vs, vs2);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shape_hash_cache_reuses_reads_but_rejects_metadata_and_cell_changes() {
+        let mut cells = VecStorage::new(make_cells("ab"));
+        assert_eq!(cells.cached_shape_hash(0, || [1; 16]), [1; 16]);
+        assert_eq!(cells.cached_shape_hash(0, || panic!("rehashed")), [1; 16]);
+        assert_eq!(cells.cached_shape_hash(1, || [2; 16]), [2; 16]);
+        assert_eq!(
+            cells.cached_shape_hash(0, || panic!("lost original key")),
+            [1; 16]
+        );
+
+        let snapshot = cells.clone();
+        cells.set_cell(0, Cell::new('X', CellAttributes::default()), false);
+        assert_eq!(cells.cached_shape_hash(0, || [3; 16]), [3; 16]);
+        assert_eq!(
+            snapshot.cached_shape_hash(0, || panic!("clone lost cache")),
+            [1; 16]
+        );
+        cells.push(Cell::blank());
+        assert_eq!(cells.cached_shape_hash(0, || [4; 16]), [4; 16]);
+        cells.scan_and_create_hyperlinks(vec![HyperlinkCellMatch {
+            cell_indices: vec![0],
+            link: Arc::new(crate::hyperlink::Hyperlink::new("https://example.invalid")),
+        }]);
+        assert_eq!(cells.cached_shape_hash(0, || [5; 16]), [5; 16]);
     }
 
     #[test]

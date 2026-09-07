@@ -255,6 +255,15 @@ impl Line {
     /// doesn't every possible bit of internal state, and we don't want to
     /// encourage using Line directly as a hash key.
     pub fn compute_shape_hash(&self) -> [u8; 16] {
+        #[cfg(feature = "std")]
+        if let CellStorage::V(cells) = &self.cells {
+            return cells
+                .cached_shape_hash(self.bits.bits(), || self.compute_shape_hash_uncached());
+        }
+        self.compute_shape_hash_uncached()
+    }
+
+    fn compute_shape_hash_uncached(&self) -> [u8; 16] {
         let mut hasher = SipHasher::new();
         self.bits.bits().hash(&mut hasher);
         for cell in self.visible_cells() {
@@ -4157,6 +4166,67 @@ mod tests {
         let a: Line = "hello".into();
         let b: Line = "hello".into();
         assert_eq!(a.compute_shape_hash(), b.compute_shape_hash());
+    }
+
+    #[test]
+    fn shape_hash_matches_fresh_content_after_same_sequence_mutations() {
+        type Mutation = (&'static str, fn(&mut Line));
+        let mutations: &[Mutation] = &[
+            ("set", |l| {
+                l.set_cell(0, Cell::new('X', CellAttributes::default()), 1)
+            }),
+            ("insert", |l| l.insert_cell(1, Cell::blank(), 20, 1)),
+            ("erase", |l| l.erase_cell(1, 1)),
+            ("remove", |l| l.remove_cell(0, 1)),
+            ("fill", |l| l.fill_range(0..3, &Cell::blank(), 1)),
+            ("resize", |l| l.resize(30, 1)),
+            ("mutable cells", |l| l.cells_mut()[0] = Cell::blank()),
+            ("attributes", |l| {
+                l.cells_mut_for_attr_changes_only()[0]
+                    .attrs_mut()
+                    .set_hyperlink(Some(alloc::sync::Arc::new(
+                        crate::hyperlink::Hyperlink::new("https://example.invalid"),
+                    )));
+            }),
+            ("wrap", |l| l.set_last_cell_was_wrapped(true, 1)),
+            ("bidi", |l| {
+                l.set_bidi_info(true, ParagraphDirectionHint::RightToLeft, 1)
+            }),
+            ("double width", |l| l.set_double_width(1)),
+            ("split", |l| {
+                let _ = l.split_off(4, 1);
+            }),
+            ("append", |l| l.append_line("tail".into(), 1)),
+            ("compression", |l| l.compress_for_scrollback()),
+        ];
+        for (name, mutate) in mutations {
+            let mut line =
+                Line::from_text("abc界e\u{0301}🚀אב", &CellAttributes::default(), 1, None);
+            let original_hash = line.compute_shape_hash();
+            assert_eq!(original_hash, line.compute_shape_hash_uncached());
+            let frozen = line.clone();
+            mutate(&mut line);
+            assert_eq!(line.current_seqno(), 1);
+            assert_eq!(
+                line.compute_shape_hash(),
+                line.compute_shape_hash_uncached(),
+                "{}",
+                name
+            );
+            assert_eq!(
+                frozen.compute_shape_hash(),
+                original_hash,
+                "snapshot: {}",
+                name
+            );
+            let clone = line.clone();
+            assert_eq!(
+                clone.compute_shape_hash(),
+                clone.compute_shape_hash_uncached(),
+                "clone: {}",
+                name
+            );
+        }
     }
 
     #[test]
