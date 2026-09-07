@@ -310,9 +310,7 @@ impl Line {
         seqno: SequenceNo,
     ) -> Line {
         let mut line = Self::from_text(s, attrs, seqno, None);
-        line.cells_mut()
-            .last_mut()
-            .map(|cell| cell.attrs_mut().set_wrapped(true));
+        line.set_last_cell_was_wrapped(true, seqno);
         line
     }
 
@@ -1655,9 +1653,15 @@ impl Line {
             return;
         }
 
-        let cells = self.coerce_vec_storage();
-        if let Some(cell) = cells.last_mut() {
-            cell.attrs_mut().set_wrapped(wrapped);
+        // A double-width final grapheme has a trailing spacer in vector
+        // storage. The reader and scrollback compressor visit the grapheme,
+        // not that spacer, so writing only the last physical cell loses the
+        // soft-wrap boundary on the next resize. Keep both cells consistent.
+        if let Some(last_visible) = self.visible_cells().last().map(|cell| cell.cell_index()) {
+            let cells = self.coerce_vec_storage();
+            for cell in &mut cells[last_visible..] {
+                cell.attrs_mut().set_wrapped(wrapped);
+            }
         }
     }
 
@@ -2955,6 +2959,57 @@ mod tests {
         let mut line: Line = "hello".into();
         line.set_last_cell_was_wrapped(true, 1);
         assert!(line.last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn wide_cell_wrap_marker_survives_storage_conversion() {
+        for text in ["a界", "e\u{0301}🚀", "界界"] {
+            let mut line: Line = text.into();
+            line.set_last_cell_was_wrapped(true, 1);
+            assert!(
+                line.last_cell_was_wrapped(),
+                "vector storage lost {:?} wrap",
+                text
+            );
+            line.compress_for_scrollback();
+            assert!(
+                line.last_cell_was_wrapped(),
+                "compressed storage lost {:?} wrap",
+                text
+            );
+            let _ = line.cells_mut();
+            assert!(line.last_cell_was_wrapped());
+            line.set_last_cell_was_wrapped(false, 2);
+            assert!(!line.last_cell_was_wrapped());
+            assert_eq!(line.as_str().as_ref(), text);
+
+            let constructed =
+                Line::from_text_with_wrapped_last_col(text, &CellAttributes::default(), 3);
+            assert!(constructed.last_cell_was_wrapped());
+        }
+    }
+
+    #[test]
+    fn wide_cell_wrap_preserves_one_logical_line_across_width_changes() {
+        let text = "界界界界界界界界";
+        let mut logical: Line = text.into();
+        for width in [4, 3, 7, 2, 5, 16, 4] {
+            let rows = logical.wrap(width, 1);
+            let last = rows.len() - 1;
+            for (idx, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    row.last_cell_was_wrapped(),
+                    idx < last,
+                    "width={width}, row={idx}: soft wrap became a hard newline"
+                );
+            }
+            logical = Line::from_cells(Vec::new(), 1);
+            for mut row in rows {
+                row.set_last_cell_was_wrapped(false, 1);
+                logical.append_line(row, 1);
+            }
+            assert_eq!(logical.as_str().as_ref(), text);
+        }
     }
 
     #[test]

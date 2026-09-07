@@ -5193,6 +5193,17 @@ mod tests {
                     screen.stable_row_index_offset,
                     fresh.stable_row_index_offset
                 );
+                let rebuilt = screen.rebuild_logical_lines_from_physical(seqno);
+                let logical_text: Vec<_> = rebuilt
+                    .iter()
+                    .map(|line| line.line(&screen.lines).as_str().into_owned())
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                assert_eq!(
+                    logical_text,
+                    vec![text.clone(); 3],
+                    "width {cols} must retain the original three logical records"
+                );
                 let full_hash = screen.compute_layout_signature();
                 let cache = screen.rewrap_cache.as_ref().unwrap();
                 assert_eq!(cache.source_signature, full_hash);
