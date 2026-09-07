@@ -5692,6 +5692,8 @@ fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLin
     // viewport. Both paths can therefore return the same row more than once.
     // Validate every positional reference before hydration or deduplication;
     // only identical rendered rows (including hyperlinks) may collapse.
+    // Each range/cursor read takes a separate terminal lock, so the line's
+    // last-change sequence can advance between two otherwise identical reads.
     lines.validate_references(false)?;
     let (hydrated, images) = lines.extract_data();
     anyhow::ensure!(
@@ -5700,10 +5702,13 @@ fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLin
     );
     let mut indices = HashMap::with_capacity(hydrated.len());
     let mut unique = Vec::with_capacity(hydrated.len());
-    for (row, line) in hydrated {
+    for (row, mut line) in hydrated {
         if let Some(&index) = indices.get(&row) {
-            let (_, previous): &(StableRowIndex, Line) = &unique[index];
-            if previous != &line {
+            let (_, previous): &mut (StableRowIndex, Line) = &mut unique[index];
+            let latest_seqno = previous.current_seqno().max(line.current_seqno());
+            previous.update_last_change_seqno(latest_seqno);
+            line.update_last_change_seqno(latest_seqno);
+            if *previous != line {
                 return Err(SerializedLinesStructureError::DuplicateStableRow.into());
             }
         } else {
@@ -28319,6 +28324,75 @@ mod test {
     }
 
     #[test]
+    fn legacy46_duplicate_rows_keep_latest_sequence_when_rendered_content_matches() {
+        let mut attrs = termwiz::cell::CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/sequence",
+        ))));
+        // The first pair reproduces a captured v46 cursor bonus row. The
+        // viewport and cursor reads held separate terminal locks: identical
+        // cells/flags were stamped 1_670_532 and 1_670_533.
+        for (first_seqno, second_seqno) in [
+            (1_670_532, 1_670_533),
+            (17, 9),
+            (usize::MAX - 1, usize::MAX),
+        ] {
+            let first = Line::from_text("same cursor row", &attrs, first_seqno, None);
+            let second = Line::from_text("same cursor row", &attrs, second_seqno, None);
+            assert_ne!(first, second, "Line equality includes sequence metadata");
+            let expected = Line::from_text(
+                "same cursor row",
+                &attrs,
+                first_seqno.max(second_seqno),
+                None,
+            );
+            let repeated = SerializedLines::from(vec![(29, first), (29, second)]);
+            assert_eq!(
+                repeated.validate_structure(),
+                Err(SerializedLinesStructureError::DuplicateStableRow),
+                "the strict current-peer structure contract is unchanged",
+            );
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let mut push = sample_retention_metadata_render_change();
+                push.bonus_lines = repeated.clone();
+                for pdu in [
+                    Pdu::GetLinesResponse(GetLinesResponse {
+                        pane_id: 17,
+                        lines: repeated.clone(),
+                    }),
+                    Pdu::GetPaneRenderChangesResponse(push.clone()),
+                ] {
+                    let serial = if matches!(&pdu, Pdu::GetLinesResponse(_)) {
+                        4
+                    } else {
+                        0
+                    };
+                    let wire = pdu.encode_frame_with_mode(serial, mode).unwrap();
+                    let decoded =
+                        Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+                            .expect("sequence-only drift is not a conflicting rendered row");
+                    let (actual_serial, payload) = decoded.into_parts();
+                    assert_eq!(actual_serial, serial);
+                    let lines = match payload {
+                        MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response)) => {
+                            response.lines
+                        }
+                        MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response)) => {
+                            assert_eq!(response.seqno, push.seqno);
+                            assert_eq!(response.cursor_position, push.cursor_position);
+                            response.bonus_lines
+                        }
+                        _ => panic!("expected a supported legacy text response"),
+                    };
+                    let (actual, images) = lines.extract_data_checked().unwrap();
+                    assert_eq!(actual, vec![(29, expected.clone())]);
+                    assert!(images.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy46_duplicate_rows_reject_conflicting_text_links_and_invalid_references() {
         let mut attrs = termwiz::cell::CellAttributes::default();
         attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
@@ -28329,8 +28403,8 @@ mod test {
             "https://example.com/b",
         ))));
         for conflicting in [
-            Line::from_text("other", &attrs, 1, None),
-            Line::from_text("first", &attrs, 1, None),
+            Line::from_text("other", &attrs, 2, None),
+            Line::from_text("first", &attrs, 2, None),
         ] {
             let lines = SerializedLines::from(vec![(5, first.clone()), (5, conflicting)]);
             let error = normalize_legacy46_text_lines(lines).unwrap_err();
@@ -28339,6 +28413,18 @@ mod test {
                 Some(&SerializedLinesStructureError::DuplicateStableRow)
             );
         }
+        let mut different_flags = first.clone();
+        different_flags.set_double_width(2);
+        let error = normalize_legacy46_text_lines(SerializedLines::from(vec![
+            (5, first.clone()),
+            (5, different_flags),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SerializedLinesStructureError>(),
+            Some(&SerializedLinesStructureError::DuplicateStableRow),
+            "a newer sequence must not conceal conflicting display flags",
+        );
         let mut lines = SerializedLines::from(vec![(5, first.clone()), (5, first)]);
         lines.hyperlinks[0].coords[1].line_idx = 2;
         let error = normalize_legacy46_text_lines(lines).unwrap_err();
