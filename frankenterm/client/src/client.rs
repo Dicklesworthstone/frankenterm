@@ -15909,12 +15909,11 @@ mod tests {
     fn legacy_bootstrap_admits_notifications_to_bounded_pre_ready_queue() {
         let rpc_transport = RpcTransportState::new();
         let generation = rpc_transport.active_generation().unwrap();
-        let title = Pdu::WindowTitleChanged(WindowTitleChanged {
+        let title = WindowTitleChanged {
             window_id: 42,
             title: "legacy startup".to_string(),
-        });
-        let wire = title
-            .clone()
+        };
+        let wire = Pdu::WindowTitleChanged(title.clone())
             .prepare_outbound_for_dialect(
                 MuxWireDialect::LEGACY46,
                 PduProducer::Server,
@@ -15946,7 +15945,7 @@ mod tests {
             let AsyncPduDecode::Decoded(decoded) = decoded else {
                 panic!("legacy title must be materialized");
             };
-            assert_eq!(decoded.pdu, title);
+            assert_eq!(decoded.pdu, Pdu::WindowTitleChanged(title.clone()));
             let mut queue = PreReadyUnilateralQueue::default();
             queue
                 .enqueue(decoded, 0, 0)
