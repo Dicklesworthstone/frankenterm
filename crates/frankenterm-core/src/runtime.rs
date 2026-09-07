@@ -4939,6 +4939,17 @@ impl ObservationRuntime {
     fn start_impl(&self) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
 
+        // Register before any producer can publish on another worker. The
+        // subscriber buffers initial discovery events until the bridge polls.
+        let snapshot_subscriber = self
+            .snapshot_config
+            .as_ref()
+            .filter(|config| {
+                config.enabled
+                    && matches!(config.scheduling.mode, SnapshotSchedulingMode::Intelligent)
+            })
+            .and_then(|_| self.event_bus.as_ref().map(|bus| bus.subscribe()));
+
         // Stage 1 ingress: multi-producer capture tasks write into bounded MPSC.
         let (capture_ingress_tx, capture_ingress_rx) =
             mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
@@ -5053,18 +5064,18 @@ impl ObservationRuntime {
                 ));
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let wezterm = self.wezterm_handle.clone();
-                let snapshot_triggers =
-                    if matches!(
-                        snap_config.scheduling.mode,
-                        SnapshotSchedulingMode::Intelligent
-                    ) {
-                        Some(self.spawn_snapshot_trigger_task(
-                            Arc::clone(&engine),
-                            self.event_bus.clone(),
-                        ))
-                    } else {
-                        None
-                    };
+                let snapshot_triggers = if matches!(
+                    snap_config.scheduling.mode,
+                    SnapshotSchedulingMode::Intelligent
+                ) {
+                    Some(self.spawn_snapshot_trigger_task(
+                        Arc::clone(&engine),
+                        snapshot_subscriber,
+                        shutdown_rx.clone(),
+                    ))
+                } else {
+                    None
+                };
                 let snapshot_shutdown_clean = Arc::new(AtomicBool::new(false));
                 let snapshot_scheduler_status = Arc::new(AtomicU8::new(SNAPSHOT_SCHEDULER_RUNNING));
                 let task_snapshot_scheduler_status = Arc::clone(&snapshot_scheduler_status);
@@ -5171,7 +5182,8 @@ impl ObservationRuntime {
     fn spawn_snapshot_trigger_task(
         &self,
         snapshot_engine: Arc<crate::snapshot_engine::SnapshotEngine>,
-        event_bus: Option<Arc<EventBus>>,
+        mut subscriber: Option<crate::events::EventSubscriber>,
+        mut shutdown_rx: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let registry = Arc::clone(&self.registry);
@@ -5179,8 +5191,7 @@ impl ObservationRuntime {
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
-            let mut subscriber = event_bus.as_ref().map(|bus| bus.subscribe());
-            let idle_enabled = subscriber.is_some();
+            let mut idle_enabled = subscriber.is_some();
             let started_at = crate::runtime_async::timer_now_with_cx(&loop_cx);
             let mut last_activity = started_at;
             let mut last_idle_trigger = started_at;
@@ -5198,13 +5209,20 @@ impl ObservationRuntime {
                 let mut tick_only = true;
 
                 if let Some(sub) = subscriber.as_mut() {
-                    match runtime_timeout(
-                        &loop_cx,
-                        Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
-                        sub.recv(),
-                    )
-                    .await
-                    {
+                    // The tick is deliberately long; shutdown must wake this
+                    // wait immediately rather than force-abort a healthy task.
+                    let receive = crate::runtime_async::select! {
+                        _ = shutdown_rx.changed(&loop_cx) => None,
+                        receive = runtime_timeout(
+                            &loop_cx,
+                            Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
+                            sub.recv(),
+                        ) => Some(receive),
+                    };
+                    let Some(receive) = receive else {
+                        break;
+                    };
+                    match receive {
                         Ok(recv) => {
                             if shutdown_flag.load(Ordering::SeqCst) {
                                 break;
@@ -5263,14 +5281,22 @@ impl ObservationRuntime {
                         }
                         Err(RuntimeTimeoutFailure::Elapsed) => {}
                     }
-                } else if let Err(failure) = runtime_sleep(
-                    &loop_cx,
-                    Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
-                )
-                .await
-                {
-                    record_runtime_wait_failure("snapshot_trigger_bridge", failure);
-                    break;
+                } else {
+                    let sleep_result = crate::runtime_async::select! {
+                        _ = shutdown_rx.changed(&loop_cx) => None,
+                        result = runtime_sleep(
+                            &loop_cx,
+                            Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
+                        ) => Some(result),
+                    };
+                    match sleep_result {
+                        None => break,
+                        Some(Ok(())) => {}
+                        Some(Err(failure)) => {
+                            record_runtime_wait_failure("snapshot_trigger_bridge", failure);
+                            break;
+                        }
+                    }
                 }
 
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -5286,15 +5312,13 @@ impl ObservationRuntime {
 
                 if subscriber_closed {
                     subscriber = None;
-                }
-
-                if !tick_only {
-                    continue;
+                    idle_enabled = false;
                 }
 
                 let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
 
-                if idle_enabled
+                if tick_only
+                    && idle_enabled
                     && runtime_time_elapsed_at_least(
                         now,
                         last_activity,
@@ -5327,6 +5351,9 @@ impl ObservationRuntime {
                     }
                 }
 
+                // Sustained event traffic must not starve the memory-pressure
+                // check by preventing an idle timer tick. The cooldown bounds
+                // emission independently of event throughput.
                 let cursor_snapshot_bytes = metrics.cursor_snapshot_bytes_last();
                 if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES
                     && last_memory_trigger.is_none_or(|last_trigger| {
@@ -11355,7 +11382,34 @@ impl RuntimeHandle {
         shutdown_timeout: Duration,
     ) -> ShutdownSummary {
         let _ = cx.checkpoint();
-        self.shutdown_with_timeout_impl(shutdown_timeout).await
+        self.shutdown_with_timeout_impl(shutdown_timeout, |_| async { Ok(()) })
+            .await
+    }
+
+    /// Settle caller-owned durable state before publishing a clean session.
+    ///
+    /// The callback runs exactly once after core task/SQLite settlement, even
+    /// when an earlier phase was unclean, so callers can still salvage durable
+    /// recorder writes. It receives a fresh cleanup context; cooperative waiting
+    /// is bounded by `shutdown_timeout`, and late success is rejected. Blocking
+    /// I/O in a callback cannot be preempted by an async deadline and must move
+    /// to a lifecycle-owned blocking worker. Return an error for any prior task failure
+    /// or failed durable flush. Error/timeout withholds the terminal checkpoint
+    /// and clean mark; it can never repair an earlier core shutdown failure.
+    /// Do not spawn detached work from this callback: its future owns settlement.
+    pub async fn shutdown_with_settlement_with_cx<F, Fut>(
+        self,
+        cx: &crate::cx::Cx,
+        shutdown_timeout: Duration,
+        settle_external: F,
+    ) -> ShutdownSummary
+    where
+        F: FnOnce(crate::cx::Cx) -> Fut,
+        Fut: Future<Output = std::result::Result<(), String>>,
+    {
+        let _ = cx.checkpoint();
+        self.shutdown_with_timeout_impl(shutdown_timeout, settle_external)
+            .await
     }
 
     /// Request graceful shutdown with an explicit task-join timeout.
@@ -11378,7 +11432,15 @@ impl RuntimeHandle {
             .await
     }
 
-    async fn shutdown_with_timeout_impl(mut self, shutdown_timeout: Duration) -> ShutdownSummary {
+    async fn shutdown_with_timeout_impl<F, Fut>(
+        mut self,
+        shutdown_timeout: Duration,
+        settle_external: F,
+    ) -> ShutdownSummary
+    where
+        F: FnOnce(crate::cx::Cx) -> Fut,
+        Fut: Future<Output = std::result::Result<(), String>>,
+    {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let mut warnings = Vec::new();
         let mut clean = true;
@@ -11689,6 +11751,51 @@ impl RuntimeHandle {
                 "Shutdown ended with {final_write_queue} storage write queue item(s) still observed"
             ));
             clean = false;
+        }
+
+        // External recorders may still own buffered writes after the core
+        // producer joins. Their durable acknowledgement, and the caller's
+        // already-settled service failures, must precede any clean-session mark.
+        let settlement_cx = crate::cx::for_request();
+        let settlement_started = Instant::now();
+        let settlement_result = runtime_timeout(
+            &settlement_cx,
+            shutdown_timeout,
+            settle_external(settlement_cx.clone()),
+        )
+        .await;
+        // A callback can spend its entire first poll in synchronous I/O.
+        // The async timer cannot interrupt that poll; a late successful return
+        // still must not authorize the clean-session boundary.
+        let settlement_result = if settlement_started.elapsed() > shutdown_timeout {
+            Err(RuntimeTimeoutFailure::Elapsed)
+        } else {
+            settlement_result
+        };
+        match settlement_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                clean = false;
+                let detail = crate::output::sanitize_redact_truncate_bounded(
+                    utf8_prefix_at_most(&error, MAX_RUNTIME_WATCHDOG_WARNING_INPUT_BYTES),
+                    MAX_RUNTIME_WATCHDOG_WARNING_WIDTH,
+                    MAX_RUNTIME_WATCHDOG_WARNING_BYTES,
+                    |normalized| RUNTIME_HEALTH_REDACTOR.redact(normalized),
+                );
+                warnings.push(format!("External shutdown settlement failed: {detail}"));
+            }
+            Err(RuntimeTimeoutFailure::Elapsed) => {
+                clean = false;
+                warnings.push("External shutdown settlement exceeded its timeout".to_string());
+            }
+            Err(RuntimeTimeoutFailure::Context(failure)) => {
+                clean = false;
+                record_runtime_wait_failure("runtime_shutdown_external_settlement", failure);
+                warnings.push(format!(
+                    "External shutdown settlement wait failed with class {}",
+                    failure.as_str()
+                ));
+            }
         }
 
         // The consuming RuntimeHandle is the sole terminal-snapshot owner. A
@@ -18179,11 +18286,334 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert!(sessions > 0, "startup must create a snapshot session");
+            assert_eq!(sessions, 1, "one engine must own exactly one session");
             assert_eq!(
                 clean_sessions, sessions,
                 "every RuntimeBuilder-owned snapshot session must close cleanly"
             );
+            let shutdown_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_checkpoints WHERE checkpoint_type = 'shutdown'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(shutdown_count, 1, "only the terminal owner may finalize");
+        });
+    }
+
+    async fn start_snapshot_settlement_fixture(
+        enabled: bool,
+    ) -> (tempfile::TempDir, String, Arc<EventBus>, RuntimeHandle) {
+        let (dir, db_path) = temp_db_path();
+        let storage = StorageHandle::new(&db_path).await.unwrap();
+        let mock = crate::wezterm::MockWezterm::new();
+        mock.add_default_pane(0).await;
+        let bus = Arc::new(EventBus::new(64));
+        let mut runtime = ObservationRuntime::new(
+            RuntimeConfig {
+                discovery_interval: Duration::from_millis(20),
+                capture_interval: Duration::from_millis(20),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            },
+            storage,
+            Arc::new(RwLock::new(PatternEngine::new())),
+        )
+        .with_wezterm_handle(Arc::new(mock))
+        .with_event_bus(Arc::clone(&bus))
+        .with_snapshot_config(SnapshotConfig {
+            enabled,
+            ..Default::default()
+        });
+        let handle = runtime.start().await.unwrap();
+        (dir, db_path, bus, handle)
+    }
+
+    async fn wait_for_snapshot_checkpoint(db_path: &str, checkpoint_type: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let exists: bool = rusqlite::Connection::open(db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_checkpoints WHERE checkpoint_type = ?1)",
+                    [checkpoint_type],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if exists {
+                eprintln!("snapshot checkpoint observed: type={checkpoint_type}");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no {checkpoint_type} checkpoint before deadline"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn snapshot_settlement_counts(db_path: &str) -> (i64, i64, i64) {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(shutdown_clean), 0),
+                    (SELECT COUNT(*) FROM session_checkpoints WHERE checkpoint_type = 'shutdown')
+                 FROM mux_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn runtime_snapshot_event_bridge_persists_before_fallback_or_shutdown() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path, bus, handle) = start_snapshot_settlement_fixture(true).await;
+            assert!(handle.snapshot.is_some());
+            assert!(handle.snapshot_triggers.is_some());
+            assert!(
+                bus.subscriber_count() > 0,
+                "startup must subscribe synchronously"
+            );
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            assert!(
+                bus.publish(Event::WorkflowCompleted {
+                    workflow_id: "snapshot-durable-event-fixture".to_string(),
+                    success: false,
+                    reason: None,
+                }) > 0
+            );
+            // Ten-second deadline is much shorter than the default 30-minute
+            // fallback. This asserts durable publication, not just queue ingress.
+            wait_for_snapshot_checkpoint(&db_path, "event").await;
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
+            let summary = handle.shutdown_with_summary().await;
+            assert!(summary.is_clean(), "{:?}", summary.warnings);
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_memory_pressure_is_checked_during_event_traffic() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path, bus, handle) = start_snapshot_settlement_fixture(true).await;
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            // Maintenance samples immediately on startup and could otherwise
+            // overwrite the injected gauge before the event bridge reads it.
+            // The deque is appended after the gauge store; the sample counter
+            // alone is not a completion fence because it increments first.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let first_sample_complete = !handle
+                    .metrics
+                    .cursor_snapshot_recent_bytes
+                    .lock()
+                    .unwrap()
+                    .is_empty();
+                if first_sample_complete {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "initial memory sample not completed"
+                );
+                sleep(Duration::from_millis(20)).await;
+            }
+            handle
+                .metrics
+                .record_cursor_snapshot_memory(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES);
+            let activity = Event::SegmentCaptured {
+                pane_id: 0,
+                seq: 900,
+                content_len: 1,
+            };
+            assert!(snapshot_trigger_from_event(&activity).is_none());
+            assert!(bus.publish(activity) > 0);
+            // Memory pressure must be checked even on an event (non-timer)
+            // iteration. Without it this waits for the 30-second idle tick.
+            wait_for_snapshot_checkpoint(&db_path, "event").await;
+            let summary = handle.shutdown_with_summary().await;
+            assert!(summary.is_clean(), "{:?}", summary.warnings);
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_idle_bridge_without_event_bus_settles_promptly() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(0).await;
+            let mut runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_wezterm_handle(Arc::new(mock))
+            .with_snapshot_config(SnapshotConfig::default());
+            let handle = runtime.start().await.unwrap();
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            sleep(Duration::from_millis(30)).await;
+            let started = Instant::now();
+            let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
+            assert!(summary.is_clean(), "{:?}", summary.warnings);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_disabled_does_not_create_sessions_or_tasks() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path, bus, handle) = start_snapshot_settlement_fixture(false).await;
+            assert!(handle.snapshot.is_none());
+            assert!(handle.snapshot_triggers.is_none());
+            assert!(handle.snapshot_engine.is_none());
+            let _ = bus.publish(Event::WorkflowCompleted {
+                workflow_id: "disabled-snapshot-fixture".to_string(),
+                success: false,
+                reason: None,
+            });
+            let summary = handle.shutdown_with_summary().await;
+            assert!(summary.is_clean(), "{:?}", summary.warnings);
+            assert_eq!(snapshot_settlement_counts(&db_path), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_external_settlement_precedes_clean_mark() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path, _bus, handle) = start_snapshot_settlement_fixture(true).await;
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            let entered = &AtomicBool::new(false);
+            let released = &AtomicBool::new(false);
+            let caller_cx = crate::cx::for_testing();
+            // Mandatory cleanup must remain independent of a cancelled caller.
+            caller_cx.cancel_with(crate::outcome::CancelKind::User, Some("fixture shutdown"));
+            let shutdown = handle.shutdown_with_settlement_with_cx(
+                &caller_cx,
+                Duration::from_secs(2),
+                |cleanup_cx| async move {
+                    assert!(cleanup_cx.checkpoint().is_ok());
+                    assert!(!entered.swap(true, Ordering::SeqCst), "settle exactly once");
+                    while !released.load(Ordering::SeqCst) {
+                        crate::runtime_async::sleep_with_cx(&cleanup_cx, Duration::from_millis(5))
+                            .await
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            let observer = async {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !entered.load(Ordering::SeqCst) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "external settlement was not reached"
+                    );
+                    sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
+                sleep(Duration::from_millis(30)).await;
+                assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
+                eprintln!("external settlement blocked: no shutdown checkpoint or clean mark");
+                released.store(true, Ordering::SeqCst);
+            };
+            let (summary, ()) = futures::join!(shutdown, observer);
+            assert!(summary.is_clean(), "{:?}", summary.warnings);
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_external_failure_or_timeout_keeps_session_unclean() {
+        for timeout in [false, true] {
+            run_async_test_isolated(move || async move {
+                let (_dir, db_path, _bus, handle) = start_snapshot_settlement_fixture(true).await;
+                wait_for_snapshot_checkpoint(&db_path, "startup").await;
+                let cx = crate::cx::for_testing();
+                let called = AtomicBool::new(false);
+                let summary = handle
+                    .shutdown_with_settlement_with_cx(&cx, Duration::from_secs(2), |_| async {
+                        assert!(!called.swap(true, Ordering::SeqCst));
+                        if timeout {
+                            std::future::pending::<()>().await;
+                        }
+                        Err("selected recorder durable flush refused".to_string())
+                    })
+                    .await;
+                assert!(called.load(Ordering::SeqCst));
+                assert!(!summary.is_clean());
+                let expected = if timeout {
+                    "External shutdown settlement exceeded its timeout"
+                } else {
+                    "External shutdown settlement failed: selected recorder durable flush refused"
+                };
+                assert!(
+                    summary.warnings.iter().any(|warning| warning == expected),
+                    "{:?}",
+                    summary.warnings
+                );
+                assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
+                eprintln!(
+                    "external settlement negative control: timeout={timeout}, warnings={:?}",
+                    summary.warnings
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_snapshot_late_non_yielding_settlement_cannot_mark_clean() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path, _bus, handle) = start_snapshot_settlement_fixture(true).await;
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            let cx = crate::cx::for_testing();
+            let called = AtomicBool::new(false);
+            let summary = handle
+                .shutdown_with_settlement_with_cx(&cx, Duration::from_secs(2), |_| async {
+                    called.store(true, Ordering::SeqCst);
+                    // Deliberately block one poll, like the current sync_data
+                    // path. This tests late-receipt rejection, NOT preemption
+                    // of a stuck syscall or a wall-clock shutdown guarantee.
+                    std::thread::sleep(Duration::from_millis(2100));
+                    Ok(())
+                })
+                .await;
+            assert!(called.load(Ordering::SeqCst));
+            assert!(!summary.is_clean());
+            assert!(
+                summary.warnings.iter().any(|warning| {
+                    warning == "External shutdown settlement exceeded its timeout"
+                })
+            );
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_aborted_scheduler_cannot_be_cleared_by_external_success() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path, _bus, handle) = start_snapshot_settlement_fixture(true).await;
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            handle.snapshot.as_ref().unwrap().abort();
+            let called = AtomicBool::new(false);
+            let cx = crate::cx::for_testing();
+            let summary = handle
+                .shutdown_with_settlement_with_cx(&cx, Duration::from_secs(2), |_| async {
+                    called.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            assert!(
+                called.load(Ordering::SeqCst),
+                "still attempt durable salvage"
+            );
+            assert!(!summary.is_clean());
+            assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
         });
     }
 

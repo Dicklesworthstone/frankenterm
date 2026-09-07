@@ -46531,44 +46531,33 @@ async fn settle_watcher_background_task(
     Ok(())
 }
 
-struct SnapshotBackgroundTasks {
-    bridge: frankenterm_core::watchdog::WatchdogHandle,
-    scheduler: frankenterm_core::watchdog::WatchdogHandle,
-    scheduler_failure: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-async fn settle_snapshot_background_tasks(
-    tasks: SnapshotBackgroundTasks,
+async fn settle_watcher_recorder_with_cx(
     cleanup_cx: &frankenterm_core::cx::Cx,
-) -> Vec<anyhow::Error> {
-    // The bridge owns delivery of the durable watch-channel shutdown signal.
-    // Settle it first so the scheduler can observe that signal and exit through
-    // its own cleanup path. WatchdogHandle retains the two-second fallback abort
-    // for either task if cooperative acknowledgement stalls.
-    let mut failures = Vec::new();
-    if let Err(error) =
-        settle_watcher_background_task("snapshot_shutdown_bridge", tasks.bridge, cleanup_cx, false)
-            .await
-    {
-        failures.push(error);
+    recorder: &frankenterm_core::recorder_storage::RecorderStorageInstance,
+    selected_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
+) -> anyhow::Result<()> {
+    use frankenterm_core::recorder_storage::{FlushMode, RecorderStorage as _};
+    let stats = recorder
+        .flush_with_cx(cleanup_cx, FlushMode::Durable)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "selected recorder backend {selected_backend} failed durable shutdown flush: {error}"
+            )
+        })?;
+    if stats.backend != selected_backend {
+        anyhow::bail!(
+            "selected recorder backend {selected_backend} returned shutdown flush identity {}",
+            stats.backend
+        );
     }
-    if let Err(error) =
-        settle_watcher_background_task("snapshot_scheduler", tasks.scheduler, cleanup_cx, false)
-            .await
-    {
-        failures.push(error);
-    }
-    let scheduler_failure = tasks
-        .scheduler_failure
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(error) = scheduler_failure {
-        failures.push(anyhow::anyhow!(
-            "snapshot scheduler exited without a normal shutdown receipt: {error}"
-        ));
-    }
-    failures
+    tracing::info!(
+        backend = %stats.backend,
+        flushed_at_ms = stats.flushed_at_ms,
+        latest_ordinal = stats.latest_offset.as_ref().map(|offset| offset.ordinal),
+        "Selected recorder backend reached durable shutdown flush"
+    );
+    Ok(())
 }
 
 fn reload_watcher_configuration(
@@ -46699,13 +46688,13 @@ async fn wait_for_watcher_stop_signal() {
     let _ = frankenterm_core::runtime_async::signal::ctrl_c().await;
 }
 
-/// Wall-clock bound on the terminal pane listing taken during watcher
-/// shutdown.
+/// Per-phase bound on watcher runtime shutdown, including external recorder
+/// settlement and terminal pane listing.
 ///
 /// The listing runs after the signal that asked the watcher to stop, against a
 /// backend that is frequently the reason the watcher is stopping at all. It is
 /// worth a short wait for a real terminal snapshot and nothing more (ft-yykm1).
-const SHUTDOWN_TERMINAL_SNAPSHOT_LISTING_TIMEOUT: Duration = Duration::from_secs(10);
+const WATCHER_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatcherControlReceiveFailure {
@@ -46822,7 +46811,7 @@ async fn run_watcher(
     use frankenterm_core::patterns::PatternEngine;
     use frankenterm_core::policy::PolicyGatedInjector;
     use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
-    use frankenterm_core::runtime_async::{mpsc, watch};
+    use frankenterm_core::runtime_async::mpsc;
     use frankenterm_core::storage::StorageHandle;
     use frankenterm_core::webhook::WebhookDispatcher;
     use frankenterm_core::workflows::{
@@ -47405,6 +47394,7 @@ async fn run_watcher(
             },
         )
         .with_event_bus(Arc::clone(&event_bus))
+        .with_snapshot_config(config.snapshots.clone())
         .with_wezterm_handle(wezterm_handle.clone());
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
@@ -47685,90 +47675,6 @@ async fn run_watcher(
         frankenterm_core::watchdog::spawn_mux_watchdog(cx, watchdog_config, wezterm, shutdown_flag)
     };
 
-    // Start snapshot engine for session persistence
-    let (snapshot_engine, mut snapshot_task_handles): (
-        Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>>,
-        Option<SnapshotBackgroundTasks>,
-    ) = if config.snapshots.enabled {
-        let engine_db = Arc::new(db_path.to_string());
-        let engine = Arc::new(frankenterm_core::snapshot_engine::SnapshotEngine::new(
-            engine_db,
-            config.snapshots.clone(),
-        ));
-        let engine_for_loop = Arc::clone(&engine);
-        let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
-        let bridge_shutdown_owner = Arc::clone(&shutdown_flag_for_snap);
-        let snapshot_wezterm = wezterm_handle.clone();
-        // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
-        let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
-        let bridge_task = frankenterm_core::runtime_async::task::spawn(async move {
-            // ft-xbnl0.2.3 tick 285: cx-first shutdown-bridge poll sleep.
-            let bridge_cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
-            loop {
-                if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = snap_shutdown_tx.send(true);
-                    break;
-                }
-                if frankenterm_core::runtime_async::sleep_with_cx(
-                    &bridge_cx,
-                    Duration::from_millis(500),
-                )
-                .await
-                .is_err()
-                {
-                    // Cx cancelled — send shutdown signal to the periodic loop.
-                    let _ = snap_shutdown_tx.send(true);
-                    break;
-                }
-            }
-        });
-        let bridge_handle = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-            bridge_task,
-            bridge_shutdown_owner,
-        );
-        let scheduler_failure = Arc::new(std::sync::Mutex::new(None::<String>));
-        let task_scheduler_failure = Arc::clone(&scheduler_failure);
-        let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
-            if let Err(error) = engine_for_loop
-                .run_periodic(snap_shutdown_rx, move || {
-                    let wez = snapshot_wezterm.clone();
-                    async move {
-                        // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
-                        let probe_cx = frankenterm_core::cx::Cx::current()
-                            .unwrap_or_else(frankenterm_core::cx::for_request);
-                        wez.list_panes_with_cx(&probe_cx).await.map_err(|error| {
-                            frankenterm_core::snapshot_engine::SnapshotError::PaneList(
-                                error.to_string(),
-                            )
-                        })
-                    }
-                })
-                .await
-            {
-                tracing::warn!(%error, "snapshot scheduler failed");
-                *task_scheduler_failure
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
-            }
-        });
-        let scheduler_handle = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-            scheduler_task,
-            Arc::clone(&handle.shutdown_flag),
-        );
-        tracing::info!("Snapshot engine started");
-        (
-            Some(engine),
-            Some(SnapshotBackgroundTasks {
-                bridge: bridge_handle,
-                scheduler: scheduler_handle,
-                scheduler_failure,
-            }),
-        )
-    } else {
-        (None, None)
-    };
-
     // Track current config for hot reload. OS-delivered reload signals and
     // instance-bound cooperative IPC reload requests call the same application
     // function. IPC token authentication is additionally enforced when tokens
@@ -47972,11 +47878,6 @@ async fn run_watcher(
 
     tracing::info!("Shutting down observation runtime...");
     handle.signal_shutdown();
-    if let Some(snapshot_tasks) = snapshot_task_handles.take() {
-        shutdown_failures.extend(
-            settle_snapshot_background_tasks(snapshot_tasks, &background_shutdown_cx).await,
-        );
-    }
 
     if let Some(notification_handle) = notification_handle
         && let Err(error) = settle_watcher_background_task(
@@ -48059,7 +47960,36 @@ async fn run_watcher(
     }
 
     match Arc::try_unwrap(handle) {
-        Ok(handle) => handle.shutdown().await,
+        Ok(handle) => {
+            let external_failure_count = shutdown_failures.len();
+            let recorder = recorder_storage.as_ref();
+            let selected_backend = recorder_startup_selection.selected_backend;
+            let summary = handle
+                .shutdown_with_settlement_with_cx(
+                    &background_shutdown_cx,
+                    WATCHER_RUNTIME_SHUTDOWN_TIMEOUT,
+                    |cleanup_cx| async move {
+                        // Flush even after an earlier failure, but never let a
+                        // successful flush erase that failure's clean-mark veto.
+                        settle_watcher_recorder_with_cx(&cleanup_cx, recorder, selected_backend)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if external_failure_count > 0 {
+                            return Err(format!(
+                                "{external_failure_count} watcher service shutdown failure(s)"
+                            ));
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+            if !summary.is_clean() {
+                shutdown_failures.push(anyhow::anyhow!(
+                    "observation runtime shutdown was unclean: {}",
+                    summary.warnings.join("; ")
+                ));
+            }
+        }
         Err(handle) => {
             let strong_count = Arc::strong_count(&handle);
             tracing::warn!(
@@ -48069,109 +47999,24 @@ async fn run_watcher(
             shutdown_failures.push(anyhow::anyhow!(
                 "observation runtime retained {strong_count} owners and could not be joined"
             ));
-        }
-    }
-
-    {
-        use frankenterm_core::recorder_storage::RecorderStorage as _;
-        match recorder_storage
-            .flush_with_cx(
+            // Best-effort bounded salvage only. Outstanding producers cannot
+            // authorize a terminal snapshot or clean session.
+            match frankenterm_core::runtime_async::timeout_with_cx(
                 &background_shutdown_cx,
-                frankenterm_core::recorder_storage::FlushMode::Durable,
+                WATCHER_RUNTIME_SHUTDOWN_TIMEOUT,
+                settle_watcher_recorder_with_cx(
+                    &background_shutdown_cx,
+                    recorder_storage.as_ref(),
+                    recorder_startup_selection.selected_backend,
+                ),
             )
             .await
-        {
-            Ok(stats) if stats.backend == recorder_startup_selection.selected_backend => {
-                tracing::info!(
-                    backend = %stats.backend,
-                    flushed_at_ms = stats.flushed_at_ms,
-                    latest_ordinal = stats.latest_offset.as_ref().map(|offset| offset.ordinal),
-                    "Selected recorder backend reached durable shutdown flush"
-                );
-            }
-            Ok(stats) => {
-                shutdown_failures.push(anyhow::anyhow!(
-                    "selected recorder backend {} returned shutdown flush identity {}",
-                    recorder_startup_selection.selected_backend,
-                    stats.backend
-                ));
-            }
-            Err(error) => {
-                shutdown_failures.push(anyhow::anyhow!(
-                    "selected recorder backend {} failed durable shutdown flush: {error}",
-                    recorder_startup_selection.selected_backend
-                ));
-            }
-        }
-    }
-
-    // Only a fully settled pipeline may publish the terminal checkpoint and
-    // exact-receipt clean mark. A genuine empty pane observation is still a
-    // terminal snapshot; a listing error is not evidence of emptiness.
-    if shutdown_failures.is_empty()
-        && let Some(ref engine) = snapshot_engine
-    {
-        let wez = wezterm_handle.clone();
-        let shutdown_snap_cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        // SIGTERM arrives most often because the backend this listing talks to
-        // is already gone, and the listing then costs a full retry ladder of
-        // subprocess timeouts before it fails. Bound it so `ft watch` exits on
-        // the signal instead of appearing to ignore it (ft-yykm1). Timing out
-        // is a listing failure, not evidence of an empty session, so the clean
-        // mark is withheld exactly as it is for any other listing error.
-        match frankenterm_core::runtime_async::timeout_with_cx(
-            &shutdown_snap_cx,
-            SHUTDOWN_TERMINAL_SNAPSHOT_LISTING_TIMEOUT,
-            wez.list_panes_with_cx(&shutdown_snap_cx),
-        )
-        .await
-        {
-            Ok(Ok(panes)) => match engine
-                .shutdown_checkpoint_with_cx(&shutdown_snap_cx, &panes, Duration::from_secs(5))
-                .await
             {
-                Ok(snapshot) => {
-                    tracing::info!(
-                        panes = snapshot.pane_count,
-                        bytes = snapshot.total_bytes,
-                        checkpoint_id = snapshot.checkpoint_id,
-                        "Shutdown checkpoint and clean mark settled"
-                    );
-                }
-                Err(error) => {
-                    let detail = if let Some(checkpoint) = error.committed_shutdown_checkpoint() {
-                        format!(
-                            "shutdown checkpoint {} committed, but its clean mark failed: {error}",
-                            checkpoint.checkpoint_id
-                        )
-                    } else {
-                        format!(
-                            "shutdown checkpoint failed before a terminal receipt was published: {error}"
-                        )
-                    };
-                    tracing::warn!(%error, "Snapshot session remains unclean");
-                    shutdown_failures.push(anyhow::anyhow!(detail));
-                }
-            },
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    %error,
-                    "Failed to list panes for shutdown checkpoint; snapshot session remains unclean"
-                );
-                shutdown_failures.push(anyhow::anyhow!(
-                    "failed to list panes for the shutdown checkpoint: {error}"
-                ));
-            }
-            Err(_) => {
-                let seconds = SHUTDOWN_TERMINAL_SNAPSHOT_LISTING_TIMEOUT.as_secs();
-                tracing::warn!(
-                    timeout_secs = seconds,
-                    "Timed out listing panes for the shutdown checkpoint; snapshot session remains unclean"
-                );
-                shutdown_failures.push(anyhow::anyhow!(
-                    "timed out after {seconds}s listing panes for the shutdown checkpoint"
-                ));
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => shutdown_failures.push(error),
+                Err(_) => shutdown_failures.push(anyhow::anyhow!(
+                    "recorder salvage flush exceeded its shutdown budget"
+                )),
             }
         }
     }
@@ -98128,67 +97973,61 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_background_shutdown_settles_bridge_before_scheduler() {
+    fn watcher_snapshot_wiring_has_one_owner_and_external_settlement() {
+        // Placement matters: another command also shuts down RuntimeHandle.
+        // Pair this source-routing guard with the real SQLite runtime tests.
+        let watcher = include_str!("main.rs")
+            .split_once("async fn run_watcher(")
+            .unwrap()
+            .1
+            .split_once("fn maybe_trigger_e2e_watcher_panic_once(")
+            .unwrap()
+            .0;
+        assert_eq!(watcher.matches(".with_snapshot_config(").count(), 1);
+        assert_eq!(
+            watcher
+                .matches(".shutdown_with_settlement_with_cx(")
+                .count(),
+            1
+        );
+        assert!(!watcher.contains("SnapshotEngine::new("));
+        assert!(!watcher.contains("handle.shutdown().await"));
+        let settlement = watcher
+            .split_once(".shutdown_with_settlement_with_cx(")
+            .unwrap()
+            .1;
+        assert!(settlement.contains("settle_watcher_recorder_with_cx("));
+        assert!(settlement.contains("external_failure_count > 0"));
+        assert!(settlement.contains("if !summary.is_clean()"));
+    }
+
+    #[test]
+    fn watcher_snapshot_settlement_requires_selected_recorder_identity() {
         run_async_test(async {
-            let shared_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let bridge_shutdown = Arc::clone(&shared_shutdown);
-            let scheduler_shutdown = Arc::clone(&shared_shutdown);
-            let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let bridge_phase = Arc::clone(&phase);
-            let scheduler_phase = Arc::clone(&phase);
-            let (shutdown_tx, mut shutdown_rx) =
-                frankenterm_core::runtime_async::watch::channel(false);
-
-            let bridge_task = frankenterm_core::runtime_async::task::spawn(async move {
-                while !bridge_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                    frankenterm_core::runtime_async::yield_now().await;
-                }
-                assert_eq!(
-                    bridge_phase.swap(1, std::sync::atomic::Ordering::SeqCst),
-                    0,
-                    "snapshot bridge must publish shutdown before the scheduler exits",
-                );
-                shutdown_tx
-                    .send(true)
-                    .expect("snapshot scheduler shutdown receiver must remain alive");
-            });
-            let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
-                let scheduler_cx = frankenterm_core::cx::for_testing();
-                while !shutdown_rx.borrow_and_clone() {
-                    shutdown_rx
-                        .changed(&scheduler_cx)
-                        .await
-                        .expect("snapshot shutdown bridge must remain alive until delivery");
-                }
-                assert_eq!(
-                    scheduler_phase.swap(2, std::sync::atomic::Ordering::SeqCst),
-                    1,
-                    "snapshot scheduler must observe the bridge signal before settlement",
-                );
-            });
-
-            let tasks = SnapshotBackgroundTasks {
-                bridge: frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-                    bridge_task,
-                    Arc::clone(&shared_shutdown),
-                ),
-                scheduler: frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-                    scheduler_task,
-                    scheduler_shutdown,
-                ),
-                scheduler_failure: Arc::new(std::sync::Mutex::new(None)),
+            use frankenterm_core::recorder_storage::{
+                RecorderBackendKind, RecorderStorageInstance, RusqliteRecorderStorage,
+                RusqliteStorageConfig,
             };
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = RecorderStorageInstance::Rusqlite(
+                RusqliteRecorderStorage::open(RusqliteStorageConfig {
+                    db_path: dir.path().join("recorder.sqlite3"),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
             let cleanup_cx = frankenterm_core::cx::for_testing();
-            let timeout_cx = frankenterm_core::cx::for_testing();
-            let failures = frankenterm_core::runtime_async::timeout_with_cx(
-                &timeout_cx,
-                Duration::from_secs(1),
-                settle_snapshot_background_tasks(tasks, &cleanup_cx),
+            settle_watcher_recorder_with_cx(&cleanup_cx, &recorder, RecorderBackendKind::Rusqlite)
+                .await
+                .expect("real selected recorder must durably flush");
+            let error = settle_watcher_recorder_with_cx(
+                &cleanup_cx,
+                &recorder,
+                RecorderBackendKind::AppendLog,
             )
             .await
-            .expect("cooperative bridge-first snapshot settlement must remain bounded");
-            assert!(failures.is_empty(), "settlement failures: {failures:?}");
-            assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 2);
+            .expect_err("a different backend cannot authorize a clean session");
+            assert!(error.to_string().contains("shutdown flush identity"));
         });
     }
 

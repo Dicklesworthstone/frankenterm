@@ -1289,7 +1289,35 @@ interval_seconds = 300
 max_concurrent_captures = 10
 retention_count = 10
 retention_days = 7
+
+[snapshots.scheduling]
+mode = "intelligent"
+snapshot_threshold = 5.0
+periodic_fallback_minutes = 30
 ```
+
+`ft watch` uses one runtime-owned engine for startup, event-driven, and final
+SQLite checkpoints. Intelligent mode is the default: workflow completion,
+pane/state transitions, idle windows, and memory pressure feed a bounded
+trigger queue. Ordinary trigger values accumulate toward the threshold;
+hazard and memory-pressure triggers request immediate capture. The fallback
+timer is 30 minutes by default. `interval_seconds` applies to explicit
+`mode = "periodic"`, not the intelligent fallback. Disabling snapshots starts
+neither the snapshot scheduler nor its trigger bridge.
+
+On shutdown, the trigger bridge is explicitly awakened and all core tasks
+must settle before the selected recorder backend is durably flushed. Earlier
+watcher-service failures, an unacknowledged scheduler, nonempty capture queues,
+or a recorder flush error/timeout withhold the terminal checkpoint and clean
+mark. Only successful settlement permits the one final checkpoint and its
+exact clean receipt. Cooperative phase waits are bounded, and a settlement
+result arriving after its deadline cannot mark the session clean. Recorder
+flush still performs synchronous disk I/O; a stalled syscall cannot yet be
+preempted by that async timer. Moving it into an owned blocking-I/O worker is
+tracked in `ft-interactive-swarm-product-convergence-7xqz4.8.14.3.13`. A cancelled
+caller does not skip mandatory cleanup. These automatic checkpoints remain
+SQLite observations: they do not automatically publish portable artifacts,
+save exact hot terminal/parser state, or restore running processes.
 
 Notes:
 
