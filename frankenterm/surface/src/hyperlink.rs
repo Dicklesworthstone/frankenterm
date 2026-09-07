@@ -185,8 +185,41 @@ impl Rule {
     /// Given a line of text from the terminal screen, and a set of
     /// rules, return the set of RuleMatches.
     pub fn match_hyperlinks(line: &str, rules: &[Rule]) -> Vec<RuleMatch> {
+        #[cfg(feature = "std")]
+        let use_literal_prefilter = {
+            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            !*DISABLED.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_HYPERLINK_LITERAL_PREFILTER")
+                    .is_some_and(|value| value == "1")
+            })
+        };
+        #[cfg(not(feature = "std"))]
+        let use_literal_prefilter = true;
+        Self::match_hyperlinks_impl(line, rules, use_literal_prefilter)
+    }
+
+    fn match_hyperlinks_impl(
+        line: &str,
+        rules: &[Rule],
+        use_literal_prefilter: bool,
+    ) -> Vec<RuleMatch> {
         let mut matches = Vec::new();
+        let mut has_url_delimiter = None;
         for rule in rules.iter() {
+            // Both exact built-in patterns require these three consecutive
+            // bytes. The closing-parenthesis rule otherwise runs a backtracking
+            // matcher on ordinary text during every remote-line hydration.
+            // Do not infer requirements from arbitrary user regex syntax: even
+            // an optional URL alternative could match without this delimiter.
+            if use_literal_prefilter
+                && matches!(
+                    rule.regex.as_str(),
+                    CLOSING_PARENTHESIS_HYPERLINK_PATTERN | GENERIC_HYPERLINK_PATTERN
+                )
+                && !*has_url_delimiter.get_or_insert_with(|| line.contains("://"))
+            {
+                continue;
+            }
             for capture_result in rule.regex.captures_iter(line) {
                 if let Ok(captures) = capture_result {
                     let m = Match { rule, captures };
@@ -219,6 +252,58 @@ impl Rule {
 mod test {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn literal_prefilter_preserves_urls_and_custom_non_url_matches() {
+        let rules = vec![
+            Rule::new(CLOSING_PARENTHESIS_HYPERLINK_PATTERN, "$0").unwrap(),
+            Rule::new(GENERIC_HYPERLINK_PATTERN, "$0").unwrap(),
+            Rule::with_highlight(r"(?:https?://\S+|issue-(\d+))", "issue:$1", 1).unwrap(),
+            Rule::new(r"\b\w+@[\w-]+(\.[\w-]+)+\b", "mailto:$0").unwrap(),
+        ];
+        for text in [
+            "Text reflow: ASCII ligatures ffi =>, 界面, e\u{301}, 🚀.",
+            "issue-123 user@example.com",
+            "http://example.com/(complete_parentheses)",
+            "界 https://example.com/(a)> ftp://host/path_ issue-456",
+            "http://example.com/(a)) http://example.com/end-",
+            ":/ :// :/// http: / /example.com",
+            "https://例子.测试/界面 🚀 issue-7",
+            "",
+        ] {
+            assert_eq!(
+                Rule::match_hyperlinks_impl(text, &rules, true),
+                Rule::match_hyperlinks_impl(text, &rules, false),
+                "literal prefilter changed matching for {:?}",
+                text,
+            );
+        }
+        assert_eq!(
+            Rule::match_hyperlinks("issue-123 user@example.com", &rules).len(),
+            2
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn literal_prefilter_matches_unfiltered_regex_on_generated_text(
+            prefix in ".{0,80}",
+            suffix in ".{0,80}",
+            include_url in proptest::bool::ANY,
+        ) {
+            let rules = vec![
+                Rule::new(CLOSING_PARENTHESIS_HYPERLINK_PATTERN, "$0").unwrap(),
+                Rule::new(GENERIC_HYPERLINK_PATTERN, "$0").unwrap(),
+                Rule::new(r"issue-\d+|https?://\S+", "$0").unwrap(),
+            ];
+            let middle = if include_url { "https://example.com/(path)" } else { "issue-17" };
+            let text = format!("{}{}{}", prefix, middle, suffix);
+            proptest::prop_assert_eq!(
+                Rule::match_hyperlinks_impl(&text, &rules, true),
+                Rule::match_hyperlinks_impl(&text, &rules, false),
+            );
+        }
+    }
 
     #[test]
     fn parse_implicit() {
