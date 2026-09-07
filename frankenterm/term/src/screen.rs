@@ -2978,36 +2978,6 @@ impl Screen {
         };
         let mut adjusted_cursor = (cursor_x, cursor_y);
         let wrapped_count = self.rewrap_row_prefix_scratch.last().copied().unwrap_or(0);
-        if let Some((logical_idx, logical_x)) = logical_cursor {
-            let num_lines = logical_x / physical_cols;
-            let last_x = logical_x - (num_lines * physical_cols);
-            let row_base = self
-                .rewrap_row_prefix_scratch
-                .get(logical_idx)
-                .copied()
-                .unwrap_or(wrapped_count);
-            adjusted_cursor = (last_x, row_base + num_lines);
-
-            // Special case: if the cursor lands in column zero within a
-            // logical line, retain its association with that wrapped line.
-            // A zero logical offset starts a distinct hard-newline row and
-            // must never be moved onto the preceding record.
-            // Put it back on the prior line. The cursor is now
-            // technically outside of the viewport width.
-            if logical_x > 0 && adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
-                if physical_cols < self.physical_cols {
-                    // getting smaller: preserve its original position
-                    // on the prior line
-                    adjusted_cursor.0 = cursor_x;
-                } else {
-                    // getting larger; we were most likely in column 1
-                    // or somewhere close. Jump to the end of the
-                    // prior line.
-                    adjusted_cursor.0 = physical_cols;
-                }
-                adjusted_cursor.1 -= 1;
-            }
-        }
 
         let required_capacity = estimated_capacity.max(physical_rows);
         let mut pruned_rows = 0usize;
@@ -3073,13 +3043,32 @@ impl Screen {
             }
         };
 
-        // If we resized narrower and generated additional lines,
-        // we may need to scroll the lines to make room.  However,
-        // if the bottom line(s) are whitespace, we'll prune those
-        // out first in the rewrap case so that we don't lose any
-        // real information off the top of the scrollback
+        // Map through the actual chosen rows, not logical_x / window_width.
+        // Wide graphemes and bounded wrap plans can leave a row underfull;
+        // division then shifts the cursor onto another grapheme or a spacer.
+        // A trailing virtual column remains on the last row of its record.
+        if let Some((logical_idx, mut remaining)) = logical_cursor {
+            if let (Some(&start), Some(&end)) = (
+                self.rewrap_row_prefix_scratch.get(logical_idx),
+                self.rewrap_row_prefix_scratch.get(logical_idx + 1),
+            ) {
+                for row in start..end {
+                    let row_len = self.lines[row].len();
+                    if remaining < row_len || row + 1 == end {
+                        adjusted_cursor = (remaining, row);
+                        break;
+                    }
+                    remaining -= row_len;
+                }
+            }
+        }
+
+        // Prune unused trailing blanks before allowing scrollback to grow,
+        // but retain the cursor's row even when it is an empty hard newline.
+        // Removing that row would leave the cursor outside the retained lines.
         let capacity = physical_rows + self.hot_scrollback_size();
         while self.lines.len() > capacity
+            && self.lines.len().saturating_sub(1) > adjusted_cursor.1
             && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
         {
             self.lines.pop_back();
@@ -6229,6 +6218,33 @@ mod tests {
                 assert_eq!(text, expected);
             });
             assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn reflow_cursor_tracks_actual_wide_grapheme_rows() {
+        let mut screen = test_screen(1, 6, 96);
+        screen.lines = VecDeque::from([Line::from_text(
+            "界界界",
+            &CellAttributes::default(),
+            1,
+            None,
+        )]);
+        // The cursor is on the third grapheme, not its trailing spacer.
+        let mut cursor = (4, 0);
+        for cols in [3, 5, 2, 4, 6, 3] {
+            cursor = screen.rewrap_lines(cols, 1, cursor.0, cursor.1, 2);
+            screen.physical_cols = cols;
+            assert_eq!(
+                screen.logical_cursor_from_physical(cursor.0, cursor.1),
+                Some((0, 4))
+            );
+            assert!(
+                screen.lines[cursor.1]
+                    .visible_cells()
+                    .any(|cell| cell.cell_index() == cursor.0),
+                "width {cols} mapped cursor {cursor:?} onto a spacer or past the line"
+            );
         }
     }
 
