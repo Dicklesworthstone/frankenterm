@@ -312,32 +312,39 @@ impl ConnectionUI {
 
         let (tx, rx) = unbounded();
         reservation
-            .spawn_local(async move {
-                if let Err(err) = termwiztermtab::run(
-                    params.size,
-                    params.window_id,
-                    move |term| {
-                        let mut ui = ConnectionUIImpl { term, rx };
-                        let status = ui.run().unwrap_or_else(|e| {
-                            log::error!("while running ConnectionUI loop: {:?}", e);
-                            CloseStatus::Implicit
-                        });
+            .handoff_to_main_thread_local(move |reservation| {
+                // Reconnect UI creation also runs on the client reader thread.
+                // Construct the thread-affine terminal future on its owner,
+                // retaining the admission already reserved by that caller.
+                reservation
+                    .spawn_local(async move {
+                        if let Err(err) = termwiztermtab::run(
+                            params.size,
+                            params.window_id,
+                            move |term| {
+                                let mut ui = ConnectionUIImpl { term, rx };
+                                let status = ui.run().unwrap_or_else(|e| {
+                                    log::error!("while running ConnectionUI loop: {:?}", e);
+                                    CloseStatus::Implicit
+                                });
 
-                        if !params.disable_close_delay && status == CloseStatus::Implicit {
-                            ui.sleep(
-                                "(this window will close automatically)",
-                                Duration::new(120, 0),
-                            )
-                            .ok();
+                                if !params.disable_close_delay && status == CloseStatus::Implicit {
+                                    ui.sleep(
+                                        "(this window will close automatically)",
+                                        Duration::new(120, 0),
+                                    )
+                                    .ok();
+                                }
+                                Ok(())
+                            },
+                            None,
+                        )
+                        .await
+                        {
+                            log::error!("connection UI task failed after admission: {err:#}");
                         }
-                        Ok(())
-                    },
-                    None,
-                )
-                .await
-                {
-                    log::error!("connection UI task failed after admission: {err:#}");
-                }
+                    })
+                    .detach();
             })
             .detach();
         Self {
@@ -577,6 +584,50 @@ pub fn show_configuration_error_message(err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn reconnect_ui_created_on_reader_thread_runs_on_gui_owner() {
+        let _guard = crate::MUX_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let ui = ConnectionUI::with_params(ConnectionUIParams {
+                size: TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    ..Default::default()
+                },
+                disable_close_delay: true,
+                window_id: None,
+            });
+            assert!(
+                ui.response_requires_main_thread,
+                "must exercise the GUI path"
+            );
+            let result = ui.sleep_with_reason("reconnect regression", Duration::ZERO);
+            ui.close();
+            reply_tx.send(result).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            executor.try_tick().expect("poll GUI tasks on their owner");
+            if let Ok(result) = reply_rx.try_recv() {
+                result.expect("the real connection UI must service the reader's request");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connection UI did not reply"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        reader.join().expect("reconnect reader must finish");
+        while executor.try_tick().expect("drain GUI cleanup") {}
+        Mux::shutdown();
+    }
 
     #[test]
     fn split_multi_line_prompt_single_line() {

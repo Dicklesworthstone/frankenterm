@@ -5681,6 +5681,38 @@ fn legacy46_serialized_lines_are_text_only(lines: &SerializedLines) -> bool {
         })
 }
 
+fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLines, Error> {
+    match lines.validate_structure() {
+        Ok(_) => return Ok(lines),
+        Err(SerializedLinesStructureError::DuplicateStableRow) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Legacy GetLines clips each requested range independently. Disjoint
+    // ranges outside retained scrollback can therefore return the same rows.
+    // Validate every positional reference before hydration or deduplication;
+    // only identical rendered rows (including hyperlinks) may collapse.
+    lines.validate_references(false)?;
+    let (hydrated, images) = lines.extract_data();
+    anyhow::ensure!(
+        images.is_empty(),
+        "legacy text normalization cannot hydrate images"
+    );
+    let mut indices = HashMap::with_capacity(hydrated.len());
+    let mut unique = Vec::with_capacity(hydrated.len());
+    for (row, line) in hydrated {
+        if let Some(&index) = indices.get(&row) {
+            let (_, previous): &(StableRowIndex, Line) = &unique[index];
+            if previous != &line {
+                return Err(SerializedLinesStructureError::DuplicateStableRow.into());
+            }
+        } else {
+            indices.insert(row, unique.len());
+            unique.push((row, line));
+        }
+    }
+    Ok(SerializedLines::from(unique))
+}
+
 fn unsupported_mux_wire_payload(
     ident: u64,
     reason: MuxWireUnsupportedReason,
@@ -5734,16 +5766,17 @@ fn decode_materialized_for_dialect(
                 MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES,
             )?),
             23 => {
-                let response: GetLinesResponse = deserialize_exact_payload_with_limit(
+                let mut response: GetLinesResponse = deserialize_exact_payload_with_limit(
                     decoded.data.as_slice(),
                     decoded.is_compressed,
                     "Legacy46GetLinesResponse",
                     MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
                 )?;
-                response.lines.validate_structure()?;
                 if legacy46_serialized_lines_are_text_only(&response.lines) {
+                    response.lines = normalize_legacy46_text_lines(response.lines)?;
                     MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))
                 } else {
+                    response.lines.validate_structure()?;
                     unsupported_mux_wire_payload(
                         ident,
                         MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
@@ -15636,10 +15669,17 @@ impl SerializedLines {
     pub fn validate_structure(
         &self,
     ) -> Result<SerializedLinesResourceCounts, SerializedLinesStructureError> {
+        self.validate_references(true)
+    }
+
+    fn validate_references(
+        &self,
+        reject_duplicate_rows: bool,
+    ) -> Result<SerializedLinesResourceCounts, SerializedLinesStructureError> {
         let mut line_lengths = HashMap::with_capacity(self.lines.len());
         let mut cells = 0usize;
         for (stable_row, line) in &self.lines {
-            if line_lengths.insert(*stable_row, line.len()).is_some() {
+            if line_lengths.insert(*stable_row, line.len()).is_some() && reject_duplicate_rows {
                 return Err(SerializedLinesStructureError::DuplicateStableRow);
             }
             cells = cells
@@ -28171,6 +28211,82 @@ mod test {
                 .contains("exact render metadata UTF-8 bytes length 65537 exceeds maximum 65536"),
             "unexpected v46 pane-title error: {:#}",
             error
+        );
+    }
+
+    #[test]
+    fn legacy46_clipped_ranges_collapse_identical_rows_and_preserve_links() {
+        let link = Arc::new(Hyperlink::new_implicit("https://example.com/legacy"));
+        let mut attrs = termwiz::cell::CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::clone(&link)));
+        let first = Line::from_text("first", &attrs, 1, None);
+        let second = Line::from_text("second", &attrs, 1, None);
+        let expected = vec![(1933, first.clone()), (1934, second.clone())];
+        let lines = SerializedLines::from(vec![
+            (1933, first.clone()),
+            (1934, second.clone()),
+            (1933, first),
+            (1934, second),
+        ]);
+        assert_eq!(
+            lines.validate_structure(),
+            Err(SerializedLinesStructureError::DuplicateStableRow),
+            "the current strict structure contract must still reject duplicates"
+        );
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let wire = Pdu::GetLinesResponse(GetLinesResponse {
+                pane_id: 17,
+                lines: lines.clone(),
+            })
+            .encode_frame_with_mode(4, mode)
+            .expect("encode legacy repeated-range response");
+            let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+                .expect("legacy duplicate rows are identical after hyperlink hydration");
+            let (_, MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))) =
+                decoded.into_parts()
+            else {
+                panic!("text response must remain available");
+            };
+            assert_eq!(response.pane_id, 17);
+            let (actual, images) = response.lines.extract_data_checked().unwrap();
+            assert_eq!(actual, expected);
+            assert!(images.is_empty());
+            let first_cell = actual[0].1.get_cell(0).unwrap();
+            let second_cell = actual[1].1.get_cell(0).unwrap();
+            let first_link = first_cell.attrs().hyperlink().unwrap();
+            let second_link = second_cell.attrs().hyperlink().unwrap();
+            assert!(Arc::ptr_eq(first_link, second_link));
+        }
+    }
+
+    #[test]
+    fn legacy46_duplicate_rows_reject_conflicting_text_links_and_invalid_references() {
+        let mut attrs = termwiz::cell::CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/a",
+        ))));
+        let first = Line::from_text("first", &attrs, 1, None);
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/b",
+        ))));
+        for conflicting in [
+            Line::from_text("other", &attrs, 1, None),
+            Line::from_text("first", &attrs, 1, None),
+        ] {
+            let lines = SerializedLines::from(vec![(5, first.clone()), (5, conflicting)]);
+            let error = normalize_legacy46_text_lines(lines).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<SerializedLinesStructureError>(),
+                Some(&SerializedLinesStructureError::DuplicateStableRow)
+            );
+        }
+        let mut lines = SerializedLines::from(vec![(5, first.clone()), (5, first)]);
+        lines.hyperlinks[0].coords[1].line_idx = 2;
+        let error = normalize_legacy46_text_lines(lines).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SerializedLinesStructureError>(),
+            Some(&SerializedLinesStructureError::HyperlinkLineOutOfRange),
+            "deduplication must never erase a malformed positional reference"
         );
     }
 

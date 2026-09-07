@@ -7017,15 +7017,7 @@ fn commit_batch_with_byte_limit(
 
 static GLOBAL_WRITER: OnceLock<Result<PersistenceWriter, PersistenceFailure>> = OnceLock::new();
 static STARTUP_SNAPSHOT: OnceLock<StartupRestoreCache> = OnceLock::new();
-static NAMESPACE_MIGRATION_FAILURE: OnceLock<PersistenceFailure> = OnceLock::new();
-
-fn same_window_state_payload(left: &PersistedState, right: &PersistedState) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    left.store_revision = 0;
-    right.store_revision = 0;
-    left == right
-}
+static NAMESPACE_MIGRATION_RESULT: OnceLock<Result<(), PersistenceFailure>> = OnceLock::new();
 
 fn migrate_legacy_window_state_at(
     legacy_primary: &Path,
@@ -7102,14 +7094,9 @@ fn migrate_legacy_window_state_at_with_interruption(
     };
     let canonical = load_authoritative_unlocked(canonical_primary)?;
     if canonical.source != StoreSource::Empty {
-        let legacy = load_authoritative_unlocked(legacy_primary)?;
-        if legacy.source != StoreSource::Empty
-            && !same_window_state_payload(&canonical.state, &legacy.state)
-        {
-            return Err(PersistenceFailure::corrupt(
-                "canonical and legacy window-state authorities diverge",
-            ));
-        }
+        // Migration seeds an absent FrankenTerm authority once. Subsequent
+        // geometry changes naturally diverge from the retained WezTerm copy;
+        // that read-only migration input cannot invalidate the current store.
         return Ok(false);
     }
 
@@ -7165,30 +7152,20 @@ fn migrate_legacy_window_state_if_needed() -> Result<(), PersistenceFailure> {
 }
 
 fn migration_result_from<F>(
-    failure_fence: &OnceLock<PersistenceFailure>,
+    result: &OnceLock<Result<(), PersistenceFailure>>,
     migrate: F,
 ) -> Result<(), PersistenceFailure>
 where
     F: FnOnce() -> Result<(), PersistenceFailure>,
 {
-    if let Some(failure) = failure_fence.get() {
-        return Err(failure.clone());
-    }
-    match migrate() {
-        Ok(()) => match failure_fence.get() {
-            Some(failure) => Err(failure.clone()),
-            None => Ok(()),
-        },
-        Err(failure) => {
-            let _ = failure_fence.set(failure.clone());
-            Err(failure_fence.get().cloned().unwrap_or(failure))
-        }
-    }
+    // Both outcomes are process-wide. Rechecking a successful migration from
+    // every resize callback would reopen, lock and parse both disk journals.
+    result.get_or_init(migrate).clone()
 }
 
 fn ensure_legacy_window_state_migrated() -> Result<(), PersistenceFailure> {
     migration_result_from(
-        &NAMESPACE_MIGRATION_FAILURE,
+        &NAMESPACE_MIGRATION_RESULT,
         migrate_legacy_window_state_if_needed,
     )
 }
@@ -7446,7 +7423,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_migration_success_is_rechecked_until_a_failure_is_pinned() {
+    fn namespace_migration_success_avoids_repeated_disk_work() {
         let fence = OnceLock::new();
         let calls = AtomicUsize::new(0);
         for _ in 0..2 {
@@ -7454,9 +7431,9 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
-            .expect("successful namespace checks remain live");
+            .expect("successful namespace migration remains cached");
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -7514,10 +7491,29 @@ mod tests {
             !migrate_legacy_window_state_at(&legacy, &canonical)
                 .expect("repeated migration is idempotent")
         );
+        let mut resized = PendingBatch::default();
+        resized
+            .queue_window_state(
+                "migration-workspace".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .unwrap();
+        commit_for_test(&canonical, &resized, WriteInterruption::None).unwrap();
+        assert!(!migrate_legacy_window_state_at(&legacy, &canonical).unwrap());
+        assert!(
+            load_snapshot_at(&canonical).unwrap().window_states["migration-workspace"].fullscreen
+        );
+        assert_eq!(
+            load_snapshot_at(&legacy).unwrap().window_states,
+            legacy_before.window_states
+        );
     }
 
     #[test]
-    fn divergent_window_state_authorities_fail_closed_without_overwrite() {
+    fn divergent_window_state_namespaces_preserve_the_canonical_authority() {
         let fixture = tempfile::tempdir().expect("window-state divergence fixture");
         let legacy = fixture.path().join("wezterm").join("window-state.json");
         let canonical = fixture.path().join("frankenterm").join("window-state.json");
@@ -7536,14 +7532,20 @@ mod tests {
                 .expect("publish divergent authority");
         }
 
-        assert!(migrate_legacy_window_state_at(&legacy, &canonical).is_err());
+        assert!(!migrate_legacy_window_state_at(&legacy, &canonical).unwrap());
         let canonical_after = load_snapshot_at(&canonical).expect("load canonical authority");
         assert!(canonical_after.window_states.contains_key("canonical"));
         assert!(!canonical_after.window_states.contains_key("legacy"));
+        assert!(
+            load_snapshot_at(&legacy)
+                .unwrap()
+                .window_states
+                .contains_key("legacy")
+        );
     }
 
     #[test]
-    fn completed_window_state_migration_rejects_later_legacy_divergence() {
+    fn completed_window_state_migration_preserves_independent_later_writes() {
         let fixture = tempfile::tempdir().expect("window-state late divergence fixture");
         let legacy = fixture.path().join("wezterm").join("window-state.json");
         let canonical = fixture.path().join("frankenterm").join("window-state.json");
@@ -7577,7 +7579,9 @@ mod tests {
         commit_for_test(&legacy, &later, WriteInterruption::None)
             .expect("publish later legacy divergence");
 
-        assert!(migrate_legacy_window_state_at(&legacy, &canonical).is_err());
+        commit_for_test(&canonical, &initial, WriteInterruption::None)
+            .expect("canonical writer advances after migration");
+        assert!(!migrate_legacy_window_state_at(&legacy, &canonical).unwrap());
         let canonical_after = load_snapshot_at(&canonical).expect("load retained canonical state");
         assert!(
             !canonical_after

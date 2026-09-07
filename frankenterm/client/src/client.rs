@@ -1542,12 +1542,21 @@ impl RpcProtocolAuthority {
         let codec_response = spec.ident == <GetCodecVersionResponse as PduWireIdent>::IDENT;
         let unit_response = spec.ident == <UnitResponse as PduWireIdent>::IDENT;
         let error_response = spec.ident == <ErrorResponse as PduWireIdent>::IDENT;
+        // Codec 46 servers can push notifications between the version reply
+        // and SetClientId. Admit only the negotiated legacy unilateral surface;
+        // the reader's bounded pre-ready queue retains it until registration
+        // and topology publication finish. Current peers keep the stricter
+        // registration contract, and no correlated reply gains authority here.
+        let legacy_notification = role == PduWireRole::Unilateral
+            && self.codec.is_some_and(|codec| codec.dialect.is_legacy46());
         let phase_authorized = match self.phase {
             RpcProtocolPhase::AwaitingCodecResponse => codec_response || error_response,
-            RpcProtocolPhase::AwaitingRegistrationResponse => unit_response || error_response,
+            RpcProtocolPhase::AwaitingRegistrationResponse => {
+                unit_response || error_response || legacy_notification
+            }
             RpcProtocolPhase::Established => !codec_response,
-            RpcProtocolPhase::AwaitingCodecRequest
-            | RpcProtocolPhase::AwaitingRegistrationRequest => false,
+            RpcProtocolPhase::AwaitingRegistrationRequest => legacy_notification,
+            RpcProtocolPhase::AwaitingCodecRequest => false,
         };
         if !phase_authorized {
             return Err(OrdinaryMuxProtocolError::PhaseViolation {
@@ -12534,6 +12543,23 @@ mod tests {
                 .context("encode exact codec-46 version response")?;
                 Write::write_all(&mut server_stream, &version_frame)
                     .context("write exact codec-46 version response")?;
+                // Old servers publish topology notifications before replying
+                // to SetClientId. They must enter the bounded pre-ready queue,
+                // without bypassing the negotiated schema or readiness fence.
+                let title_frame = Pdu::WindowTitleChanged(WindowTitleChanged {
+                    window_id: 0,
+                    title: "legacy pre-registration title".to_string(),
+                })
+                .prepare_outbound_for_dialect(
+                    MuxWireDialect::LEGACY46,
+                    PduProducer::Server,
+                    PduWireRole::Unilateral,
+                    None,
+                    CompressionMode::Never,
+                )?
+                .encode_frame(0)?;
+                Write::write_all(&mut server_stream, &title_frame)
+                    .context("write legacy notification before registration")?;
                 Write::flush(&mut server_stream)
                     .context("flush exact codec-46 version response")?;
 
@@ -15876,6 +15902,61 @@ mod tests {
                     "registry inactive rejection must leave its body unread"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn legacy_bootstrap_admits_notifications_to_bounded_pre_ready_queue() {
+        let rpc_transport = RpcTransportState::new();
+        let generation = rpc_transport.active_generation().unwrap();
+        let title = Pdu::WindowTitleChanged(WindowTitleChanged {
+            window_id: 42,
+            title: "legacy startup".to_string(),
+        });
+        let wire = title
+            .clone()
+            .prepare_outbound_for_dialect(
+                MuxWireDialect::LEGACY46,
+                PduProducer::Server,
+                PduWireRole::Unilateral,
+                None,
+                CompressionMode::Never,
+            )
+            .unwrap()
+            .encode_frame(0)
+            .unwrap();
+        for phase in [
+            RpcProtocolPhase::AwaitingRegistrationRequest,
+            RpcProtocolPhase::AwaitingRegistrationResponse,
+        ] {
+            let mut protocol =
+                RpcProtocolAuthority::established_for_test(generation, LEGACY46_CODEC_VERSION);
+            protocol.phase = phase;
+            rpc_transport.lifecycle.lock().protocol = Some(protocol);
+            let mut reader = std::io::Cursor::new(&wire);
+            let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
+                &mut reader,
+                None,
+                |header| {
+                    validate_ordinary_mux_inbound_header(&rpc_transport, generation, header, 1)?;
+                    Ok(PduBodyDisposition::Materialize)
+                },
+            ))
+            .expect("negotiated legacy notification must pass header admission");
+            let AsyncPduDecode::Decoded(decoded) = decoded else {
+                panic!("legacy title must be materialized");
+            };
+            assert_eq!(decoded.pdu, title);
+            let mut queue = PreReadyUnilateralQueue::default();
+            queue
+                .enqueue(decoded, 0, 0)
+                .expect("retain until readiness");
+            assert_eq!(queue.waiting.len(), 1);
+            assert!(queue.waiting_bytes > 0);
+            assert_eq!(
+                rpc_transport.ready_generation.load(AtomicOrdering::Acquire),
+                0
+            );
         }
     }
 
