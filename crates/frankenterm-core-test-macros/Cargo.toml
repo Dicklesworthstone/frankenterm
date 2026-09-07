@@ -9,7 +9,7 @@ publish = false
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full", "parsing"] }
+syn = { version = "3", features = ["full", "parsing"] }
 proc-macro2 = "1"
 quote = "1"
 
