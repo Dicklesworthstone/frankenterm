@@ -2605,6 +2605,30 @@ impl LocalPane {
         }
     }
 
+    fn prepare_resize_reflow(
+        terminal: &Mutex<Terminal>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<Vec<Action>>,
+        size: TerminalSize,
+        is_cancelled: impl Fn() -> bool,
+    ) -> (Option<frankenterm_term::ScreenReflowPreparation>, Duration) {
+        let capture_start = Instant::now();
+        let mut prepared = {
+            let terminal = terminal.lock();
+            #[cfg(feature = "disruptor-pane-io")]
+            let mut terminal = terminal;
+            #[cfg(feature = "disruptor-pane-io")]
+            Self::drain_action_ring_into(action_ring, &mut terminal);
+            terminal.capture_reflow_preparation(size)
+        };
+        let capture_elapsed = capture_start.elapsed();
+        if let Some(work) = prepared.as_mut() {
+            if !work.prepare(is_cancelled) {
+                prepared = None;
+            }
+        }
+        (prepared, capture_elapsed)
+    }
+
     fn apply_resize_sync(
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
@@ -2771,6 +2795,39 @@ impl LocalPane {
             });
         }
 
+        // Capture COW lines and a shared logical cache, then perform the costly
+        // wrap planning/materialization without either admission or terminal
+        // locks. The live resize below validates the exact source before reuse.
+        // One existing pane worker owns this work; newer intents cancel it at
+        // bounded batch boundaries and still pass the final commit barrier.
+        let reflow_prepare_start = Instant::now();
+        static DISABLE_PREPARATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let (mut prepared_reflow, reflow_capture_elapsed) =
+            if *DISABLE_PREPARATION.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_PREPARED_REFLOW").is_some_and(|value| value == "1")
+            }) {
+                (None, Duration::ZERO)
+            } else {
+                Self::prepare_resize_reflow(
+                    terminal,
+                    #[cfg(feature = "disruptor-pane-io")]
+                    action_ring,
+                    size,
+                    || resize_queue.lock().superseded_by(token).is_some(),
+                )
+            };
+        log::trace!(
+            "LocalPane::resize prepare pane_id={} seq={} capture_us={} prepare_us={} ready={}",
+            pane_id,
+            token.seq,
+            reflow_capture_elapsed.as_micros(),
+            reflow_prepare_start
+                .elapsed()
+                .saturating_sub(reflow_capture_elapsed)
+                .as_micros(),
+            prepared_reflow.is_some(),
+        );
+
         let terminal_apply_lock_start = Instant::now();
         let mut terminal = terminal.lock();
         #[cfg(feature = "disruptor-pane-io")]
@@ -2782,9 +2839,26 @@ impl LocalPane {
                     return Duration::default();
                 }
                 let terminal_resize_start = Instant::now();
-                terminal.resize(size);
+                terminal.resize_with_prepared_reflow(size, prepared_reflow.as_mut());
                 terminal_resize_start.elapsed()
             });
+        drop(terminal);
+        if let Some(prepared) = prepared_reflow.as_ref() {
+            metrics::counter!(
+                "mux.localpane.resize.prepared_reflow",
+                "outcome" => if prepared.was_applied() { "applied" } else { "not_applied" },
+            )
+            .increment(1);
+            log::trace!(
+                "LocalPane::resize prepared_commit pane_id={} seq={} applied={}",
+                pane_id,
+                token.seq,
+                prepared.was_applied(),
+            );
+        }
+        // Cache replacement and cancelled snapshots can retire large histories.
+        // Their last references must not be destroyed under either UI lock.
+        drop(prepared_reflow);
         let terminal_resize_elapsed = match commit_decision {
             ResizeCommitDecision::Committed(elapsed) => elapsed,
             ResizeCommitDecision::Superseded {
@@ -4876,6 +4950,59 @@ mod tests {
         assert_eq!(retained.apply_error_retries, 0);
         assert!(queue.worker_running);
         assert_ne!(initial.seq, newer.seq);
+    }
+
+    #[test]
+    fn resize_preparation_releases_locks_and_observes_supersession() {
+        let terminal = Mutex::new(test_terminal(term_size(80, 3)));
+        terminal
+            .lock()
+            .advance_bytes(b"a long logical line that needs wrapping\r\nsecond line");
+        let queue = Mutex::new(ResizeQueueState::default());
+        let target = term_size(8, 3);
+        let initial = queue.lock().enqueue(target, pty_size(8, 3), Instant::now());
+        queue.lock().dequeue_for_worker();
+        let checks = std::cell::Cell::new(0);
+        #[cfg(feature = "disruptor-pane-io")]
+        let action_ring = ArrayQueue::new(4);
+        let (prepared, _) = LocalPane::prepare_resize_reflow(
+            &terminal,
+            #[cfg(feature = "disruptor-pane-io")]
+            &action_ring,
+            target,
+            || {
+                assert!(
+                    terminal.try_lock().is_some(),
+                    "preparation must release the terminal lock"
+                );
+                let mut queue = queue
+                    .try_lock()
+                    .expect("preparation must release admission");
+                checks.set(checks.get() + 1);
+                if checks.get() == 3 {
+                    queue.enqueue(term_size(120, 3), pty_size(120, 3), Instant::now());
+                }
+                queue
+                    .superseded_by(ResizeCancellationToken::new(initial.seq))
+                    .is_some()
+            },
+        );
+        assert!(
+            prepared.is_none(),
+            "a superseded preparation must not be installed"
+        );
+        assert_eq!(
+            checks.get(),
+            3,
+            "exercise cancellation after source capture"
+        );
+        let mut terminal = terminal.lock();
+        let (decision, _) =
+            with_resize_commit_barrier(&queue, ResizeCancellationToken::new(initial.seq), || {
+                terminal.resize(target)
+            });
+        assert!(matches!(decision, ResizeCommitDecision::Superseded { .. }));
+        assert_eq!(terminal.get_size(), term_size(80, 3));
     }
 
     #[test]
