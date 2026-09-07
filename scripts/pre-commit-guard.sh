@@ -39,9 +39,9 @@ if [ "$TOTAL_DELETIONS" -gt 50 ]; then
     exit 1
 fi
 
-# Chain to the Beads hook when it is installed.
+# br has no `hooks run` subcommand. Export through its supported CLI without
+# staging anything (including when the caller uses a private Git index).
+# Keep export failures visible and fail the commit rather than hide stale tasks.
 if command -v br >/dev/null 2>&1; then
-    br hooks run pre-commit "$@" 2>/dev/null || true
-elif command -v bd >/dev/null 2>&1; then
-    bd hooks run pre-commit "$@" 2>/dev/null || true
+    br sync --flush-only
 fi
