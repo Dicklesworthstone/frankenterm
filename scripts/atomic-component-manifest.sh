@@ -445,7 +445,9 @@ class AnchoredRoot:
                             marker_records.append(decode_marker(match))
                             if len(marker_records) > 1:
                                 fail(
-                                    "component_identity_mismatch",
+                                    "duplicate_component_identity_marker"
+                                    if marker_records[0] == marker_records[1]
+                                    else "component_identity_mismatch",
                                     f"component {relative} contains more than one atomic identity record",
                                     path=relative,
                                     found=marker_records,

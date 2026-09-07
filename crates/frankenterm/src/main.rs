@@ -118096,12 +118096,31 @@ cat "$FAKE_FONT_ARCHIVE"
         );
         assert!(app.contains("before-app-selector-switch"));
         assert!(app.contains("after-app-selector-switch"));
+        let production_guard = app
+            .find(
+                "if [ \"${FT_INSTALL_TEST_LIBRARY_ONLY:-0}\" != 1 ] || \\\n     [ \"${FT_INSTALL_TEST_ALLOW_APP_SELECTOR:-0}\" != 1 ]; then",
+            )
+            .expect("production app activation requires both explicit test-only flags");
+        let production_guard_end = app[production_guard..]
+            .find("\n  fi")
+            .map(|offset| production_guard + offset)
+            .expect("production app activation guard end");
+        let pending_guard = &app[production_guard..production_guard_end];
+        assert!(pending_guard.contains("APP_RECEIPT_READINESS=\"not_run\""));
+        assert!(pending_guard.contains(
+            "mark_app_pending cross_launcher_lifecycle_unproven \"$staged_app\" \"$app_id\""
+        ));
+        assert!(
+            pending_guard.trim_end().ends_with("return"),
+            "production app installation must return with a verified pending candidate"
+        );
         let readiness = app
-            .find("Running non-activating native readiness proof")
-            .expect("pre-switch native readiness proof");
+            .find("Running test-only non-activating native readiness proof")
+            .expect("test-only pre-switch native readiness proof");
         let selector_switch = app
             .find("installer_failpoint before-app-selector-switch")
             .expect("app selector switch boundary");
+        assert!(production_guard_end < readiness);
         assert!(readiness < selector_switch);
         assert!(app.contains("FRANKENTERM_ATOMIC_MANIFEST_TOOL=\"$staged_verifier\""));
         assert!(app.contains(
@@ -121789,12 +121808,21 @@ printf x > "$MINISIGN_MARKER"
             .output()
             .expect("execute duplicate-marker manifest generator");
         assert!(!rejected.status.success());
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr)
-                .contains("duplicate_component_identity_marker"),
-            "unexpected duplicate-marker rejection: {}",
-            String::from_utf8_lossy(&rejected.stderr)
+        let rejection: serde_json::Value = serde_json::from_slice(&rejected.stderr)
+            .expect("structured duplicate-marker rejection");
+        assert_eq!(rejection["ok"], false);
+        assert_eq!(
+            rejection["error"]["code"],
+            "duplicate_component_identity_marker"
         );
+        assert_eq!(rejection["error"]["path"], "ft");
+        let found = rejection["error"]["found"]
+            .as_array()
+            .expect("rejected component identity records");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], found[1]);
+        assert_eq!(found[0]["build_id"], build_id);
+        assert_eq!(found[0]["component"], "ft");
         assert!(!manifest.exists());
     }
 

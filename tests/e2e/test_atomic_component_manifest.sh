@@ -808,6 +808,24 @@ cat "$DUPLICATE_RECORD/package/bin/frankenterm-gui" >> "$DUPLICATE_RECORD/packag
 expect_failure component_identity_mismatch "$DUPLICATE_RECORD/error.log" \
   generate_fixture "$DUPLICATE_RECORD"
 
+# Two copies of the same complete record are also invalid. Keep this distinct
+# from a foreign component/build marker and from a parser's bare prefix literal.
+IDENTICAL_RECORD="$TEST_ROOT/identical-identity-record"
+make_fixture "$IDENTICAL_RECORD"
+printf 'FT_ATOMIC_COMPONENT_IDENTITY_V1:%s:ft:%s:%s:%s;\n' \
+  "$BUILD_A" "$TARGET" "$PROFILE" "$VERSION" >> "$IDENTICAL_RECORD/package/bin/ft"
+expect_failure duplicate_component_identity_marker "$IDENTICAL_RECORD/error.log" \
+  generate_fixture "$IDENTICAL_RECORD"
+jq -e --arg build "$BUILD_A" '
+  .ok == false
+  and .error.path == "bin/ft"
+  and (.error.found | length) == 2
+  and .error.found[0] == .error.found[1]
+  and .error.found[0].build_id == $build
+  and .error.found[0].component == "ft"
+' "$IDENTICAL_RECORD/error.log" >/dev/null
+test ! -e "$IDENTICAL_RECORD/manifest.json"
+
 # Inert Git objects supply source authority without a second project checkout.
 SOURCE_OBJECTS="$TEST_ROOT/source-objects.git"
 SOURCE_ARCHIVE="$TEST_ROOT/source-archive"
