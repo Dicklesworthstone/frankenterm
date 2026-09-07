@@ -98,6 +98,158 @@ mod font_id_tests {
     }
 }
 
+#[cfg(test)]
+mod scale_font_tests {
+    use super::*;
+
+    fn fonts(dpi: usize) -> FontConfiguration {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, dpi).unwrap();
+        assert_eq!(
+            fonts.config().font_locator,
+            config::FontLocatorSelection::ConfigDirsOnly
+        );
+        fonts
+    }
+
+    fn glyph_pixels(font: &LoadedFont, infos: &[GlyphInfo]) -> Vec<RasterizedGlyph> {
+        infos
+            .iter()
+            .map(|info| font.rasterize_glyph(info.glyph_pos, info.font_idx).unwrap())
+            .collect()
+    }
+
+    fn assert_same_pixels(expected: &[RasterizedGlyph], actual: &[RasterizedGlyph]) {
+        assert_eq!(expected.len(), actual.len());
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert_eq!(expected.data, actual.data);
+            assert_eq!(expected.width, actual.width);
+            assert_eq!(expected.height, actual.height);
+            assert_eq!(expected.bearing_x, actual.bearing_x);
+            assert_eq!(expected.bearing_y, actual.bearing_y);
+            assert_eq!(expected.has_color, actual.has_color);
+            assert_eq!(expected.is_scaled, actual.is_scaled);
+        }
+    }
+
+    #[test]
+    fn returning_to_previous_scale_reuses_fonts_with_fresh_glyph_parity() {
+        let fonts = fonts(96);
+        let original = fonts.default_font().unwrap();
+        let text = "ffi != => e\u{301} W0123456789";
+        let expected = original
+            .blocking_shape(text, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        let expected_pixels = glyph_pixels(&original, &expected);
+        fonts.change_scaling(1.25, 96);
+        let enlarged = fonts.default_font().unwrap();
+        assert_ne!(original.metrics(), enlarged.metrics());
+        fonts.change_scaling(1.0, 96);
+        let restored = fonts.default_font().unwrap();
+        assert!(
+            Rc::ptr_eq(&original, &restored),
+            "returning to the previous scale must retain the already loaded font faces"
+        );
+        assert_eq!(
+            restored
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap(),
+            expected
+        );
+        let fresh = FontConfiguration::new(Some(fonts.config()), 96).unwrap();
+        assert_eq!(restored.metrics(), fresh.default_font().unwrap().metrics());
+        assert_same_pixels(&expected_pixels, &glyph_pixels(&restored, &expected));
+        assert_same_pixels(
+            &expected_pixels,
+            &glyph_pixels(&fresh.default_font().unwrap(), &expected),
+        );
+        assert_eq!(
+            restored
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap(),
+            fresh
+                .default_font()
+                .unwrap()
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn unchanged_scale_preserves_fonts_and_entity_zoom_ignores_terminal_scale() {
+        let fonts = fonts(96);
+        let original = fonts.default_font().unwrap();
+        let title = fonts.title_font().unwrap();
+        fonts.change_scaling(1.0, 96);
+        assert!(Rc::ptr_eq(&original, &fonts.default_font().unwrap()));
+        fonts.change_scaling(1.25, 96);
+        assert!(Rc::ptr_eq(&title, &fonts.title_font().unwrap()));
+    }
+
+    #[test]
+    fn dpi_change_refreshes_every_entity_font_against_fresh_metrics() {
+        let fonts = fonts(96);
+        let before = [
+            fonts.title_font().unwrap(),
+            fonts.command_palette_font().unwrap(),
+            fonts.char_select_font().unwrap(),
+            fonts.pane_select_font().unwrap(),
+        ];
+        fonts.change_scaling(1.0, 144);
+        let after = [
+            fonts.title_font().unwrap(),
+            fonts.command_palette_font().unwrap(),
+            fonts.char_select_font().unwrap(),
+            fonts.pane_select_font().unwrap(),
+        ];
+        let fresh = FontConfiguration::new(Some(fonts.config()), 144).unwrap();
+        let expected = [
+            fresh.title_font().unwrap(),
+            fresh.command_palette_font().unwrap(),
+            fresh.char_select_font().unwrap(),
+            fresh.pane_select_font().unwrap(),
+        ];
+        for ((before, after), expected) in before.iter().zip(&after).zip(&expected) {
+            assert!(!Rc::ptr_eq(before, after));
+            assert_ne!(before.metrics(), after.metrics());
+            assert_eq!(after.metrics(), expected.metrics());
+            assert_eq!(after.dpi, 144);
+        }
+    }
+
+    #[test]
+    fn configuration_reload_discards_active_and_previous_scale_fonts() {
+        let fonts = fonts(96);
+        let old_base = Rc::downgrade(&fonts.default_font().unwrap());
+        fonts.change_scaling(1.25, 96);
+        let old_zoom = Rc::downgrade(&fonts.default_font().unwrap());
+        fonts.config_changed(&fonts.config()).unwrap();
+        assert!(old_base.upgrade().is_none());
+        assert!(old_zoom.upgrade().is_none());
+        fonts.change_scaling(1.0, 96);
+        let fresh = FontConfiguration::new(Some(fonts.config()), 96).unwrap();
+        assert_eq!(
+            fonts.default_font().unwrap().metrics(),
+            fresh.default_font().unwrap().metrics()
+        );
+    }
+
+    #[test]
+    fn scale_history_retains_only_the_immediately_previous_set() {
+        let fonts = fonts(96);
+        let original = Rc::downgrade(&fonts.default_font().unwrap());
+        fonts.change_scaling(1.25, 96);
+        let zoom = Rc::downgrade(&fonts.default_font().unwrap());
+        assert!(original.upgrade().is_some());
+        fonts.change_scaling(1.5, 96);
+        let _current = fonts.default_font().unwrap();
+        assert!(original.upgrade().is_none());
+        assert!(zoom.upgrade().is_some());
+        fonts.change_scaling(1.75, 96);
+        assert!(zoom.upgrade().is_none());
+    }
+}
+
 lazy_static::lazy_static! {
     static ref LAST_WARNING: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
 }
@@ -524,8 +676,29 @@ enum Entity {
     PaneSelect,
 }
 
+// Keep only the immediately preceding scale, and decline to retain an unusually
+// large style set. Cmd +/- reversals can reuse initialized fallback faces without
+// accumulating font engines for every size visited during a long zoom sequence.
+const MAX_RETAINED_SCALE_STYLES: usize = 64;
+
+struct PreviousScaleFonts {
+    scale: f64,
+    dpi: usize,
+    fonts: HashMap<TextStyle, Rc<LoadedFont>>,
+    metrics: Option<FontMetrics>,
+}
+
+fn reuse_previous_scale_fonts() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_SCALE_FONT_REUSE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 struct FontConfigInner {
     fonts: RefCell<HashMap<TextStyle, Rc<LoadedFont>>>,
+    previous_scale_fonts: RefCell<Option<PreviousScaleFonts>>,
     metrics: RefCell<Option<FontMetrics>>,
     dpi: RefCell<usize>,
     font_scale: RefCell<f64>,
@@ -552,6 +725,7 @@ impl FontConfigInner {
         let locator = new_locator(config.font_locator);
         Ok(Self {
             fonts: RefCell::new(HashMap::new()),
+            previous_scale_fonts: RefCell::new(None),
             locator,
             metrics: RefCell::new(None),
             title_font: RefCell::new(None),
@@ -572,6 +746,7 @@ impl FontConfigInner {
         *self.config.borrow_mut() = config.clone();
         // Config was reloaded, invalidate our caches
         fonts.clear();
+        self.previous_scale_fonts.borrow_mut().take();
         self.title_font.borrow_mut().take();
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
@@ -1028,11 +1203,44 @@ impl FontConfigInner {
         let prior_font = *self.font_scale.borrow();
         let prior_dpi = *self.dpi.borrow();
 
+        if prior_font == font_scale && prior_dpi == dpi {
+            return (prior_font, prior_dpi);
+        }
+
+        let mut fonts = self.fonts.borrow_mut();
+        let mut metrics = self.metrics.borrow_mut();
+        let mut previous = self.previous_scale_fonts.borrow_mut();
+        let restored = previous
+            .take()
+            .filter(|entry| entry.scale == font_scale && entry.dpi == dpi);
+        let outgoing = std::mem::take(&mut *fonts);
+        let outgoing_metrics = metrics.take();
+        if reuse_previous_scale_fonts() {
+            if let Some(restored) = restored {
+                *fonts = restored.fonts;
+                *metrics = restored.metrics;
+            }
+            if !outgoing.is_empty() && outgoing.len() <= MAX_RETAINED_SCALE_STYLES {
+                *previous = Some(PreviousScaleFonts {
+                    scale: prior_font,
+                    dpi: prior_dpi,
+                    fonts: outgoing,
+                    metrics: outgoing_metrics,
+                });
+            }
+        }
+
         *self.dpi.borrow_mut() = dpi;
         *self.font_scale.borrow_mut() = font_scale;
-        self.fonts.borrow_mut().clear();
-        self.metrics.borrow_mut().take();
-        self.title_font.borrow_mut().take();
+
+        // Entity fonts use their own point sizes, independent of terminal zoom.
+        // They do depend on DPI; every entity must refresh when the display does.
+        if prior_dpi != dpi {
+            self.title_font.borrow_mut().take();
+            self.pane_select_font.borrow_mut().take();
+            self.char_select_font.borrow_mut().take();
+            self.command_palette_font.borrow_mut().take();
+        }
 
         (prior_font, prior_dpi)
     }
