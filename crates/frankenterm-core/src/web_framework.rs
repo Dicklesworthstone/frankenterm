@@ -70,7 +70,7 @@ impl WebStreamLifecycle {
         }
     }
 
-    fn signal_shutdown(&self) {
+    pub(crate) fn signal_shutdown(&self) {
         // The pinned watch retains the latest value even with zero receivers,
         // so a stream first polled after shutdown cannot miss this transition.
         if self.stop.send(true).is_err() {

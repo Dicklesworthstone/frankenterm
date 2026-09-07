@@ -10,12 +10,12 @@ use super::{
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
+use crate::runtime_async::stream::Stream;
 use crate::runtime_async::{mpsc, sleep, task};
 use crate::storage::{SegmentScanQuery, StorageHandle};
 use crate::web_framework::{
     QueryString, Request, Response, StatusCode, WebStreamLifecycle, sse_stream_response,
 };
-use asupersync::stream::Stream;
 use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
@@ -323,7 +323,7 @@ struct SseByteStream {
 }
 
 struct SseRecvState {
-    cx: asupersync::Cx,
+    cx: crate::cx::Cx,
 }
 
 impl SseRecvState {
@@ -400,6 +400,16 @@ impl Stream for SseByteStream {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// End a stream before its event identifier can wrap or be reused.
+fn advance_stream_sequence(seq: &mut u64) -> bool {
+    let Some(next) = seq.checked_add(1) else {
+        tracing::warn!(target: "wa.web", "web_stream_sequence_exhausted");
+        return false;
+    };
+    *seq = next;
+    true
 }
 
 pub(super) fn make_stream_frame(
@@ -512,7 +522,9 @@ async fn emit_new_segment_frames(
         let segments = match storage.scan_segments_with_cx(&scan_cx, query).await {
             Ok(segments) => segments,
             Err(err) => {
-                *seq += 1;
+                if !advance_stream_sequence(seq) {
+                    return DeltaCatchup::Stop;
+                }
                 let frame = make_stream_frame(
                     "deltas",
                     "error",
@@ -544,7 +556,9 @@ async fn emit_new_segment_frames(
         for segment in segments {
             *after_id = Some(segment.id);
 
-            *seq += 1;
+            if !advance_stream_sequence(seq) {
+                return DeltaCatchup::Stop;
+            }
             let frame = make_stream_frame(
                 "deltas",
                 "delta",
@@ -671,7 +685,9 @@ pub(super) fn handle_stream_events(
             let mut seq = 0_u64;
             let mut consecutive_drops = 0_u64;
 
-            seq += 1;
+            if !advance_stream_sequence(&mut seq) {
+                return;
+            }
             let ready = make_stream_frame(
                 "events",
                 "ready",
@@ -720,7 +736,9 @@ pub(super) fn handle_stream_events(
                         });
                         redact_json_value(&mut event_json, &redactor);
 
-                        seq += 1;
+                        if !advance_stream_sequence(&mut seq) {
+                            break;
+                        }
                         let frame = make_stream_frame(
                             "events",
                             "event",
@@ -742,7 +760,9 @@ pub(super) fn handle_stream_events(
                         }
                     }
                     Ok(Err(RecvError::Lagged { missed_count })) => {
-                        seq += 1;
+                        if !advance_stream_sequence(&mut seq) {
+                            break;
+                        }
                         let frame = make_stream_frame(
                             "events",
                             "lag",
@@ -833,7 +853,9 @@ pub(super) fn handle_stream_deltas(
             let mut consecutive_drops = 0_u64;
             let mut after_id: Option<i64> = None;
 
-            seq += 1;
+            if !advance_stream_sequence(&mut seq) {
+                return;
+            }
             let ready = make_stream_frame(
                 "deltas",
                 "ready",
@@ -902,7 +924,9 @@ pub(super) fn handle_stream_deltas(
                             continue;
                         }
 
-                        seq += 1;
+                        if !advance_stream_sequence(&mut seq) {
+                            break;
+                        }
                         let frame = make_stream_frame(
                             "deltas",
                             "gap",
@@ -931,7 +955,9 @@ pub(super) fn handle_stream_deltas(
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(RecvError::Lagged { missed_count })) => {
-                        seq += 1;
+                        if !advance_stream_sequence(&mut seq) {
+                            break;
+                        }
                         let frame = make_stream_frame(
                             "deltas",
                             "lag",
@@ -1054,7 +1080,7 @@ mod tests {
 
     #[test]
     fn stream_shutdown_before_first_poll_discards_queue_and_drops_producer_once() {
-        use asupersync::stream::Stream;
+        use crate::runtime_async::stream::Stream;
         use std::pin::Pin;
         use std::sync::atomic::Ordering;
         use std::task::{Context, Poll, Waker};
@@ -1070,7 +1096,7 @@ mod tests {
 
     #[test]
     fn response_drop_disposes_parked_producer_without_a_detached_task() {
-        use asupersync::stream::Stream;
+        use crate::runtime_async::stream::Stream;
         use std::pin::Pin;
         use std::sync::atomic::Ordering;
         use std::task::{Context, Poll, Waker};
@@ -1087,8 +1113,144 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn real_lifecycle_signal_wakes_and_ends_parked_body() {
+        use crate::runtime_async::stream::Stream;
+        use crate::web_framework::WebStreamLifecycle;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let lifecycle = WebStreamLifecycle::new();
+        let waiter = lifecycle.shutdown_waiter(&crate::cx::for_request());
+        let (mut stream, drops) = owned_stream_fixture(waiter);
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(_))
+        ));
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let before_signal = wakes.0.load(Ordering::SeqCst);
+        lifecycle.signal_shutdown();
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before_signal,
+            "shutdown must wake the response's registered task"
+        );
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        lifecycle.signal_shutdown();
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+    }
+
+    #[test]
+    fn lifecycle_signal_during_producer_poll_wins_over_queued_output() {
+        use crate::runtime_async::stream::Stream;
+        use crate::web_framework::WebStreamLifecycle;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+
+        let lifecycle = WebStreamLifecycle::new();
+        let cx = crate::cx::for_request();
+        let waiter = lifecycle.shutdown_waiter(&cx);
+        let (tx, rx) = mpsc::channel(2);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = ProducerDropProbe(Arc::clone(&drops));
+        let producer = Box::pin(async move {
+            let _probe = probe;
+            tx.try_send(SseEvent::comment("must not escape shutdown"))
+                .expect("queue available");
+            lifecycle.signal_shutdown();
+            std::future::pending::<()>().await;
+        });
+        let mut stream = super::SseByteStream::new(cx, rx, producer, waiter);
+        let mut poll_cx = Context::from_waker(Waker::noop());
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut poll_cx),
+            Poll::Ready(None)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut poll_cx),
+            Poll::Ready(None)
+        );
+    }
+
     fn default_limits() -> super::super::WebRuntimeLimits {
         super::super::resolve_runtime_limits(None)
+    }
+
+    #[test]
+    fn lifecycle_shutdown_drops_producer_parked_in_real_rate_limit_sleep() {
+        run_async_test_isolated(|| async {
+            use crate::runtime_async::stream::Stream;
+            use crate::web_framework::WebStreamLifecycle;
+            use std::pin::Pin;
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::task::{Context, Poll, Waker};
+            use std::time::{Duration, Instant};
+
+            let lifecycle = WebStreamLifecycle::new();
+            let cx = crate::cx::for_request();
+            let waiter = lifecycle.shutdown_waiter(&cx);
+            let (tx, rx) = mpsc::channel(2);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let probe = ProducerDropProbe(Arc::clone(&drops));
+            let sent = Arc::new(AtomicBool::new(false));
+            let producer_sent = Arc::clone(&sent);
+            let producer = Box::pin(async move {
+                let _probe = probe;
+                let mut next_emit_at = Instant::now() + Duration::from_secs(3600);
+                let mut consecutive_drops = 0;
+                let did_send = super::send_rate_limited_sse(
+                    &tx,
+                    SseEvent::comment("must not outlive the response"),
+                    &mut next_emit_at,
+                    Duration::from_secs(1),
+                    &mut consecutive_drops,
+                )
+                .await;
+                producer_sent.store(did_send, Ordering::SeqCst);
+            });
+            let mut stream = super::SseByteStream::new(cx, rx, producer, waiter);
+            let mut poll_cx = Context::from_waker(Waker::noop());
+            assert!(Pin::new(&mut stream).poll_next(&mut poll_cx).is_pending());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(!sent.load(Ordering::SeqCst));
+
+            lifecycle.signal_shutdown();
+            assert_eq!(
+                Pin::new(&mut stream).poll_next(&mut poll_cx),
+                Poll::Ready(None)
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(!sent.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn stream_sequence_ends_before_overflow_without_reusing_an_id() {
+        let mut first = 0;
+        assert!(super::advance_stream_sequence(&mut first));
+        assert_eq!(first, 1);
+        let mut last = u64::MAX - 1;
+        assert!(super::advance_stream_sequence(&mut last));
+        assert_eq!(last, u64::MAX);
+        assert!(!super::advance_stream_sequence(&mut last));
+        assert_eq!(last, u64::MAX);
     }
 
     /// Per ft-22x4r: every async test in supported paths must drive the
