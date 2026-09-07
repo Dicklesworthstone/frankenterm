@@ -191,7 +191,53 @@ pub struct ClientInner {
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
+    pending_window_titles: Mutex<HashMap<WindowId, Arc<AtomicBool>>>,
     detached: AtomicBool,
+}
+
+/// Owns one attachment's pending title update, including its RPC. Producers
+/// mark the same entry dirty while it is in flight. Completion and new-writer
+/// admission share the map lock, so the final update cannot lose its wakeup.
+struct PendingWindowTitle {
+    inner: Arc<ClientInner>,
+    window_id: WindowId,
+    dirty: Arc<AtomicBool>,
+}
+
+impl PendingWindowTitle {
+    fn begin_update(&self) {
+        // Clear before reading the authoritative mux title. A mutation before
+        // this cut is included in that read; one after it requests another pass.
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    fn finish_if_clean(&self) -> bool {
+        let mut pending =
+            lock_or_recover(&self.inner.pending_window_titles, "pending_window_titles");
+        if self.dirty.load(Ordering::Acquire) {
+            return false;
+        }
+        if pending
+            .get(&self.window_id)
+            .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
+        {
+            pending.remove(&self.window_id);
+        }
+        true
+    }
+}
+
+impl Drop for PendingWindowTitle {
+    fn drop(&mut self) {
+        let mut pending =
+            lock_or_recover(&self.inner.pending_window_titles, "pending_window_titles");
+        if pending
+            .get(&self.window_id)
+            .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
+        {
+            pending.remove(&self.window_id);
+        }
+    }
 }
 
 /// Suppresses only this exact client attachment's outbound metadata echo while
@@ -1275,6 +1321,7 @@ impl ClientInner {
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
             reliable_input_queue: ReliableInputQueue::new(),
+            pending_window_titles: Mutex::new(HashMap::new()),
             detached: AtomicBool::new(false),
         }
     }
@@ -1318,6 +1365,31 @@ impl ClientInner {
                     .unwrap_or(false)
             })
             .unwrap_or(true)
+    }
+
+    fn queue_window_title(
+        self: &Arc<Self>,
+        window_id: WindowId,
+    ) -> Option<(WindowId, PendingWindowTitle)> {
+        // A mux notification reaches every attached domain. Reject unrelated
+        // windows before allocating a task or holding a scheduler permit.
+        let remote_window_id = self.local_to_remote_window(window_id)?;
+        let mut pending = lock_or_recover(&self.pending_window_titles, "pending_window_titles");
+        if let Some(dirty) = pending.get(&window_id) {
+            dirty.store(true, Ordering::Release);
+            metrics::counter!("mux.client.window_title.coalesced").increment(1);
+            return None;
+        }
+        let dirty = Arc::new(AtomicBool::new(true));
+        pending.insert(window_id, Arc::clone(&dirty));
+        Some((
+            remote_window_id,
+            PendingWindowTitle {
+                inner: Arc::clone(self),
+                window_id,
+                dirty,
+            },
+        ))
     }
 
     pub(crate) fn is_detached(&self) -> bool {
@@ -1922,6 +1994,10 @@ fn mux_notify_client_domain(
                 if !inner.should_forward_local_metadata() {
                     return true;
                 }
+                let Some((remote_window_id, pending_title)) = inner.queue_window_title(window_id)
+                else {
+                    return true;
+                };
                 let mux = Arc::clone(&mux);
                 let rpc = inner.client.rpc_scope();
                 match promise::spawn::try_reserve_main_thread(
@@ -1931,31 +2007,27 @@ fn mux_notify_client_domain(
                     promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                         reservation
                             .spawn(async move {
-                                // De-bounce the title propagation.
-                                promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
-                                if !client_inner_is_current(&mux, &domain, &inner) {
-                                    return Ok(());
-                                }
-                                let Some(client_domain) = domain.downcast_ref::<ClientDomain>()
-                                else {
-                                    return Ok(());
-                                };
-                                let Some(remote_window_id) =
-                                    client_domain.local_to_remote_window_id(window_id)
-                                else {
-                                    return Ok(());
-                                };
-                                let title = mux
-                                    .get_window(window_id)
-                                    .map(|win| win.get_title().to_string());
-                                if let Some(title) = title {
-                                    inner
-                                        .client
-                                        .set_window_title(codec::WindowTitleChanged {
-                                            window_id: remote_window_id,
-                                            title,
-                                        })
-                                        .await?;
+                                loop {
+                                    promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
+                                    if !client_inner_is_current(&mux, &domain, &inner)
+                                        || inner.local_to_remote_window(window_id) != Some(remote_window_id)
+                                    {
+                                        return Ok(());
+                                    }
+                                    pending_title.begin_update();
+                                    let title = mux.get_window(window_id)
+                                        .map(|win| win.get_title().to_string());
+                                    let Some(title) = title else { return Ok(()); };
+                                    rpc.set_window_title(codec::WindowTitleChanged {
+                                        window_id: remote_window_id,
+                                        title,
+                                    }).await.map_err(|error| {
+                                        log::error!("window-title propagation failed for domain {} window {window_id}: {error:#}", inner.local_domain_id);
+                                        error
+                                    })?;
+                                    if pending_title.finish_if_clean() {
+                                        break;
+                                    }
                                 }
                                 anyhow::Result::<()>::Ok(())
                             })
@@ -4145,6 +4217,7 @@ impl Domain for ClientDomain {
             })
             .await
             .map_err(|e| {
+                log::error!("initial attachment failed for domain {domain_id}: {e:#}");
                 ui.output_str(&format!("Error during attach: {:#}\n", e));
                 e
             });
@@ -4450,6 +4523,69 @@ mod tests {
             None,
             false,
         ))
+    }
+
+    #[test]
+    fn window_title_burst_is_single_flight_and_preserves_inflight_updates() {
+        let inner = test_client_inner(91_020);
+        lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(70, 17);
+        assert!(inner.queue_window_title(99).is_none());
+        let (remote, pending) = inner.queue_window_title(17).expect("first title update");
+        assert_eq!(remote, 70);
+        for _ in 0..40_000 {
+            assert!(inner.queue_window_title(17).is_none());
+        }
+        assert_eq!(
+            lock_or_recover(&inner.pending_window_titles, "test pending titles").len(),
+            1
+        );
+
+        pending.begin_update();
+        let writer = Arc::clone(&inner);
+        std::thread::spawn(move || assert!(writer.queue_window_title(17).is_none()))
+            .join()
+            .expect("inflight title writer");
+        assert!(
+            !pending.finish_if_clean(),
+            "an update during the RPC requires another pass"
+        );
+        pending.begin_update();
+        assert!(pending.finish_if_clean());
+
+        let (_, successor) = inner
+            .queue_window_title(17)
+            .expect("update after completion");
+        drop(pending);
+        assert!(
+            inner.queue_window_title(17).is_none(),
+            "old completion must not erase its successor"
+        );
+        drop(successor);
+        assert!(lock_or_recover(&inner.pending_window_titles, "test pending titles").is_empty());
+        assert!(
+            inner.queue_window_title(17).is_some(),
+            "cancelled work must release admission"
+        );
+    }
+
+    #[test]
+    fn window_title_coalescing_is_scoped_to_the_exact_attachment_and_window() {
+        let old = test_client_inner(91_021);
+        let replacement = test_client_inner(91_021);
+        for inner in [&old, &replacement] {
+            lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(70, 17);
+            lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(80, 18);
+        }
+        let (_, old_ticket) = old.queue_window_title(17).unwrap();
+        let (_, current_ticket) = replacement.queue_window_title(17).unwrap();
+        let (remote, other_window) = replacement.queue_window_title(18).unwrap();
+        assert_eq!(remote, 80);
+        drop(old_ticket);
+        assert!(replacement.queue_window_title(17).is_none());
+        drop(current_ticket);
+        assert!(replacement.queue_window_title(17).is_some());
+        assert!(replacement.queue_window_title(18).is_none());
+        drop(other_window);
     }
 
     #[test]

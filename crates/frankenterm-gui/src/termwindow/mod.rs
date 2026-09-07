@@ -142,6 +142,27 @@ lazy_static::lazy_static! {
 
 pub const ICON_DATA: &[u8] = include_bytes!("../../../../assets/icon/terminal.png");
 
+/// One title refresh for one exact GUI subscription. The ticket travels through
+/// both scheduler hops, including Window::notify, so a burst cannot refill the
+/// queue between the mux callback and the actual window handler. That handler
+/// reads the current mux title; intermediate title strings need no delivery.
+pub struct PendingMuxTitleRefresh(Arc<AtomicBool>);
+
+impl PendingMuxTitleRefresh {
+    fn acquire(pending: &Arc<AtomicBool>) -> Option<Self> {
+        pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(pending)))
+    }
+}
+
+impl Drop for PendingMuxTitleRefresh {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         log::warn!("recovering poisoned {name} lock");
@@ -216,6 +237,7 @@ pub enum TermWindowNotif {
         /// Exact mux removal-generation authority retained until this window
         /// has finished cleaning its numeric pane-keyed state.
         pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
+        pending_title_refresh: Option<PendingMuxTitleRefresh>,
     },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
@@ -3935,6 +3957,7 @@ impl TermWindow {
                 notification: n,
                 mux_owner,
                 pane_removal_cleanup,
+                pending_title_refresh: _pending_title_refresh,
             } => {
                 let Some(notification_owner) = mux_owner.upgrade() else {
                     return Ok(());
@@ -4458,14 +4481,42 @@ impl TermWindow {
         !matches!(notification, MuxNotification::PaneRemoved(_)) || has_cleanup_lease
     }
 
+    fn mux_notification_targets_window(n: &MuxNotification, window_id: MuxWindowId) -> bool {
+        // These payloads freeze their destination at the structural commit.
+        // Filter before reserving GUI work, rather than enqueueing once for
+        // every window and discovering the destination on the main thread.
+        // Pane events deliberately keep the overlay-aware handler below.
+        match n {
+            MuxNotification::TabAddedToWindow {
+                window_id: target, ..
+            }
+            | MuxNotification::WindowTitleChanged {
+                window_id: target, ..
+            }
+            | MuxNotification::WindowInvalidated(target)
+            | MuxNotification::WindowRemoved(target) => *target == window_id,
+            MuxNotification::FloatingPaneSpawnCommitted(spawn) => spawn.window_id() == window_id,
+            MuxNotification::WindowOrderChanged { window, .. } => window.window_id() == window_id,
+            MuxNotification::WindowTopologyChanged(change) => {
+                change.affects_window(window_id)
+                    || change.removed_windows().binary_search(&window_id).is_ok()
+            }
+            _ => true,
+        }
+    }
+
     fn mux_pane_output_event_callback(
         n: MuxNotification,
         window: &Window,
         mux_window_id: MuxWindowId,
         dead: &Arc<AtomicBool>,
         mux_owner: &Weak<Mux>,
-        pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
+        deferred_authority: (
+            Option<PaneRemovalCleanupLease>,
+            Option<PendingMuxTitleRefresh>,
+        ),
     ) -> bool {
+        let (pane_removal_cleanup, pending_title_refresh) = deferred_authority;
         if dead.load(Ordering::Relaxed) {
             // Subscription cancelled asynchronously
             return false;
@@ -4597,6 +4648,7 @@ impl TermWindow {
             notification: n,
             mux_owner: Arc::downgrade(&mux),
             pane_removal_cleanup,
+            pending_title_refresh,
         });
 
         true
@@ -4616,6 +4668,7 @@ impl TermWindow {
         let callback_subscription_id = Arc::clone(&subscription_id);
         let callback_unsubscribe_requested = Arc::clone(&unsubscribe_requested);
         let callback_mux = Arc::downgrade(&mux);
+        let pending_title_refresh = Arc::new(AtomicBool::new(false));
         let allocated_subscription_id = mux
             .subscribe_with_pane_removal_cleanup(move |n, pane_removal_cleanup| {
                 if dead.load(Ordering::Relaxed) {
@@ -4639,6 +4692,18 @@ impl TermWindow {
                     callback_unsubscribe_requested.store(true, Ordering::Release);
                     return false;
                 }
+                if !Self::mux_notification_targets_window(&n, mux_window_id) {
+                    return true;
+                }
+                let pending_title_refresh = if matches!(&n, MuxNotification::WindowTitleChanged { .. }) {
+                    let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) else {
+                        metrics::counter!("gui.mux_title_refresh.coalesced").increment(1);
+                        return true;
+                    };
+                    Some(ticket)
+                } else {
+                    None
+                };
                 let window = window.clone();
                 let dead = dead.clone();
                 let subscription_id = Arc::clone(&callback_subscription_id);
@@ -4666,7 +4731,7 @@ impl TermWindow {
                                     mux_window_id,
                                     &dead,
                                     &mux,
-                                    pane_removal_cleanup,
+                                    (pane_removal_cleanup, pending_title_refresh),
                                 ) {
                                     dead.store(true, Ordering::Release);
                                     unsubscribe_requested.store(true, Ordering::Release);
@@ -8522,6 +8587,68 @@ mod tests {
             "requested",
             true,
         ));
+    }
+
+    #[test]
+    fn mux_title_burst_admits_only_one_refresh_for_its_destination() {
+        let pending: Vec<_> = (0..64)
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        let mut queued = Vec::new();
+        for sequence in 0..40_000 {
+            let notification = mux::MuxNotification::WindowTitleChanged {
+                window_id: 17,
+                title: format!("title-{sequence}"),
+            };
+            for (window_id, pending) in pending.iter().enumerate() {
+                if super::TermWindow::mux_notification_targets_window(&notification, window_id) {
+                    if let Some(ticket) = super::PendingMuxTitleRefresh::acquire(pending) {
+                        queued.push(ticket);
+                    }
+                }
+            }
+        }
+        assert_eq!(queued.len(), 1, "a burst must occupy one refresh slot");
+        let through_window_notify = queued.pop().expect("the destination refresh");
+        assert!(super::PendingMuxTitleRefresh::acquire(&pending[17]).is_none());
+        drop(through_window_notify);
+        assert!(super::PendingMuxTitleRefresh::acquire(&pending[17]).is_some());
+    }
+
+    #[test]
+    fn mux_title_refresh_cancellation_and_subscription_replacement_are_independent() {
+        let old = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let replacement = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abandoned = super::PendingMuxTitleRefresh::acquire(&old).unwrap();
+        let current = super::PendingMuxTitleRefresh::acquire(&replacement).unwrap();
+        drop(abandoned);
+        assert!(super::PendingMuxTitleRefresh::acquire(&old).is_some());
+        assert!(super::PendingMuxTitleRefresh::acquire(&replacement).is_none());
+        drop(current);
+        assert!(super::PendingMuxTitleRefresh::acquire(&replacement).is_some());
+    }
+
+    #[test]
+    fn mux_window_prefilter_preserves_pane_cleanup_and_overlay_delivery() {
+        for window_id in [0, 17, usize::MAX] {
+            for notification in [
+                mux::MuxNotification::PaneOutput(7),
+                mux::MuxNotification::PaneRemoved(7),
+                mux::MuxNotification::PaneFocused(7),
+            ] {
+                assert!(super::TermWindow::mux_notification_targets_window(
+                    &notification,
+                    window_id,
+                ));
+            }
+            assert_eq!(
+                super::TermWindow::mux_notification_targets_window(
+                    &mux::MuxNotification::WindowRemoved(17),
+                    window_id,
+                ),
+                window_id == 17,
+            );
+        }
     }
 
     #[test]

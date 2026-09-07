@@ -9600,7 +9600,7 @@ impl Client {
                         && !reconnect_authorization.load(AtomicOrdering::Acquire)
                     {
                         log::error!(
-                            "initial client attachment ended before reconnect authority was published; closing this incarnation without dialing a successor"
+                            "initial client attachment ended for domain {local_domain_id:?} before reconnect authority was published; closing this incarnation without dialing a successor: {thread_result:?}"
                         );
                         break;
                     }
