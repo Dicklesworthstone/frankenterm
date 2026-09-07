@@ -5856,6 +5856,36 @@ fn spawn_pre_ready_unilateral_replay(
     let mut abort_guard = replay_scope
         .fatal_abort_guard("pre-ready unilateral replay failed or was cancelled")
         .expect("an exact pre-ready replay scope always has a generation");
+    let mut finish_replay = move |result| {
+        let completion = ReaderMessage::FinishReadyReplay {
+            generation,
+            reader_sender: reader_sender.clone(),
+            replayed_pdus,
+            replayed_bytes,
+            result,
+        };
+        match reader_sender.try_send(completion) {
+            Ok(()) => abort_guard.disarm(),
+            Err(_) => {
+                metrics::counter!(
+                    "mux.client.rpc.readiness_replay_completion.total",
+                    "outcome" => "reader_queue_unavailable"
+                )
+                .increment(1);
+            }
+        }
+    };
+    if dispatch_authority.is_standalone() {
+        // Standalone clients have no GUI scheduler. Their bounded notification
+        // replay only applies the existing synchronous ignore/reject policy;
+        // readiness is still published by the reader's completion transition.
+        let result = batch.into_iter().try_for_each(|queued| {
+            process_unilateral(&dispatch_authority, queued.decode()?)
+                .context("replaying a standalone pre-ready unilateral PDU")
+        });
+        finish_replay(result);
+        return;
+    }
     let reservation = match reserve_client_main_thread(
         MainThreadServiceClass::Topology,
         replayed_bytes.saturating_add(4 * 1024),
@@ -5887,23 +5917,7 @@ fn spawn_pre_ready_unilateral_replay(
             }
             .await;
 
-            let completion = ReaderMessage::FinishReadyReplay {
-                generation,
-                reader_sender: reader_sender.clone(),
-                replayed_pdus,
-                replayed_bytes,
-                result,
-            };
-            match reader_sender.try_send(completion) {
-                Ok(()) => abort_guard.disarm(),
-                Err(_) => {
-                    metrics::counter!(
-                        "mux.client.rpc.readiness_replay_completion.total",
-                        "outcome" => "reader_queue_unavailable"
-                    )
-                    .increment(1);
-                }
-            }
+            finish_replay(result);
             anyhow::Result::<()>::Ok(())
         })
         .detach();

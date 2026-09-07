@@ -60,7 +60,7 @@ fn reset_redact_depth_limit_hit_count_for_test() {
 #[inline]
 fn record_redact_depth_limit_hits(hits: u64) {
     let _ =
-        REDACT_DEPTH_LIMIT_HIT_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        REDACT_DEPTH_LIMIT_HIT_COUNT.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             Some(count.saturating_add(hits))
         });
 }
@@ -820,12 +820,20 @@ mod tests {
             inspected_base64_bytes: super::MAX_BASE64_INSPECTION_BYTES - candidate.len(),
             ..Default::default()
         };
-        let first = super::redact_base64_payload(&candidate, &Redactor::new(), 0, &mut state)
-            .expect("first redaction");
+        // Traverse real siblings once, so a future per-child state reset
+        // cannot silently turn this into two independent inspection budgets.
+        let mut siblings = serde_json::json!([candidate.clone(), candidate]);
+        assert!(super::redact_json_value_with_depth(
+            &mut siblings,
+            &Redactor::new(),
+            0,
+            &mut state,
+        ));
+        assert_eq!(siblings.as_array().expect("array shape preserved").len(), 2);
         assert_eq!(
             serde_json::from_slice::<String>(
                 &base64::engine::general_purpose::STANDARD
-                    .decode(first)
+                    .decode(siblings[0].as_str().expect("first redaction stays encoded"))
                     .expect("base64")
             )
             .expect("JSON"),
@@ -835,12 +843,10 @@ mod tests {
             state.inspected_base64_bytes,
             super::MAX_BASE64_INSPECTION_BYTES
         );
-        let second = super::redact_base64_payload(&candidate, &Redactor::new(), 0, &mut state)
-            .expect("second is omitted");
         assert_eq!(
             serde_json::from_slice::<String>(
                 &base64::engine::general_purpose::STANDARD
-                    .decode(second)
+                    .decode(siblings[1].as_str().expect("second is explicitly omitted"))
                     .expect("base64")
             )
             .expect("valid JSON marker"),
@@ -932,6 +938,18 @@ mod tests {
         DEPTH_COUNTER_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn redaction_depth_counter_saturates_without_wrapping() {
+        let _serialized = lock_depth_counter();
+        super::REDACT_DEPTH_LIMIT_HIT_COUNT
+            .store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        for hits in [2, 1, 0] {
+            super::record_redact_depth_limit_hits(hits);
+            assert_eq!(super::redact_depth_limit_hit_count(), u64::MAX);
+        }
+        super::reset_redact_depth_limit_hit_count_for_test();
     }
 
     #[test]

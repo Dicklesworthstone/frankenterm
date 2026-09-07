@@ -12291,11 +12291,12 @@ mod tests {
             empty_overlay(destination_window, 1),
         ];
         canonicalize_state(&mut state);
-        std::fs::write(
-            &path,
-            encode_disk_slot(&state).expect("encode rotation-denial base"),
-        )
-        .expect("write rotation-denial base");
+        let encoded = encode_disk_slot(&state).expect("encode rotation-denial base");
+        std::fs::write(&path, &encoded).expect("write rotation-denial primary");
+        std::fs::write(shadow_file_name(&path), encoded).expect("write rotation-denial shadow");
+        // A missing journal peer independently requires a repair generation.
+        // Start with healthy redundancy to isolate rejected ownership changes.
+        assert!(!load_snapshot_at(&path).unwrap().degraded_recovery);
 
         let mut invalid_transfer = PendingBatch::default();
         invalid_transfer
@@ -12321,6 +12322,7 @@ mod tests {
         assert_eq!(rejected.receipt.rejected_updates, 2);
 
         let after = load_snapshot_at(&path).expect("load unrotated authority");
+        assert_eq!(after.store_revision, state.store_revision);
         assert_eq!(after.layout_creation_epoch, LayoutCreationEpoch::INITIAL);
         assert_eq!(after.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
         assert!(after.overlay(source_window).is_some());
@@ -15253,6 +15255,8 @@ mod tests {
     fn corrupt_first_receipt_restarts_in_peer_without_exposing_candidate_content() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
+        let _lock = open_locked_file(&path, true)
+            .expect("establish the writer's private directory before direct receipt access");
         let candidate = initial_attempt_path(&path, 0);
         let sensitive_candidate = b"credential_value_that_must_not_escape";
         std::fs::write(&candidate, sensitive_candidate).expect("write interrupted candidate");
@@ -15260,6 +15264,15 @@ mod tests {
         let peer = initial_retirement_receipt_path(&path, 0, SlotPosition::Shadow);
         std::fs::write(&corrupt, b"partial receipt").expect("write interrupted first receipt");
 
+        let unused = choose_initial_attempt_slot(&path).expect("prefer an unused attempt slot");
+        assert!(!unused.occupied);
+        assert_eq!(unused.candidate, initial_attempt_path(&path, 1));
+        // Reuse and retirement apply only after all fixed slots are occupied.
+        // Equal retirement counts then select the first slot deterministically.
+        for index in 1..INITIAL_ATTEMPT_SLOT_COUNT {
+            std::fs::write(initial_attempt_path(&path, index), b"interrupted peer")
+                .expect("occupy remaining attempt slots");
+        }
         let choice = choose_initial_attempt_slot(&path)
             .expect("corrupt first receipt can restart in its missing peer");
         assert!(choice.occupied);

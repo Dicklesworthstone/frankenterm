@@ -31,12 +31,19 @@ fn schedule_frontend_main_thread<MAKE, FUT>(
     operation: &'static str,
     make_future: MAKE,
 ) where
-    MAKE: FnOnce() -> FUT,
+    MAKE: FnOnce() -> FUT + Send + 'static,
     FUT: std::future::Future<Output = ()> + 'static,
 {
     match try_reserve_main_thread(service_class, estimated_bytes) {
         MainThreadReservationOutcome::Reserved(reservation) => {
-            reservation.spawn_local(make_future()).detach();
+            // Config reloads and mux notifications can originate on worker
+            // threads. Construct the local future only after transferring this
+            // exact admission to the GUI thread, where it will also be polled.
+            reservation
+                .handoff_to_main_thread_local(move |reservation| {
+                    reservation.spawn_local(make_future()).detach();
+                })
+                .detach();
         }
         rejected => {
             metrics::counter!(
@@ -164,7 +171,7 @@ impl GuiFrontEnd {
                                     MainThreadServiceClass::Topology,
                                     FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                                     "workspace rename reconciliation",
-                                    || async move {
+                                    move || async move {
                                         drop(switcher);
                                     },
                                 );
@@ -180,7 +187,7 @@ impl GuiFrontEnd {
                         MainThreadServiceClass::Topology,
                         FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                         "workspace state reconciliation",
-                        || async move {
+                        move || async move {
                             if let Some(fe) = crate::frontend::try_front_end()
                                 && !fe.is_switching_workspace()
                             {
@@ -197,7 +204,7 @@ impl GuiFrontEnd {
                         MainThreadServiceClass::Topology,
                         FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                         "window topology reconciliation",
-                        || async move {
+                        move || async move {
                             if let Some(fe) = crate::frontend::try_front_end()
                                 && !fe.is_switching_workspace()
                             {
@@ -211,7 +218,7 @@ impl GuiFrontEnd {
                         MainThreadServiceClass::Input,
                         FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                         "focused pane reconciliation",
-                        || async move {
+                        move || async move {
                             if let Some(mux) = Mux::try_get()
                                 && let Err(err) = mux.focus_pane_and_containing_tab(pane_id)
                             {
@@ -329,7 +336,7 @@ impl GuiFrontEnd {
                             MainThreadServiceClass::Topology,
                             FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                             "empty mux termination",
-                            || async move {
+                            move || async move {
                                 let Some(notifying_mux) = mux_owner.upgrade() else {
                                     return;
                                 };
@@ -371,7 +378,7 @@ impl GuiFrontEnd {
                         MainThreadServiceClass::Input,
                         estimated_bytes,
                         "clipboard assignment",
-                        || async move {
+                        move || async move {
                             log::trace!(
                                 "enqueue clipboard in pane {} selection={:?} bytes={}",
                                 pane_id,
@@ -435,7 +442,7 @@ impl GuiFrontEnd {
                     MainThreadServiceClass::Topology,
                     FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                     "open command script",
-                    || async move {
+                    move || async move {
                         use config::keyassignment::SpawnTabDomain;
                         use wezterm_term::TerminalSize;
 
@@ -853,7 +860,7 @@ fn terminal_toast_action(
                 MainThreadServiceClass::Interactive,
                 FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
                 "terminal toast focus",
-                || async move {
+                move || async move {
                     focus_terminal_toast_source(pane_id);
                 },
             );
@@ -895,6 +902,57 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[test]
+    fn background_frontend_dispatch_constructs_and_polls_local_future_on_owner() {
+        use promise::spawn::{MainThreadAdmissionLimits, MainThreadServiceClass, SimpleExecutor};
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Exercise the actual frontend dispatcher without initializing a
+        // frontend, native window, or event loop. A single available slot also
+        // proves that the handoff retains its original admission.
+        let executor =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 4096, 0, 0).unwrap())
+                .unwrap();
+        let owner = std::thread::current().id();
+        let constructed = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let constructed_in_factory = Arc::clone(&constructed);
+        let polled_in_future = Arc::clone(&polled);
+        std::thread::spawn(move || {
+            assert_ne!(std::thread::current().id(), owner);
+            super::schedule_frontend_main_thread(
+                MainThreadServiceClass::Background,
+                4096,
+                "background frontend regression",
+                move || {
+                    assert_eq!(std::thread::current().id(), owner);
+                    constructed_in_factory.store(true, Ordering::Release);
+                    let local = Rc::new(owner);
+                    async move {
+                        assert_eq!(std::thread::current().id(), *local);
+                        polled_in_future.store(true, Ordering::Release);
+                    }
+                },
+            );
+        })
+        .join()
+        .expect("background notification must only transfer its factory");
+
+        assert!(!constructed.load(Ordering::Acquire));
+        assert!(!polled.load(Ordering::Acquire));
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        assert!(executor.try_tick().unwrap());
+        assert!(constructed.load(Ordering::Acquire));
+        assert!(!polled.load(Ordering::Acquire));
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        assert!(executor.try_tick().unwrap());
+        assert!(polled.load(Ordering::Acquire));
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.queue_snapshot().depth, 0);
+    }
 
     #[test]
     fn osc22_request_parser_accepts_terminal_cursor_slugs() {
