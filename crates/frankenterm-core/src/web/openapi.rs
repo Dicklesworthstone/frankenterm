@@ -62,6 +62,7 @@ mod tests {
                     .filter(|id| !id.is_empty())
                     .expect("every operation must have a nonempty ID");
                 assert!(operation_ids.insert(id), "duplicate operation ID: {id}");
+                assert!(operation.get("security").is_none(), "auth is not wired yet");
             }
         }
         assert_eq!(documented, actual, "discovery and live routes must agree");
@@ -71,6 +72,8 @@ mod tests {
         assert_eq!(spec["info"]["title"], "FrankenTerm observation API");
         assert_eq!(spec["info"]["version"], crate::VERSION);
         assert_eq!(spec["openapi"], "3.1.0");
+        assert!(spec.get("security").is_none(), "no unwired global auth");
+        assert!(spec["components"].get("securitySchemes").is_none());
         assert!(
             spec["info"]["description"]
                 .as_str()
