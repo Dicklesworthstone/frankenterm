@@ -1382,6 +1382,7 @@ impl RusqliteRecorderStorage {
         config.validate()?;
         ensure_parent_dir(&config.db_path)?;
         let conn = Connection::open(&config.db_path).map_err(sqlite_error)?;
+        configure_rusqlite_durability(&conn)?;
         initialize_rusqlite_schema(&conn)?;
         Ok(Self {
             config,
@@ -2127,6 +2128,64 @@ fn evict_rusqlite_receipts(
     Ok(())
 }
 
+/// Establish the writer policy before schema changes or append receipts.
+///
+/// EXTRA adds directory synchronization for DELETE-journal commits and equals
+/// FULL in WAL mode. Preserve existing safe journal modes rather than migrate
+/// a database (and contend with its readers) merely by opening a recorder.
+/// fullfsync requests the stronger flush on platforms that support it; reading
+/// this flag on Linux is not evidence of hardware power-loss durability.
+/// https://www.sqlite.org/pragma.html#pragma_synchronous
+fn configure_rusqlite_durability(
+    conn: &Connection,
+) -> std::result::Result<(), RecorderStorageError> {
+    let journal_mode: String = conn
+        .query_row("PRAGMA main.journal_mode", [], |row| row.get(0))
+        .map_err(sqlite_error)?;
+    let file_backed: bool = conn
+        .query_row(
+            "SELECT length(file) > 0 FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if !file_backed
+        || !matches!(
+            journal_mode.as_str(),
+            "delete" | "truncate" | "persist" | "wal"
+        )
+    {
+        return Err(RecorderStorageError::InvalidRequest {
+            message: "SQLite recorder requires a file-backed database with a persistent journal"
+                .to_string(),
+        });
+    }
+    conn.execute_batch("PRAGMA main.synchronous = EXTRA; PRAGMA fullfsync = ON;")
+        .map_err(sqlite_error)?;
+    // SQLite silently ignores unknown PRAGMAs. Do not infer the policy solely
+    // from execute_batch succeeding, including on alternate SQLite builds.
+    let synchronous: i64 = conn
+        .query_row("PRAGMA main.synchronous", [], |row| row.get(0))
+        .map_err(sqlite_error)?;
+    let fullfsync: i64 = conn
+        .query_row("PRAGMA fullfsync", [], |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if synchronous != 3 || fullfsync != 1 {
+        return Err(RecorderStorageError::InvalidRequest {
+            message: "SQLite recorder could not establish EXTRA/fullfsync durability policy"
+                .to_string(),
+        });
+    }
+    tracing::debug!(
+        target: "recorder::bootstrap",
+        journal_mode,
+        synchronous,
+        fullfsync,
+        "Verified SQLite recorder connection durability policy"
+    );
+    Ok(())
+}
+
 fn initialize_rusqlite_schema(conn: &Connection) -> std::result::Result<(), RecorderStorageError> {
     conn.execute_batch(
         "
@@ -2522,15 +2581,22 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        // Absorb TLS destructor panics from asupersync during runtime drop.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Still attempt TLS cleanup after teardown fails, but never hide a
+        // runtime failure behind otherwise successful recorder assertions.
+        let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+        if let Err(payload) = teardown {
+            std::panic::resume_unwind(payload);
+        }
+        if let Err(payload) = cleanup {
             std::panic::resume_unwind(payload);
         }
     }
@@ -2947,6 +3013,184 @@ recorder_backend = "frankensqlite"
             Err(RecorderStorageError::QueueFull { capacity: 1 })
         ));
         drop(sqlite_first);
+    }
+
+    #[test]
+    fn rusqlite_durability_policy_delete_roundtrip() {
+        run_async_test(rusqlite_durability_policy_roundtrip(false));
+    }
+
+    #[test]
+    fn rusqlite_durability_policy_wal_roundtrip() {
+        run_async_test(rusqlite_durability_policy_roundtrip(true));
+    }
+
+    async fn rusqlite_durability_policy_roundtrip(wal: bool) {
+        let dir = tempdir().unwrap();
+        let config = recorder_test_config(dir.path()).rusqlite;
+        let expected_mode = if wal { "wal" } else { "delete" };
+        if wal {
+            let seed = Connection::open(&config.db_path).unwrap();
+            let mode: String = seed
+                .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            seed.execute_batch("PRAGMA synchronous = NORMAL; CREATE TABLE seed (id INTEGER);")
+                .unwrap();
+        }
+
+        for ordinal in 0..2 {
+            let storage = RusqliteRecorderStorage::open(config.clone()).unwrap();
+            {
+                let inner = storage.inner.lock().await;
+                let mode: String = inner
+                    .conn
+                    .query_row("PRAGMA main.journal_mode", [], |row| row.get(0))
+                    .unwrap();
+                let synchronous: i64 = inner
+                    .conn
+                    .query_row("PRAGMA main.synchronous", [], |row| row.get(0))
+                    .unwrap();
+                let fullfsync: i64 = inner
+                    .conn
+                    .query_row("PRAGMA fullfsync", [], |row| row.get(0))
+                    .unwrap();
+                eprintln!(
+                    "recorder durability open: mode={mode}, reopen={ordinal}, synchronous={synchronous}, fullfsync={fullfsync}"
+                );
+                assert_eq!(mode, expected_mode, "opening must preserve journal mode");
+                assert_eq!(
+                    synchronous, 3,
+                    "persistent recorder must explicitly use EXTRA"
+                );
+                assert_eq!(fullfsync, 1, "request fullfsync on supporting platforms");
+            }
+            let response = storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("durability-{ordinal}"),
+                    events: vec![sample_event(
+                        &format!("durability-{ordinal}"),
+                        7,
+                        ordinal,
+                        "payload",
+                    )],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: ordinal,
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.backend, RecorderBackendKind::Rusqlite);
+            assert_eq!(response.accepted_count, 1);
+            assert_eq!(response.committed_durability, DurabilityLevel::Fsync);
+            assert_eq!(response.last_offset.ordinal, ordinal);
+            let checkpoint = RecorderCheckpoint {
+                consumer: CheckpointConsumerId("durability-reader".to_string()),
+                upto_offset: response.last_offset.clone(),
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: ordinal,
+            };
+            assert_eq!(
+                storage.commit_checkpoint(checkpoint).await.unwrap(),
+                CheckpointCommitOutcome::Advanced
+            );
+            let flushed = storage.flush(FlushMode::Durable).await.unwrap();
+            assert_eq!(flushed.backend, RecorderBackendKind::Rusqlite);
+            assert_eq!(flushed.latest_offset, Some(response.last_offset));
+            drop(storage);
+
+            let reader = Connection::open_with_flags(
+                &config.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let count: u64 = reader
+                .query_row("SELECT COUNT(*) FROM recorder_events", [], |row| row.get(0))
+                .unwrap();
+            let checkpoint: u64 = reader
+                .query_row(
+                    "SELECT ordinal FROM recorder_checkpoints WHERE consumer = 'durability-reader'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let integrity: String = reader
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, ordinal + 1);
+            assert_eq!(checkpoint, ordinal);
+            assert_eq!(integrity, "ok");
+            eprintln!(
+                "recorder durability reopen: mode={expected_mode}, events={count}, checkpoint={checkpoint}, integrity={integrity}"
+            );
+        }
+    }
+
+    #[test]
+    fn rusqlite_durability_policy_rejects_volatile_public_storage() {
+        let config = RusqliteStorageConfig {
+            db_path: PathBuf::from(":memory:"),
+            ..RusqliteStorageConfig::default()
+        };
+        let error = RusqliteRecorderStorage::open(config)
+            .expect_err("a volatile database cannot acknowledge persistent recorder writes");
+        assert!(
+            matches!(error, RecorderStorageError::InvalidRequest { ref message }
+            if message.contains("persistent journal")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rusqlite_durability_policy_normalizes_weak_connections_without_changing_journal() {
+        for mode in ["DELETE", "TRUNCATE", "PERSIST", "WAL"] {
+            let dir = tempdir().unwrap();
+            let conn = Connection::open(dir.path().join("policy.sqlite3")).unwrap();
+            let actual: String = conn
+                .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual, mode.to_ascii_lowercase());
+            conn.execute_batch("PRAGMA synchronous = OFF; PRAGMA fullfsync = OFF;")
+                .unwrap();
+            configure_rusqlite_durability(&conn).unwrap();
+            let settings: (String, i64, i64) = conn.query_row(
+                "SELECT journal_mode, synchronous, fullfsync FROM pragma_journal_mode, pragma_synchronous, pragma_fullfsync",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(settings, (actual, 3, 1));
+            initialize_rusqlite_schema(&conn).unwrap();
+            eprintln!("recorder policy normalized: mode={mode}, synchronous=3, fullfsync=1");
+        }
+    }
+
+    #[test]
+    fn rusqlite_durability_policy_rejects_unsafe_journals_before_schema_changes() {
+        for mode in ["MEMORY", "OFF"] {
+            let dir = tempdir().unwrap();
+            let conn = Connection::open(dir.path().join("unsafe.sqlite3")).unwrap();
+            let actual: String = conn
+                .query_row(&format!("PRAGMA journal_mode = {mode}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual, mode.to_ascii_lowercase());
+            let error = configure_rusqlite_durability(&conn).unwrap_err();
+            assert!(matches!(error, RecorderStorageError::InvalidRequest { .. }));
+            let count: u64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "reject unsafe storage before recorder schema writes"
+            );
+            eprintln!("recorder unsafe journal rejected: mode={mode}, schema_objects={count}");
+        }
+        let temporary = Connection::open("").unwrap();
+        assert!(matches!(
+            configure_rusqlite_durability(&temporary),
+            Err(RecorderStorageError::InvalidRequest { .. })
+        ));
     }
 
     #[test]
