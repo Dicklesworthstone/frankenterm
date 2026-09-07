@@ -14,14 +14,38 @@ pub(crate) struct HyperlinkCellMatch {
 }
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct VecStorage {
-    cells: Vec<Cell>,
+    // Render snapshots and cached reflows usually change only Line metadata.
+    // Share their cell payload until a caller actually edits it.
+    cells: Arc<Vec<Cell>>,
+}
+
+impl Clone for VecStorage {
+    fn clone(&self) -> Self {
+        // Retain the eager-copy arm for paired native profiling and a narrow
+        // operational rollback. Resolve it once, never during individual cell
+        // edits; both arms have identical serialization and mutation semantics.
+        #[cfg(feature = "std")]
+        {
+            static EAGER_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *EAGER_COPY.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_SHARED_LINE_CELLS").is_some_and(|v| v == "1")
+            }) {
+                return Self::new(self.cells.as_ref().clone());
+            }
+        }
+        Self {
+            cells: Arc::clone(&self.cells),
+        }
+    }
 }
 
 impl VecStorage {
     pub(crate) fn new(cells: Vec<Cell>) -> Self {
-        Self { cells }
+        Self {
+            cells: Arc::new(cells),
+        }
     }
 
     #[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]
@@ -36,14 +60,14 @@ impl VecStorage {
                 }
             }
         }
-        self.cells[idx] = cell;
+        Arc::make_mut(&mut self.cells)[idx] = cell;
     }
 
     pub(crate) fn scan_and_create_hyperlinks(&mut self, matches: Vec<HyperlinkCellMatch>) -> bool {
         let mut has_implicit_hyperlinks = false;
         for matched in matches {
             for cell_idx in matched.cell_indices {
-                let Some(cell) = self.cells.get_mut(cell_idx) else {
+                let Some(cell) = Arc::make_mut(&mut self.cells).get_mut(cell_idx) else {
                     continue;
                 };
                 let attrs = cell.attrs_mut();
@@ -69,7 +93,7 @@ impl core::ops::Deref for VecStorage {
 
 impl core::ops::DerefMut for VecStorage {
     fn deref_mut(&mut self) -> &mut Vec<Cell> {
-        &mut self.cells
+        Arc::make_mut(&mut self.cells)
     }
 }
 
@@ -153,6 +177,42 @@ mod tests {
         let vs = VecStorage::new(make_cells("test"));
         let vs2 = vs.clone();
         assert_eq!(vs, vs2);
+    }
+
+    #[test]
+    fn vec_storage_snapshots_share_cells_until_mutation_and_remain_independent() {
+        let mut original = VecStorage::new(make_cells("abcd"));
+        let mut snapshot = original.clone();
+        assert_eq!(original.as_ptr(), snapshot.as_ptr());
+
+        original.set_cell(0, Cell::new('X', CellAttributes::default()), false);
+        assert_ne!(original.as_ptr(), snapshot.as_ptr());
+        assert_eq!(snapshot[0].str(), "a");
+        snapshot.push(Cell::new('e', CellAttributes::default()));
+        assert_eq!(original.len(), 4);
+        assert_eq!(snapshot.len(), 5);
+
+        let frozen = original.clone();
+        original.scan_and_create_hyperlinks(vec![HyperlinkCellMatch {
+            cell_indices: vec![1, 2],
+            link: Arc::new(crate::hyperlink::Hyperlink::new("https://example.invalid")),
+        }]);
+        assert!(original[1].attrs().hyperlink().is_some());
+        assert!(frozen[1].attrs().hyperlink().is_none());
+        assert!(snapshot[1].attrs().hyperlink().is_none());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn vec_storage_sharing_preserves_the_existing_serialized_cell_array() {
+        let cells = make_cells("wire");
+        let original = VecStorage::new(cells.clone());
+        let snapshot = original.clone();
+        let expected = serde_json::json!({"cells": cells});
+        assert_eq!(serde_json::to_value(&original).unwrap(), expected);
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), expected);
+        let restored: VecStorage = serde_json::from_value(expected).unwrap();
+        assert_eq!(original, restored);
     }
 
     #[test]
