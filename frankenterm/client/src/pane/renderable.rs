@@ -3571,7 +3571,7 @@ mod tests {
             (100..100, [0..0, 0..0]),
             // Malformed input is deliberately reversed; it must not prefetch.
             (
-                Range {
+                std::ops::Range {
                     start: 104,
                     end: 100,
                 },
