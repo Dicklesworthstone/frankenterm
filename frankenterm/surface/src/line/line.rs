@@ -2273,6 +2273,18 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
         line_count: 0,
         break_offsets: vec![],
     });
+    // A bounded lookahead can omit feasible edges, including a full row
+    // wider than lookahead_limit tokens. Keep greedy as a complete feasible
+    // incumbent: searching fewer edges must never make the selected layout
+    // worse. The normal candidate comparator retains all tie-break rules.
+    let greedy_breaks = greedy_break_offsets_from_width_prefix(tokens, width, width_prefix);
+    best[token_count] = Some(evaluate_break_offsets_with_width_prefix(
+        tokens,
+        &greedy_breaks,
+        width,
+        model,
+        width_prefix,
+    ));
 
     for start in 0..token_count {
         let Some(prefix) = best[start].clone() else {
@@ -3405,6 +3417,62 @@ mod tests {
         assert_eq!(plan.break_offsets.last(), Some(&tokens.len()));
         assert!(plan.evaluated_states > 0);
         assert!(plan.evaluated_states <= model.max_dp_states);
+    }
+
+    #[test]
+    fn bounded_wrap_plan_keeps_full_rows_beyond_lookahead() {
+        // The default 64-token lookahead cannot reach the first greedy
+        // endpoint at 120. A bounded search must not replace that zero-cost
+        // layout with two needlessly underfull rows.
+        let line: Line = "x".repeat(121).as_str().into();
+        let report = line.wrap_with_report(120, 19, MonospaceKpCostModel::terminal_default());
+        assert_eq!(report.scorecard.greedy_total_cost, 0);
+        assert_eq!(report.scorecard.selected_total_cost, 0);
+        assert_eq!(
+            report.lines.iter().map(Line::len).collect::<Vec<_>>(),
+            [120, 1]
+        );
+        assert!(report.lines[0].last_cell_was_wrapped());
+        assert!(!report.lines[1].last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn bounded_wrap_plan_never_loses_to_greedy() {
+        let corpora = ["x".repeat(121), "界e\u{301}ab".repeat(25)];
+        for text in corpora {
+            let tokens = cells_from_text(&text);
+            let mut widths = LineWrapWidthPrefixScratch::default();
+            widths.rebuild(&tokens);
+            for lookahead_limit in [1, 2, 4, 64] {
+                let model = MonospaceKpCostModel {
+                    lookahead_limit,
+                    ..MonospaceKpCostModel::terminal_default()
+                };
+                for width in [0, 1, 2, 8, 63, 64, 65, 120, 128] {
+                    let plan = bounded_monospace_wrap_plan(&tokens, width, model);
+                    let selected = evaluate_break_offsets_with_width_prefix(
+                        &tokens,
+                        &plan.break_offsets,
+                        width,
+                        model,
+                        &widths,
+                    );
+                    let greedy = evaluate_break_offsets_with_width_prefix(
+                        &tokens,
+                        &greedy_break_offsets_from_tokens(&tokens, width),
+                        width,
+                        model,
+                        &widths,
+                    );
+                    assert_ne!(
+                        compare_monospace_break_candidates(&selected, &greedy),
+                        Ordering::Greater,
+                        "width={width} lookahead={lookahead_limit} tokens={}",
+                        tokens.len(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

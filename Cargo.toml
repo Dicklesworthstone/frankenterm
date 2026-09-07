@@ -649,8 +649,11 @@ inherits = "release"
 panic = "abort"
 
 [profile.release-perf]
-# Round-4 gauntlet A/B profile. NEVER bench on `--release` (opt-level="z", size-optimized):
-# size-opt distorts hot-loop codegen and invalidates any perf claim (keep-gate rule 3).
+# Round-4 gauntlet profile for algorithm A/B experiments. Measurements apply
+# only to the measured profile: speed-oriented codegen here does not establish
+# the performance of shipped release-interactive artifacts, which inherit "z".
+# Installation and release qualification must also measure the actual shipped
+# profile; its size-oriented codegen is part of the behavior being qualified.
 # Use thin LTO (not the shipped fat `lto=true`) so each A/B arm rebuilds fast on RCH workers;
 # relative before/after deltas stay valid because both arms use the identical profile.
 # Frame pointers (set via RUSTFLAGS="-C force-frame-pointers=yes" in the bench-AB driver) keep
