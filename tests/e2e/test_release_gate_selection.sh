@@ -74,6 +74,14 @@ rg -q '^PASS release panic contract' "$RUN_DIR/production.log"
 # Exercise the real source guards in an owned repository. Only explicit I/O
 # failure cases replace scanners; clean/forbidden controls scan actual files.
 # These are refusal/integrity checks, not runtime or release capability proof.
+(
+# A release invocation may use a private index or explicit repository paths.
+# Keep that authority for the production control above, but never let fixture
+# git add or source enumeration read or modify the caller's repository state.
+git_local_environment=$(git rev-parse --local-env-vars)
+while IFS= read -r variable; do
+  unset "$variable"
+done <<< "$git_local_environment"
 GUARD_FIXTURE="$RUN_DIR/source-guards"
 mkdir -p "$GUARD_FIXTURE/scripts" "$GUARD_FIXTURE/crates/frankenterm-core/src" \
   "$GUARD_FIXTURE/crates/frankenterm-core/tests"
@@ -90,6 +98,9 @@ printf 'fn longer(_: &%s%sFactory) {}\n' 'dyn ' 'MuxInterface' \
   >"$GUARD_FIXTURE/crates/frankenterm-core/src/longer_identifier.rs"
 git -C "$GUARD_FIXTURE" init -q -b main
 git -C "$GUARD_FIXTURE" add scripts crates
+# Every guard must scan repository files even when a caller redirects stdin.
+# Without an explicit rg path, this harmless input can produce a false clean.
+printf 'owned input is not repository source\n' >"$RUN_DIR/guard-stdin"
 
 expect_guard_exit() {
   local expected="$1" label="$2" mode="$3" gate="$4" actual=0
@@ -125,7 +136,7 @@ expect_guard_exit() {
     }
     export -f command rg git grep
     bash "$1"
-  ' guard-case "$GUARD_FIXTURE/scripts/$gate" >"$RUN_DIR/$count.log" 2>&1 || actual=$?
+  ' guard-case "$GUARD_FIXTURE/scripts/$gate" <"$RUN_DIR/guard-stdin" >"$RUN_DIR/$count.log" 2>&1 || actual=$?
   if [[ "$actual" -ne "$expected" ]]; then
     printf 'FAIL %s expected=%s actual=%s log=%s\n' "$label" "$expected" "$actual" "$RUN_DIR/$count.log" >&2
     cat "$RUN_DIR/$count.log" >&2
@@ -163,3 +174,4 @@ git -C "$GUARD_FIXTURE" add crates
 expect_guard_exit 2 asupersync-real-read-failure real check_asupersync_test_only.sh
 
 printf 'RELEASE_GATE_SELECTION_SUCCESS cases=%s production=passed artifacts=%s\n' "$count" "$RUN_DIR"
+)

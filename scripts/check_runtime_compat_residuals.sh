@@ -33,10 +33,11 @@ EXEMPT_FILES=(
 # Use ripgrep if available; fall back to git grep.
 scan_status=0
 if command -v rg >/dev/null 2>&1; then
+    # An explicit path prevents redirected stdin from replacing the source scan.
     matches="$(rg --count-matches --no-heading 'runtime_compat' \
         --glob 'crates/**/*.rs' --glob 'frankenterm/**/*.rs' \
         --glob 'crates/**/Cargo.toml' --glob 'frankenterm/**/Cargo.toml' \
-        --glob '!target/**')" || scan_status=$?
+        --glob '!target/**' .)" || scan_status=$?
 else
     matches="$(git grep -c 'runtime_compat' -- 'crates/**/*.rs' \
         'frankenterm/**/*.rs' 'crates/**/Cargo.toml' \
@@ -57,6 +58,7 @@ total_occurrences=0
 
 while IFS=: read -r file count; do
     [[ -z "${file}" ]] && continue
+    file="${file#./}"
     total_occurrences=$((total_occurrences + count))
 
     # Exempt?

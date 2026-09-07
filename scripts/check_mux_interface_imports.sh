@@ -47,8 +47,9 @@ PATTERN='dyn[[:space:]]+(Mux|Wezterm)Interface([^[:alnum:]_]|$)'
 # back to git-grep otherwise.
 scan_status=0
 if command -v rg >/dev/null 2>&1; then
+    # An explicit path prevents redirected stdin from replacing the source scan.
     matches="$(rg --line-number --no-heading --pcre2 "${PATTERN}" \
-        --glob '!target/**' --glob '!.beads/**')" || scan_status=$?
+        --glob '!target/**' --glob '!.beads/**' .)" || scan_status=$?
 else
     matches="$(git grep -n -E "${PATTERN}" -- '*.rs' '*.sh' '*.md')" || scan_status=$?
 fi
@@ -71,9 +72,9 @@ for f in "${ALLOWED_FILES[@]}"; do
     # alphanumerics in this repo, but be defensive).
     esc="$(printf '%s' "$f" | sed -e 's/[][\\.*^$/+?()|{}]/\\&/g')"
     if [[ -z "${allow_regex}" ]]; then
-        allow_regex="^${esc}:"
+        allow_regex="^(\./)?${esc}:"
     else
-        allow_regex="${allow_regex}|^${esc}:"
+        allow_regex="${allow_regex}|^(\./)?${esc}:"
     fi
 done
 
