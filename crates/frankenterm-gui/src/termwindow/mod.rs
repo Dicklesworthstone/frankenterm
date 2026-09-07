@@ -146,20 +146,31 @@ pub const ICON_DATA: &[u8] = include_bytes!("../../../../assets/icon/terminal.pn
 /// both scheduler hops, including Window::notify, so a burst cannot refill the
 /// queue between the mux callback and the actual window handler. That handler
 /// reads the current mux title; intermediate title strings need no delivery.
-pub struct PendingMuxTitleRefresh(Arc<AtomicBool>);
+pub struct PendingMuxTitleRefresh(Option<Arc<AtomicBool>>);
 
 impl PendingMuxTitleRefresh {
     fn acquire(pending: &Arc<AtomicBool>) -> Option<Self> {
         pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| Self(Arc::clone(pending)))
+            .map(|_| Self(Some(Arc::clone(pending))))
+    }
+
+    fn begin_refresh(mut self) {
+        // Clear before reading current mux state. A concurrent update after
+        // that read must be able to queue a successor; this consumed ticket
+        // must never clear the successor's ownership when it is dropped.
+        if let Some(pending) = self.0.take() {
+            pending.store(false, Ordering::Release);
+        }
     }
 }
 
 impl Drop for PendingMuxTitleRefresh {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        if let Some(pending) = self.0.take() {
+            pending.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -3957,7 +3968,7 @@ impl TermWindow {
                 notification: n,
                 mux_owner,
                 pane_removal_cleanup,
-                pending_title_refresh: _pending_title_refresh,
+                pending_title_refresh,
             } => {
                 let Some(notification_owner) = mux_owner.upgrade() else {
                     return Ok(());
@@ -3967,6 +3978,9 @@ impl TermWindow {
                     // A queued notification from a replaced mux must never act
                     // on same-numbered panes or windows in the new mux.
                     return Ok(());
+                }
+                if let Some(pending) = pending_title_refresh {
+                    pending.begin_refresh();
                 }
                 match n {
                     MuxNotification::Alert {
@@ -4487,6 +4501,21 @@ impl TermWindow {
         // every window and discovering the destination on the main thread.
         // Pane events deliberately keep the overlay-aware handler below.
         match n {
+            // These events have no TermWindow side effects. Their owners
+            // (notably GuiFrontEnd) subscribe separately; do not reserve a
+            // task per window just to return from the deferred callback.
+            MuxNotification::PaneAdded(_)
+            | MuxNotification::WindowCreated(_)
+            | MuxNotification::ActiveWorkspaceChanged(_)
+            | MuxNotification::WorkspaceRenamed { .. }
+            | MuxNotification::WindowWorkspaceChanged { .. }
+            | MuxNotification::Empty
+            | MuxNotification::AssignClipboard { .. }
+            | MuxNotification::SaveToDownloads { .. }
+            | MuxNotification::Alert {
+                alert: Alert::ToastNotification { .. },
+                ..
+            } => false,
             MuxNotification::TabAddedToWindow {
                 window_id: target, ..
             }
@@ -4503,6 +4532,25 @@ impl TermWindow {
             }
             _ => true,
         }
+    }
+
+    fn mux_notification_only_refreshes_title(n: &MuxNotification) -> bool {
+        matches!(
+            n,
+            MuxNotification::WindowTitleChanged { .. }
+                | MuxNotification::TabTitleChanged { .. }
+                | MuxNotification::TabResized(_)
+                | MuxNotification::PaneFocused(_)
+                | MuxNotification::Alert {
+                    alert: Alert::OutputSinceFocusLost
+                        | Alert::CurrentWorkingDirectoryChanged
+                        | Alert::WindowTitleChanged(_)
+                        | Alert::TabTitleChanged(_)
+                        | Alert::IconTitleChanged(_)
+                        | Alert::Progress(_),
+                    ..
+                }
+        )
     }
 
     fn mux_pane_output_event_callback(
@@ -4695,7 +4743,7 @@ impl TermWindow {
                 if !Self::mux_notification_targets_window(&n, mux_window_id) {
                     return true;
                 }
-                let pending_title_refresh = if matches!(&n, MuxNotification::WindowTitleChanged { .. }) {
+                let pending_title_refresh = if Self::mux_notification_only_refreshes_title(&n) {
                     let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) else {
                         metrics::counter!("gui.mux_title_refresh.coalesced").increment(1);
                         return true;
@@ -4703,6 +4751,18 @@ impl TermWindow {
                     Some(ticket)
                 } else {
                     None
+                };
+                let n = if pending_title_refresh.is_some() {
+                    // Every admitted event in this group only refreshes the
+                    // title/status from live mux state. Route that refresh to
+                    // this exact window: an unrelated tab event must not win
+                    // the ticket, be filtered later, and erase a local update.
+                    MuxNotification::WindowTitleChanged {
+                        window_id: mux_window_id,
+                        title: String::new(),
+                    }
+                } else {
+                    n
                 };
                 let window = window.clone();
                 let dead = dead.clone();
@@ -8626,6 +8686,107 @@ mod tests {
         assert!(super::PendingMuxTitleRefresh::acquire(&replacement).is_none());
         drop(current);
         assert!(super::PendingMuxTitleRefresh::acquire(&replacement).is_some());
+    }
+
+    #[test]
+    fn mux_title_refresh_begin_allows_successor_without_releasing_its_ticket() {
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = super::PendingMuxTitleRefresh::acquire(&pending).unwrap();
+        first.begin_refresh();
+        let successor = super::PendingMuxTitleRefresh::acquire(&pending).unwrap();
+        assert!(super::PendingMuxTitleRefresh::acquire(&pending).is_none());
+        drop(successor);
+        assert!(super::PendingMuxTitleRefresh::acquire(&pending).is_some());
+    }
+
+    #[test]
+    fn mux_title_mixed_startup_burst_is_bounded_per_window() {
+        let pending: Vec<_> = (0..64)
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        let mut queued = Vec::new();
+        for sequence in 0..40_000 {
+            let notification = match sequence % 4 {
+                0 => mux::MuxNotification::TabResized(7),
+                1 => mux::MuxNotification::TabTitleChanged {
+                    tab_id: 7,
+                    title: format!("tab-{sequence}"),
+                },
+                2 => mux::MuxNotification::Alert {
+                    pane_id: 7,
+                    alert: frankenterm_term::Alert::WindowTitleChanged(format!("pane-{sequence}")),
+                },
+                _ => mux::MuxNotification::WindowTitleChanged {
+                    window_id: 17,
+                    title: format!("window-{sequence}"),
+                },
+            };
+            assert!(super::TermWindow::mux_notification_only_refreshes_title(
+                &notification
+            ));
+            for (window_id, pending) in pending.iter().enumerate() {
+                if super::TermWindow::mux_notification_targets_window(&notification, window_id) {
+                    if let Some(ticket) = super::PendingMuxTitleRefresh::acquire(pending) {
+                        queued.push(ticket);
+                    }
+                }
+            }
+        }
+        assert_eq!(queued.len(), pending.len());
+        // A tab refresh can take a window's slot before a targeted title
+        // update arrives. Both must read the destination's latest mux state.
+        assert!(super::PendingMuxTitleRefresh::acquire(&pending[17]).is_none());
+        for ticket in queued {
+            ticket.begin_refresh();
+        }
+        assert!(
+            pending
+                .iter()
+                .all(|slot| !slot.load(std::sync::atomic::Ordering::Acquire))
+        );
+    }
+
+    #[test]
+    fn mux_window_prefilter_skips_ignored_events_without_coalescing_side_effects() {
+        for window_id in [0, 17, usize::MAX] {
+            for notification in [
+                mux::MuxNotification::PaneAdded(7),
+                mux::MuxNotification::WindowCreated(17),
+                mux::MuxNotification::Empty,
+                mux::MuxNotification::WorkspaceRenamed {
+                    old_workspace: "old".into(),
+                    new_workspace: "new".into(),
+                },
+            ] {
+                assert!(!super::TermWindow::mux_notification_targets_window(
+                    &notification,
+                    window_id,
+                ));
+            }
+        }
+        for notification in [
+            mux::MuxNotification::PaneOutput(7),
+            mux::MuxNotification::PaneRemoved(7),
+            mux::MuxNotification::Alert {
+                pane_id: 7,
+                alert: frankenterm_term::Alert::SetUserVar {
+                    name: "key".into(),
+                    value: "value".into(),
+                },
+            },
+            mux::MuxNotification::Alert {
+                pane_id: 7,
+                alert: frankenterm_term::Alert::Bell,
+            },
+        ] {
+            assert!(!super::TermWindow::mux_notification_only_refreshes_title(
+                &notification
+            ));
+            assert!(super::TermWindow::mux_notification_targets_window(
+                &notification,
+                17
+            ));
+        }
     }
 
     #[test]
