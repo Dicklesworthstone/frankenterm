@@ -5687,8 +5687,9 @@ fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLin
         Err(SerializedLinesStructureError::DuplicateStableRow) => {}
         Err(error) => return Err(error.into()),
     }
-    // Legacy GetLines clips each requested range independently. Disjoint
-    // ranges outside retained scrollback can therefore return the same rows.
+    // Legacy GetLines clips each requested range independently, and legacy
+    // render pushes can append the cursor row after including it in the
+    // viewport. Both paths can therefore return the same row more than once.
     // Validate every positional reference before hydration or deduplication;
     // only identical rendered rows (including hyperlinks) may collapse.
     lines.validate_references(false)?;
@@ -5784,16 +5785,18 @@ fn decode_materialized_for_dialect(
                 }
             }
             25 => {
-                let response: GetPaneRenderChangesResponse = deserialize_exact_payload_with_limit(
-                    decoded.data.as_slice(),
-                    decoded.is_compressed,
-                    "Legacy46GetPaneRenderChangesResponse",
-                    MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
-                )?;
-                response.bonus_lines.validate_structure()?;
+                let mut response: GetPaneRenderChangesResponse =
+                    deserialize_exact_payload_with_limit(
+                        decoded.data.as_slice(),
+                        decoded.is_compressed,
+                        "Legacy46GetPaneRenderChangesResponse",
+                        MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
+                    )?;
                 if legacy46_serialized_lines_are_text_only(&response.bonus_lines) {
+                    response.bonus_lines = normalize_legacy46_text_lines(response.bonus_lines)?;
                     MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response))
                 } else {
+                    response.bonus_lines.validate_structure()?;
                     unsupported_mux_wire_payload(
                         ident,
                         MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
@@ -28256,6 +28259,62 @@ mod test {
             let first_link = first_cell.attrs().hyperlink().unwrap();
             let second_link = second_cell.attrs().hyperlink().unwrap();
             assert!(Arc::ptr_eq(first_link, second_link));
+        }
+    }
+
+    #[test]
+    fn legacy46_bonus_lines_collapse_identical_cursor_row_and_preserve_snapshot() {
+        let mut attrs = termwiz::cell::CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/legacy-cursor",
+        ))));
+        let first = Line::from_text("viewport", &attrs, 17, None);
+        let cursor = Line::from_text("cursor", &attrs, 17, None);
+        let mut response = sample_retention_metadata_render_change();
+        response.bonus_lines = SerializedLines::from(vec![
+            (1933, first.clone()),
+            (1934, cursor.clone()),
+            (1934, cursor.clone()),
+        ]);
+        assert_eq!(
+            response.bonus_lines.validate_structure(),
+            Err(SerializedLinesStructureError::DuplicateStableRow),
+        );
+        let mut expected = response.clone();
+        expected.bonus_lines = SerializedLines::from(vec![(1933, first), (1934, cursor.clone())]);
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let wire = Pdu::GetPaneRenderChangesResponse(response.clone())
+                .encode_frame_with_mode(0, mode)
+                .unwrap();
+            let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+                .expect("legacy unsolicited render pushes must normalize identical cursor rows");
+            let (serial, MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(actual))) =
+                decoded.into_parts()
+            else {
+                panic!("text render push must remain available");
+            };
+            assert_eq!(serial, 0);
+            assert_eq!(actual, expected, "all other snapshot metadata must survive");
+            actual.bonus_lines.validate_structure().unwrap();
+
+            let mut conflict = response.clone();
+            conflict.bonus_lines = SerializedLines::from(vec![
+                (1934, cursor.clone()),
+                (
+                    1934,
+                    Line::from_text("conflicting cursor", &attrs, 17, None),
+                ),
+            ]);
+            let wire = Pdu::GetPaneRenderChangesResponse(conflict)
+                .encode_frame_with_mode(0, mode)
+                .unwrap();
+            let error = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+                .expect_err("conflicting legacy bonus rows remain invalid");
+            assert_eq!(
+                error.downcast_ref::<SerializedLinesStructureError>(),
+                Some(&SerializedLinesStructureError::DuplicateStableRow),
+            );
         }
     }
 
