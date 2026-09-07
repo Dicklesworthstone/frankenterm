@@ -13,7 +13,9 @@ use std::time::Duration;
 use tracing::warn;
 
 #[allow(unused_imports)]
-pub(crate) use fastapi::core::{BoxFuture, ControlFlow, Cx, Middleware, OpenApiConfig, StartupOutcome};
+pub(crate) use fastapi::core::{
+    BoxFuture, ControlFlow, Cx, Middleware, OpenApiConfig, StartupOutcome,
+};
 #[allow(unused_imports)]
 pub(crate) use fastapi::http::QueryString;
 #[allow(unused_imports)]
