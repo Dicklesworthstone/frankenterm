@@ -8714,7 +8714,7 @@ mod tests {
                 },
                 2 => mux::MuxNotification::Alert {
                     pane_id: 7,
-                    alert: frankenterm_term::Alert::WindowTitleChanged(format!("pane-{sequence}")),
+                    alert: super::Alert::WindowTitleChanged(format!("pane-{sequence}")),
                 },
                 _ => mux::MuxNotification::WindowTitleChanged {
                     window_id: 17,
@@ -8769,14 +8769,14 @@ mod tests {
             mux::MuxNotification::PaneRemoved(7),
             mux::MuxNotification::Alert {
                 pane_id: 7,
-                alert: frankenterm_term::Alert::SetUserVar {
+                alert: super::Alert::SetUserVar {
                     name: "key".into(),
                     value: "value".into(),
                 },
             },
             mux::MuxNotification::Alert {
                 pane_id: 7,
-                alert: frankenterm_term::Alert::Bell,
+                alert: super::Alert::Bell,
             },
         ] {
             assert!(!super::TermWindow::mux_notification_only_refreshes_title(
