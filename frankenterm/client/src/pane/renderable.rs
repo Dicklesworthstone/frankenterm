@@ -80,6 +80,30 @@ fn should_apply_unilateral_delta(current_seqno: SequenceNo, delta_seqno: Sequenc
     delta_seqno >= current_seqno
 }
 
+fn prefetch_ranges(
+    requested: &Range<StableRowIndex>,
+    dimensions: &RenderableDimensions,
+) -> [Range<StableRowIndex>; 2] {
+    if requested.is_empty() || dimensions.viewport_rows == 0 || dimensions.scrollback_rows == 0 {
+        return [0..0, 0..0];
+    }
+    let viewport =
+        StableRowIndex::try_from(dimensions.viewport_rows).unwrap_or(StableRowIndex::MAX);
+    let span = requested.end.saturating_sub(requested.start).min(viewport);
+    let oldest = dimensions.scrollback_top;
+    let newest = oldest.saturating_add(
+        StableRowIndex::try_from(dimensions.scrollback_rows).unwrap_or(StableRowIndex::MAX),
+    );
+    let before_end = requested.start.min(newest);
+    let before_start = requested.start.saturating_sub(span).max(oldest);
+    let after_start = requested.end.max(oldest);
+    let after_end = requested.end.saturating_add(span).min(newest);
+    [
+        before_start.min(before_end)..before_end,
+        after_start..after_end.max(after_start),
+    ]
+}
+
 fn render_line_cache_capacity(
     config: &ConfigHandle,
     dimensions: &RenderableDimensions,
@@ -3250,25 +3274,22 @@ impl RenderableState {
         // cached) costs nothing and never steals fetch budget from on-screen updates.
         // Off-screen rows join `to_fetch` but never `result` (they are not displayed).
         // [prefetch]
-        let viewport_span = StableRowIndex::try_from(inner.dimensions.viewport_rows)
-            .unwrap_or(StableRowIndex::MAX)
-            .max(1);
-        let span = lines
-            .end
-            .saturating_sub(lines.start)
-            .clamp(1, viewport_span);
-        let lo = lines.start.saturating_sub(span);
-        let hi = lines.end.saturating_add(span);
+        // Use the last server-reported extent: viewport_rows may already have
+        // been changed optimistically by a local resize. Out-of-bounds GetLines
+        // requests are shifted back into the server's retained rows, so probing
+        // below the screen can retransmit the entire visible viewport.
+        let [before, after] = prefetch_ranges(&lines, &inner.dimensions);
         let needs_prefetch =
-            (lo..lines.start)
-                .chain(lines.end..hi)
+            before
+                .clone()
+                .chain(after.clone())
                 .any(|idx| match inner.lines.peek(&idx) {
                     None | Some(LineEntry::Stale(_)) => true,
                     Some(LineEntry::Line(line)) => line.changed_since(inner.seqno),
                     Some(LineEntry::Fetching(_)) | Some(LineEntry::LineAndFetching(..)) => false,
                 });
         if needs_prefetch && inner.fetch_limiter.non_blocking_admittance_check(1) {
-            for idx in (lo..lines.start).chain(lines.end..hi) {
+            for idx in before.chain(after) {
                 match inner.lines.pop(&idx) {
                     Some(LineEntry::Line(line)) => {
                         if line.changed_since(inner.seqno) {
@@ -3529,6 +3550,92 @@ mod tests {
 
     fn test_renderable_state() -> Arc<parking_lot::Mutex<super::RenderableState>> {
         test_renderable_state_with_echo_threshold(None)
+    }
+
+    #[test]
+    fn prefetch_stays_inside_server_extent_during_resize_and_scrolling() {
+        let dimensions = mux::renderable::RenderableDimensions {
+            viewport_rows: 4,
+            scrollback_top: 100,
+            scrollback_rows: 12,
+            physical_top: 108,
+            ..Default::default()
+        };
+        for (request, expected) in [
+            (100..104, [100..100, 104..108]),
+            (104..108, [100..104, 108..112]),
+            (108..112, [104..108, 112..112]),
+            (98..102, [98..98, 102..106]),
+            (110..114, [106..110, 114..114]),
+            (120..124, [112..112, 124..124]),
+            (100..100, [0..0, 0..0]),
+            (104..100, [0..0, 0..0]),
+        ] {
+            assert_eq!(super::prefetch_ranges(&request, &dimensions), expected);
+        }
+
+        // A taller local window updates viewport_rows before the remote mux
+        // acknowledges the resize. It must not invent rows beyond its extent.
+        let taller = mux::renderable::RenderableDimensions {
+            viewport_rows: 8,
+            ..dimensions
+        };
+        assert_eq!(
+            super::prefetch_ranges(&(108..116), &taller),
+            [100..108, 116..116]
+        );
+
+        let boundary = mux::renderable::RenderableDimensions {
+            scrollback_top: wezterm_term::StableRowIndex::MAX - 4,
+            scrollback_rows: 4,
+            ..dimensions
+        };
+        let last = wezterm_term::StableRowIndex::MAX;
+        assert_eq!(
+            super::prefetch_ranges(&(last - 2..last), &boundary),
+            [last - 4..last - 2, last..last],
+        );
+    }
+
+    #[test]
+    fn get_lines_does_not_prefetch_nonexistent_rows_or_change_visible_content() {
+        let renderable = test_renderable_state();
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.dimensions.viewport_rows = 4;
+            inner.dimensions.scrollback_rows = 4;
+            inner.dimensions.scrollback_top = 0;
+            inner.dimensions.physical_top = 0;
+            inner.seqno = 7;
+            for row in 0..4 {
+                let line = Line::from_text(
+                    &format!("row {row}: 界 e\u{0301}"),
+                    &CellAttributes::default(),
+                    7,
+                    None,
+                );
+                inner.lines.put(row, LineEntry::Line(line));
+            }
+        }
+        for _ in 0..3 {
+            let state = renderable.lock();
+            let (first, visible) = state.get_lines(0..4);
+            assert_eq!(first, 0);
+            assert_eq!(visible.len(), 4);
+            for (row, line) in visible.iter().enumerate() {
+                assert_eq!(line.as_str(), format!("row {row}: 界 e\u{0301}"));
+            }
+            let inner = state.inner.borrow();
+            assert_eq!(
+                inner.lines.len(),
+                4,
+                "out-of-bounds prefetch polluted the cache"
+            );
+            assert!(inner.lines.iter().all(|(row, entry)| {
+                (0..4).contains(row) && matches!(entry, LineEntry::Line(_))
+            }));
+        }
     }
 
     fn test_image(width: u32, height: u32, fill: u8) -> Arc<ImageData> {
