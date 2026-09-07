@@ -184,7 +184,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 43,
-        "fix": 59,
+        "fix": 60,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 242,
+      "fork_side_commit_count": 243,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-07T04:42:34-04:00",
-        "sha": "58d1f5f695c4fa790b2028580adb8d06ae32f915",
-        "subject": "fix(codec): normalize sequence-only drift in legacy duplicate rows"
+        "committed_at": "2026-09-07T05:41:50-04:00",
+        "sha": "2eed7f59a985f6e6e09820fc5b4d75022a53590e",
+        "subject": "fix(codec): retain the newest legacy row snapshot"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2410,
-  "generated_at": "2026-09-07T08:54:15.491454Z",
+  "fork_side_commit_total": 2411,
+  "generated_at": "2026-09-07T09:42:40.760119Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
