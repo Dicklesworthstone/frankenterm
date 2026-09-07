@@ -5055,6 +5055,7 @@ impl ObservationRuntime {
             snapshot_engine,
             snapshot_scheduler_status,
             snapshot_shutdown_requested,
+            snapshot_trigger_shutdown_acknowledged,
         ) = if let Some(ref snap_config) = self.snapshot_config {
             if snap_config.enabled {
                 let db_path = Arc::new(self.storage.db_path().to_string());
@@ -5064,18 +5065,22 @@ impl ObservationRuntime {
                 ));
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let wezterm = self.wezterm_handle.clone();
-                let snapshot_triggers = if matches!(
+                let snapshot_trigger_shutdown_acknowledged = matches!(
                     snap_config.scheduling.mode,
                     SnapshotSchedulingMode::Intelligent
-                ) {
-                    Some(self.spawn_snapshot_trigger_task(
-                        Arc::clone(&engine),
-                        snapshot_subscriber,
-                        shutdown_rx.clone(),
-                    ))
-                } else {
-                    None
-                };
+                )
+                .then(|| Arc::new(AtomicBool::new(false)));
+                let snapshot_triggers =
+                    snapshot_trigger_shutdown_acknowledged
+                        .as_ref()
+                        .map(|acknowledged| {
+                            self.spawn_snapshot_trigger_task(
+                                Arc::clone(&engine),
+                                snapshot_subscriber,
+                                shutdown_rx.clone(),
+                                Arc::clone(acknowledged),
+                            )
+                        });
                 let snapshot_shutdown_clean = Arc::new(AtomicBool::new(false));
                 let snapshot_scheduler_status = Arc::new(AtomicU8::new(SNAPSHOT_SCHEDULER_RUNNING));
                 let task_snapshot_scheduler_status = Arc::clone(&snapshot_scheduler_status);
@@ -5135,12 +5140,13 @@ impl ObservationRuntime {
                     Some(engine),
                     Some(snapshot_scheduler_status),
                     Some(snapshot_shutdown_requested),
+                    snapshot_trigger_shutdown_acknowledged,
                 )
             } else {
-                (None, None, None, None, None, None, None)
+                (None, None, None, None, None, None, None, None)
             }
         } else {
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
 
         info!("Observation runtime started");
@@ -5159,6 +5165,7 @@ impl ObservationRuntime {
             snapshot_engine,
             snapshot_scheduler_status,
             snapshot_shutdown_requested,
+            snapshot_trigger_shutdown_acknowledged,
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: self.storage.clone(),
             metrics: Arc::clone(&self.metrics),
@@ -5184,6 +5191,7 @@ impl ObservationRuntime {
         snapshot_engine: Arc<crate::snapshot_engine::SnapshotEngine>,
         mut subscriber: Option<crate::events::EventSubscriber>,
         mut shutdown_rx: watch::Receiver<bool>,
+        shutdown_acknowledged: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let registry = Arc::clone(&self.registry);
@@ -5196,13 +5204,18 @@ impl ObservationRuntime {
             let mut last_activity = started_at;
             let mut last_idle_trigger = started_at;
             let mut last_memory_trigger = None;
+            let mut event_source_failed = false;
 
-            loop {
-                if shutdown_flag.load(Ordering::SeqCst) {
-                    break;
+            let acknowledged = loop {
+                if shutdown_flag.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                    break true;
                 }
                 if loop_cx.checkpoint().is_err() {
-                    break;
+                    record_runtime_wait_failure(
+                        "snapshot_trigger_bridge_entry",
+                        runtime_context_failure_kind(&loop_cx),
+                    );
+                    break false;
                 }
 
                 let mut subscriber_closed = false;
@@ -5212,27 +5225,32 @@ impl ObservationRuntime {
                     // The tick is deliberately long; shutdown must wake this
                     // wait immediately rather than force-abort a healthy task.
                     let receive = crate::runtime_async::select! {
-                        _ = shutdown_rx.changed(&loop_cx) => None,
+                        changed = shutdown_rx.changed(&loop_cx) => Err(changed),
                         receive = runtime_timeout(
                             &loop_cx,
                             Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
-                            sub.recv(),
-                        ) => Some(receive),
+                            sub.recv_cx(&loop_cx),
+                        ) => Ok(receive),
                     };
-                    let Some(receive) = receive else {
-                        break;
+                    let receive = match receive {
+                        Ok(receive) => receive,
+                        Err(Ok(())) => continue, // Recheck the actual shutdown value.
+                        Err(Err(error)) => {
+                            warn!(?error, "snapshot trigger bridge lost shutdown watch");
+                            break false;
+                        }
                     };
                     match receive {
                         Ok(recv) => {
                             if shutdown_flag.load(Ordering::SeqCst) {
-                                break;
+                                break true;
                             }
                             if loop_cx.checkpoint().is_err() {
                                 record_runtime_wait_failure(
                                     "snapshot_trigger_bridge_event",
                                     runtime_context_failure_kind(&loop_cx),
                                 );
-                                break;
+                                break false;
                             }
                             tick_only = false;
                             match recv {
@@ -5247,7 +5265,7 @@ impl ObservationRuntime {
                                                 "snapshot_trigger_bridge_emit",
                                                 runtime_context_failure_kind(&loop_cx),
                                             );
-                                            break;
+                                            break false;
                                         }
                                         if !snapshot_engine.emit_trigger(trigger) {
                                             debug!(
@@ -5267,47 +5285,56 @@ impl ObservationRuntime {
                                     );
                                 }
                                 Err(crate::events::RecvError::Cancelled) => {
-                                    debug!("snapshot trigger bridge subscriber cancelled");
-                                    subscriber_closed = true;
+                                    record_runtime_wait_failure(
+                                        "snapshot_trigger_bridge_subscriber",
+                                        runtime_context_failure_kind(&loop_cx),
+                                    );
+                                    break false;
                                 }
                                 Err(crate::events::RecvError::Closed) => {
+                                    warn!("snapshot trigger bridge lost event source");
+                                    event_source_failed = true;
                                     subscriber_closed = true;
                                 }
                             }
                         }
                         Err(RuntimeTimeoutFailure::Context(failure)) => {
                             record_runtime_wait_failure("snapshot_trigger_bridge_recv", failure);
-                            break;
+                            break false;
                         }
                         Err(RuntimeTimeoutFailure::Elapsed) => {}
                     }
                 } else {
                     let sleep_result = crate::runtime_async::select! {
-                        _ = shutdown_rx.changed(&loop_cx) => None,
+                        changed = shutdown_rx.changed(&loop_cx) => Err(changed),
                         result = runtime_sleep(
                             &loop_cx,
                             Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
-                        ) => Some(result),
+                        ) => Ok(result),
                     };
                     match sleep_result {
-                        None => break,
-                        Some(Ok(())) => {}
-                        Some(Err(failure)) => {
+                        Err(Ok(())) => continue,
+                        Err(Err(error)) => {
+                            warn!(?error, "snapshot trigger bridge lost shutdown watch");
+                            break false;
+                        }
+                        Ok(Ok(())) => {}
+                        Ok(Err(failure)) => {
                             record_runtime_wait_failure("snapshot_trigger_bridge", failure);
-                            break;
+                            break false;
                         }
                     }
                 }
 
                 if shutdown_flag.load(Ordering::SeqCst) {
-                    break;
+                    break true;
                 }
                 if loop_cx.checkpoint().is_err() {
                     record_runtime_wait_failure(
                         "snapshot_trigger_bridge_tick",
                         runtime_context_failure_kind(&loop_cx),
                     );
-                    break;
+                    break false;
                 }
 
                 if subscriber_closed {
@@ -5331,7 +5358,16 @@ impl ObservationRuntime {
                     )
                 {
                     let observed_panes = {
-                        let reg = registry.read().await;
+                        let reg = match registry.read_with_cx(&loop_cx).await {
+                            Ok(reg) => reg,
+                            Err(error) => {
+                                warn!(
+                                    ?error,
+                                    "snapshot trigger bridge could not read idle registry"
+                                );
+                                break false;
+                            }
+                        };
                         reg.observed_pane_ids().len()
                     };
                     if loop_cx.checkpoint().is_err() {
@@ -5339,15 +5375,16 @@ impl ObservationRuntime {
                             "snapshot_trigger_bridge_idle_emit",
                             runtime_context_failure_kind(&loop_cx),
                         );
-                        break;
+                        break false;
                     }
                     if observed_panes > 0 {
-                        if !snapshot_engine
+                        if snapshot_engine
                             .emit_trigger(crate::snapshot_engine::SnapshotTrigger::IdleWindow)
                         {
+                            last_idle_trigger = now;
+                        } else {
                             debug!("snapshot idle-window trigger dropped (queue full or inactive)");
                         }
-                        last_idle_trigger = now;
                     }
                 }
 
@@ -5369,16 +5406,21 @@ impl ObservationRuntime {
                             "snapshot_trigger_bridge_memory_emit",
                             runtime_context_failure_kind(&loop_cx),
                         );
-                        break;
+                        break false;
                     }
-                    if !snapshot_engine
+                    if snapshot_engine
                         .emit_trigger(crate::snapshot_engine::SnapshotTrigger::MemoryPressure)
                     {
+                        last_memory_trigger = Some(now);
+                    } else {
                         debug!("snapshot memory-pressure trigger dropped (queue full or inactive)");
                     }
-                    last_memory_trigger = Some(now);
                 }
-            }
+            };
+            // Joining a unit-returning task is not a receipt: cancellation,
+            // lost watches, and a lost event source must remain sticky failures
+            // even if the runtime later requests an otherwise healthy shutdown.
+            shutdown_acknowledged.store(acknowledged && !event_source_failed, Ordering::Release);
         })
     }
 
@@ -10102,7 +10144,7 @@ pub struct RuntimeHandle {
     /// Set only by the unique RuntimeHandle shutdown owner after every runtime
     /// task has settled, storage has flushed, and the terminal snapshot helper
     /// returns both its final-checkpoint and clean-mark receipt.
-    /// `None` means this runtime did not enable the duplicate snapshot surface.
+    /// `None` means this runtime did not enable snapshots.
     snapshot_shutdown_clean: Option<Arc<AtomicBool>>,
     /// Snapshot engine retained by the unique shutdown owner. The scheduler
     /// task never finalizes this engine merely because its loop returns.
@@ -10114,6 +10156,10 @@ pub struct RuntimeHandle {
     /// Explicit shutdown intent shared with the scheduler task. This separates
     /// an expected watch-channel acknowledgement from a spontaneous return.
     snapshot_shutdown_requested: Option<Arc<AtomicBool>>,
+    /// Present only for intelligent scheduling. Set by the trigger bridge only
+    /// after an explicit shutdown with no earlier loss of its event source.
+    /// Early failure or abort leaves this false even when the task joins `Ok`.
+    snapshot_trigger_shutdown_acknowledged: Option<Arc<AtomicBool>>,
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
@@ -11656,6 +11702,17 @@ impl RuntimeHandle {
             warnings.push(
                 "RuntimeBuilder snapshot engine has no scheduler acknowledgement authority"
                     .to_string(),
+            );
+        }
+
+        if self
+            .snapshot_trigger_shutdown_acknowledged
+            .as_ref()
+            .is_some_and(|acknowledged| !acknowledged.load(Ordering::Acquire))
+        {
+            clean = false;
+            warnings.push(
+                "RuntimeBuilder snapshot trigger bridge did not acknowledge shutdown".to_string(),
             );
         }
 
@@ -17749,6 +17806,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_scheduler_status: None,
             snapshot_shutdown_requested: None,
+            snapshot_trigger_shutdown_acknowledged: None,
             shutdown_flag: Arc::clone(&runtime.shutdown_flag),
             storage: runtime.storage.clone(),
             metrics: Arc::clone(&runtime.metrics),
@@ -18437,6 +18495,361 @@ mod tests {
             let summary = handle.shutdown_with_summary().await;
             assert!(summary.is_clean(), "{:?}", summary.warnings);
             assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_cancelled_trigger_bridge_cannot_mark_clean() {
+        run_async_test_isolated(|| snapshot_failed_trigger_bridge_stays_unclean(true));
+    }
+
+    #[test]
+    fn runtime_snapshot_lost_trigger_shutdown_watch_cannot_mark_clean() {
+        run_async_test_isolated(|| snapshot_failed_trigger_bridge_stays_unclean(false));
+    }
+
+    async fn snapshot_failed_trigger_bridge_stays_unclean(cancel: bool) {
+        let (_dir, db_path) = temp_db_path();
+        let storage = StorageHandle::new(&db_path).await.unwrap();
+        let mock = crate::wezterm::MockWezterm::new();
+        mock.add_default_pane(0).await;
+        let bus = Arc::new(EventBus::new(64));
+        let mut runtime = ObservationRuntime::new(
+            RuntimeConfig::default(),
+            storage,
+            Arc::new(RwLock::new(PatternEngine::new())),
+        )
+        .with_wezterm_handle(Arc::new(mock))
+        .with_event_bus(Arc::clone(&bus))
+        .with_snapshot_config(SnapshotConfig::default());
+        let mut handle = runtime.start().await.unwrap();
+        wait_for_snapshot_checkpoint(&db_path, "startup").await;
+
+        // Replace only the trigger bridge with one whose context/watch can be
+        // faulted independently. Fully join the removed fixture task so its
+        // deliberate abort cannot itself veto the later clean-mark assertion.
+        let original_bridge = handle.snapshot_triggers.take().unwrap();
+        original_bridge.abort();
+        assert!(original_bridge.await.is_err());
+        let bridge_cx = crate::cx::for_testing();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let replacement = {
+            let _guard = crate::cx::Cx::set_current(Some(bridge_cx.clone()));
+            runtime.spawn_snapshot_trigger_task(
+                Arc::clone(handle.snapshot_engine.as_ref().unwrap()),
+                Some(bus.subscribe()),
+                shutdown_rx,
+                Arc::clone(&acknowledged),
+            )
+        };
+        handle.snapshot_triggers = Some(replacement);
+        handle.snapshot_trigger_shutdown_acknowledged = Some(acknowledged);
+        assert!(
+            bus.publish(Event::WorkflowCompleted {
+                workflow_id: "trigger-failure-live-bridge".to_string(),
+                success: false,
+                reason: None,
+            }) > 0
+        );
+        wait_for_snapshot_checkpoint(&db_path, "event").await;
+        let shutdown_tx = if cancel {
+            bridge_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("trigger bridge fixture"),
+            );
+            // Wake the select explicitly: this tests terminal status, not the
+            // cancellation latency of an otherwise-idle native watch waiter.
+            shutdown_tx.send(false).unwrap();
+            Some(shutdown_tx)
+        } else {
+            drop(shutdown_tx);
+            None
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.snapshot_triggers.as_ref().unwrap().is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "faulted bridge did not terminate"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let called = AtomicBool::new(false);
+        let summary = handle
+            .shutdown_with_settlement_with_cx(
+                &crate::cx::for_testing(),
+                Duration::from_secs(2),
+                |_| async {
+                    called.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+        drop(shutdown_tx);
+        let counts = snapshot_settlement_counts(&db_path);
+        eprintln!(
+            "trigger bridge fault: cancel={cancel}, settlement_called={}, counts={counts:?}, warnings={:?}",
+            called.load(Ordering::SeqCst),
+            summary.warnings
+        );
+        assert!(
+            called.load(Ordering::SeqCst),
+            "still attempt durable salvage"
+        );
+        assert!(
+            !summary.is_clean(),
+            "early bridge exit cannot certify clean"
+        );
+        assert!(summary.warnings.iter().any(|warning| {
+            warning == "RuntimeBuilder snapshot trigger bridge did not acknowledge shutdown"
+        }));
+        assert_eq!(counts, (1, 0, 0));
+    }
+
+    #[test]
+    fn runtime_snapshot_rejected_pressure_trigger_retries_when_queue_drains() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            );
+            let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
+                Arc::new(db_path.clone()),
+                SnapshotConfig::default(),
+            ));
+            // Fill the real bounded queue before starting its consumer. These
+            // startup hints have zero accumulated value and cannot create the
+            // event checkpoint that is the success oracle below.
+            for _ in 0..512 {
+                assert!(engine.emit_trigger(crate::snapshot_engine::SnapshotTrigger::Startup));
+            }
+            runtime
+                .metrics
+                .record_cursor_snapshot_memory(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES);
+            let bus = EventBus::new(64);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let bridge = runtime.spawn_snapshot_trigger_task(
+                Arc::clone(&engine),
+                Some(bus.subscribe()),
+                shutdown_rx.clone(),
+                Arc::clone(&acknowledged),
+            );
+            let activity = Event::SegmentCaptured {
+                pane_id: 0,
+                seq: 901,
+                content_len: 1,
+            };
+            assert!(snapshot_trigger_from_event(&activity).is_none());
+            assert!(bus.publish(activity) > 0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.telemetry().snapshot().triggers_emitted == 512 {
+                assert!(Instant::now() < deadline, "no pressure enqueue attempted");
+                sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(engine.telemetry().snapshot().triggers_accepted, 512);
+
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(0).await;
+            let pane_provider: crate::wezterm::WeztermHandle = Arc::new(mock);
+            let scheduler_engine = Arc::clone(&engine);
+            let scheduler = spawn_runtime_task(&runtime_loop_cx(), move |cx| async move {
+                let pane_provider_cx = cx.clone();
+                scheduler_engine
+                    .run_periodic_with_cx(&cx, shutdown_rx, move || {
+                        let pane_provider = Arc::clone(&pane_provider);
+                        let pane_provider_cx = pane_provider_cx.clone();
+                        async move {
+                            pane_provider
+                                .list_panes_with_cx(&pane_provider_cx)
+                                .await
+                                .map_err(|error| {
+                                    crate::snapshot_engine::SnapshotError::PaneList(
+                                        error.to_string(),
+                                    )
+                                })
+                        }
+                    })
+                    .await
+            });
+            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            let mut next_sequence = 902;
+            let observed = loop {
+                // EventBus deliberately deduplicates identical pane/sequence
+                // pairs. Every retry wake must represent a new capture.
+                assert!(
+                    bus.publish(Event::SegmentCaptured {
+                        pane_id: 0,
+                        seq: next_sequence,
+                        content_len: 1,
+                    }) > 0
+                );
+                next_sequence += 1;
+                let exists: bool = connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM session_checkpoints WHERE checkpoint_type = 'event')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if exists || Instant::now() >= deadline {
+                    break exists;
+                }
+                sleep(Duration::from_millis(20)).await;
+            };
+            let telemetry = engine.telemetry().snapshot();
+            // Settle both real tasks even for the pre-fix negative control.
+            runtime.shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_tx.send(true).unwrap();
+            let cleanup_cx = crate::cx::for_testing();
+            runtime_timeout(&cleanup_cx, Duration::from_secs(5), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+            runtime_timeout(&cleanup_cx, Duration::from_secs(5), scheduler)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            assert!(acknowledged.load(Ordering::Acquire));
+            eprintln!(
+                "pressure queue retry: durable_event={observed}, emitted={}, accepted={}",
+                telemetry.triggers_emitted, telemetry.triggers_accepted
+            );
+            assert!(
+                observed,
+                "rejected enqueue must not consume the 120-second cooldown"
+            );
+            assert_eq!(
+                telemetry.triggers_accepted, 513,
+                "an accepted pressure request must still start the cooldown"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_snapshot_false_watch_updates_preserve_trigger_bridge() {
+        for with_bus in [false, true] {
+            run_async_test_isolated(move || async move {
+                let (_dir, db_path) = temp_db_path();
+                let storage = StorageHandle::new(&db_path).await.unwrap();
+                let runtime = ObservationRuntime::new(
+                    RuntimeConfig::default(),
+                    storage.clone(),
+                    Arc::new(RwLock::new(PatternEngine::new())),
+                );
+                let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
+                    Arc::new(db_path),
+                    SnapshotConfig::default(),
+                ));
+                let bus = EventBus::new(64);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let acknowledged = Arc::new(AtomicBool::new(false));
+                let bridge = runtime.spawn_snapshot_trigger_task(
+                    Arc::clone(&engine),
+                    with_bus.then(|| bus.subscribe()),
+                    shutdown_rx,
+                    Arc::clone(&acknowledged),
+                );
+                // Exercise both the event select and the no-bus timer select.
+                // A watch version change is not itself a shutdown request.
+                for _ in 0..3 {
+                    shutdown_tx.send(false).unwrap();
+                    sleep(Duration::from_millis(20)).await;
+                    assert!(!bridge.is_finished(), "false watch update stopped bridge");
+                    assert!(!acknowledged.load(Ordering::Acquire));
+                }
+                if with_bus {
+                    assert!(
+                        bus.publish(Event::WorkflowCompleted {
+                            workflow_id: "false-watch-live-bridge".to_string(),
+                            success: false,
+                            reason: None,
+                        }) > 0
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while engine.telemetry().snapshot().triggers_accepted == 0 {
+                        assert!(
+                            Instant::now() < deadline,
+                            "bridge no longer forwards events"
+                        );
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                // Watch-only shutdown must work even without the atomic flag.
+                shutdown_tx.send(true).unwrap();
+                runtime_timeout(&crate::cx::for_testing(), Duration::from_secs(5), bridge)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(acknowledged.load(Ordering::Acquire));
+                storage.shutdown().await.unwrap();
+                eprintln!(
+                    "false watch update remained live: event_bus={with_bus}, shutdown_ack=true"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_snapshot_lost_event_source_preserves_pressure_salvage_but_not_clean_ack() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            );
+            let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
+                Arc::new(db_path),
+                SnapshotConfig::default(),
+            ));
+            let bus = EventBus::new(64);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let bridge = runtime.spawn_snapshot_trigger_task(
+                Arc::clone(&engine),
+                Some(bus.subscribe()),
+                shutdown_rx,
+                Arc::clone(&acknowledged),
+            );
+            runtime
+                .metrics
+                .record_cursor_snapshot_memory(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES);
+            drop(bus);
+            // Closure, not a 30-second timer or an event, wakes the bridge.
+            // Pressure ingress is the causal fence that closure was processed.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.telemetry().snapshot().triggers_accepted == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "event-source loss did not reach pressure salvage"
+                );
+                sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !bridge.is_finished(),
+                "keep the pressure fallback available"
+            );
+            shutdown_tx.send(true).unwrap();
+            runtime_timeout(&crate::cx::for_testing(), Duration::from_secs(5), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            assert!(
+                !acknowledged.load(Ordering::Acquire),
+                "later shutdown cannot erase event-source loss"
+            );
+            eprintln!("event source lost: pressure_salvage=true, shutdown_ack=false");
         });
     }
 
