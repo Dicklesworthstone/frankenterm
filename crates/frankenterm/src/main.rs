@@ -118122,22 +118122,75 @@ cat "$FAKE_FONT_ARCHIVE"
             .expect("app selector switch boundary");
         assert!(production_guard_end < readiness);
         assert!(readiness < selector_switch);
-        assert!(app.contains("FRANKENTERM_ATOMIC_MANIFEST_TOOL=\"$staged_verifier\""));
-        assert!(app.contains(
-            "FRANKENTERM_MUX_SERVER=\"$staged_app/Contents/MacOS/frankenterm-mux-server\""
+        let readiness_call = app
+            .find(
+                "if ! run_macos_app_readiness \"$staged_app\" \"$retained_manifest\" \\\n      \"$app_source\" \"$app_profile\"; then",
+            )
+            .expect("test-only readiness receives the exact staged app identity");
+        assert!(readiness < readiness_call);
+        assert!(readiness_call < selector_switch);
+        let (_, readiness_helper) = installer
+            .split_once("run_macos_app_readiness() {\n")
+            .expect("macOS app readiness helper");
+        let (readiness_helper, _) = readiness_helper
+            .split_once("\n}\n")
+            .expect("macOS app readiness helper end");
+        assert!(readiness_helper.contains(
+            "local app_root=\"$1\" retained_manifest=\"$2\" app_source=\"$3\" app_profile=\"$4\""
         ));
-        assert!(app.contains(
-            "FRANKENTERM_PTY_GUARDIAN=\"$staged_app/Contents/MacOS/frankenterm-pty-guardian\""
+        assert!(readiness_helper.contains(
+            "local staged_verifier=\"$app_root/Contents/Resources/verify-components.sh\""
+        ));
+        assert!(readiness_helper.contains("FRANKENTERM_ATOMIC_MANIFEST_TOOL=\"$staged_verifier\""));
+        assert!(readiness_helper.contains(
+            "FRANKENTERM_MUX_SERVER=\"$app_root/Contents/MacOS/frankenterm-mux-server\""
+        ));
+        assert!(readiness_helper.contains(
+            "FRANKENTERM_PTY_GUARDIAN=\"$app_root/Contents/MacOS/frankenterm-pty-guardian\""
         ));
         assert!(
             app.contains("Post-switch app verification failed; restoring the prior app authority")
         );
-        assert!(app.contains("app-rollback:$dest:$app_id"));
-        assert!(app.contains("app-first-publish-rollback:$dest:$app_id"));
+        let (_, rollback_helper) = installer
+            .split_once("rollback_macos_app_activation() {\n")
+            .expect("macOS app rollback helper");
+        let (rollback_helper, _) = rollback_helper
+            .split_once("\n}\n")
+            .expect("macOS app rollback helper end");
+        assert!(rollback_helper.contains("app-rollback:$dest:$app_id"));
+        assert!(rollback_helper.contains("app-first-publish-rollback:$dest:$app_id"));
+        let (_, post_switch_failure) = app
+            .split_once("Post-switch app verification failed; restoring the prior app authority")
+            .expect("post-switch app verification failure");
+        let (_, rollback_failure) = post_switch_failure
+            .split_once(
+                "if ! rollback_macos_app_activation \"$transition_helper\" \"$dest\" \\\n        \"$staged_app\" \"$target_app\" \"$app_id\" \"$operation\" \"$stage_id\" \"$target_id\"; then",
+            )
+            .expect("post-switch rollback receives the exact candidate and prior identities");
+        let (rollback_failure, _) = rollback_failure
+            .split_once("\n    fi")
+            .expect("post-switch rollback failure boundary");
+        assert!(rollback_failure.contains("mark_app_failed app_post_switch_rollback_failed"));
+        assert!(
+            rollback_failure.trim_end().ends_with("return 1"),
+            "failed rollback must not acknowledge restored app authority"
+        );
         assert!(
             app.contains("Candidate app retained for diagnosis; prior app authority was restored")
         );
-        assert!(app.contains("$operation\" || return 0"));
+        let (selector_transition, _) = app[selector_switch..]
+            .split_once("\n  fi")
+            .expect("app selector transition failure boundary");
+        assert!(selector_transition.contains(
+            "if ! atomic_path_transition \"$transition_helper\" \"$dest\" \\\n    \"$(basename \"$staged_app\")\" FrankenTerm.app \"$txid\" \"$stage_id\" \"$target_id\" \\\n      \"$operation\"; then"
+        ));
+        assert!(
+            selector_transition.contains("the prepared receipt was retained for exact recovery")
+        );
+        assert!(
+            selector_transition.trim_end().ends_with("return 1"),
+            "unacknowledged selector transition must fail with its prepared receipt retained"
+        );
         assert!(!app.contains("move_no_clobber \"$target_app\""));
         assert!(app.contains("dest=\"/Applications\""));
         assert!(app.contains("dest=\"$HOME/Applications\""));
