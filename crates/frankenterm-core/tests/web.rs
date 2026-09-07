@@ -6,6 +6,10 @@
 #![recursion_limit = "256"]
 
 #[cfg(feature = "web")]
+#[path = "common/fixtures.rs"]
+mod runtime_fixtures;
+
+#[cfg(feature = "web")]
 mod web_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -35,12 +39,41 @@ mod web_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use frankenterm_core::runtime_async::CompatRuntime;
-        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build test runtime");
-        runtime.block_on(future);
+        // The shared fixture restores the ambient runtime handle even when
+        // an assertion unwinds. Do not retain a strong TLS handle into the
+        // next test's runtime or silently discard a runtime teardown panic.
+        crate::runtime_fixtures::RuntimeFixture::current_thread().block_on(future);
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn run_async_test_with_cx<F>(
+        test: impl FnOnce(frankenterm_core::cx::Cx, frankenterm_core::cx::Cx) -> F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_fixtures::RuntimeFixture::current_thread();
+        // Pinned Asupersync 0.3.10 does not expose request_cx_with_budget.
+        // Its block_on installs a fresh context backed by this runtime's
+        // drivers. Retain that context for the server, then enter a separate
+        // block_on for the client/cleanup driver: cancelling the server must
+        // not cancel the test that observes whether cleanup really happened.
+        let server_cx = runtime.block_on(async {
+            frankenterm_core::cx::Cx::current().expect("runtime-owned server context")
+        });
+        let cleanup_cx = runtime.block_on(async {
+            frankenterm_core::cx::Cx::current().expect("runtime-owned cleanup context")
+        });
+        runtime.block_on(async move {
+            let observer_cx =
+                frankenterm_core::cx::Cx::current().expect("runtime-owned observer context");
+            assert_ne!(server_cx.task_id(), observer_cx.task_id());
+            assert_ne!(cleanup_cx.task_id(), observer_cx.task_id());
+            assert_ne!(server_cx.task_id(), cleanup_cx.task_id());
+            test(server_cx, cleanup_cx).await;
+            observer_cx
+                .checkpoint()
+                .expect("server cancellation must not cancel the fixture observer");
+        });
     }
 
     /// Extract the HTTP response body from a raw HTTP response string.
@@ -740,6 +773,99 @@ mod web_tests {
         });
     }
 
+    /// Keep both real SSE response bodies parked beyond the entire shutdown
+    /// budget. Shutdown must wake them; an eventual keepalive is not cleanup.
+    #[test]
+    fn idle_event_and_delta_streams_shutdown_without_keepalive() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 60,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage)
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_storage_event_tail(false)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .expect("idle-stream server starts");
+            let addr = server.bound_addr();
+            let mut clients = Vec::new();
+            let mut response_bytes = 0_usize;
+            for path in ["/stream/events", "/stream/deltas"] {
+                let client = timeout(Duration::from_secs(2), async {
+                    let mut client = TcpStream::connect(addr).await.unwrap();
+                    let request = format!(
+                        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    );
+                    client.write_all(request.as_bytes()).await.unwrap();
+                    let mut received = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let count = read(&mut client, &mut chunk).await.unwrap();
+                        assert_ne!(count, 0, "stream ended before readiness");
+                        assert!(received.len() + count <= 4096, "bounded ready frame");
+                        received.extend_from_slice(&chunk[..count]);
+                        let raw = String::from_utf8_lossy(&received);
+                        if raw.contains("event: ready") && raw.contains("\"kind\":\"ready\"") {
+                            assert_eq!(extract_status(&raw), 200);
+                            response_bytes += received.len();
+                            break;
+                        }
+                    }
+                    client
+                })
+                .await
+                .expect("real SSE response must reach ready before shutdown");
+                clients.push(client);
+            }
+            assert_eq!(event_bus.subscriber_count(), 2, "both streams are live");
+
+            let started = Instant::now();
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let elapsed = started.elapsed();
+            shutdown
+                .expect("shutdown must finish before the outer watchdog")
+                .expect("idle streams must not survive either drain phase");
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "subscriptions settle before return"
+            );
+            for mut client in clients {
+                timeout(Duration::from_secs(1), async {
+                    let mut trailing_bytes = 0_usize;
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let count = read(&mut client, &mut chunk).await.unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        trailing_bytes += count;
+                        assert!(trailing_bytes <= 4096, "bounded terminal stream bytes");
+                    }
+                    response_bytes += trailing_bytes;
+                })
+                .await
+                .expect("both real clients must observe EOF after shutdown");
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.13.1", "scenario": "idle_events_and_deltas_drain",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "streams": 2, "subscribers_after": 0, "response_bytes": response_bytes,
+                    "shutdown_ms": elapsed.as_millis(), "keepalive_secs": 60, "teardown": "clean",
+                })
+            );
+        });
+    }
+
     /// A connection that stalls mid-request must not serialize the accept
     /// loop. A later health request should complete while the first connection
     /// is still waiting for the rest of its request bytes.
@@ -820,8 +946,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_health_with_cx_ephemeral_port() {
-        run_async_test(async {
-            let cx = frankenterm_core::cx::for_request();
+        run_async_test_with_cx(|cx, _| async move {
             let server = start_web_server_with_cx(&cx, WebServerConfig::default().with_port(0))
                 .await
                 .unwrap();
@@ -845,12 +970,11 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_startup_cancellation_rolls_back_shutdown_hooks() {
-        run_async_test(async {
+        run_async_test_with_cx(|cx, _| async move {
             let startup_count = Arc::new(AtomicUsize::new(0));
             let shutdown_count = Arc::new(AtomicUsize::new(0));
             let startup_count_for_hook = Arc::clone(&startup_count);
             let shutdown_count_for_hook = Arc::clone(&shutdown_count);
-            let cx = frankenterm_core::cx::for_request();
             let cx_for_hook = cx.clone();
             let app = FrameworkApp::builder()
                 .on_startup(move || {
@@ -891,32 +1015,49 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_startup_abort_rolls_back_shutdown_hooks() {
-        run_async_test(async {
+        run_async_test_with_cx(|cx, _| async move {
+            const PRIVATE_HOOK_DETAIL: &str = "fatal-startup-private-sentinel";
             let startup_count = Arc::new(AtomicUsize::new(0));
+            let later_startup_count = Arc::new(AtomicUsize::new(0));
             let shutdown_count = Arc::new(AtomicUsize::new(0));
             let startup_count_for_hook = Arc::clone(&startup_count);
+            let later_startup_count_for_hook = Arc::clone(&later_startup_count);
             let shutdown_count_for_hook = Arc::clone(&shutdown_count);
             let app = FrameworkApp::builder()
                 .on_startup(move || {
                     startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 })
-                .on_startup(|| Err(FrameworkStartupHookError::new("fatal-startup-sentinel")))
+                .on_startup(|| Err(FrameworkStartupHookError::new(PRIVATE_HOOK_DETAIL)))
+                .on_startup(move || {
+                    later_startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
                 .on_shutdown(move || {
                     shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 })
                 .build();
-            let cx = frankenterm_core::cx::for_request();
-
+            // An invalid bind address is a competing later failure: the exact
+            // startup error below proves we never reached bind resolution.
             let result =
-                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app).await;
+                FrameworkWebRuntime::start_with_cx(&cx, "not-a-socket-address".to_string(), app)
+                    .await;
 
             let error = result.err().expect("fatal startup hook must abort startup");
             assert!(
-                error.to_string().contains("fatal-startup-sentinel"),
-                "fatal startup hook error must remain primary: {error}"
+                matches!(
+                    &error,
+                    frankenterm_core::Error::RuntimeOperation {
+                        operation,
+                        source: frankenterm_core::error::RuntimeOperationSource::Backend(detail),
+                    } if *operation == "web startup hooks" && detail == "web_startup_hook_aborted"
+                ),
+                "the finite startup failure must remain primary: {error}"
             );
+            assert!(!error.to_string().contains(PRIVATE_HOOK_DETAIL));
+            assert!(!format!("{error:?}").contains(PRIVATE_HOOK_DETAIL));
             assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(later_startup_count.load(Ordering::SeqCst), 0);
             assert_eq!(
                 shutdown_count.load(Ordering::SeqCst),
                 1,
@@ -930,7 +1071,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_bind_failure_rolls_back_shutdown_hooks() {
-        run_async_test(async {
+        run_async_test_with_cx(|cx, _| async move {
             let occupied = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("port reservation should bind");
@@ -950,8 +1091,6 @@ mod web_tests {
                     shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 })
                 .build();
-            let cx = frankenterm_core::cx::for_request();
-
             let result =
                 FrameworkWebRuntime::start_with_cx(&cx, occupied_addr.to_string(), app).await;
 
@@ -979,8 +1118,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_shutdown_with_precancelled_cx_cleans_before_error() {
-        run_async_test(async {
-            let start_cx = frankenterm_core::cx::for_request();
+        run_async_test_with_cx(|start_cx, shutdown_cx| async move {
             let server =
                 start_web_server_with_cx(&start_cx, WebServerConfig::default().with_port(0))
                     .await
@@ -991,7 +1129,6 @@ mod web_tests {
                 .expect("server should answer before shutdown");
             assert!(response.contains("200"));
 
-            let shutdown_cx = frankenterm_core::cx::for_request();
             shutdown_cx.cancel_with(
                 frankenterm_core::outcome::CancelKind::User,
                 Some("pre-cancelled WebServerHandle shutdown test"),
@@ -1019,7 +1156,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_finish_with_precancelled_cx_runs_shutdown_hooks() {
-        run_async_test(async {
+        run_async_test_with_cx(|start_cx, finish_cx| async move {
             let shutdown_count = Arc::new(AtomicUsize::new(0));
             let shutdown_count_for_hook = Arc::clone(&shutdown_count);
             let app = FrameworkApp::builder()
@@ -1028,7 +1165,6 @@ mod web_tests {
                     shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 })
                 .build();
-            let start_cx = frankenterm_core::cx::for_request();
             let (addr, mut runtime) =
                 FrameworkWebRuntime::start_with_cx(&start_cx, "127.0.0.1:0".to_string(), app)
                     .await
@@ -1040,7 +1176,6 @@ mod web_tests {
 
             runtime.signal_shutdown();
             let join_result = runtime.join_handle_mut().await;
-            let finish_cx = frankenterm_core::cx::for_request();
             finish_cx.cancel_with(
                 frankenterm_core::outcome::CancelKind::User,
                 Some("pre-cancelled framework finish test"),
@@ -1069,7 +1204,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_finish_reports_connection_that_survives_bounded_drain() {
-        run_async_test(async {
+        run_async_test_with_cx(|cx, _| async move {
             let handler_started = Arc::new(AtomicUsize::new(0));
             let release_handler = Arc::new(AtomicUsize::new(0));
             let started_for_handler = Arc::clone(&handler_started);
@@ -1088,7 +1223,6 @@ mod web_tests {
                     }
                 })
                 .build();
-            let cx = frankenterm_core::cx::for_request();
             let (addr, mut runtime) =
                 FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
                     .await
@@ -1167,8 +1301,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_server_with_cx_pre_cancelled_refuses_to_bind() {
-        run_async_test(async {
-            let cx = frankenterm_core::cx::for_request();
+        run_async_test_with_cx(|cx, _| async move {
             cx.cancel_with(
                 frankenterm_core::outcome::CancelKind::User,
                 Some("pre-cancel web_server_with_cx test"),
@@ -1212,8 +1345,7 @@ mod web_tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn web_server_with_cx_mid_flight_cancel_surfaces_after_cleanup() {
-        run_async_test(async {
-            let cx = frankenterm_core::cx::for_request();
+        run_async_test_with_cx(|cx, _| async move {
             let cx_for_server = cx.clone();
 
             // Reserve a currently free port so the test can prove the server
