@@ -191,7 +191,7 @@ pub struct ClientInner {
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
-    pending_window_titles: Mutex<HashMap<WindowId, Arc<AtomicBool>>>,
+    pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
     detached: AtomicBool,
 }
 
@@ -200,7 +200,7 @@ pub struct ClientInner {
 /// admission share the map lock, so the final update cannot lose its wakeup.
 struct PendingWindowTitle {
     inner: Arc<ClientInner>,
-    window_id: WindowId,
+    window_mapping: (WindowId, WindowId),
     dirty: Arc<AtomicBool>,
 }
 
@@ -218,10 +218,10 @@ impl PendingWindowTitle {
             return false;
         }
         if pending
-            .get(&self.window_id)
+            .get(&self.window_mapping)
             .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
         {
-            pending.remove(&self.window_id);
+            pending.remove(&self.window_mapping);
         }
         true
     }
@@ -232,10 +232,10 @@ impl Drop for PendingWindowTitle {
         let mut pending =
             lock_or_recover(&self.inner.pending_window_titles, "pending_window_titles");
         if pending
-            .get(&self.window_id)
+            .get(&self.window_mapping)
             .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
         {
-            pending.remove(&self.window_id);
+            pending.remove(&self.window_mapping);
         }
     }
 }
@@ -1374,19 +1374,22 @@ impl ClientInner {
         // A mux notification reaches every attached domain. Reject unrelated
         // windows before allocating a task or holding a scheduler permit.
         let remote_window_id = self.local_to_remote_window(window_id)?;
+        // Resync can remap a local window within this attachment. Its new
+        // destination needs independent work while the old mapping retires.
+        let window_mapping = (window_id, remote_window_id);
         let mut pending = lock_or_recover(&self.pending_window_titles, "pending_window_titles");
-        if let Some(dirty) = pending.get(&window_id) {
+        if let Some(dirty) = pending.get(&window_mapping) {
             dirty.store(true, Ordering::Release);
             metrics::counter!("mux.client.window_title.coalesced").increment(1);
             return None;
         }
         let dirty = Arc::new(AtomicBool::new(true));
-        pending.insert(window_id, Arc::clone(&dirty));
+        pending.insert(window_mapping, Arc::clone(&dirty));
         Some((
             remote_window_id,
             PendingWindowTitle {
                 inner: Arc::clone(self),
-                window_id,
+                window_mapping,
                 dirty,
             },
         ))
@@ -4566,6 +4569,23 @@ mod tests {
             inner.queue_window_title(17).is_some(),
             "cancelled work must release admission"
         );
+    }
+
+    #[test]
+    fn window_title_remap_does_not_coalesce_into_work_for_the_previous_destination() {
+        let inner = test_client_inner(91_022);
+        lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(70, 17);
+        let (_, obsolete) = inner.queue_window_title(17).unwrap();
+        lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(80, 17);
+        let (remote, current) = inner
+            .queue_window_title(17)
+            .expect("remapped window requires its own title propagation");
+        assert_eq!(remote, 80);
+        drop(obsolete);
+        assert!(inner.queue_window_title(17).is_none());
+        current.begin_update();
+        assert!(current.finish_if_clean());
+        assert!(lock_or_recover(&inner.pending_window_titles, "test pending titles").is_empty());
     }
 
     #[test]
