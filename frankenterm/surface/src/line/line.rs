@@ -205,6 +205,30 @@ impl PartialEq for Line {
 }
 
 impl Line {
+    /// Conservative, exact source check for work prepared from a cloned line.
+    /// Image payloads can change through shared handles, so they never qualify.
+    /// Renderer appdata and a no-match hyperlink scan do not change wrapping;
+    /// all cell attributes, layout bits and mutation sequence numbers do.
+    pub fn is_same_reflow_source(&self, other: &Self) -> bool {
+        if self.seqno != other.seqno || self.has_image_attachments() {
+            return false;
+        }
+        let normalized_bits = |line: &Self| {
+            let mut bits = line.bits;
+            if !line.has_hyperlink() {
+                bits.remove(LineBits::SCANNED_IMPLICIT_HYPERLINKS);
+            }
+            bits
+        };
+        normalized_bits(self) == normalized_bits(other)
+            && match (&self.cells, &other.cells) {
+                (CellStorage::V(left), CellStorage::V(right)) => {
+                    left.shares_cells_with(right) || left == right
+                }
+                _ => self.cells == other.cells,
+            }
+    }
+
     pub fn with_width_and_cell(width: usize, cell: Cell, seqno: SequenceNo) -> Self {
         let mut cells = Vec::with_capacity(width);
         cells.resize(width, cell.clone());

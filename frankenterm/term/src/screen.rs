@@ -78,7 +78,7 @@ pub struct Screen {
     pub dpi: u32,
 
     pub(crate) saved_cursor: Option<SavedCursor>,
-    rewrap_cache: Option<LogicalLineWrapCache>,
+    rewrap_cache: Option<Arc<LogicalLineWrapCache>>,
     rewrap_line_cache: HashMap<WrapLineCacheKey, CachedWrappedLine>,
     rewrap_line_cache_order: VecDeque<WrapLineCacheKey>,
     rewrap_scratch_slots: Vec<Option<RewrapScratch>>,
@@ -645,6 +645,52 @@ struct LogicalLineWrapCache {
     logical_lines: Vec<Line>,
     wrapped_by_key: HashMap<WrapCacheKey, CachedResizeLines>,
     wrap_key_order: VecDeque<WrapCacheKey>,
+}
+
+/// Owned wrap work. This carries no authority to replace terminal state.
+/// Capture is performed under the terminal lock; `prepare` runs without it.
+pub struct ScreenReflowPreparation {
+    snapshot: Screen,
+    source_lines: VecDeque<Line>,
+    source_cursor: CursorPosition,
+    source_dpi: u32,
+    target: TerminalSize,
+    ready: bool,
+    applied: bool,
+}
+
+impl ScreenReflowPreparation {
+    pub fn was_applied(&self) -> bool {
+        self.applied
+    }
+
+    pub fn prepare(&mut self, is_cancelled: impl Fn() -> bool) -> bool {
+        self.ready = false;
+        self.applied = false;
+        // Image payloads are internally mutable and cannot be frozen by Line's
+        // copy-on-write cells. Keep those screens on the synchronous path.
+        if is_cancelled() || self.snapshot.lines.iter().any(Line::has_image_attachments) {
+            return false;
+        }
+        self.source_lines = self.snapshot.lines.clone();
+        self.snapshot
+            .prune_resize_trailing_blanks(self.source_cursor);
+        if self.target.dpi != self.snapshot.dpi {
+            if let Some(cache) = self.snapshot.rewrap_cache.as_mut() {
+                Arc::make_mut(cache).clear_wraps();
+            }
+            self.snapshot.dpi = self.target.dpi;
+        }
+        self.ready = self
+            .snapshot
+            .logical_wraps_for_resize(
+                self.target.cols.max(1),
+                self.source_cursor.seqno,
+                &is_cancelled,
+            )
+            .is_some();
+        self.ready
+    }
 }
 
 enum WrappedResizeLines {
@@ -1512,7 +1558,7 @@ impl Screen {
             // Width/DPI cache keys describe results under the previous policy.
             // Keep the logical content, but recompute wraps and quality evidence.
             if let Some(cache) = self.rewrap_cache.as_mut() {
-                cache.clear_wraps();
+                Arc::make_mut(cache).clear_wraps();
             }
             self.last_resize_wrap_scorecard = None;
             self.last_resize_wrap_gate_payload = None;
@@ -2585,7 +2631,11 @@ impl Screen {
         &mut self,
         physical_cols: usize,
         seqno: SequenceNo,
-    ) -> (WrappedResizeLines, usize, bool, bool, usize) {
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Option<(WrappedResizeLines, usize, bool, bool, usize)> {
+        if is_cancelled() {
+            return None;
+        }
         let wrap_key = WrapCacheKey {
             physical_cols,
             dpi: self.dpi,
@@ -2601,6 +2651,7 @@ impl Screen {
 
         if let (Some(entry), Some(source_signature)) = (cache.as_mut(), source_signature) {
             if entry.source_signature == source_signature {
+                let entry = Arc::make_mut(entry);
                 logical_cache_hit = true;
                 let logical_count = entry.logical_lines.len();
                 if let Some(mut wrapped) = entry.get_wrapped(wrap_key) {
@@ -2611,21 +2662,24 @@ impl Screen {
                     self.last_resize_wrap_gate_payload = wrapped.gate_payload.take();
                     let cache_entries = entry.wrapped_by_key.len();
                     self.rewrap_cache = cache;
-                    return (
+                    return Some((
                         WrappedResizeLines::Cached(wrapped),
                         logical_count,
                         logical_cache_hit,
                         wrap_cache_hit,
                         cache_entries,
-                    );
+                    ));
                 }
 
-                self.wrap_logical_lines_for_resize(
+                if !self.wrap_logical_lines_for_resize(
                     &entry.logical_lines,
                     physical_cols,
                     seqno,
                     Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
-                );
+                    is_cancelled,
+                ) {
+                    return None;
+                }
                 entry.insert_wrapped(
                     wrap_key,
                     self.clone_wrapped_from_scratch(logical_count),
@@ -2634,13 +2688,13 @@ impl Screen {
                 );
                 let cache_entries = entry.wrapped_by_key.len();
                 self.rewrap_cache = cache;
-                return (
+                return Some((
                     WrappedResizeLines::Scratch { logical_count },
                     logical_count,
                     logical_cache_hit,
                     wrap_cache_hit,
                     cache_entries,
-                );
+                ));
             }
         }
 
@@ -2655,12 +2709,15 @@ impl Screen {
         let logical_count = logical_lines.len();
         let reflow_plan =
             self.build_viewport_reflow_plan_for_logical_ranges(&logical_ranges, logical_count);
-        self.wrap_logical_lines_for_resize(
+        if !self.wrap_logical_lines_for_resize(
             &logical_lines,
             physical_cols,
             seqno,
             Some(&reflow_plan),
-        );
+            is_cancelled,
+        ) {
+            return None;
+        }
         let cache_logical_lines = logical_lines
             .iter()
             .map(|line| line.clone_line(&self.lines))
@@ -2673,14 +2730,14 @@ impl Screen {
             self.last_resize_wrap_gate_payload.clone(),
         );
         let cache_entries = new_cache.wrapped_by_key.len();
-        self.rewrap_cache = Some(new_cache);
-        (
+        self.rewrap_cache = Some(Arc::new(new_cache));
+        Some((
             WrappedResizeLines::Scratch { logical_count },
             logical_count,
             logical_cache_hit,
             wrap_cache_hit,
             cache_entries,
-        )
+        ))
     }
 
     fn needs_rewrap_for_width_change(&self, physical_cols: usize) -> bool {
@@ -2707,12 +2764,14 @@ impl Screen {
         physical_cols: usize,
         seqno: SequenceNo,
         reflow_plan: Option<&ViewportReflowPlan>,
-    ) where
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> bool
+    where
         T: ReflowLogicalLine + Sync,
     {
         let logical_count = logical_lines.len();
         if logical_count == 0 {
-            return;
+            return true;
         }
 
         let wrap_policy = self.resize_wrap_policy;
@@ -2753,6 +2812,9 @@ impl Screen {
             .min(logical_count);
 
         for (batch_idx, batch) in plan.batches.iter().enumerate() {
+            if is_cancelled() {
+                return false;
+            }
             let batch_len = batch
                 .logical_range
                 .end
@@ -2962,6 +3024,7 @@ impl Screen {
             self.last_resize_wrap_scorecard = None;
             self.last_resize_wrap_gate_payload = None;
         }
+        true
     }
 
     fn rewrap_lines(
@@ -2985,8 +3048,9 @@ impl Screen {
                 .max(original_len)
         };
         let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
-        let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
-            self.logical_wraps_for_resize(physical_cols, seqno);
+        let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) = self
+            .logical_wraps_for_resize(physical_cols, seqno, &|| false)
+            .expect("synchronous reflow cannot be cancelled");
         let cached_layout_signature = match &wrapped {
             WrappedResizeLines::Cached(wrapped) => {
                 self.rebuild_rewrap_row_prefix_scratch(&wrapped.lines);
@@ -3113,6 +3177,7 @@ impl Screen {
             let layout_signature =
                 cached_layout_signature.unwrap_or_else(|| self.compute_layout_signature());
             if let Some(cache) = self.rewrap_cache.as_mut() {
+                let cache = Arc::make_mut(cache);
                 cache.source_signature = layout_signature;
                 let key = WrapCacheKey {
                     physical_cols,
@@ -3152,13 +3217,97 @@ impl Screen {
         adjusted_cursor
     }
 
-    /// Resize the physical, viewable portion of the screen
+    pub(crate) fn capture_reflow_preparation(
+        &self,
+        size: TerminalSize,
+        cursor: CursorPosition,
+    ) -> Option<ScreenReflowPreparation> {
+        if !self.allow_scrollback || !self.needs_rewrap_for_width_change(size.cols.max(1)) {
+            return None;
+        }
+        // The empty constructor avoids allocating another full scrollback.
+        // Copy only the inputs to wrapping, not recovery state, retained frames,
+        // keyboard state, per-line caches or scratch buffers. The logical cache
+        // is shared here and detaches on the worker, outside the terminal lock.
+        let mut snapshot = Self::try_new(
+            size,
+            &self.config,
+            true,
+            cursor.seqno,
+            BidiMode {
+                enabled: false,
+                hint: frankenterm_bidi::ParagraphDirectionHint::LeftToRight,
+            },
+            true,
+        )
+        .ok()?;
+        snapshot.lines = self.lines.clone();
+        snapshot.physical_cols = self.physical_cols;
+        snapshot.physical_rows = self.physical_rows;
+        snapshot.dpi = self.dpi;
+        snapshot.stable_row_index_offset = self.stable_row_index_offset;
+        snapshot.resize_wrap_policy = self.resize_wrap_policy;
+        snapshot.rewrap_cache = self.rewrap_cache.clone();
+        Some(ScreenReflowPreparation {
+            snapshot,
+            source_lines: VecDeque::new(),
+            source_cursor: cursor,
+            source_dpi: self.dpi,
+            target: size,
+            ready: false,
+            applied: false,
+        })
+    }
+
+    fn matches_reflow_preparation(
+        &self,
+        prepared: &ScreenReflowPreparation,
+        size: TerminalSize,
+        cursor: CursorPosition,
+    ) -> bool {
+        prepared.ready
+            && prepared.target == size
+            && prepared.source_cursor == cursor
+            && prepared.source_dpi == self.dpi
+            && prepared.snapshot.physical_cols == self.physical_cols
+            && prepared.snapshot.physical_rows == self.physical_rows
+            && prepared.snapshot.stable_row_index_offset == self.stable_row_index_offset
+            && prepared.snapshot.resize_wrap_policy == self.resize_wrap_policy
+            && prepared.source_lines.len() == self.lines.len()
+            && prepared
+                .source_lines
+                .iter()
+                .zip(&self.lines)
+                .all(|(source, live)| source.is_same_reflow_source(live))
+    }
+
+    fn prune_resize_trailing_blanks(&mut self, cursor: CursorPosition) {
+        let cursor_phys = self.phys_row(cursor.y);
+        for _ in cursor_phys + 1..self.lines.len() {
+            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
+                self.lines.pop_back();
+            }
+        }
+    }
+
+    /// Resize the physical, viewable portion of the screen.
     pub fn resize(
         &mut self,
         size: TerminalSize,
         cursor: CursorPosition,
         seqno: SequenceNo,
         is_conpty: bool,
+    ) -> CursorPosition {
+        self.resize_with_prepared_reflow(size, cursor, seqno, is_conpty, None)
+    }
+
+    pub(crate) fn resize_with_prepared_reflow(
+        &mut self,
+        size: TerminalSize,
+        cursor: CursorPosition,
+        seqno: SequenceNo,
+        is_conpty: bool,
+        prepared: Option<&mut ScreenReflowPreparation>,
     ) -> CursorPosition {
         // A resize may return early or reuse cached wraps without recording a
         // fresh viewport batch. Never attribute an earlier resize's work to it.
@@ -3177,11 +3326,15 @@ impl Screen {
             size.dpi
         );
         self.retain_last_good_frame(seqno, LastGoodFrameTransition::ResizeBegin);
+        let prepared =
+            prepared.filter(|prepared| self.matches_reflow_preparation(prepared, size, cursor));
         let dpi_changed = self.dpi != size.dpi;
         self.dpi = size.dpi;
         if dpi_changed {
-            if let Some(cache) = self.rewrap_cache.as_mut() {
-                cache.clear_wraps();
+            if prepared.is_none() {
+                if let Some(cache) = self.rewrap_cache.as_mut() {
+                    Arc::make_mut(cache).clear_wraps();
+                }
             }
             self.clear_rewrap_line_cache();
         }
@@ -3190,10 +3343,36 @@ impl Screen {
         // this avoids growing the scrollback size when rapidly switching between normal and
         // maximized states.
         let cursor_phys = self.phys_row(cursor.y);
-        for _ in cursor_phys + 1..self.lines.len() {
-            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
-                self.lines.pop_back();
+        self.prune_resize_trailing_blanks(cursor);
+        if let Some(prepared) = prepared {
+            // Only memoized wraps move into the live screen. Resize below still
+            // owns cursor mapping, alternate-screen handling and state updates.
+            // Retain the displaced cache in the preparation so its destruction
+            // happens after the caller releases the terminal and queue locks.
+            std::mem::swap(&mut self.rewrap_cache, &mut prepared.snapshot.rewrap_cache);
+            // The preparation owns only new counters, never a stale copy of
+            // live telemetry. Add completed work without overwriting activity
+            // that happened while the terminal lock was released.
+            let work = &prepared.snapshot.cold_scrollback_worker;
+            self.cold_scrollback_worker.peak_backlog_depth = self
+                .cold_scrollback_worker
+                .peak_backlog_depth
+                .max(work.peak_backlog_depth);
+            self.cold_scrollback_worker.completed_lines_total = self
+                .cold_scrollback_worker
+                .completed_lines_total
+                .saturating_add(work.completed_lines_total);
+            self.cold_scrollback_worker.completed_batches_total = self
+                .cold_scrollback_worker
+                .completed_batches_total
+                .saturating_add(work.completed_batches_total);
+            if work.completed_batches_total > 0 {
+                self.cold_scrollback_worker
+                    .completion_throughput_lines_per_sec = work.completion_throughput_lines_per_sec;
             }
+            self.last_viewport_first_reflow_us = prepared.snapshot.last_viewport_first_reflow_us;
+            prepared.ready = false;
+            prepared.applied = true;
         }
 
         let (cursor_x, cursor_y) = if physical_cols != self.physical_cols {
@@ -5254,6 +5433,198 @@ mod tests {
     }
 
     #[test]
+    fn prepared_reflow_matches_synchronous_geometry_and_cursor() {
+        for conpty in [false, true] {
+            let mut screen = test_screen(4, 8, 96);
+            let attrs = CellAttributes::blank();
+            screen.lines = VecDeque::from(vec![
+                Line::from_text_with_wrapped_last_col("ab界cdef", &attrs, 1),
+                Line::from_text("e\u{301}🦀z", &attrs, 1, None),
+                Line::from_text("abcdefghijklmno", &attrs, 1, None),
+                Line::new(1),
+            ]);
+            let mut cursor = test_cursor(0, 3, 1);
+            for (index, (rows, cols, dpi)) in [
+                (3, 3, 96),
+                (6, 11, 144),
+                (1, 2, 144),
+                (4, 8, 96),
+                (3, 3, 96),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let size = test_size(rows, cols, dpi);
+                let seqno = index + 2;
+                let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+                assert!(prepared.prepare(|| false));
+                assert!(screen.matches_reflow_preparation(&prepared, size, cursor));
+                let mut synchronous = screen.clone();
+                let expected = synchronous.resize(size, cursor, seqno, conpty);
+                cursor = screen.resize_with_prepared_reflow(
+                    size,
+                    cursor,
+                    seqno,
+                    conpty,
+                    Some(&mut prepared),
+                );
+                assert!(
+                    !prepared.ready,
+                    "the validated preparation must be consumed"
+                );
+                assert_eq!(cursor, expected);
+                assert_eq!(screen.lines, synchronous.lines);
+                assert_eq!(screen.physical_rows, synchronous.physical_rows);
+                assert_eq!(screen.physical_cols, synchronous.physical_cols);
+                assert_eq!(
+                    screen.last_resize_wrap_scorecard,
+                    synchronous.last_resize_wrap_scorecard
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_reflow_rejects_changed_source_and_policy() {
+        for mutation in 0..7 {
+            let mut screen = test_screen(3, 8, 96);
+            let attrs = CellAttributes::blank();
+            screen.lines = VecDeque::from(vec![
+                Line::from_text("abcdefghijkl", &attrs, 1, None),
+                Line::from_text("界e\u{301}z", &attrs, 1, None),
+                Line::new(1),
+            ]);
+            let mut cursor = test_cursor(0, 2, 1);
+            let size = test_size(3, 4, 96);
+            let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+            assert!(prepared.prepare(|| false));
+            match mutation {
+                // Deliberately retain the same seqno: content validation must
+                // not rely on every mutable caller incrementing it.
+                0 => {
+                    screen.lines[0].set_cell(0, Cell::new('Z', attrs.clone()), 1);
+                }
+                1 => {
+                    screen.lines[0].set_last_cell_was_wrapped(true, 1);
+                }
+                2 => {
+                    screen.lines.push_front(Line::new(1));
+                }
+                3 => {
+                    screen.stable_row_index_offset += 1;
+                }
+                4 => {
+                    screen.resize_wrap_policy.kp_cost_model.lookahead_limit = 1;
+                }
+                5 => {
+                    cursor.x = 1;
+                }
+                6 => {
+                    screen.dpi = 144;
+                }
+                _ => unreachable!(),
+            }
+            assert!(!screen.matches_reflow_preparation(&prepared, size, cursor));
+            let mut synchronous = screen.clone();
+            let expected = synchronous.resize(size, cursor, 2, false);
+            let actual =
+                screen.resize_with_prepared_reflow(size, cursor, 2, false, Some(&mut prepared));
+            assert!(prepared.ready, "stale work must not be installed");
+            assert_eq!(actual, expected, "mutation {mutation}");
+            assert_eq!(screen.lines, synchronous.lines, "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn prepared_reflow_cancels_between_batches_without_touching_live_screen() {
+        let mut screen = test_screen(3, 8, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = (0..256)
+            .map(|index| {
+                Line::from_text(&format!("{index:04} abc界defghijklmnop"), &attrs, 1, None)
+            })
+            .collect();
+        let original = screen.lines.clone();
+        let cursor = test_cursor(0, 2, 1);
+        let size = test_size(3, 4, 96);
+        let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+        let checks = std::cell::Cell::new(0usize);
+        assert!(!prepared.prepare(|| {
+            checks.set(checks.get() + 1);
+            checks.get() == 4
+        }));
+        assert_eq!(
+            checks.get(),
+            4,
+            "cancellation must be observed before completing all batches"
+        );
+        assert!(!prepared.ready);
+        assert_eq!(screen.lines, original);
+        assert_eq!(screen.physical_cols, 8);
+    }
+
+    #[test]
+    fn prepared_reflow_preserves_live_cold_work_counters() {
+        let mut screen = test_screen(3, 8, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = (0..256)
+            .map(|_| Line::from_text("abcdefghijklmnop", &attrs, 1, None))
+            .collect();
+        let cursor = test_cursor(0, 2, 1);
+        let size = test_size(3, 4, 96);
+        let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+        assert!(prepared.prepare(|| false));
+        let completed = prepared
+            .snapshot
+            .cold_scrollback_worker
+            .completed_lines_total;
+        assert!(completed > 0);
+        screen.cold_scrollback_worker.completed_lines_total = 77;
+        screen.resize_with_prepared_reflow(size, cursor, 2, false, Some(&mut prepared));
+        assert!(prepared.was_applied());
+        assert_eq!(
+            screen.cold_scrollback_worker.completed_lines_total,
+            77 + completed
+        );
+    }
+
+    #[test]
+    fn prepared_reflow_accepts_no_match_scan_and_rechecks_new_rules() {
+        use frankenterm_surface::hyperlink::Rule;
+        let mut screen = test_screen(3, 6, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcdef", &attrs, 1, None),
+            Line::from_text("xy", &attrs, 1, None),
+            Line::new(1),
+        ]);
+        let cursor = test_cursor(0, 1, 1);
+        let size = test_size(3, 4, 96);
+        let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+        let old_rules = vec![Rule::new("never-matches", "$0").unwrap()];
+        for line in &mut screen.lines {
+            line.scan_and_create_hyperlinks(&old_rules);
+        }
+        assert!(prepared.prepare(|| false));
+        assert!(screen.matches_reflow_preparation(&prepared, size, cursor));
+        screen.resize_with_prepared_reflow(size, cursor, 2, false, Some(&mut prepared));
+        assert!(prepared.was_applied());
+        let new_rules = vec![Rule::new("xy", "https://new.example/$0").unwrap()];
+        for line in &mut screen.lines {
+            line.scan_and_create_hyperlinks(&new_rules);
+        }
+        assert!(screen
+            .lines
+            .iter()
+            .flat_map(Line::visible_cells)
+            .any(|cell| {
+                cell.attrs()
+                    .hyperlink()
+                    .is_some_and(|link| link.uri() == "https://new.example/xy")
+            }));
+    }
+
+    #[test]
     fn cached_target_signatures_match_fresh_hashing_and_complete_line_state() {
         let mut attrs = CellAttributes::blank();
         attrs.set_hyperlink(Some(Arc::new(
@@ -5288,7 +5659,7 @@ mod tests {
                 }
                 let mut fresh = screen.clone();
                 if let Some(cache) = fresh.rewrap_cache.as_mut() {
-                    for wrapped in cache.wrapped_by_key.values_mut() {
+                    for wrapped in Arc::make_mut(cache).wrapped_by_key.values_mut() {
                         wrapped.layout_signature = None;
                     }
                 }
@@ -5342,6 +5713,14 @@ mod tests {
             .map(|_| Line::from_text("abcdefghijklmnopqrstuvwx", &attrs, 1, None))
             .collect();
         let mut cursor = test_cursor(0, 0, 1);
+        let mut prepared = screen
+            .capture_reflow_preparation(test_size(3, 8, 96), cursor)
+            .unwrap();
+        assert!(
+            !prepared.prepare(|| false),
+            "mutable images must remain synchronous"
+        );
+        assert!(!screen.lines[0].is_same_reflow_source(&screen.lines[0].clone()));
         for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
             let cache = screen.rewrap_cache.as_ref().unwrap();
@@ -5678,7 +6057,7 @@ mod tests {
             LogicalLineForResize::PhysicalLine(2)
         ));
 
-        screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, None);
+        screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, None, &|| false);
         assert!(matches!(
             screen.rewrap_scratch_slots[0],
             Some(RewrapScratch::PhysicalLine(0))
@@ -5824,8 +6203,9 @@ mod tests {
                 .map(|_| Line::from_text("abcdefgh", &attrs, 0, None))
                 .collect::<Vec<_>>(),
         );
-        let _ = screen.logical_wraps_for_resize(4, 2);
-        let (_, _, _, wrap_cache_hit, _) = screen.logical_wraps_for_resize(4, 2);
+        let _ = screen.logical_wraps_for_resize(4, 2, &|| false);
+        let (_, _, _, wrap_cache_hit, _) =
+            screen.logical_wraps_for_resize(4, 2, &|| false).unwrap();
         assert!(wrap_cache_hit, "exercise an actual cached wrap");
         screen.last_viewport_first_reflow_us = u64::MAX;
         screen.resize(test_size(4, 4, 96), test_cursor(0, 3, 1), 2, false);
@@ -5895,8 +6275,20 @@ mod tests {
         let full_scan_plan = ViewportReflowPlan::full_scan(logical_count);
         let mut viewport_screen = screen.clone();
         let mut full_scan_screen = screen.clone();
-        viewport_screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, Some(&viewport_plan));
-        full_scan_screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, Some(&full_scan_plan));
+        viewport_screen.wrap_logical_lines_for_resize(
+            &logical_lines,
+            4,
+            2,
+            Some(&viewport_plan),
+            &|| false,
+        );
+        full_scan_screen.wrap_logical_lines_for_resize(
+            &logical_lines,
+            4,
+            2,
+            Some(&full_scan_plan),
+            &|| false,
+        );
 
         let wrapped_snapshot = |screen: &Screen| {
             screen
@@ -7254,14 +7646,14 @@ mod tests {
         for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
         }
-        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5);
+        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, &|| false).unwrap();
         assert!(cached, "exercise a previously cached target width");
         assert!(screen.last_resize_wrap_scorecard.is_none());
 
         // Installing the same policy must keep useful whole-line wraps.
         let unchanged = Arc::clone(&screen.config);
         screen.set_config(&unchanged);
-        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5);
+        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, &|| false).unwrap();
         assert!(cached, "unchanged policy should retain cached wraps");
 
         let scored: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {

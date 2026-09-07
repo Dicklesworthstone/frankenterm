@@ -260,8 +260,11 @@ impl ScreenOrAlt {
         cursor_alt: CursorPosition,
         seqno: SequenceNo,
         is_conpty: bool,
+        prepared: Option<&mut ScreenReflowPreparation>,
     ) -> (CursorPosition, CursorPosition) {
-        let cursor_main = self.screen.resize(size, cursor_main, seqno, is_conpty);
+        let cursor_main =
+            self.screen
+                .resize_with_prepared_reflow(size, cursor_main, seqno, is_conpty, prepared);
         let cursor_alt = self.alt_screen.resize(size, cursor_alt, seqno, is_conpty);
         (cursor_main, cursor_alt)
     }
@@ -1179,8 +1182,23 @@ impl TerminalState {
     /// We need to resize both the primary and alt screens, adjusting
     /// the cursor positions of both accordingly.
     pub fn resize(&mut self, size: TerminalSize) {
-        self.increment_seqno();
-        let (cursor_main, cursor_alt) = if self.screen.alt_screen_is_active {
+        self.resize_with_prepared_reflow(size, None);
+    }
+
+    /// Capture immutable wrapping inputs; call `prepare` after releasing the
+    /// terminal lock, then pass the result to `resize_with_prepared_reflow`.
+    pub fn capture_reflow_preparation(
+        &self,
+        size: TerminalSize,
+    ) -> Option<ScreenReflowPreparation> {
+        let (cursor_main, _) = self.resize_cursors();
+        self.screen
+            .screen
+            .capture_reflow_preparation(size, cursor_main)
+    }
+
+    fn resize_cursors(&self) -> (CursorPosition, CursorPosition) {
+        if self.screen.alt_screen_is_active {
             (
                 self.screen
                     .screen
@@ -1200,7 +1218,19 @@ impl TerminalState {
                     .map(|s| s.position)
                     .unwrap_or_else(CursorPosition::default),
             )
-        };
+        }
+    }
+
+    /// Apply a resize using prepared wraps only when their exact source still
+    /// matches. The caller retains the preparation until after releasing its
+    /// locks, including any displaced cache held by the preparation.
+    pub fn resize_with_prepared_reflow(
+        &mut self,
+        size: TerminalSize,
+        prepared: Option<&mut ScreenReflowPreparation>,
+    ) {
+        self.increment_seqno();
+        let (cursor_main, cursor_alt) = self.resize_cursors();
 
         let (adjusted_cursor_main, adjusted_cursor_alt) = self.screen.resize(
             size,
@@ -1208,6 +1238,7 @@ impl TerminalState {
             cursor_alt,
             self.seqno,
             self.enable_conpty_quirks,
+            prepared,
         );
         self.top_and_bottom_margins = 0..size.rows as i64;
         self.left_and_right_margins = 0..size.cols;
@@ -3252,6 +3283,99 @@ mod tests {
             "1.0",
             Box::new(std::io::sink()),
         )
+    }
+
+    #[test]
+    fn prepared_terminal_resize_preserves_primary_alternate_and_saved_cursor() {
+        for alternate_active in [false, true] {
+            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+                kitty_budget: 1024,
+                unicode_version: UnicodeVersion::new(14),
+                scorecard_enabled: true,
+                checksum_rectangular_area: false,
+            });
+            let original_size = TerminalSize {
+                rows: 4,
+                cols: 12,
+                pixel_width: 120,
+                pixel_height: 80,
+                dpi: 96,
+            };
+            let new_terminal = || {
+                crate::Terminal::new(
+                    original_size,
+                    config.clone(),
+                    "test",
+                    "1",
+                    Box::new(std::io::sink()),
+                )
+            };
+            let mut actual = new_terminal();
+            let mut expected = new_terminal();
+            for terminal in [&mut actual, &mut expected] {
+                terminal.advance_bytes("main ab界e\u{301}🦀cdefghijklmnop\r\nnext\x1b7\x1b[?1049hALTERNATE ab界cdef\x1b7".as_bytes());
+                if !alternate_active {
+                    terminal.advance_bytes(b"\x1b[?1049l");
+                }
+            }
+            for (cols, rows, dpi) in [(5, 6, 144), (17, 3, 96), (7, 4, 144)] {
+                let size = TerminalSize {
+                    cols,
+                    rows,
+                    dpi,
+                    pixel_width: cols * 10,
+                    pixel_height: rows * 20,
+                };
+                let mut prepared = actual.capture_reflow_preparation(size).unwrap();
+                assert!(prepared.prepare(|| false));
+                expected.resize(size);
+                actual.resize_with_prepared_reflow(size, Some(&mut prepared));
+                assert_eq!(actual.get_size(), expected.get_size());
+                assert_eq!(actual.cursor_pos(), expected.cursor_pos());
+                assert_eq!(
+                    actual.screen.screen.all_lines(),
+                    expected.screen.screen.all_lines()
+                );
+                assert_eq!(
+                    actual.screen.alt_screen.all_lines(),
+                    expected.screen.alt_screen.all_lines()
+                );
+                assert_eq!(
+                    actual.screen.alt_screen_is_active,
+                    expected.screen.alt_screen_is_active
+                );
+                for (actual, expected) in [
+                    (
+                        &actual.screen.screen.saved_cursor,
+                        &expected.screen.screen.saved_cursor,
+                    ),
+                    (
+                        &actual.screen.alt_screen.saved_cursor,
+                        &expected.screen.alt_screen.saved_cursor,
+                    ),
+                ] {
+                    assert_eq!(
+                        actual.as_ref().map(|c| (c.position, c.wrap_next)),
+                        expected.as_ref().map(|c| (c.position, c.wrap_next))
+                    );
+                }
+                assert_eq!(
+                    actual.top_and_bottom_margins,
+                    expected.top_and_bottom_margins
+                );
+                assert_eq!(
+                    actual.left_and_right_margins,
+                    expected.left_and_right_margins
+                );
+            }
+            actual.advance_bytes(b"\x1b[?1049l\x1b8Z");
+            expected.advance_bytes(b"\x1b[?1049l\x1b8Z");
+            assert_eq!(actual.cursor_pos(), expected.cursor_pos());
+            assert_eq!(
+                actual.screen.screen.all_lines(),
+                expected.screen.screen.all_lines()
+            );
+        }
     }
 
     #[derive(Clone, Debug, Default)]

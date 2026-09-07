@@ -71,6 +71,10 @@ impl Clone for VecStorage {
 }
 
 impl VecStorage {
+    pub(crate) fn shares_cells_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cells, &other.cells)
+    }
+
     pub(crate) fn new(cells: Vec<Cell>) -> Self {
         Self {
             cells: Arc::new(CellBuffer {
