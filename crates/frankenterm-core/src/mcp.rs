@@ -2236,6 +2236,10 @@ mod tests {
             !db_path.exists(),
             "observing the audit writer must not initialize its database"
         );
+        // Control: the writer-capable query used by the former poll really
+        // does bootstrap a missing database, even when it finds no audit row.
+        assert!(latest_audit_action(&db_path, "mcp.wa.rules_list").is_none());
+        assert!(db_path.exists());
     }
 
     fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
