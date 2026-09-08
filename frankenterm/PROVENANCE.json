@@ -156,21 +156,21 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 51,
-        "fix": 74,
+        "fix": 75,
         "other": 16,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 24
+        "test": 26
       },
-      "fork_side_commit_count": 200,
+      "fork_side_commit_count": 203,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-07T02:02:58-04:00",
-        "sha": "1ebee81cdca80676da6a25932f1408205c41c9e5",
-        "subject": "fix(client): preserve title updates across remote window remapping"
+        "classification": "test",
+        "committed_at": "2026-09-07T14:16:28-04:00",
+        "sha": "54dada17b6a3fdd61798a34d693c9b551c6c0c28",
+        "subject": "test(client): qualify malformed range in nested test module"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -446,17 +446,17 @@
         "docs": 1,
         "feat": 2,
         "fix": 16,
-        "other": 2,
+        "other": 3,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 31,
+      "fork_side_commit_count": 32,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-07T21:24:35-04:00",
-        "sha": "e74e32709f53c4113d0a3c0a904d1013a90d54d8",
-        "subject": "feat(surface/platform): line clustering, termwiz widgets, window atlas, scripting"
+        "classification": "other",
+        "committed_at": "2026-09-07T15:42:35-04:00",
+        "sha": "24317633223fbb21ea9499ca26f07dcb2b8b3854",
+        "subject": "perf(font): reuse the previous scale without retaining unbounded font history"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -638,21 +638,21 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 185,
-        "fix": 190,
+        "fix": 192,
         "other": 34,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 69
+        "test": 70
       },
-      "fork_side_commit_count": 546,
+      "fork_side_commit_count": 549,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-06T21:01:44-04:00",
-        "sha": "691aafc1afe1000cad9b9c0866689aa87e742b6a",
-        "subject": "fix(gui): restore legacy remote startup and persistent window state"
+        "classification": "test",
+        "committed_at": "2026-09-08T00:43:18-04:00",
+        "sha": "b3cbe944ce2353821cb9fca106e9bff5b7f26b9f",
+        "subject": "test(guardian): align authority audit with sealed build and replay paths"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -846,21 +846,21 @@
         "chore": 2,
         "cleanup": 1,
         "cosmetic": 7,
-        "feat": 12,
-        "fix": 27,
-        "other": 11,
+        "feat": 13,
+        "fix": 30,
+        "other": 15,
         "refactor": 2,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 85,
+      "fork_side_commit_count": 93,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "chore",
-        "committed_at": "2026-09-04T03:17:09-04:00",
-        "sha": "10c363160f5573a956759318ac4099035377e824",
-        "subject": "chore(lints): make the workspace clean under nightly-2026-08-31"
+        "classification": "fix",
+        "committed_at": "2026-09-08T00:34:37-04:00",
+        "sha": "3a26f3681f8c0e29b89fe6669ac186404e81cfa1",
+        "subject": "fix(reflow): support minimal features and validate live-source changes"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -891,21 +891,21 @@
       "classification_summary": {
         "cleanup": 3,
         "cosmetic": 14,
-        "feat": 49,
-        "fix": 81,
-        "other": 30,
+        "feat": 50,
+        "fix": 85,
+        "other": 31,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 45
       },
-      "fork_side_commit_count": 235,
+      "fork_side_commit_count": 241,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-05T23:25:39-04:00",
-        "sha": "24f68723a6f204976694f5a46893709584fd9eae",
-        "subject": "perf(term): cache immutable text-wrap signatures after measured hashing"
+        "classification": "fix",
+        "committed_at": "2026-09-08T00:34:37-04:00",
+        "sha": "3a26f3681f8c0e29b89fe6669ac186404e81cfa1",
+        "subject": "fix(reflow): support minimal features and validate live-source changes"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2411,
-  "generated_at": "2026-09-07T09:42:40.760119Z",
+  "fork_side_commit_total": 2432,
+  "generated_at": "2026-09-08T04:52:48.322967Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
