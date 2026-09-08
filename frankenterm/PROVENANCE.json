@@ -445,18 +445,18 @@
         "cosmetic": 7,
         "docs": 1,
         "feat": 2,
-        "fix": 16,
-        "other": 3,
+        "fix": 17,
+        "other": 4,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 32,
+      "fork_side_commit_count": 34,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-07T15:42:35-04:00",
-        "sha": "24317633223fbb21ea9499ca26f07dcb2b8b3854",
-        "subject": "perf(font): reuse the previous scale without retaining unbounded font history"
+        "committed_at": "2026-09-08T13:40:09-04:00",
+        "sha": "e5a79b82dddbd363384096e79f3f0d777e99cb22",
+        "subject": "perf(font): retain bounded unsuccessful fallback faces"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2438,
-  "generated_at": "2026-09-08T09:22:44.298897Z",
+  "fork_side_commit_total": 2440,
+  "generated_at": "2026-09-08T17:44:27.403549Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
