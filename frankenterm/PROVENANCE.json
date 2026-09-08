@@ -638,21 +638,21 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 185,
-        "fix": 192,
+        "fix": 193,
         "other": 34,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 72
+        "test": 73
       },
-      "fork_side_commit_count": 551,
+      "fork_side_commit_count": 553,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-08T02:00:59-04:00",
-        "sha": "a85ecc1b8feeaa1845fd634e8700d1f97c237006",
-        "subject": "test(guardian): inventory the catalog payload size assertion"
+        "classification": "fix",
+        "committed_at": "2026-09-08T05:01:30-04:00",
+        "sha": "b559bb1be0776d6974263b59726555a308c81aff",
+        "subject": "fix(resize): skip terminal dimension reads for flexible panes"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2435,
-  "generated_at": "2026-09-08T06:01:24.820221Z",
+  "fork_side_commit_total": 2437,
+  "generated_at": "2026-09-08T09:01:54.019171Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
