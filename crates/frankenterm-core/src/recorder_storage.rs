@@ -3191,7 +3191,7 @@ mod tests {
         RecorderTextEncoding,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex as StdMutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex as StdMutex};
     use tempfile::tempdir;
 
     fn run_async_test<F>(future: F)
