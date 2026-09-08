@@ -306,10 +306,11 @@ pub enum CheckpointCommitOutcome {
 pub struct RecorderStorageHealth {
     pub backend: RecorderBackendKind,
     pub degraded: bool,
-    /// Number of admitted append calls, including owned blocking work still settling.
-    /// Checkpoint and flush calls use separate single-flight admissions and are not counted.
+    /// Number of admitted append calls, including owned blocking work still settling in the
+    /// built-in backends. Their checkpoint and flush calls use separate single-flight admissions
+    /// and are not counted.
     pub queue_depth: usize,
-    /// Configured append admission capacity. Checkpoint and flush capacity is always one.
+    /// Configured append admission capacity. Built-in checkpoint and flush capacity is one.
     pub queue_capacity: usize,
     pub latest_offset: Option<RecorderOffset>,
     pub last_error: Option<String>,
@@ -578,12 +579,13 @@ pub trait RecorderStorage: Send + Sync {
         req: AppendRequest,
     ) -> std::result::Result<AppendResponse, RecorderStorageError>;
 
-    /// Cx-first [`Self::append_batch`] (ft-xbnl0.2.3). Default
-    /// implementation checks caller cancellation via `cx.checkpoint()?`
-    /// before delegating to the non-cx `append_batch`. Concrete
-    /// backends with internal cancellation support (e.g. a
-    /// `timeout_with_cx`-aware write path) SHOULD override to
-    /// thread cx deeper.
+    /// Cx-first [`Self::append_batch`] (ft-xbnl0.2.3).
+    ///
+    /// The default implementation rejects pre-cancelled callers before delegating. Built-in
+    /// backends additionally offload owned blocking work: cancellation observed after admission
+    /// returns typed non-success, while an already-started storage effect settles to its natural
+    /// result for exact retry reconciliation. A successful result passes a final caller-Cx
+    /// delivery gate.
     async fn append_batch_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -598,9 +600,9 @@ pub trait RecorderStorage: Send + Sync {
     async fn flush(&self, mode: FlushMode)
     -> std::result::Result<FlushStats, RecorderStorageError>;
 
-    /// Cx-first [`Self::flush`] (ft-xbnl0.2.3). Default
-    /// implementation checks caller cancellation before
-    /// delegating to the non-cx `flush`.
+    /// Cx-first [`Self::flush`] (ft-xbnl0.2.3). The default implementation rejects
+    /// pre-cancelled callers before delegating. Built-in backends use the same owned-settlement
+    /// and final delivery-gate contract as [`Self::append_batch_with_cx`].
     async fn flush_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -642,9 +644,9 @@ pub trait RecorderStorage: Send + Sync {
         checkpoint: RecorderCheckpoint,
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError>;
 
-    /// Cx-first [`Self::commit_checkpoint`] (ft-xbnl0.2.3).
-    /// Default implementation checks caller cancellation before
-    /// delegating to the non-cx `commit_checkpoint`.
+    /// Cx-first [`Self::commit_checkpoint`] (ft-xbnl0.2.3). The default implementation rejects
+    /// pre-cancelled callers before delegating. Built-in backends use the same owned-settlement
+    /// and final delivery-gate contract as [`Self::append_batch_with_cx`].
     async fn commit_checkpoint_with_cx(
         &self,
         cx: &crate::cx::Cx,
