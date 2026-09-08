@@ -106,8 +106,7 @@ impl Atlas {
         packing_stats.record_atlas_size(atlas_size);
 
         // Record the atlas footprint so dashboards can surface
-        // memory pressure once the grow path lands. SRGBA = 4 bytes
-        // per pixel.
+        // memory pressure. SRGBA = 4 bytes per pixel.
         let bytes_estimate = (side as u64).saturating_mul(side as u64).saturating_mul(4);
         metrics::gauge!("window.atlas.size_bytes").set(bytes_estimate as f64);
 
