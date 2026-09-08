@@ -882,6 +882,10 @@ fn recover_checkpoints_from_scan(
 
 impl AppendLogRecorderStorage {
     /// Open or create an append-log recorder backend.
+    ///
+    /// On Unix, the data descriptor holds a nonblocking exclusive writer lease
+    /// until this backend is dropped. Competing opens fail with a retryable I/O
+    /// error before tail recovery can inspect or truncate a live writer's log.
     pub fn open(config: AppendLogStorageConfig) -> std::result::Result<Self, RecorderStorageError> {
         config.validate()?;
         ensure_parent_dir(&config.data_path)?;
@@ -892,6 +896,16 @@ impl AppendLogRecorderStorage {
             .read(true)
             .append(true)
             .open(&config.data_path)?;
+
+        // Recovery may truncate a torn tail, so acquire authority before the
+        // scan, not just before appending. BufWriter retains this exact File;
+        // failed initialization or final owner drop releases its lease without
+        // an explicit unlock that could race with a buffered final write.
+        // Unix flock is advisory and leaves independent indexer reads working.
+        // Windows whole-file locks deny those reads; its writer authority needs
+        // a separate protocol rather than silently breaking live observation.
+        #[cfg(unix)]
+        fs2::FileExt::try_lock_exclusive(&file)?;
 
         let scan = scan_valid_prefix(&mut file)?;
         let persisted = load_persisted_state(&config.state_path)?;

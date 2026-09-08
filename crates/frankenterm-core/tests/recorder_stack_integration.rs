@@ -132,6 +132,215 @@ fn storage_config(path: &std::path::Path) -> AppendLogStorageConfig {
     }
 }
 
+#[cfg(unix)]
+fn assert_writer_lease_busy(config: AppendLogStorageConfig) {
+    let err = AppendLogRecorderStorage::open(config).unwrap_err();
+    assert_eq!(err.class(), RecorderStorageErrorClass::Retryable);
+    match err {
+        RecorderStorageError::Io(source) => {
+            assert_eq!(
+                source.raw_os_error(),
+                fs2::lock_contended_error().raw_os_error()
+            );
+        }
+        other => panic!("expected a contended writer lease, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_writer_lease_precedes_torn_tail_recovery() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = storage_config(dir.path());
+    let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+    // A real incomplete record models bytes that must not be recovered while
+    // their writer is alive. Unix advisory locks allow this independent handle.
+    let tail = [12, 0, 0, 0, b'{'];
+    let mut external = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&config.data_path)
+        .unwrap();
+    external.write_all(&tail).unwrap();
+    external.sync_data().unwrap();
+    drop(external);
+
+    for attempt in 1..=2 {
+        assert_writer_lease_busy(config.clone());
+        assert_eq!(std::fs::read(&config.data_path).unwrap(), tail);
+        assert!(!config.state_path.exists());
+        eprintln!("recorder writer lease: phase=busy, attempt={attempt}, preserved_bytes=5");
+    }
+    drop(owner);
+    let recovered = AppendLogRecorderStorage::open(config.clone()).unwrap();
+    assert!(std::fs::read(&config.data_path).unwrap().is_empty());
+    drop(recovered);
+    eprintln!("recorder writer lease: phase=owner_released, recovered_bytes=0");
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_writer_lease_covers_hard_link_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = storage_config(dir.path());
+    let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+    let mut alias = config.clone();
+    alias.data_path = dir.path().join("events-alias.log");
+    std::fs::hard_link(&config.data_path, &alias.data_path).unwrap();
+    assert_writer_lease_busy(alias.clone());
+    drop(owner);
+    let successor = AppendLogRecorderStorage::open(alias).unwrap();
+    assert_writer_lease_busy(config);
+    drop(successor);
+    eprintln!("recorder writer lease: alias=hard_link, phase=successor_exclusive");
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_writer_lease_covers_symlink_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = storage_config(dir.path());
+    let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+    let mut alias = config.clone();
+    alias.data_path = dir.path().join("events-symlink.log");
+    std::os::unix::fs::symlink(&config.data_path, &alias.data_path).unwrap();
+    assert_writer_lease_busy(alias.clone());
+    drop(owner);
+    let successor = AppendLogRecorderStorage::open(alias).unwrap();
+    assert_writer_lease_busy(config);
+    drop(successor);
+    eprintln!("recorder writer lease: alias=symlink, phase=successor_exclusive");
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_writer_lease_released_after_initialization_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = storage_config(dir.path());
+    std::fs::write(&config.state_path, b"not valid JSON").unwrap();
+    for attempt in 1..=2 {
+        assert!(matches!(
+            AppendLogRecorderStorage::open(config.clone()),
+            Err(RecorderStorageError::Json(_))
+        ));
+        eprintln!("recorder writer lease: phase=initialization_failed, attempt={attempt}");
+    }
+    std::fs::rename(&config.state_path, dir.path().join("invalid-state.saved")).unwrap();
+    let recovered = AppendLogRecorderStorage::open(config.clone()).unwrap();
+    assert_writer_lease_busy(config.clone());
+    drop(recovered);
+    AppendLogRecorderStorage::open(config).unwrap();
+    eprintln!("recorder writer lease: phase=initialization_repaired");
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_writer_lease_cross_process_handoff() {
+    const CHILD_MODE: &str = "FT_RECORDER_WRITER_LEASE_CHILD";
+    const CHILD_DIR: &str = "FT_RECORDER_WRITER_LEASE_DIR";
+    const TEST_NAME: &str = "append_log_writer_lease_cross_process_handoff";
+
+    if let Some(mode) = std::env::var_os(CHILD_MODE) {
+        let path = std::path::PathBuf::from(std::env::var_os(CHILD_DIR).unwrap());
+        let config = storage_config(&path);
+        if mode == "busy" {
+            assert_writer_lease_busy(config);
+            eprintln!("recorder writer lease: process=child, phase=busy_verified");
+        } else {
+            assert_eq!(mode, "append");
+            run_async_test(async {
+                let storage = AppendLogRecorderStorage::open(config).unwrap();
+                let receipt = storage
+                    .append_batch(AppendRequest {
+                        batch_id: "successor-batch".to_string(),
+                        events: vec![sample_event("successor", 1, 1, "second")],
+                        required_durability: DurabilityLevel::Fsync,
+                        producer_ts_ms: 0,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.first_offset.ordinal, 1);
+                assert_eq!(receipt.accepted_count, 1);
+            });
+            eprintln!("recorder writer lease: process=child, phase=appended, ordinal=1");
+        }
+        return;
+    }
+
+    let run_child = |path: &std::path::Path, mode: &str| {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_MODE, mode)
+            .env(CHILD_DIR, path)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "writer lease child mode={mode}: {status}");
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => {
+                    // Only this test's own child is terminated, and always
+                    // reaped: a blocking-lock regression must not hang the suite.
+                    let killed = child.kill();
+                    let reaped = child.wait();
+                    panic!(
+                        "writer lease child mode={mode} did not finish: {result:?}; kill={killed:?}; wait={reaped:?}"
+                    );
+                }
+            }
+        }
+    };
+
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = storage_config(dir.path());
+        let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        owner
+            .append_batch(AppendRequest {
+                batch_id: "owner-batch".to_string(),
+                events: vec![sample_event("owner", 1, 0, "first")],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 0,
+            })
+            .await
+            .unwrap();
+        run_child(dir.path(), "busy");
+        assert_eq!(owner.health().await.latest_offset.unwrap().ordinal, 0);
+        drop(owner);
+        run_child(dir.path(), "append");
+        let reopened = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        assert_eq!(reopened.health().await.latest_offset.unwrap().ordinal, 1);
+        drop(reopened);
+
+        let bytes = std::fs::read(&config.data_path).unwrap();
+        let mut remaining = bytes.as_slice();
+        for expected in [
+            sample_event("owner", 1, 0, "first"),
+            sample_event("successor", 1, 1, "second"),
+        ] {
+            assert!(remaining.len() >= 4);
+            let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+            remaining = &remaining[4..];
+            assert!(remaining.len() >= len);
+            let actual: serde_json::Value = serde_json::from_slice(&remaining[..len]).unwrap();
+            assert_eq!(actual, serde_json::to_value(expected).unwrap());
+            remaining = &remaining[len..];
+        }
+        assert!(
+            remaining.is_empty(),
+            "unexpected bytes after two exact events"
+        );
+        eprintln!("recorder writer lease: process=parent, phase=reopened, exact_records=2");
+    });
+}
+
 #[test]
 fn append_log_appended_retry_after_state_write_failure_does_not_duplicate() {
     assert_append_retry_after_state_failure_is_idempotent(DurabilityLevel::Appended, false);
