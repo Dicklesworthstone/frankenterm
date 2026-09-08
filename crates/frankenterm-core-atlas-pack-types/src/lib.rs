@@ -533,6 +533,11 @@ struct FreeRect {
     height: u32,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONTAINMENT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl FreeRect {
     #[inline]
     const fn right(&self) -> u64 {
@@ -566,6 +571,8 @@ impl FreeRect {
     /// rectangles after a split.
     #[inline]
     fn contains(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        CONTAINMENT_CHECKS.with(|count| count.set(count.get().saturating_add(1)));
         self.x <= other.x
             && self.y <= other.y
             && other.right() <= self.right()
@@ -1328,6 +1335,184 @@ mod tests {
     // ----------------------------------------------------------------
     // MaximalRectanglesPacker (BSSF)
     // ----------------------------------------------------------------
+
+    /// Frozen pre-optimization allocation oracle. Keep its all-pairs pruning
+    /// independent of the production pruning path so survivor order and equal
+    /// rectangle tie breaking are compared after every allocation.
+    fn legacy_maximal_alloc(
+        packer: &mut MaximalRectanglesPacker,
+        size: GlyphSize,
+    ) -> AllocationOutcome {
+        if size.width > packer.size.width {
+            return AllocationOutcome::Rejected(RejectReason::GlyphWiderThanAtlas);
+        }
+        if size.height > packer.size.height {
+            return AllocationOutcome::Rejected(RejectReason::GlyphTallerThanAtlas);
+        }
+        let best = packer
+            .free_rects
+            .iter()
+            .filter(|free| free.fits(size))
+            .min_by_key(|free| {
+                let w = free.width - size.width;
+                let h = free.height - size.height;
+                (w.min(h), w.max(h), free.x, free.y)
+            });
+        let Some(best) = best else {
+            return AllocationOutcome::Rejected(RejectReason::AtlasFull);
+        };
+        let placed = PackedRect {
+            x: best.x,
+            y: best.y,
+            width: size.width,
+            height: size.height,
+        };
+        let right = u64::from(placed.x) + u64::from(size.width);
+        let bottom = u64::from(placed.y) + u64::from(size.height);
+        let mut free_rects = Vec::new();
+        for free in &packer.free_rects {
+            if !free.intersects(placed.x, placed.y, size.width, size.height) {
+                free_rects.push(*free);
+                continue;
+            }
+            if placed.y > free.y {
+                free_rects.push(FreeRect {
+                    height: placed.y - free.y,
+                    ..*free
+                });
+            }
+            if bottom < free.bottom() {
+                free_rects.push(FreeRect {
+                    y: u32::try_from(bottom).unwrap(),
+                    height: u32::try_from(free.bottom() - bottom).unwrap(),
+                    ..*free
+                });
+            }
+            if placed.x > free.x {
+                free_rects.push(FreeRect {
+                    width: placed.x - free.x,
+                    ..*free
+                });
+            }
+            if right < free.right() {
+                free_rects.push(FreeRect {
+                    x: u32::try_from(right).unwrap(),
+                    width: u32::try_from(free.right() - right).unwrap(),
+                    ..*free
+                });
+            }
+        }
+        let mut i = 0;
+        while i < free_rects.len() {
+            let mut removed_i = false;
+            let mut j = i + 1;
+            while j < free_rects.len() {
+                if free_rects[j].contains(&free_rects[i]) {
+                    free_rects.remove(i);
+                    removed_i = true;
+                    break;
+                }
+                if free_rects[i].contains(&free_rects[j]) {
+                    free_rects.remove(j);
+                } else {
+                    j += 1;
+                }
+            }
+            if !removed_i {
+                i += 1;
+            }
+        }
+        packer.free_rects = free_rects;
+        packer.placements.push(placed);
+        AllocationOutcome::Placed(placed)
+    }
+
+    #[test]
+    fn maximal_rectangles_matches_legacy_allocation_streams() {
+        for seed in 0_u64..24 {
+            let mut random = seed + 1;
+            let mut current = MaximalRectanglesPacker::new(atlas(128, 128));
+            let mut legacy = current.clone();
+            for step in 0..256 {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let width = ((random >> 32) % 40) as u32;
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let height = ((random >> 32) % 40) as u32;
+                let request = glyph(width, height);
+                assert_eq!(
+                    current.try_alloc(request),
+                    legacy_maximal_alloc(&mut legacy, request),
+                    "seed={seed} step={step}"
+                );
+                assert_eq!(
+                    current.free_rects, legacy.free_rects,
+                    "seed={seed} step={step}"
+                );
+                assert_eq!(current.placements, legacy.placements);
+                if step % 97 == 96 {
+                    current.clear();
+                    legacy.clear();
+                }
+            }
+        }
+        for edge in [0, 1, 16, u32::MAX] {
+            let mut current = MaximalRectanglesPacker::new(atlas(edge, edge));
+            let mut legacy = current.clone();
+            for request in [
+                glyph(0, 0),
+                glyph(1, 1),
+                glyph(edge, 0),
+                glyph(0, edge),
+                glyph(edge, edge),
+                glyph(u32::MAX, u32::MAX),
+            ] {
+                assert_eq!(
+                    current.try_alloc(request),
+                    legacy_maximal_alloc(&mut legacy, request)
+                );
+                assert_eq!(current.free_rects, legacy.free_rects);
+            }
+        }
+    }
+
+    #[test]
+    fn maximal_rectangles_zoom_workload() {
+        for round in 0..3 {
+            let mut packer = MaximalRectanglesPacker::new(atlas(4096, 4096));
+            let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+            CONTAINMENT_CHECKS.with(|count| count.set(0));
+            let start = std::time::Instant::now();
+            for index in 0..4096_u32 {
+                let request = glyph(8 + (index * 17 % 31), 12 + (index * 29 % 37));
+                let placed = packer
+                    .try_alloc(std::hint::black_box(request))
+                    .placed()
+                    .unwrap();
+                for value in [placed.x, placed.y, placed.width, placed.height] {
+                    fingerprint = (fingerprint ^ u64::from(value)).wrapping_mul(0x100_0000_01b3);
+                }
+                for free in &packer.free_rects {
+                    for value in [free.x, free.y, free.width, free.height] {
+                        fingerprint =
+                            (fingerprint ^ u64::from(value)).wrapping_mul(0x100_0000_01b3);
+                    }
+                }
+            }
+            let elapsed = start.elapsed();
+            let comparisons = CONTAINMENT_CHECKS.with(std::cell::Cell::get);
+            assert!(non_overlapping(packer.placements()));
+            println!(
+                "ATLAS_ZOOM_WORKLOAD round={round} allocations={} free_rects={} contains={comparisons} fingerprint={fingerprint:016x} elapsed_us={}",
+                packer.placements.len(),
+                packer.free_rects.len(),
+                elapsed.as_micros()
+            );
+        }
+    }
 
     #[test]
     fn maximal_rectangles_first_alloc_lands_at_origin() {
