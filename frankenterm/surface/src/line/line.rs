@@ -210,7 +210,11 @@ impl Line {
     /// Renderer appdata and a no-match hyperlink scan do not change wrapping;
     /// all cell attributes, layout bits and mutation sequence numbers do.
     pub fn is_same_reflow_source(&self, other: &Self) -> bool {
-        if self.seqno != other.seqno || self.has_image_attachments() {
+        if self.seqno != other.seqno {
+            return false;
+        }
+        #[cfg(feature = "use_image")]
+        if self.has_image_attachments() {
             return false;
         }
         let normalized_bits = |line: &Self| {

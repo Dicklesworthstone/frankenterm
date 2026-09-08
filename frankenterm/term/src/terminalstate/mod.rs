@@ -3330,6 +3330,10 @@ mod tests {
                 assert!(prepared.prepare(|| false));
                 expected.resize(size);
                 actual.resize_with_prepared_reflow(size, Some(&mut prepared));
+                assert!(
+                    prepared.was_applied(),
+                    "unchanged input must use prepared wraps"
+                );
                 assert_eq!(actual.get_size(), expected.get_size());
                 assert_eq!(actual.cursor_pos(), expected.cursor_pos());
                 assert_eq!(
@@ -3374,6 +3378,64 @@ mod tests {
             assert_eq!(
                 actual.screen.screen.all_lines(),
                 expected.screen.screen.all_lines()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_terminal_resize_rejects_output_parsed_after_capture() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: true,
+            checksum_rectangular_area: false,
+        });
+        let original_size = TerminalSize {
+            rows: 4,
+            cols: 12,
+            pixel_width: 120,
+            pixel_height: 80,
+            dpi: 96,
+        };
+        for output in ["\r\nnew 界e\u{301}🦀 output", "\x1b[2J\x1b[Hreplacement"] {
+            let new_terminal = || {
+                crate::Terminal::new(
+                    original_size,
+                    config.clone(),
+                    "test",
+                    "1",
+                    Box::new(std::io::sink()),
+                )
+            };
+            let mut actual = new_terminal();
+            let mut expected = new_terminal();
+            for terminal in [&mut actual, &mut expected] {
+                terminal.advance_bytes(b"a logical line spanning several physical rows\r\ntail");
+            }
+            let size = TerminalSize {
+                cols: 5,
+                pixel_width: 50,
+                ..original_size
+            };
+            let mut prepared = actual.capture_reflow_preparation(size).unwrap();
+            assert!(prepared.prepare(|| false));
+            actual.advance_bytes(output.as_bytes());
+            expected.advance_bytes(output.as_bytes());
+            expected.resize(size);
+            actual.resize_with_prepared_reflow(size, Some(&mut prepared));
+            assert!(
+                !prepared.was_applied(),
+                "new output must invalidate the snapshot"
+            );
+            assert_eq!(actual.get_size(), expected.get_size());
+            assert_eq!(actual.cursor_pos(), expected.cursor_pos());
+            assert_eq!(
+                actual.screen.screen.all_lines(),
+                expected.screen.screen.all_lines()
+            );
+            assert_eq!(
+                actual.screen.alt_screen.all_lines(),
+                expected.screen.alt_screen.all_lines()
             );
         }
     }

@@ -4954,7 +4954,13 @@ mod tests {
 
     #[test]
     fn resize_preparation_releases_locks_and_observes_supersession() {
-        let terminal = Mutex::new(test_terminal(term_size(80, 3)));
+        let terminal = Mutex::new(Terminal::new(
+            term_size(80, 3),
+            Arc::new(GuardianLifetimeTestTermConfig),
+            "FrankenTerm",
+            "resize-preparation-test",
+            Box::new(std::io::sink()),
+        ));
         terminal
             .lock()
             .advance_bytes(b"a long logical line that needs wrapping\r\nsecond line");
