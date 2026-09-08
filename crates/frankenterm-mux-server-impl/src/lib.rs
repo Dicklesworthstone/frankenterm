@@ -6322,6 +6322,11 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             decoded_bytes,
             rows,
         )?;
+        // Reauthentication takes the same keyring mutex. Release the decode
+        // cache and its borrowed keyring guard before attempting that lock.
+        // The mutation and filesystem leases still protect this snapshot.
+        drop(cipher_cache);
+        drop(keyring);
         drop(store);
         if let Some(manifest) = manifest_before.as_ref() {
             self.revalidate_snapshot_manifest(manifest)?;
