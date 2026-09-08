@@ -2205,13 +2205,20 @@ mod tests {
                  FROM audit_actions WHERE action_kind = ?1 ORDER BY ts DESC LIMIT 1",
                 [action_kind],
                 |row| {
+                    let pane_id = row
+                        .get::<_, Option<i64>>(5)?
+                        .map(|value| {
+                            u64::try_from(value)
+                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, value))
+                        })
+                        .transpose()?;
                     Ok(crate::storage::AuditActionRecord {
                         id: row.get(0)?,
                         ts: row.get(1)?,
                         actor_kind: row.get(2)?,
                         actor_id: row.get(3)?,
                         correlation_id: row.get(4)?,
-                        pane_id: row.get(5)?,
+                        pane_id,
                         domain: row.get(6)?,
                         action_kind: row.get(7)?,
                         policy_decision: row.get(8)?,
