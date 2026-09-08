@@ -473,7 +473,9 @@ impl Face {
 
         // Scaling before truncating to integer minimizes the chances of hitting
         // the fallback code for set_pixel_sizes below.
-        let size = FT_F26Dot6::from_num(point_size);
+        let size = FT_F26Dot6::checked_from_num(point_size)
+            .filter(|_| point_size > 0.0)
+            .ok_or_else(|| anyhow!("font size must be positive, finite and representable"))?;
 
         let selected_size = match self.set_char_size(size, size, dpi, dpi) {
             Ok(_) => {

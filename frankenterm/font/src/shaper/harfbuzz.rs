@@ -655,7 +655,7 @@ impl FontShaper for HarfbuzzShaper {
 
         let key = MetricsKey {
             font_idx,
-            size: NotNan::new(size).unwrap(),
+            size: NotNan::new(size).context("font size must not be NaN")?,
             dpi,
         };
         if let Some(metrics) = self.metrics.borrow().get(&key) {
@@ -909,6 +909,37 @@ mod test {
             .unwrap()
             .clone();
         vec![handle; count]
+    }
+
+    #[test]
+    fn invalid_font_sizes_return_errors_without_poisoning_cached_faces() {
+        let handles = fallback_test_handles(1);
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let fresh = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let shape = |shaper: &HarfbuzzShaper, size| {
+            shaper.shape(
+                "WZ ffi e\u{301}",
+                size,
+                72,
+                &mut Vec::new(),
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+        };
+        let expected = shape(&fresh, 10.).unwrap();
+        assert_eq!(shape(&shaper, 10.).unwrap(), expected);
+        for size in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 0., -1.] {
+            assert!(shape(&shaper, size).is_err(), "shape accepted {size}");
+            assert!(shaper.metrics(size, 72).is_err(), "metrics accepted {size}");
+            assert!(
+                shaper.metrics_for_idx(0, size, 72).is_err(),
+                "indexed metrics accepted {size}"
+            );
+            assert_eq!(shape(&shaper, 10.).unwrap(), expected);
+        }
     }
 
     #[test]
