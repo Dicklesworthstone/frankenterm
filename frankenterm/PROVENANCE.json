@@ -442,7 +442,7 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cleanup": 1,
-        "cosmetic": 7,
+        "cosmetic": 8,
         "docs": 1,
         "feat": 2,
         "fix": 18,
@@ -450,13 +450,13 @@
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 35,
+      "fork_side_commit_count": 36,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-08T15:46:23-04:00",
-        "sha": "ce7d97d201255df32bf95784693221e300d869b2",
-        "subject": "fix(font): reject invalid sizes before numeric conversion"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-08T17:19:23-04:00",
+        "sha": "14aaa7fe77712282e4c73b8feae1605df8e0451d",
+        "subject": "style(font): format the invalid-size regression cases"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2441,
-  "generated_at": "2026-09-08T19:46:42.257652Z",
+  "fork_side_commit_total": 2442,
+  "generated_at": "2026-09-08T21:20:10.329225Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
