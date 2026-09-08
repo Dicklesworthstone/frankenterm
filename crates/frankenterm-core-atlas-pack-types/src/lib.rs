@@ -3,7 +3,7 @@
 //! Per Jukka Jylänki's *A Thousand Ways to Pack the Bin*, several
 //! algorithms trade speed for waste:
 //!
-//! - **Shelf-packing** — constant-time placement; row-based, ideal for
+//! - **Shelf-packing** — amortized constant-time placement; row-based, ideal for
 //!   uniform-height glyph runs (small static atlases).
 //! - **Skyline** — online placement; selected by default when the
 //!   largest axis is above 512 and below 4096.
@@ -245,7 +245,7 @@ pub fn select_packer(size: Atlas2DSize, thresholds: PackerSelectionThresholds) -
 
 /// Row-based shelf-packer. Tracks the current shelf's `y` and the
 /// cursor `x` along the active shelf; opens a new shelf when the
-/// glyph doesn't fit on the current one. O(1) per allocation;
+/// glyph doesn't fit on the current one. Amortized O(1) per allocation;
 /// wasted space depends on the glyph sequence.
 #[derive(Debug, Clone)]
 pub struct ShelfPacker {
@@ -341,8 +341,8 @@ impl ShelfPacker {
 /// Bottom-Left skyline packer. Tracks the upper boundary of placed
 /// glyphs as a list of horizontal segments (`SkylineNode`). For
 /// each allocation, finds the segment where the glyph fits with the
-/// lowest top-y, places it, and merges segments. ~5% wasted; O(N)
-/// per allocation in the segment count.
+/// lowest top-y, places it, and merges segments. Worst-case O(N²)
+/// per allocation in the segment count because each candidate scans its span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SkylineNode {
     x: u32,
@@ -587,9 +587,9 @@ impl FreeRect {
 /// 1. Scans every free rectangle large enough to hold the glyph and
 ///    picks the one with the smallest residual short side
 ///    (`min(free.w - g.w, free.h - g.h)`). Ties go to the smaller
-///    long side, then to the upper-left corner — the same Bottom-Left
-///    rule [`SkylinePacker`] uses, so the placement is deterministic
-///    run-to-run for identical input.
+///    long side, then smaller x, then smaller y. This x-before-y
+///    tie-break differs from [`SkylinePacker`]'s y-before-x order and
+///    is deterministic for identical input.
 /// 2. Places the glyph at the chosen free rect's upper-left corner.
 /// 3. Splits every free rect that intersects the placed glyph into
 ///    up to four new maximal rectangles (above, below, left, right).
