@@ -634,7 +634,9 @@ fn blocker_radar_contract_docs_truth_gate() {
             "`git status --short --branch`",
             "`rch status`",
             "`rch diagnose`",
-            "`gh run view`",
+            "`dsr doctor`",
+            "`dsr health all`",
+            "`dsr repos info frankenterm`",
             "`ft.blocker_radar.v1`",
             "`schema_version`",
             "`contract_id`",
@@ -740,6 +742,7 @@ fn blocker_radar_contract_docs_truth_gate() {
             "raw pane transcript is allowed",
             "raw prompt is allowed",
             "recommended restart",
+            "`gh run view`",
         ],
     );
 
