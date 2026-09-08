@@ -10777,10 +10777,10 @@ mod tests {
             inventory.item_macros,
             vec![
                 expected_item_macro(
-                    "static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointCatalogAdoptionEvidenceV1: Clone, Copy);"
                 ),
                 expected_item_macro(
-                    "static_assertions::assert_not_impl_any!(GuardianCheckpointCatalogAdoptionEvidenceV1: Clone, Copy);"
+                    "static_assertions::assert_not_impl_any!(GuardianCheckpointDurableCompletionReceiptV1: Clone, Copy);"
                 ),
                 expected_item_macro(
                     "static_assertions::assert_impl_all!(GuardianCheckpointDurableCompletionReceiptV1: zeroize::ZeroizeOnDrop);"
