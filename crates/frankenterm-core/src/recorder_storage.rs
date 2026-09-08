@@ -20,12 +20,20 @@
 //!   `recorder_checkpoints` table and survives reopen.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt as _;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+#[cfg(any(unix, windows))]
+use cap_std::fs::MetadataExt as _;
+use cap_std::fs::{Dir as CapDir, Metadata as CapMetadata, OpenOptions as CapOpenOptions};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -573,6 +581,10 @@ pub struct AppendLogStorageConfig {
     /// Path to append-only data file.
     pub data_path: PathBuf,
     /// Path to persisted writer/checkpoint state.
+    ///
+    /// Opening resolves existing symlinks and reserves the sibling staging
+    /// path (`with_extension("tmp")`) and its `.lock` sidecar. These paths
+    /// must be distinct from the data file; the sidecar remains after close.
     pub state_path: PathBuf,
     /// Maximum concurrent append calls admitted.
     pub queue_capacity: usize,
@@ -585,7 +597,7 @@ pub struct AppendLogStorageConfig {
 }
 
 impl AppendLogStorageConfig {
-    /// Validate config for runtime safety.
+    /// Validate numeric limits; filesystem identity admission happens on open.
     pub fn validate(&self) -> std::result::Result<(), RecorderStorageError> {
         if self.queue_capacity == 0 {
             return Err(RecorderStorageError::InvalidRequest {
@@ -830,6 +842,8 @@ pub struct AppendLogRecorderStorage {
 #[derive(Debug)]
 struct AppendLogInner {
     writer: std::io::BufWriter<File>,
+    // Field order keeps state authority alive through the writer's final flush.
+    state_file: AppendLogStateFile,
     segment_id: u64,
     next_offset: u64,
     next_ordinal: u64,
@@ -886,16 +900,31 @@ impl AppendLogRecorderStorage {
     /// On Unix, the data descriptor holds a nonblocking exclusive writer lease
     /// until this backend is dropped. Competing opens fail with a retryable I/O
     /// error before tail recovery can inspect or truncate a live writer's log.
-    pub fn open(config: AppendLogStorageConfig) -> std::result::Result<Self, RecorderStorageError> {
+    /// A separate staging-name lease excludes writers sharing snapshot paths.
+    /// Path aliases within this configuration are rejected before recovery.
+    /// This is not a security boundary for directories writable by an adversary
+    /// or a global reservation of paths used in different roles by other logs.
+    pub fn open(
+        mut config: AppendLogStorageConfig,
+    ) -> std::result::Result<Self, RecorderStorageError> {
         config.validate()?;
+        config.data_path = resolve_recorder_path(&config.data_path)?;
+        config.state_path = resolve_recorder_path(&config.state_path)?;
+        validate_recorder_paths(&config)?;
         ensure_parent_dir(&config.data_path)?;
         ensure_parent_dir(&config.state_path)?;
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&config.data_path)?;
+        // The staging-name lease also excludes distinct logs that share state
+        // or whose different state extensions produce the same staging path.
+        let state_file = AppendLogStateFile::open(&config.state_path)?;
+        validate_recorder_paths(&config)?;
+        let (data_dir, data_name) = recorder_parent(&config.data_path)?;
+        let mut options = recorder_open_options();
+        options.create(true).read(true).append(true);
+        let mut file = data_dir.open_with(&data_name, &options)?.into_std();
+        if !file.metadata()?.is_file() {
+            return Err(invalid_recorder_path("data path is not a regular file"));
+        }
 
         // Recovery may truncate a torn tail, so acquire authority before the
         // scan, not just before appending. BufWriter retains this exact File;
@@ -907,8 +936,9 @@ impl AppendLogRecorderStorage {
         #[cfg(unix)]
         fs2::FileExt::try_lock_exclusive(&file)?;
 
+        validate_recorder_paths(&config)?;
+        let persisted = state_file.load()?;
         let scan = scan_valid_prefix(&mut file)?;
-        let persisted = load_persisted_state(&config.state_path)?;
         let recovered_segment_id = 0;
         let state_matches_scan = scan.matches_persisted_state(&persisted);
 
@@ -940,6 +970,7 @@ impl AppendLogRecorderStorage {
 
         let inner = AppendLogInner {
             writer: std::io::BufWriter::new(file),
+            state_file,
             segment_id,
             next_offset,
             next_ordinal,
@@ -970,7 +1001,7 @@ impl AppendLogRecorderStorage {
             next_ordinal: inner.next_ordinal,
             checkpoints: inner.checkpoints.clone(),
         };
-        write_persisted_state(&self.config.state_path, &persisted)
+        inner.state_file.write(&persisted)
     }
 
     fn latest_offset(inner: &AppendLogInner) -> Option<RecorderOffset> {
@@ -1324,7 +1355,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
                     checkpoints: inner.checkpoints.clone(),
                 };
                 persisted.checkpoints.insert(key, checkpoint);
-                write_persisted_state(&self.config.state_path, &persisted)?;
+                inner.state_file.write(&persisted)?;
                 inner.checkpoints = persisted.checkpoints;
             }
 
@@ -2420,27 +2451,274 @@ fn read_sqlite_checkpoint(
         .transpose()
 }
 
-fn load_persisted_state(path: &Path) -> std::result::Result<PersistedState, RecorderStorageError> {
-    if !path.exists() {
-        return Ok(PersistedState::default());
+fn invalid_recorder_path(message: impl Into<String>) -> RecorderStorageError {
+    RecorderStorageError::InvalidRequest {
+        message: message.into(),
     }
-    let bytes = std::fs::read(path)?;
-    if bytes.is_empty() {
-        return Ok(PersistedState::default());
-    }
-    let state = serde_json::from_slice::<PersistedState>(&bytes)?;
-    Ok(state)
 }
 
-fn write_persisted_state(
-    path: &Path,
-    state: &PersistedState,
+/// Resolve existing symlinks before reducing parent components. Missing
+/// descendants can be normalized without creating directories or files.
+fn resolve_recorder_path(path: &Path) -> std::result::Result<PathBuf, RecorderStorageError> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        if component == std::path::Component::ParentDir {
+            match std::fs::metadata(&resolved) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(invalid_recorder_path(
+                        "parent traversal through a non-directory",
+                    ));
+                }
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+                _ => {}
+            }
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component.as_os_str());
+        match std::fs::canonicalize(&resolved) {
+            Ok(canonical) => resolved = canonical,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        return Err(invalid_recorder_path(
+                            "recorder path has a dangling symlink",
+                        ));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(resolved)
+}
+
+fn recorder_parent(path: &Path) -> std::result::Result<(CapDir, PathBuf), RecorderStorageError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid_recorder_path("recorder path needs a file name"))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok((
+        CapDir::open_ambient_dir(parent, cap_std::ambient_authority())?,
+        PathBuf::from(name),
+    ))
+}
+
+fn recorder_open_options() -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options.follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.nonblock(true);
+    options
+}
+
+fn recorder_file_identity(
+    metadata: &CapMetadata,
+) -> std::result::Result<(u64, u64), RecorderStorageError> {
+    #[cfg(unix)]
+    {
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        metadata
+            .volume_serial_number()
+            .zip(metadata.file_index())
+            .map(|(volume, index)| (u64::from(volume), index))
+            .ok_or_else(|| invalid_recorder_path("recorder file identity is unavailable"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(invalid_recorder_path(
+            "recorder file identity is unsupported",
+        ))
+    }
+}
+
+fn recorder_link_count(metadata: &CapMetadata) -> std::result::Result<u64, RecorderStorageError> {
+    #[cfg(unix)]
+    {
+        Ok(metadata.nlink())
+    }
+    #[cfg(windows)]
+    {
+        metadata
+            .number_of_links()
+            .map(u64::from)
+            .ok_or_else(|| invalid_recorder_path("recorder file link count is unavailable"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(invalid_recorder_path(
+            "recorder file link count is unsupported",
+        ))
+    }
+}
+
+fn recorder_state_lock_path(state_path: &Path) -> PathBuf {
+    let mut lock_path = state_path.with_extension("tmp").into_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+/// Read-only admission. Do this before opening the log: recovery can truncate it.
+fn validate_recorder_paths(
+    config: &AppendLogStorageConfig,
 ) -> std::result::Result<(), RecorderStorageError> {
-    let tmp_path = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(state)?;
-    std::fs::write(&tmp_path, bytes)?;
-    std::fs::rename(&tmp_path, path)?;
+    let paths = [
+        ("data", config.data_path.clone()),
+        ("state", config.state_path.clone()),
+        ("staging", config.state_path.with_extension("tmp")),
+        ("state lock", recorder_state_lock_path(&config.state_path)),
+    ];
+    let mut observed = Vec::with_capacity(paths.len());
+    for (role, path) in &paths {
+        let canonical = resolve_recorder_path(path)?;
+        let metadata = match recorder_parent(&canonical)
+            .and_then(|(dir, name)| Ok(dir.metadata(name)?))
+        {
+            Ok(metadata) => Some(metadata),
+            Err(RecorderStorageError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(metadata) = &metadata {
+            if !metadata.is_file() {
+                return Err(invalid_recorder_path(format!(
+                    "recorder {role} path is not a regular file"
+                )));
+            }
+        }
+        let identity = metadata.as_ref().map(recorder_file_identity).transpose()?;
+        for (prior_role, prior_path, prior_identity) in &observed {
+            if &canonical == prior_path || identity.is_some() && identity == *prior_identity {
+                return Err(invalid_recorder_path(format!(
+                    "recorder {prior_role} and {role} paths identify the same file"
+                )));
+            }
+        }
+        // Mutable state/staging names must not alias an unenumerated file in
+        // another configuration. The data descriptor may have read aliases.
+        if *role != "data" {
+            if let Some(metadata) = &metadata {
+                if recorder_link_count(metadata)? != 1 {
+                    return Err(invalid_recorder_path(format!(
+                        "recorder {role} file must have exactly one hard link"
+                    )));
+                }
+            }
+        }
+        if matches!(*role, "staging" | "state lock") && canonical != *path {
+            return Err(invalid_recorder_path(format!(
+                "recorder {role} path must not be a symlink"
+            )));
+        }
+        observed.push((*role, canonical, identity));
+    }
     Ok(())
+}
+
+#[derive(Debug)]
+struct AppendLogStateFile {
+    directory: CapDir,
+    state_name: PathBuf,
+    temporary_name: PathBuf,
+    lock_name: PathBuf,
+    lock: File,
+}
+
+impl AppendLogStateFile {
+    fn open(path: &Path) -> std::result::Result<Self, RecorderStorageError> {
+        let (directory, state_name) = recorder_parent(path)?;
+        let temporary_name = state_name.with_extension("tmp");
+        let lock_name = recorder_state_lock_path(&state_name);
+        let mut options = recorder_open_options();
+        options.create(true).read(true).write(true);
+        let lock = directory.open_with(&lock_name, &options)?.into_std();
+        let metadata = CapMetadata::from_file(&lock)?;
+        if !metadata.is_file() || recorder_link_count(&metadata)? != 1 {
+            return Err(invalid_recorder_path(
+                "recorder state lock must be a uniquely linked regular file",
+            ));
+        }
+        fs2::FileExt::try_lock_exclusive(&lock)?;
+        let state_file = Self {
+            directory,
+            state_name,
+            temporary_name,
+            lock_name,
+            lock,
+        };
+        state_file.check_lock()?;
+        Ok(state_file)
+    }
+
+    fn check_lock(&self) -> std::result::Result<(), RecorderStorageError> {
+        let named = self.directory.symlink_metadata(&self.lock_name)?;
+        let held = CapMetadata::from_file(&self.lock)?;
+        if !named.is_file()
+            || recorder_link_count(&named)? != 1
+            || recorder_file_identity(&named)? != recorder_file_identity(&held)?
+        {
+            return Err(std::io::Error::other("recorder state lock identity changed").into());
+        }
+        Ok(())
+    }
+
+    fn load(&self) -> std::result::Result<PersistedState, RecorderStorageError> {
+        self.check_lock()?;
+        let mut options = recorder_open_options();
+        options.read(true);
+        let mut file = match self.directory.open_with(&self.state_name, &options) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PersistedState::default());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(invalid_recorder_path(
+                "recorder state path is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Ok(PersistedState::default());
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn write(&self, state: &PersistedState) -> std::result::Result<(), RecorderStorageError> {
+        self.check_lock()?;
+        let bytes = serde_json::to_vec_pretty(state)?;
+        let mut options = recorder_open_options();
+        // Do not truncate until the actual no-follow descriptor is validated.
+        options.create(true).write(true);
+        let mut file = self.directory.open_with(&self.temporary_name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || recorder_link_count(&metadata)? != 1 {
+            return Err(std::io::Error::other(
+                "recorder staging file must be a uniquely linked regular file",
+            )
+            .into());
+        }
+        file.set_len(0)?;
+        file.write_all(&bytes)?;
+        drop(file);
+        self.check_lock()?;
+        self.directory
+            .rename(&self.temporary_name, &self.directory, &self.state_name)?;
+        Ok(())
+    }
 }
 
 fn scan_valid_prefix(file: &mut File) -> std::result::Result<ScanResult, RecorderStorageError> {
@@ -4962,10 +5240,12 @@ recorder_backend = "frankensqlite"
                     .unwrap();
             }
 
-            let mut persisted = load_persisted_state(&cfg.state_path).unwrap();
+            let state_file = AppendLogStateFile::open(&cfg.state_path).unwrap();
+            let mut persisted = state_file.load().unwrap();
             let recovered_offset = persisted.next_offset;
             persisted.next_ordinal = 99;
-            write_persisted_state(&cfg.state_path, &persisted).unwrap();
+            state_file.write(&persisted).unwrap();
+            drop(state_file);
 
             let reopened = AppendLogRecorderStorage::open(cfg).unwrap();
             let resp = reopened
@@ -5015,7 +5295,8 @@ recorder_backend = "frankensqlite"
             }
 
             let actual_len = std::fs::metadata(&cfg.data_path).unwrap().len();
-            let mut persisted = load_persisted_state(&cfg.state_path).unwrap();
+            let state_file = AppendLogStateFile::open(&cfg.state_path).unwrap();
+            let mut persisted = state_file.load().unwrap();
             persisted.segment_id = 9;
             persisted.next_offset = actual_len + 32;
             persisted.next_ordinal = 3;
@@ -5038,7 +5319,8 @@ recorder_backend = "frankensqlite"
                     committed_at_ms: 11,
                 },
             );
-            write_persisted_state(&cfg.state_path, &persisted).unwrap();
+            state_file.write(&persisted).unwrap();
+            drop(state_file);
 
             let reopened = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
             let keep = reopened

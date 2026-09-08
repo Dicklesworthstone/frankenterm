@@ -132,6 +132,303 @@ fn storage_config(path: &std::path::Path) -> AppendLogStorageConfig {
     }
 }
 
+#[test]
+fn append_log_path_admission_preserves_colliding_files() {
+    for case in [
+        "data_state",
+        "data_staging",
+        "state_staging",
+        "data_lock",
+        "parent_dot",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = storage_config(dir.path());
+        match case {
+            "data_state" => config.state_path = config.data_path.clone(),
+            "data_staging" => config.data_path = config.state_path.with_extension("tmp"),
+            "state_staging" => config.state_path = dir.path().join("state.tmp"),
+            "data_lock" => config.data_path = dir.path().join("state.tmp.lock"),
+            "parent_dot" => {
+                std::fs::create_dir(dir.path().join("child")).unwrap();
+                config.state_path = dir.path().join("child/../events.log");
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(&config.data_path, b"retained log bytes").unwrap();
+        assert_path_admission_preserves_files(config, case);
+    }
+}
+
+fn assert_path_admission_preserves_files(config: AppendLogStorageConfig, case: &str) {
+    let retained: Vec<_> = [
+        config.data_path.clone(),
+        config.state_path.clone(),
+        config.state_path.with_extension("tmp"),
+    ]
+    .into_iter()
+    .filter(|path| path.is_file())
+    .map(|path| {
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect();
+    assert!(!retained.is_empty());
+    let result = AppendLogRecorderStorage::open(config);
+    // Check bytes before the error class so the old-source control exposes
+    // actual destructive recovery, not just a changed error message.
+    for (path, expected) in &retained {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            *expected,
+            "case={case}: existing bytes changed"
+        );
+    }
+    assert!(
+        matches!(result, Err(RecorderStorageError::InvalidRequest { .. })),
+        "case={case}: {result:?}"
+    );
+    eprintln!(
+        "recorder path admission: case={case}, retained_files={}, mutated_files=0",
+        retained.len()
+    );
+}
+
+#[test]
+fn append_log_path_admission_rejects_alias_before_creating_parents() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("not-created");
+    let mut config = storage_config(&missing);
+    config.state_path = config.data_path.clone();
+    assert!(matches!(
+        AppendLogRecorderStorage::open(config),
+        Err(RecorderStorageError::InvalidRequest { .. })
+    ));
+    assert!(!missing.exists(), "invalid admission created a directory");
+    eprintln!("recorder path admission: case=missing_parent, created_paths=0");
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_path_admission_resolves_symlink_parents_and_leaves() {
+    for case in ["parent", "state_leaf", "staging_leaf"] {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let mut config = storage_config(&real);
+        std::fs::write(&config.data_path, b"retained linked bytes").unwrap();
+        match case {
+            "parent" => {
+                let alias = dir.path().join("alias");
+                std::os::unix::fs::symlink(&real, &alias).unwrap();
+                config.state_path = alias.join("events.log");
+            }
+            "state_leaf" => {
+                std::os::unix::fs::symlink(&config.data_path, &config.state_path).unwrap()
+            }
+            "staging_leaf" => std::os::unix::fs::symlink(
+                &config.data_path,
+                config.state_path.with_extension("tmp"),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        assert_path_admission_preserves_files(config, case);
+    }
+}
+
+#[test]
+fn append_log_path_admission_resolves_hard_link_aliases() {
+    for case in ["state", "staging", "lock"] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = storage_config(dir.path());
+        std::fs::write(&config.data_path, b"retained hard-linked bytes").unwrap();
+        let alias = match case {
+            "state" => config.state_path.clone(),
+            "staging" => config.state_path.with_extension("tmp"),
+            "lock" => dir.path().join("state.tmp.lock"),
+            _ => unreachable!(),
+        };
+        std::fs::hard_link(&config.data_path, alias).unwrap();
+        assert_path_admission_preserves_files(config, case);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_path_admission_serializes_shared_state_and_staging() {
+    run_async_test(async {
+        for shared_staging_only in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = storage_config(dir.path());
+            let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            let receipt = owner
+                .append_batch(AppendRequest {
+                    batch_id: "state-owner".to_string(),
+                    events: vec![sample_event("owner", 1, 0, "retained")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 0,
+                })
+                .await
+                .unwrap();
+            let checkpoint = RecorderCheckpoint {
+                consumer: CheckpointConsumerId("state-owner-reader".to_string()),
+                upto_offset: receipt.last_offset,
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: 1,
+            };
+            owner.commit_checkpoint(checkpoint.clone()).await.unwrap();
+            let state_bytes = std::fs::read(&config.state_path).unwrap();
+            let log_bytes = std::fs::read(&config.data_path).unwrap();
+            let mut competing = config.clone();
+            competing.data_path = dir.path().join("other-events.log");
+            if shared_staging_only {
+                competing.state_path = dir.path().join("state.backup");
+            }
+            assert_writer_lease_busy(competing.clone());
+            assert!(
+                !competing.data_path.exists(),
+                "contender created a log before acquiring authority"
+            );
+            assert_eq!(std::fs::read(&config.state_path).unwrap(), state_bytes);
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), log_bytes);
+            drop(owner);
+            let reopened = AppendLogRecorderStorage::open(config).unwrap();
+            assert_eq!(
+                reopened
+                    .read_checkpoint(&checkpoint.consumer)
+                    .await
+                    .unwrap(),
+                Some(checkpoint.clone())
+            );
+            let next = reopened
+                .append_batch(AppendRequest {
+                    batch_id: "state-successor".to_string(),
+                    events: vec![sample_event("successor", 1, 1, "next")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 0,
+                })
+                .await
+                .unwrap();
+            assert_eq!(next.first_offset.ordinal, 1);
+            eprintln!(
+                "recorder path admission: shared_staging_only={shared_staging_only}, phase=reopened, checkpoint_ordinal=0, appended_ordinal=1"
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_path_admission_allows_distinct_paths_through_symlinks() {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut config = storage_config(&alias);
+        let state_target = real.join("snapshot.json");
+        let mut initial_config = storage_config(&real);
+        initial_config.state_path = state_target.clone();
+        let initial = AppendLogRecorderStorage::open(initial_config).unwrap();
+        initial.flush(FlushMode::Buffered).await.unwrap();
+        drop(initial);
+        std::os::unix::fs::symlink(&state_target, &config.state_path).unwrap();
+        config.data_path = alias.join("missing/../events.log");
+        let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        storage
+            .append_batch(AppendRequest {
+                batch_id: "resolved".to_string(),
+                events: vec![sample_event("resolved", 1, 0, "content")],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&config.state_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&config.state_path).unwrap(),
+            std::fs::read(&state_target).unwrap()
+        );
+        assert!(!real.join("missing").exists());
+        drop(storage);
+        let reopened = AppendLogRecorderStorage::open(config).unwrap();
+        assert_eq!(reopened.health().await.latest_offset.unwrap().ordinal, 0);
+        eprintln!("recorder path admission: case=valid_symlinks, phase=reopened, ordinal=0");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_path_admission_rejects_substituted_staging_links() {
+    run_async_test(async {
+        for hard_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "before-substitution".to_string(),
+                    events: vec![sample_event("before", 1, 0, "retained")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 0,
+                })
+                .await
+                .unwrap();
+            let original = std::fs::read(&config.data_path).unwrap();
+            let temporary = config.state_path.with_extension("tmp");
+            if hard_link {
+                std::fs::hard_link(&config.data_path, &temporary).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&config.data_path, &temporary).unwrap();
+            }
+            assert!(matches!(
+                storage.flush(FlushMode::Buffered).await,
+                Err(RecorderStorageError::Io(_))
+            ));
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), original);
+            assert!(storage.health().await.degraded);
+            std::fs::rename(&temporary, dir.path().join("substitution.saved")).unwrap();
+            storage.flush(FlushMode::Buffered).await.unwrap();
+            assert!(!storage.health().await.degraded);
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), original);
+            eprintln!(
+                "recorder path admission: hard_link={hard_link}, phase=substitution_repaired, corrupted_bytes=0"
+            );
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_path_admission_pins_state_directory() {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = storage_config(dir.path());
+        let state_dir = dir.path().join("snapshots");
+        let moved = dir.path().join("retained-snapshots");
+        config.state_path = state_dir.join("state.json");
+        let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        std::fs::rename(&state_dir, &moved).unwrap();
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&config.state_path, b"unrelated replacement directory").unwrap();
+        storage.flush(FlushMode::Buffered).await.unwrap();
+        assert_eq!(
+            std::fs::read(&config.state_path).unwrap(),
+            b"unrelated replacement directory"
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(moved.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["next_ordinal"], 0);
+        eprintln!("recorder path admission: case=directory_replaced, redirected_writes=0");
+    });
+}
+
 #[cfg(unix)]
 fn assert_writer_lease_busy(config: AppendLogStorageConfig) {
     let err = AppendLogRecorderStorage::open(config).unwrap_err();
@@ -187,6 +484,8 @@ fn append_log_writer_lease_covers_hard_link_alias() {
     let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
     let mut alias = config.clone();
     alias.data_path = dir.path().join("events-alias.log");
+    // Keep snapshot authority disjoint so only the data-inode lease can refuse.
+    alias.state_path = dir.path().join("alias-state.json");
     std::fs::hard_link(&config.data_path, &alias.data_path).unwrap();
     assert_writer_lease_busy(alias.clone());
     drop(owner);
@@ -204,6 +503,7 @@ fn append_log_writer_lease_covers_symlink_alias() {
     let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
     let mut alias = config.clone();
     alias.data_path = dir.path().join("events-symlink.log");
+    alias.state_path = dir.path().join("alias-state.json");
     std::os::unix::fs::symlink(&config.data_path, &alias.data_path).unwrap();
     assert_writer_lease_busy(alias.clone());
     drop(owner);
@@ -245,8 +545,13 @@ fn append_log_writer_lease_cross_process_handoff() {
         let path = std::path::PathBuf::from(std::env::var_os(CHILD_DIR).unwrap());
         let config = storage_config(&path);
         if mode == "busy" {
-            assert_writer_lease_busy(config);
-            eprintln!("recorder writer lease: process=child, phase=busy_verified");
+            assert_writer_lease_busy(config.clone());
+            let mut separate_state = config;
+            separate_state.state_path = path.join("contender-state.json");
+            assert_writer_lease_busy(separate_state);
+            eprintln!(
+                "recorder writer lease: process=child, phase=busy_verified, same_state=refused, distinct_state=refused"
+            );
         } else {
             assert_eq!(mode, "append");
             run_async_test(async {
