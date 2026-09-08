@@ -1523,6 +1523,13 @@ mod tests {
             // Captured from the pre-optimization allocator, including every
             // placement and the complete ordered free list after each glyph.
             assert_eq!(fingerprint, 0x8d5c_7a7e_d8e5_0bfb);
+            // The old all-pairs pass made 12,977,242,433 checks. Bound actual
+            // work rather than wall time so reintroducing that scan fails
+            // even on a fast or otherwise idle test worker.
+            assert!(
+                comparisons < 100_000_000,
+                "atlas pruning repeated excessive containment work: {comparisons}"
+            );
             assert!(non_overlapping(packer.placements()));
             println!(
                 "ATLAS_ZOOM_WORKLOAD round={round} allocations={} free_rects={} contains={comparisons} fingerprint={fingerprint:016x} elapsed_us={}",
