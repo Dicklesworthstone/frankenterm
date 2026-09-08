@@ -714,14 +714,12 @@ impl MigrationEngine {
                 producer_ts_ms: 0,
             };
 
-            // Tick 75 refactor: route through the Cx-first trait
-            // sibling (tick 74) so cancellation propagates into the
-            // storage write path itself, not just the between-chunk
-            // seam. Backends that override
-            // `append_batch_with_cx` with `timeout_with_cx`-aware
-            // code will benefit; the default impl is
-            // observationally equivalent to the prior
-            // `append_batch` call.
+            // Route through the Cx-first trait sibling so cancellation is
+            // checked at the write boundary as well as between chunks. The
+            // built-in backends move the owned batch into bounded blocking
+            // settlement: cancellation stops the caller waiting, but a write
+            // admitted to storage still runs to a definite outcome so retry
+            // and reconciliation remain safe.
             let append_response = target
                 .append_batch_with_cx(cx, req)
                 .await
@@ -906,19 +904,11 @@ impl MigrationEngine {
         }
 
         for consumer_id in &consumer_ids {
-            // Tick 75 refactor: use the Cx-first trait sibling
-            // for the per-consumer read. The iteration-context
-            // error message from the previous explicit
-            // `cx.checkpoint()?` is still preserved on the
-            // surrounding pane — if `read_checkpoint_with_cx`
-            // surfaces a cancellation, the default trait's error
-            // message ("read_checkpoint cancelled pre-start")
-            // combined with the `map_err` string gives enough
-            // context (`StorageError(...)` wraps the cancellation
-            // reason). Running counters are lost from the error
-            // message but that's acceptable — operators can
-            // inspect `result` state before the error for
-            // progress.
+            // Use the Cx-first trait sibling for the per-consumer read. Its
+            // cancellation error identifies the operation and structured kind
+            // but intentionally omits the caller-provided reason, which may
+            // contain terminal data. The migration stage and accumulated
+            // progress remain available from the surrounding operation/result.
             let checkpoint_opt = source
                 .read_checkpoint_with_cx(cx, consumer_id)
                 .await
@@ -1120,10 +1110,11 @@ impl MigrationEngine {
             producer_ts_ms: epoch_ms,
         };
 
-        // Tick 75 refactor: Cx-first marker append via trait
-        // sibling. A backend with internal cancellation support
-        // (via `timeout_with_cx`) can short-circuit the fsync'd
-        // write rather than waiting for a timeout.
+        // Use the Cx-first marker append so cancellation is checked before
+        // admission and again before success is delivered. Built-in backends
+        // deliberately let an admitted fsync settle under storage ownership;
+        // cancellation stops this caller waiting but never abandons a
+        // potentially durable write halfway through.
         let append_response = target
             .append_batch_with_cx(cx, req)
             .await

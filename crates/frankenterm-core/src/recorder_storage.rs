@@ -6869,13 +6869,19 @@ recorder_backend = "frankensqlite"
                 assert!(!flush_started.load(Ordering::Acquire));
 
                 release_blocking_test_gate(&append_release);
-                let append = append_task.await.unwrap().unwrap();
+                let (append_result, checkpoint_result, flush_result) =
+                    crate::runtime_async::timeout(std::time::Duration::from_secs(5), async {
+                        (append_task.await, checkpoint_task.await, flush_task.await)
+                    })
+                    .await
+                    .expect("serialized recorder mutations did not all settle within 5s");
+                let append = append_result.unwrap().unwrap();
                 assert_eq!(append.backend, backend);
                 assert_eq!(
-                    checkpoint_task.await.unwrap().unwrap(),
+                    checkpoint_result.unwrap().unwrap(),
                     CheckpointCommitOutcome::Advanced
                 );
-                assert_eq!(flush_task.await.unwrap().unwrap().backend, backend);
+                assert_eq!(flush_result.unwrap().unwrap().backend, backend);
                 assert!(checkpoint_started.load(Ordering::Acquire));
                 assert!(flush_started.load(Ordering::Acquire));
                 assert_eq!(active_bodies.load(Ordering::Acquire), 0);
@@ -7496,6 +7502,48 @@ recorder_backend = "frankensqlite"
                 failure
             );
         }
+    }
+
+    #[test]
+    fn owned_result_delivery_gate_rejects_success_for_cancelled_caller() {
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("secret post-admission cancellation reason"),
+        );
+
+        for operation in ["append_batch", "commit_checkpoint", "flush"] {
+            let error = deliver_owned_blocking_result(operation, &cx, Ok(7_u8))
+                .expect_err("cancelled caller must not receive settled success");
+            let display = error.to_string();
+            assert!(matches!(
+                error,
+                RecorderStorageError::BlockingOperation {
+                    operation: actual_operation,
+                    failure: RecorderBlockingFailure::CancelledMidFlight {
+                        kind: Some(crate::outcome::CancelKind::User)
+                    }
+                } if actual_operation == operation
+            ));
+            assert!(
+                !display.contains("secret post-admission cancellation reason"),
+                "delivery gate leaked its caller-provided cancellation reason"
+            );
+        }
+
+        let storage_error = deliver_owned_blocking_result::<u8>(
+            "append_batch",
+            &cx,
+            Err(RecorderStorageError::InvalidRequest {
+                message: "specific storage failure".to_string(),
+            }),
+        )
+        .expect_err("specific storage failure must remain non-success");
+        assert!(matches!(
+            storage_error,
+            RecorderStorageError::InvalidRequest { message }
+                if message == "specific storage failure"
+        ));
     }
 
     // ── Backend kind ─────────────────────────────────────────────────
