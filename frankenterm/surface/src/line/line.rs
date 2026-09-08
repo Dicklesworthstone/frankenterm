@@ -2319,7 +2319,7 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
             continue;
         };
 
-        let max_end = (start + model.lookahead_limit).min(token_count);
+        let max_end = start.saturating_add(model.lookahead_limit).min(token_count);
 
         // `end` is a dynamic-programming endpoint, not a bare slice index: it is used
         // arithmetically (width_between(start, end), `end == token_count`, pushed into
@@ -3515,6 +3515,24 @@ mod tests {
         assert_eq!(
             plan.break_offsets,
             greedy_break_offsets_from_tokens(&tokens, 4)
+        );
+    }
+
+    #[test]
+    fn bounded_wrap_plan_accepts_maximum_lookahead_without_overflow() {
+        let tokens = cells_from_text("a界bcdef");
+        let full_span = MonospaceKpCostModel {
+            lookahead_limit: tokens.len(),
+            max_dp_states: usize::MAX,
+            ..MonospaceKpCostModel::terminal_default()
+        };
+        let maximum = MonospaceKpCostModel {
+            lookahead_limit: usize::MAX,
+            ..full_span
+        };
+        assert_eq!(
+            bounded_monospace_wrap_plan(&tokens, 3, maximum),
+            bounded_monospace_wrap_plan(&tokens, 3, full_span),
         );
     }
 
