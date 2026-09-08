@@ -17,7 +17,6 @@ use frankenterm_font::FontConfiguration;
 use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingVertex, visit_expanded_glyph_quad_soa_vertices,
 };
-use frankenterm_gui::owner_last_guard::OwnerLastGuardedMapping;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
@@ -129,7 +128,8 @@ impl RenderContext {
             )?)),
             Self::WebGpu(state) => Ok(VertexBuffer::WebGpu(WebGpuVertexBuffer::new(
                 num_quads * VERTICES_PER_CELL,
-                state,
+                &state.device,
+                &state.queue,
             ))),
         }
     }
@@ -236,7 +236,7 @@ impl VertexBuffer {
 
 enum MappedVertexBuffer {
     Glium(GliumMappedVertexBuffer),
-    WebGpu(WebGpuMappedVertexBuffer),
+    WebGpu(RefMut<'static, VertexBuffer>),
 }
 
 impl MappedVertexBuffer {
@@ -244,21 +244,15 @@ impl MappedVertexBuffer {
         match self {
             Self::Glium(g) => &mut g.mapping[range],
             Self::WebGpu(g) => {
-                let mapping = g.parts.mapping_mut();
-                let byte_len = mapping.len();
-                debug_assert_eq!(byte_len % std::mem::size_of::<Vertex>(), 0);
-                let mut bytes = mapping.slice(..);
-                let vertex_len = byte_len / std::mem::size_of::<Vertex>();
-                // wgpu 29 exposes mapped write memory as WriteOnly. The render
-                // path writes complete Vertex values through Quad; the mapping
-                // guard below still owns the underlying buffer until unmap.
-                let mapping: &mut [Vertex] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        bytes.as_raw_ptr().as_ptr().cast::<Vertex>(),
-                        vertex_len,
-                    )
-                };
-                &mut mapping[range]
+                let buffer = g.webgpu_mut();
+                assert!(range.end <= buffer.num_vertices);
+                // New quads have the same zero initialization as the former
+                // mapped-at-creation buffer. Initialize only the used prefix,
+                // retaining earlier quads across allocator borrows this frame.
+                if range.end > buffer.staging.len() {
+                    buffer.staging.resize(range.end, Vertex::default());
+                }
+                &mut buffer.staging[range]
             }
         }
     }
@@ -325,20 +319,11 @@ impl WebGpuGlyphQuadSoaStaging {
     }
 }
 
-pub struct WebGpuMappedVertexBuffer {
-    // The mapped range and slice borrow from the vertex-buffer owner. Keep the
-    // owner alive until both derived WebGPU views are dropped.
-    parts: OwnerLastGuardedMapping<
-        wgpu::BufferViewMut,
-        wgpu::BufferSlice<'static>,
-        RefMut<'static, VertexBuffer>,
-    >,
-}
-
 pub struct WebGpuVertexBuffer {
     buf: wgpu::Buffer,
     num_vertices: usize,
-    state: Rc<WebGpuState>,
+    staging: Vec<Vertex>,
+    queue: wgpu::Queue,
 }
 
 impl std::ops::Deref for WebGpuVertexBuffer {
@@ -349,28 +334,33 @@ impl std::ops::Deref for WebGpuVertexBuffer {
 }
 
 impl WebGpuVertexBuffer {
-    pub fn new(num_vertices: usize, state: &Rc<WebGpuState>) -> Self {
+    pub fn new(num_vertices: usize, device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        metrics::counter!("gui.webgpu.vertex_buffer_allocations").increment(1);
         Self {
-            buf: state.device.create_buffer(&wgpu::BufferDescriptor {
+            buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Vertex Buffer"),
                 size: (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX,
-                mapped_at_creation: true,
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
             }),
             num_vertices,
-            state: Rc::clone(state),
+            staging: Vec::with_capacity(num_vertices),
+            queue: queue.clone(),
         }
     }
 
-    pub fn recreate(&mut self) -> wgpu::Buffer {
-        let mut new_buf = self.state.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Vertex Buffer"),
-            size: (self.num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        std::mem::swap(&mut new_buf, &mut self.buf);
-        new_buf
+    pub fn upload(&self, vertex_count: usize) -> wgpu::Buffer {
+        let bytes = bytemuck::cast_slice(&self.staging[..vertex_count]);
+        if !bytes.is_empty() {
+            // Queue writes copy CPU bytes immediately and execute before the
+            // next submitted draw, after prior submissions using this buffer.
+            // No synchronous GPU wait or full-capacity buffer recreation.
+            self.queue.write_buffer(&self.buf, 0, bytes);
+            metrics::histogram!("gui.webgpu.vertex_upload_bytes").record(bytes.len() as f64);
+        }
+        self.buf.clone()
     }
 }
 
@@ -516,13 +506,6 @@ unsafe impl<'a, T: 'static> ExtendStatic for RefMut<'a, T> {
     }
 }
 
-unsafe impl<'a> ExtendStatic for wgpu::BufferSlice<'a> {
-    type T = wgpu::BufferSlice<'static>;
-    unsafe fn extend_lifetime(self) -> Self::T {
-        unsafe { std::mem::transmute(self) }
-    }
-}
-
 unsafe impl<'a> ExtendStatic for MappedQuads<'a> {
     type T = MappedQuads<'static>;
     unsafe fn extend_lifetime(self) -> Self::T {
@@ -542,6 +525,11 @@ unsafe impl<'a, T: ?Sized + ::window::glium::buffer::Content + 'static> ExtendSt
 impl TripleVertexBuffer {
     pub fn clear_quad_allocation(&self) {
         *self.next_quad.borrow_mut() = 0;
+        for buffer in self.bufs.borrow_mut().iter_mut() {
+            if let VertexBuffer::WebGpu(buffer) = buffer {
+                buffer.staging.clear();
+            }
+        }
         for instances in self.glyph_quad_instances.borrow_mut().iter_mut() {
             instances.clear();
         }
@@ -563,14 +551,12 @@ impl TripleVertexBuffer {
 
     pub fn map(&self) -> MappedQuads<'_> {
         let index = *self.index.borrow();
-        let mut glyph_quad_instances = unsafe {
+        let glyph_quad_instances = unsafe {
             RefMut::map(self.glyph_quad_instances.borrow_mut(), |instances| {
                 &mut instances[index]
             })
             .extend_lifetime()
         };
-        glyph_quad_instances.clear();
-
         let mut bufs = self.current_vb_mut();
 
         // To map the vertex buffer, we need to hold a mutable reference to
@@ -597,14 +583,7 @@ impl TripleVertexBuffer {
                     mapping,
                 })
             }
-            VertexBuffer::WebGpu(vb) => {
-                let slice = unsafe { vb.buf.slice(..).extend_lifetime() };
-                let mapping = slice.get_mapped_range_mut();
-
-                MappedVertexBuffer::WebGpu(WebGpuMappedVertexBuffer {
-                    parts: OwnerLastGuardedMapping::new(mapping, slice, bufs),
-                })
-            }
+            VertexBuffer::WebGpu(_) => MappedVertexBuffer::WebGpu(bufs),
         };
 
         MappedQuads {
@@ -1007,6 +986,157 @@ mod tests {
         round_quad_capacity, texture_atlas_footprint_bytes,
     };
     use crate::quad::{V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT, VERTICES_PER_CELL};
+
+    #[test]
+    #[ignore = "requires a real WebGPU adapter; run explicitly for vertex-buffer qualification"]
+    fn webgpu_vertex_upload_reuses_buffers_and_preserves_queued_frames() {
+        use super::{
+            IndexBuffer, TripleVertexBuffer, Vertex, VertexBuffer, WebGpuGlyphQuadSoaStaging,
+            WebGpuIndexBuffer, WebGpuVertexBuffer,
+        };
+        use crate::quad::QuadAllocator;
+        use std::cell::RefCell;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use wgpu::util::DeviceExt;
+
+        let (device, queue) = futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    power_preference: wgpu::PowerPreference::LowPower,
+                })
+                .await
+                .expect("vertex qualification requires an actual adapter");
+            eprintln!("vertex upload adapter: {:?}", adapter.get_info());
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("vertex upload qualification"),
+                    ..Default::default()
+                })
+                .await
+                .expect("create vertex qualification device")
+        });
+        let buffers = TripleVertexBuffer {
+            index: RefCell::new(0),
+            bufs: RefCell::new(std::array::from_fn(|_| {
+                VertexBuffer::WebGpu(WebGpuVertexBuffer::new(8, &device, &queue))
+            })),
+            glyph_quad_instances: RefCell::new(std::array::from_fn(|_| {
+                WebGpuGlyphQuadSoaStaging::default()
+            })),
+            indices: IndexBuffer::WebGpu(WebGpuIndexBuffer {
+                buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("vertex qualification indices"),
+                    usage: wgpu::BufferUsages::INDEX,
+                    contents: bytemuck::cast_slice(&build_quad_indices(2)),
+                }),
+            }),
+            capacity: 2,
+            next_quad: RefCell::new(0),
+        };
+        let identities: Vec<_> = buffers
+            .bufs
+            .borrow()
+            .iter()
+            .map(|buffer| buffer.webgpu().buf.clone())
+            .collect();
+        let glyph = WebGpuGlyphQuadSoaStaging {
+            positions: vec![[1.0, 2.0, 3.0, 4.0]],
+            tex_rects: vec![[0.0, 0.0, 1.0, 1.0]],
+            fg_colors: vec![[1.0; 4]],
+            alt_colors: vec![[0.0; 4]],
+            hsv: vec![[1.0; 3]],
+            has_color: vec![0.0],
+            mix_values: vec![0.0],
+        };
+        buffers.map().extend_with_glyph_quad_soa(glyph.buffers());
+        buffers.map().extend_with_glyph_quad_soa(glyph.buffers());
+        assert_eq!(
+            buffers.current_glyph_quad_instances().len(),
+            2,
+            "borrowing another allocator must preserve earlier glyphs this frame"
+        );
+        buffers.clear_quad_allocation();
+        assert!(buffers.current_glyph_quad_instances().is_empty());
+        let mut readbacks = Vec::new();
+        // Reuse every triple-buffer slot after both full and empty frames.
+        // Submit all copies before waiting so later CPU writes cannot hide a
+        // broken ownership or queue-ordering contract by serializing the test.
+        for (frame, quad_count) in [2, 1, 0, 1, 2, 2, 0, 1].into_iter().enumerate() {
+            buffers.clear_quad_allocation();
+            let expected: Vec<_> = (0..quad_count * VERTICES_PER_CELL)
+                .map(|vertex| Vertex {
+                    position: [frame as f32, vertex as f32],
+                    fg_color: [0.25, 0.5, 0.75, 1.0],
+                    mix_value: frame as f32 / 8.0,
+                    ..Vertex::default()
+                })
+                .collect();
+            for (quad, vertices) in expected.chunks_exact(VERTICES_PER_CELL).enumerate() {
+                let mut mapped = buffers.map();
+                let start = quad * VERTICES_PER_CELL;
+                assert_eq!(
+                    mapped.mapping.slice_mut(start..start + VERTICES_PER_CELL),
+                    &[Vertex::default(); VERTICES_PER_CELL],
+                    "fresh quads must not inherit an earlier frame"
+                );
+                mapped.extend_with(vertices);
+            }
+            let (vertex_count, _) = buffers.vertex_index_count();
+            assert_eq!(vertex_count, expected.len());
+            let buffer = buffers.current_vb_mut().webgpu().upload(vertex_count);
+            assert_eq!(buffer, identities[frame % 3], "GPU buffer must be reused");
+            if vertex_count > 0 {
+                let expected_bytes: Vec<u8> = bytemuck::cast_slice(&expected).to_vec();
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("vertex qualification readback"),
+                    size: expected_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                encoder.copy_buffer_to_buffer(
+                    &buffer,
+                    0,
+                    &readback,
+                    0,
+                    expected_bytes.len() as u64,
+                );
+                queue.submit([encoder.finish()]);
+                readbacks.push((readback, expected_bytes));
+            }
+            buffers.next_index();
+        }
+        for (readback, expected) in readbacks {
+            let slice = readback.slice(..);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).expect("readback receiver is alive");
+            });
+            let started = Instant::now();
+            loop {
+                device.poll(wgpu::PollType::Poll).expect("poll actual GPU");
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(result) => {
+                        result.expect("map completed GPU copy");
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                        if started.elapsed() < Duration::from_secs(30) => {}
+                    other => panic!("GPU readback did not complete: {other:?}"),
+                }
+            }
+            let actual = slice.get_mapped_range();
+            assert_eq!(&*actual, expected.as_slice(), "queued frame bytes changed");
+            drop(actual);
+            readback.unmap();
+        }
+    }
 
     #[test]
     fn build_quad_indices_for_zero_quads_is_empty() {

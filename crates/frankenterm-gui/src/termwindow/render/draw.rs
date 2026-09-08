@@ -59,10 +59,7 @@ impl std::error::Error for DrawFailure {
 }
 
 impl crate::TermWindow {
-    pub(crate) fn call_draw_webgpu(
-        &mut self,
-        acquired: AcquiredWebGpuFrame,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn call_draw_webgpu(&mut self, acquired: AcquiredWebGpuFrame) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
         let webgpu = self
@@ -201,9 +198,8 @@ impl crate::TermWindow {
 
                 let (vertex_count, index_count) = vb.vertex_index_count();
                 if vertex_count > 0 {
-                    let mut vertices = vb.current_vb_mut();
-                    let vertex_buffer = vertices.webgpu_mut().recreate();
-                    vertex_buffer.unmap();
+                    let vertices = vb.current_vb_mut();
+                    let vertex_buffer = vertices.webgpu().upload(vertex_count);
                     render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);
