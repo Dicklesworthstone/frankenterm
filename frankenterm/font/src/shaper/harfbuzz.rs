@@ -624,6 +624,11 @@ impl FontShaper for HarfbuzzShaper {
 
         let scale = self.handles[font_idx].scale.unwrap_or(1.);
 
+        // A metrics query changes the same FT_Face used by HarfBuzz. Force
+        // the next shape to restore its requested size and call font_changed,
+        // even when it repeats the size of the previous shape.
+        // https://harfbuzz.github.io/harfbuzz-hb-ft.html#hb-ft-font-changed
+        pair.last_size_and_dpi.borrow_mut().take();
         let selected_size = pair.face.set_font_size(size * scale, dpi)?;
         let y_scale = unsafe { (*(*pair.face.face).size).metrics.y_scale.to_num::<f64>() };
         let mut metrics = FontMetrics {
@@ -690,6 +695,7 @@ impl FontShaper for HarfbuzzShaper {
             self.handles
         );
         while let Ok(Some(mut pair)) = self.load_fallback(metrics_idx, dpi) {
+            pair.last_size_and_dpi.borrow_mut().take();
             let selected_size = pair
                 .face
                 .set_font_size(size * self.handles[metrics_idx].scale.unwrap_or(1.), dpi)?;
@@ -839,6 +845,86 @@ mod test {
     use super::*;
     use crate::FontDatabase;
     use config::FontAttributes;
+
+    fn fallback_test_handles(count: usize) -> Vec<ParsedFont> {
+        let db = FontDatabase::with_built_in().unwrap();
+        let handle = db
+            .resolve(
+                &FontAttributes {
+                    family: "JetBrains Mono".into(),
+                    stretch: Default::default(),
+                    weight: Default::default(),
+                    is_fallback: false,
+                    is_synthetic: false,
+                    style: Default::default(),
+                    freetype_load_flags: None,
+                    freetype_load_target: None,
+                    freetype_render_target: None,
+                    harfbuzz_features: None,
+                    scale: None,
+                    assume_emoji_presentation: None,
+                },
+                14,
+            )
+            .unwrap()
+            .clone();
+        vec![handle; count]
+    }
+
+    #[test]
+    fn metric_queries_at_other_sizes_do_not_change_subsequent_shaping() {
+        let handles = fallback_test_handles(1);
+        let config = config::configuration();
+        for general_metrics in [false, true] {
+            let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+            shaper
+                .shape(
+                    "a",
+                    10.,
+                    72,
+                    &mut Vec::new(),
+                    None,
+                    Direction::LeftToRight,
+                    None,
+                    None,
+                )
+                .unwrap();
+            if general_metrics {
+                shaper.metrics(26., 144).unwrap();
+            } else {
+                shaper.metrics_for_idx(0, 26., 144).unwrap();
+            }
+            let fresh = HarfbuzzShaper::new(&config, &handles).unwrap();
+            let text = "WZ ffi e\u{301}";
+            assert_eq!(
+                shaper
+                    .shape(
+                        text,
+                        10.,
+                        72,
+                        &mut Vec::new(),
+                        None,
+                        Direction::LeftToRight,
+                        None,
+                        None
+                    )
+                    .unwrap(),
+                fresh
+                    .shape(
+                        text,
+                        10.,
+                        72,
+                        &mut Vec::new(),
+                        None,
+                        Direction::LeftToRight,
+                        None,
+                        None
+                    )
+                    .unwrap(),
+                "metric-only size selection must invalidate the previous Harfbuzz size"
+            );
+        }
+    }
 
     #[test]
     fn ligatures() {
