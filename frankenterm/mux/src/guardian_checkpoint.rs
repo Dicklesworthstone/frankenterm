@@ -10742,6 +10742,11 @@ mod tests {
         });
         let mut expected_expression_macros = vec![
             expected_authority_macro(
+                "<free>",
+                "<item>",
+                "assert!(GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES as usize == CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_PLAINTEXT_BYTES)",
+            ),
+            expected_authority_macro(
                 "GuardianCheckpointCipher",
                 "open",
                 "matches!(expected_context.kind, GuardianCheckpointStageRecordKindV1::SealManifest | GuardianCheckpointStageRecordKindV1::Finalizer | GuardianCheckpointStageRecordKindV1::CatalogAdoptionEvidence)",
