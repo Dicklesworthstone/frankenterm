@@ -2189,19 +2189,53 @@ mod tests {
         db_path: &Path,
         action_kind: &str,
     ) -> Option<crate::storage::AuditActionRecord> {
-        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.ok()?;
-            let rows = storage
-                .get_audit_actions(crate::storage::AuditQuery {
-                    limit: Some(1),
-                    action_kind: Some(action_kind.to_string()),
-                    ..crate::storage::AuditQuery::default()
-                })
-                .await
-                .ok()?;
-            rows.into_iter().next()
-        })
+        // Polling must not race the writer's first database/schema creation.
+        // StorageHandle::new also performs WAL recovery and trigger setup;
+        // opening it here could make the zero-retry writer fail its only try.
+        let connection = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        connection
+            .query_row(
+                "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain,
+                        action_kind, policy_decision, decision_reason, rule_id,
+                        input_summary, verification_summary, decision_context, result
+                 FROM audit_actions WHERE action_kind = ?1 ORDER BY ts DESC LIMIT 1",
+                [action_kind],
+                |row| {
+                    Ok(crate::storage::AuditActionRecord {
+                        id: row.get(0)?,
+                        ts: row.get(1)?,
+                        actor_kind: row.get(2)?,
+                        actor_id: row.get(3)?,
+                        correlation_id: row.get(4)?,
+                        pane_id: row.get(5)?,
+                        domain: row.get(6)?,
+                        action_kind: row.get(7)?,
+                        policy_decision: row.get(8)?,
+                        decision_reason: row.get(9)?,
+                        rule_id: row.get(10)?,
+                        input_summary: row.get(11)?,
+                        verification_summary: row.get(12)?,
+                        decision_context: row.get(13)?,
+                        result: row.get(14)?,
+                    })
+                },
+            )
+            .ok()
+    }
+
+    #[test]
+    fn record_mcp_audit_sync_observer_does_not_create_database() {
+        let (_dir, db_path) = temp_db_path();
+        assert!(!db_path.exists());
+        assert!(try_latest_audit_action(&db_path, "mcp.wa.rules_list").is_none());
+        assert!(
+            !db_path.exists(),
+            "observing the audit writer must not initialize its database"
+        );
     }
 
     fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
