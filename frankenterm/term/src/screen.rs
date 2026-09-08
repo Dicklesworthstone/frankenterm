@@ -689,6 +689,26 @@ impl ScreenReflowPreparation {
                 &is_cancelled,
             )
             .is_some();
+        if !self.ready || is_cancelled() {
+            self.ready = false;
+            return false;
+        }
+        // The first target-layout hash is another full-history traversal.
+        // Do it here as well: publishing cached rows changes only seqnos
+        // and derived no-match scan bits, which this signature excludes.
+        let cache = Arc::make_mut(self.snapshot.rewrap_cache.as_mut().unwrap());
+        let key = WrapCacheKey {
+            physical_cols: self.target.cols.max(1),
+            dpi: self.target.dpi,
+        };
+        if let Some(wrapped) = cache.wrapped_by_key.get_mut(&key) {
+            if !wrapped.has_images && wrapped.layout_signature.is_none() {
+                wrapped.layout_signature = Some(Screen::compute_layout_signature_for_lines(
+                    wrapped.lines.iter().flat_map(|chunk| chunk.iter()),
+                ));
+            }
+        }
+        self.ready = !is_cancelled();
         self.ready
     }
 }
@@ -3266,6 +3286,7 @@ impl Screen {
         cursor: CursorPosition,
     ) -> bool {
         prepared.ready
+            && self.allow_scrollback
             && prepared.target == size
             && prepared.source_cursor == cursor
             && prepared.source_dpi == self.dpi
@@ -5451,7 +5472,8 @@ mod tests {
                 (4, 8, 96),
                 (3, 3, 96),
             ]
-            .into_iter()
+            .iter()
+            .copied()
             .enumerate()
             {
                 let size = test_size(rows, cols, dpi);
