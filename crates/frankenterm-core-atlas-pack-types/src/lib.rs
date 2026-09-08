@@ -967,7 +967,7 @@ impl PackingStats {
         if self.atlas_bytes == 0 {
             return 0;
         }
-        ((self.used_bytes * 100) / self.atlas_bytes).min(100) as u32
+        ((u128::from(self.used_bytes) * 100) / u128::from(self.atlas_bytes)).min(100) as u32
     }
 
     /// Wasted space as integer percent. `100 - efficiency_pct` when
@@ -1785,6 +1785,47 @@ mod tests {
         // Synthetic over-provisioning; defensive cap.
         s.used_bytes = 200;
         assert_eq!(s.efficiency_pct(), 100);
+    }
+
+    #[test]
+    fn stats_efficiency_handles_full_width_counters() {
+        for (used_bytes, atlas_bytes, expected) in [
+            (u64::MAX, u64::MAX, 100),
+            (u64::MAX / 2, u64::MAX, 49),
+            (u64::MAX - 1, u64::MAX, 99),
+            (u64::MAX, 1, 100),
+            (u64::MAX, 0, 0),
+            (0, u64::MAX, 0),
+        ] {
+            let stats = PackingStats {
+                used_bytes,
+                atlas_bytes,
+                ..PackingStats::default()
+            };
+            assert_eq!(stats.efficiency_pct(), expected);
+            assert_eq!(
+                stats.wasted_pct(),
+                if atlas_bytes == 0 { 0 } else { 100 - expected }
+            );
+        }
+    }
+
+    #[test]
+    fn stats_saturated_placements_keep_full_efficiency() {
+        let mut stats = PackingStats::default();
+        stats.record_atlas_size(atlas(u32::MAX, u32::MAX));
+        let rect = PackedRect {
+            x: 0,
+            y: 0,
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        stats.record_placed(rect);
+        assert_eq!(stats.efficiency_pct(), 100);
+        stats.record_placed(rect);
+        assert_eq!(stats.used_bytes, u64::MAX);
+        assert_eq!(stats.efficiency_pct(), 100);
+        assert_eq!(stats.wasted_pct(), 0);
     }
 
     // ----------------------------------------------------------------

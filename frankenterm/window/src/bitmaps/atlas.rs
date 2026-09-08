@@ -91,13 +91,13 @@ impl Atlas {
         );
         let side = texture.width();
         ensure!(side > 0, "texture must be non-empty");
-        let iside = side as isize;
+        let atlas_size = atlas_size_from_side(side)?;
+        let iside = isize::try_from(side)?;
 
         let image = crate::Image::new(side, side);
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
         texture.write(rect, &image);
 
-        let atlas_size = atlas_size_from_side(side)?;
         let allocator = make_packer(
             select_packer(atlas_size, PackerSelectionThresholds::default()),
             atlas_size,
@@ -422,14 +422,14 @@ impl Atlas {
             )
         })?;
         let new_side = new_texture.width();
-        let iside = new_side as isize;
+        let atlas_size = atlas_size_from_side(new_side)?;
+        let iside = isize::try_from(new_side)?;
         let image = crate::Image::new(new_side, new_side);
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
         new_texture.write(rect, &image);
 
         self.texture = Rc::clone(new_texture);
         self.side = new_side;
-        let atlas_size = atlas_size_from_side(new_side)?;
         self.allocator = make_packer(
             select_packer(atlas_size, PackerSelectionThresholds::default()),
             atlas_size,
@@ -472,7 +472,15 @@ impl Atlas {
 
 fn atlas_size_from_side(side: usize) -> Fallible<Atlas2DSize> {
     let side: u32 = side.try_into()?;
-    Atlas2DSize::try_new(side, side).ok_or_else(|| anyhow::anyhow!("atlas side must be non-zero"))
+    let size = Atlas2DSize::try_new(side, side)
+        .ok_or_else(|| anyhow::anyhow!("atlas side must be non-zero"))?;
+    // Image::new allocates four bytes per pixel. Reject impossible Vec
+    // lengths before allocation, texture writes, or any grow state changes.
+    ensure!(
+        size.area() <= (isize::MAX as u64) / 4,
+        "atlas image exceeds the addressable byte length"
+    );
+    Ok(size)
 }
 
 pub struct Sprite {
@@ -553,6 +561,26 @@ mod tests {
 
         fn image_dimensions(&self) -> (usize, usize) {
             (self.width, self.height)
+        }
+    }
+
+    impl Texture2d for DimensionsOnlyBitmap {
+        fn write(&self, _rect: Rect, _im: &dyn BitmapImage) {
+            self.pixel_accessed.set(true);
+            panic!("invalid atlas dimensions must be rejected before texture writes");
+        }
+
+        fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) -> anyhow::Result<()> {
+            self.pixel_accessed.set(true);
+            panic!("invalid atlas dimensions must be rejected before texture reads");
+        }
+
+        fn width(&self) -> usize {
+            self.width
+        }
+
+        fn height(&self) -> usize {
+            self.height
         }
     }
 
@@ -910,6 +938,38 @@ mod tests {
             atlas.grow(&non_square).is_err(),
             "grow into a non-square texture must fail"
         );
+    }
+
+    #[test]
+    fn atlas_rejects_unaddressable_textures_before_allocation_or_mutation() {
+        let mut atlas = fresh_atlas(64);
+        let sprite = atlas.allocate(&cell(8, 8, 0x11)).expect("allocate");
+        let texture = atlas.texture();
+        let version = atlas.version();
+        let efficiency = atlas.packing_efficiency_pct();
+        // The first length fits usize but exceeds isize::MAX bytes. The
+        // others overflow the image length or the packer's side dimension.
+        let address_limit_side = 3usize << ((usize::BITS - 5) / 2);
+        for side in [address_limit_side, u32::MAX as usize, usize::MAX] {
+            let invalid = Rc::new(DimensionsOnlyBitmap {
+                width: side,
+                height: side,
+                pixel_accessed: Cell::new(false),
+            });
+            let invalid_texture: Rc<dyn Texture2d> = invalid.clone();
+            assert!(Atlas::new(&invalid_texture).is_err());
+            assert!(atlas.grow(&invalid_texture).is_err());
+            assert!(!invalid.pixel_accessed.get());
+            assert!(Rc::ptr_eq(&atlas.texture(), &texture));
+            assert_eq!(atlas.size(), 64);
+            assert_eq!(atlas.version(), version);
+            assert_eq!(atlas.packing_efficiency_pct(), efficiency);
+        }
+        let next = atlas
+            .allocate(&cell(8, 8, 0x22))
+            .expect("allocate after rejection");
+        assert_ne!(next.coords, sprite.coords);
+        assert_eq!(next.version(), version + 1);
     }
 
     #[test]
