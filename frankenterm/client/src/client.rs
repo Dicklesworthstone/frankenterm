@@ -17554,6 +17554,8 @@ mod tests {
             .name("ft-kuxho-handshake-server".to_string())
             .spawn(move || -> anyhow::Result<()> {
                 let (mut stream, _addr) = listener.accept().context("accept mux client")?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
                 loop {
                     let decoded = Pdu::decode(&mut stream).context("server decode client PDU")?;
@@ -17616,7 +17618,7 @@ mod tests {
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
-        let (sender, mut receiver) = unbounded();
+        let (sender, receiver) = unbounded();
         let client = Client {
             sender,
             local_domain_id: None,
@@ -17631,23 +17633,19 @@ mod tests {
         };
         let dispatch_authority = client.test_dispatch_authority(Weak::new());
 
-        let info = asupersync_block_on(async {
-            let handshake = client.verify_version_compat(&ui);
-            let worker =
-                client_thread_async(&mut reconnectable, &mut receiver, &dispatch_authority);
-            pin_mut!(handshake);
-            pin_mut!(worker);
-            match select(handshake, worker).await {
-                Either::Left((result, _worker)) => result,
-                Either::Right((result, _handshake)) => {
-                    panic!(
-                        "client thread ended before handshake completed: {:?}",
-                        result
-                    )
-                }
-            }
-        })
-        .expect("v+1 server with min_supported=v must complete client handshake");
+        // Socket readiness is delivered to scheduler-owned I/O tasks. Use the
+        // production entrypoint instead of directly polling client_thread_async
+        // inside block_on, which can park forever after the first socket read.
+        let reader = std::thread::Builder::new()
+            .name("ft-kuxho-handshake-reader".to_string())
+            .spawn(move || {
+                let (result, _reconnectable, _receiver) =
+                    client_thread(reconnectable, receiver, dispatch_authority);
+                result
+            })
+            .expect("spawn client handshake reader");
+        let info = asupersync_block_on(client.verify_version_compat(&ui))
+            .expect("v+1 server with min_supported=v must complete client handshake");
 
         assert_eq!(info.codec_vers, CODEC_VERSION + 1);
         assert_eq!(info.min_supported, CODEC_VERSION);
@@ -17676,6 +17674,7 @@ mod tests {
             .send(())
             .expect("server must remain alive through handshake assertions");
         drop(client);
+        assert_expected_reader_shutdown(reader.join().expect("reader thread panicked"));
         server
             .join()
             .expect("server thread should join")
