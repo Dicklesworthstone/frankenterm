@@ -12,15 +12,15 @@
 //! `RecorderQueryExecutor::execute`; there is no `ft recorder query` / `export`
 //! subcommand; and the executor, its elevation grants (`grant_elevation` /
 //! `revoke_elevation`), and the elevation-TTL sweep (`expire_grants`) are
-//! exercised only by tests and the test-only `RecorderExporter`. The executor's
-//! `RecorderEventReader` has a single impl — the in-memory `InMemoryEventStore`
-//! (test); there is no production reader over a real recorder backend.
+//! exercised only by tests and the test-only `RecorderExporter`. Real backend
+//! readers already exist: `recorder_storage::RusqliteEventReader` and
+//! `frankenterm-core-tantivy`'s `AppendLogEventSource`. Their existence does not
+//! connect this executor's authorization, redaction, or audit gate to callers.
 //!
 //! Do NOT assume recorder reads are access-controlled, redacted, or audited in
-//! production — they are not gated by this module. Wiring it requires a
-//! production `RecorderEventReader` over a real recorder backend (the
-//! FrankenSqlite recorder backend is currently a stub), an interface surface
-//! that constructs a long-lived executor, and a maintenance-tick call to
+//! production — they are not gated by this module. Wiring it requires using
+//! a real backend reader in an interface surface that constructs a long-lived
+//! executor, and a maintenance-tick call to
 //! `expire_grants`. Until that lands, the flow below is a design, not an
 //! enforced guarantee.
 //!

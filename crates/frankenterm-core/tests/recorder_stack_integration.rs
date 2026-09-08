@@ -133,6 +133,141 @@ fn storage_config(path: &std::path::Path) -> AppendLogStorageConfig {
 }
 
 #[test]
+fn append_log_appended_retry_after_state_write_failure_does_not_duplicate() {
+    assert_append_retry_after_state_failure_is_idempotent(DurabilityLevel::Appended, false);
+}
+
+#[test]
+fn append_log_fsync_retry_after_state_write_failure_does_not_duplicate() {
+    assert_append_retry_after_state_failure_is_idempotent(DurabilityLevel::Fsync, false);
+}
+
+#[test]
+fn append_log_appended_retry_after_state_rename_failure_does_not_duplicate() {
+    assert_append_retry_after_state_failure_is_idempotent(DurabilityLevel::Appended, true);
+}
+
+#[test]
+fn append_log_fsync_retry_after_state_rename_failure_does_not_duplicate() {
+    assert_append_retry_after_state_failure_is_idempotent(DurabilityLevel::Fsync, true);
+}
+
+fn assert_append_retry_after_state_failure_is_idempotent(
+    durability: DurabilityLevel,
+    fail_rename: bool,
+) {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        let obstruction = if fail_rename {
+            config.state_path.clone()
+        } else {
+            config.state_path.with_extension("tmp")
+        };
+        std::fs::create_dir(&obstruction).unwrap();
+        let request = AppendRequest {
+            batch_id: "accepted-before-save-error".to_string(),
+            events: vec![
+                sample_event("retry-0", 1, 0, "first"),
+                sample_event("retry-1", 1, 1, "second"),
+            ],
+            required_durability: durability,
+            producer_ts_ms: 0,
+        };
+        assert!(matches!(
+            storage.append_batch(request.clone()).await,
+            Err(RecorderStorageError::Io(_))
+        ));
+        let accepted_bytes = std::fs::read(&config.data_path).unwrap();
+        assert!(!accepted_bytes.is_empty());
+        let first_health = storage.health().await;
+        assert!(first_health.degraded);
+        assert_eq!(first_health.latest_offset.as_ref().unwrap().ordinal, 1);
+
+        // The retry must attempt persistence again, but not append again.
+        assert!(matches!(
+            storage.append_batch(request.clone()).await,
+            Err(RecorderStorageError::Io(_))
+        ));
+        let retry_health = storage.health().await;
+        eprintln!(
+            "recorder append retry: durability={durability:?}, rename={fail_rename}, phase=save_failed_twice, observed_ordinal={:?}, expected_ordinal=1",
+            retry_health
+                .latest_offset
+                .as_ref()
+                .map(|offset| offset.ordinal)
+        );
+        assert_eq!(retry_health.latest_offset, first_health.latest_offset);
+        assert!(retry_health.degraded);
+        assert_eq!(std::fs::read(&config.data_path).unwrap(), accepted_bytes);
+
+        let mut conflicting = request.clone();
+        conflicting.events[0] = sample_event("retry-0", 1, 0, "different");
+        assert!(matches!(
+            storage.append_batch(conflicting).await,
+            Err(RecorderStorageError::IdempotencyConflict { .. })
+        ));
+        assert_eq!(std::fs::read(&config.data_path).unwrap(), accepted_bytes);
+
+        std::fs::rename(&obstruction, dir.path().join("retained-save-obstruction")).unwrap();
+        let saved = storage.append_batch(request.clone()).await.unwrap();
+        assert!(saved.was_idempotent_replay);
+        assert_eq!(saved.accepted_count, 2);
+        assert_eq!(saved.first_offset.ordinal, 0);
+        assert_eq!(saved.first_offset.byte_offset, 0);
+        assert_eq!(saved.last_offset.ordinal, 1);
+        assert_eq!(saved.committed_durability, durability);
+        assert!(!storage.health().await.degraded);
+        assert_eq!(std::fs::read(&config.data_path).unwrap(), accepted_bytes);
+        assert_eq!(storage.append_batch(request.clone()).await.unwrap(), saved);
+
+        let next_event = sample_event("retry-2", 1, 2, "third");
+        let next = storage
+            .append_batch(AppendRequest {
+                batch_id: "after-recovered-save".to_string(),
+                events: vec![next_event.clone()],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert!(!next.was_idempotent_replay);
+        assert_eq!(next.first_offset.ordinal, 2);
+        assert_eq!(next.first_offset.byte_offset, accepted_bytes.len() as u64);
+        drop(storage);
+
+        let reopened = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        assert_eq!(reopened.health().await.latest_offset.unwrap().ordinal, 2);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
+        assert_eq!(persisted["next_ordinal"], 3);
+
+        // Decode the actual length-prefixed log independently of the writer's
+        // counters, so a plausible receipt cannot hide duplicate/corrupt bytes.
+        let bytes = std::fs::read(&config.data_path).unwrap();
+        let mut remaining = bytes.as_slice();
+        let mut records = Vec::new();
+        while !remaining.is_empty() {
+            let (length, rest) = remaining.split_at(4);
+            let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+            let (payload, rest) = rest.split_at(length);
+            records.push(serde_json::from_slice::<serde_json::Value>(payload).unwrap());
+            remaining = rest;
+        }
+        let mut expected = request.events;
+        expected.push(next_event);
+        assert_eq!(
+            serde_json::Value::Array(records),
+            serde_json::to_value(expected).unwrap()
+        );
+        eprintln!(
+            "recorder append retry: durability={durability:?}, rename={fail_rename}, phase=reopened, records=3, duplicates=0"
+        );
+    });
+}
+
+#[test]
 fn append_log_checkpoint_persistence_failure_preserves_absent_checkpoint() {
     assert_checkpoint_persistence_failure_is_atomic(false);
 }

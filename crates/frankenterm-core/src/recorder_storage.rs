@@ -1186,20 +1186,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
                 };
             }
 
-            match required_durability {
-                DurabilityLevel::Enqueued => {}
-                DurabilityLevel::Appended => {
-                    inner.writer.flush()?;
-                    self.persist_state(&inner)?;
-                }
-                DurabilityLevel::Fsync => {
-                    inner.writer.flush()?;
-                    inner.writer.get_ref().sync_data()?;
-                    self.persist_state(&inner)?;
-                }
-            }
-
-            let response = AppendResponse {
+            let mut response = AppendResponse {
                 backend: RecorderBackendKind::AppendLog,
                 accepted_count: last_offset
                     .ordinal
@@ -1207,24 +1194,35 @@ impl RecorderStorage for AppendLogRecorderStorage {
                     .saturating_add(1) as usize,
                 first_offset,
                 last_offset,
-                committed_durability: required_durability,
+                committed_durability: DurabilityLevel::Enqueued,
                 committed_at_ms: crate::recording::epoch_ms_now(),
                 was_idempotent_replay: false,
             };
 
+            // Every record is now accepted by the writer. Retain its identity
+            // before any flush, sync, or state save can fail: a retry must
+            // upgrade this receipt, not append the same events a second time.
             inner.idempotency_cache.insert(
                 batch_id.clone(),
                 CachedAppendReceipt {
-                    request_digest_sha256,
+                    request_digest_sha256: request_digest_sha256.clone(),
                     response: response.clone(),
                 },
             );
-            inner.idempotency_order.push_back(batch_id);
+            inner.idempotency_order.push_back(batch_id.clone());
             while inner.idempotency_cache.len() > self.config.max_idempotency_entries {
                 if let Some(evict) = inner.idempotency_order.pop_front() {
                     inner.idempotency_cache.remove(&evict);
                 }
             }
+            self.ensure_cached_response_durability(&mut inner, &mut response, required_durability)?;
+            inner.idempotency_cache.insert(
+                batch_id,
+                CachedAppendReceipt {
+                    request_digest_sha256,
+                    response: response.clone(),
+                },
+            );
             Ok(response)
         })();
 

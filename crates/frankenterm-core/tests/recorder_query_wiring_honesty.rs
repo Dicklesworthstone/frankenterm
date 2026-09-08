@@ -5,10 +5,10 @@
 //! Reality (reality-check sweep, verified): no CLI / robot-mode / MCP / runtime
 //! surface routes recorder reads through `RecorderQueryExecutor::execute`; the
 //! executor, its elevation grants (`grant_elevation` / `revoke_elevation`), and
-//! the elevation-TTL sweep (`expire_grants`) are reachable only from tests; and
-//! the executor's `RecorderEventReader` has a single impl — the in-memory test
-//! store. So the documented access-control + redaction + audit-hash-chain read
-//! gate enforces nothing in production.
+//! the elevation-TTL sweep (`expire_grants`) are reachable only from tests.
+//! Real append-log and rusqlite readers exist, but they do not by themselves
+//! wire the executor's access-control + redaction + audit-hash-chain read gate
+//! into production.
 //!
 //! A module doc that claims the gate IS enforced ("Any interface surface (CLI,
 //! robot mode, MCP) calls this module") is a security-relevant overpromise:
