@@ -852,6 +852,17 @@ impl RecorderStorage for RecorderStorageInstance {
         }
     }
 
+    async fn append_batch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.append_batch_with_cx(cx, req).await,
+            Self::Rusqlite(inner) => inner.append_batch_with_cx(cx, req).await,
+        }
+    }
+
     async fn flush(
         &self,
         mode: FlushMode,
@@ -890,6 +901,17 @@ impl RecorderStorage for RecorderStorageInstance {
         match self {
             Self::AppendLog(inner) => inner.commit_checkpoint(checkpoint).await,
             Self::Rusqlite(inner) => inner.commit_checkpoint(checkpoint).await,
+        }
+    }
+
+    async fn commit_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.commit_checkpoint_with_cx(cx, checkpoint).await,
+            Self::Rusqlite(inner) => inner.commit_checkpoint_with_cx(cx, checkpoint).await,
         }
     }
 
@@ -939,30 +961,31 @@ pub fn bootstrap_recorder_storage(
 }
 
 /// Baseline append-only recorder backend.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppendLogRecorderStorage {
     config: AppendLogStorageConfig,
-    in_flight: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+    checkpoint_in_flight: Arc<AtomicUsize>,
     flush_in_flight: Arc<AtomicUsize>,
     inner: Arc<Mutex<AppendLogInner>>,
 }
 
 #[cfg(test)]
 #[derive(Clone)]
-struct RecorderFlushTestHook {
+struct RecorderBlockingTestHook {
     before: Arc<dyn Fn() + Send + Sync>,
     after: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[cfg(test)]
-impl std::fmt::Debug for RecorderFlushTestHook {
+impl std::fmt::Debug for RecorderBlockingTestHook {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RecorderFlushTestHook(..)")
+        formatter.write_str("RecorderBlockingTestHook(..)")
     }
 }
 
 #[cfg(test)]
-impl RecorderFlushTestHook {
+impl RecorderBlockingTestHook {
     fn run_before(&self) {
         (self.before)();
     }
@@ -986,7 +1009,11 @@ struct AppendLogInner {
     idempotency_order: VecDeque<String>,
     last_error: Option<String>,
     #[cfg(test)]
-    flush_test_hook: Option<RecorderFlushTestHook>,
+    append_test_hook: Option<RecorderBlockingTestHook>,
+    #[cfg(test)]
+    checkpoint_test_hook: Option<RecorderBlockingTestHook>,
+    #[cfg(test)]
+    flush_test_hook: Option<RecorderBlockingTestHook>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1117,19 +1144,30 @@ impl AppendLogRecorderStorage {
             idempotency_order: VecDeque::new(),
             last_error: None,
             #[cfg(test)]
+            append_test_hook: None,
+            #[cfg(test)]
+            checkpoint_test_hook: None,
+            #[cfg(test)]
             flush_test_hook: None,
         };
 
         Ok(Self {
             config,
-            in_flight: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            checkpoint_in_flight: Arc::new(AtomicUsize::new(0)),
             flush_in_flight: Arc::new(AtomicUsize::new(0)),
             inner: Arc::new(Mutex::new(inner)),
         })
     }
 
-    fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
-        try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
+    fn try_acquire_slot(&self) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+        try_acquire_owned_bounded_slot(&self.in_flight, self.config.queue_capacity)
+    }
+
+    fn try_acquire_checkpoint_slot(
+        &self,
+    ) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+        try_acquire_owned_bounded_slot(&self.checkpoint_in_flight, 1)
     }
 
     fn try_acquire_flush_slot(
@@ -1209,142 +1247,10 @@ impl AppendLogRecorderStorage {
         Ok(())
     }
 
-    async fn flush_on_blocking_thread(
-        inner: Arc<Mutex<AppendLogInner>>,
-        mode: FlushMode,
-    ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        // Caller cancellation controls the wait for admission, not settlement of
-        // an already-admitted storage effect. Use a live infrastructure context
-        // for the serialization lock so a mid-flight caller cancellation cannot
-        // strand the owned blocking closure before it reaches a terminal result.
-        let settlement_cx = crate::cx::for_request();
-        let mut inner = inner.lock_with_cx(&settlement_cx).await.map_err(|_| {
-            RecorderStorageError::Io(std::io::Error::other(
-                "recorder append-log flush serialization lock failed",
-            ))
-        })?;
-
-        #[cfg(test)]
-        let flush_test_hook = inner.flush_test_hook.clone();
-        #[cfg(test)]
-        if let Some(hook) = &flush_test_hook {
-            hook.run_before();
-        }
-
-        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
-            inner.writer.flush()?;
-            if mode == FlushMode::Durable {
-                inner.writer.get_ref().sync_data()?;
-            }
-            Self::persist_state(&inner)?;
-            Ok(FlushStats {
-                backend: RecorderBackendKind::AppendLog,
-                flushed_at_ms: crate::recording::epoch_ms_now(),
-                latest_offset: Self::latest_offset(&inner),
-            })
-        })();
-
-        #[cfg(test)]
-        if let Some(hook) = &flush_test_hook {
-            hook.run_after();
-        }
-
-        match result {
-            Ok(stats) => {
-                Self::clear_last_error(&mut inner);
-                Ok(stats)
-            }
-            Err(err) => {
-                Self::record_last_error(&mut inner, "flush", &err);
-                Err(err)
-            }
-        }
-    }
-}
-
-struct InFlightGuard<'a> {
-    counter: &'a AtomicUsize,
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-struct OwnedInFlightGuard {
-    counter: Arc<AtomicUsize>,
-}
-
-impl Drop for OwnedInFlightGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn try_acquire_bounded_slot(
-    counter: &AtomicUsize,
-    capacity: usize,
-) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
-    let mut current = counter.load(Ordering::Acquire);
-    loop {
-        if current >= capacity {
-            return Err(RecorderStorageError::QueueFull { capacity });
-        }
-
-        match counter.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Ok(InFlightGuard { counter }),
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn try_acquire_owned_bounded_slot(
-    counter: &Arc<AtomicUsize>,
-    capacity: usize,
-) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
-    let mut current = counter.load(Ordering::Acquire);
-    loop {
-        if current >= capacity {
-            return Err(RecorderStorageError::QueueFull { capacity });
-        }
-
-        match counter.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                return Ok(OwnedInFlightGuard {
-                    counter: Arc::clone(counter),
-                });
-            }
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-impl RecorderStorage for AppendLogRecorderStorage {
-    fn backend_kind(&self) -> RecorderBackendKind {
-        RecorderBackendKind::AppendLog
-    }
-
-    fn append_log_data_path(&self) -> Option<&Path> {
-        Some(&self.config.data_path)
-    }
-
-    async fn append_batch(
+    async fn append_batch_on_blocking_thread(
         &self,
         req: AppendRequest,
     ) -> std::result::Result<AppendResponse, RecorderStorageError> {
-        let _slot = self.try_acquire_slot()?;
-
         if req.batch_id.trim().is_empty() {
             return Err(RecorderStorageError::InvalidRequest {
                 message: "batch_id must not be empty".to_string(),
@@ -1399,47 +1305,51 @@ impl RecorderStorage for AppendLogRecorderStorage {
         let request_digest_sha256 =
             digest_serialized_event_payloads(encoded.iter().map(Vec::as_slice));
 
-        let mut inner = self.inner.lock().await;
-        if let Some(mut existing) = inner.idempotency_cache.get(&batch_id).cloned() {
-            if existing.request_digest_sha256 != request_digest_sha256 {
-                let err = RecorderStorageError::IdempotencyConflict {
-                    batch_id: batch_id.clone(),
-                };
-                Self::record_last_error(&mut inner, "append_batch_idempotency_conflict", &err);
-                return Err(err);
-            }
-            if existing.response.was_idempotent_replay {
-                let err = RecorderStorageError::CorruptCachedReplayReceipt {
-                    batch_id: batch_id.clone(),
-                };
-                Self::record_last_error(&mut inner, "append_batch_idempotent_receipt", &err);
-                return Err(err);
-            }
-            match Self::ensure_cached_response_durability(
-                &mut inner,
-                &mut existing.response,
-                required_durability,
-            ) {
-                Ok(()) => {
-                    inner.idempotency_cache.insert(batch_id, existing.clone());
-                    Self::clear_last_error(&mut inner);
-                    existing.response.was_idempotent_replay = true;
-                    return Ok(existing.response);
-                }
-                Err(err) => {
-                    Self::record_last_error(&mut inner, "append_batch_idempotent_durability", &err);
-                    return Err(err);
-                }
-            }
+        // Caller cancellation controls the wait for the blocking result, not
+        // settlement of an admitted append. Use an independent live context
+        // for per-backend serialization so the owned closure always reaches a
+        // terminal result and releases its admission guard.
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = self
+            .inner
+            .lock_with_cx(&settlement_cx)
+            .await
+            .map_err(|_| recorder_blocking_runtime_error("append_batch"))?;
+
+        #[cfg(test)]
+        let append_test_hook = inner.append_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &append_test_hook {
+            hook.run_before();
         }
 
         let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
+            if let Some(mut existing) = inner.idempotency_cache.get(&batch_id).cloned() {
+                if existing.request_digest_sha256 != request_digest_sha256 {
+                    return Err(RecorderStorageError::IdempotencyConflict {
+                        batch_id: batch_id.clone(),
+                    });
+                }
+                if existing.response.was_idempotent_replay {
+                    return Err(RecorderStorageError::CorruptCachedReplayReceipt {
+                        batch_id: batch_id.clone(),
+                    });
+                }
+                Self::ensure_cached_response_durability(
+                    &mut inner,
+                    &mut existing.response,
+                    required_durability,
+                )?;
+                inner.idempotency_cache.insert(batch_id, existing.clone());
+                existing.response.was_idempotent_replay = true;
+                return Ok(existing.response);
+            }
+
             let first_offset = RecorderOffset {
                 segment_id: inner.segment_id,
                 byte_offset: inner.next_offset,
                 ordinal: inner.next_ordinal,
             };
-
             let mut last_offset = first_offset.clone();
 
             for payload in encoded {
@@ -1504,6 +1414,11 @@ impl RecorderStorage for AppendLogRecorderStorage {
             Ok(response)
         })();
 
+        #[cfg(test)]
+        if let Some(hook) = &append_test_hook {
+            hook.run_after();
+        }
+
         match result {
             Ok(response) => {
                 Self::clear_last_error(&mut inner);
@@ -1514,6 +1429,242 @@ impl RecorderStorage for AppendLogRecorderStorage {
                 Err(err)
             }
         }
+    }
+
+    async fn commit_checkpoint_on_blocking_thread(
+        &self,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = self
+            .inner
+            .lock_with_cx(&settlement_cx)
+            .await
+            .map_err(|_| recorder_blocking_runtime_error("commit_checkpoint"))?;
+
+        #[cfg(test)]
+        let checkpoint_test_hook = inner.checkpoint_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &checkpoint_test_hook {
+            hook.run_before();
+        }
+
+        let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            let key = checkpoint.consumer.0.clone();
+            let outcome = match inner.checkpoints.get(&key) {
+                Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
+                    return Err(RecorderStorageError::CheckpointRegression {
+                        consumer: key,
+                        current_ordinal: existing.upto_offset.ordinal,
+                        attempted_ordinal: checkpoint.upto_offset.ordinal,
+                    });
+                }
+                Some(existing)
+                    if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal =>
+                {
+                    CheckpointCommitOutcome::NoopAlreadyAdvanced
+                }
+                _ => CheckpointCommitOutcome::Advanced,
+            };
+
+            if outcome == CheckpointCommitOutcome::Advanced {
+                // Publish in memory only after the state-file replacement
+                // succeeds. Otherwise a failed save makes an equal retry
+                // return NoopAlreadyAdvanced without ever saving its progress.
+                let mut persisted = PersistedState {
+                    segment_id: inner.segment_id,
+                    next_offset: inner.next_offset,
+                    next_ordinal: inner.next_ordinal,
+                    checkpoints: inner.checkpoints.clone(),
+                };
+                persisted.checkpoints.insert(key, checkpoint);
+                inner.state_file.write(&persisted)?;
+                inner.checkpoints = persisted.checkpoints;
+            }
+
+            Ok(outcome)
+        })();
+
+        #[cfg(test)]
+        if let Some(hook) = &checkpoint_test_hook {
+            hook.run_after();
+        }
+
+        match result {
+            Ok(outcome) => {
+                Self::clear_last_error(&mut inner);
+                Ok(outcome)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "commit_checkpoint", &err);
+                Err(err)
+            }
+        }
+    }
+
+    async fn flush_on_blocking_thread(
+        inner: Arc<Mutex<AppendLogInner>>,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        // Caller cancellation controls the wait for admission, not settlement of
+        // an already-admitted storage effect. Use a live infrastructure context
+        // for the serialization lock so a mid-flight caller cancellation cannot
+        // strand the owned blocking closure before it reaches a terminal result.
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = inner.lock_with_cx(&settlement_cx).await.map_err(|_| {
+            RecorderStorageError::Io(std::io::Error::other(
+                "recorder append-log flush serialization lock failed",
+            ))
+        })?;
+
+        #[cfg(test)]
+        let flush_test_hook = inner.flush_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &flush_test_hook {
+            hook.run_before();
+        }
+
+        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
+            inner.writer.flush()?;
+            if mode == FlushMode::Durable {
+                inner.writer.get_ref().sync_data()?;
+            }
+            Self::persist_state(&inner)?;
+            Ok(FlushStats {
+                backend: RecorderBackendKind::AppendLog,
+                flushed_at_ms: crate::recording::epoch_ms_now(),
+                latest_offset: Self::latest_offset(&inner),
+            })
+        })();
+
+        #[cfg(test)]
+        if let Some(hook) = &flush_test_hook {
+            hook.run_after();
+        }
+
+        match result {
+            Ok(stats) => {
+                Self::clear_last_error(&mut inner);
+                Ok(stats)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "flush", &err);
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+#[cfg(test)]
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct OwnedInFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for OwnedInFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+fn try_acquire_bounded_slot(
+    counter: &AtomicUsize,
+    capacity: usize,
+) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= capacity {
+            return Err(RecorderStorageError::QueueFull { capacity });
+        }
+
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(InFlightGuard { counter }),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn try_acquire_owned_bounded_slot(
+    counter: &Arc<AtomicUsize>,
+    capacity: usize,
+) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= capacity {
+            return Err(RecorderStorageError::QueueFull { capacity });
+        }
+
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Ok(OwnedInFlightGuard {
+                    counter: Arc::clone(counter),
+                });
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+impl RecorderStorage for AppendLogRecorderStorage {
+    fn backend_kind(&self) -> RecorderBackendKind {
+        RecorderBackendKind::AppendLog
+    }
+
+    fn append_log_data_path(&self) -> Option<&Path> {
+        Some(&self.config.data_path)
+    }
+
+    async fn append_batch(
+        &self,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        let slot = self.try_acquire_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking(move || {
+            let _slot = slot;
+            futures::executor::block_on(storage.append_batch_on_blocking_thread(req))
+        })
+        .await
+        .map_err(|_| recorder_blocking_runtime_error("append_batch"))?
+    }
+
+    async fn append_batch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        if let Some(error) = recorder_pre_cancelled_error("append_batch", cx) {
+            return Err(error);
+        }
+        let slot = self.try_acquire_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            let _slot = slot;
+            futures::executor::block_on(storage.append_batch_on_blocking_thread(req))
+        })
+        .await
+        .map_err(|error| recorder_blocking_error("append_batch", error))?
     }
 
     async fn flush(
@@ -1560,53 +1711,36 @@ impl RecorderStorage for AppendLogRecorderStorage {
         &self,
         checkpoint: RecorderCheckpoint,
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-        let mut inner = self.inner.lock().await;
-        let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-            let key = checkpoint.consumer.0.clone();
-            let outcome = match inner.checkpoints.get(&key) {
-                Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
-                    return Err(RecorderStorageError::CheckpointRegression {
-                        consumer: key,
-                        current_ordinal: existing.upto_offset.ordinal,
-                        attempted_ordinal: checkpoint.upto_offset.ordinal,
-                    });
-                }
-                Some(existing)
-                    if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal =>
-                {
-                    CheckpointCommitOutcome::NoopAlreadyAdvanced
-                }
-                _ => CheckpointCommitOutcome::Advanced,
-            };
+        let slot = self.try_acquire_checkpoint_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking(move || {
+            let _slot = slot;
+            futures::executor::block_on(
+                storage.commit_checkpoint_on_blocking_thread(checkpoint),
+            )
+        })
+        .await
+        .map_err(|_| recorder_blocking_runtime_error("commit_checkpoint"))?
+    }
 
-            if outcome == CheckpointCommitOutcome::Advanced {
-                // Publish in memory only after the state-file replacement
-                // succeeds. Otherwise a failed save makes an equal retry
-                // return NoopAlreadyAdvanced without ever saving its progress.
-                let mut persisted = PersistedState {
-                    segment_id: inner.segment_id,
-                    next_offset: inner.next_offset,
-                    next_ordinal: inner.next_ordinal,
-                    checkpoints: inner.checkpoints.clone(),
-                };
-                persisted.checkpoints.insert(key, checkpoint);
-                inner.state_file.write(&persisted)?;
-                inner.checkpoints = persisted.checkpoints;
-            }
-
-            Ok(outcome)
-        })();
-
-        match result {
-            Ok(outcome) => {
-                Self::clear_last_error(&mut inner);
-                Ok(outcome)
-            }
-            Err(err) => {
-                Self::record_last_error(&mut inner, "commit_checkpoint", &err);
-                Err(err)
-            }
+    async fn commit_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        if let Some(error) = recorder_pre_cancelled_error("commit_checkpoint", cx) {
+            return Err(error);
         }
+        let slot = self.try_acquire_checkpoint_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            let _slot = slot;
+            futures::executor::block_on(
+                storage.commit_checkpoint_on_blocking_thread(checkpoint),
+            )
+        })
+        .await
+        .map_err(|error| recorder_blocking_error("commit_checkpoint", error))?
     }
 
     async fn health(&self) -> RecorderStorageHealth {
@@ -1643,9 +1777,11 @@ impl RecorderStorage for AppendLogRecorderStorage {
 }
 
 /// Rusqlite-backed recorder storage and event reader.
+#[derive(Clone)]
 pub struct RusqliteRecorderStorage {
     config: RusqliteStorageConfig,
-    in_flight: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+    checkpoint_in_flight: Arc<AtomicUsize>,
     flush_in_flight: Arc<AtomicUsize>,
     inner: Arc<Mutex<RusqliteInner>>,
 }
@@ -1654,7 +1790,11 @@ struct RusqliteInner {
     conn: Connection,
     last_error: Option<String>,
     #[cfg(test)]
-    flush_test_hook: Option<RecorderFlushTestHook>,
+    append_test_hook: Option<RecorderBlockingTestHook>,
+    #[cfg(test)]
+    checkpoint_test_hook: Option<RecorderBlockingTestHook>,
+    #[cfg(test)]
+    flush_test_hook: Option<RecorderBlockingTestHook>,
 }
 
 impl std::fmt::Debug for RusqliteRecorderStorage {
@@ -1663,6 +1803,10 @@ impl std::fmt::Debug for RusqliteRecorderStorage {
             .field("db_path", &self.config.db_path)
             .field("queue_capacity", &self.config.queue_capacity)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
+            .field(
+                "checkpoint_in_flight",
+                &self.checkpoint_in_flight.load(Ordering::Relaxed),
+            )
             .field(
                 "flush_in_flight",
                 &self.flush_in_flight.load(Ordering::Relaxed),
@@ -1681,11 +1825,16 @@ impl RusqliteRecorderStorage {
         initialize_rusqlite_schema(&conn)?;
         Ok(Self {
             config,
-            in_flight: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            checkpoint_in_flight: Arc::new(AtomicUsize::new(0)),
             flush_in_flight: Arc::new(AtomicUsize::new(0)),
             inner: Arc::new(Mutex::new(RusqliteInner {
                 conn,
                 last_error: None,
+                #[cfg(test)]
+                append_test_hook: None,
+                #[cfg(test)]
+                checkpoint_test_hook: None,
                 #[cfg(test)]
                 flush_test_hook: None,
             })),
@@ -1697,8 +1846,14 @@ impl RusqliteRecorderStorage {
         RusqliteEventReader::new(self.config.db_path.clone())
     }
 
-    fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
-        try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
+    fn try_acquire_slot(&self) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+        try_acquire_owned_bounded_slot(&self.in_flight, self.config.queue_capacity)
+    }
+
+    fn try_acquire_checkpoint_slot(
+        &self,
+    ) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+        try_acquire_owned_bounded_slot(&self.checkpoint_in_flight, 1)
     }
 
     fn try_acquire_flush_slot(
@@ -1910,11 +2065,279 @@ impl RusqliteRecorderStorage {
         Ok(())
     }
 
+    async fn append_batch_on_blocking_thread(
+        &self,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        if req.batch_id.trim().is_empty() {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "batch_id must not be empty".to_string(),
+            });
+        }
+        if req.events.is_empty() {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "events must not be empty".to_string(),
+            });
+        }
+        if req.events.len() > self.config.max_batch_events {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: format!(
+                    "batch event count {} exceeds max {}",
+                    req.events.len(),
+                    self.config.max_batch_events
+                ),
+            });
+        }
+
+        let AppendRequest {
+            batch_id,
+            events,
+            required_durability,
+            producer_ts_ms: _producer_ts_ms,
+        } = req;
+
+        let mut encoded = Vec::with_capacity(events.len());
+        let mut total_bytes = 0usize;
+        for event in events {
+            let payload = serde_json::to_string(&event)?;
+            total_bytes = total_bytes
+                .checked_add(payload.len().saturating_add(4))
+                .ok_or_else(|| RecorderStorageError::InvalidRequest {
+                    message: "batch byte size overflow".to_string(),
+                })?;
+            encoded.push((event, payload));
+        }
+        if total_bytes > self.config.max_batch_bytes {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: format!(
+                    "batch bytes {} exceeds max {}",
+                    total_bytes, self.config.max_batch_bytes
+                ),
+            });
+        }
+        let request_digest_sha256 =
+            digest_serialized_event_payloads(encoded.iter().map(|(_, payload)| payload.as_bytes()));
+
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = self
+            .inner
+            .lock_with_cx(&settlement_cx)
+            .await
+            .map_err(|_| recorder_blocking_runtime_error("append_batch"))?;
+
+        #[cfg(test)]
+        let append_test_hook = inner.append_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &append_test_hook {
+            hook.run_before();
+        }
+
+        let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
+            if let Some(mut existing) = Self::cached_response(&inner.conn, &batch_id)? {
+                if existing.request_digest_sha256 != request_digest_sha256 {
+                    return Err(RecorderStorageError::IdempotencyConflict {
+                        batch_id: batch_id.clone(),
+                    });
+                }
+                if !existing
+                    .response
+                    .committed_durability
+                    .satisfies(required_durability)
+                {
+                    existing.response.committed_durability = required_durability;
+                    existing.response.committed_at_ms = crate::recording::epoch_ms_now();
+                    Self::update_cached_response(&inner.conn, &batch_id, &existing)?;
+                }
+                existing.response.was_idempotent_replay = true;
+                return Ok(existing.response);
+            }
+
+            let head = sqlite_head_offset(&inner.conn)?;
+            let transaction = inner.conn.transaction().map_err(sqlite_error)?;
+            let first_offset = head.clone();
+            let mut next_ordinal = head.ordinal;
+            let mut next_byte_offset = head.byte_offset;
+            let mut last_offset = first_offset.clone();
+            let committed_at_ms = crate::recording::epoch_ms_now();
+
+            for (event, payload) in encoded {
+                let payload_bytes = payload.len() as u64;
+                let offset = RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: next_byte_offset,
+                    ordinal: next_ordinal,
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO recorder_events (
+                             ordinal, segment_id, byte_offset, payload_json, payload_bytes,
+                             event_id, pane_id, schema_version, recorded_at_ms, batch_id, inserted_at_ms
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        params![
+                            u64_to_sql_i64(offset.ordinal, "ordinal")?,
+                            u64_to_sql_i64(offset.segment_id, "segment_id")?,
+                            u64_to_sql_i64(offset.byte_offset, "byte_offset")?,
+                            payload,
+                            u64_to_sql_i64(payload_bytes, "payload_bytes")?,
+                            event.event_id.as_str(),
+                            u64_to_sql_i64(event.pane_id, "pane_id")?,
+                            event.schema_version.as_str(),
+                            u64_to_sql_i64(event.recorded_at_ms, "recorded_at_ms")?,
+                            batch_id.as_str(),
+                            u64_to_sql_i64(committed_at_ms, "inserted_at_ms")?,
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+                last_offset = offset;
+                next_ordinal = next_ordinal.saturating_add(1);
+                next_byte_offset = next_byte_offset.saturating_add(payload_bytes.saturating_add(4));
+            }
+
+            let response = AppendResponse {
+                backend: RecorderBackendKind::Rusqlite,
+                accepted_count: last_offset
+                    .ordinal
+                    .saturating_sub(first_offset.ordinal)
+                    .saturating_add(1) as usize,
+                first_offset,
+                last_offset,
+                committed_durability: required_durability,
+                committed_at_ms,
+                was_idempotent_replay: false,
+            };
+            let receipt = CachedAppendReceipt {
+                request_digest_sha256,
+                response: response.clone(),
+            };
+            let response_json = serde_json::to_string(&receipt)?;
+            transaction
+                .execute(
+                    "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        batch_id.as_str(),
+                        response_json,
+                        u64_to_sql_i64(committed_at_ms, "committed_at_ms")?,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            evict_rusqlite_receipts(&transaction, self.config.max_idempotency_entries)?;
+            transaction.commit().map_err(sqlite_error)?;
+            Ok(response)
+        })();
+
+        #[cfg(test)]
+        if let Some(hook) = &append_test_hook {
+            hook.run_after();
+        }
+
+        match result {
+            Ok(response) => {
+                Self::clear_last_error(&mut inner);
+                Ok(response)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "append_batch", &err);
+                Err(err)
+            }
+        }
+    }
+
+    async fn commit_checkpoint_on_blocking_thread(
+        &self,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = self
+            .inner
+            .lock_with_cx(&settlement_cx)
+            .await
+            .map_err(|_| recorder_blocking_runtime_error("commit_checkpoint"))?;
+
+        #[cfg(test)]
+        let checkpoint_test_hook = inner.checkpoint_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &checkpoint_test_hook {
+            hook.run_before();
+        }
+
+        let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            // The async mutex covers this instance only. Acquire SQLite writer
+            // authority before reading so another connection cannot advance the
+            // checkpoint between our comparison and upsert (or noop receipt).
+            let transaction = inner
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_error)?;
+            let existing = read_sqlite_checkpoint(&transaction, &checkpoint.consumer)?;
+            let outcome = match existing {
+                Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
+                    return Err(RecorderStorageError::CheckpointRegression {
+                        consumer: checkpoint.consumer.0.clone(),
+                        current_ordinal: existing.upto_offset.ordinal,
+                        attempted_ordinal: checkpoint.upto_offset.ordinal,
+                    });
+                }
+                Some(existing)
+                    if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal =>
+                {
+                    CheckpointCommitOutcome::NoopAlreadyAdvanced
+                }
+                _ => CheckpointCommitOutcome::Advanced,
+            };
+
+            if outcome == CheckpointCommitOutcome::Advanced {
+                transaction
+                    .execute(
+                        "INSERT INTO recorder_checkpoints (
+                             consumer, segment_id, byte_offset, ordinal,
+                             schema_version, committed_at_ms
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT(consumer) DO UPDATE SET
+                             segment_id = excluded.segment_id,
+                             byte_offset = excluded.byte_offset,
+                             ordinal = excluded.ordinal,
+                             schema_version = excluded.schema_version,
+                             committed_at_ms = excluded.committed_at_ms",
+                        params![
+                            checkpoint.consumer.0,
+                            u64_to_sql_i64(checkpoint.upto_offset.segment_id, "segment_id")?,
+                            u64_to_sql_i64(checkpoint.upto_offset.byte_offset, "byte_offset")?,
+                            u64_to_sql_i64(checkpoint.upto_offset.ordinal, "ordinal")?,
+                            checkpoint.schema_version,
+                            u64_to_sql_i64(checkpoint.committed_at_ms, "committed_at_ms")?,
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            transaction.commit().map_err(sqlite_error)?;
+            Ok(outcome)
+        })();
+
+        #[cfg(test)]
+        if let Some(hook) = &checkpoint_test_hook {
+            hook.run_after();
+        }
+
+        match result {
+            Ok(outcome) => {
+                Self::clear_last_error(&mut inner);
+                Ok(outcome)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "commit_checkpoint", &err);
+                Err(err)
+            }
+        }
+    }
+
     async fn flush_on_blocking_thread(
         inner: Arc<Mutex<RusqliteInner>>,
         mode: FlushMode,
     ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        // An admitted SQLite checkpoint remains owned even when the caller
+        // An admitted SQLite flush remains owned even when the caller
         // stops waiting. Do not let caller cancellation abort the per-backend
         // serialization acquire and leave the closure with an unknown lifetime.
         let settlement_cx = crate::cx::for_request();
@@ -1972,161 +2395,32 @@ impl RecorderStorage for RusqliteRecorderStorage {
         &self,
         req: AppendRequest,
     ) -> std::result::Result<AppendResponse, RecorderStorageError> {
-        let _slot = self.try_acquire_slot()?;
+        let slot = self.try_acquire_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking(move || {
+            let _slot = slot;
+            futures::executor::block_on(storage.append_batch_on_blocking_thread(req))
+        })
+        .await
+        .map_err(|_| recorder_blocking_runtime_error("append_batch"))?
+    }
 
-        if req.batch_id.trim().is_empty() {
-            return Err(RecorderStorageError::InvalidRequest {
-                message: "batch_id must not be empty".to_string(),
-            });
+    async fn append_batch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        if let Some(error) = recorder_pre_cancelled_error("append_batch", cx) {
+            return Err(error);
         }
-        if req.events.is_empty() {
-            return Err(RecorderStorageError::InvalidRequest {
-                message: "events must not be empty".to_string(),
-            });
-        }
-        if req.events.len() > self.config.max_batch_events {
-            return Err(RecorderStorageError::InvalidRequest {
-                message: format!(
-                    "batch event count {} exceeds max {}",
-                    req.events.len(),
-                    self.config.max_batch_events
-                ),
-            });
-        }
-
-        let AppendRequest {
-            batch_id,
-            events,
-            required_durability,
-            producer_ts_ms: _producer_ts_ms,
-        } = req;
-
-        let mut encoded = Vec::with_capacity(events.len());
-        let mut total_bytes = 0usize;
-        for event in events {
-            let payload = serde_json::to_string(&event)?;
-            total_bytes = total_bytes
-                .checked_add(payload.len().saturating_add(4))
-                .ok_or_else(|| RecorderStorageError::InvalidRequest {
-                    message: "batch byte size overflow".to_string(),
-                })?;
-            encoded.push((event, payload));
-        }
-        if total_bytes > self.config.max_batch_bytes {
-            return Err(RecorderStorageError::InvalidRequest {
-                message: format!(
-                    "batch bytes {} exceeds max {}",
-                    total_bytes, self.config.max_batch_bytes
-                ),
-            });
-        }
-        let request_digest_sha256 =
-            digest_serialized_event_payloads(encoded.iter().map(|(_, payload)| payload.as_bytes()));
-
-        let mut inner = self.inner.lock().await;
-        let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
-            if let Some(mut existing) = Self::cached_response(&inner.conn, &batch_id)? {
-                if existing.request_digest_sha256 != request_digest_sha256 {
-                    return Err(RecorderStorageError::IdempotencyConflict {
-                        batch_id: batch_id.clone(),
-                    });
-                }
-                if !existing
-                    .response
-                    .committed_durability
-                    .satisfies(required_durability)
-                {
-                    existing.response.committed_durability = required_durability;
-                    existing.response.committed_at_ms = crate::recording::epoch_ms_now();
-                    Self::update_cached_response(&inner.conn, &batch_id, &existing)?;
-                }
-                existing.response.was_idempotent_replay = true;
-                return Ok(existing.response);
-            }
-
-            let head = sqlite_head_offset(&inner.conn)?;
-            let tx = inner.conn.transaction().map_err(sqlite_error)?;
-            let first_offset = head.clone();
-            let mut next_ordinal = head.ordinal;
-            let mut next_byte_offset = head.byte_offset;
-            let mut last_offset = first_offset.clone();
-            let committed_at_ms = crate::recording::epoch_ms_now();
-
-            for (event, payload) in encoded {
-                let payload_bytes = payload.len() as u64;
-                let offset = RecorderOffset {
-                    segment_id: 0,
-                    byte_offset: next_byte_offset,
-                    ordinal: next_ordinal,
-                };
-                tx.execute(
-                    "INSERT INTO recorder_events (
-                         ordinal, segment_id, byte_offset, payload_json, payload_bytes,
-                         event_id, pane_id, schema_version, recorded_at_ms, batch_id, inserted_at_ms
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                    params![
-                        u64_to_sql_i64(offset.ordinal, "ordinal")?,
-                        u64_to_sql_i64(offset.segment_id, "segment_id")?,
-                        u64_to_sql_i64(offset.byte_offset, "byte_offset")?,
-                        payload,
-                        u64_to_sql_i64(payload_bytes, "payload_bytes")?,
-                        event.event_id.as_str(),
-                        u64_to_sql_i64(event.pane_id, "pane_id")?,
-                        event.schema_version.as_str(),
-                        u64_to_sql_i64(event.recorded_at_ms, "recorded_at_ms")?,
-                        batch_id.as_str(),
-                        u64_to_sql_i64(committed_at_ms, "inserted_at_ms")?,
-                    ],
-                )
-                .map_err(sqlite_error)?;
-                last_offset = offset;
-                next_ordinal = next_ordinal.saturating_add(1);
-                next_byte_offset = next_byte_offset.saturating_add(payload_bytes.saturating_add(4));
-            }
-
-            let response = AppendResponse {
-                backend: RecorderBackendKind::Rusqlite,
-                accepted_count: last_offset
-                    .ordinal
-                    .saturating_sub(first_offset.ordinal)
-                    .saturating_add(1) as usize,
-                first_offset,
-                last_offset,
-                committed_durability: required_durability,
-                committed_at_ms,
-                was_idempotent_replay: false,
-            };
-            let receipt = CachedAppendReceipt {
-                request_digest_sha256,
-                response: response.clone(),
-            };
-            let response_json = serde_json::to_string(&receipt)?;
-            tx.execute(
-                "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    batch_id.as_str(),
-                    response_json,
-                    u64_to_sql_i64(committed_at_ms, "committed_at_ms")?,
-                ],
-            )
-            .map_err(sqlite_error)?;
-            evict_rusqlite_receipts(&tx, self.config.max_idempotency_entries)?;
-            tx.commit().map_err(sqlite_error)?;
-            Ok(response)
-        })();
-
-        match result {
-            Ok(response) => {
-                Self::clear_last_error(&mut inner);
-                Ok(response)
-            }
-            Err(err) => {
-                Self::record_last_error(&mut inner, "append_batch", &err);
-                Err(err)
-            }
-        }
+        let slot = self.try_acquire_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            let _slot = slot;
+            futures::executor::block_on(storage.append_batch_on_blocking_thread(req))
+        })
+        .await
+        .map_err(|error| recorder_blocking_error("append_batch", error))?
     }
 
     async fn flush(
@@ -2173,70 +2467,36 @@ impl RecorderStorage for RusqliteRecorderStorage {
         &self,
         checkpoint: RecorderCheckpoint,
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-        let mut inner = self.inner.lock().await;
-        let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-            // The async mutex covers this instance only. Acquire SQLite writer
-            // authority before reading so another connection cannot advance the
-            // checkpoint between our comparison and upsert (or noop receipt).
-            let transaction = inner
-                .conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(sqlite_error)?;
-            let existing = read_sqlite_checkpoint(&transaction, &checkpoint.consumer)?;
-            let outcome = match existing {
-                Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
-                    return Err(RecorderStorageError::CheckpointRegression {
-                        consumer: checkpoint.consumer.0.clone(),
-                        current_ordinal: existing.upto_offset.ordinal,
-                        attempted_ordinal: checkpoint.upto_offset.ordinal,
-                    });
-                }
-                Some(existing)
-                    if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal =>
-                {
-                    CheckpointCommitOutcome::NoopAlreadyAdvanced
-                }
-                _ => CheckpointCommitOutcome::Advanced,
-            };
+        let slot = self.try_acquire_checkpoint_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking(move || {
+            let _slot = slot;
+            futures::executor::block_on(
+                storage.commit_checkpoint_on_blocking_thread(checkpoint),
+            )
+        })
+        .await
+        .map_err(|_| recorder_blocking_runtime_error("commit_checkpoint"))?
+    }
 
-            if outcome == CheckpointCommitOutcome::Advanced {
-                transaction
-                    .execute(
-                        "INSERT INTO recorder_checkpoints (
-                             consumer, segment_id, byte_offset, ordinal,
-                             schema_version, committed_at_ms
-                         )
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                         ON CONFLICT(consumer) DO UPDATE SET
-                             segment_id = excluded.segment_id,
-                             byte_offset = excluded.byte_offset,
-                             ordinal = excluded.ordinal,
-                             schema_version = excluded.schema_version,
-                             committed_at_ms = excluded.committed_at_ms",
-                        params![
-                            checkpoint.consumer.0,
-                            u64_to_sql_i64(checkpoint.upto_offset.segment_id, "segment_id")?,
-                            u64_to_sql_i64(checkpoint.upto_offset.byte_offset, "byte_offset")?,
-                            u64_to_sql_i64(checkpoint.upto_offset.ordinal, "ordinal")?,
-                            checkpoint.schema_version,
-                            u64_to_sql_i64(checkpoint.committed_at_ms, "committed_at_ms")?,
-                        ],
-                    )
-                    .map_err(sqlite_error)?;
-            }
-            transaction.commit().map_err(sqlite_error)?;
-            Ok(outcome)
-        })();
-        match result {
-            Ok(outcome) => {
-                Self::clear_last_error(&mut inner);
-                Ok(outcome)
-            }
-            Err(err) => {
-                Self::record_last_error(&mut inner, "commit_checkpoint", &err);
-                Err(err)
-            }
+    async fn commit_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        if let Some(error) = recorder_pre_cancelled_error("commit_checkpoint", cx) {
+            return Err(error);
         }
+        let slot = self.try_acquire_checkpoint_slot()?;
+        let storage = self.clone();
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            let _slot = slot;
+            futures::executor::block_on(
+                storage.commit_checkpoint_on_blocking_thread(checkpoint),
+            )
+        })
+        .await
+        .map_err(|error| recorder_blocking_error("commit_checkpoint", error))?
     }
 
     async fn health(&self) -> RecorderStorageHealth {
@@ -3226,29 +3486,79 @@ mod tests {
         }
     }
 
-    async fn install_flush_test_hook(
+    #[derive(Clone, Copy)]
+    enum RecorderBlockingTestOperation {
+        Append,
+        Checkpoint,
+        Flush,
+    }
+
+    async fn install_blocking_test_hook(
         storage: &RecorderStorageInstance,
-        hook: RecorderFlushTestHook,
+        operation: RecorderBlockingTestOperation,
+        hook: RecorderBlockingTestHook,
     ) {
         match storage {
             RecorderStorageInstance::AppendLog(storage) => {
-                storage.inner.lock().await.flush_test_hook = Some(hook);
+                let mut inner = storage.inner.lock().await;
+                match operation {
+                    RecorderBlockingTestOperation::Append => inner.append_test_hook = Some(hook),
+                    RecorderBlockingTestOperation::Checkpoint => {
+                        inner.checkpoint_test_hook = Some(hook);
+                    }
+                    RecorderBlockingTestOperation::Flush => inner.flush_test_hook = Some(hook),
+                }
             }
             RecorderStorageInstance::Rusqlite(storage) => {
-                storage.inner.lock().await.flush_test_hook = Some(hook);
+                let mut inner = storage.inner.lock().await;
+                match operation {
+                    RecorderBlockingTestOperation::Append => inner.append_test_hook = Some(hook),
+                    RecorderBlockingTestOperation::Checkpoint => {
+                        inner.checkpoint_test_hook = Some(hook);
+                    }
+                    RecorderBlockingTestOperation::Flush => inner.flush_test_hook = Some(hook),
+                }
             }
         }
     }
 
-    async fn clear_flush_test_hook(storage: &RecorderStorageInstance) {
+    async fn clear_blocking_test_hook(
+        storage: &RecorderStorageInstance,
+        operation: RecorderBlockingTestOperation,
+    ) {
         match storage {
             RecorderStorageInstance::AppendLog(storage) => {
-                storage.inner.lock().await.flush_test_hook = None;
+                let mut inner = storage.inner.lock().await;
+                match operation {
+                    RecorderBlockingTestOperation::Append => inner.append_test_hook = None,
+                    RecorderBlockingTestOperation::Checkpoint => {
+                        inner.checkpoint_test_hook = None;
+                    }
+                    RecorderBlockingTestOperation::Flush => inner.flush_test_hook = None,
+                }
             }
             RecorderStorageInstance::Rusqlite(storage) => {
-                storage.inner.lock().await.flush_test_hook = None;
+                let mut inner = storage.inner.lock().await;
+                match operation {
+                    RecorderBlockingTestOperation::Append => inner.append_test_hook = None,
+                    RecorderBlockingTestOperation::Checkpoint => {
+                        inner.checkpoint_test_hook = None;
+                    }
+                    RecorderBlockingTestOperation::Flush => inner.flush_test_hook = None,
+                }
             }
         }
+    }
+
+    async fn install_flush_test_hook(
+        storage: &RecorderStorageInstance,
+        hook: RecorderBlockingTestHook,
+    ) {
+        install_blocking_test_hook(storage, RecorderBlockingTestOperation::Flush, hook).await;
+    }
+
+    async fn clear_flush_test_hook(storage: &RecorderStorageInstance) {
+        clear_blocking_test_hook(storage, RecorderBlockingTestOperation::Flush).await;
     }
 
     async fn wait_for_test_flag(flag: &AtomicBool, description: &'static str) {
@@ -3261,9 +3571,55 @@ mod tests {
         .unwrap_or_else(|error| panic!("timed out waiting for {description}: {error}"));
     }
 
-    type FlushReleaseGate = (StdMutex<bool>, Condvar);
+    fn blocking_admission_depth(
+        storage: &RecorderStorageInstance,
+        operation: RecorderBlockingTestOperation,
+    ) -> usize {
+        match (storage, operation) {
+            (RecorderStorageInstance::AppendLog(storage), RecorderBlockingTestOperation::Append) => {
+                storage.in_flight.load(Ordering::Acquire)
+            }
+            (
+                RecorderStorageInstance::AppendLog(storage),
+                RecorderBlockingTestOperation::Checkpoint,
+            ) => storage.checkpoint_in_flight.load(Ordering::Acquire),
+            (RecorderStorageInstance::AppendLog(storage), RecorderBlockingTestOperation::Flush) => {
+                storage.flush_in_flight.load(Ordering::Acquire)
+            }
+            (RecorderStorageInstance::Rusqlite(storage), RecorderBlockingTestOperation::Append) => {
+                storage.in_flight.load(Ordering::Acquire)
+            }
+            (
+                RecorderStorageInstance::Rusqlite(storage),
+                RecorderBlockingTestOperation::Checkpoint,
+            ) => storage.checkpoint_in_flight.load(Ordering::Acquire),
+            (RecorderStorageInstance::Rusqlite(storage), RecorderBlockingTestOperation::Flush) => {
+                storage.flush_in_flight.load(Ordering::Acquire)
+            }
+        }
+    }
 
-    fn wait_for_flush_test_release(gate: &FlushReleaseGate, backend: RecorderBackendKind) {
+    async fn wait_for_blocking_admission_release(
+        storage: &RecorderStorageInstance,
+        operation: RecorderBlockingTestOperation,
+        description: &'static str,
+    ) {
+        crate::runtime_async::timeout(std::time::Duration::from_secs(5), async {
+            while blocking_admission_depth(storage, operation) != 0 {
+                crate::runtime_async::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("timed out waiting for {description}: {error}"));
+    }
+
+    type BlockingReleaseGate = (StdMutex<bool>, Condvar);
+
+    fn wait_for_blocking_test_release(
+        gate: &BlockingReleaseGate,
+        backend: RecorderBackendKind,
+        operation: &'static str,
+    ) {
         let released = gate.0.lock().unwrap();
         let (released, _) = gate
             .1
@@ -3273,15 +3629,45 @@ mod tests {
             .unwrap();
         assert!(
             *released,
-            "{backend} timed out waiting for the executor-side flush release"
+            "{backend} timed out waiting for the executor-side {operation} release"
         );
     }
 
-    fn release_flush_test_gate(gate: &FlushReleaseGate) {
+    fn release_blocking_test_gate(gate: &BlockingReleaseGate) {
         let mut released = gate.0.lock().unwrap();
         *released = true;
         drop(released);
         gate.1.notify_all();
+    }
+
+    fn persisted_event_count(config: &RecorderStorageConfig) -> u64 {
+        match config.backend {
+            RecorderBackendKind::AppendLog => {
+                let mut file = File::open(&config.append_log.data_path).unwrap();
+                scan_valid_prefix(&mut file).unwrap().valid_records
+            }
+            RecorderBackendKind::Rusqlite => {
+                let connection = Connection::open(&config.rusqlite.db_path).unwrap();
+                let count = connection
+                    .query_row("SELECT COUNT(*) FROM recorder_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap();
+                u64::try_from(count).unwrap()
+            }
+            RecorderBackendKind::FrankenSqlite => {
+                panic!("frankensqlite has no recorder storage implementation")
+            }
+        }
+    }
+
+    fn blocking_test_checkpoint(response: &AppendResponse) -> RecorderCheckpoint {
+        RecorderCheckpoint {
+            consumer: CheckpointConsumerId("blocking-mutation-consumer".to_string()),
+            upto_offset: response.last_offset.clone(),
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            committed_at_ms: 1_700_000_000_500,
+        }
     }
 
     fn sample_event(event_id: &str, pane_id: u64, sequence: u64, text: &str) -> RecorderEvent {
@@ -4023,10 +4409,10 @@ recorder_backend = "frankensqlite"
             let (resume_tx, resume_rx) = channel();
             std::thread::scope(|scope| {
                 let writer = scope.spawn(move || {
-                    BUSY_GATE.with(|gate| *gate.borrow_mut() = Some((busy_tx, resume_rx)));
+                    let busy_gate = Arc::new(StdMutex::new(Some((busy_tx, resume_rx))));
                     run_async_test(async {
                         {
-                            let inner = storage.inner.lock().await;
+                            let mut inner = storage.inner.lock().await;
                             inner.conn.busy_handler(Some(|_| {
                                 BUSY_GATE.with(|gate| {
                                     let Some((entered, resume)) = gate.borrow_mut().take() else {
@@ -4036,8 +4422,25 @@ recorder_backend = "frankensqlite"
                                         && resume.recv_timeout(Duration::from_secs(10)).is_ok()
                                 })
                             })).unwrap();
+                            inner.checkpoint_test_hook = Some(RecorderBlockingTestHook {
+                                before: {
+                                    let busy_gate = Arc::clone(&busy_gate);
+                                    Arc::new(move || {
+                                        let pair = busy_gate
+                                            .lock()
+                                            .unwrap()
+                                            .take()
+                                            .expect("checkpoint busy gate installed once");
+                                        BUSY_GATE.with(|gate| *gate.borrow_mut() = Some(pair));
+                                    })
+                                },
+                                after: Arc::new(|| {
+                                    BUSY_GATE.with(|gate| *gate.borrow_mut() = None);
+                                }),
+                            });
                         }
                         let result = storage.commit_checkpoint(delayed).await;
+                        storage.inner.lock().await.checkpoint_test_hook = None;
                         let persisted = storage.read_checkpoint(&newer.consumer).await.unwrap();
                         let outcome = match &result {
                             Err(RecorderStorageError::CheckpointRegression { .. }) => "regression",
@@ -4635,14 +5038,9 @@ recorder_backend = "frankensqlite"
         });
     }
 
-    /// ft-xbnl0.2.3 Cx-first: default trait `append_batch_with_cx`
-    /// must match the legacy `append_batch` for an uncancelled
-    /// cx, producing identical AppendResponse fields (ordinals,
-    /// byte_offsets). The default delegates to `append_batch`
-    /// after a checkpoint, so for an uncancelled cx they are
-    /// observationally equivalent. This test pins the contract
-    /// so that overriding backends (when added) won't
-    /// accidentally regress the default-delegation parity.
+    /// The concrete Cx-first append path and legacy append path share the same
+    /// owned blocking mutation body. For a live Cx they must retain one ordered
+    /// offset stream and otherwise remain observationally equivalent.
     #[test]
     fn trait_append_batch_with_cx_matches_legacy() {
         run_async_test(async {
@@ -4679,8 +5077,8 @@ recorder_backend = "frankensqlite"
             assert_eq!(legacy_response.last_offset.ordinal, 1);
             // Byte offsets are monotonically increasing across
             // both cx and legacy append paths — proves the
-            // Cx-first default didn't accidentally re-order or
-            // skip the write.
+            // Cx-first owned dispatch didn't accidentally re-order or skip the
+            // write.
             assert!(
                 legacy_response.first_offset.byte_offset > cx_response.first_offset.byte_offset,
                 "legacy byte_offset must follow cx byte_offset in the same storage"
@@ -4688,11 +5086,8 @@ recorder_backend = "frankensqlite"
         });
     }
 
-    /// ft-xbnl0.2.3 Cx-first: default trait
-    /// `read_checkpoint_with_cx` and `commit_checkpoint_with_cx`
-    /// must round-trip correctly for uncancelled cx. Writes a
-    /// checkpoint via the Cx-first commit variant, reads it
-    /// back via the Cx-first read variant, asserts parity.
+    /// The concrete Cx-first checkpoint commit must round-trip through the
+    /// existing Cx-first read boundary for a live caller context.
     #[test]
     fn trait_checkpoint_cx_variants_round_trip() {
         run_async_test(async {
@@ -5583,6 +5978,541 @@ recorder_backend = "frankensqlite"
     // ── Durability levels ────────────────────────────────────────────
 
     #[test]
+    fn checkpoint_busy_handler_does_not_pin_the_async_executor() {
+        struct BusyGate {
+            entered: AtomicBool,
+            released: StdMutex<bool>,
+            release: Condvar,
+        }
+
+        static ACTIVE_BUSY_GATE: StdMutex<Option<Arc<BusyGate>>> = StdMutex::new(None);
+        static TEST_SERIALIZATION: StdMutex<()> = StdMutex::new(());
+
+        fn wait_for_writer_release(_: i32) -> bool {
+            let gate = ACTIVE_BUSY_GATE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
+                .expect("checkpoint busy handler gate must be installed");
+            gate.entered.store(true, Ordering::Release);
+            let released = gate.released.lock().unwrap();
+            let (released, _) = gate
+                .release
+                .wait_timeout_while(
+                    released,
+                    std::time::Duration::from_secs(2),
+                    |released| !*released,
+                )
+                .unwrap();
+            *released
+        }
+
+        let _serial = TEST_SERIALIZATION.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let config = recorder_test_config(dir.path()).rusqlite;
+        let storage = RusqliteRecorderStorage::open(config.clone()).unwrap();
+        let gate = Arc::new(BusyGate {
+            entered: AtomicBool::new(false),
+            released: StdMutex::new(false),
+            release: Condvar::new(),
+        });
+        *ACTIVE_BUSY_GATE.lock().unwrap() = Some(Arc::clone(&gate));
+        run_async_test(async {
+            storage
+                .inner
+                .lock()
+                .await
+                .conn
+                .busy_handler(Some(wait_for_writer_release))
+                .unwrap();
+        });
+
+        let (writer_locked_tx, writer_locked_rx) = std::sync::mpsc::channel();
+        let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
+        let writer_released = Arc::new(AtomicBool::new(false));
+        let writer_released_by_thread = Arc::clone(&writer_released);
+        let writer = std::thread::spawn(move || {
+            let mut connection = Connection::open(config.db_path).unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            writer_locked_tx.send(()).unwrap();
+            writer_release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("executor sibling must release the SQLite writer");
+            transaction.commit().unwrap();
+            writer_released_by_thread.store(true, Ordering::Release);
+        });
+        writer_locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("external SQLite writer must acquire its transaction");
+
+        run_async_test(async {
+            let checkpoint = RecorderCheckpoint {
+                consumer: CheckpointConsumerId("blocking-executor-proof".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: 1,
+            };
+            let cx = crate::cx::for_request();
+            let sibling = async {
+                wait_for_test_flag(&gate.entered, "real SQLite busy-handler entry").await;
+                writer_release_tx.send(()).unwrap();
+                wait_for_test_flag(&writer_released, "external SQLite writer release").await;
+                let mut released = gate.released.lock().unwrap();
+                *released = true;
+                drop(released);
+                gate.release.notify_all();
+            };
+            let (outcome, ()) = futures::join!(
+                storage.commit_checkpoint_with_cx(&cx, checkpoint),
+                sibling
+            );
+            assert_eq!(outcome.unwrap(), CheckpointCommitOutcome::Advanced);
+        });
+
+        writer.join().unwrap();
+        *ACTIVE_BUSY_GATE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn mutation_with_cx_pre_cancel_is_typed_and_never_enters_blocking_body() {
+        run_async_test(async {
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempdir().unwrap();
+                let mut config = recorder_test_config(dir.path());
+                config.backend = backend;
+                config.append_log.queue_capacity = 1;
+                config.rusqlite.queue_capacity = 1;
+                let storage = bootstrap_recorder_storage(config.clone()).unwrap();
+
+                let append_entered = Arc::new(AtomicBool::new(false));
+                install_blocking_test_hook(
+                    &storage,
+                    RecorderBlockingTestOperation::Append,
+                    RecorderBlockingTestHook {
+                        before: {
+                            let append_entered = Arc::clone(&append_entered);
+                            Arc::new(move || append_entered.store(true, Ordering::Release))
+                        },
+                        after: Arc::new(|| {}),
+                    },
+                )
+                .await;
+                let append_cx = crate::cx::for_testing();
+                append_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("recorder append pre-cancel test"),
+                );
+                let append_error = storage
+                    .append_batch_with_cx(
+                        &append_cx,
+                        AppendRequest {
+                            batch_id: format!("pre-cancel-append-{backend}"),
+                            events: vec![sample_event("pre-cancel-event", 1, 0, "unchanged")],
+                            required_durability: DurabilityLevel::Fsync,
+                            producer_ts_ms: 1,
+                        },
+                    )
+                    .await
+                    .expect_err("pre-cancelled append must not report success");
+                assert!(matches!(
+                    append_error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "append_batch",
+                        failure: RecorderBlockingFailure::CancelledBeforeStart {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    }
+                ));
+                assert!(
+                    !append_entered.load(Ordering::Acquire),
+                    "{backend} pre-cancelled append entered its blocking body"
+                );
+                assert_eq!(persisted_event_count(&config), 0);
+                clear_blocking_test_hook(&storage, RecorderBlockingTestOperation::Append).await;
+
+                let checkpoint_entered = Arc::new(AtomicBool::new(false));
+                install_blocking_test_hook(
+                    &storage,
+                    RecorderBlockingTestOperation::Checkpoint,
+                    RecorderBlockingTestHook {
+                        before: {
+                            let checkpoint_entered = Arc::clone(&checkpoint_entered);
+                            Arc::new(move || checkpoint_entered.store(true, Ordering::Release))
+                        },
+                        after: Arc::new(|| {}),
+                    },
+                )
+                .await;
+                let checkpoint = RecorderCheckpoint {
+                    consumer: CheckpointConsumerId(format!("pre-cancel-checkpoint-{backend}")),
+                    upto_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                    committed_at_ms: 1,
+                };
+                let checkpoint_cx = crate::cx::for_testing();
+                checkpoint_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("recorder checkpoint pre-cancel test"),
+                );
+                let checkpoint_error = storage
+                    .commit_checkpoint_with_cx(&checkpoint_cx, checkpoint.clone())
+                    .await
+                    .expect_err("pre-cancelled checkpoint must not report success");
+                assert!(matches!(
+                    checkpoint_error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "commit_checkpoint",
+                        failure: RecorderBlockingFailure::CancelledBeforeStart {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    }
+                ));
+                assert!(
+                    !checkpoint_entered.load(Ordering::Acquire),
+                    "{backend} pre-cancelled checkpoint entered its blocking body"
+                );
+                assert_eq!(
+                    storage
+                        .read_checkpoint(&checkpoint.consumer)
+                        .await
+                        .unwrap(),
+                    None
+                );
+                clear_blocking_test_hook(&storage, RecorderBlockingTestOperation::Checkpoint)
+                    .await;
+
+                // Both pre-cancelled calls must release admission immediately.
+                let appended = storage
+                    .append_batch(AppendRequest {
+                        batch_id: format!("post-pre-cancel-append-{backend}"),
+                        events: vec![sample_event("post-pre-cancel-event", 1, 0, "written")],
+                        required_durability: DurabilityLevel::Fsync,
+                        producer_ts_ms: 2,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(appended.backend, backend);
+                let checkpoint = blocking_test_checkpoint(&appended);
+                assert_eq!(
+                    storage.commit_checkpoint(checkpoint).await.unwrap(),
+                    CheckpointCommitOutcome::Advanced
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_with_cx_midflight_cancel_retains_owned_settlement_and_exact_retry() {
+        run_async_test(async {
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempdir().unwrap();
+                let mut config = recorder_test_config(dir.path());
+                config.backend = backend;
+                config.append_log.queue_capacity = 1;
+                config.rusqlite.queue_capacity = 1;
+                let storage = Arc::new(bootstrap_recorder_storage(config.clone()).unwrap());
+                let polling_thread = std::thread::current().id();
+
+                let append_started = Arc::new(AtomicBool::new(false));
+                let append_completed = Arc::new(AtomicBool::new(false));
+                let append_thread = Arc::new(StdMutex::new(None));
+                let append_release = Arc::new((StdMutex::new(false), Condvar::new()));
+                install_blocking_test_hook(
+                    storage.as_ref(),
+                    RecorderBlockingTestOperation::Append,
+                    RecorderBlockingTestHook {
+                        before: {
+                            let append_started = Arc::clone(&append_started);
+                            let append_thread = Arc::clone(&append_thread);
+                            let append_release = Arc::clone(&append_release);
+                            Arc::new(move || {
+                                *append_thread.lock().unwrap() = Some(std::thread::current().id());
+                                append_started.store(true, Ordering::Release);
+                                wait_for_blocking_test_release(
+                                    &append_release,
+                                    backend,
+                                    "append",
+                                );
+                            })
+                        },
+                        after: {
+                            let append_completed = Arc::clone(&append_completed);
+                            Arc::new(move || append_completed.store(true, Ordering::Release))
+                        },
+                    },
+                )
+                .await;
+                let append_request = AppendRequest {
+                    batch_id: format!("midflight-append-{backend}"),
+                    events: vec![sample_event("midflight-event", 7, 0, "settled-once")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 1,
+                };
+                let append_cx = crate::cx::for_testing();
+                let append_task_cx = append_cx.clone();
+                let append_task_storage = Arc::clone(&storage);
+                let append_task_request = append_request.clone();
+                let (append_result_tx, append_result_rx) =
+                    crate::runtime_async::oneshot::channel();
+                let append_task = crate::runtime_async::task::spawn(async move {
+                    let result = append_task_storage
+                        .append_batch_with_cx(&append_task_cx, append_task_request)
+                        .await;
+                    let _ = append_result_tx.send(result);
+                });
+
+                wait_for_test_flag(&append_started, "blocking recorder append admission").await;
+                assert_ne!(
+                    *append_thread.lock().unwrap(),
+                    Some(polling_thread),
+                    "{backend} append body ran inline on the executor thread"
+                );
+                let append_pre_cancel_cx = crate::cx::for_testing();
+                append_pre_cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("concurrent append pre-cancel test"),
+                );
+                let pre_cancel_error = storage
+                    .append_batch_with_cx(&append_pre_cancel_cx, append_request.clone())
+                    .await
+                    .expect_err("pre-cancel must take precedence over append overload");
+                assert!(matches!(
+                    pre_cancel_error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "append_batch",
+                        failure: RecorderBlockingFailure::CancelledBeforeStart { .. }
+                    }
+                ));
+                let append_overload = storage
+                    .append_batch(AppendRequest {
+                        batch_id: format!("overlapping-append-{backend}"),
+                        events: vec![sample_event("overlapping-event", 7, 1, "must-not-write")],
+                        required_durability: DurabilityLevel::Fsync,
+                        producer_ts_ms: 2,
+                    })
+                    .await
+                    .expect_err("admitted append must retain its configured capacity");
+                assert!(matches!(
+                    append_overload,
+                    RecorderStorageError::QueueFull { capacity: 1 }
+                ));
+                append_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("recorder append mid-flight cancel test"),
+                );
+                let append_error = crate::runtime_async::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::runtime_async::oneshot_recv(append_result_rx),
+                )
+                .await
+                .expect("mid-flight append cancellation did not settle within 5s")
+                .expect("append task dropped its result sender")
+                .expect_err("mid-flight append cancellation must not report success");
+                assert!(matches!(
+                    append_error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "append_batch",
+                        failure: RecorderBlockingFailure::CancelledMidFlight {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    }
+                ));
+                assert!(
+                    !append_completed.load(Ordering::Acquire),
+                    "{backend} append cancellation waited for the held blocking body"
+                );
+                release_blocking_test_gate(&append_release);
+                clear_blocking_test_hook(
+                    storage.as_ref(),
+                    RecorderBlockingTestOperation::Append,
+                )
+                .await;
+                append_task.await.unwrap();
+                assert!(append_completed.load(Ordering::Acquire));
+                wait_for_blocking_admission_release(
+                    storage.as_ref(),
+                    RecorderBlockingTestOperation::Append,
+                    "append admission release after late settlement",
+                )
+                .await;
+
+                let reconciled_append = storage.append_batch(append_request).await.unwrap();
+                assert_eq!(reconciled_append.backend, backend);
+                assert!(reconciled_append.was_idempotent_replay);
+                assert_eq!(reconciled_append.first_offset.ordinal, 0);
+                assert_eq!(reconciled_append.last_offset.ordinal, 0);
+                assert_eq!(persisted_event_count(&config), 1);
+                assert_eq!(
+                    storage.flush(FlushMode::Durable).await.unwrap().backend,
+                    backend
+                );
+
+                let checkpoint = blocking_test_checkpoint(&reconciled_append);
+                let checkpoint_started = Arc::new(AtomicBool::new(false));
+                let checkpoint_completed = Arc::new(AtomicBool::new(false));
+                let checkpoint_thread = Arc::new(StdMutex::new(None));
+                let checkpoint_release = Arc::new((StdMutex::new(false), Condvar::new()));
+                install_blocking_test_hook(
+                    storage.as_ref(),
+                    RecorderBlockingTestOperation::Checkpoint,
+                    RecorderBlockingTestHook {
+                        before: {
+                            let checkpoint_started = Arc::clone(&checkpoint_started);
+                            let checkpoint_thread = Arc::clone(&checkpoint_thread);
+                            let checkpoint_release = Arc::clone(&checkpoint_release);
+                            Arc::new(move || {
+                                *checkpoint_thread.lock().unwrap() =
+                                    Some(std::thread::current().id());
+                                checkpoint_started.store(true, Ordering::Release);
+                                wait_for_blocking_test_release(
+                                    &checkpoint_release,
+                                    backend,
+                                    "checkpoint",
+                                );
+                            })
+                        },
+                        after: {
+                            let checkpoint_completed = Arc::clone(&checkpoint_completed);
+                            Arc::new(move || checkpoint_completed.store(true, Ordering::Release))
+                        },
+                    },
+                )
+                .await;
+                let checkpoint_cx = crate::cx::for_testing();
+                let checkpoint_task_cx = checkpoint_cx.clone();
+                let checkpoint_task_storage = Arc::clone(&storage);
+                let checkpoint_task_value = checkpoint.clone();
+                let (checkpoint_result_tx, checkpoint_result_rx) =
+                    crate::runtime_async::oneshot::channel();
+                let checkpoint_task = crate::runtime_async::task::spawn(async move {
+                    let result = checkpoint_task_storage
+                        .commit_checkpoint_with_cx(&checkpoint_task_cx, checkpoint_task_value)
+                        .await;
+                    let _ = checkpoint_result_tx.send(result);
+                });
+
+                wait_for_test_flag(
+                    &checkpoint_started,
+                    "blocking recorder checkpoint admission",
+                )
+                .await;
+                assert_ne!(
+                    *checkpoint_thread.lock().unwrap(),
+                    Some(polling_thread),
+                    "{backend} checkpoint body ran inline on the executor thread"
+                );
+                let checkpoint_pre_cancel_cx = crate::cx::for_testing();
+                checkpoint_pre_cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("concurrent checkpoint pre-cancel test"),
+                );
+                let pre_cancel_error = storage
+                    .commit_checkpoint_with_cx(&checkpoint_pre_cancel_cx, checkpoint.clone())
+                    .await
+                    .expect_err("pre-cancel must take precedence over checkpoint overload");
+                assert!(matches!(
+                    pre_cancel_error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "commit_checkpoint",
+                        failure: RecorderBlockingFailure::CancelledBeforeStart { .. }
+                    }
+                ));
+                let checkpoint_overload = storage
+                    .commit_checkpoint(checkpoint.clone())
+                    .await
+                    .expect_err("checkpoint single-flight must reject overlapping work");
+                assert!(matches!(
+                    checkpoint_overload,
+                    RecorderStorageError::QueueFull { capacity: 1 }
+                ));
+                checkpoint_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("recorder checkpoint mid-flight cancel test"),
+                );
+                let checkpoint_error = crate::runtime_async::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::runtime_async::oneshot_recv(checkpoint_result_rx),
+                )
+                .await
+                .expect("mid-flight checkpoint cancellation did not settle within 5s")
+                .expect("checkpoint task dropped its result sender")
+                .expect_err("mid-flight checkpoint cancellation must not report success");
+                assert!(matches!(
+                    checkpoint_error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "commit_checkpoint",
+                        failure: RecorderBlockingFailure::CancelledMidFlight {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    }
+                ));
+                assert!(
+                    !checkpoint_completed.load(Ordering::Acquire),
+                    "{backend} checkpoint cancellation waited for the held blocking body"
+                );
+                release_blocking_test_gate(&checkpoint_release);
+                clear_blocking_test_hook(
+                    storage.as_ref(),
+                    RecorderBlockingTestOperation::Checkpoint,
+                )
+                .await;
+                checkpoint_task.await.unwrap();
+                assert!(checkpoint_completed.load(Ordering::Acquire));
+                wait_for_blocking_admission_release(
+                    storage.as_ref(),
+                    RecorderBlockingTestOperation::Checkpoint,
+                    "checkpoint admission release after late settlement",
+                )
+                .await;
+
+                assert_eq!(
+                    storage.commit_checkpoint(checkpoint.clone()).await.unwrap(),
+                    CheckpointCommitOutcome::NoopAlreadyAdvanced
+                );
+                assert_eq!(
+                    storage
+                        .read_checkpoint(&checkpoint.consumer)
+                        .await
+                        .unwrap(),
+                    Some(checkpoint.clone())
+                );
+                drop(storage);
+
+                let reopened = bootstrap_recorder_storage(config.clone()).unwrap();
+                assert_eq!(persisted_event_count(&config), 1);
+                assert_eq!(
+                    reopened
+                        .read_checkpoint(&checkpoint.consumer)
+                        .await
+                        .unwrap(),
+                    Some(checkpoint)
+                );
+                assert_eq!(
+                    reopened.health().await.latest_offset.map(|offset| offset.ordinal),
+                    Some(0)
+                );
+            }
+        });
+    }
+
+    #[test]
     fn flush_with_cx_leaves_executor_responsive_and_reopens_for_both_backends() {
         run_async_test(async {
             for backend in [
@@ -5609,7 +6539,7 @@ recorder_backend = "frankensqlite"
                 let completed = Arc::new(AtomicBool::new(false));
                 let sibling_ran = Arc::new(AtomicBool::new(false));
                 let release = Arc::new((StdMutex::new(false), Condvar::new()));
-                let hook = RecorderFlushTestHook {
+                let hook = RecorderBlockingTestHook {
                     before: {
                         let blocking_thread = Arc::clone(&blocking_thread);
                         let started = Arc::clone(&started);
@@ -5617,7 +6547,7 @@ recorder_backend = "frankensqlite"
                         Arc::new(move || {
                             *blocking_thread.lock().unwrap() = Some(std::thread::current().id());
                             started.store(true, Ordering::Release);
-                            wait_for_flush_test_release(&release, backend);
+                            wait_for_blocking_test_release(&release, backend, "flush");
                         })
                     },
                     after: {
@@ -5631,7 +6561,7 @@ recorder_backend = "frankensqlite"
                 let sibling = async {
                     wait_for_test_flag(&started, "blocking recorder flush admission").await;
                     sibling_ran.store(true, Ordering::Release);
-                    release_flush_test_gate(&release);
+                    release_blocking_test_gate(&release);
                 };
                 let (flush, ()) =
                     futures::join!(storage.flush_with_cx(&cx, FlushMode::Durable), sibling);
@@ -5680,7 +6610,7 @@ recorder_backend = "frankensqlite"
                 let entered = Arc::new(AtomicBool::new(false));
                 install_flush_test_hook(
                     &storage,
-                    RecorderFlushTestHook {
+                    RecorderBlockingTestHook {
                         before: {
                             let entered = Arc::clone(&entered);
                             Arc::new(move || entered.store(true, Ordering::Release))
@@ -5748,13 +6678,13 @@ recorder_backend = "frankensqlite"
                 let release = Arc::new((StdMutex::new(false), Condvar::new()));
                 install_flush_test_hook(
                     &storage,
-                    RecorderFlushTestHook {
+                    RecorderBlockingTestHook {
                         before: {
                             let started = Arc::clone(&started);
                             let release = Arc::clone(&release);
                             Arc::new(move || {
                                 started.store(true, Ordering::Release);
-                                wait_for_flush_test_release(&release, backend);
+                                wait_for_blocking_test_release(&release, backend, "flush");
                             })
                         },
                         after: {
@@ -5803,7 +6733,7 @@ recorder_backend = "frankensqlite"
                         !completed.load(Ordering::Acquire),
                         "{backend} completed while its flush body was still deliberately blocked"
                     );
-                    release_flush_test_gate(&release);
+                    release_blocking_test_gate(&release);
                 };
                 let (flush_result, ()) =
                     futures::join!(storage.flush_with_cx(&cx, FlushMode::Durable), controller);
