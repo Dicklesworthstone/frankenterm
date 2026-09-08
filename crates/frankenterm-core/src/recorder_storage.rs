@@ -344,6 +344,50 @@ pub enum RecorderStorageErrorClass {
     DependencyUnavailable,
 }
 
+/// Typed failure reported when recorder work cannot settle through the owned
+/// blocking executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderBlockingFailure {
+    /// The caller was already cancelled, so no blocking work was admitted.
+    CancelledBeforeStart {
+        /// Structured cancellation kind, when the caller context carries one.
+        kind: Option<crate::outcome::CancelKind>,
+    },
+    /// The caller cancelled after blocking work was admitted.
+    ///
+    /// A closure that already started is not preempted and may still settle the
+    /// storage effect after this error reaches the caller.
+    CancelledMidFlight {
+        /// Structured cancellation kind, when the caller context carries one.
+        kind: Option<crate::outcome::CancelKind>,
+    },
+    /// The blocking executor or its result-delivery path failed. The caller
+    /// must reconcile storage state before assuming that no effect occurred.
+    RuntimeFailure,
+    /// The cancellation watcher could not classify a timer failure while the
+    /// caller context was still live. Admitted work may still settle after this
+    /// error reaches the caller.
+    CancellationWatcherTimerFailure,
+}
+
+impl std::fmt::Display for RecorderBlockingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CancelledBeforeStart { kind } => {
+                write!(formatter, "cancelled before start (kind={kind:?})")
+            }
+            Self::CancelledMidFlight { kind } => {
+                write!(formatter, "cancelled mid-flight (kind={kind:?})")
+            }
+            Self::RuntimeFailure => formatter.write_str("runtime failure"),
+            Self::CancellationWatcherTimerFailure => {
+                formatter.write_str("cancellation watcher timer failure")
+            }
+        }
+    }
+}
+
 /// Storage-layer error type with stable classes.
 #[derive(Debug, Error)]
 pub enum RecorderStorageError {
@@ -394,6 +438,12 @@ pub enum RecorderStorageError {
         actual_backend: RecorderBackendKind,
     },
 
+    #[error("recorder {operation} blocking execution failed: {failure}")]
+    BlockingOperation {
+        operation: &'static str,
+        failure: RecorderBlockingFailure,
+    },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -427,6 +477,11 @@ impl RecorderStorageError {
             | Self::CorruptCachedReplayReceipt { .. }
             | Self::CorruptCachedReceiptEncoding { .. }
             | Self::BackendIdentityMismatch { .. } => RecorderStorageErrorClass::Corruption,
+            Self::BlockingOperation {
+                failure: RecorderBlockingFailure::RuntimeFailure,
+                ..
+            } => RecorderStorageErrorClass::DependencyUnavailable,
+            Self::BlockingOperation { .. } => RecorderStorageErrorClass::Retryable,
             Self::Io(_) => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
             Self::Sqlite(_) => RecorderStorageErrorClass::Retryable,
@@ -434,6 +489,47 @@ impl RecorderStorageError {
             Self::BackendUnavailable { .. } => RecorderStorageErrorClass::DependencyUnavailable,
         }
     }
+}
+
+fn recorder_blocking_error(
+    operation: &'static str,
+    error: crate::runtime_async::SpawnBlockingWithCxError,
+) -> RecorderStorageError {
+    use crate::runtime_async::SpawnBlockingWithCxError;
+
+    let failure = match error {
+        SpawnBlockingWithCxError::CancelledBeforeSpawn { kind } => {
+            RecorderBlockingFailure::CancelledBeforeStart { kind }
+        }
+        SpawnBlockingWithCxError::CancelledMidFlight { kind } => {
+            RecorderBlockingFailure::CancelledMidFlight { kind }
+        }
+        SpawnBlockingWithCxError::RuntimeFailure => RecorderBlockingFailure::RuntimeFailure,
+        SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
+            RecorderBlockingFailure::CancellationWatcherTimerFailure
+        }
+    };
+    RecorderStorageError::BlockingOperation { operation, failure }
+}
+
+fn recorder_blocking_runtime_error(operation: &'static str) -> RecorderStorageError {
+    RecorderStorageError::BlockingOperation {
+        operation,
+        failure: RecorderBlockingFailure::RuntimeFailure,
+    }
+}
+
+fn recorder_pre_cancelled_error(
+    operation: &'static str,
+    cx: &crate::cx::Cx,
+) -> Option<RecorderStorageError> {
+    cx.checkpoint().is_err().then(|| {
+        let kind = cx.root_cancel_cause().map(|reason| reason.kind);
+        RecorderStorageError::BlockingOperation {
+            operation,
+            failure: RecorderBlockingFailure::CancelledBeforeStart { kind },
+        }
+    })
 }
 
 /// Recorder storage boundary used by capture and indexing layers.
@@ -766,6 +862,17 @@ impl RecorderStorage for RecorderStorageInstance {
         }
     }
 
+    async fn flush_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.flush_with_cx(cx, mode).await,
+            Self::Rusqlite(inner) => inner.flush_with_cx(cx, mode).await,
+        }
+    }
+
     async fn read_checkpoint(
         &self,
         consumer: &CheckpointConsumerId,
@@ -836,7 +943,33 @@ pub fn bootstrap_recorder_storage(
 pub struct AppendLogRecorderStorage {
     config: AppendLogStorageConfig,
     in_flight: AtomicUsize,
+    flush_in_flight: Arc<AtomicUsize>,
     inner: Arc<Mutex<AppendLogInner>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RecorderFlushTestHook {
+    before: Arc<dyn Fn() + Send + Sync>,
+    after: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for RecorderFlushTestHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RecorderFlushTestHook(..)")
+    }
+}
+
+#[cfg(test)]
+impl RecorderFlushTestHook {
+    fn run_before(&self) {
+        (self.before)();
+    }
+
+    fn run_after(&self) {
+        (self.after)();
+    }
 }
 
 #[derive(Debug)]
@@ -852,6 +985,8 @@ struct AppendLogInner {
     idempotency_cache: HashMap<String, CachedAppendReceipt>,
     idempotency_order: VecDeque<String>,
     last_error: Option<String>,
+    #[cfg(test)]
+    flush_test_hook: Option<RecorderFlushTestHook>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -981,17 +1116,26 @@ impl AppendLogRecorderStorage {
             idempotency_cache: HashMap::new(),
             idempotency_order: VecDeque::new(),
             last_error: None,
+            #[cfg(test)]
+            flush_test_hook: None,
         };
 
         Ok(Self {
             config,
             in_flight: AtomicUsize::new(0),
+            flush_in_flight: Arc::new(AtomicUsize::new(0)),
             inner: Arc::new(Mutex::new(inner)),
         })
     }
 
     fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
         try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
+    }
+
+    fn try_acquire_flush_slot(
+        &self,
+    ) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+        try_acquire_owned_bounded_slot(&self.flush_in_flight, 1)
     }
 
     fn persist_state(inner: &AppendLogInner) -> std::result::Result<(), RecorderStorageError> {
@@ -1064,6 +1208,58 @@ impl AppendLogRecorderStorage {
         response.committed_at_ms = crate::recording::epoch_ms_now();
         Ok(())
     }
+
+    async fn flush_on_blocking_thread(
+        inner: Arc<Mutex<AppendLogInner>>,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        // Caller cancellation controls the wait for admission, not settlement of
+        // an already-admitted storage effect. Use a live infrastructure context
+        // for the serialization lock so a mid-flight caller cancellation cannot
+        // strand the owned blocking closure before it reaches a terminal result.
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = inner.lock_with_cx(&settlement_cx).await.map_err(|_| {
+            RecorderStorageError::Io(std::io::Error::other(
+                "recorder append-log flush serialization lock failed",
+            ))
+        })?;
+
+        #[cfg(test)]
+        let flush_test_hook = inner.flush_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &flush_test_hook {
+            hook.run_before();
+        }
+
+        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
+            inner.writer.flush()?;
+            if mode == FlushMode::Durable {
+                inner.writer.get_ref().sync_data()?;
+            }
+            Self::persist_state(&inner)?;
+            Ok(FlushStats {
+                backend: RecorderBackendKind::AppendLog,
+                flushed_at_ms: crate::recording::epoch_ms_now(),
+                latest_offset: Self::latest_offset(&inner),
+            })
+        })();
+
+        #[cfg(test)]
+        if let Some(hook) = &flush_test_hook {
+            hook.run_after();
+        }
+
+        match result {
+            Ok(stats) => {
+                Self::clear_last_error(&mut inner);
+                Ok(stats)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "flush", &err);
+                Err(err)
+            }
+        }
+    }
 }
 
 struct InFlightGuard<'a> {
@@ -1071,6 +1267,16 @@ struct InFlightGuard<'a> {
 }
 
 impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct OwnedInFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for OwnedInFlightGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1093,6 +1299,32 @@ fn try_acquire_bounded_slot(
             Ordering::Acquire,
         ) {
             Ok(_) => return Ok(InFlightGuard { counter }),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn try_acquire_owned_bounded_slot(
+    counter: &Arc<AtomicUsize>,
+    capacity: usize,
+) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= capacity {
+            return Err(RecorderStorageError::QueueFull { capacity });
+        }
+
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Ok(OwnedInFlightGuard {
+                    counter: Arc::clone(counter),
+                });
+            }
             Err(observed) => current = observed,
         }
     }
@@ -1288,30 +1520,32 @@ impl RecorderStorage for AppendLogRecorderStorage {
         &self,
         mode: FlushMode,
     ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        let mut inner = self.inner.lock().await;
-        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
-            inner.writer.flush()?;
-            if mode == FlushMode::Durable {
-                inner.writer.get_ref().sync_data()?;
-            }
-            Self::persist_state(&inner)?;
-            Ok(FlushStats {
-                backend: RecorderBackendKind::AppendLog,
-                flushed_at_ms: crate::recording::epoch_ms_now(),
-                latest_offset: Self::latest_offset(&inner),
-            })
-        })();
+        let flush_slot = self.try_acquire_flush_slot()?;
+        let inner = Arc::clone(&self.inner);
+        crate::runtime_async::spawn_blocking(move || {
+            let _flush_slot = flush_slot;
+            futures::executor::block_on(Self::flush_on_blocking_thread(inner, mode))
+        })
+        .await
+        .map_err(|_| recorder_blocking_runtime_error("flush"))?
+    }
 
-        match result {
-            Ok(stats) => {
-                Self::clear_last_error(&mut inner);
-                Ok(stats)
-            }
-            Err(err) => {
-                Self::record_last_error(&mut inner, "flush", &err);
-                Err(err)
-            }
+    async fn flush_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        if let Some(error) = recorder_pre_cancelled_error("flush", cx) {
+            return Err(error);
         }
+        let flush_slot = self.try_acquire_flush_slot()?;
+        let inner = Arc::clone(&self.inner);
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            let _flush_slot = flush_slot;
+            futures::executor::block_on(Self::flush_on_blocking_thread(inner, mode))
+        })
+        .await
+        .map_err(|error| recorder_blocking_error("flush", error))?
     }
 
     async fn read_checkpoint(
@@ -1412,12 +1646,15 @@ impl RecorderStorage for AppendLogRecorderStorage {
 pub struct RusqliteRecorderStorage {
     config: RusqliteStorageConfig,
     in_flight: AtomicUsize,
+    flush_in_flight: Arc<AtomicUsize>,
     inner: Arc<Mutex<RusqliteInner>>,
 }
 
 struct RusqliteInner {
     conn: Connection,
     last_error: Option<String>,
+    #[cfg(test)]
+    flush_test_hook: Option<RecorderFlushTestHook>,
 }
 
 impl std::fmt::Debug for RusqliteRecorderStorage {
@@ -1426,6 +1663,10 @@ impl std::fmt::Debug for RusqliteRecorderStorage {
             .field("db_path", &self.config.db_path)
             .field("queue_capacity", &self.config.queue_capacity)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
+            .field(
+                "flush_in_flight",
+                &self.flush_in_flight.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1441,9 +1682,12 @@ impl RusqliteRecorderStorage {
         Ok(Self {
             config,
             in_flight: AtomicUsize::new(0),
+            flush_in_flight: Arc::new(AtomicUsize::new(0)),
             inner: Arc::new(Mutex::new(RusqliteInner {
                 conn,
                 last_error: None,
+                #[cfg(test)]
+                flush_test_hook: None,
             })),
         })
     }
@@ -1455,6 +1699,12 @@ impl RusqliteRecorderStorage {
 
     fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
         try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
+    }
+
+    fn try_acquire_flush_slot(
+        &self,
+    ) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
+        try_acquire_owned_bounded_slot(&self.flush_in_flight, 1)
     }
 
     fn clear_last_error(inner: &mut RusqliteInner) {
@@ -1659,6 +1909,58 @@ impl RusqliteRecorderStorage {
         .map_err(sqlite_error)?;
         Ok(())
     }
+
+    async fn flush_on_blocking_thread(
+        inner: Arc<Mutex<RusqliteInner>>,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        // An admitted SQLite checkpoint remains owned even when the caller
+        // stops waiting. Do not let caller cancellation abort the per-backend
+        // serialization acquire and leave the closure with an unknown lifetime.
+        let settlement_cx = crate::cx::for_request();
+        let mut inner = inner.lock_with_cx(&settlement_cx).await.map_err(|_| {
+            RecorderStorageError::Io(std::io::Error::other(
+                "recorder rusqlite flush serialization lock failed",
+            ))
+        })?;
+
+        #[cfg(test)]
+        let flush_test_hook = inner.flush_test_hook.clone();
+        #[cfg(test)]
+        if let Some(hook) = &flush_test_hook {
+            hook.run_before();
+        }
+
+        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
+            if mode == FlushMode::Durable {
+                inner
+                    .conn
+                    .execute_batch("PRAGMA wal_checkpoint(FULL);")
+                    .map_err(sqlite_error)?;
+            }
+            Ok(FlushStats {
+                backend: RecorderBackendKind::Rusqlite,
+                flushed_at_ms: crate::recording::epoch_ms_now(),
+                latest_offset: sqlite_latest_storage_offset(&inner.conn)?,
+            })
+        })();
+
+        #[cfg(test)]
+        if let Some(hook) = &flush_test_hook {
+            hook.run_after();
+        }
+
+        match result {
+            Ok(stats) => {
+                Self::clear_last_error(&mut inner);
+                Ok(stats)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "flush", &err);
+                Err(err)
+            }
+        }
+    }
 }
 
 impl RecorderStorage for RusqliteRecorderStorage {
@@ -1831,30 +2133,32 @@ impl RecorderStorage for RusqliteRecorderStorage {
         &self,
         mode: FlushMode,
     ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        let mut inner = self.inner.lock().await;
-        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
-            if mode == FlushMode::Durable {
-                inner
-                    .conn
-                    .execute_batch("PRAGMA wal_checkpoint(FULL);")
-                    .map_err(sqlite_error)?;
-            }
-            Ok(FlushStats {
-                backend: RecorderBackendKind::Rusqlite,
-                flushed_at_ms: crate::recording::epoch_ms_now(),
-                latest_offset: sqlite_latest_storage_offset(&inner.conn)?,
-            })
-        })();
-        match result {
-            Ok(stats) => {
-                Self::clear_last_error(&mut inner);
-                Ok(stats)
-            }
-            Err(err) => {
-                Self::record_last_error(&mut inner, "flush", &err);
-                Err(err)
-            }
+        let flush_slot = self.try_acquire_flush_slot()?;
+        let inner = Arc::clone(&self.inner);
+        crate::runtime_async::spawn_blocking(move || {
+            let _flush_slot = flush_slot;
+            futures::executor::block_on(Self::flush_on_blocking_thread(inner, mode))
+        })
+        .await
+        .map_err(|_| recorder_blocking_runtime_error("flush"))?
+    }
+
+    async fn flush_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        if let Some(error) = recorder_pre_cancelled_error("flush", cx) {
+            return Err(error);
         }
+        let flush_slot = self.try_acquire_flush_slot()?;
+        let inner = Arc::clone(&self.inner);
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            let _flush_slot = flush_slot;
+            futures::executor::block_on(Self::flush_on_blocking_thread(inner, mode))
+        })
+        .await
+        .map_err(|error| recorder_blocking_error("flush", error))?
     }
 
     async fn read_checkpoint(
@@ -2886,8 +3190,8 @@ mod tests {
         RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
         RecorderTextEncoding,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
     use tempfile::tempdir;
 
     fn run_async_test<F>(future: F)
@@ -2920,6 +3224,64 @@ mod tests {
         if let Err(payload) = cleanup {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    async fn install_flush_test_hook(
+        storage: &RecorderStorageInstance,
+        hook: RecorderFlushTestHook,
+    ) {
+        match storage {
+            RecorderStorageInstance::AppendLog(storage) => {
+                storage.inner.lock().await.flush_test_hook = Some(hook);
+            }
+            RecorderStorageInstance::Rusqlite(storage) => {
+                storage.inner.lock().await.flush_test_hook = Some(hook);
+            }
+        }
+    }
+
+    async fn clear_flush_test_hook(storage: &RecorderStorageInstance) {
+        match storage {
+            RecorderStorageInstance::AppendLog(storage) => {
+                storage.inner.lock().await.flush_test_hook = None;
+            }
+            RecorderStorageInstance::Rusqlite(storage) => {
+                storage.inner.lock().await.flush_test_hook = None;
+            }
+        }
+    }
+
+    async fn wait_for_test_flag(flag: &AtomicBool, description: &'static str) {
+        crate::runtime_async::timeout(std::time::Duration::from_secs(5), async {
+            while !flag.load(Ordering::Acquire) {
+                crate::runtime_async::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("timed out waiting for {description}: {error}"));
+    }
+
+    type FlushReleaseGate = (StdMutex<bool>, Condvar);
+
+    fn wait_for_flush_test_release(gate: &FlushReleaseGate, backend: RecorderBackendKind) {
+        let released = gate.0.lock().unwrap();
+        let (released, _) = gate
+            .1
+            .wait_timeout_while(released, std::time::Duration::from_secs(5), |released| {
+                !*released
+            })
+            .unwrap();
+        assert!(
+            *released,
+            "{backend} timed out waiting for the executor-side flush release"
+        );
+    }
+
+    fn release_flush_test_gate(gate: &FlushReleaseGate) {
+        let mut released = gate.0.lock().unwrap();
+        *released = true;
+        drop(released);
+        gate.1.notify_all();
     }
 
     fn sample_event(event_id: &str, pane_id: u64, sequence: u64, text: &str) -> RecorderEvent {
@@ -5221,6 +5583,263 @@ recorder_backend = "frankensqlite"
     // ── Durability levels ────────────────────────────────────────────
 
     #[test]
+    fn flush_with_cx_leaves_executor_responsive_and_reopens_for_both_backends() {
+        run_async_test(async {
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempdir().unwrap();
+                let mut config = recorder_test_config(dir.path());
+                config.backend = backend;
+                let storage = bootstrap_recorder_storage(config.clone()).unwrap();
+                storage
+                    .append_batch(AppendRequest {
+                        batch_id: format!("blocking-flush-{backend}"),
+                        events: vec![sample_event("blocking-flush-event", 1, 0, "durable")],
+                        required_durability: DurabilityLevel::Enqueued,
+                        producer_ts_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+
+                let polling_thread = std::thread::current().id();
+                let blocking_thread = Arc::new(StdMutex::new(None));
+                let started = Arc::new(AtomicBool::new(false));
+                let completed = Arc::new(AtomicBool::new(false));
+                let sibling_ran = Arc::new(AtomicBool::new(false));
+                let release = Arc::new((StdMutex::new(false), Condvar::new()));
+                let hook = RecorderFlushTestHook {
+                    before: {
+                        let blocking_thread = Arc::clone(&blocking_thread);
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        Arc::new(move || {
+                            *blocking_thread.lock().unwrap() = Some(std::thread::current().id());
+                            started.store(true, Ordering::Release);
+                            wait_for_flush_test_release(&release, backend);
+                        })
+                    },
+                    after: {
+                        let completed = Arc::clone(&completed);
+                        Arc::new(move || completed.store(true, Ordering::Release))
+                    },
+                };
+                install_flush_test_hook(&storage, hook).await;
+
+                let cx = crate::cx::for_request();
+                let sibling = async {
+                    wait_for_test_flag(&started, "blocking recorder flush admission").await;
+                    sibling_ran.store(true, Ordering::Release);
+                    release_flush_test_gate(&release);
+                };
+                let (flush, ()) =
+                    futures::join!(storage.flush_with_cx(&cx, FlushMode::Durable), sibling);
+                let stats = flush.unwrap();
+
+                assert_eq!(stats.backend, backend);
+                assert_eq!(
+                    stats.latest_offset.as_ref().map(|offset| offset.ordinal),
+                    Some(0)
+                );
+                assert!(sibling_ran.load(Ordering::Acquire));
+                assert!(completed.load(Ordering::Acquire));
+                assert_ne!(
+                    *blocking_thread.lock().unwrap(),
+                    Some(polling_thread),
+                    "{backend} flush body ran inline on the executor thread"
+                );
+
+                drop(storage);
+                let reopened = bootstrap_recorder_storage(config).unwrap();
+                assert_eq!(
+                    reopened
+                        .health()
+                        .await
+                        .latest_offset
+                        .as_ref()
+                        .map(|offset| offset.ordinal),
+                    Some(0),
+                    "{backend} durable flush did not survive reopen"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn flush_with_cx_pre_cancel_never_enters_blocking_body() {
+        run_async_test(async {
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempdir().unwrap();
+                let mut config = recorder_test_config(dir.path());
+                config.backend = backend;
+                let storage = bootstrap_recorder_storage(config).unwrap();
+                let entered = Arc::new(AtomicBool::new(false));
+                install_flush_test_hook(
+                    &storage,
+                    RecorderFlushTestHook {
+                        before: {
+                            let entered = Arc::clone(&entered);
+                            Arc::new(move || entered.store(true, Ordering::Release))
+                        },
+                        after: Arc::new(|| {}),
+                    },
+                )
+                .await;
+
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("recorder flush pre-cancel test"),
+                );
+                let error = storage
+                    .flush_with_cx(&cx, FlushMode::Durable)
+                    .await
+                    .expect_err("pre-cancelled flush must not report success");
+                assert!(matches!(
+                    error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "flush",
+                        failure: RecorderBlockingFailure::CancelledBeforeStart {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    }
+                ));
+                assert!(
+                    !entered.load(Ordering::Acquire),
+                    "{backend} pre-cancelled flush entered the blocking body"
+                );
+                clear_flush_test_hook(&storage).await;
+                assert_eq!(
+                    storage.flush(FlushMode::Buffered).await.unwrap().backend,
+                    backend,
+                    "{backend} pre-cancellation leaked its exclusive flush admission"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn flush_with_cx_midflight_cancel_is_non_success_and_retry_reconciles() {
+        run_async_test(async {
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempdir().unwrap();
+                let mut config = recorder_test_config(dir.path());
+                config.backend = backend;
+                let storage = bootstrap_recorder_storage(config.clone()).unwrap();
+                storage
+                    .append_batch(AppendRequest {
+                        batch_id: format!("cancelled-flush-{backend}"),
+                        events: vec![sample_event("cancelled-flush-event", 1, 0, "settle")],
+                        required_durability: DurabilityLevel::Enqueued,
+                        producer_ts_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+
+                let started = Arc::new(AtomicBool::new(false));
+                let completed = Arc::new(AtomicBool::new(false));
+                let release = Arc::new((StdMutex::new(false), Condvar::new()));
+                install_flush_test_hook(
+                    &storage,
+                    RecorderFlushTestHook {
+                        before: {
+                            let started = Arc::clone(&started);
+                            let release = Arc::clone(&release);
+                            Arc::new(move || {
+                                started.store(true, Ordering::Release);
+                                wait_for_flush_test_release(&release, backend);
+                            })
+                        },
+                        after: {
+                            let completed = Arc::clone(&completed);
+                            Arc::new(move || completed.store(true, Ordering::Release))
+                        },
+                    },
+                )
+                .await;
+
+                let cx = crate::cx::for_testing();
+                let controller = async {
+                    wait_for_test_flag(&started, "mid-flight recorder flush admission").await;
+                    let pre_cancelled_cx = crate::cx::for_testing();
+                    pre_cancelled_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("concurrent recorder flush pre-cancel test"),
+                    );
+                    let pre_cancelled = storage
+                        .flush_with_cx(&pre_cancelled_cx, FlushMode::Buffered)
+                        .await
+                        .expect_err("pre-cancellation must take precedence over overload");
+                    assert!(matches!(
+                        pre_cancelled,
+                        RecorderStorageError::BlockingOperation {
+                            operation: "flush",
+                            failure: RecorderBlockingFailure::CancelledBeforeStart {
+                                kind: Some(crate::outcome::CancelKind::User)
+                            }
+                        }
+                    ));
+                    let overload = storage
+                        .flush(FlushMode::Buffered)
+                        .await
+                        .expect_err("a second flush must not occupy another blocking worker");
+                    assert!(
+                        matches!(overload, RecorderStorageError::QueueFull { capacity: 1 }),
+                        "{backend} returned the wrong concurrent-flush admission error: {overload}"
+                    );
+                    cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("recorder flush mid-flight cancel test"),
+                    );
+                    crate::runtime_async::sleep(std::time::Duration::from_millis(200)).await;
+                    assert!(
+                        !completed.load(Ordering::Acquire),
+                        "{backend} completed while its flush body was still deliberately blocked"
+                    );
+                    release_flush_test_gate(&release);
+                };
+                let (flush_result, ()) =
+                    futures::join!(storage.flush_with_cx(&cx, FlushMode::Durable), controller);
+                let error = flush_result
+                    .expect_err("mid-flight cancellation must not report durable success");
+                assert!(matches!(
+                    error,
+                    RecorderStorageError::BlockingOperation {
+                        operation: "flush",
+                        failure: RecorderBlockingFailure::CancelledMidFlight {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    }
+                ));
+                clear_flush_test_hook(&storage).await;
+                let reconciled = storage.flush(FlushMode::Durable).await.unwrap();
+                assert_eq!(reconciled.backend, backend);
+                assert!(completed.load(Ordering::Acquire));
+                drop(storage);
+
+                let reopened = bootstrap_recorder_storage(config).unwrap();
+                assert_eq!(
+                    reopened
+                        .health()
+                        .await
+                        .latest_offset
+                        .as_ref()
+                        .map(|offset| offset.ordinal),
+                    Some(0),
+                    "{backend} retry did not reconcile the cancelled flush before reopen"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn enqueued_durability_does_not_fsync() {
         run_async_test(async {
             let dir = tempdir().unwrap();
@@ -5493,6 +6112,57 @@ recorder_backend = "frankensqlite"
             actual_backend: RecorderBackendKind::AppendLog,
         };
         assert_eq!(err.class(), RecorderStorageErrorClass::Corruption);
+    }
+
+    #[test]
+    fn blocking_failure_mapping_is_structured_and_classified() {
+        use crate::runtime_async::SpawnBlockingWithCxError;
+
+        let cases = [
+            (
+                SpawnBlockingWithCxError::CancelledBeforeSpawn {
+                    kind: Some(crate::outcome::CancelKind::User),
+                },
+                RecorderBlockingFailure::CancelledBeforeStart {
+                    kind: Some(crate::outcome::CancelKind::User),
+                },
+                RecorderStorageErrorClass::Retryable,
+            ),
+            (
+                SpawnBlockingWithCxError::CancelledMidFlight {
+                    kind: Some(crate::outcome::CancelKind::Deadline),
+                },
+                RecorderBlockingFailure::CancelledMidFlight {
+                    kind: Some(crate::outcome::CancelKind::Deadline),
+                },
+                RecorderStorageErrorClass::Retryable,
+            ),
+            (
+                SpawnBlockingWithCxError::RuntimeFailure,
+                RecorderBlockingFailure::RuntimeFailure,
+                RecorderStorageErrorClass::DependencyUnavailable,
+            ),
+            (
+                SpawnBlockingWithCxError::CancellationWatcherTimerFailure,
+                RecorderBlockingFailure::CancellationWatcherTimerFailure,
+                RecorderStorageErrorClass::Retryable,
+            ),
+        ];
+
+        for (source, expected_failure, expected_class) in cases {
+            let error = recorder_blocking_error("flush", source);
+            assert_eq!(error.class(), expected_class);
+            let RecorderStorageError::BlockingOperation { operation, failure } = error else {
+                panic!("blocking error mapping returned a non-blocking variant");
+            };
+            assert_eq!(operation, "flush");
+            assert_eq!(failure, expected_failure);
+            let json = serde_json::to_string(&failure).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RecorderBlockingFailure>(&json).unwrap(),
+                failure
+            );
+        }
     }
 
     // ── Backend kind ─────────────────────────────────────────────────
