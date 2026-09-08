@@ -644,15 +644,15 @@
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 70
+        "test": 71
       },
-      "fork_side_commit_count": 549,
+      "fork_side_commit_count": 550,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-08T00:43:18-04:00",
-        "sha": "b3cbe944ce2353821cb9fca106e9bff5b7f26b9f",
-        "subject": "test(guardian): align authority audit with sealed build and replay paths"
+        "committed_at": "2026-09-08T01:54:55-04:00",
+        "sha": "4632b06fc1bcb12b5c92ec55d9cab087f32af59f",
+        "subject": "test(mux): exercise authenticated capture under real contention"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -847,20 +847,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 13,
-        "fix": 30,
+        "fix": 31,
         "other": 15,
         "refactor": 2,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 93,
+      "fork_side_commit_count": 94,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-08T00:34:37-04:00",
-        "sha": "3a26f3681f8c0e29b89fe6669ac186404e81cfa1",
-        "subject": "fix(reflow): support minimal features and validate live-source changes"
+        "committed_at": "2026-09-08T01:55:57-04:00",
+        "sha": "308eb8b17a81d3e3f68d42ebbe814a2fd9400f1a",
+        "subject": "fix(reflow): clamp lookahead without overflowing its endpoint"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2432,
-  "generated_at": "2026-09-08T04:52:48.322967Z",
+  "fork_side_commit_total": 2434,
+  "generated_at": "2026-09-08T05:56:19.799525Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
