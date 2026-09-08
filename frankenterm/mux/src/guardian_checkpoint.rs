@@ -10291,6 +10291,8 @@ mod tests {
             "from_output_cipher:pub:GuardianOutputCipher",
             "inspect_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_ack_finalizer_with_adoption:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointReceipt,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_catalog_adoption_evidence:pub:GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_catalog_adoption_evidence_with_seed:pub:GuardianCheckpointCatalogAdoptionEvidenceSeedV1,GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_durable_manifest_receipt:pub:GuardianCheckpointStageBindingV1,GuardianCheckpointStageRequestV1,Uuid,GuardianCheckpointCandidateIdentityV1,GuardianCheckpointOrderedChunkSetIdentityV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_expiry_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_expiry_finalizer_with_policy:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointPolicyExpiryReceiptV1,GuardianEncryptedCheckpointStageRecordV1",
@@ -10303,9 +10305,11 @@ mod tests {
             "retry_seal_manifest:pub:GuardianCheckpointManifestRetryCapabilityV1",
             "seal:pub:GuardianCheckpointStageSealIntentV1",
             "seal_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointReceipt",
+            "seal_catalog_adoption_evidence:pub:GuardianCheckpointCatalogAdoptionEvidenceSeedV1,GuardianCheckpointCatalogAdoptionBindingV1",
             "seal_exact_payload:private:GuardianCheckpointStageRecordContextV1,u8,u8",
             "seal_expiry_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointPolicyExpiryReceiptV1",
             "seal_manifest:pub:GuardianCheckpointValidatedManifestOperationV1",
+            "seal_replay_stable_catalog_adoption_payload:private:GuardianCheckpointStageRecordContextV1,u8,u8",
             "seal_validated_manifest:private:GuardianCheckpointValidatedManifestOperationV1",
         ]
         .into_iter()
@@ -10417,6 +10421,12 @@ mod tests {
                 "private",
                 false,
                 "fn seal_exact_payload(&self, context: GuardianCheckpointStageRecordContextV1, plaintext: &[u8], expected_plaintext_digest: &[u8; 32]) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn seal_replay_stable_catalog_adoption_payload(&self, context: GuardianCheckpointStageRecordContextV1, plaintext: &[u8], expected_plaintext_digest: &[u8; 32]) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointCipher",

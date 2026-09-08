@@ -5284,39 +5284,139 @@ mod disruptor_ring_keep_gate {
 
     #[test]
     fn checkpoint_lock_drains_disruptor_before_pending_actions_and_model_capture() {
-        let size = term_size(10, 1);
-        let mut parser = termwiz::escape::parser::Parser::new();
-        let mut staged = Vec::new();
-        parser.parse(b"a", |action| action.append_to(&mut staged));
-        let mut pending = Vec::new();
-        parser.parse(b"b", |action| action.append_to(&mut pending));
-        let ground = parser
-            .recovery_ground_boundary()
-            .expect("two printable bytes end at parser ground");
+        use crate::guardian_checkpoint::capture_and_bind_live_parser_checkpoint;
+        use crate::guardian_output_journal::{
+            GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
+            GuardianOutputSegmentIdentity,
+        };
+        use std::io::Read;
 
-        let pane = LocalPane::new(
+        let size = term_size(10, 1);
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let segment =
+            GuardianOutputSegmentIdentity::new(durable_pane_id, uuid::Uuid::new_v4(), 1, None)
+                .expect("valid checkpoint segment");
+        let directory = tempfile::tempdir().expect("private journal directory");
+        let directory_file = std::fs::File::open(directory.path()).expect("open journal parent");
+        rustix::fs::fchmod(&directory_file, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make journal parent private");
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &directory_file,
+            std::ffi::OsStr::new("checkpoint.segment"),
+            segment,
+            GuardianOutputCipher::try_from_key_slice(&[0x5a; 32]).expect("valid cipher"),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create checkpoint journal");
+        journal
+            .sync_parent_directory_and_activate()
+            .expect("activate checkpoint journal");
+        let receipt = journal.append_and_sync(b"ab").expect("commit parser bytes");
+
+        let pane = Arc::new(LocalPane::new(
             1,
             test_terminal(size),
             Box::new(TestChild),
             Box::new(TestMasterPty),
             Box::new(Vec::<u8>::new()),
             1,
-            *uuid::Uuid::new_v4().as_bytes(),
+            *durable_pane_id.as_bytes(),
             "checkpoint-disruptor-test".to_string(),
+        ));
+        let registered_pane: Arc<dyn Pane> = pane.clone();
+        let mux = Arc::new(crate::Mux::new(None));
+        let generation = crate::PaneRegistrationGeneration::new(
+            pane.pane_id(),
+            &mux.pane_retirements,
+            Arc::downgrade(&mux),
         );
-        pane.perform_actions(staged);
+        {
+            let _registration = mux.pane_registration.lock();
+            mux.insert_pane_registration_locked(
+                pane.pane_id(),
+                pane.domain_id(),
+                &registered_pane,
+                &generation,
+            )
+            .expect("register checkpoint pane without a competing parser thread");
+        }
+        let operation = mux
+            .capture_pane_operation(pane.pane_id())
+            .expect("admit current pane operation");
+        let control = &generation.live_parser_checkpoint;
+        let (mut writer, mut reader) = crate::allocate_socketpair().expect("parser socket");
+        writer
+            .set_non_blocking(true)
+            .expect("nonblocking parser writer");
+        let (mut wake_writer, _wake_reader) = crate::allocate_socketpair().expect("wake socket");
+        wake_writer
+            .set_non_blocking(true)
+            .expect("nonblocking wake writer");
+        control
+            .attach_reader_channels(writer, wake_writer)
+            .expect("attach parser channels");
+        let target = operation
+            .authorize_guardian_output_delivery(segment, receipt, Arc::<[u8]>::from(&b"ab"[..]))
+            .expect("authorize the exact journal bytes for this registration");
+        control
+            .write_delivered_bytes(b"ab")
+            .expect("deliver authenticated bytes");
+        let mut delivered = [0; 2];
+        reader
+            .read_exact(&mut delivered)
+            .expect("read delivered parser bytes");
+        assert_eq!(&delivered, b"ab");
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut staged = Vec::new();
+        parser.parse(&delivered[..1], |action| action.append_to(&mut staged));
+        let mut pending = Vec::new();
+        parser.parse(&delivered[1..], |action| action.append_to(&mut pending));
+        assert_eq!(
+            control.record_parsed_bytes(delivered.len()).unwrap(),
+            target
+        );
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("two printable bytes end at parser ground");
+        let limits = TerminalCheckpointLimits::default();
+        let (request_id, completion) = control
+            .register_checkpoint(
+                &registered_pane,
+                &generation,
+                durable_pane_id,
+                segment,
+                receipt,
+                limits,
+            )
+            .expect("register checkpoint at the authenticated delivery fence");
+        let request = control
+            .begin_capture(target)
+            .unwrap()
+            .expect("admit capture");
+        let capture_operation = generation.try_acquire().expect("lease current generation");
+        {
+            // An idle producer applies immediately. Exercise real contention
+            // so capture, rather than the producer, must drain this batch.
+            let _terminal = pane.terminal.lock();
+            pane.perform_actions(staged);
+        }
         assert!(
             !pane.action_ring.is_empty(),
             "fixture must stage its first parser batch in the disruptor"
         );
-        let checkpoint = pane
-            .capture_live_parser_checkpoint(
-                LiveParserCaptureAuthority::issue_for_test(),
-                &mut pending,
-                ground,
-                TerminalCheckpointLimits::default(),
-            )
-            .expect("capture model through the production LocalPane lock path");
+        let checkpoint = capture_and_bind_live_parser_checkpoint(
+            &registered_pane,
+            &capture_operation,
+            &request,
+            &mut pending,
+            ground,
+        )
+        .expect("capture model through the production LocalPane lock path");
+        control.complete_capture(request_id, Ok(checkpoint));
+        let checkpoint = completion
+            .try_recv()
+            .unwrap()
+            .expect("publish captured model");
 
         assert!(
             pane.action_ring.is_empty(),
@@ -5332,6 +5432,20 @@ mod disruptor_ring_keep_gate {
             2,
             "ring action must precede pending action in captured model"
         );
+        assert_eq!(pane.get_lines(0..1).1[0].as_str().trim_end(), "ab");
+        assert_eq!(
+            checkpoint.terminal_checkpoint().canonical_payload(),
+            pane.terminal
+                .lock()
+                .capture_recovery_checkpoint(limits)
+                .unwrap()
+                .canonical_payload(),
+            "published checkpoint must contain the complete ordered model"
+        );
+        control.close_reader_channels();
+        drop(capture_operation);
+        drop(operation);
+        assert!(mux.remove_pane_registration_if_same(pane.pane_id(), &registered_pane));
     }
 
     #[test]

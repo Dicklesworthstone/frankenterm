@@ -2998,7 +2998,14 @@ mod tests {
             FILE_HEADER_BYTES_U64 + RECORD_HEADER_BYTES_U64,
         ))
         .expect("seek ciphertext");
-        file.write_all(&[0xff]).expect("corrupt ciphertext");
+        let mut ciphertext_byte = [0];
+        file.read_exact(&mut ciphertext_byte)
+            .expect("read ciphertext byte");
+        ciphertext_byte[0] ^= 1;
+        file.seek(SeekFrom::Current(-1))
+            .expect("seek back to ciphertext byte");
+        file.write_all(&ciphertext_byte)
+            .expect("corrupt ciphertext");
         file.sync_all().expect("sync corruption");
         drop(file);
         assert!(matches!(
