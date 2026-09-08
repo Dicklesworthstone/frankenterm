@@ -3925,11 +3925,16 @@ fn pane_axis_constraints(
     overrides: &HashMap<PaneId, PaneConstraints>,
 ) -> AxisConstraints {
     let constraints = effective_pane_constraints(pane, overrides);
-    let dims = pane.get_dimensions();
-    let fixed_size = match axis {
-        Axis::Width => Some(dims.cols),
-        Axis::Height => Some(dims.viewport_rows),
-    };
+    // Only fixed panes constrain layout to their current size. Querying an
+    // ordinary pane here needlessly waits on its terminal mutex while the
+    // parser may be persisting scrollback, before resize work can be queued.
+    let fixed_size = constraints.fixed.then(|| {
+        let dims = pane.get_dimensions();
+        match axis {
+            Axis::Width => dims.cols,
+            Axis::Height => dims.viewport_rows,
+        }
+    });
     axis_constraints_from_pane_constraints(constraints, axis, fixed_size)
 }
 

@@ -4953,6 +4953,54 @@ mod tests {
     }
 
     #[test]
+    fn tab_resize_admission_does_not_wait_for_ordinary_pane_terminal() {
+        let pane = Arc::new(LocalPane::new(
+            703,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x73; 16],
+            "resize-admission-test".to_string(),
+        ));
+        let tab = Arc::new(crate::tab::Tab::new(&term_size(80, 24)));
+        let dynamic_pane: Arc<dyn Pane> = pane.clone();
+        tab.assign_pane(&dynamic_pane);
+
+        // Reproduce a parser holding the real terminal mutex during a spill.
+        // Planning and queue admission must return before that lock is freed;
+        // the existing resize worker is allowed to wait for model ownership.
+        let terminal = pane.terminal.lock();
+        let target = term_size(120, 30);
+        let (started_tx, started_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        let resizing_tab = Arc::clone(&tab);
+        let resize = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            resizing_tab.resize(target);
+            done_tx.send(resizing_tab.get_size()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let admitted = done_rx.recv_timeout(Duration::from_secs(2));
+        // Always release contention and join, including the regressed path.
+        drop(terminal);
+        resize.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.resize_queue.lock().worker_running {
+            assert!(Instant::now() < deadline, "resize worker did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            admitted.expect("ordinary pane layout waited for the terminal mutex"),
+            target,
+        );
+        assert_eq!(pane.terminal.lock().get_size(), target);
+    }
+
+    #[test]
     fn resize_preparation_releases_locks_and_observes_supersession() {
         let terminal = Mutex::new(Terminal::new(
             term_size(80, 3),
