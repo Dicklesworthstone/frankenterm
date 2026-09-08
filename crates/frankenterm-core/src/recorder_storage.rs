@@ -1302,8 +1302,18 @@ impl RecorderStorage for AppendLogRecorderStorage {
             };
 
             if outcome == CheckpointCommitOutcome::Advanced {
-                inner.checkpoints.insert(key, checkpoint);
-                self.persist_state(&inner)?;
+                // Publish in memory only after the state-file replacement
+                // succeeds. Otherwise a failed save makes an equal retry
+                // return NoopAlreadyAdvanced without ever saving its progress.
+                let mut persisted = PersistedState {
+                    segment_id: inner.segment_id,
+                    next_offset: inner.next_offset,
+                    next_ordinal: inner.next_ordinal,
+                    checkpoints: inner.checkpoints.clone(),
+                };
+                persisted.checkpoints.insert(key, checkpoint);
+                write_persisted_state(&self.config.state_path, &persisted)?;
+                inner.checkpoints = persisted.checkpoints;
             }
 
             Ok(outcome)

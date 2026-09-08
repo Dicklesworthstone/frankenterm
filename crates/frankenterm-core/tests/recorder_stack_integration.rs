@@ -22,8 +22,9 @@ use frankenterm_core::recorder_retention::{
     RetentionConfig, RetentionManager, SegmentMeta, SegmentPhase, SensitivityTier,
 };
 use frankenterm_core::recorder_storage::{
-    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel, FlushMode,
-    RecorderStorage, RecorderStorageErrorClass,
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointCommitOutcome,
+    CheckpointConsumerId, DurabilityLevel, FlushMode, RecorderCheckpoint, RecorderStorage,
+    RecorderStorageError, RecorderStorageErrorClass,
 };
 use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
@@ -46,7 +47,22 @@ where
         .enable_all()
         .build()
         .expect("failed to build test runtime");
-    runtime.block_on(future);
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(future);
+    }));
+    let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(runtime);
+    }));
+    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frankenterm_core::runtime_async::clear_runtime_handle();
+    }));
+    // Attempt every cleanup step without discarding failures or masking the
+    // original test-body assertion with a later teardown failure.
+    for result in [body, teardown, cleanup] {
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 }
 
 // =============================================================================
@@ -114,6 +130,124 @@ fn storage_config(path: &std::path::Path) -> AppendLogStorageConfig {
         max_batch_bytes: 1024 * 1024,
         max_idempotency_entries: 32,
     }
+}
+
+#[test]
+fn append_log_checkpoint_persistence_failure_preserves_absent_checkpoint() {
+    assert_checkpoint_persistence_failure_is_atomic(false);
+}
+
+#[test]
+fn append_log_checkpoint_persistence_failure_preserves_existing_checkpoint() {
+    assert_checkpoint_persistence_failure_is_atomic(true);
+}
+
+fn assert_checkpoint_persistence_failure_is_atomic(has_prior_checkpoint: bool) {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+        let appended = storage
+            .append_batch(AppendRequest {
+                batch_id: "checkpoint-save-failure".to_string(),
+                events: vec![
+                    sample_event("save-0", 1, 0, "first"),
+                    sample_event("save-1", 1, 1, "second"),
+                ],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 0,
+            })
+            .await
+            .unwrap();
+        let consumer = CheckpointConsumerId("save-failure-reader".to_string());
+        let first = RecorderCheckpoint {
+            consumer: consumer.clone(),
+            upto_offset: appended.first_offset,
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            committed_at_ms: 1,
+        };
+        let previous = if has_prior_checkpoint {
+            assert_eq!(
+                storage.commit_checkpoint(first.clone()).await.unwrap(),
+                CheckpointCommitOutcome::Advanced
+            );
+            Some(first.clone())
+        } else {
+            None
+        };
+        let next = RecorderCheckpoint {
+            upto_offset: appended.last_offset,
+            committed_at_ms: 2,
+            ..first.clone()
+        };
+        let state_before = std::fs::read(&config.state_path).unwrap();
+        let temporary_path = config.state_path.with_extension("tmp");
+        // A real directory makes the actual state-file write fail even
+        // as root. Move the obstruction aside for retry; do not delete it.
+        std::fs::create_dir(&temporary_path).unwrap();
+        let error = storage.commit_checkpoint(next.clone()).await.unwrap_err();
+        assert!(matches!(error, RecorderStorageError::Io(_)));
+        let observed = storage.read_checkpoint(&consumer).await.unwrap();
+        eprintln!(
+            "recorder checkpoint save: prior={has_prior_checkpoint}, phase=write_failed, observed_ordinal={:?}, expected_ordinal={:?}",
+            observed
+                .as_ref()
+                .map(|checkpoint| checkpoint.upto_offset.ordinal),
+            previous
+                .as_ref()
+                .map(|checkpoint| checkpoint.upto_offset.ordinal)
+        );
+        assert_eq!(observed, previous);
+        assert_eq!(std::fs::read(&config.state_path).unwrap(), state_before);
+        assert!(storage.health().await.degraded);
+
+        std::fs::rename(
+            &temporary_path,
+            dir.path().join("retained-state-obstruction"),
+        )
+        .unwrap();
+        assert_eq!(
+            storage.commit_checkpoint(next.clone()).await.unwrap(),
+            CheckpointCommitOutcome::Advanced,
+            "a previously failed checkpoint must actually be saved on retry"
+        );
+        assert_eq!(
+            storage.read_checkpoint(&consumer).await.unwrap(),
+            Some(next.clone())
+        );
+        assert!(!storage.health().await.degraded);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
+        let saved: RecorderCheckpoint =
+            serde_json::from_value(persisted["checkpoints"][&consumer.0].clone()).unwrap();
+        assert_eq!(saved, next);
+        drop(storage);
+
+        let reopened = AppendLogRecorderStorage::open(config).unwrap();
+        assert_eq!(
+            reopened.read_checkpoint(&consumer).await.unwrap(),
+            Some(next.clone())
+        );
+        assert_eq!(
+            reopened.commit_checkpoint(next.clone()).await.unwrap(),
+            CheckpointCommitOutcome::NoopAlreadyAdvanced
+        );
+        assert!(matches!(
+            reopened.commit_checkpoint(first).await,
+            Err(RecorderStorageError::CheckpointRegression {
+                current_ordinal: 1,
+                attempted_ordinal: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            reopened.read_checkpoint(&consumer).await.unwrap(),
+            Some(next)
+        );
+        eprintln!(
+            "recorder checkpoint save: prior={has_prior_checkpoint}, phase=reopened, ordinal=1, equal=noop, lower=rejected"
+        );
+    });
 }
 
 fn make_segment(
