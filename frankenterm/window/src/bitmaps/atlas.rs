@@ -183,6 +183,7 @@ impl Atlas {
             width
                 .checked_mul(height)
                 .and_then(|pixels| pixels.checked_mul(4))
+                .filter(|&bytes| bytes <= isize::MAX as usize)
                 .ok_or(OutOfTextureSpace {
                     size: None,
                     current_size: self.side,
@@ -813,19 +814,21 @@ mod tests {
     fn scale_down_rejects_source_byte_overflow_before_pixel_access() {
         let mut atlas = fresh_atlas(16);
         let baseline = atlas.version();
-        let image = DimensionsOnlyBitmap {
-            width: usize::MAX,
-            height: 2,
-            pixel_accessed: Cell::new(false),
-        };
+        for (width, height) in [(usize::MAX, 2), (isize::MAX as usize / 4 + 1, 1)] {
+            let image = DimensionsOnlyBitmap {
+                width,
+                height,
+                pixel_accessed: Cell::new(false),
+            };
 
-        let err = atlas
-            .allocate_with_padding(&image, None, Some(2))
-            .expect_err("overflowing source byte geometry must fail");
+            let err = atlas
+                .allocate_with_padding(&image, None, Some(2))
+                .expect_err("unaddressable source byte geometry must fail");
 
-        assert_eq!(err.failure, AtlasAllocationFailure::ArithmeticOverflow);
-        assert!(!image.pixel_accessed.get());
-        assert_eq!(atlas.version(), baseline);
+            assert_eq!(err.failure, AtlasAllocationFailure::ArithmeticOverflow);
+            assert!(!image.pixel_accessed.get());
+            assert_eq!(atlas.version(), baseline);
+        }
     }
 
     #[test]
