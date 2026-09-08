@@ -1306,18 +1306,26 @@ timer is 30 minutes by default. `interval_seconds` applies to explicit
 neither the snapshot scheduler nor its trigger bridge.
 
 On shutdown, the trigger bridge is explicitly awakened and all core tasks
-must settle before the selected recorder backend is durably flushed. Earlier
-watcher-service failures, an unacknowledged scheduler, nonempty capture queues,
-or a recorder flush error/timeout withhold the terminal checkpoint and clean
-mark. Only successful settlement permits the one final checkpoint and its
-exact clean receipt. Cooperative phase waits are bounded, and a settlement
-result arriving after its deadline cannot mark the session clean. Recorder
-flush still performs synchronous disk I/O; a stalled syscall cannot yet be
-preempted by that async timer. Moving it into an owned blocking-I/O worker is
-tracked in `ft-interactive-swarm-product-convergence-7xqz4.8.14.3.13`. A cancelled
-caller does not skip mandatory cleanup. These automatic checkpoints remain
-SQLite observations: they do not automatically publish portable artifacts,
-save exact hot terminal/parser state, or restore running processes.
+must settle before the selected recorder backend's durable-flush request may
+authorize the final checkpoint. Earlier watcher-service failures, an
+unacknowledged scheduler, nonempty capture queues, or a recorder flush
+error/timeout withhold the terminal checkpoint and clean mark. Only successful,
+on-time settlement permits the one final checkpoint and its exact clean
+receipt. That receipt is scoped to the backend's current durability contract;
+it is not whole-mux restoration or hardware power-loss proof.
+
+The append-log and Rusqlite flush bodies now execute on the owned
+`runtime_async`/Asupersync blocking substrate. Cooperative phase waits are
+bounded, and a settlement result arriving after its deadline cannot mark the
+session clean. Caller cancellation returns a typed non-success result but
+cannot preempt an already-running kernel syscall; the admitted single-flight
+operation remains owned through settlement. Append-batch and checkpoint disk
+mutations still execute synchronously while their async futures are polled,
+and exact retained reconciliation for every admitted write remains tracked by
+`ft-interactive-swarm-product-convergence-7xqz4.8.14.3.13`. A cancelled caller
+does not skip mandatory cleanup. These automatic checkpoints remain SQLite
+observations: they do not automatically publish portable artifacts, save exact
+hot terminal/parser state, or restore running processes.
 
 Notes:
 
