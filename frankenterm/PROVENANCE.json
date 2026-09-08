@@ -644,15 +644,15 @@
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 71
+        "test": 72
       },
-      "fork_side_commit_count": 550,
+      "fork_side_commit_count": 551,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-08T01:54:55-04:00",
-        "sha": "4632b06fc1bcb12b5c92ec55d9cab087f32af59f",
-        "subject": "test(mux): exercise authenticated capture under real contention"
+        "committed_at": "2026-09-08T02:00:59-04:00",
+        "sha": "a85ecc1b8feeaa1845fd634e8700d1f97c237006",
+        "subject": "test(guardian): inventory the catalog payload size assertion"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1059,8 +1059,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2434,
-  "generated_at": "2026-09-08T05:56:19.799525Z",
+  "fork_side_commit_total": 2435,
+  "generated_at": "2026-09-08T06:01:24.820221Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
