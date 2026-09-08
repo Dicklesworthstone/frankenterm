@@ -4967,7 +4967,20 @@ mod tests {
             let mut names = BTreeSet::new();
             for argument in &signature.inputs {
                 let ty = match argument {
-                    syn::FnArg::Receiver(receiver) => receiver.ty.as_ref(),
+                    syn::FnArg::Receiver(receiver) => match &receiver.kind {
+                        syn::ReceiverKind::Typed(_, ty) => ty.as_ref(),
+                        // A bare `self` / `&self` receiver is the implicit `Self`
+                        // type (syn 2 synthesized it; syn 3 does not), so resolve
+                        // it to the owner exactly like the visitor does for an
+                        // explicit `Self` path.
+                        _ => {
+                            let name = owner.unwrap_or("Self").to_owned();
+                            if Self::protected(&name) {
+                                names.insert(name);
+                            }
+                            continue;
+                        }
+                    },
                     syn::FnArg::Typed(argument) => argument.ty.as_ref(),
                 };
                 names.extend(Self::protected_names_in_type(ty, owner));
@@ -5211,7 +5224,7 @@ mod tests {
                 let trait_name = item
                     .trait_
                     .as_ref()
-                    .and_then(|(_, path, _)| Self::path_name(path))
+                    .and_then(|(path, _)| Self::path_name(path))
                     .unwrap_or_else(|| "<inherent>".to_owned());
                 self.impls.push(format!("{target}:{trait_name}"));
             }
@@ -5620,7 +5633,20 @@ mod tests {
             let mut names = BTreeSet::new();
             for input in &signature.inputs {
                 let ty = match input {
-                    syn::FnArg::Receiver(receiver) => receiver.ty.as_ref(),
+                    syn::FnArg::Receiver(receiver) => match &receiver.kind {
+                        syn::ReceiverKind::Typed(_, ty) => ty.as_ref(),
+                        // A bare `self` / `&self` receiver is the implicit `Self`
+                        // type (syn 2 synthesized it; syn 3 does not), so resolve
+                        // it to the owner exactly like the visitor does for an
+                        // explicit `Self` path.
+                        _ => {
+                            let name = owner.unwrap_or("Self").to_owned();
+                            if Self::protected(&name) {
+                                names.insert(name);
+                            }
+                            continue;
+                        }
+                    },
                     syn::FnArg::Typed(argument) => argument.ty.as_ref(),
                 };
                 names.extend(Self::type_names(ty, owner));
@@ -6003,7 +6029,7 @@ mod tests {
             if let Some(owner) = owner.as_deref().filter(|name| Self::protected(name)) {
                 let implemented = item.trait_.as_ref().map_or_else(
                     || "<inherent>".to_owned(),
-                    |(_, path, _)| Self::path_label(path),
+                    |(path, _)| Self::path_label(path),
                 );
                 self.impls.push(format!("{owner}:{implemented}"));
                 self.record_conditional(&format!("impl:{owner}:{implemented}"), &item.attrs);
@@ -7276,7 +7302,8 @@ mod tests {
         let borrowed_signature = &borrowed_stage_encoding_inventory.ownership_methods[0].1.sig;
         assert!(matches!(
             borrowed_signature.inputs.first(),
-            Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_some()
+            Some(syn::FnArg::Receiver(receiver))
+                if matches!(receiver.kind, syn::ReceiverKind::Reference(..))
         ));
         assert_ne!(
             borrowed_stage_encoding_inventory.ownership_methods[0],

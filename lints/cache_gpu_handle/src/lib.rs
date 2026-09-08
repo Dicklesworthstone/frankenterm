@@ -610,7 +610,7 @@ fn collect_type_idents(ty: &Type, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Type::BareFn(bf) => {
+        Type::FnPtr(bf) => {
             for input in &bf.inputs {
                 collect_type_idents(&input.ty, out);
             }
@@ -644,8 +644,10 @@ fn collect_path_idents(path: &syn::Path, out: &mut BTreeSet<String>) {
                 }
             }
             syn::PathArguments::Parenthesized(p) => {
+                // syn 3 models `Fn(name: T)`-style inputs as `NamedArg`; the
+                // type is what matters for the ident graph.
                 for input in &p.inputs {
-                    collect_type_idents(input, out);
+                    collect_type_idents(&input.ty, out);
                 }
                 if let syn::ReturnType::Type(_, rty) = &p.output {
                     collect_type_idents(rty, out);
