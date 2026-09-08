@@ -6968,6 +6968,10 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
             "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_checkpoint_stage",
+            // Genesis decodes only after validating both authenticated
+            // envelopes and their connection/build authority, then checks the
+            // Begin scope, geometry and one-shot reservation identity.
+            "GuardianCheckpointStageRequestV1@GuardianProtocolState::reserve_genesis_spawn",
             "GuardianCheckpointStageRequestV1@GuardianReply::require_request_payload",
         ]
         .into_iter()
@@ -7027,6 +7031,9 @@ mod tests {
         assert_eq!(
             inventory.uses,
             vec![
+                expected_use(
+                    "use frankenterm_build_identity::{AtomicBuildIdentity, SealedAtomicBuildIdentity, UNSEALED_BUILD_ID};",
+                ),
                 expected_use("use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};",),
                 expected_use(
                     "use frankenterm_term::{terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV2};",
@@ -7035,13 +7042,17 @@ mod tests {
                 expected_use("use portable_pty::{cmdbuilder::CommandBuilder, PtySize};"),
                 expected_use("use sha2::{Digest as _, Sha256};"),
                 expected_use("use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};",),
-                expected_use("use std::convert::TryFrom;"),
+                expected_use("use std::convert::{TryFrom, TryInto};"),
                 expected_use("use std::panic::AssertUnwindSafe;"),
+                expected_use("use std::sync::Arc;"),
                 expected_use("use thiserror::Error;"),
                 expected_use("use uuid::Uuid;"),
                 expected_use("use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};"),
                 expected_use(
-                    "use crate::guardian_checkpoint::{GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointOriginV1, LiveParserCheckpointAck};",
+                    "use crate::guardian_checkpoint::{GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointGenesisSpawnPermitV1, GuardianCheckpointOriginV1, GuardianGenesisReservationIdentityV1, LiveParserCheckpointAck};",
+                ),
+                expected_use(
+                    "use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputJournalError, GuardianOutputPredecessor, GuardianOutputSegmentIdentity};",
                 ),
             ]
         );
@@ -7084,6 +7095,15 @@ mod tests {
         assert_eq!(
             inventory.item_macros,
             vec![
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianAuthenticatedMuxConnectionAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianLiveBuildAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);"
+                ),
+                expected_item_macro(
+                    "static_assertions::assert_not_impl_any!(GuardianSuccessorMuxHandoffAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);"
+                ),
                 expected_item_macro(
                     "static_assertions::assert_not_impl_any!(GuardianCheckpointCatalogAdoptionPermitV1: Clone, Copy);"
                 ),
@@ -7143,7 +7163,14 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(inventory.unexpected_macros, Vec::<syn::Macro>::new());
+        // Freeze the one compile-time build identity lookup exactly; do not
+        // permit arbitrary environment reads or new macro expansion sites.
+        assert_eq!(
+            inventory.unexpected_macros,
+            vec![expected_item_macro(
+                "option_env!(\"FT_ATOMIC_BUILD_IDENTITY\");"
+            )]
+        );
         inventory.projection_sites.sort();
         let mut expected_projection_sites = vec![
             "<free>::decode_guardian_request",

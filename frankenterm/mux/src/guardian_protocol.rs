@@ -12540,11 +12540,20 @@ mod tests {
             Err(GuardianProtocolError::GenesisBuildIdentityUnavailable)
         ));
 
-        let zero_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
-            AtomicBuildIdentity::Sealed(sealed_build_identity(0)),
+        // Zero is not constructible as a sealed identity. Corrupt the wire
+        // bytes instead, and require rejection before authenticated authority
+        // can exist rather than panicking inside the fixture constructor.
+        assert!(SealedAtomicBuildIdentity::from_lower_hex(&"00".repeat(32)).is_err());
+        let mut zero_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x51)),
         )
         .encode();
-        let zero_hello = authenticate(&request(
+        zero_payload[8..].fill(0);
+        assert!(matches!(
+            GuardianHelloBuildIdentityV1::decode(&zero_payload),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+        let zero_hello = request(
             GuardianOperation::Hello,
             Uuid::nil(),
             id(2),
@@ -12554,10 +12563,10 @@ mod tests {
             0,
             None,
             &zero_payload,
-        ));
+        );
         assert!(matches!(
-            state.authenticate_mux_connection_for_genesis(&zero_hello),
-            Err(GuardianProtocolError::GenesisBuildIdentityUnavailable)
+            encode_guardian_request(&secret(), &zero_hello),
+            Err(GuardianProtocolError::InvalidOperationPayload)
         ));
 
         let authority = mux_genesis_authority(&state, id(2), 0x51);
