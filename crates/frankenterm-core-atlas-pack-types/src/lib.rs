@@ -596,10 +596,10 @@ impl FreeRect {
 ///    up to four new maximal rectangles (above, below, left, right).
 /// 4. Prunes any free rect fully contained in another.
 ///
-/// Worst-case cost is `O(N²)` per allocation in the free-rect count,
-/// but the pruning step keeps the list bounded for realistic glyph
-/// corpora — Jylänki reports `~2 %` wasted space, the tightest of the
-/// online single-pass algorithms.
+/// Pruning costs `O(N * K)` for `N` candidate free rectangles and `K`
+/// newly split strips. Unchanged rectangles are already mutually maximal
+/// and need no repeated containment checks. Worst-case cost remains
+/// `O(N²)` when an allocation splits a large fraction of the free list.
 #[derive(Debug, Clone)]
 pub struct MaximalRectanglesPacker {
     size: Atlas2DSize,
@@ -666,6 +666,7 @@ impl MaximalRectanglesPacker {
         let glyph_right = u64::from(place_x) + u64::from(glyph.width);
         let glyph_bottom = u64::from(place_y) + u64::from(glyph.height);
         let mut new_free: Vec<FreeRect> = Vec::with_capacity(self.free_rects.len() + 4);
+        let mut split_indices = Vec::new();
         for free in &self.free_rects {
             if !free.intersects(place_x, place_y, glyph.width, glyph.height) {
                 new_free.push(*free);
@@ -674,6 +675,7 @@ impl MaximalRectanglesPacker {
             // Above strip — exists iff the glyph's top edge is below
             // the free rect's top.
             if place_y > free.y {
+                split_indices.push(new_free.len());
                 new_free.push(FreeRect {
                     x: free.x,
                     y: free.y,
@@ -683,6 +685,7 @@ impl MaximalRectanglesPacker {
             }
             // Below strip.
             if glyph_bottom < free.bottom() {
+                split_indices.push(new_free.len());
                 new_free.push(FreeRect {
                     x: free.x,
                     y: u32::try_from(glyph_bottom)
@@ -694,6 +697,7 @@ impl MaximalRectanglesPacker {
             }
             // Left strip.
             if place_x > free.x {
+                split_indices.push(new_free.len());
                 new_free.push(FreeRect {
                     x: free.x,
                     y: free.y,
@@ -703,6 +707,7 @@ impl MaximalRectanglesPacker {
             }
             // Right strip.
             if glyph_right < free.right() {
+                split_indices.push(new_free.len());
                 new_free.push(FreeRect {
                     x: u32::try_from(glyph_right)
                         .expect("free-rect x must remain inside u32 atlas bounds"),
@@ -714,27 +719,32 @@ impl MaximalRectanglesPacker {
             }
         }
 
-        // Prune: drop any free rect fully contained in another.
-        let mut i = 0;
-        while i < new_free.len() {
-            let mut removed_i = false;
-            let mut j = i + 1;
-            while j < new_free.len() {
-                if new_free[j].contains(&new_free[i]) {
-                    new_free.remove(i);
-                    removed_i = true;
-                    break;
-                }
-                if new_free[i].contains(&new_free[j]) {
-                    new_free.remove(j);
-                    continue;
-                }
-                j += 1;
+        // The old free list is an antichain under containment. Every new
+        // strip is contained in its old parent, so it cannot contain an
+        // unchanged old rectangle: that would contradict the old antichain.
+        // Only new strips can therefore become redundant. Check each against
+        // the full candidate list, retaining the last equal rectangle just
+        // as the original all-pairs pruning did. A containing candidate may
+        // itself be removed; transitivity still makes this removal valid.
+        split_indices.retain(|&i| {
+            let rect = &new_free[i];
+            new_free
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && other.contains(rect) && (other != rect || j > i))
+        });
+        // Indices remain sorted. One stable compaction preserves the exact
+        // original survivor order, including allocation tie breaking.
+        let mut removed = split_indices.into_iter().peekable();
+        let mut index = 0;
+        new_free.retain(|_| {
+            let discard = removed.peek() == Some(&index);
+            if discard {
+                removed.next();
             }
-            if !removed_i {
-                i += 1;
-            }
-        }
+            index += 1;
+            !discard
+        });
 
         self.free_rects = new_free;
         let rect = PackedRect {
@@ -1442,7 +1452,9 @@ mod tests {
                     .wrapping_mul(6_364_136_223_846_793_005)
                     .wrapping_add(1);
                 let height = ((random >> 32) % 40) as u32;
-                let request = glyph(width, height);
+                // Public fields also permit degenerate dimensions; compare
+                // that existing behavior without calling the nonzero helper.
+                let request = GlyphSize { width, height };
                 assert_eq!(
                     current.try_alloc(request),
                     legacy_maximal_alloc(&mut legacy, request),
@@ -1460,16 +1472,20 @@ mod tests {
             }
         }
         for edge in [0, 1, 16, u32::MAX] {
-            let mut current = MaximalRectanglesPacker::new(atlas(edge, edge));
+            let mut current = MaximalRectanglesPacker::new(Atlas2DSize {
+                width: edge,
+                height: edge,
+            });
             let mut legacy = current.clone();
-            for request in [
-                glyph(0, 0),
-                glyph(1, 1),
-                glyph(edge, 0),
-                glyph(0, edge),
-                glyph(edge, edge),
-                glyph(u32::MAX, u32::MAX),
+            for (width, height) in [
+                (0, 0),
+                (1, 1),
+                (edge, 0),
+                (0, edge),
+                (edge, edge),
+                (u32::MAX, u32::MAX),
             ] {
+                let request = GlyphSize { width, height };
                 assert_eq!(
                     current.try_alloc(request),
                     legacy_maximal_alloc(&mut legacy, request)
@@ -1504,6 +1520,9 @@ mod tests {
             }
             let elapsed = start.elapsed();
             let comparisons = CONTAINMENT_CHECKS.with(std::cell::Cell::get);
+            // Captured from the pre-optimization allocator, including every
+            // placement and the complete ordered free list after each glyph.
+            assert_eq!(fingerprint, 0x8d5c_7a7e_d8e5_0bfb);
             assert!(non_overlapping(packer.placements()));
             println!(
                 "ATLAS_ZOOM_WORKLOAD round={round} allocations={} free_rects={} contains={comparisons} fingerprint={fingerprint:016x} elapsed_us={}",
