@@ -847,6 +847,7 @@ struct AppendLogInner {
     segment_id: u64,
     next_offset: u64,
     next_ordinal: u64,
+    latest_record_start: Option<u64>,
     checkpoints: HashMap<String, RecorderCheckpoint>,
     idempotency_cache: HashMap<String, CachedAppendReceipt>,
     idempotency_order: VecDeque<String>,
@@ -865,6 +866,7 @@ struct PersistedState {
 struct ScanResult {
     valid_len: u64,
     valid_records: u64,
+    latest_record_start: Option<u64>,
 }
 
 impl ScanResult {
@@ -974,6 +976,7 @@ impl AppendLogRecorderStorage {
             segment_id,
             next_offset,
             next_ordinal,
+            latest_record_start: scan.latest_record_start,
             checkpoints,
             idempotency_cache: HashMap::new(),
             idempotency_order: VecDeque::new(),
@@ -991,10 +994,7 @@ impl AppendLogRecorderStorage {
         try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
     }
 
-    fn persist_state(
-        &self,
-        inner: &AppendLogInner,
-    ) -> std::result::Result<(), RecorderStorageError> {
+    fn persist_state(inner: &AppendLogInner) -> std::result::Result<(), RecorderStorageError> {
         let persisted = PersistedState {
             segment_id: inner.segment_id,
             next_offset: inner.next_offset,
@@ -1005,13 +1005,10 @@ impl AppendLogRecorderStorage {
     }
 
     fn latest_offset(inner: &AppendLogInner) -> Option<RecorderOffset> {
-        if inner.next_ordinal == 0 {
-            return None;
-        }
         Some(RecorderOffset {
             segment_id: inner.segment_id,
-            byte_offset: inner.next_offset,
-            ordinal: inner.next_ordinal - 1,
+            byte_offset: inner.latest_record_start?,
+            ordinal: inner.next_ordinal.checked_sub(1)?,
         })
     }
 
@@ -1042,7 +1039,6 @@ impl AppendLogRecorderStorage {
     }
 
     fn ensure_cached_response_durability(
-        &self,
         inner: &mut AppendLogInner,
         response: &mut AppendResponse,
         required_durability: DurabilityLevel,
@@ -1055,12 +1051,12 @@ impl AppendLogRecorderStorage {
             DurabilityLevel::Enqueued => {}
             DurabilityLevel::Appended => {
                 inner.writer.flush()?;
-                self.persist_state(inner)?;
+                Self::persist_state(inner)?;
             }
             DurabilityLevel::Fsync => {
                 inner.writer.flush()?;
                 inner.writer.get_ref().sync_data()?;
-                self.persist_state(inner)?;
+                Self::persist_state(inner)?;
             }
         }
 
@@ -1187,7 +1183,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
                 Self::record_last_error(&mut inner, "append_batch_idempotent_receipt", &err);
                 return Err(err);
             }
-            match self.ensure_cached_response_durability(
+            match Self::ensure_cached_response_durability(
                 &mut inner,
                 &mut existing.response,
                 required_durability,
@@ -1224,6 +1220,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
                 inner.writer.write_all(&payload)?;
                 inner.next_offset += 4 + payload_len as u64;
                 inner.next_ordinal += 1;
+                inner.latest_record_start = Some(record_start);
                 last_offset = RecorderOffset {
                     segment_id: inner.segment_id,
                     byte_offset: record_start,
@@ -1260,7 +1257,11 @@ impl RecorderStorage for AppendLogRecorderStorage {
                     inner.idempotency_cache.remove(&evict);
                 }
             }
-            self.ensure_cached_response_durability(&mut inner, &mut response, required_durability)?;
+            Self::ensure_cached_response_durability(
+                &mut inner,
+                &mut response,
+                required_durability,
+            )?;
             inner.idempotency_cache.insert(
                 batch_id,
                 CachedAppendReceipt {
@@ -1293,7 +1294,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
             if mode == FlushMode::Durable {
                 inner.writer.get_ref().sync_data()?;
             }
-            self.persist_state(&inner)?;
+            Self::persist_state(&inner)?;
             Ok(FlushStats {
                 backend: RecorderBackendKind::AppendLog,
                 flushed_at_ms: crate::recording::epoch_ms_now(),
@@ -2287,9 +2288,9 @@ fn initialize_rusqlite_schema(conn: &Connection) -> std::result::Result<(), Reco
     .map_err(sqlite_error)
 }
 
-fn sqlite_head_offset(
+fn sqlite_last_record(
     conn: &Connection,
-) -> std::result::Result<RecorderOffset, RecorderStorageError> {
+) -> std::result::Result<Option<(RecorderOffset, u64)>, RecorderStorageError> {
     let row = conn
         .query_row(
             "SELECT ordinal, segment_id, byte_offset, payload_bytes
@@ -2309,11 +2310,7 @@ fn sqlite_head_offset(
         .optional()
         .map_err(sqlite_error)?;
     let Some((ordinal, segment_id, byte_offset, payload_bytes)) = row else {
-        return Ok(RecorderOffset {
-            segment_id: 0,
-            byte_offset: 0,
-            ordinal: 0,
-        });
+        return Ok(None);
     };
     let ordinal = u64::try_from(ordinal).map_err(|_| RecorderStorageError::CorruptRecord {
         offset: 0,
@@ -2334,25 +2331,39 @@ fn sqlite_head_offset(
             offset: byte_offset,
             reason: format!("recorder_events.payload_bytes is negative: {payload_bytes}"),
         })?;
+    Ok(Some((
+        RecorderOffset {
+            segment_id,
+            byte_offset,
+            ordinal,
+        },
+        payload_bytes,
+    )))
+}
+
+fn sqlite_head_offset(
+    conn: &Connection,
+) -> std::result::Result<RecorderOffset, RecorderStorageError> {
+    let Some((last, payload_bytes)) = sqlite_last_record(conn)? else {
+        return Ok(RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        });
+    };
     Ok(RecorderOffset {
-        segment_id,
-        byte_offset: byte_offset.saturating_add(payload_bytes.saturating_add(4)),
-        ordinal: ordinal.saturating_add(1),
+        segment_id: last.segment_id,
+        byte_offset: last
+            .byte_offset
+            .saturating_add(payload_bytes.saturating_add(4)),
+        ordinal: last.ordinal.saturating_add(1),
     })
 }
 
 fn sqlite_latest_storage_offset(
     conn: &Connection,
 ) -> std::result::Result<Option<RecorderOffset>, RecorderStorageError> {
-    let head = sqlite_head_offset(conn)?;
-    if head.ordinal == 0 {
-        return Ok(None);
-    }
-    Ok(Some(RecorderOffset {
-        segment_id: head.segment_id,
-        byte_offset: head.byte_offset,
-        ordinal: head.ordinal - 1,
-    }))
+    Ok(sqlite_last_record(conn)?.map(|(offset, _)| offset))
 }
 
 fn sqlite_cursor_start(
@@ -2727,6 +2738,7 @@ fn scan_valid_prefix(file: &mut File) -> std::result::Result<ScanResult, Recorde
 
     let mut offset = 0u64;
     let mut records = 0u64;
+    let mut latest_record_start = None;
     loop {
         if offset + 4 > file_len {
             break;
@@ -2744,6 +2756,7 @@ fn scan_valid_prefix(file: &mut File) -> std::result::Result<ScanResult, Recorde
         file.seek(SeekFrom::Current(
             i64::try_from(payload_len).unwrap_or(i64::MAX),
         ))?;
+        latest_record_start = Some(offset);
         offset = next_offset;
         records += 1;
     }
@@ -2757,6 +2770,7 @@ fn scan_valid_prefix(file: &mut File) -> std::result::Result<ScanResult, Recorde
     Ok(ScanResult {
         valid_len: offset,
         valid_records: records,
+        latest_record_start,
     })
 }
 
@@ -3320,6 +3334,75 @@ recorder_backend = "frankensqlite"
             Err(RecorderStorageError::QueueFull { capacity: 1 })
         ));
         drop(sqlite_first);
+    }
+
+    #[test]
+    fn latest_offsets_identify_last_record_before_and_after_reopen() {
+        run_async_test(async {
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempdir().unwrap();
+                let mut config = recorder_test_config(dir.path());
+                config.backend = backend;
+                let mut storage = bootstrap_recorder_storage(config.clone()).unwrap();
+                assert_eq!(storage.health().await.latest_offset, None);
+                assert_eq!(storage.lag_metrics().await.unwrap().latest_offset, None);
+                assert_eq!(
+                    storage
+                        .flush(FlushMode::Durable)
+                        .await
+                        .unwrap()
+                        .latest_offset,
+                    None
+                );
+
+                for batch in 0..3 {
+                    let response = storage
+                        .append_batch(AppendRequest {
+                            batch_id: format!("latest-{batch}"),
+                            events: vec![
+                                sample_event(&format!("first-{batch}"), 7, batch * 2, "界面"),
+                                sample_event(
+                                    &format!("last-{batch}"),
+                                    7,
+                                    batch * 2 + 1,
+                                    "longer 🚀 payload",
+                                ),
+                            ],
+                            required_durability: DurabilityLevel::Fsync,
+                            producer_ts_ms: batch,
+                        })
+                        .await
+                        .unwrap();
+                    let expected = Some(response.last_offset);
+                    assert_eq!(
+                        storage
+                            .flush(FlushMode::Durable)
+                            .await
+                            .unwrap()
+                            .latest_offset,
+                        expected
+                    );
+                    assert_eq!(storage.health().await.latest_offset, expected);
+                    assert_eq!(storage.lag_metrics().await.unwrap().latest_offset, expected);
+                    drop(storage);
+
+                    storage = bootstrap_recorder_storage(config.clone()).unwrap();
+                    assert_eq!(
+                        storage
+                            .flush(FlushMode::Durable)
+                            .await
+                            .unwrap()
+                            .latest_offset,
+                        expected
+                    );
+                    assert_eq!(storage.health().await.latest_offset, expected);
+                    assert_eq!(storage.lag_metrics().await.unwrap().latest_offset, expected);
+                }
+            }
+        });
     }
 
     #[test]

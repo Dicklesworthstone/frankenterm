@@ -210,6 +210,8 @@ fn append_log_path_admission_rejects_alias_before_creating_parents() {
 #[cfg(unix)]
 #[test]
 fn append_log_path_admission_resolves_symlink_parents_and_leaves() {
+    use std::os::unix::fs::symlink;
+
     for case in ["parent", "state_leaf", "staging_leaf"] {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
@@ -219,17 +221,13 @@ fn append_log_path_admission_resolves_symlink_parents_and_leaves() {
         match case {
             "parent" => {
                 let alias = dir.path().join("alias");
-                std::os::unix::fs::symlink(&real, &alias).unwrap();
+                symlink(&real, &alias).unwrap();
                 config.state_path = alias.join("events.log");
             }
-            "state_leaf" => {
-                std::os::unix::fs::symlink(&config.data_path, &config.state_path).unwrap()
+            "state_leaf" => symlink(&config.data_path, &config.state_path).unwrap(),
+            "staging_leaf" => {
+                symlink(&config.data_path, config.state_path.with_extension("tmp")).unwrap()
             }
-            "staging_leaf" => std::os::unix::fs::symlink(
-                &config.data_path,
-                config.state_path.with_extension("tmp"),
-            )
-            .unwrap(),
             _ => unreachable!(),
         }
         assert_path_admission_preserves_files(config, case);
@@ -320,12 +318,14 @@ fn append_log_path_admission_serializes_shared_state_and_staging() {
 #[cfg(unix)]
 #[test]
 fn append_log_path_admission_allows_distinct_paths_through_symlinks() {
+    use std::os::unix::fs::symlink;
+
     run_async_test(async {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         let alias = dir.path().join("alias");
         std::fs::create_dir(&real).unwrap();
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        symlink(&real, &alias).unwrap();
         let mut config = storage_config(&alias);
         let state_target = real.join("snapshot.json");
         let mut initial_config = storage_config(&real);
@@ -333,7 +333,7 @@ fn append_log_path_admission_allows_distinct_paths_through_symlinks() {
         let initial = AppendLogRecorderStorage::open(initial_config).unwrap();
         initial.flush(FlushMode::Buffered).await.unwrap();
         drop(initial);
-        std::os::unix::fs::symlink(&state_target, &config.state_path).unwrap();
+        symlink(&state_target, &config.state_path).unwrap();
         config.data_path = alias.join("missing/../events.log");
         let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
         storage
@@ -366,6 +366,8 @@ fn append_log_path_admission_allows_distinct_paths_through_symlinks() {
 #[cfg(unix)]
 #[test]
 fn append_log_path_admission_rejects_substituted_staging_links() {
+    use std::os::unix::fs::symlink;
+
     run_async_test(async {
         for hard_link in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -385,7 +387,7 @@ fn append_log_path_admission_rejects_substituted_staging_links() {
             if hard_link {
                 std::fs::hard_link(&config.data_path, &temporary).unwrap();
             } else {
-                std::os::unix::fs::symlink(&config.data_path, &temporary).unwrap();
+                symlink(&config.data_path, &temporary).unwrap();
             }
             assert!(matches!(
                 storage.flush(FlushMode::Buffered).await,
@@ -498,13 +500,15 @@ fn append_log_writer_lease_covers_hard_link_alias() {
 #[cfg(unix)]
 #[test]
 fn append_log_writer_lease_covers_symlink_alias() {
+    use std::os::unix::fs::symlink;
+
     let dir = tempfile::tempdir().unwrap();
     let config = storage_config(dir.path());
     let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
     let mut alias = config.clone();
     alias.data_path = dir.path().join("events-symlink.log");
     alias.state_path = dir.path().join("alias-state.json");
-    std::os::unix::fs::symlink(&config.data_path, &alias.data_path).unwrap();
+    symlink(&config.data_path, &alias.data_path).unwrap();
     assert_writer_lease_busy(alias.clone());
     drop(owner);
     let successor = AppendLogRecorderStorage::open(alias).unwrap();
