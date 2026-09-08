@@ -8,7 +8,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use log::error;
 use ordered_float::NotNan;
 use std::cell::{RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use termwiz::cell::{unicode_column_width, Presentation};
 use wezterm_bidi::Direction;
@@ -22,6 +22,20 @@ use wezterm_bidi::Direction;
 // than runtime configs.
 const USE_OT_FUNCS: bool = false;
 const USE_OT_FACE: bool = false;
+
+// Missing glyphs can visit the same fallback faces for every cluster in a
+// frame. Keep a few of those faces warm instead of repeatedly opening them
+// and loading/hinting all of their cell-metric probe glyphs. Successful faces
+// retain their existing lifetime; this bounds only the additional residency.
+const MAX_UNUSED_FALLBACK_FONTS: usize = 4;
+
+fn retain_unused_fallback_fonts() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_UNUSED_FALLBACK_FONT_CACHE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
 
 #[derive(Clone, Debug)]
 struct Info {
@@ -82,6 +96,7 @@ struct MetricsKey {
 pub struct HarfbuzzShaper {
     handles: Vec<ParsedFont>,
     fonts: Vec<RefCell<Option<FontPair>>>,
+    unused_fonts: RefCell<VecDeque<FallbackIdx>>,
     lib: ftwrap::Library,
     metrics: RefCell<HashMap<MetricsKey, FontMetrics>>,
     features: Vec<harfbuzz::hb_feature_t>,
@@ -134,6 +149,7 @@ impl HarfbuzzShaper {
 
         Ok(Self {
             fonts,
+            unused_fonts: RefCell::new(VecDeque::new()),
             handles,
             lib,
             metrics: RefCell::new(HashMap::new()),
@@ -142,11 +158,7 @@ impl HarfbuzzShaper {
         })
     }
 
-    fn load_fallback(
-        &self,
-        font_idx: FallbackIdx,
-        dpi: u32,
-    ) -> anyhow::Result<Option<RefMut<'_, FontPair>>> {
+    fn load_fallback(&self, font_idx: FallbackIdx) -> anyhow::Result<Option<RefMut<'_, FontPair>>> {
         if font_idx >= self.handles.len() {
             return Ok(None);
         }
@@ -162,15 +174,7 @@ impl HarfbuzzShaper {
                     let font = if USE_OT_FACE {
                         harfbuzz::Font::from_locator(&handle.handle)?
                     } else {
-                        let (load_flags, _) = ftwrap::compute_load_flags_from_config(
-                            handle.freetype_load_flags,
-                            handle.freetype_load_target,
-                            handle.freetype_render_target,
-                            Some(dpi),
-                        );
-                        let mut font = harfbuzz::Font::new(face.face);
-                        font.set_load_flags(load_flags);
-                        font
+                        harfbuzz::Font::new(face.face)
                     };
 
                     let features = match &handle.harfbuzz_features {
@@ -193,6 +197,21 @@ impl HarfbuzzShaper {
                         features,
                         last_size_and_dpi: RefCell::new(None),
                     });
+                }
+
+                if retain_unused_fallback_fonts() && !opt_pair.as_ref().unwrap().shaped_any {
+                    let mut unused = self.unused_fonts.borrow_mut();
+                    unused.retain(|&idx| idx != font_idx);
+                    unused.push_back(font_idx);
+                    while unused.len() > MAX_UNUSED_FALLBACK_FONTS {
+                        let evicted = unused.pop_front().unwrap();
+                        // The current index was moved to the back above, so
+                        // eviction cannot borrow the slot currently in use.
+                        let mut slot = self.fonts[evicted].borrow_mut();
+                        if slot.as_ref().is_some_and(|pair| !pair.shaped_any) {
+                            slot.take();
+                        }
+                    }
                 }
 
                 Ok(Some(RefMut::map(opt_pair, |opt_pair| {
@@ -242,7 +261,7 @@ impl HarfbuzzShaper {
         let mut no_more_fallbacks = false;
 
         loop {
-            match self.load_fallback(font_idx, dpi).context("load_fallback")? {
+            match self.load_fallback(font_idx).context("load_fallback")? {
                 Some(mut pair) => {
                     if let Some(p) = presentation {
                         if pair.presentation != p {
@@ -275,6 +294,18 @@ impl HarfbuzzShaper {
                             font.set_ptem(point_size as f32);
                             let scale = pixel_size as i32 * 64;
                             font.set_font_scale(scale, scale);
+                        } else {
+                            // The default hinting flags depend on DPI. A
+                            // retained face must refresh them when crossing
+                            // that boundary, just like a newly loaded face.
+                            let handle = &self.handles[font_idx];
+                            let (load_flags, _) = ftwrap::compute_load_flags_from_config(
+                                handle.freetype_load_flags,
+                                handle.freetype_load_target,
+                                handle.freetype_render_target,
+                                Some(dpi),
+                            );
+                            font.set_load_flags(load_flags);
                         }
 
                         font.font_changed();
@@ -459,7 +490,23 @@ impl HarfbuzzShaper {
         //  log::error!("do_shape: font_idx={} {:?} {:#?}", font_idx, &s[range.clone()], info_clusters);
         log::debug!("font_idx={font_idx} info_clusters: {:#?}", info_clusters);
 
-        let mut direct_clusters = 0;
+        // Protect a face that will contribute real output before recursing
+        // into missing clusters. Otherwise a long fallback walk could evict
+        // this newly successful face before the outer call returns.
+        let contributes_directly = info_clusters.iter().any(|infos| {
+            !cluster_resolver
+                .get(infos[0].cluster)
+                .expect("assigned above")
+                .incomplete
+        });
+        if retain_unused_fallback_fonts() && !shaped_any && contributes_directly {
+            if let Some(pair) = self.fonts[font_idx].borrow_mut().as_mut() {
+                pair.shaped_any = true;
+            }
+            self.unused_fonts
+                .borrow_mut()
+                .retain(|&idx| idx != font_idx);
+        }
 
         for infos in &info_clusters {
             let cluster_info = cluster_resolver
@@ -537,24 +584,17 @@ impl HarfbuzzShaper {
                 let glyph = make_glyphinfo(substr, weighted_cell_width, font_idx, info);
 
                 cluster.push(glyph);
-                direct_clusters += 1;
             }
         }
 
-        if !shaped_any {
-            if let Some(opt_pair) = self.fonts.get(font_idx) {
-                if direct_clusters == 0 {
-                    // If we've never shaped anything from this font, and we didn't
-                    // shape it just now, then we're probably a fallback font from
-                    // the system and unlikely to be useful to keep around, so we
-                    // unload it.
-                    log::trace!(
-                        "Shaper didn't resolve glyphs from {:?}, so unload it",
-                        self.handles[font_idx]
-                    );
-                    opt_pair.borrow_mut().take();
-                } else if let Some(pair) = &mut *opt_pair.borrow_mut() {
-                    // We shaped something: mark this pair up so that it sticks around
+        if !retain_unused_fallback_fonts() && !shaped_any {
+            // Same-binary native control: preserve the original immediate
+            // unload policy when the experiment switch is set.
+            if let Some(slot) = self.fonts.get(font_idx) {
+                let mut slot = slot.borrow_mut();
+                if !contributes_directly {
+                    slot.take();
+                } else if let Some(pair) = slot.as_mut() {
                     pair.shaped_any = true;
                 }
             }
@@ -610,7 +650,7 @@ impl FontShaper for HarfbuzzShaper {
 
     fn metrics_for_idx(&self, font_idx: usize, size: f64, dpi: u32) -> anyhow::Result<FontMetrics> {
         let mut pair = self
-            .load_fallback(font_idx, dpi)?
+            .load_fallback(font_idx)?
             .ok_or_else(|| anyhow!("metrics_for_idx: there is no font with idx={font_idx}!?"))?;
 
         let key = MetricsKey {
@@ -694,7 +734,7 @@ impl FontShaper for HarfbuzzShaper {
             theoretical_height,
             self.handles
         );
-        while let Ok(Some(mut pair)) = self.load_fallback(metrics_idx, dpi) {
+        while let Ok(Some(mut pair)) = self.load_fallback(metrics_idx) {
             pair.last_size_and_dpi.borrow_mut().take();
             let selected_size = pair
                 .face
@@ -923,6 +963,122 @@ mod test {
                     .unwrap(),
                 "metric-only size selection must invalidate the previous Harfbuzz size"
             );
+        }
+    }
+
+    #[test]
+    fn unsuccessful_fallback_faces_are_reused_with_fresh_shape_parity() {
+        let handles = fallback_test_handles(3);
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        for (size, dpi, direction) in [
+            (10., 72, Direction::LeftToRight),
+            (10., 72, Direction::LeftToRight),
+            (14., 96, Direction::RightToLeft),
+            (12., 144, Direction::LeftToRight),
+            (10., 72, Direction::LeftToRight),
+        ] {
+            for text in ["\u{10ffff}", "ffi e\u{301} \u{10ffff} =>"] {
+                let mut missing = Vec::new();
+                let actual = shaper
+                    .shape(text, size, dpi, &mut missing, None, direction, None, None)
+                    .unwrap();
+                let fresh = HarfbuzzShaper::new(&config, &handles).unwrap();
+                let mut fresh_missing = Vec::new();
+                let expected = fresh
+                    .shape(
+                        text,
+                        size,
+                        dpi,
+                        &mut fresh_missing,
+                        None,
+                        direction,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(missing, fresh_missing);
+                assert!(!missing.is_empty(), "exercise actual unresolved fallback");
+                for slot in shaper.fonts.iter().skip(1) {
+                    let slot = slot.borrow();
+                    let pair = slot
+                        .as_ref()
+                        .expect("unsuccessful fallback must remain loaded between clusters");
+                    assert!(!pair.shaped_any);
+                    assert_eq!(*pair.last_size_and_dpi.borrow(), Some((size, dpi)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsuccessful_fallback_residency_is_bounded_and_successful_faces_stay_loaded() {
+        let handles = fallback_test_handles(MAX_UNUSED_FALLBACK_FONTS + 5);
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let text = "\u{10ffff} ffi";
+        let mut missing = Vec::new();
+        let expected = shaper
+            .shape(
+                text,
+                10.,
+                72,
+                &mut missing,
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(shaper.fonts[0].borrow().as_ref().unwrap().shaped_any);
+        let promoted = *shaper.unused_fonts.borrow().front().unwrap();
+        assert!(promoted > 0);
+        let promoted_output = shaper
+            .do_shape(
+                promoted,
+                "ffi",
+                10.,
+                72,
+                &mut Vec::new(),
+                None,
+                Direction::LeftToRight,
+                0..3,
+                None,
+            )
+            .unwrap();
+        assert!(!promoted_output.is_empty());
+        assert!(promoted_output
+            .iter()
+            .all(|glyph| glyph.font_idx == promoted));
+        assert!(!shaper.unused_fonts.borrow().contains(&promoted));
+        for _ in 0..3 {
+            let mut actual_missing = Vec::new();
+            assert_eq!(
+                shaper
+                    .shape(
+                        text,
+                        10.,
+                        72,
+                        &mut actual_missing,
+                        None,
+                        Direction::LeftToRight,
+                        None,
+                        None
+                    )
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(actual_missing, missing);
+            assert!(shaper.fonts[promoted].borrow().as_ref().unwrap().shaped_any);
+            assert!(shaper.fonts[0].borrow().as_ref().unwrap().shaped_any);
+            let unused_resident = shaper
+                .fonts
+                .iter()
+                .filter(|slot| slot.borrow().as_ref().is_some_and(|pair| !pair.shaped_any))
+                .count();
+            assert!(unused_resident <= MAX_UNUSED_FALLBACK_FONTS);
+            assert_eq!(unused_resident, shaper.unused_fonts.borrow().len());
         }
     }
 
