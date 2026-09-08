@@ -5186,6 +5186,93 @@ recorder_backend = "frankensqlite"
     }
 
     #[test]
+    fn trait_default_cx_cancellation_is_typed_and_content_free() {
+        fn assert_cancelled(error: RecorderStorageError, expected_operation: &'static str) {
+            let display = error.to_string();
+            assert!(
+                matches!(
+                    error,
+                    RecorderStorageError::BlockingOperation {
+                        operation,
+                        failure: RecorderBlockingFailure::CancelledBeforeStart {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    } if operation == expected_operation
+                ),
+                "unexpected default Cx cancellation for {expected_operation}: {display}"
+            );
+            assert!(
+                !display.contains("secret cancellation reason"),
+                "default Cx cancellation leaked its caller-provided reason"
+            );
+        }
+
+        run_async_test(async {
+            let storage = StubRecorderStorage {
+                backend: RecorderBackendKind::AppendLog,
+            };
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("secret cancellation reason"),
+            );
+
+            assert_cancelled(
+                storage
+                    .append_batch_with_cx(
+                        &cx,
+                        AppendRequest {
+                            batch_id: "unused".to_string(),
+                            events: vec![sample_event("unused", 1, 0, "unused")],
+                            required_durability: DurabilityLevel::Enqueued,
+                            producer_ts_ms: 1,
+                        },
+                    )
+                    .await
+                    .unwrap_err(),
+                "append_batch",
+            );
+            assert_cancelled(
+                storage
+                    .flush_with_cx(&cx, FlushMode::Buffered)
+                    .await
+                    .unwrap_err(),
+                "flush",
+            );
+            assert_cancelled(
+                storage
+                    .read_checkpoint_with_cx(&cx, &CheckpointConsumerId("unused".to_string()))
+                    .await
+                    .unwrap_err(),
+                "read_checkpoint",
+            );
+            assert_cancelled(
+                storage
+                    .commit_checkpoint_with_cx(
+                        &cx,
+                        RecorderCheckpoint {
+                            consumer: CheckpointConsumerId("unused".to_string()),
+                            upto_offset: RecorderOffset {
+                                segment_id: 0,
+                                byte_offset: 0,
+                                ordinal: 0,
+                            },
+                            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                            committed_at_ms: 1,
+                        },
+                    )
+                    .await
+                    .unwrap_err(),
+                "commit_checkpoint",
+            );
+            assert_cancelled(
+                storage.lag_metrics_with_cx(&cx).await.unwrap_err(),
+                "lag_metrics",
+            );
+        });
+    }
+
+    #[test]
     fn duplicate_batch_id_is_idempotent() {
         run_async_test(async {
             let dir = tempdir().unwrap();
