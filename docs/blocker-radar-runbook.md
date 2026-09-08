@@ -83,7 +83,7 @@ Agent Mail.
 | Final verdict | Example evidence | Safe outcome |
 | --- | --- | --- |
 | `tracker_inconsistent` | `bv --robot-triage` recommends `ft-e87u6.2` as "Currently unclaimed - available for work", but `br show ft-e87u6.2 --json` says `status=blocked`, `assignee=BluePike`, with fresh PR 59 queue comments. | Do not claim. Wait or coordinate with the owner; record `bv.br_status_mismatch`. |
-| `external_wait` | GitHub Actions current-head run is queued or the check suite has zero jobs and no failure log. | Recheck read-only later or comment with run/check ids; do not cancel, rerun, or infer pass/fail. |
+| `external_wait` | A required DSR build or verification receipt is unavailable or has the wrong source identity. | Inspect retained DSR receipts and RCH logs; comment with the missing artifact or source mismatch. |
 | `mail_degraded` | Agent Mail list/inbox is unavailable, but Beads/git evidence is otherwise usable. | Use `scripts/swarm-tick.sh --agent-mail-fallback frankenterm`; cite fallback state before any claim. |
 | `dirty_overlap` | `git status --short` shows tracked paths that overlap the candidate's likely edit surface or another owner lane. | Stop before edits/staging; request handoff or split the work. |
 | `claimable` | Candidate appears in `br ready --json`, `br show` has `status=open` and no assignee, dependencies are clear, dirty paths do not overlap, and external queues are not blocking. | Reserve owned paths, then claim with `br update <id> --claim --actor <agent> --json`. |
@@ -102,8 +102,8 @@ lane evidence.
 | `stale_possible` | The bead may be stale, but the radar cannot prove the lane is free. | Comment with the stale evidence and request confirmation. | Do not take over unless Beads/git evidence later proves the owner is gone or the user directs it. |
 | `dirty_overlap` | Dirty tracked files overlap the intended work or owner scope. | Stop before editing or staging; identify the owner and request handoff. | Do not stage broad paths, format the package, or mix unrelated changes into proof. |
 | `rch_substrate_blocked` | RCH failed before a trustworthy Cargo/test/source verdict was reached. | File or update a blocker with the RCH log, worker, target dir, and reason code. | Do not count local Cargo or RCH sync chatter as proof. |
-| `ci_queued` | GitHub Actions has queued jobs or pending checks. | Inspect the current-head run/check suite read-only and wait. | Do not infer pass/fail or cancel/rerun CI without operator approval. |
-| `ci_zero_jobs` | A check suite exists but jobs have not materialized. | Record the zero-job state and recheck later. | Do not call the suite passed or failed. |
+| `ci_queued` | Legacy fixture vocabulary for queued CI. | Inspect retained DSR/RCH receipts for current FrankenTerm evidence. | Do not inspect, monitor, or use GitHub Actions. |
+| `ci_zero_jobs` | Legacy fixture vocabulary for a check suite with no jobs. | Inspect retained DSR/RCH receipts for current FrankenTerm evidence. | Do not inspect, monitor, or use GitHub Actions. |
 | `artifact_missing` | A required package, proof, or release artifact is absent. | Inspect artifact metadata/logs and block downstream closeout. | Do not fabricate an artifact path or rerun publishing from this lane. |
 | `mail_unavailable` | Agent Mail is unavailable or degraded. | Use Beads/git fallback and cite the fallback snapshot. | Do not repair, restart, stop, or kill Agent Mail. |
 | `degraded` | One or more sources timed out, failed, or returned partial data. | Fail closed and gather better read-only evidence. | Do not claim safety from a partial snapshot. |
@@ -139,16 +139,17 @@ artifact metadata, run logs, and expected artifact name. Add a Beads comment
 with the missing artifact id/path and do not unblock dependent packaging beads
 until a later proof run publishes or retrieves the artifact.
 
-### GitHub Actions queued with zero jobs
+### Legacy CI fixture states
 
 Radar states: `ci_queued` or `ci_zero_jobs`.
 
 Fixture anchors: `ci-queued`, `ci-zero-jobs`.
 
-Queued checks and zero-job suites are external scheduling states. They are not
-source failures and not passes. Recheck the current-head run or check suite
-read-only, then comment with the run id, check suite id, observed status, and
-next recheck time.
+These states remain in historical fixtures; they are not live FrankenTerm
+evidence. FrankenTerm uses DSR exclusively. Never inspect, monitor, trigger, or
+use GitHub Actions. For release readiness, use `dsr doctor`, `dsr health all`,
+`dsr repos info frankenterm`, and retained DSR build/verification receipts.
+Record missing receipts or source mismatches with their artifact paths.
 
 ### Agent Mail fallback mode
 
@@ -228,7 +229,7 @@ them during normal blocker-radar triage:
 | --- | --- |
 | `am service restart`, `am service stop`, `am doctor fix`, `am doctor repair`, `am doctor reconstruct`, or killing Agent Mail processes | Retry once, then use `scripts/swarm-tick.sh --agent-mail-fallback frankenterm`. |
 | `rch daemon restart`, worker drain, worker update, or shared service mutation | Use read-only `rch status`/logs, or file/update a blocker with retained evidence. |
-| GitHub Actions cancel/rerun or package republish from a docs/proof triage lane | Inspect the current-head run and comment with exact blocker evidence. |
+| Any GitHub Actions inspection, monitoring, cancel/rerun, or package republish from a docs/proof triage lane | Inspect retained DSR build/verification receipts and RCH logs, then record the exact blocker evidence. |
 | `git reset --hard`, `git clean -fd`, `rm -rf`, broad checkout, force push, or deleting files | Use `git status`, `git diff`, narrow staging, and ask the user before any irreversible action. |
 | Staging another owner path or broad package formatting over dirty overlap | Reserve/claim the owned slice, stage only owned paths, and request handoff for overlap. |
 | Fabricating artifact paths, proof-ledger entries, or terminal pass claims | Leave the bead open/blocked and cite the missing evidence. |
@@ -249,9 +250,9 @@ dirty-path check [clean or owned paths], dependencies [state]. Claiming as
 ### External blocker
 
 ```text
-Blocker radar: waiting_external on [substrate]. State [ci_queued/ci_zero_jobs/
-artifact_missing/rch_substrate_blocked]; reason [reason_code]. Evidence:
-[run/check/artifact/worker/log path]. Safe next action: [read-only recheck or
+Blocker radar: waiting_external on [substrate]. State
+[artifact_missing/rch_substrate_blocked]; reason [reason_code]. Evidence:
+[DSR receipt/artifact/worker/RCH log path]. Safe next action: [read-only recheck or
 follow-up bead]. No pass/fail or source-behavior claim is made.
 ```
 
