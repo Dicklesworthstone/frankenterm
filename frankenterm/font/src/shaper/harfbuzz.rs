@@ -931,7 +931,14 @@ mod test {
         };
         let expected = shape(&fresh, 10.).unwrap();
         assert_eq!(shape(&shaper, 10.).unwrap(), expected);
-        for size in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 0., -1.] {
+        for size in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            0.,
+            -1.,
+        ] {
             assert!(shape(&shaper, size).is_err(), "shape accepted {size}");
             assert!(shaper.metrics(size, 72).is_err(), "metrics accepted {size}");
             assert!(
