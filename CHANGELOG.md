@@ -31,10 +31,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main>
 
 - Local-pane resize prepares text wrapping outside the terminal and resize-admission locks. It validates the captured text, cursor, geometry and policy before applying the result; parser output or a superseding resize invalidates stale work. Image-bearing content retains the synchronous path.
+- Flexible-pane layout no longer reads terminal dimensions while planning a resize. This avoids waiting on the parser's terminal lock for dimensions that only fixed-size panes require.
 - WebGPU rendering reuses vertex buffers across frames and uploads only the active vertices. Glyph instances from earlier allocator borrows survive until the end of the same frame.
 - Font scaling retains a bounded cache of the previous scale, and text wrapping reuses validated geometry and scan state. The wrap planner preserves the greedy layout bound.
 
-The local 0.15.4-rc.1 candidate includes these changes. Native resize/font latency, streaming-output behavior and memory qualification remain pending; this entry does not announce a release or an instant-resize result.
+- Recorder flush, health and lag positions now identify the start of the last record in both storage backends, including after reopening the log.
+
+The local 0.15.4-rc.2 candidate includes these changes. Native profiling of rc.1 found synchronous scrollback persistence holding the terminal lock during output; moving that persistence off the lock remains unfinished. Native resize/font latency, streaming-output behavior and memory qualification remain pending. This entry does not announce a release or an instant-resize result.
 
 ---
 
