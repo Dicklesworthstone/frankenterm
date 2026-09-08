@@ -2650,12 +2650,14 @@ impl LiveScrollbackSpillSink {
         let mut publication_attempted = false;
         let result = (|| -> anyhow::Result<()> {
             Self::validate_append_wal_identity(wal, self.durable_pane_id)?;
-            {
-                let keyring = self
-                    .lock_keyring("persist append WAL authentication")
-                    .map_err(anyhow::Error::new)?;
-                Self::authenticate_append_wal(wal, &keyring)?;
-            }
+            // The caller serializes this sink's mutation. Its store is
+            // pane-local; hold the shared key authority only for this bounded
+            // publication, including acknowledgement of the published bytes.
+            let mut keyring = self
+                .lock_keyring("persist append WAL authentication")
+                .map_err(anyhow::Error::new)?;
+            let keyring = keyring.scoped_authority()?;
+            Self::authenticate_append_wal(wal, &keyring)?;
             anyhow::ensure!(
                 wal.wal_sha256 == Self::append_wal_checksum(wal)?,
                 "append WAL checksum changed before publication"
@@ -2677,17 +2679,12 @@ impl LiveScrollbackSpillSink {
                     &durable_pane_id,
                     &self.manifest_path,
                 )?;
-                {
-                    let keyring = self
-                        .lock_keyring("replace consumed append WAL authentication")
-                        .map_err(anyhow::Error::new)?;
-                    Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
-                    Self::authenticate_append_wal(&active, &keyring)?;
-                    anyhow::ensure!(
-                        Self::authenticate_manifest(&manifest, &keyring)?,
-                        "active append WAL supersession manifest is not authenticated"
-                    );
-                }
+                Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
+                Self::authenticate_append_wal(&active, &keyring)?;
+                anyhow::ensure!(
+                    Self::authenticate_manifest(&manifest, &keyring)?,
+                    "active append WAL supersession manifest is not authenticated"
+                );
                 if Self::append_wal_matches_target_manifest(&active, &manifest)? {
                     let store = self
                         .lock_store("replace consumed append WAL target")
@@ -2851,9 +2848,6 @@ impl LiveScrollbackSpillSink {
             let published = Self::read_append_wal(&active_path)?
                 .ok_or_else(|| anyhow::anyhow!("published append WAL disappeared"))?;
             anyhow::ensure!(published == *wal, "published append WAL changed");
-            let keyring = self
-                .lock_keyring("acknowledge append WAL authentication")
-                .map_err(anyhow::Error::new)?;
             Self::authenticate_append_wal(&published, &keyring)?;
             Ok(())
         })();
@@ -2884,9 +2878,10 @@ impl LiveScrollbackSpillSink {
             &self.manifest_path,
         )?;
         {
-            let keyring = self
+            let mut keyring = self
                 .lock_keyring("advance append WAL supersession authentication")
                 .map_err(anyhow::Error::new)?;
+            let keyring = keyring.scoped_authority()?;
             Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
             Self::authenticate_append_wal(&active, &keyring)?;
             anyhow::ensure!(
@@ -4626,6 +4621,18 @@ impl LiveScrollbackSpillSink {
             let verified_ledger = state.verified_ledger;
             drop(state);
             let ledger_pane_id = self.active_ledger_pane_id();
+            let mut keyring_guard = if authenticated_manifest {
+                Some(
+                    self.lock_keyring("persist_manifest authentication")
+                        .map_err(anyhow::Error::new)?,
+                )
+            } else {
+                None
+            };
+            let mut keyring = keyring_guard
+                .as_mut()
+                .map(|keyring| keyring.scoped_authority())
+                .transpose()?;
 
             let (
                 oldest_seq,
@@ -4734,12 +4741,9 @@ impl LiveScrollbackSpillSink {
                 manifest_sha256: String::new(),
             };
 
-            if authenticated_manifest {
+            if let Some(keyring) = keyring.as_mut() {
                 expected_live_scrollback_v4_chain(&manifest)?;
                 let canonical = Self::manifest_authentication_bytes(&manifest)?;
-                let mut keyring = self
-                    .lock_keyring("persist_manifest authentication")
-                    .map_err(anyhow::Error::new)?;
                 let cipher = keyring
                     .latest_active_cipher()
                     .context("load guardian manifest-authentication key")?;
@@ -4818,11 +4822,11 @@ impl LiveScrollbackSpillSink {
                         "deterministic scrollback manifest stage belongs to a different transaction"
                     );
                     if live_scrollback_manifest_is_authenticated(&staged) {
-                        let keyring = self
-                            .lock_keyring("persist_manifest staged authentication")
-                            .map_err(anyhow::Error::new)?;
+                        let keyring = keyring.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("authenticated stage has no publication key authority")
+                        })?;
                         anyhow::ensure!(
-                            Self::authenticate_manifest(&staged, &keyring)?,
+                            Self::authenticate_manifest(&staged, keyring)?,
                             "deterministic authenticated scrollback manifest stage did not authenticate"
                         );
                     }
@@ -4867,15 +4871,11 @@ impl LiveScrollbackSpillSink {
                 published_manifest == manifest,
                 "published scrollback manifest changed during acknowledgement"
             );
-            if authenticated_manifest {
-                let keyring = self
-                    .lock_keyring("persist_manifest published authentication")
-                    .map_err(anyhow::Error::new)?;
+            if let Some(keyring) = keyring.as_ref() {
                 anyhow::ensure!(
-                    Self::authenticate_manifest(&published_manifest, &keyring)?,
+                    Self::authenticate_manifest(&published_manifest, keyring)?,
                     "published v4 scrollback manifest lost guardian authority"
                 );
-                drop(keyring);
                 if publication_state != "cleared" {
                     let store = self
                         .lock_store("persist_manifest published logical ledger")
@@ -8394,6 +8394,78 @@ mod tests {
             .expect("open manifest fixture parent")
             .sync_all()
             .expect("synchronize manifest fixture parent");
+    }
+
+    #[test]
+    fn authenticated_publications_reuse_one_authority_lease_and_reopen_exact_rows() {
+        use guardian_output_keys::AUTHORITY_LEASE_ACQUISITIONS;
+
+        let (dir, context, sink, wal, appended) = append_wal_fixture(187, 1);
+        for attempt in 0..2 {
+            let before = AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get);
+            let result = sink.persist_authenticated_append_wal(&wal);
+            if attempt == 0 {
+                result.expect("publish and acknowledge the exact WAL");
+            } else {
+                // An unconsumed WAL cannot be replaced, even by an identical
+                // request. The caller must reconcile its target first.
+                let error = result.expect_err("retain the unconsumed WAL on retry");
+                assert!(!error.outcome_indeterminate());
+            }
+            assert_eq!(
+                AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
+                before + 1,
+                "WAL authentication and acknowledgement must share one durable authority lease"
+            );
+            assert_eq!(
+                LiveScrollbackSpillSink::read_append_wal(
+                    &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap()
+                )
+                .unwrap()
+                .as_ref(),
+                Some(&wal),
+                "a refused retry must preserve the exact authenticated WAL"
+            );
+        }
+        let recovered_state = materialize_append_wal_target_for_test(&sink, &wal);
+        *sink
+            .lock_state("install test publication state")
+            .expect("lock test publication state") = recovered_state;
+        for _ in 0..2 {
+            let before = AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get);
+            sink.persist_manifest("complete")
+                .expect("publish and acknowledge the authenticated manifest");
+            assert_eq!(
+                AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
+                before + 1,
+                "manifest sealing and acknowledgement must share one durable authority lease"
+            );
+        }
+        // Rotation must be able to acquire the released scope, and reopening
+        // must authenticate both publications through the historical key.
+        let original_key = sink
+            .lock_keyring("read test publication key")
+            .expect("lock publication keyring")
+            .active_key_id();
+        assert_ne!(
+            sink.lock_keyring("rotate after test publication")
+                .expect("lock keyring after publication")
+                .rotate()
+                .expect("rotation acquires the released authority lease"),
+            original_key
+        );
+        drop(sink);
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("reopen authenticated publications after key rotation");
+        assert!(reopened.load_scrollback_line(10).is_none());
+        assert_eq!(
+            reopened
+                .load_scrollback_line(11)
+                .expect("the published target row survives reopen")
+                .as_str()
+                .as_ref(),
+            appended.as_str().as_ref()
+        );
     }
 
     #[test]

@@ -172,9 +172,39 @@ impl std::fmt::Debug for Activation {
 pub struct GuardianOutputKeyring {
     directory: CapDir,
     use_authority_lock: bool,
+    scoped_authority: Option<AuthorityFileLease>,
     active: Activation,
     active_key: GuardianOutputKey,
     pending_generation: Option<u64>,
+}
+
+/// One serialized persistence operation may authenticate several records with
+/// the same authority. Keep its durable lock lease alive across those lookups,
+/// while every lookup still validates the pinned inode and key inventory.
+pub(crate) struct GuardianOutputKeyringScope<'a> {
+    keyring: &'a mut GuardianOutputKeyring,
+}
+
+impl std::ops::Deref for GuardianOutputKeyringScope<'_> {
+    type Target = GuardianOutputKeyring;
+
+    fn deref(&self) -> &Self::Target {
+        self.keyring
+    }
+}
+
+impl std::ops::DerefMut for GuardianOutputKeyringScope<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.keyring
+    }
+}
+
+impl Drop for GuardianOutputKeyringScope<'_> {
+    fn drop(&mut self) {
+        // Also releases the OS lease when the persistence operation returns
+        // an error or unwinds. No authority is cached across operations.
+        drop(self.keyring.scoped_authority.take());
+    }
 }
 
 impl std::fmt::Debug for GuardianOutputKeyring {
@@ -334,6 +364,16 @@ impl GuardianOutputKeyring {
         self.pending_generation
     }
 
+    pub(crate) fn scoped_authority(
+        &mut self,
+    ) -> Result<GuardianOutputKeyringScope<'_>, GuardianOutputKeyringError> {
+        if self.scoped_authority.is_some() {
+            return Err(GuardianOutputKeyringError::AuthorityChanged);
+        }
+        self.scoped_authority = self.acquire_authority_lease(true)?;
+        Ok(GuardianOutputKeyringScope { keyring: self })
+    }
+
     pub fn active_cipher(&self) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
         let _authority_lease = self.acquire_authority_lease(false)?;
         verify_latest_authority(&self.directory, self.active, &self.active_key)?;
@@ -402,6 +442,10 @@ impl GuardianOutputKeyring {
         &self,
         exclusive: bool,
     ) -> Result<Option<AuthorityFileLease>, GuardianOutputKeyringError> {
+        if let Some(lease) = &self.scoped_authority {
+            validate_open_authority_lock_file(&self.directory, &lease.file)?;
+            return Ok(None);
+        }
         self.use_authority_lock
             .then(|| AuthorityFileLease::acquire(&self.directory, false, exclusive))
             .transpose()
@@ -450,6 +494,7 @@ fn open_inventory(
     Ok(GuardianOutputKeyring {
         directory,
         use_authority_lock: false,
+        scoped_authority: None,
         active,
         active_key,
         pending_generation: inventory.pending.map(|intent| intent.generation),
@@ -619,8 +664,15 @@ impl AuthorityFileLease {
             let _ = fs2::FileExt::unlock(&file);
             return Err(error);
         }
+        #[cfg(test)]
+        AUTHORITY_LEASE_ACQUISITIONS.with(|count| count.set(count.get() + 1));
         Ok(Self { file })
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static AUTHORITY_LEASE_ACQUISITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Drop for AuthorityFileLease {
@@ -949,6 +1001,7 @@ fn provision_first(
         active,
         active_key,
         pending_generation: None,
+        scoped_authority: None,
     })
 }
 
@@ -2154,6 +2207,119 @@ mod tests {
             GuardianOutputKeyring::open_existing_scrollback_sibling(&nonempty_scrollback),
             Err(GuardianOutputKeyringError::UnsafeKeyFile)
         ));
+    }
+
+    #[test]
+    fn scoped_authority_reuses_one_lease_and_releases_it_after_unwind() {
+        let root = tempfile::tempdir().expect("create scoped authority root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let mut keyring = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+            .expect("provision scoped authority");
+        let key_id = keyring.active_key_id();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                scrollback
+                    .join(SCROLLBACK_KEYRING_SIBLING)
+                    .join(AUTHORITY_LOCK_NAME),
+            )
+            .expect("open an independent authority-lock description");
+        let before = AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get);
+        {
+            let mut scope = keyring.scoped_authority().expect("acquire authority scope");
+            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            for _ in 0..4 {
+                assert_eq!(scope.active_cipher().unwrap().key_id(), key_id);
+                assert_eq!(scope.latest_active_cipher().unwrap().key_id(), key_id);
+                assert_eq!(scope.cipher_for_key_id(key_id).unwrap().key_id(), key_id);
+            }
+            assert_eq!(
+                AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
+                before + 1
+            );
+            assert!(
+                scope.scoped_authority().is_err(),
+                "nested scopes must not release the outer lease"
+            );
+            assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+        }
+        fs2::FileExt::try_lock_exclusive(&contender).expect("normal return releases authority");
+        fs2::FileExt::unlock(&contender).expect("release contender");
+        assert!(keyring.scoped_authority.is_none());
+        keyring
+            .active_cipher()
+            .expect("ordinary lookup acquires a fresh lease");
+        assert_eq!(
+            AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
+            before + 2
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = keyring.scoped_authority().expect("acquire unwinding scope");
+            panic!("test authority-scope unwind cleanup");
+        }))
+        .expect_err("the negative control must unwind");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"test authority-scope unwind cleanup")
+        );
+        assert!(keyring.scoped_authority.is_none());
+        fs2::FileExt::try_lock_exclusive(&contender).expect("unwind releases authority");
+        fs2::FileExt::unlock(&contender).expect("release contender after unwind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_authority_rejects_lock_replacement_and_key_mutation() {
+        for replace_lock in [false, true] {
+            let root = tempfile::tempdir().expect("create tampering test root");
+            let scrollback = root.path().join("scrollback-lines");
+            std::fs::create_dir(&scrollback).expect("create scrollback directory");
+            let mut keyring =
+                GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+                    .expect("provision authority before tampering");
+            let scope = keyring
+                .scoped_authority()
+                .expect("pin live authority scope");
+            let key_id = scope.active_key_id();
+            if replace_lock {
+                scope
+                    .directory
+                    .rename(
+                        AUTHORITY_LOCK_NAME,
+                        &scope.directory,
+                        ".retained-authority-lock",
+                    )
+                    .expect("retain original lock inode");
+                create_private_file(&scope.directory, AUTHORITY_LOCK_NAME)
+                    .expect("create a distinct lock inode");
+                assert!(matches!(
+                    scope.active_cipher(),
+                    Err(GuardianOutputKeyringError::IdentityChanged)
+                ));
+                assert!(matches!(
+                    scope.cipher_for_key_id(key_id),
+                    Err(GuardianOutputKeyringError::IdentityChanged)
+                ));
+            } else {
+                let mut options = CapOpenOptions::new();
+                options.write(true).follow(FollowSymlinks::No);
+                let mut file = scope
+                    .directory
+                    .open_with(key_name(key_id), &options)
+                    .expect("open original key for mutation");
+                file.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
+                    .expect("change key material without changing inode");
+                file.sync_all().expect("synchronize changed key");
+                assert!(
+                    scope.active_cipher().is_err(),
+                    "scope must not cache trusted key material"
+                );
+                assert!(scope.cipher_for_key_id(key_id).is_err());
+            }
+        }
     }
 
     #[test]
