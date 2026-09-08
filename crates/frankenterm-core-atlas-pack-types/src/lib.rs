@@ -3,26 +3,26 @@
 //! Per Jukka Jylänki's *A Thousand Ways to Pack the Bin*, several
 //! algorithms trade speed for waste:
 //!
-//! - **Shelf-packing** — fastest, ~10% wasted; row-based, ideal for
+//! - **Shelf-packing** — constant-time placement; row-based, ideal for
 //!   uniform-height glyph runs (small static atlases).
-//! - **Skyline** — simple, ~5% wasted, online; the default the bead
-//!   names for atlases below 2048².
-//! - **Maximal rectangles** — tighter (~2% wasted), slower; the bead's
-//!   default for atlases above 4096². The full
+//! - **Skyline** — online placement; selected by default when the
+//!   largest axis is above 512 and below 4096.
+//! - **Maximal rectangles** — more expensive placement with overlapping
+//!   free rectangles; selected by default at a largest axis of 4096 or above. The full
 //!   [`MaximalRectanglesPacker`] implementation and selector dispatch
-//!   live in this crate.
+//!   live in this crate. Packing efficiency depends on the glyph workload.
 //!
 //! ## What this module ships
 //!
-//! - `Atlas2DSize { width, height }` and `GlyphSize` with non-zero
-//!   invariant.
+//! - `Atlas2DSize { width, height }` and `GlyphSize` with constructors
+//!   that reject zero dimensions; their public fields can bypass those checks.
 //! - `PackedRect { x, y, width, height }` — the result of an
 //!   allocation. The integration layer copies this into the atlas's
 //!   per-glyph metadata (cross-link `atlas_stability.rs` ft-mpc9b.1.1).
 //! - `AllocationOutcome` — `Placed(rect)` / `Rejected(reason)`.
 //! - `PackerKind` — `Shelf | Skyline | MaximalRectangles`. The
 //!   adaptive selector picks one from atlas size.
-//! - `select_packer(size) -> PackerKind` — pure-logic policy.
+//! - `select_packer(size, thresholds) -> PackerKind` — pure-logic policy.
 //!   Configurable thresholds via `PackerSelectionThresholds`.
 //! - `ShelfPacker`, `SkylinePacker`, and `MaximalRectanglesPacker` all
 //!   implement the [`BinPacker`] trait. The factory
@@ -32,7 +32,7 @@
 //! - `non_overlapping` — invariant checker for tests + integration's
 //!   debug-mode assertions. Returns the first overlap pair if any.
 //! - `PackingStats` — running counters (`alloc_total`,
-//!   `reject_total`, `wasted_bytes`, `used_bytes`) + `efficiency_pct`
+//!   `reject_total`, `atlas_bytes`, `used_bytes`) + `efficiency_pct`
 //!   for `ft doctor`.
 //!
 //! ## What ships in this module (ft-i1y15)
@@ -90,8 +90,8 @@ impl Atlas2DSize {
     }
 }
 
-/// Glyph dimensions to allocate. Non-zero on construction so the
-/// packer's invariants hold without per-call zero-checks.
+/// Glyph dimensions to allocate. Constructors require non-zero dimensions;
+/// callers using the public fields directly can also represent zero sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphSize {
     pub width: u32,
@@ -206,7 +206,7 @@ pub enum PackerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackerSelectionThresholds {
-    /// Atlases at or below this size on either axis use `Shelf`.
+    /// Atlases at or below this size on both axes use `Shelf`.
     /// Default `512` per the bead's hint that shelf is the legacy
     /// fallback for small static atlases.
     pub shelf_max_axis: u32,
@@ -226,8 +226,7 @@ impl Default for PackerSelectionThresholds {
 
 /// Adaptive selector. `Shelf` for ≤ shelf_max_axis on both axes,
 /// `MaximalRectangles` for ≥ maximal_rectangles_min_axis on either
-/// axis, `Skyline` for everything in between (the default for the
-/// bead's "<2048²" range).
+/// axis, `Skyline` for everything in between.
 #[must_use]
 pub fn select_packer(size: Atlas2DSize, thresholds: PackerSelectionThresholds) -> PackerKind {
     let max_axis = size.width.max(size.height);
@@ -246,8 +245,8 @@ pub fn select_packer(size: Atlas2DSize, thresholds: PackerSelectionThresholds) -
 
 /// Row-based shelf-packer. Tracks the current shelf's `y` and the
 /// cursor `x` along the active shelf; opens a new shelf when the
-/// glyph doesn't fit on the current one. ~10% wasted space; O(1)
-/// per allocation.
+/// glyph doesn't fit on the current one. O(1) per allocation;
+/// wasted space depends on the glyph sequence.
 #[derive(Debug, Clone)]
 pub struct ShelfPacker {
     size: Atlas2DSize,
@@ -942,7 +941,9 @@ pub fn non_overlapping(placements: &[PackedRect]) -> bool {
 pub struct PackingStats {
     pub alloc_total: u64,
     pub reject_total: u64,
+    /// Sum of placed rectangle areas in pixels, despite the historical field name.
     pub used_bytes: u64,
+    /// Atlas area in pixels; multiply by the pixel format's byte width for storage.
     pub atlas_bytes: u64,
 }
 
@@ -1750,7 +1751,7 @@ mod tests {
     #[test]
     fn stats_efficiency_after_placements() {
         let mut s = PackingStats::default();
-        s.record_atlas_size(atlas(100, 100)); // 10_000 bytes
+        s.record_atlas_size(atlas(100, 100)); // 10_000 pixels
         s.record_placed(PackedRect {
             x: 0,
             y: 0,
