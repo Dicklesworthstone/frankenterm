@@ -2741,35 +2741,10 @@ impl LiveScrollbackSpillSink {
                 Err(error) => return Err(error),
             };
             if stage_is_exact {
-                let path_metadata = std::fs::symlink_metadata(&stage_path)?;
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-
-                    options.custom_flags(libc::O_NOFOLLOW);
-                }
-                let file = options.open(&stage_path)?;
-                let handle_metadata = file.metadata()?;
-                anyhow::ensure!(
-                    path_metadata.file_type().is_file()
-                        && path_metadata.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
-                        && handle_metadata.is_file()
-                        && handle_metadata.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
-                    "opened exact append WAL stage is not a bounded regular file"
-                );
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt as _;
-
-                    anyhow::ensure!(
-                        handle_metadata.dev() == path_metadata.dev()
-                            && handle_metadata.ino() == path_metadata.ino(),
-                        "exact append WAL stage changed identity before synchronization"
-                    );
-                }
-                file.sync_all()?;
+                Self::sync_private_scrollback_stage(
+                    &stage_path,
+                    LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                )?;
             } else {
                 let stage_exists = std::fs::symlink_metadata(&stage_path).is_ok();
                 let mut options = std::fs::OpenOptions::new();
@@ -3613,6 +3588,13 @@ impl LiveScrollbackSpillSink {
                             .context("authenticate retained complete scrollback rows")?;
                         }
 
+                        // A failed earlier file sync can leave complete,
+                        // authentic bytes in cache. Reestablish their durability
+                        // before the retained stage becomes recovery authority.
+                        Self::sync_private_scrollback_stage(
+                            &stage_path,
+                            LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+                        )?;
                         std::fs::rename(&stage_path, &manifest_path).with_context(|| {
                             format!(
                                 "publish retained complete scrollback manifest {}",
@@ -3782,6 +3764,12 @@ impl LiveScrollbackSpillSink {
                         "staged append WAL is neither adjacent to nor authentically superseded by the published generation"
                     );
                 }
+                // The WAL must be durable before reconciliation can commit
+                // ledger writes that depend on it after a subsequent crash.
+                Self::sync_private_scrollback_stage(
+                    &append_wal_stage_path,
+                    LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                )?;
                 match std::fs::rename(&append_wal_stage_path, &append_wal_path) {
                     Ok(()) => {}
                     Err(rename_error) => {
@@ -4541,12 +4529,12 @@ impl LiveScrollbackSpillSink {
         Ok(())
     }
 
-    fn sync_private_manifest_stage(path: &std::path::Path) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            Self::manifest_stage_is_recoverably_incomplete(path)?,
-            "manifest stage disappeared before synchronization"
-        );
+    fn sync_private_scrollback_stage(path: &std::path::Path, max_bytes: u64) -> anyhow::Result<()> {
         let expected = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            expected.file_type().is_file() && expected.len() <= max_bytes,
+            "scrollback stage is not a bounded regular file"
+        );
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true);
         #[cfg(unix)]
@@ -4558,19 +4546,24 @@ impl LiveScrollbackSpillSink {
         let file = options.open(path)?;
         let observed = file.metadata()?;
         anyhow::ensure!(
-            expected.file_type().is_file()
-                && expected.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES
-                && observed.is_file()
-                && observed.len() <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
-            "manifest stage handle is not a bounded file"
+            observed.is_file() && observed.len() <= max_bytes,
+            "scrollback stage handle is not a bounded file"
         );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("scrollback stage has no parent"))?;
+            let parent_metadata = std::fs::symlink_metadata(parent)?;
             anyhow::ensure!(
-                observed.dev() == expected.dev() && observed.ino() == expected.ino(),
-                "manifest stage changed identity before synchronization"
+                unix_mode_is_private(observed.permissions().mode())
+                    && observed.nlink() == 1
+                    && observed.uid() == parent_metadata.uid()
+                    && observed.dev() == expected.dev()
+                    && observed.ino() == expected.ino(),
+                "scrollback stage lost private file authority before synchronization"
             );
         }
         file.sync_all()?;
@@ -4583,7 +4576,7 @@ impl LiveScrollbackSpillSink {
                 path_metadata.file_type().is_file()
                     && path_metadata.dev() == observed.dev()
                     && path_metadata.ino() == observed.ino(),
-                "manifest stage changed path during synchronization"
+                "scrollback stage changed path during synchronization"
             );
         }
         Ok(())
@@ -4836,7 +4829,10 @@ impl LiveScrollbackSpillSink {
                     // than comparing the renamed stage against the newly sealed
                     // equivalent constructed for this retry.
                     manifest = staged;
-                    Self::sync_private_manifest_stage(&temp_path)?;
+                    Self::sync_private_scrollback_stage(
+                        &temp_path,
+                        LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+                    )?;
                     #[cfg(not(windows))]
                     std::fs::File::open(parent)?.sync_all()?;
                 }
@@ -9380,6 +9376,177 @@ mod tests {
         assert_eq!(manifest.oldest_seq, Some(0));
         assert_eq!(manifest.retained_rows, 1);
         assert_eq!(manifest.next_seq, 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires strace syscall fault injection; run explicitly through RCH"]
+    fn recovered_stages_require_file_sync_before_publication() {
+        const CHILD_ROOT: &str = "FT_SCROLLBACK_RECOVERY_SYNC_CHILD_ROOT";
+        const CHILD_FAULT: &str = "FT_SCROLLBACK_RECOVERY_SYNC_CHILD_FAULT";
+        const IDENTITY: u8 = 231;
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let context = config::ScrollbackSpillSinkContext {
+                pane_id: usize::from(IDENTITY) + 20_000,
+                domain_id: 3,
+                durable_pane_id: [IDENTITY; 16],
+                command_description: "append-wal-crash-fixture".to_string(),
+            };
+            let result = LiveScrollbackSpillSink::new(PathBuf::from(root), &context);
+            if std::env::var_os(CHILD_FAULT).is_some() {
+                let error = match result {
+                    Ok(_) => panic!("stage synchronization must fail closed"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.chain().any(|cause| cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.raw_os_error() == Some(libc::EIO))),
+                    "recovery must propagate the injected stage sync failure: {error:#}"
+                );
+                eprintln!("RECOVERED_STAGE_SYNC failure_rejected");
+            } else {
+                let sink = result.expect("recover the synchronized authenticated stage");
+                assert_eq!(
+                    sink.load_scrollback_line(11)
+                        .expect("recovered exact successor")
+                        .as_str()
+                        .as_ref(),
+                    "append-wal-recovered-target"
+                );
+                assert!(sink.load_scrollback_line(10).is_none());
+                assert_eq!(sink.retained_scrollback_rows(), 1);
+                eprintln!("RECOVERED_STAGE_SYNC exact_recovery_verified");
+            }
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("current test executable");
+        for kind in ["manifest", "wal"] {
+            let mut sync_ordinal = None;
+            for inject_fault in [false, true] {
+                let (dir, _context, sink, wal, _appended) = append_wal_fixture(IDENTITY, 1);
+                let stage_path = if kind == "wal" {
+                    let path = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path)
+                        .expect("WAL stage path");
+                    write_complete_append_wal_fixture(&path, &wal);
+                    path
+                } else {
+                    let predecessor = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+                        .expect("read predecessor")
+                        .expect("predecessor exists");
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish WAL before ledger mutation");
+                    let recovered_state = materialize_append_wal_target_for_test(&sink, &wal);
+                    *sink.lock_state("prepare recovery sync fixture").unwrap() = recovered_state;
+                    sink.persist_manifest("complete")
+                        .expect("construct successor");
+                    let target = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+                        .expect("read successor")
+                        .expect("successor exists");
+                    overwrite_private_manifest_fixture(&sink.manifest_path, &predecessor);
+                    let path = LiveScrollbackSpillSink::deterministic_manifest_stage_path(
+                        &sink.manifest_path,
+                    )
+                    .expect("manifest stage path");
+                    write_private_stage_fixture(&path, &serde_json::to_vec(&target).unwrap());
+                    path
+                };
+                let pane_dir = sink.manifest_path.parent().unwrap().to_path_buf();
+                drop(sink);
+                let pane_bytes = || {
+                    std::fs::read_dir(&pane_dir)
+                        .unwrap()
+                        .map(|entry| {
+                            let entry = entry.unwrap();
+                            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                let predecessor_bytes = pane_bytes();
+                let trace_path = dir.path().join("recovery-sync.trace");
+                let mut command = std::process::Command::new("strace");
+                command
+                    .args([
+                        "-f",
+                        "-qq",
+                        "-yy",
+                        "-e",
+                        "trace=fsync,rename,renameat,renameat2",
+                        "-o",
+                    ])
+                    .arg(&trace_path);
+                if inject_fault {
+                    command
+                        .arg("-e")
+                        .arg(format!(
+                            "inject=fsync:error=EIO:when={}",
+                            sync_ordinal.expect("positive trace identifies recovery stage sync")
+                        ))
+                        .env(CHILD_FAULT, "1");
+                } else {
+                    command.env_remove(CHILD_FAULT);
+                }
+                let output = command
+                    .arg(&executable)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "tests::recovered_stages_require_file_sync_before_publication",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_ROOT, dir.path())
+                    .output()
+                    .expect("strace must be installed for the explicit recovery fault gate");
+                let trace =
+                    std::fs::read_to_string(trace_path).expect("read recovery syscall trace");
+                let child_stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "{kind} fault={inject_fault}: stdout={} stderr={child_stderr} trace={trace}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                let lines: Vec<_> = trace.lines().collect();
+                let stage_path = stage_path.to_str().expect("fixture path is UTF-8");
+                let stage_sync = lines
+                    .iter()
+                    .position(|line| line.contains("fsync(") && line.contains(stage_path))
+                    .expect("the actual constructor must synchronize the retained stage file");
+                let publication = lines
+                    .iter()
+                    .position(|line| line.contains("rename") && line.contains(stage_path));
+                if inject_fault {
+                    assert!(lines[stage_sync].contains("INJECTED"), "{trace}");
+                    assert!(
+                        publication.is_none(),
+                        "failed stage sync must precede rename: {trace}"
+                    );
+                    assert_eq!(
+                        pane_bytes(),
+                        predecessor_bytes,
+                        "failed recovery changed authority"
+                    );
+                    assert!(child_stderr.contains("RECOVERED_STAGE_SYNC failure_rejected"));
+                } else {
+                    assert!(lines[stage_sync].contains("= 0"), "{trace}");
+                    assert!(
+                        stage_sync < publication.expect("successful recovery publishes the stage")
+                    );
+                    let thread = lines[stage_sync].split_whitespace().next().unwrap();
+                    sync_ordinal = Some(
+                        lines[..=stage_sync]
+                            .iter()
+                            .filter(|line| {
+                                line.split_whitespace().next() == Some(thread)
+                                    && line.contains("fsync(")
+                            })
+                            .count(),
+                    );
+                    assert!(child_stderr.contains("RECOVERED_STAGE_SYNC exact_recovery_verified"));
+                }
+                eprintln!("RECOVERED_STAGE_SYNC kind={kind} fault={inject_fault} verified");
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug)]
