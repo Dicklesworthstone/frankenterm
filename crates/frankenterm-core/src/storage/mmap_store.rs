@@ -3391,6 +3391,66 @@ mod tests {
     }
 
     #[test]
+    fn versioned_replacement_preserves_large_batch_on_reopen() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let mut records: Vec<String> = (0..1024)
+            .map(|index| {
+                format!(
+                    "row-{index:04}-界-e\u{301}-🦀-{}",
+                    "x".repeat(256 + index % 17)
+                )
+            })
+            .collect();
+        records[0].clear();
+        records[1023] = "z".repeat(128 * 1024);
+        let expected_bytes = format!("{}\n", records.join("\n")).into_bytes();
+        let committed_bytes = u64::try_from(expected_bytes.len()).unwrap();
+
+        // The same complete production staging call is measured before and
+        // after batching. Three warmups precede ten fresh-ledger samples;
+        // exact bytes, ordering and reopen visibility are checked every time.
+        for round in 0..13_u64 {
+            let replacement_id = (1_u64 << 63) | (0x100 + round);
+            let started = std::time::Instant::now();
+            let staged = store
+                .stage_versioned_pane_replacement(
+                    replacement_id,
+                    &records,
+                    records.len(),
+                    committed_bytes,
+                )
+                .expect("stage complete replacement batch");
+            let elapsed = started.elapsed();
+            assert!(!staged.reused_existing());
+            assert_eq!(staged.record_count(), records.len());
+            assert_eq!(staged.committed_bytes(), committed_bytes);
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("{replacement_id}.log"))).unwrap(),
+                expected_bytes
+            );
+            let mut reopened = file_only_store(dir.path());
+            reopened.open_existing_pane(replacement_id).unwrap();
+            assert_eq!(
+                reopened.tail_lines(replacement_id, records.len()).unwrap(),
+                records
+            );
+            assert_eq!(
+                reopened.next_seq(replacement_id).unwrap(),
+                u64::try_from(records.len()).unwrap()
+            );
+            eprintln!(
+                "SCROLLBACK_REPLACEMENT_STAGE phase={} round={} rows={} bytes={} elapsed_ns={}",
+                if round < 3 { "warmup" } else { "sample" },
+                round,
+                records.len(),
+                committed_bytes,
+                elapsed.as_nanos()
+            );
+        }
+    }
+
+    #[test]
     fn deterministic_replacement_retry_reuses_one_bounded_ledger_slot() {
         let dir = temp_dir();
         let mut store = file_only_store(dir.path());
