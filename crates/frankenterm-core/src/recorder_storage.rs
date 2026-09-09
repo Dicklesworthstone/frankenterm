@@ -3322,6 +3322,23 @@ impl AppendLogStateFile {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    fn check_staging_identity(
+        &self,
+        file: &cap_std::fs::File,
+    ) -> std::result::Result<(), RecorderStorageError> {
+        let held = file.metadata()?;
+        let named = self.directory.symlink_metadata(&self.temporary_name)?;
+        if !held.is_file()
+            || !named.is_file()
+            || recorder_link_count(&held)? != 1
+            || recorder_link_count(&named)? != 1
+            || recorder_file_identity(&held)? != recorder_file_identity(&named)?
+        {
+            return Err(std::io::Error::other("recorder staging file identity changed").into());
+        }
+        Ok(())
+    }
+
     fn write(&self, state: &PersistedState) -> std::result::Result<(), RecorderStorageError> {
         self.check_lock()?;
         let bytes = state.canonical_bytes()?;
@@ -3329,17 +3346,15 @@ impl AppendLogStateFile {
         // Do not truncate until the actual no-follow descriptor is validated.
         options.create(true).write(true);
         let mut file = self.directory.open_with(&self.temporary_name, &options)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || recorder_link_count(&metadata)? != 1 {
-            return Err(std::io::Error::other(
-                "recorder staging file must be a uniquely linked regular file",
-            )
-            .into());
-        }
+        self.check_staging_identity(&file)?;
         file.set_len(0)?;
         file.write_all(&bytes)?;
-        drop(file);
+        // Persist the complete candidate before it can replace the previous
+        // state. This alone does not make the rename durable: parent-directory
+        // sync and post-publication uncertainty still require reconciliation.
+        file.sync_all()?;
         self.check_lock()?;
+        self.check_staging_identity(&file)?;
         self.directory
             .rename(&self.temporary_name, &self.directory, &self.state_name)?;
         Ok(())
@@ -7301,6 +7316,57 @@ recorder_backend = "frankensqlite"
             .unwrap()
             .committed_at_ms += 1;
         assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn persisted_state_staging_identity_rejects_replaced_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state_file = AppendLogStateFile::open(&path).unwrap();
+        let original = PersistedState::default();
+        state_file.write(&original).unwrap();
+        let published = std::fs::read(&path).unwrap();
+        let mut options = recorder_open_options();
+        options.create_new(true).write(true);
+        let mut held = state_file
+            .directory
+            .open_with(&state_file.temporary_name, &options)
+            .unwrap();
+        held.write_all(b"held candidate").unwrap();
+        state_file.check_staging_identity(&held).unwrap();
+        let staging = dir.path().join(&state_file.temporary_name);
+        std::fs::rename(&staging, dir.path().join("displaced-candidate")).unwrap();
+        std::fs::write(&staging, b"replacement candidate").unwrap();
+        assert!(state_file.check_staging_identity(&held).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        assert_eq!(std::fs::read(&staging).unwrap(), b"replacement candidate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_staging_alias_rejection_preserves_published_state() {
+        for symlink in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            let state_file = AppendLogStateFile::open(&path).unwrap();
+            state_file.write(&PersistedState::default()).unwrap();
+            let published = std::fs::read(&path).unwrap();
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, b"untouched sentinel").unwrap();
+            let staging = dir.path().join(&state_file.temporary_name);
+            if symlink {
+                std::os::unix::fs::symlink(&victim, &staging).unwrap();
+            } else {
+                std::fs::hard_link(&victim, &staging).unwrap();
+            }
+            let advanced = PersistedState {
+                next_offset: 42,
+                ..PersistedState::default()
+            };
+            assert!(state_file.write(&advanced).is_err());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched sentinel");
+            assert_eq!(std::fs::read(&path).unwrap(), published);
+        }
     }
 
     #[test]
