@@ -9446,7 +9446,14 @@ mod tests {
             let mut sync_ordinal = None;
             for inject_fault in [false, true] {
                 let (dir, _context, sink, wal, _appended) = append_wal_fixture(IDENTITY, 1);
-                let stage_path = if kind != "manifest" {
+                let stage_path = if kind == "active_wal" {
+                    // The first-row fixture uses a prepared manifest, so it
+                    // has no active WAL yet. Publish the actual later-row WAL
+                    // and observe its dependent manifest publication on reopen.
+                    sink.persist_authenticated_append_wal(&wal)
+                        .expect("publish active WAL recovery fixture");
+                    sink.manifest_path.clone()
+                } else if kind != "manifest" {
                     let path = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path)
                         .expect("WAL stage path");
                     write_complete_append_wal_fixture(&path, &wal);
@@ -9543,7 +9550,9 @@ mod tests {
                     .position(|line| {
                         line.contains("fsync(") && line.contains(&format!("<{sync_path}>"))
                     })
-                    .expect("the actual constructor must synchronize the retained authority file");
+                    .unwrap_or_else(|| {
+                        panic!("{kind}: constructor did not synchronize {sync_path}: {trace}")
+                    });
                 let publication = lines
                     .iter()
                     .position(|line| line.contains("rename") && line.contains(stage_path));
