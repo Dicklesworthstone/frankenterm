@@ -42970,6 +42970,7 @@ fn recorder_startup_health_failure_reason(
 }
 
 async fn bootstrap_recorder_backend_with_probe(
+    cx: &frankenterm_core::cx::Cx,
     requested_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
     append_log: frankenterm_core::recorder_storage::AppendLogStorageConfig,
     rusqlite: frankenterm_core::recorder_storage::RusqliteStorageConfig,
@@ -42984,15 +42985,21 @@ async fn bootstrap_recorder_backend_with_probe(
         append_log,
         rusqlite,
     };
-    let storage = bootstrap_recorder_storage(recorder_config).map_err(|error| {
-        let detail = error.to_string();
-        anyhow::Error::new(error).context(format!(
-            "non-retryable: failed to bootstrap recorder backend {}: {detail}",
-            requested_backend
-        ))
-    })?;
+    // Opening includes recovery scans, directory publication and SQLite setup.
+    // Keep all of it off the async worker, and retain the join through natural
+    // settlement so cancellation cannot abandon an admitted backend/lock.
+    let storage = run_cli_settled_blocking_effect(cx, "recorder.bootstrap", move || {
+        bootstrap_recorder_storage(recorder_config).map_err(|error| {
+            let detail = error.to_string();
+            anyhow::Error::new(error).context(format!(
+                "non-retryable: failed to bootstrap recorder backend {}: {detail}",
+                requested_backend
+            ))
+        })
+    })
+    .await?;
 
-    let health = storage.health().await;
+    let health = storage.health_with_cx(cx).await;
     if let Some(reason) = recorder_startup_health_failure_reason(&health) {
         anyhow::bail!(
             "non-retryable: recorder backend {} startup health probe failed: {}",
@@ -43001,6 +43008,10 @@ async fn bootstrap_recorder_backend_with_probe(
         );
     }
 
+    anyhow::ensure!(
+        cx.checkpoint().is_ok(),
+        "recorder.bootstrap cancelled after backend settlement"
+    );
     Ok(storage)
 }
 
@@ -46923,6 +46934,7 @@ async fn run_watcher(
     let recorder_rusqlite_config = recorder_rusqlite_storage_config(layout, &config);
     let recorder_storage = Arc::new(
         bootstrap_recorder_backend_with_probe(
+            cx,
             requested_recorder_backend,
             recorder_append_log_config,
             recorder_rusqlite_config,
@@ -104900,6 +104912,7 @@ recorder_backend = "rusqlite"
             let rusqlite_db_path = rusqlite.db_path.clone();
 
             let error = bootstrap_recorder_backend_with_probe(
+                &frankenterm_core::cx::for_request(),
                 frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
                 append_log,
                 rusqlite,
@@ -104930,6 +104943,42 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn watcher_startup_cancelled_bootstrap_creates_no_backend_files() {
+        run_async_test(async {
+            use frankenterm_core::recorder_storage::{
+                AppendLogStorageConfig, RecorderBackendKind, RusqliteStorageConfig,
+            };
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let append_log = AppendLogStorageConfig {
+                    data_path: root.path().join("append/events.log"),
+                    state_path: root.path().join("append/state.json"),
+                    ..AppendLogStorageConfig::default()
+                };
+                let rusqlite = RusqliteStorageConfig {
+                    db_path: root.path().join("sqlite/recorder.db"),
+                    ..RusqliteStorageConfig::default()
+                };
+                let cx = frankenterm_core::cx::for_testing();
+                cx.cancel_with(
+                    frankenterm_core::outcome::CancelKind::User,
+                    Some("private-bootstrap-cancellation"),
+                );
+                let error =
+                    bootstrap_recorder_backend_with_probe(&cx, backend, append_log, rusqlite)
+                        .await
+                        .unwrap_err();
+                assert!(error.to_string().contains("cancelled"));
+                assert!(!error.to_string().contains("private-bootstrap-cancellation"));
+                assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            }
+        });
+    }
+
+    #[test]
     fn watcher_startup_rusqlite_bootstrap_succeeds_without_fallback() {
         run_async_test(async {
             let temp_root = tempfile::tempdir().expect("create recorder tempdir");
@@ -104944,6 +104993,7 @@ recorder_backend = "rusqlite"
             };
 
             let storage = bootstrap_recorder_backend_with_probe(
+                &frankenterm_core::cx::for_request(),
                 frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
                 append_log,
                 rusqlite,
