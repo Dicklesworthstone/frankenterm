@@ -4203,7 +4203,8 @@ positive and negative controls, and requires a retained RCH source receipt:
 
 ```bash
 FT_FORMAT_BASE=$(git rev-parse HEAD)
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_DISABLE_TARGET_REUSE=1 \
+  rch --no-self-healing exec \
   --base "$FT_FORMAT_BASE" --clean-overlay --no-overlay -- \
   env FT_FORMAT_PROOF_SHA="$FT_FORMAT_BASE" \
       FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
@@ -4218,6 +4219,8 @@ the remote transcript shows the named test passing, `1 passed`, `0 filtered
 out`, and `WORKSPACE_FORMAT_PROOF_SUCCESS` naming that revision. An exit-zero
 command alone is insufficient. The mandatory core-package verification
 command in `AGENTS.md` remains in effect.
+The per-job target prevents this tiny check from waiting on a larger build's
+shared Cargo lock; it trades incremental reuse for a small isolated compile.
 
 ### Methodology playbooks
 
