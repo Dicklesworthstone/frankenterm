@@ -4857,9 +4857,7 @@ mod tests {
     #[test]
     fn stable_range_excludes_unrepresentable_resident_rows() {
         let max_offset = usize::try_from(StableRowIndex::MAX).unwrap();
-        for (offset, expected_rows) in
-            [(max_offset - 1, 1), (max_offset, 0), (max_offset + 1, 0)]
-        {
+        for (offset, expected_rows) in [(max_offset - 1, 1), (max_offset, 0), (max_offset + 1, 0)] {
             let mut screen = test_screen(3, 8, 96);
             screen.stable_row_index_offset = offset;
             let requested = (StableRowIndex::MAX - 2)..StableRowIndex::MAX;
