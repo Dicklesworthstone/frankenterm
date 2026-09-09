@@ -431,7 +431,9 @@ fn rs_idempotency_cache_evicts_oldest_when_full() {
             .unwrap()
             .len();
 
-        let _ = storage
+        // A retained key cannot silently accept different contents, even when
+        // the caller asks for stronger durability.
+        let conflict = storage
             .append_batch(AppendRequest {
                 batch_id: "b3".to_string(),
                 events: vec![sample_event("e3-replay", 1, 200, "replay")],
@@ -439,7 +441,30 @@ fn rs_idempotency_cache_evicts_oldest_when_full() {
                 producer_ts_ms: 200,
             })
             .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            RecorderStorageError::IdempotencyConflict { ref batch_id } if batch_id == "b3"
+        ));
+        assert_eq!(
+            std::fs::metadata(dir.path().join("events.log"))
+                .unwrap()
+                .len(),
+            data_len_before2,
+            "conflicting retry must not write bytes"
+        );
+
+        let replay = storage
+            .append_batch(AppendRequest {
+                batch_id: "b3".to_string(),
+                events: vec![sample_event("e3", 1, 3, "x")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 200,
+            })
+            .await
             .unwrap();
+        assert!(replay.was_idempotent_replay);
+        assert_eq!(replay.first_offset.ordinal, 3);
 
         let data_len_after2 = std::fs::metadata(dir.path().join("events.log"))
             .unwrap()
@@ -590,7 +615,7 @@ fn rs_checkpoint_regression_returns_error() {
 }
 
 #[test]
-fn rs_health_records_checkpoint_regression_diagnostic() {
+fn rs_health_ignores_checkpoint_regression_from_caller_data() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
@@ -629,11 +654,21 @@ fn rs_health_records_checkpoint_regression_diagnostic() {
             RecorderStorageError::CheckpointRegression { .. }
         ));
 
-        let degraded = storage.health().await;
-        assert!(degraded.degraded);
-        let diagnostic = degraded.last_error.unwrap();
-        assert!(diagnostic.contains("commit_checkpoint failed"));
-        assert!(diagnostic.contains("TerminalData"));
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+        let after_rejection = storage.health().await;
+        assert!(!after_rejection.degraded);
+        assert!(after_rejection.last_error.is_none());
+        assert_eq!(
+            storage
+                .read_checkpoint(&consumer)
+                .await
+                .unwrap()
+                .unwrap()
+                .upto_offset
+                .ordinal,
+            5,
+            "a rejected regression must preserve the committed checkpoint"
+        );
 
         let _ = storage
             .commit_checkpoint(RecorderCheckpoint {
@@ -656,7 +691,7 @@ fn rs_health_records_checkpoint_regression_diagnostic() {
 }
 
 #[test]
-fn rs_health_records_append_diagnostic_and_clears_on_success() {
+fn rs_health_ignores_invalid_append_request_from_caller_data() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
@@ -675,11 +710,11 @@ fn rs_health_records_append_diagnostic_and_clears_on_success() {
             .unwrap_err();
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
 
-        let degraded = storage.health().await;
-        assert!(degraded.degraded);
-        let diagnostic = degraded.last_error.unwrap();
-        assert!(diagnostic.contains("append_batch failed"));
-        assert!(diagnostic.contains("TerminalData"));
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+        let after_rejection = storage.health().await;
+        assert!(!after_rejection.degraded);
+        assert!(after_rejection.last_error.is_none());
+        assert_eq!(std::fs::metadata(storage.data_path()).unwrap().len(), 0);
 
         let _ = storage
             .append_batch(AppendRequest {
