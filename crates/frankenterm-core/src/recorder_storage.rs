@@ -397,6 +397,11 @@ impl std::fmt::Display for RecorderBlockingFailure {
 /// Storage-layer error type with stable classes.
 #[derive(Debug, Error)]
 pub enum RecorderStorageError {
+    #[error("recorder state exceeds {resource} limit ({limit})")]
+    StateResourceLimit {
+        resource: &'static str,
+        limit: usize,
+    },
     /// Retry the same operation: a failed rename or later step may already
     /// have installed the candidate. Never interpret this as a rollback.
     #[error("recorder state publication failed at {phase:?} (may_be_published={may_be_published})")]
@@ -485,6 +490,7 @@ impl RecorderStorageError {
         match self {
             Self::QueueFull { .. } => RecorderStorageErrorClass::Overload,
             Self::InvalidRequest { .. }
+            | Self::StateResourceLimit { .. }
             | Self::CheckpointRegression { .. }
             | Self::IdempotencyConflict { .. } => RecorderStorageErrorClass::TerminalData,
             Self::CorruptRecord { .. }
@@ -1070,14 +1076,109 @@ struct PersistedState {
     segment_id: u64,
     next_offset: u64,
     next_ordinal: u64,
+    #[serde(deserialize_with = "deserialize_unique_checkpoints")]
     checkpoints: HashMap<String, RecorderCheckpoint>,
 }
 
+fn deserialize_unique_checkpoints<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, RecorderCheckpoint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueCheckpoints;
+    impl<'de> serde::de::Visitor<'de> for UniqueCheckpoints {
+        type Value = HashMap<String, RecorderCheckpoint>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("unique checkpoint consumer identities")
+        }
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut checkpoints = HashMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if checkpoints.contains_key(&key) {
+                    return Err(serde::de::Error::custom(
+                        "duplicate checkpoint consumer identity",
+                    ));
+                }
+                checkpoints.insert(key, map.next_value()?);
+            }
+            Ok(checkpoints)
+        }
+    }
+    deserializer.deserialize_map(UniqueCheckpoints)
+}
+
+/// Version-1 persisted-state budgets, independent of machine memory. Durable
+/// consumers are never evicted to meet these limits; admission fails instead.
+pub const RECORDER_STATE_MAX_BYTES_V1: usize = 16 * 1024 * 1024;
+pub const RECORDER_STATE_MAX_CONSUMERS_V1: usize = 65_536;
+pub const RECORDER_STATE_MAX_CONSUMER_BYTES_V1: usize = 1024;
+pub const RECORDER_STATE_MAX_SCHEMA_BYTES_V1: usize = 128;
+
+fn state_limit(resource: &'static str, limit: usize) -> RecorderStorageError {
+    RecorderStorageError::StateResourceLimit { resource, limit }
+}
+
+fn validate_checkpoint_state(checkpoint: &RecorderCheckpoint) -> Result<(), RecorderStorageError> {
+    if checkpoint.consumer.0.len() > RECORDER_STATE_MAX_CONSUMER_BYTES_V1 {
+        return Err(state_limit(
+            "consumer_bytes",
+            RECORDER_STATE_MAX_CONSUMER_BYTES_V1,
+        ));
+    }
+    if checkpoint.schema_version.len() > RECORDER_STATE_MAX_SCHEMA_BYTES_V1 {
+        return Err(state_limit(
+            "schema_bytes",
+            RECORDER_STATE_MAX_SCHEMA_BYTES_V1,
+        ));
+    }
+    Ok(())
+}
+
 impl PersistedState {
+    fn validate(&self) -> Result<(), RecorderStorageError> {
+        if self.checkpoints.len() > RECORDER_STATE_MAX_CONSUMERS_V1 {
+            return Err(state_limit(
+                "consumer_count",
+                RECORDER_STATE_MAX_CONSUMERS_V1,
+            ));
+        }
+        for (key, checkpoint) in &self.checkpoints {
+            validate_checkpoint_state(checkpoint)?;
+            if key != &checkpoint.consumer.0 {
+                return Err(RecorderStorageError::InvalidRequest {
+                    message: "persisted checkpoint identity mismatch".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Stable bytes for publication identity and exact retry reconciliation.
     /// Keep the runtime map unchanged; only the persisted object's key order
     /// is canonical. Existing state files with arbitrary key order still load.
-    fn canonical_bytes(&self) -> serde_json::Result<Vec<u8>> {
+    fn canonical_bytes(&self) -> Result<Vec<u8>, RecorderStorageError> {
+        self.validate()?;
+        struct BoundedStateBytes {
+            bytes: Vec<u8>,
+            exceeded: bool,
+        }
+        impl Write for BoundedStateBytes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > RECORDER_STATE_MAX_BYTES_V1 - self.bytes.len() {
+                    self.exceeded = true;
+                    return Err(std::io::Error::other("recorder state byte limit"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
         #[derive(Serialize)]
         struct WireState<'a> {
             segment_id: u64,
@@ -1086,16 +1187,28 @@ impl PersistedState {
             checkpoints: std::collections::BTreeMap<&'a str, &'a RecorderCheckpoint>,
         }
 
-        serde_json::to_vec_pretty(&WireState {
-            segment_id: self.segment_id,
-            next_offset: self.next_offset,
-            next_ordinal: self.next_ordinal,
-            checkpoints: self
-                .checkpoints
-                .iter()
-                .map(|(key, value)| (key.as_str(), value))
-                .collect(),
-        })
+        let mut output = BoundedStateBytes {
+            bytes: Vec::new(),
+            exceeded: false,
+        };
+        let encoded = serde_json::to_writer_pretty(
+            &mut output,
+            &WireState {
+                segment_id: self.segment_id,
+                next_offset: self.next_offset,
+                next_ordinal: self.next_ordinal,
+                checkpoints: self
+                    .checkpoints
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value))
+                    .collect(),
+            },
+        );
+        if output.exceeded {
+            return Err(state_limit("serialized_bytes", RECORDER_STATE_MAX_BYTES_V1));
+        }
+        encoded?;
+        Ok(output.bytes)
     }
 }
 
@@ -1420,6 +1533,32 @@ impl AppendLogRecorderStorage {
                 return Ok(existing.response);
             }
 
+            let next_offset = inner
+                .next_offset
+                .checked_add(total_bytes as u64)
+                .ok_or_else(|| RecorderStorageError::InvalidRequest {
+                    message: "recorder byte offset exhausted".to_string(),
+                })?;
+            let next_ordinal = inner
+                .next_ordinal
+                .checked_add(encoded.len() as u64)
+                .ok_or_else(|| RecorderStorageError::InvalidRequest {
+                    message: "recorder ordinal exhausted".to_string(),
+                })?;
+            // Counters are the only state fields changed by appending. Check
+            // size before touching the log when their JSON representation grows;
+            // otherwise the already-admitted state has exactly the same size.
+            if next_offset.to_string().len() != inner.next_offset.to_string().len()
+                || next_ordinal.to_string().len() != inner.next_ordinal.to_string().len()
+            {
+                PersistedState {
+                    segment_id: inner.segment_id,
+                    next_offset,
+                    next_ordinal,
+                    checkpoints: inner.checkpoints.clone(),
+                }
+                .canonical_bytes()?;
+            }
             let first_offset = RecorderOffset {
                 segment_id: inner.segment_id,
                 byte_offset: inner.next_offset,
@@ -1525,7 +1664,16 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            validate_checkpoint_state(&checkpoint)?;
             let key = checkpoint.consumer.0.clone();
+            if !inner.checkpoints.contains_key(&key)
+                && inner.checkpoints.len() >= RECORDER_STATE_MAX_CONSUMERS_V1
+            {
+                return Err(state_limit(
+                    "consumer_count",
+                    RECORDER_STATE_MAX_CONSUMERS_V1,
+                ));
+            }
             let outcome = match inner.checkpoints.get(&key) {
                 Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
                     return Err(RecorderStorageError::CheckpointRegression {
@@ -3387,8 +3535,19 @@ impl AppendLogStateFile {
                 "recorder state path is not a uniquely linked regular file",
             ));
         }
+        let metadata = file.metadata()?;
+        if metadata.len() > RECORDER_STATE_MAX_BYTES_V1 as u64 {
+            return Err(state_limit("serialized_bytes", RECORDER_STATE_MAX_BYTES_V1));
+        }
+        // Metadata is only an early refusal: cap the actual read as well so
+        // concurrent growth cannot turn startup into an unbounded allocation.
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        (&mut file)
+            .take(RECORDER_STATE_MAX_BYTES_V1 as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > RECORDER_STATE_MAX_BYTES_V1 {
+            return Err(state_limit("serialized_bytes", RECORDER_STATE_MAX_BYTES_V1));
+        }
         // Reopening after an interrupted publication must establish the visible
         // state's durability before exposing its checkpoints to callers.
         file.sync_all()?;
@@ -3398,7 +3557,11 @@ impl AppendLogStateFile {
         if bytes.is_empty() {
             return Ok(PersistedState::default());
         }
-        Ok(serde_json::from_slice(&bytes)?)
+        let state: PersistedState = serde_json::from_slice(&bytes)?;
+        // Also ensure that compact legacy JSON can be republished within the
+        // canonical-size budget, before event-log recovery is allowed to run.
+        state.canonical_bytes()?;
+        Ok(state)
     }
 
     fn check_staging_identity(
@@ -7478,6 +7641,58 @@ recorder_backend = "frankensqlite"
             .unwrap()
             .committed_at_ms += 1;
         assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn oversized_state_refusal_preserves_event_log_before_recovery() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let sentinel = b"unscannable event log sentinel";
+        std::fs::write(&config.data_path, sentinel).unwrap();
+        let state = File::create(&config.state_path).unwrap();
+        state
+            .set_len(RECORDER_STATE_MAX_BYTES_V1 as u64 + 1)
+            .unwrap();
+        assert!(matches!(
+            AppendLogRecorderStorage::open(config.clone()),
+            Err(RecorderStorageError::StateResourceLimit {
+                resource: "serialized_bytes",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(config.data_path).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn checkpoint_identity_byte_budget_is_inclusive() {
+        let mut checkpoint = RecorderCheckpoint {
+            consumer: CheckpointConsumerId("a".repeat(RECORDER_STATE_MAX_CONSUMER_BYTES_V1)),
+            upto_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+            schema_version: "s".repeat(RECORDER_STATE_MAX_SCHEMA_BYTES_V1),
+            committed_at_ms: 0,
+        };
+        validate_checkpoint_state(&checkpoint).unwrap();
+        checkpoint.consumer.0.push('a');
+        assert!(matches!(
+            validate_checkpoint_state(&checkpoint),
+            Err(RecorderStorageError::StateResourceLimit {
+                resource: "consumer_bytes",
+                ..
+            })
+        ));
+        checkpoint.consumer.0.pop();
+        checkpoint.schema_version.push('s');
+        assert!(matches!(
+            validate_checkpoint_state(&checkpoint),
+            Err(RecorderStorageError::StateResourceLimit {
+                resource: "schema_bytes",
+                ..
+            })
+        ));
     }
 
     #[test]
