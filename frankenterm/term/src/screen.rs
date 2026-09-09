@@ -3845,24 +3845,23 @@ impl Screen {
 
         let range_len =
             usize::try_from(range.end.saturating_sub(range.start)).unwrap_or(usize::MAX);
-
-        let first = match self.stable_row_to_phys(range.start) {
-            Some(first) => first,
-            None => {
-                return 0..range_len.min(self.lines.len());
-            }
+        let oldest = self.phys_to_stable_row_index(0);
+        let newest_exclusive = self.phys_to_stable_row_index(self.lines.len());
+        // Saturated stable coordinates do not make unrepresentable rows
+        // addressable. Match the half-open interval used by get_lines.
+        let addressable_len = usize::try_from(newest_exclusive.saturating_sub(oldest))
+            .unwrap_or(0)
+            .min(self.lines.len());
+        let resolved_len = range_len.min(addressable_len);
+        let first = if range.end > newest_exclusive {
+            // Use the exclusive endpoint: subtracting from the last row
+            // instead would return one more row than the caller requested.
+            addressable_len.saturating_sub(resolved_len)
+        } else {
+            self.stable_row_to_phys(range.start).unwrap_or(0)
         };
 
-        let last = match self.stable_row_to_phys(range.end.saturating_sub(1)) {
-            Some(last) => last,
-            None => {
-                let last = self.lines.len().saturating_sub(1);
-                return last.saturating_sub(range_len)
-                    ..last.saturating_add(1).min(self.lines.len());
-            }
-        };
-
-        first..last.saturating_add(1).min(self.lines.len())
+        first..first.saturating_add(resolved_len).min(addressable_len)
     }
 
     /// Translate a range of VisibleRowIndex to a range of PhysRowIndex.
@@ -4836,6 +4835,43 @@ mod tests {
 
         assert_eq!(screen.stable_range(&(2..2)), 0..0);
         assert_eq!(screen.stable_range(&(2..1)), 0..0);
+    }
+
+    #[test]
+    fn stable_range_clamps_to_the_requested_row_count() {
+        let mut screen = test_screen(5, 8, 96);
+        screen.stable_row_index_offset = 10;
+
+        assert_eq!(screen.stable_range(&(11..14)), 1..4);
+        assert_eq!(screen.stable_range(&(9..12)), 0..3);
+        assert_eq!(screen.stable_range(&(14..16)), 3..5);
+        assert_eq!(screen.stable_range(&(16..18)), 3..5);
+        assert_eq!(screen.stable_range(&(15..16)), 4..5);
+        assert_eq!(screen.stable_range(&(9..16)), 0..5);
+        assert_eq!(
+            screen.stable_range(&(StableRowIndex::MIN..StableRowIndex::MAX)),
+            0..5
+        );
+    }
+
+    #[test]
+    fn stable_range_excludes_unrepresentable_resident_rows() {
+        let max_offset = usize::try_from(StableRowIndex::MAX).unwrap();
+        for (offset, expected_rows) in
+            [(max_offset - 1, 1), (max_offset, 0), (max_offset + 1, 0)]
+        {
+            let mut screen = test_screen(3, 8, 96);
+            screen.stable_row_index_offset = offset;
+            let requested = (StableRowIndex::MAX - 2)..StableRowIndex::MAX;
+            let physical = screen.stable_range(&requested);
+            let (first, lines) = screen.lines_in_stable_range(requested);
+
+            assert_eq!(physical, 0..expected_rows, "offset {offset}");
+            assert_eq!(lines.len(), expected_rows, "offset {offset}");
+            if expected_rows != 0 {
+                assert_eq!(first, screen.phys_to_stable_row_index(physical.start));
+            }
+        }
     }
 
     #[test]
