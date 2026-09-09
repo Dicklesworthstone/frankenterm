@@ -558,7 +558,7 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 | Reality-check attestation bundles | Sigstore-signed slot manifest | None | None | None |
 | Incident bundles | Live collectors + publish-side snapshot | None | None | None |
 | Async runtime contract | asupersync, `Cx`-first, project-audited cancellation, `tokio` banned | tokio (no `Cx` model) | smol (no `Cx` model) | none of these project-specific contracts |
-| Unsafe code | `#![forbid(unsafe_code)]` workspace-wide | unsafe present | unsafe present | unsafe present |
+| Unsafe code | Forbidden in CLI/core; audited native/FFI exceptions | unsafe present | unsafe present | unsafe present |
 
 **When to use ft:**
 - Running 2+ AI coding agents that need coordination
@@ -788,8 +788,10 @@ RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
     -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
 ```
 
-This produces an uninstalled candidate process family under
-`target/release-interactive/`. Do **not** copy only `ft` over a live
+This builds an uninstalled candidate process family under the requested
+`CARGO_TARGET_DIR` (`/tmp/ft-readme-release-interactive/release-interactive/`
+in this example) on the selected RCH worker. Consult the RCH artifact receipt
+for retrieved local paths. Do **not** copy only `ft` over a live
 installation: the CLI, mux server, and PTY guardian are an atomic family with a
 shared build identity, manifest, and selector. On Apple-Silicon macOS, build the
 complete four-role app bundle (GUI plus that process family) with
@@ -3962,9 +3964,9 @@ This section catalogues the non-obvious design decisions the project has made, t
   asupersync types directly; those references are not evidence that every
   operation has completed its cancellation/ownership proof.
 
-### Why `#![forbid(unsafe_code)]` workspace-wide?
+### Why forbid unsafe code in the CLI and core?
 
-- **Memory safety should be a guarantee, not a goal.** Forbidding unsafe at the workspace level means we can't accidentally introduce it during a refactor.
+- **Keep unsafe out of application logic.** The CLI and core forbid unsafe code, and other crates inherit the workspace lint where applicable. Native/FFI exceptions remain subject to separate audits.
 - **Native-API workarounds use `std::process::Command`** (sysctl, ps, pgrep on macOS) rather than FFI.
 - **Vendored WezTerm crates with unsafe** are audited separately and tracked in `docs/vendored-wezterm-design.md`.
 - **Trade-off accepted**: some optimizations require unsafe and we don't take them. Performance work remains measurement-driven within safe Rust; current target-class input latency, resize/zoom responsiveness, and long-session scalability are not certified and must not be inferred from this safety policy.
@@ -4193,6 +4195,29 @@ RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CAR
   cargo test -p frankenterm-core --test 'proptest_*'          # property tests
 ```
 
+For a fast supplemental workspace-format check, the dependency-free atlas
+crate exposes the unchanged canonical formatting test. It still runs
+`cargo fmt --all -- --check` across the workspace, verifies the formatter's
+positive and negative controls, and requires a retained RCH source receipt:
+
+```bash
+FT_FORMAT_BASE=$(git rev-parse HEAD)
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec \
+  --base "$FT_FORMAT_BASE" --clean-overlay --no-overlay -- \
+  env FT_FORMAT_PROOF_SHA="$FT_FORMAT_BASE" \
+      FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
+      CARGO_TARGET_DIR=/tmp/ft-workspace-format-lean \
+  cargo test -j 2 -p frankenterm-core-atlas-pack-types \
+    --test workspace_format_proof --locked \
+    workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
+```
+
+This checks the committed revision, excluding local edits. Count it only when
+the remote transcript shows the named test passing, `1 passed`, `0 filtered
+out`, and `WORKSPACE_FORMAT_PROOF_SUCCESS` naming that revision. An exit-zero
+command alone is insufficient. The mandatory core-package verification
+command in `AGENTS.md` remains in effect.
+
 ### Methodology playbooks
 
 - [`docs/methodology/proof-techniques.md`](docs/methodology/proof-techniques.md) — when to use Loom / TLA+ / Stateright / proptest / dylint / cargo-deny, with exemplar files in this repo
@@ -4230,7 +4255,7 @@ ft doctor --json > /tmp/ft-doctor-memory.json
 ft status --health > /tmp/ft-status-health.txt
 ```
 
-Or reduce poll interval in `ft.toml`:
+To poll less frequently, increase the interval in `ft.toml`:
 ```toml
 [ingest]
 poll_interval_ms = 500
