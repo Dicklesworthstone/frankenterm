@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsSyncExt as _;
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 #[cfg(any(unix, windows))]
 use cap_std::fs::MetadataExt as _;
 use cap_std::fs::{Dir as CapDir, Metadata as CapMetadata, OpenOptions as CapOpenOptions};
@@ -1309,10 +1309,14 @@ impl AppendLogRecorderStorage {
         validate_recorder_paths(&config)?;
         ensure_parent_dir(&config.data_path)?;
         ensure_parent_dir(&config.state_path)?;
+        validate_recorder_paths(&config)?;
 
         // The staging-name lease also excludes distinct logs that share state
         // or whose different state extensions produce the same staging path.
         let path_leases = acquire_recorder_path_leases(&config)?;
+        // Creating lease directories can expose an initially absent Unicode
+        // alias of the reserved namespace. Reject it before opening resources.
+        validate_recorder_paths(&config)?;
         let mut state_file = AppendLogStateFile::open(&config.state_path)?;
         state_file.path_leases = path_leases;
         state_file.check_lock()?;
@@ -3594,9 +3598,11 @@ fn recorder_state_lock_path(state_path: &Path) -> PathBuf {
 }
 
 const RECORDER_PATH_LEASE_PREFIX: &str = ".ft-recorder-lease-";
+const RECORDER_PATH_LEASE_DIRECTORY: &str = ".ft-recorder-leases";
 
 #[derive(Debug)]
 struct RecorderPathLease {
+    parent: CapDir,
     directory: CapDir,
     name: PathBuf,
     file: File,
@@ -3604,6 +3610,17 @@ struct RecorderPathLease {
 
 impl RecorderPathLease {
     fn check(&self) -> Result<(), RecorderStorageError> {
+        let named_directory = self
+            .parent
+            .symlink_metadata(RECORDER_PATH_LEASE_DIRECTORY)?;
+        let held_directory = self.directory.dir_metadata()?;
+        if !named_directory.is_dir()
+            || recorder_file_identity(&named_directory)? != recorder_file_identity(&held_directory)?
+        {
+            return Err(invalid_recorder_path(
+                "recorder lease directory identity changed",
+            ));
+        }
         let named = self.directory.symlink_metadata(&self.name)?;
         let held = CapMetadata::from_file(&self.file)?;
         if !named.is_file()
@@ -3641,15 +3658,22 @@ fn acquire_recorder_path_leases(
     paths.sort();
     let mut leases = Vec::with_capacity(paths.len());
     for path in paths {
-        let (directory, resource_name) = recorder_parent(&path)?;
-        let name = PathBuf::from(format!(
-            "{RECORDER_PATH_LEASE_PREFIX}{:x}",
-            Sha256::digest(resource_name.as_os_str().as_encoded_bytes())
-        ));
+        let (parent, name) = recorder_parent(&path)?;
+        match parent.create_dir(RECORDER_PATH_LEASE_DIRECTORY) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+        let directory = parent.open_dir_nofollow(RECORDER_PATH_LEASE_DIRECTORY)?;
+        // Keep the basename intact: hashing its bytes gives distinct leases to
+        // case/Unicode-equivalent names on APFS. The sibling lease directory
+        // uses the filesystem's name equivalence, including for absent targets.
+        // Do not configure different per-directory case-folding policies for it.
         let mut options = recorder_open_options();
         options.create(true).read(true).write(true);
         let file = directory.open_with(&name, &options)?.into_std();
         let lease = RecorderPathLease {
+            parent,
             directory,
             name,
             file,
@@ -3677,13 +3701,42 @@ fn validate_recorder_paths(
     let mut observed = Vec::with_capacity(paths.len());
     for (role, path) in &paths {
         let canonical = resolve_recorder_path(path)?;
-        if canonical.file_name().is_some_and(|name| {
-            name.as_encoded_bytes()
-                .starts_with(RECORDER_PATH_LEASE_PREFIX.as_bytes())
+        if canonical.components().any(|component| {
+            let name = component.as_os_str().as_encoded_bytes();
+            name.eq_ignore_ascii_case(RECORDER_PATH_LEASE_DIRECTORY.as_bytes())
+                || name
+                    .get(..RECORDER_PATH_LEASE_PREFIX.len())
+                    .is_some_and(|prefix| {
+                        prefix.eq_ignore_ascii_case(RECORDER_PATH_LEASE_PREFIX.as_bytes())
+                    })
         }) {
             return Err(invalid_recorder_path(
                 "recorder path uses reserved lease namespace",
             ));
+        }
+        // APFS also folds non-ASCII characters such as long-s into ASCII.
+        // Compare filesystem identities instead of guessing its Unicode tables.
+        for ancestor in canonical
+            .ancestors()
+            .filter(|path| path.file_name().is_some())
+        {
+            let observed_namespace = (|| -> Result<bool, RecorderStorageError> {
+                let (parent, name) = recorder_parent(ancestor)?;
+                let reserved = parent.metadata(RECORDER_PATH_LEASE_DIRECTORY)?;
+                let candidate = parent.metadata(name)?;
+                Ok(recorder_file_identity(&reserved)? == recorder_file_identity(&candidate)?)
+            })();
+            match observed_namespace {
+                Ok(true) => {
+                    return Err(invalid_recorder_path(
+                        "recorder path aliases reserved lease namespace",
+                    ));
+                }
+                Ok(false) => {}
+                Err(RecorderStorageError::Io(err))
+                    if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
         let metadata = match recorder_parent(&canonical)
             .and_then(|(dir, name)| Ok(dir.metadata(name)?))
@@ -8108,16 +8161,91 @@ recorder_backend = "frankensqlite"
 
     #[test]
     fn recorder_paths_cannot_target_the_lease_namespace() {
+        for name in [
+            format!("{RECORDER_PATH_LEASE_PREFIX}reserved"),
+            ".FT-RECORDER-LEASE-reserved".to_string(),
+            RECORDER_PATH_LEASE_DIRECTORY.to_string(),
+            ".FT-RECORDER-LEASES/child".to_string(),
+        ] {
+            let root = tempdir().unwrap();
+            let mut config = test_config(root.path());
+            config.data_path = root.path().join(name);
+            assert!(matches!(
+                AppendLogRecorderStorage::open(config),
+                Err(RecorderStorageError::InvalidRequest { .. })
+            ));
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn path_leases_preserve_filesystem_equivalence_for_absent_targets() {
+        for (original, alias) in [
+            ("State.json", "STATE.JSON"),
+            ("caf\u{e9}.json", "cafe\u{301}.json"),
+        ] {
+            let root = tempdir().unwrap();
+            // Probe the actual parent filesystem without creating either target.
+            let probe = root.path().join("probe");
+            std::fs::create_dir(&probe).unwrap();
+            std::fs::write(probe.join(original), b"probe").unwrap();
+            let equivalent = probe.join(alias).exists();
+            let mut config = test_config(root.path());
+            config.state_path = root.path().join(original);
+            let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            assert!(!config.state_path.exists());
+            let data_before = std::fs::read(&config.data_path).unwrap();
+            let contender = AppendLogRecorderStorage::open(AppendLogStorageConfig {
+                data_path: root.path().join(alias),
+                state_path: root.path().join("contender.json"),
+                ..config.clone()
+            });
+            if equivalent {
+                assert!(
+                    contender.is_err(),
+                    "equivalent missing target acquired twice"
+                );
+                assert!(!config.state_path.exists());
+            } else {
+                assert!(contender.is_ok(), "distinct names must remain independent");
+                eprintln!(
+                    "case/Unicode alias exclusion not exercised for {original:?}: filesystem distinguishes names"
+                );
+            }
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), data_before);
+            drop(contender);
+            drop(owner);
+            assert!(AppendLogRecorderStorage::open(config).is_ok());
+        }
+    }
+
+    #[test]
+    fn path_leases_reject_unicode_aliases_of_reserved_ancestors() {
         let root = tempdir().unwrap();
+        let reserved = root.path().join(RECORDER_PATH_LEASE_DIRECTORY);
+        let alias = root.path().join(".ft-recorder-lea\u{17f}es");
+        // Store the non-ASCII spelling so canonicalization cannot make the
+        // ASCII fast rejection hide a broken identity-based ancestor check.
+        std::fs::create_dir(&alias).unwrap();
+        if !reserved.exists() {
+            eprintln!(
+                "reserved Unicode alias exclusion not exercised: filesystem distinguishes long-s"
+            );
+            return;
+        }
+        let protected = reserved.join("protected.log");
+        std::fs::write(&protected, b"lease bytes must survive").unwrap();
         let mut config = test_config(root.path());
-        config.data_path = root
-            .path()
-            .join(format!("{RECORDER_PATH_LEASE_PREFIX}reserved"));
+        config.data_path = alias.join("protected.log");
         assert!(matches!(
             AppendLogRecorderStorage::open(config),
             Err(RecorderStorageError::InvalidRequest { .. })
         ));
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(&protected).unwrap(),
+            b"lease bytes must survive"
+        );
+        assert_eq!(std::fs::read_dir(&reserved).unwrap().count(), 1);
     }
 
     #[test]
