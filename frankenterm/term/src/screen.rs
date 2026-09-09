@@ -1824,6 +1824,16 @@ impl Screen {
         if spill_outcome.cold_lines_evicted == 0 {
             return;
         }
+        if self
+            .config
+            .scrollback_spill_sink()
+            .is_some_and(|sink| sink.requires_scrollback_flush())
+        {
+            // Queue admission is only a memory transfer. The deferred adapter
+            // reports actual durable acknowledgements after its backing write;
+            // never manufacture worker completions here before that happens.
+            return;
+        }
 
         self.cold_scrollback_worker
             .begin_intent(seqno, spill_outcome.cold_lines_evicted);

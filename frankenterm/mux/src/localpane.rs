@@ -36,7 +36,7 @@ use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1987,49 +1987,73 @@ struct LocalPaneDCSHandler {
     mux_registration: Arc<PaneRegistrationSlot>,
 }
 
-pub(crate) fn emit_output_for_pane(registration: PaneRegistrationHandle, message: &str) {
-    let estimated_bytes = LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES.saturating_add(message.len());
-    let reservation = if promise::spawn::is_scheduler_configured() {
-        match promise::spawn::try_reserve_main_thread(
-            promise::spawn::MainThreadServiceClass::Render,
-            estimated_bytes,
-        ) {
-            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                Some(reservation)
-            }
-            rejected => {
-                metrics::counter!(
-                    "mux.local_pane.main_thread_admission",
-                    "operation" => "emit pane output",
-                    "outcome" => "inline_fallback"
-                )
-                .increment(1);
-                log::error!(
-                    "main-thread scheduler rejected local-pane output; preserving output inline: {rejected:?}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut parser = termwiz::escape::parser::Parser::new();
-    let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
-    parser.parse(message.as_bytes(), |action| actions.push(action));
+const MAX_GENERATED_OUTPUT_WORKERS: usize = 16;
+const MAX_GENERATED_OUTPUT_MESSAGE_BYTES: usize = 64 * 1024;
+static GENERATED_OUTPUT_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
-    if let Some(reservation) = reservation {
-        reservation
-            .spawn(async move {
-                let _ = registration.try_with_current_output(|pane| {
-                    pane.perform_actions(actions);
-                });
+struct GeneratedOutputPermit(&'static AtomicUsize);
+
+impl Drop for GeneratedOutputPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Generated exit/control-mode notices can arrive while the caller holds the
+/// process or terminal lock, including on the GUI thread. Never apply or drain
+/// them inline. This bounded auxiliary lane does not carry PTY output bytes.
+fn spawn_generated_output(
+    workers: &'static AtomicUsize,
+    message: &str,
+    apply: impl FnOnce(Vec<Action>) + Send + 'static,
+) -> bool {
+    if message.len() > MAX_GENERATED_OUTPUT_MESSAGE_BYTES
+        || workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_GENERATED_OUTPUT_WORKERS).then(|| active + 1)
             })
-            .detach();
-    } else {
+            .is_err()
+    {
+        metrics::counter!("mux.generated_output.rejected").increment(1);
+        log::error!("generated pane notice rejected by bounded worker admission");
+        return false;
+    }
+    let permit = GeneratedOutputPermit(workers);
+    let message = message.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("mux-generated-output".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            if catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| {
+                    let mut parser = termwiz::escape::parser::Parser::new();
+                    let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
+                    parser.parse(message.as_bytes(), |action| actions.push(action));
+                    apply(actions);
+                }),
+            )
+            .is_err()
+            {
+                metrics::counter!("mux.generated_output.panicked").increment(1);
+                log::error!("generated pane notice worker failed at the pane callback boundary");
+            }
+        });
+    if let Err(error) = spawned {
+        // A failed spawn drops its closure, returning the permit as well.
+        metrics::counter!("mux.generated_output.spawn_failed").increment(1);
+        log::error!("cannot spawn generated pane notice worker: {error}");
+        return false;
+    }
+    true
+}
+
+pub(crate) fn emit_output_for_pane(registration: PaneRegistrationHandle, message: &str) {
+    spawn_generated_output(&GENERATED_OUTPUT_WORKERS, message, move |actions| {
         let _ = registration.try_with_current_output(|pane| {
             pane.perform_actions(actions);
         });
-    }
+    });
 }
 
 impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
@@ -3409,6 +3433,80 @@ impl Drop for LocalPane {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn generated_output_returns_before_its_terminal_can_be_locked() {
+        static WORKERS: AtomicUsize = AtomicUsize::new(0);
+        let terminal = Arc::new(Mutex::new(guardian_lifetime_test_terminal()));
+        let held = terminal.lock();
+        let target = Arc::clone(&terminal);
+        let (admitted_tx, admitted_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        let caller = std::thread::spawn(move || {
+            admitted_tx
+                .send(spawn_generated_output(&WORKERS, "notice", move |actions| {
+                    target.lock().perform_actions(actions);
+                    done_tx.send(()).unwrap();
+                }))
+                .unwrap();
+        });
+        let admitted = admitted_rx.recv_timeout(Duration::from_millis(500));
+        let premature = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        drop(held);
+        caller.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            admitted.unwrap(),
+            "generated output must not run inline under a caller's lock"
+        );
+        assert!(!premature);
+        assert_eq!(terminal.lock().cursor_pos().x, 6);
+    }
+
+    #[test]
+    fn generated_output_worker_and_message_admission_are_bounded() {
+        static WORKERS: AtomicUsize = AtomicUsize::new(0);
+        let release = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let mut admitted = 0;
+        for _ in 0..MAX_GENERATED_OUTPUT_WORKERS {
+            let release = Arc::clone(&release);
+            admitted += usize::from(spawn_generated_output(&WORKERS, "bounded", move |_| {
+                let mut ready = release.0.lock();
+                while !*ready {
+                    release.1.wait(&mut ready);
+                }
+            }));
+        }
+        let refused =
+            !spawn_generated_output(&WORKERS, "overflow", |_| panic!("overflow callback ran"));
+        *release.0.lock() = true;
+        release.1.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while WORKERS.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(refused);
+        assert_eq!(admitted, MAX_GENERATED_OUTPUT_WORKERS);
+        assert_eq!(WORKERS.load(Ordering::Acquire), 0);
+        assert!(!spawn_generated_output(
+            &WORKERS,
+            &"x".repeat(MAX_GENERATED_OUTPUT_MESSAGE_BYTES + 1),
+            |_| panic!("oversized callback ran")
+        ));
+        assert_eq!(WORKERS.load(Ordering::Acquire), 0);
+        assert!(spawn_generated_output(&WORKERS, "panic", |_| panic!(
+            "synthetic generated-output callback panic"
+        )));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while WORKERS.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            WORKERS.load(Ordering::Acquire),
+            0,
+            "panic must release admission"
+        );
+    }
 
     fn term_size(cols: usize, rows: usize) -> TerminalSize {
         TerminalSize {

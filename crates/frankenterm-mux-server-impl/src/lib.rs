@@ -496,6 +496,7 @@ mod deferred_scrollback {
                     .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
                 state.pending_bytes -= row.charged_bytes;
                 state.durable_bytes = durable_bytes;
+                metrics::counter!("mux.scrollback.deferred_rows_durable").increment(1);
             }
         }
     }
@@ -553,6 +554,7 @@ mod deferred_scrollback {
             state.pending_bytes += charge;
             state.oldest = Some(oldest);
             state.newest_exclusive = Some(next);
+            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
             true
         }
 
@@ -8278,12 +8280,18 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let reading = Arc::clone(&pane);
             let reader = std::thread::spawn(move || {
-                tx.send((reading.get_dimensions(), reading.get_title().to_string()))
-                    .unwrap();
+                tx.send((
+                    reading.get_dimensions(),
+                    reading.get_title().to_string(),
+                    reading
+                        .get_tiered_scrollback_status()
+                        .unwrap()
+                        .cold_worker_completed_lines_total,
+                ))
+                .unwrap();
             });
-            let responsive = rx
-                .recv_timeout(std::time::Duration::from_millis(500))
-                .is_ok();
+            let observed = rx.recv_timeout(std::time::Duration::from_millis(500));
+            let responsive = observed.is_ok();
             drop(lease);
             writer.join().unwrap();
             reader.join().unwrap();
@@ -8295,6 +8303,13 @@ mod tests {
                 responsive, use_queue,
                 "queued={use_queue}: direct persistence is the negative control"
             );
+            if use_queue {
+                assert_eq!(
+                    observed.unwrap().2,
+                    0,
+                    "admission must not report durable worker completion"
+                );
+            }
             assert_eq!(
                 backing.retained_scrollback_rows(),
                 265,
@@ -8304,7 +8319,10 @@ mod tests {
             assert_eq!(first, 0);
             assert_eq!(lines.len(), 271);
             for (row, line) in lines.iter().take(270).enumerate() {
-                assert_eq!(line.as_str().trim_end(), format!("row-{row:03} e\u{301} 日本語"));
+                assert_eq!(
+                    line.as_str().trim_end(),
+                    format!("row-{row:03} e\u{301} 日本語")
+                );
             }
             assert!(lines[270].as_str().trim().is_empty());
             // The actual GUI reload supplies a presentation-only TermConfig.
@@ -8361,7 +8379,13 @@ mod tests {
         )
         .unwrap();
         deferred.flush_scrollback().unwrap();
-        assert_eq!(backing.load_scrollback_line(0), retained);
+        let mut persisted = backing.load_scrollback_line(0).unwrap();
+        let mut retained = retained.unwrap();
+        // The durable codec materializes clustered cells. Compare the full
+        // semantic row after normalizing only that storage representation.
+        persisted.cells_mut();
+        retained.cells_mut();
+        assert_eq!(persisted, retained);
     }
 
     #[test]
