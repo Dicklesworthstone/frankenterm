@@ -371,6 +371,227 @@ pub fn reconcile_client_domain_config(
     }
 }
 
+/// The parser owns draining this bounded warm queue. No worker thread, disk
+/// operation or acknowledgement is hidden in queue admission. In particular,
+/// readers of queued rows and metadata never wait for the durable sink's
+/// mutation lock while it synchronizes files.
+mod deferred_scrollback {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use wezterm_term::config::{
+        ScrollbackClearCommit, ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
+        ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
+        ScrollbackSpillSink,
+    };
+    use wezterm_term::{Line, StableRowIndex};
+
+    const MAX_PENDING_ROWS: usize = 256;
+    const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
+    struct PendingRow {
+        stable_row: StableRowIndex,
+        line: Arc<Line>,
+        retention: usize,
+        charged_bytes: usize,
+    }
+
+    struct State {
+        pending: VecDeque<PendingRow>,
+        pending_bytes: usize,
+        durable_bytes: usize,
+        oldest: Option<StableRowIndex>,
+        newest_exclusive: Option<StableRowIndex>,
+    }
+
+    pub(super) struct DeferredScrollbackSpillSink {
+        backing: Arc<dyn ScrollbackSpillSink>,
+        operation: Mutex<()>,
+        state: Mutex<State>,
+    }
+
+    impl std::fmt::Debug for DeferredScrollbackSpillSink {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DeferredScrollbackSpillSink")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl DeferredScrollbackSpillSink {
+        pub(super) fn new(
+            backing: Arc<dyn ScrollbackSpillSink>,
+        ) -> Result<Self, ScrollbackSpillError> {
+            let state = Self::backing_state(backing.as_ref())?;
+            Ok(Self {
+                backing,
+                operation: Mutex::new(()),
+                state: Mutex::new(state),
+            })
+        }
+
+        fn backing_state(backing: &dyn ScrollbackSpillSink) -> Result<State, ScrollbackSpillError> {
+            let oldest = backing.oldest_scrollback_row();
+            let rows = StableRowIndex::try_from(backing.retained_scrollback_rows())
+                .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+            let newest_exclusive = oldest
+                .map(|oldest| {
+                    oldest
+                        .checked_add(rows)
+                        .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))
+                })
+                .transpose()?;
+            Ok(State {
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                durable_bytes: backing.retained_scrollback_bytes(),
+                oldest,
+                newest_exclusive,
+            })
+        }
+
+        // Charges cell storage and grapheme bytes without allocating a second
+        // text serialization under the terminal lock. Shared attribute/image
+        // payloads are not a claim about total process memory usage.
+        fn row_charge(line: &Line) -> Option<usize> {
+            let cells = line.len().checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
+            line.visible_cells().try_fold(
+                cells.checked_add(std::mem::size_of::<Line>())?,
+                |bytes, cell| bytes.checked_add(cell.str().len()),
+            )
+        }
+
+        /// The caller holds operation. Never hold state across backing IO.
+        fn drain(&self) -> Result<(), ScrollbackSpillError> {
+            loop {
+                let next = {
+                    let state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    state.pending.front().map(|row| {
+                        (row.stable_row, Arc::clone(&row.line), row.retention)
+                    })
+                };
+                let Some((stable_row, line, retention)) = next else {
+                    return Ok(());
+                };
+                if !self.backing.store_scrollback_line(stable_row, &line, retention) {
+                    return Err(ScrollbackSpillError::StorageUnavailable);
+                }
+                let durable_bytes = self.backing.retained_scrollback_bytes();
+                let mut state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                // operation excludes enqueue, clear and replacement. Keep the
+                // owned plaintext until the backing sink acknowledges durability.
+                let row = state.pending.pop_front().ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
+                state.pending_bytes -= row.charged_bytes;
+                state.durable_bytes = durable_bytes;
+            }
+        }
+    }
+
+    impl ScrollbackSpillSink for DeferredScrollbackSpillSink {
+        fn store_scrollback_line(&self, stable_row: StableRowIndex, line: &Line, retention: usize) -> bool {
+            // Queue saturation or another operation leaves the offered row in
+            // Screen; never wait for filesystem IO while the terminal is held.
+            let Ok(_operation) = self.operation.try_lock() else { return false; };
+            let Ok(mut state) = self.state.lock() else { return false; };
+            if let Some(existing) = state.pending.iter().find(|row| row.stable_row == stable_row) {
+                return existing.line.as_ref() == line && existing.retention == retention;
+            }
+            let Ok(retention_rows) = StableRowIndex::try_from(retention) else { return false; };
+            let Some(next) = stable_row.checked_add(1) else { return false; };
+            let Some(charge) = Self::row_charge(line) else { return false; };
+            if retention == 0
+                || state.newest_exclusive.is_some_and(|expected| expected != stable_row)
+                || state.pending.len() >= MAX_PENDING_ROWS
+                || charge > MAX_PENDING_BYTES.saturating_sub(state.pending_bytes)
+            {
+                return false;
+            }
+            let oldest = state.oldest.unwrap_or(stable_row).max(next.saturating_sub(retention_rows));
+            state.pending.push_back(PendingRow {
+                stable_row,
+                line: Arc::new(line.clone()),
+                retention,
+                charged_bytes: charge,
+            });
+            state.pending_bytes += charge;
+            state.oldest = Some(oldest);
+            state.newest_exclusive = Some(next);
+            true
+        }
+
+        fn requires_scrollback_flush(&self) -> bool { true }
+
+        fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
+            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            self.drain()
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            {
+                let state = self.state.lock().ok()?;
+                if stable_row < state.oldest? || stable_row >= state.newest_exclusive? {
+                    return None;
+                }
+                if let Some(row) = state.pending.iter().find(|row| row.stable_row == stable_row) {
+                    return Some(row.line.as_ref().clone());
+                }
+            }
+            self.backing.load_scrollback_line(stable_row)
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.state.lock().ok()?.oldest
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.state.lock().ok().and_then(|state| {
+                state.newest_exclusive?.checked_sub(state.oldest?).and_then(|rows| usize::try_from(rows).ok())
+            }).unwrap_or(0)
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.state.lock().map(|state| state.durable_bytes.saturating_add(state.pending_bytes)).unwrap_or(0)
+        }
+
+        fn snapshot_scrollback(&self, newest: StableRowIndex, limits: ScrollbackSnapshotLimits) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            self.drain()?;
+            self.backing.snapshot_scrollback(newest, limits)
+        }
+
+        fn replace_scrollback_prefix(&self, expected: Option<ScrollbackSnapshotGeneration>, prefix: ScrollbackPrefix<'_>, retention: usize) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let mut state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            if !state.pending.is_empty() {
+                return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
+            }
+            let receipt = self.backing.replace_scrollback_prefix(expected, prefix, retention)?;
+            *state = State {
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                durable_bytes: self.backing.retained_scrollback_bytes(),
+                oldest: receipt.oldest_stable_row(),
+                newest_exclusive: Some(receipt.newest_stable_row_exclusive()),
+            };
+            Ok(receipt)
+        }
+
+        fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
+            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // A successful explicit clear discards both the durable generation
+            // and its queued suffix. On failure every queued row stays readable.
+            let mut state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let receipt = self.backing.clear_scrollback()?;
+            *state = State {
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                durable_bytes: 0,
+                oldest: None,
+                newest_exclusive: None,
+            };
+            Ok(receipt)
+        }
+    }
+}
+
 struct LiveScrollbackSpillSink {
     pane_id: u64,
     active_ledger_pane_id: std::sync::atomic::AtomicU64,
@@ -7538,7 +7759,13 @@ pub fn install_scrollback_spill_sink_factory() {
     let base_dir = Arc::new(default_live_scrollback_dir());
     config::set_scrollback_spill_sink_factory(Some(Arc::new(move |context| {
         match LiveScrollbackSpillSink::new((*base_dir).clone(), &context) {
-            Ok(sink) => Some(Arc::new(sink)),
+            Ok(sink) => match deferred_scrollback::DeferredScrollbackSpillSink::new(Arc::new(sink)) {
+                Ok(sink) => Some(Arc::new(sink)),
+                Err(error) => {
+                    log::warn!("failed to initialize deferred scrollback metadata: {error}");
+                    None
+                }
+            },
             Err(error) => {
                 log::warn!(
                     "failed to initialize live scrollback spill sink for pane {} domain {}: {}",

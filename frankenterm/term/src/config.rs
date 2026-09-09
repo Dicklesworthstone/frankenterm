@@ -927,7 +927,13 @@ impl Default for ScrollbackTierConfig {
 /// and a higher layer may persist and hydrate them without forcing this crate to
 /// depend on storage/redaction crates.
 pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
-    /// Persist a row that just left the in-memory hot tier.
+    /// Retain a row that just left the in-memory hot tier.
+    ///
+    /// Success transfers responsibility for keeping the exact row readable to
+    /// the sink. A deferred sink must retain an owned in-memory copy until its
+    /// durable write succeeds; queue admission is not a durability receipt.
+    /// Refusal leaves ownership with Screen. Deferred sinks must bound their
+    /// queue and expose it through the ordinary read and metadata methods.
     ///
     /// `max_retained_rows` is the configured total scrollback budget minus the
     /// hot rows still resident in [`Screen`](crate::screen::Screen). Sinks should
@@ -938,6 +944,19 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         line: &Line,
         max_retained_rows: usize,
     ) -> bool;
+
+    /// Whether parser-side maintenance must drain this sink outside the
+    /// terminal mutex before admitting another output batch.
+    fn requires_scrollback_flush(&self) -> bool {
+        false
+    }
+
+    /// Make all admitted rows durable. Errors retain every unacknowledged row
+    /// in memory. The parser applies backpressure outside the terminal mutex;
+    /// callers must not treat failure as permission to discard queued rows.
+    fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
+        Ok(())
+    }
 
     /// Hydrate a previously stored stable row.
     fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line>;

@@ -1878,6 +1878,34 @@ impl Screen {
         true
     }
 
+    /// Retry hot-tier overflow after a deferred sink has drained. Returns None
+    /// when settled, or whether any row moved, so the parser drains again
+    /// before accepting more input. Only scrollback is transferred; visible
+    /// rows, recovery-owned rows and the model's dirty sequence are unchanged.
+    pub(crate) fn trim_deferred_scrollback(&mut self, seqno: SequenceNo) -> Option<bool> {
+        if !self.allow_scrollback
+            || self.recovery_scrollback.is_some()
+            || !self.config.scrollback_tier_config().enabled
+            || !self.config.scrollback_spill_sink().is_some_and(|sink| sink.requires_scrollback_flush())
+        {
+            return None;
+        }
+        let limit = self.physical_rows.saturating_add(self.hot_scrollback_size());
+        let had_overflow = self.lines.len() > limit;
+        let mut moved = false;
+        while self.lines.len() > limit {
+            let Some(line) = self.lines.pop_front() else { break; };
+            let stable_row = self.stable_row_index_for_removed_top(0);
+            if !self.record_scrollback_spill(stable_row, &line, seqno) {
+                self.lines.push_front(line);
+                break;
+            }
+            self.advance_stable_row_index_offset(1);
+            moved = true;
+        }
+        had_overflow.then_some(moved)
+    }
+
     /// Force all warm-tier residency into cold-tier accounting.
     ///
     /// This is the low-level primitive needed by fleet-level memory actions
@@ -4049,10 +4077,12 @@ impl Screen {
                     if !self.record_scrollback_spill(stable_row, &line, seqno) {
                         self.lines.insert(remove_idx, line);
                         spill_blocked = true;
-                        warn!(
-                            "cold scrollback persistence failed at stable row {}; retaining the row in memory",
-                            stable_row
-                        );
+                        if !self.config.scrollback_spill_sink().is_some_and(|sink| sink.requires_scrollback_flush()) {
+                            warn!(
+                                "cold scrollback persistence failed at stable row {}; retaining the row in memory",
+                                stable_row
+                            );
+                        }
                         break;
                     }
                     removed_from_top = removed_from_top.saturating_add(1);
@@ -4091,10 +4121,12 @@ impl Screen {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
                     if !self.record_scrollback_spill(stable_row, &removed, seqno) {
                         self.lines.insert(remove_idx, removed);
-                        warn!(
-                            "cold scrollback persistence failed at stable row {}; retaining the row in memory",
-                            stable_row
-                        );
+                        if !self.config.scrollback_spill_sink().is_some_and(|sink| sink.requires_scrollback_flush()) {
+                            warn!(
+                                "cold scrollback persistence failed at stable row {}; retaining the row in memory",
+                                stable_row
+                            );
+                        }
                         break;
                     }
                     removed_from_top = removed_from_top.saturating_add(1);

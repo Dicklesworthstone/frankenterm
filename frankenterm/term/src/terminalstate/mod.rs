@@ -1029,6 +1029,13 @@ impl TerminalState {
         &mut self.screen
     }
 
+    /// Parser-side maintenance of the primary screen, including while the
+    /// alternate screen is active. The caller drains its sink outside the
+    /// terminal mutex between attempts.
+    pub fn trim_deferred_scrollback(&mut self) -> Option<bool> {
+        self.screen.screen.trim_deferred_scrollback(self.seqno)
+    }
+
     fn set_clipboard_contents(
         &self,
         selection: ClipboardSelection,

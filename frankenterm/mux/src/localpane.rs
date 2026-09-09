@@ -1015,6 +1015,10 @@ pub struct LocalPane {
     durable_pane_id: [u8; 16],
     ownership: LocalPaneOwnership,
     terminal: Arc<Mutex<Terminal>>,
+    // Serializes complete producer batches, including deferred persistence,
+    // without preventing GUI readers or resize workers from taking terminal.
+    output_application: Mutex<()>,
+    scrollback_flush_sink: Mutex<Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>>>,
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
     guardian_live_output_reader: Mutex<Option<Box<dyn GuardianLiveOutputReader>>>,
@@ -1375,7 +1379,22 @@ impl Pane for LocalPane {
     }
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
-        self.locked_terminal().set_config(config);
+        let mut terminal = self.locked_terminal();
+        let config = if let Some(existing) = terminal.get_config().scrollback_spill_sink() {
+            if let Some(settings) = config.downcast_ref::<config::TermConfig>() {
+                Arc::new(settings.for_scrollback_sink(existing)) as Arc<dyn TerminalConfiguration>
+            } else if config.scrollback_spill_sink().is_some_and(|sink| Arc::ptr_eq(&sink, &existing)) {
+                config
+            } else {
+                log::error!("refusing to detach pane {} scrollback authority during config replacement", self.pane_id);
+                return;
+            }
+        } else {
+            config
+        };
+        let sink = config.scrollback_spill_sink().filter(|sink| sink.requires_scrollback_flush());
+        terminal.set_config(config);
+        *self.scrollback_flush_sink.lock() = sink;
     }
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
@@ -1383,6 +1402,7 @@ impl Pane for LocalPane {
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
+        let _output_application = self.output_application.lock();
         #[cfg(not(feature = "disruptor-pane-io"))]
         {
             // Default path: apply directly under the terminal mutex.
@@ -1393,6 +1413,13 @@ impl Pane for LocalPane {
             // ft-87qfi: lock-free SPSC staging — see `perform_actions_disruptor`.
             self.perform_actions_disruptor(actions);
         }
+        // With the disruptor enabled this also drains the admitted ring before
+        // backpressure, so queued rows cannot be stranded until later input.
+        let sink = self.scrollback_flush_sink.lock().clone();
+        if let Some(sink) = sink {
+            drop(self.locked_terminal());
+            self.drain_scrollback_outside_terminal(sink);
+        }
     }
 
     fn capture_live_parser_checkpoint(
@@ -1402,6 +1429,7 @@ impl Pane for LocalPane {
         ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
+        let _output_application = self.output_application.lock();
         // `locked_terminal` drains the optional disruptor ring before it
         // returns. Apply this parser's still-local actions under the same lock,
         // then retain the lock through model serialization so no observer can
@@ -2210,6 +2238,54 @@ fn split_child(
 }
 
 impl LocalPane {
+    fn drain_scrollback_outside_terminal(
+        &self,
+        mut sink: Arc<dyn frankenterm_term::config::ScrollbackSpillSink>,
+    ) {
+        let mut reported_failure = false;
+        loop {
+            if matches!(
+                *self.process.lock(),
+                ProcessState::Running { killed: true, .. }
+                    | ProcessState::DeadPendingClose { killed: true }
+                    | ProcessState::Dead
+            ) {
+                return;
+            }
+            let stalled = match sink.flush_scrollback() {
+                Ok(()) => {
+                    let mut terminal = self.locked_terminal();
+                    match terminal.trim_deferred_scrollback() {
+                        None => return,
+                        Some(moved) => {
+                            if let Some(current) = self.scrollback_flush_sink.lock().clone() {
+                                sink = current;
+                            } else {
+                                return;
+                            }
+                            !moved
+                        }
+                    }
+                }
+                Err(_) => true,
+            };
+            if stalled {
+                if !reported_failure {
+                    log::error!(
+                        "pane {} scrollback persistence is stalled; retaining rows and applying parser backpressure outside the terminal lock",
+                        self.pane_id
+                    );
+                    reported_failure = true;
+                }
+                metrics::counter!("mux.scrollback.persistence_backpressure").increment(1);
+                // This is the blocking parser thread, not an async executor or
+                // the GUI. Explicit pane close ends retries; failures never
+                // permit another input batch to grow retained memory forever.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
     pub(crate) fn write_tmux_command_if_same(
         &self,
         expected: &TmuxDomainState,
@@ -3007,12 +3083,16 @@ impl LocalPane {
         }));
         let proc_list = Arc::new(Mutex::new(None));
         let proc_list_warm_pending = Arc::new(AtomicBool::new(false));
+        let scrollback_flush_sink = terminal.get_config().scrollback_spill_sink()
+            .filter(|sink| sink.requires_scrollback_flush());
 
         Self {
             pane_id,
             durable_pane_id,
             ownership,
             terminal: Arc::new(Mutex::new(terminal)),
+            output_application: Mutex::new(()),
+            scrollback_flush_sink: Mutex::new(scrollback_flush_sink),
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
             guardian_live_output_reader: Mutex::new(guardian_live_output_reader),
