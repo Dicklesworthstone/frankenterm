@@ -17,3 +17,9 @@ workspace = true
 [dependencies]
 
 [dev-dependencies]
+
+# Run the canonical std-only workspace formatter proof without compiling core.
+# The source, canaries, workspace coverage and source-identity checks are shared.
+[[test]]
+name = "workspace_format_proof"
+path = "../frankenterm-core/tests/workspace_format_proof.rs"
