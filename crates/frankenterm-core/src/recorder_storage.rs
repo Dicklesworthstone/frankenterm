@@ -397,6 +397,15 @@ impl std::fmt::Display for RecorderBlockingFailure {
 /// Storage-layer error type with stable classes.
 #[derive(Debug, Error)]
 pub enum RecorderStorageError {
+    /// Retry the same operation: a failed rename or later step may already
+    /// have installed the candidate. Never interpret this as a rollback.
+    #[error("recorder state publication failed at {phase:?} (may_be_published={may_be_published})")]
+    StatePublication {
+        phase: StatePublicationPhase,
+        may_be_published: bool,
+        operation_id: String,
+        io_kind: Option<std::io::ErrorKind>,
+    },
     #[error("queue full (capacity={capacity})")]
     QueueFull { capacity: usize },
 
@@ -488,13 +497,25 @@ impl RecorderStorageError {
                 ..
             } => RecorderStorageErrorClass::DependencyUnavailable,
             Self::BlockingOperation { .. } => RecorderStorageErrorClass::Retryable,
-            Self::Io(_) => RecorderStorageErrorClass::Retryable,
+            Self::Io(_) | Self::StatePublication { .. } => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
             Self::Sqlite(_) => RecorderStorageErrorClass::Retryable,
             Self::BackendSelection(_) => RecorderStorageErrorClass::TerminalConfig,
             Self::BackendUnavailable { .. } => RecorderStorageErrorClass::DependencyUnavailable,
         }
     }
+}
+
+/// Finite, content-free state publication diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatePublicationPhase {
+    Prepare,
+    WriteCandidate,
+    SyncCandidate,
+    Rename,
+    VerifyPublished,
+    SyncDirectory,
+    Acknowledge,
 }
 
 fn recorder_blocking_error(
@@ -1522,9 +1543,10 @@ impl AppendLogRecorderStorage {
             };
 
             if outcome == CheckpointCommitOutcome::Advanced {
-                // Publish in memory only after the state-file replacement
-                // succeeds. Otherwise a failed save makes an equal retry
-                // return NoopAlreadyAdvanced without ever saving its progress.
+                // Once rename has been attempted its outcome can be uncertain.
+                // Retain the proposed checkpoint in that case so a later call
+                // cannot overwrite potentially published progress with a lower
+                // ordinal. Equal retries below must re-establish durability.
                 let mut persisted = PersistedState {
                     segment_id: inner.segment_id,
                     next_offset: inner.next_offset,
@@ -1532,8 +1554,24 @@ impl AppendLogRecorderStorage {
                     checkpoints: inner.checkpoints.clone(),
                 };
                 persisted.checkpoints.insert(key, checkpoint);
-                inner.state_file.write(&persisted)?;
+                let publication = inner.state_file.write(&persisted);
+                if let Err(err) = publication {
+                    if matches!(
+                        &err,
+                        RecorderStorageError::StatePublication {
+                            may_be_published: true,
+                            ..
+                        }
+                    ) {
+                        inner.checkpoints = persisted.checkpoints;
+                    }
+                    return Err(err);
+                }
                 inner.checkpoints = persisted.checkpoints;
+            } else {
+                // Includes retries after a lost publication acknowledgement.
+                // Noop refers to logical progress, not an exemption from sync.
+                Self::persist_state(&inner)?;
             }
 
             Ok(outcome)
@@ -3254,15 +3292,21 @@ fn validate_recorder_paths(
 #[derive(Debug)]
 struct AppendLogStateFile {
     directory: CapDir,
+    directory_sync: File,
     state_name: PathBuf,
     temporary_name: PathBuf,
     lock_name: PathBuf,
     lock: File,
+    #[cfg(test)]
+    fail_after_rename: std::sync::atomic::AtomicBool,
 }
 
 impl AppendLogStateFile {
     fn open(path: &Path) -> std::result::Result<Self, RecorderStorageError> {
         let (directory, state_name) = recorder_parent(path)?;
+        // Fail closed before creating a lock or staging file on platforms
+        // without a qualified directory-sync primitive.
+        let directory_sync = Self::open_directory_sync(&directory)?;
         let temporary_name = state_name.with_extension("tmp");
         let lock_name = recorder_state_lock_path(&state_name);
         let mut options = recorder_open_options();
@@ -3277,16 +3321,45 @@ impl AppendLogStateFile {
         fs2::FileExt::try_lock_exclusive(&lock)?;
         let state_file = Self {
             directory,
+            directory_sync,
             state_name,
             temporary_name,
             lock_name,
             lock,
+            #[cfg(test)]
+            fail_after_rename: std::sync::atomic::AtomicBool::new(false),
         };
         state_file.check_lock()?;
         Ok(state_file)
     }
 
+    fn open_directory_sync(directory: &CapDir) -> std::io::Result<File> {
+        #[cfg(unix)]
+        {
+            // CapDir itself may be O_PATH, which Linux cannot fsync.
+            Ok(directory.open(".")?.into_std())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "recorder directory durability is not qualified on this platform",
+            ))
+        }
+    }
+
+    fn check_directory(&self) -> std::result::Result<(), RecorderStorageError> {
+        let held = CapMetadata::from_file(&self.directory_sync)?;
+        let directory = self.directory.dir_metadata()?;
+        if !held.is_dir() || recorder_file_identity(&held)? != recorder_file_identity(&directory)? {
+            return Err(std::io::Error::other("recorder directory identity changed").into());
+        }
+        Ok(())
+    }
+
     fn check_lock(&self) -> std::result::Result<(), RecorderStorageError> {
+        self.check_directory()?;
         let named = self.directory.symlink_metadata(&self.lock_name)?;
         let held = CapMetadata::from_file(&self.lock)?;
         if !named.is_file()
@@ -3309,13 +3382,19 @@ impl AppendLogStateFile {
             }
             Err(err) => return Err(err.into()),
         };
-        if !file.metadata()?.is_file() {
+        if !file.metadata()?.is_file() || recorder_link_count(&file.metadata()?)? != 1 {
             return Err(invalid_recorder_path(
-                "recorder state path is not a regular file",
+                "recorder state path is not a uniquely linked regular file",
             ));
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        // Reopening after an interrupted publication must establish the visible
+        // state's durability before exposing its checkpoints to callers.
+        file.sync_all()?;
+        self.check_published_identity(&file)?;
+        self.directory_sync.sync_all()?;
+        self.check_published_identity(&file)?;
         if bytes.is_empty() {
             return Ok(PersistedState::default());
         }
@@ -3340,24 +3419,107 @@ impl AppendLogStateFile {
     }
 
     fn write(&self, state: &PersistedState) -> std::result::Result<(), RecorderStorageError> {
-        self.check_lock()?;
         let bytes = state.canonical_bytes()?;
-        let mut options = recorder_open_options();
-        // Do not truncate until the actual no-follow descriptor is validated.
-        options.create(true).write(true);
-        let mut file = self.directory.open_with(&self.temporary_name, &options)?;
-        self.check_staging_identity(&file)?;
-        file.set_len(0)?;
-        file.write_all(&bytes)?;
-        // Persist the complete candidate before it can replace the previous
-        // state. This alone does not make the rename durable: parent-directory
-        // sync and post-publication uncertainty still require reconciliation.
-        file.sync_all()?;
+        let mut digest = Sha256::new();
+        digest.update(b"frankenterm.recorder.state-publication.v1\0");
+        digest.update(&bytes);
+        let operation_id = hex::encode(digest.finalize());
+        let mut phase = StatePublicationPhase::Prepare;
+        let mut may_be_published = false;
+        let result = (|| -> std::result::Result<(), RecorderStorageError> {
+            self.check_lock()?;
+            let mut options = recorder_open_options();
+            // Do not truncate until the actual no-follow descriptor is validated.
+            options.create(true).write(true);
+            let mut file = self.directory.open_with(&self.temporary_name, &options)?;
+            self.check_staging_identity(&file)?;
+            phase = StatePublicationPhase::WriteCandidate;
+            file.set_len(0)?;
+            file.write_all(&bytes)?;
+            phase = StatePublicationPhase::SyncCandidate;
+            file.sync_all()?;
+            self.check_lock()?;
+            self.check_staging_identity(&file)?;
+            let prior_final = self.published_name_identity()?;
+            phase = StatePublicationPhase::Rename;
+            // Even an error return can represent an uncertain namespace change
+            // (for example a remote filesystem acknowledgement failure).
+            may_be_published = true;
+            let renamed =
+                self.directory
+                    .rename(&self.temporary_name, &self.directory, &self.state_name);
+            if let Err(err) = renamed {
+                // Under the held namespace lease, an unchanged final name and
+                // still-named original candidate prove that replacement did
+                // not occur. Otherwise preserve the conservative outcome.
+                if self.check_lock().is_ok()
+                    && self.check_staging_identity(&file).is_ok()
+                    && self
+                        .published_name_identity()
+                        .is_ok_and(|now| now == prior_final)
+                {
+                    may_be_published = false;
+                }
+                // Best effort even on an ambiguous rename error; never promote
+                // the result to success merely because directory sync worked.
+                let _ = self.directory_sync.sync_all();
+                return Err(err.into());
+            }
+            phase = StatePublicationPhase::VerifyPublished;
+            let verified = self.check_published_identity(&file);
+            // Always attempt directory sync after a successful rename, even if
+            // the following identity check or acknowledgement reports failure.
+            let synced = self.directory_sync.sync_all();
+            verified?;
+            phase = StatePublicationPhase::SyncDirectory;
+            synced?;
+            phase = StatePublicationPhase::Acknowledge;
+            self.check_published_identity(&file)?;
+            #[cfg(test)]
+            if self.fail_after_rename.swap(false, Ordering::SeqCst) {
+                return Err(
+                    std::io::Error::other("injected publication acknowledgement loss").into(),
+                );
+            }
+            Ok(())
+        })();
+        result.map_err(|err| RecorderStorageError::StatePublication {
+            phase,
+            may_be_published,
+            operation_id,
+            io_kind: match err {
+                RecorderStorageError::Io(err) => Some(err.kind()),
+                _ => None,
+            },
+        })
+    }
+
+    fn check_published_identity(
+        &self,
+        file: &cap_std::fs::File,
+    ) -> std::result::Result<(), RecorderStorageError> {
         self.check_lock()?;
-        self.check_staging_identity(&file)?;
-        self.directory
-            .rename(&self.temporary_name, &self.directory, &self.state_name)?;
+        let held = file.metadata()?;
+        let named = self.directory.symlink_metadata(&self.state_name)?;
+        if !held.is_file()
+            || !named.is_file()
+            || recorder_link_count(&held)? != 1
+            || recorder_link_count(&named)? != 1
+            || recorder_file_identity(&held)? != recorder_file_identity(&named)?
+        {
+            return Err(std::io::Error::other("recorder published state identity changed").into());
+        }
         Ok(())
+    }
+
+    fn published_name_identity(
+        &self,
+    ) -> std::result::Result<Option<(u64, u64)>, RecorderStorageError> {
+        match self.directory.symlink_metadata(&self.state_name) {
+            Ok(metadata) => Ok(Some(recorder_file_identity(&metadata)?)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -7316,6 +7478,114 @@ recorder_backend = "frankensqlite"
             .unwrap()
             .committed_at_ms += 1;
         assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn state_rename_refusal_with_unchanged_names_is_definitely_unpublished() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state_file = AppendLogStateFile::open(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = state_file.write(&PersistedState::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            RecorderStorageError::StatePublication {
+                phase: StatePublicationPhase::Rename,
+                may_be_published: false,
+                ..
+            }
+        ));
+        assert!(path.is_dir());
+        assert!(dir.path().join(&state_file.temporary_name).is_file());
+    }
+
+    #[test]
+    fn checkpoint_acknowledgement_loss_retains_progress_and_retries_durably() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            let appended = storage
+                .append_batch(AppendRequest {
+                    batch_id: "publication-retry".to_string(),
+                    events: vec![
+                        sample_event("publication-0", 1, 0, "first"),
+                        sample_event("publication-1", 1, 1, "second"),
+                    ],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            let checkpoint = RecorderCheckpoint {
+                consumer: CheckpointConsumerId("private-consumer-canary".to_string()),
+                upto_offset: appended.last_offset,
+                schema_version: "v1".to_string(),
+                committed_at_ms: 2,
+            };
+            storage
+                .inner
+                .lock()
+                .await
+                .state_file
+                .fail_after_rename
+                .store(true, Ordering::SeqCst);
+            let error = storage
+                .commit_checkpoint(checkpoint.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &error,
+                RecorderStorageError::StatePublication {
+                    phase: StatePublicationPhase::Acknowledge,
+                    may_be_published: true,
+                    operation_id,
+                    ..
+                } if operation_id.len() == 64
+            ));
+            assert!(!error.to_string().contains("private-consumer-canary"));
+            assert_eq!(
+                storage.read_checkpoint(&checkpoint.consumer).await.unwrap(),
+                Some(checkpoint.clone())
+            );
+            let regressed = RecorderCheckpoint {
+                upto_offset: appended.first_offset,
+                ..checkpoint.clone()
+            };
+            assert!(matches!(
+                storage.commit_checkpoint(regressed).await,
+                Err(RecorderStorageError::CheckpointRegression { .. })
+            ));
+            // Prove the equal retry really attempts publication: another lost
+            // acknowledgement must still return non-success rather than noop.
+            storage
+                .inner
+                .lock()
+                .await
+                .state_file
+                .fail_after_rename
+                .store(true, Ordering::SeqCst);
+            assert!(matches!(
+                storage.commit_checkpoint(checkpoint.clone()).await,
+                Err(RecorderStorageError::StatePublication {
+                    may_be_published: true,
+                    ..
+                })
+            ));
+            assert_eq!(
+                storage.commit_checkpoint(checkpoint.clone()).await.unwrap(),
+                CheckpointCommitOutcome::NoopAlreadyAdvanced
+            );
+            drop(storage);
+            let reopened = AppendLogRecorderStorage::open(config).unwrap();
+            assert_eq!(
+                reopened
+                    .read_checkpoint(&checkpoint.consumer)
+                    .await
+                    .unwrap(),
+                Some(checkpoint)
+            );
+        });
     }
 
     #[test]
