@@ -397,6 +397,8 @@ impl std::fmt::Display for RecorderBlockingFailure {
 /// Storage-layer error type with stable classes.
 #[derive(Debug, Error)]
 pub enum RecorderStorageError {
+    #[error("append-log writer requires recovery after an uncertain data write")]
+    AppendLogNeedsRecovery,
     #[error("recorder state exceeds {resource} limit ({limit})")]
     StateResourceLimit {
         resource: &'static str,
@@ -493,7 +495,8 @@ impl RecorderStorageError {
             | Self::StateResourceLimit { .. }
             | Self::CheckpointRegression { .. }
             | Self::IdempotencyConflict { .. } => RecorderStorageErrorClass::TerminalData,
-            Self::CorruptRecord { .. }
+            Self::AppendLogNeedsRecovery
+            | Self::CorruptRecord { .. }
             | Self::CorruptCachedResponse { .. }
             | Self::CorruptCachedReplayReceipt { .. }
             | Self::CorruptCachedReceiptEncoding { .. }
@@ -1053,6 +1056,7 @@ impl RecorderBlockingTestHook {
 #[derive(Debug)]
 struct AppendLogInner {
     writer: std::io::BufWriter<File>,
+    writer_failed: bool,
     // Field order keeps state authority alive through the writer's final flush.
     state_file: AppendLogStateFile,
     segment_id: u64,
@@ -1322,6 +1326,7 @@ impl AppendLogRecorderStorage {
 
         let inner = AppendLogInner {
             writer: std::io::BufWriter::new(file),
+            writer_failed: false,
             state_file,
             segment_id,
             next_offset,
@@ -1391,6 +1396,22 @@ impl AppendLogRecorderStorage {
         inner.last_error = None;
     }
 
+    fn ensure_writer_healthy(inner: &AppendLogInner) -> Result<(), RecorderStorageError> {
+        if inner.writer_failed {
+            return Err(RecorderStorageError::AppendLogNeedsRecovery);
+        }
+        Ok(())
+    }
+
+    fn flush_writer(inner: &mut AppendLogInner) -> Result<(), RecorderStorageError> {
+        Self::ensure_writer_healthy(inner)?;
+        if inner.writer.flush().is_err() {
+            inner.writer_failed = true;
+            return Err(RecorderStorageError::AppendLogNeedsRecovery);
+        }
+        Ok(())
+    }
+
     fn record_last_error(
         inner: &mut AppendLogInner,
         operation: &'static str,
@@ -1420,11 +1441,11 @@ impl AppendLogRecorderStorage {
         match required_durability {
             DurabilityLevel::Enqueued => {}
             DurabilityLevel::Appended => {
-                inner.writer.flush()?;
+                Self::flush_writer(inner)?;
                 Self::persist_state(inner)?;
             }
             DurabilityLevel::Fsync => {
-                inner.writer.flush()?;
+                Self::flush_writer(inner)?;
                 inner.writer.get_ref().sync_data()?;
                 Self::persist_state(inner)?;
             }
@@ -1512,6 +1533,7 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
+            Self::ensure_writer_healthy(&inner)?;
             if let Some(mut existing) = inner.idempotency_cache.get(&batch_id).cloned() {
                 if existing.request_digest_sha256 != request_digest_sha256 {
                     return Err(RecorderStorageError::IdempotencyConflict {
@@ -1570,10 +1592,16 @@ impl AppendLogRecorderStorage {
                 let payload_len = payload.len();
                 let record_start = inner.next_offset;
                 let ordinal = inner.next_ordinal;
-                inner
+                // Either write_all can have emitted a partial record before
+                // returning an error. Never append more bytes after that tear.
+                let written = inner
                     .writer
-                    .write_all(&(payload_len as u32).to_le_bytes())?;
-                inner.writer.write_all(&payload)?;
+                    .write_all(&(payload_len as u32).to_le_bytes())
+                    .and_then(|()| inner.writer.write_all(&payload));
+                if written.is_err() {
+                    inner.writer_failed = true;
+                    return Err(RecorderStorageError::AppendLogNeedsRecovery);
+                }
                 inner.next_offset += 4 + payload_len as u64;
                 inner.next_ordinal += 1;
                 inner.latest_record_start = Some(record_start);
@@ -1664,6 +1692,7 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            Self::ensure_writer_healthy(&inner)?;
             validate_checkpoint_state(&checkpoint)?;
             let key = checkpoint.consumer.0.clone();
             if !inner.checkpoints.contains_key(&key)
@@ -1764,7 +1793,7 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
-            inner.writer.flush()?;
+            Self::flush_writer(&mut inner)?;
             if mode == FlushMode::Durable {
                 inner.writer.get_ref().sync_data()?;
             }
@@ -7641,6 +7670,65 @@ recorder_backend = "frankensqlite"
             .unwrap()
             .committed_at_ms += 1;
         assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn failed_data_writer_refuses_all_mutations_until_reopen() {
+        run_async_test(async {
+            for capacity in [1, 8192] {
+                let dir = tempdir().unwrap();
+                let config = test_config(dir.path());
+                let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+                let request = |batch: &str| AppendRequest {
+                    batch_id: batch.to_string(),
+                    events: vec![sample_event(batch, 1, 0, "payload")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                };
+                let initial = storage.append_batch(request("initial")).await.unwrap();
+                let before = std::fs::read(&config.data_path).unwrap();
+                let state_before = std::fs::read(&config.state_path).unwrap();
+                // A real read-only descriptor fails either the direct prefix
+                // write (capacity 1) or the buffered flush (capacity 8192).
+                storage.inner.lock().await.writer = std::io::BufWriter::with_capacity(
+                    capacity,
+                    File::open(&config.data_path).unwrap(),
+                );
+                assert!(matches!(
+                    storage.append_batch(request("failed")).await,
+                    Err(RecorderStorageError::AppendLogNeedsRecovery)
+                ));
+                assert!(matches!(
+                    storage.append_batch(request("later")).await,
+                    Err(RecorderStorageError::AppendLogNeedsRecovery)
+                ));
+                assert!(matches!(
+                    storage.flush(FlushMode::Durable).await,
+                    Err(RecorderStorageError::AppendLogNeedsRecovery)
+                ));
+                assert!(matches!(
+                    storage
+                        .commit_checkpoint(RecorderCheckpoint {
+                            consumer: CheckpointConsumerId("reader".to_string()),
+                            upto_offset: initial.last_offset,
+                            schema_version: "v1".to_string(),
+                            committed_at_ms: 2,
+                        })
+                        .await,
+                    Err(RecorderStorageError::AppendLogNeedsRecovery)
+                ));
+                assert!(storage.health().await.degraded);
+                assert_eq!(std::fs::read(&config.data_path).unwrap(), before);
+                assert_eq!(std::fs::read(&config.state_path).unwrap(), state_before);
+                drop(storage);
+                let reopened = AppendLogRecorderStorage::open(config).unwrap();
+                let next = reopened
+                    .append_batch(request("after-reopen"))
+                    .await
+                    .unwrap();
+                assert_eq!(next.first_offset.ordinal, 1);
+            }
+        });
     }
 
     #[test]
