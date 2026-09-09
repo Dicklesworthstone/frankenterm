@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
@@ -650,6 +650,13 @@ struct PaneFile {
     line_offsets: Vec<LineOffset>,
 }
 
+#[derive(Clone, Copy)]
+enum PaneOpenPolicy {
+    RecoverOrCreate,
+    RecoverExisting,
+    VerifyExisting,
+}
+
 impl PaneFile {
     fn create_new_private_append_file(path: &Path) -> Result<Option<File>, MmapStoreError> {
         let mut options = OpenOptions::new();
@@ -821,21 +828,25 @@ impl PaneFile {
                 Ok((file, true))
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let mut existing = OpenOptions::new();
-                existing.read(true).append(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-
-                    existing.custom_flags(libc::O_NOFOLLOW);
-                }
-                let file = existing.open(path)?;
-                Self::harden_open_file_permissions(&file)?;
-                Self::revalidate_open_file(path, &file)?;
-                Ok((file, false))
+                Self::open_existing_append_file(path).map(|file| (file, false))
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn open_existing_append_file(path: &Path) -> Result<File, MmapStoreError> {
+        let mut existing = OpenOptions::new();
+        existing.read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            existing.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = existing.open(path)?;
+        Self::harden_open_file_permissions(&file)?;
+        Self::revalidate_open_file(path, &file)?;
+        Ok(file)
     }
 
     fn sync_parent_directory(path: &Path) -> Result<(), MmapStoreError> {
@@ -912,12 +923,6 @@ impl PaneFile {
             record.clear();
         }
         Ok(latest)
-    }
-
-    fn scan_offsets_and_base(
-        file: &File,
-    ) -> Result<(Vec<LineOffset>, u64, u64, u64), MmapStoreError> {
-        Self::scan_offsets_and_base_bounded(file, None, None)
     }
 
     fn scan_offsets_and_base_bounded(
@@ -1021,22 +1026,48 @@ impl PaneFile {
             options.custom_flags(libc::O_NOFOLLOW);
         }
         let file = options.open(path)?;
-        let (offsets, committed_len, _base_seq, _data_start) = Self::scan_offsets_and_base(&file)?;
+        let (offsets, committed_len, _base_seq, _data_start) =
+            Self::scan_offsets_and_base_bounded(&file, None, None)?;
         Ok((offsets, committed_len))
     }
 
     fn open(base_dir: &Path, pane_id: PaneId) -> Result<Self, MmapStoreError> {
+        Self::open_bounded(
+            base_dir,
+            pane_id,
+            None,
+            None,
+            PaneOpenPolicy::RecoverOrCreate,
+        )
+    }
+
+    fn open_bounded(
+        base_dir: &Path,
+        pane_id: PaneId,
+        max_records: Option<usize>,
+        max_physical_bytes: Option<u64>,
+        policy: PaneOpenPolicy,
+    ) -> Result<Self, MmapStoreError> {
         let log_path = base_dir.join(format!("{pane_id}.log"));
         let base_seq_path = Self::base_seq_path(&log_path);
-        let (file, log_created) = Self::open_append_file(&log_path)?;
+        let open_file = |path: &Path| match policy {
+            PaneOpenPolicy::RecoverOrCreate => Self::open_append_file(path),
+            PaneOpenPolicy::RecoverExisting | PaneOpenPolicy::VerifyExisting => {
+                Self::open_existing_append_file(path).map(|file| (file, false))
+            }
+        };
+        let (file, log_created) = open_file(&log_path)?;
         let (mut line_offsets, file_len, log_base_seq, data_start) =
-            Self::scan_offsets_and_base(&file)?;
+            Self::scan_offsets_and_base_bounded(&file, max_records, max_physical_bytes)?;
         let trailing_partial = file.metadata()?.len() > file_len;
-        let (base_seq_file, base_seq_created) = Self::open_append_file(&base_seq_path)?;
+        let (base_seq_file, base_seq_created) = open_file(&base_seq_path)?;
         if log_created || base_seq_created {
             Self::sync_parent_directory(&log_path)?;
         }
-        let journal_base_seq = if file_len == 0 {
+        // Verifying a deterministic stage must neither create missing files
+        // nor repair a conflicting journal into an apparently valid receipt.
+        let journal_base_seq = if file_len == 0 && !matches!(policy, PaneOpenPolicy::VerifyExisting)
+        {
             // An empty synchronized content log is authoritative for clear.
             // Reset any journal value left by a crash between clearing the log
             // and clearing its sequence sidecar.
@@ -1092,6 +1123,11 @@ impl PaneFile {
     }
 
     fn append_line(&mut self, line: &str) -> Result<u64, MmapStoreError> {
+        if self.file_len == 0 && line.as_bytes().starts_with(b"\0FTMMAP") {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "first record collides with the reserved pane header".to_string(),
+            ));
+        }
         if line
             .as_bytes()
             .iter()
@@ -2113,14 +2149,22 @@ impl MmapScrollbackStore {
                 ));
             }
         }
-        let pane = PaneFile::open(&self.base_dir, pane_id)?;
+        let pane = PaneFile::open_bounded(
+            &self.base_dir,
+            pane_id,
+            None,
+            None,
+            PaneOpenPolicy::RecoverExisting,
+        )?;
         self.panes.insert(pane_id, pane);
         Ok(())
     }
 
     /// Stage a complete replacement ledger under a fresh unreachable pane ID.
     ///
-    /// Every record and both ledger files are synchronized before return. The
+    /// Records are buffered only while the new ledger is unreachable. Both
+    /// ledger files and their directory are synchronized before return,
+    /// including when retrying an existing deterministic slot. The
     /// caller must publish its authenticated pointer manifest separately; a
     /// failure here never modifies any previously published pane ledger.
     /// `pane_id` is a caller-derived deterministic transaction identity. If
@@ -2142,14 +2186,35 @@ impl MmapScrollbackStore {
                 observed: u64::try_from(records.len()).unwrap_or(u64::MAX),
             });
         }
+        // Validate the complete batch before creating its deterministic slot.
+        // A bad later record must not leave an unretryable partial ledger.
         let record_bytes = records.iter().try_fold(0_u64, |total, record| {
+            if record.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+                return Err(MmapStoreError::InvalidLineRecord);
+            }
+            let bytes = u64::try_from(record.len())
+                .map_err(|_| MmapStoreError::NumericOverflow("record_bytes"))?;
+            let terminated_bytes = bytes
+                .checked_add(1)
+                .ok_or(MmapStoreError::NumericOverflow("record_bytes"))?;
+            if terminated_bytes > PANE_LOG_MAX_RECORD_BYTES {
+                return Err(MmapStoreError::PaneLogRecordTooLarge {
+                    bytes: terminated_bytes,
+                    max: PANE_LOG_MAX_RECORD_BYTES,
+                });
+            }
             total
-                .checked_add(
-                    u64::try_from(record.len())
-                        .map_err(|_| MmapStoreError::NumericOverflow("record_bytes"))?,
-                )
+                .checked_add(bytes)
                 .ok_or(MmapStoreError::NumericOverflow("record_bytes"))
         })?;
+        if records
+            .first()
+            .is_some_and(|record| record.as_bytes().starts_with(b"\0FTMMAP"))
+        {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "replacement record collides with the reserved pane header".to_string(),
+            ));
+        }
         let record_delimiters = u64::try_from(records.len())
             .map_err(|_| MmapStoreError::NumericOverflow("record_delimiters"))?;
         let committed_byte_limit_observation = record_bytes
@@ -2182,7 +2247,19 @@ impl MmapScrollbackStore {
             return Err(MmapStoreError::VersionedPaneIdentityCollision);
         }
         if log_exists {
-            let pane = PaneFile::open(&self.base_dir, pane_id)?;
+            let pane = PaneFile::open_bounded(
+                &self.base_dir,
+                pane_id,
+                Some(records.len()),
+                Some(committed_byte_limit_observation),
+                PaneOpenPolicy::VerifyExisting,
+            )
+            .map_err(|error| match error {
+                MmapStoreError::PaneSnapshotLimitExceeded { .. } => {
+                    MmapStoreError::VersionedPaneIdentityCollision
+                }
+                error => error,
+            })?;
             if pane.base_seq != 0
                 || pane.data_start != 0
                 || pane.trailing_partial
@@ -2192,6 +2269,11 @@ impl MmapScrollbackStore {
             {
                 return Err(MmapStoreError::VersionedPaneIdentityCollision);
             }
+            // A prior attempt can leave complete bytes in the page cache
+            // after a sync failure. Readability is not a durability receipt.
+            pane.file.sync_all()?;
+            pane.base_seq_file.sync_all()?;
+            PaneFile::sync_parent_directory(&pane.log_path)?;
             let staged = MmapStagedPaneLedger {
                 pane_id,
                 record_count: records.len(),
@@ -2209,13 +2291,22 @@ impl MmapScrollbackStore {
             // slot; never allocate a second random ledger for one transaction.
             return Err(MmapStoreError::VersionedPaneIdentityCollision);
         };
-        for record in records {
-            pane.append_line(record)?;
+        {
+            // This file has no published manifest or in-memory index yet.
+            // Preserve the record format while amortizing writes and issuing
+            // one durability barrier for the entire replacement. Live appends
+            // still use append_line's per-record acknowledgement contract.
+            let mut writer = BufWriter::with_capacity(64 * 1024, &mut pane.file);
+            for record in records {
+                writer.write_all(record.as_bytes())?;
+                writer.write_all(b"\n")?;
+            }
+            writer.flush()?;
         }
         pane.file.sync_all()?;
         pane.base_seq_file.sync_all()?;
         PaneFile::sync_parent_directory(&pane.log_path)?;
-        let committed_bytes = pane.file_len;
+        let committed_bytes = pane.file.metadata()?.len();
         if committed_bytes != committed_byte_limit_observation {
             return Err(MmapStoreError::StagedPaneVerificationFailed);
         }
@@ -2242,8 +2333,17 @@ impl MmapScrollbackStore {
         if expected_records.len() != staged.record_count {
             return Err(MmapStoreError::StagedPaneVerificationFailed);
         }
-        let pane = PaneFile::open(&self.base_dir, staged.pane_id)?;
+        let pane = PaneFile::open_bounded(
+            &self.base_dir,
+            staged.pane_id,
+            Some(staged.record_count),
+            Some(staged.committed_bytes),
+            PaneOpenPolicy::VerifyExisting,
+        )?;
         if pane.base_seq != 0
+            || pane.data_start != 0
+            || pane.trailing_partial
+            || pane.base_seq_file.metadata()?.len() != 0
             || pane.line_offsets.len() != staged.record_count
             || pane.file_len != staged.committed_bytes
             || pane.next_seq()?
@@ -3447,6 +3547,232 @@ mod tests {
                 committed_bytes,
                 elapsed.as_nanos()
             );
+        }
+    }
+
+    #[test]
+    fn versioned_replacement_invalid_records_leave_no_partial_slot() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let invalid_batches = [
+            vec!["valid".to_string(), "bad\nrecord".to_string()],
+            vec!["valid".to_string(), "bad\rrecord".to_string()],
+            vec!["\0FTMMAP1:0".to_string()],
+            vec!["\0FTMMAP2:0".to_string()],
+            vec![
+                "valid".to_string(),
+                "x".repeat(usize::try_from(PANE_LOG_MAX_RECORD_BYTES).unwrap()),
+            ],
+        ];
+        for (index, records) in invalid_batches.into_iter().enumerate() {
+            let replacement_id = (1_u64 << 63) | (0x200 + u64::try_from(index).unwrap());
+            assert!(
+                store
+                    .stage_versioned_pane_replacement(
+                        replacement_id,
+                        &records,
+                        records.len(),
+                        u64::MAX,
+                    )
+                    .is_err()
+            );
+            for extension in ["log", "seq"] {
+                assert!(
+                    !dir.path()
+                        .join(format!("{replacement_id}.{extension}"))
+                        .exists(),
+                    "invalid input must not create a deterministic ledger slot"
+                );
+            }
+            assert!(!store.panes.contains_key(&replacement_id));
+            store
+                .stage_versioned_pane_replacement(replacement_id, &["corrected".to_string()], 1, 10)
+                .expect("corrected input can still use the original deterministic slot");
+        }
+    }
+
+    #[test]
+    fn versioned_replacement_rejects_conflicting_empty_slot_without_repair() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let replacement_id = (1_u64 << 63) | 0x210;
+        let log_path = dir.path().join(format!("{replacement_id}.log"));
+        let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
+        std::fs::write(&log_path, b"").unwrap();
+        let journal = b"FTSEQ1:0\n";
+        std::fs::write(&sequence_path, journal).unwrap();
+        assert!(
+            store
+                .stage_versioned_pane_replacement(replacement_id, &[], 0, 0)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(sequence_path).unwrap(), journal);
+        assert!(!store.panes.contains_key(&replacement_id));
+    }
+
+    #[test]
+    fn versioned_replacement_reopen_rejects_extra_bytes_and_rows() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let records = vec!["record".to_string()];
+        for (index, extra) in ["partial", "second\n"].into_iter().enumerate() {
+            let replacement_id = (1_u64 << 63) | (0x220 + u64::try_from(index).unwrap());
+            let staged = store
+                .stage_versioned_pane_replacement(replacement_id, &records, 1, 7)
+                .unwrap();
+            let log_path = dir.path().join(format!("{replacement_id}.log"));
+            OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap()
+                .write_all(extra.as_bytes())
+                .unwrap();
+            let bytes_before = std::fs::read(&log_path).unwrap();
+            assert!(store.verify_staged_pane_ledger(staged, &records).is_err());
+            assert!(
+                store
+                    .stage_versioned_pane_replacement(replacement_id, &records, 1, 7)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(log_path).unwrap(), bytes_before);
+        }
+    }
+
+    #[test]
+    fn versioned_replacement_verification_never_recreates_missing_authority() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let records = vec!["record".to_string()];
+        for (index, extension) in ["log", "seq"].into_iter().enumerate() {
+            let replacement_id = (1_u64 << 63) | (0x240 + u64::try_from(index).unwrap());
+            let staged = store
+                .stage_versioned_pane_replacement(replacement_id, &records, 1, 7)
+                .unwrap();
+            let path = dir.path().join(format!("{replacement_id}.{extension}"));
+            let saved_path = dir
+                .path()
+                .join(format!("saved-{replacement_id}.{extension}"));
+            std::fs::rename(&path, &saved_path).unwrap();
+            assert!(store.verify_staged_pane_ledger(staged, &records).is_err());
+            assert!(
+                !path.exists(),
+                "verification must not recreate missing authority"
+            );
+            assert!(saved_path.exists());
+        }
+    }
+
+    #[test]
+    fn file_store_rejects_first_record_header_collision_before_acknowledgement() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let header = "\0FTMMAP1:0";
+        assert!(matches!(
+            store.append_line(1, header),
+            Err(MmapStoreError::InvalidPaneLogHeader(_))
+        ));
+        assert_eq!(store.next_seq(1).unwrap(), 0);
+        assert_eq!(store.append_line(1, "ordinary-first-row").unwrap(), 0);
+        assert_eq!(store.append_line(1, header).unwrap(), 1);
+        let mut reopened = file_only_store(dir.path());
+        reopened.open_existing_pane(1).unwrap();
+        assert_eq!(
+            reopened.tail_lines(1, 2).unwrap(),
+            vec!["ordinary-first-row", header]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires strace syscall fault injection; run explicitly through RCH"]
+    fn versioned_replacement_requires_every_sync_before_receipt() {
+        const CHILD_MODE: &str = "FT_SCROLLBACK_STAGE_SYNC_FAULT_CHILD";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            let (kind, fault) = mode.split_once(':').expect("child mode");
+            let fault: usize = fault.parse().expect("sync failure ordinal");
+            let dir = temp_dir();
+            let mut store = file_only_store(dir.path());
+            let replacement_id = (1_u64 << 63) | 0x230;
+            let records = vec!["first".to_string(), "second".to_string()];
+            let log_path = dir.path().join(format!("{replacement_id}.log"));
+            let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
+            // A complete-looking interrupted stage is deliberately written
+            // without a durability barrier. Its retry must supply that barrier.
+            if kind == "retry" {
+                std::fs::write(&log_path, b"first\nsecond\n").unwrap();
+                std::fs::write(&sequence_path, b"").unwrap();
+            }
+            let predecessor_path = dir.path().join("0.log");
+            std::fs::write(&predecessor_path, b"published predecessor\n").unwrap();
+            let result =
+                store.stage_versioned_pane_replacement(replacement_id, &records, records.len(), 13);
+            if fault == 0 {
+                let staged = result.expect("all required synchronization completed");
+                assert_eq!(staged.reused_existing(), kind == "retry");
+                assert_eq!(std::fs::read(log_path).unwrap(), b"first\nsecond\n");
+            } else {
+                assert!(
+                    matches!(result, Err(MmapStoreError::Io(ref error))
+                        if error.raw_os_error() == Some(libc::EIO)),
+                    "sync failure must prevent receipt publication: {result:?}"
+                );
+                assert!(!store.panes.contains_key(&replacement_id));
+            }
+            assert_eq!(
+                std::fs::read(predecessor_path).unwrap(),
+                b"published predecessor\n"
+            );
+            eprintln!("SCROLLBACK_STAGE_SYNC_CONTROL kind={kind} fault={fault} verified");
+            return;
+        }
+
+        let dir = temp_dir();
+        let executable = std::env::current_exe().expect("current test binary");
+        for (kind, sync_count) in [("fresh", 6), ("retry", 3)] {
+            for fault in 0..=sync_count {
+                let trace_path = dir.path().join(format!("{kind}-{fault}.trace"));
+                let mut command = std::process::Command::new("strace");
+                command
+                    .args(["-f", "-qq", "-e", "trace=fsync", "-o"])
+                    .arg(&trace_path);
+                if fault != 0 {
+                    command
+                        .arg("-e")
+                        .arg(format!("inject=fsync:error=EIO:when={fault}"));
+                }
+                let output = command
+                    .arg(&executable)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "storage::mmap_store::tests::versioned_replacement_requires_every_sync_before_receipt",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MODE, format!("{kind}:{fault}"))
+                    .output()
+                    .expect("strace must be installed for this explicit fault gate");
+                let trace = std::fs::read_to_string(trace_path).expect("syscall trace");
+                assert!(
+                    output.status.success(),
+                    "{kind} fault={fault}: stdout={} stderr={} trace={trace}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let child_stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(child_stderr.contains(&format!(
+                    "SCROLLBACK_STAGE_SYNC_CONTROL kind={kind} fault={fault} verified"
+                )));
+                let observed_syncs = trace.lines().filter(|line| line.contains("fsync(")).count();
+                assert_eq!(
+                    observed_syncs,
+                    if fault == 0 { sync_count } else { fault },
+                    "{kind} fault={fault}: {trace}"
+                );
+                assert_eq!(trace.contains("INJECTED"), fault != 0, "{trace}");
+                eprintln!(
+                    "SCROLLBACK_STAGE_SYNC_CONTROL kind={kind} fault={fault} syncs={observed_syncs} verified"
+                );
+            }
         }
     }
 
