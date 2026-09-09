@@ -1057,6 +1057,7 @@ impl RecorderBlockingTestHook {
 struct AppendLogInner {
     writer: std::io::BufWriter<File>,
     writer_failed: bool,
+    repair_boundary: Option<AppendRepairBoundary>,
     // Field order keeps state authority alive through the writer's final flush.
     state_file: AppendLogStateFile,
     segment_id: u64,
@@ -1073,6 +1074,15 @@ struct AppendLogInner {
     checkpoint_test_hook: Option<RecorderBlockingTestHook>,
     #[cfg(test)]
     flush_test_hook: Option<RecorderBlockingTestHook>,
+}
+
+/// Logical boundary preceding a batch which never obtained a receipt. Earlier
+/// acknowledged records may still be buffered and must be flushed, not dropped.
+#[derive(Debug, Clone, Copy)]
+struct AppendRepairBoundary {
+    next_offset: u64,
+    next_ordinal: u64,
+    latest_record_start: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1327,6 +1337,7 @@ impl AppendLogRecorderStorage {
         let inner = AppendLogInner {
             writer: std::io::BufWriter::new(file),
             writer_failed: false,
+            repair_boundary: None,
             state_file,
             segment_id,
             next_offset,
@@ -1409,6 +1420,44 @@ impl AppendLogRecorderStorage {
             inner.writer_failed = true;
             return Err(RecorderStorageError::AppendLogNeedsRecovery);
         }
+        Ok(())
+    }
+
+    fn repair_writer(inner: &mut AppendLogInner) -> Result<(), RecorderStorageError> {
+        if !inner.writer_failed {
+            return Ok(());
+        }
+        let repaired = (|| -> Result<(), RecorderStorageError> {
+            inner.state_file.check_lock()?;
+            // BufWriter retains the unwritten remainder after flush errors.
+            // Settle it before truncation so acknowledged, buffered records
+            // before the failed batch are preserved. Never discard its buffer.
+            inner.writer.flush()?;
+            if let Some(boundary) = inner.repair_boundary {
+                if inner.writer.get_ref().metadata()?.len() < boundary.next_offset {
+                    return Err(RecorderStorageError::AppendLogNeedsRecovery);
+                }
+                // Exclusive writer ownership and the inner mutex remain held.
+                // Only the unreceipted batch suffix can be removed here.
+                inner.writer.get_ref().set_len(boundary.next_offset)?;
+                inner.next_offset = boundary.next_offset;
+                inner.next_ordinal = boundary.next_ordinal;
+                inner.latest_record_start = boundary.latest_record_start;
+            }
+            if inner.writer.get_ref().metadata()?.len() != inner.next_offset {
+                return Err(RecorderStorageError::AppendLogNeedsRecovery);
+            }
+            inner.writer.get_ref().sync_data()?;
+            Self::persist_state(inner)?;
+            Ok(())
+        })();
+        if repaired.is_err() {
+            // Retain both quarantine and boundary even after partial repair;
+            // the next owned attempt must establish durability again.
+            return Err(RecorderStorageError::AppendLogNeedsRecovery);
+        }
+        inner.repair_boundary = None;
+        inner.writer_failed = false;
         Ok(())
     }
 
@@ -1533,7 +1582,6 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
-            Self::ensure_writer_healthy(&inner)?;
             if let Some(mut existing) = inner.idempotency_cache.get(&batch_id).cloned() {
                 if existing.request_digest_sha256 != request_digest_sha256 {
                     return Err(RecorderStorageError::IdempotencyConflict {
@@ -1545,6 +1593,7 @@ impl AppendLogRecorderStorage {
                         batch_id: batch_id.clone(),
                     });
                 }
+                Self::repair_writer(&mut inner)?;
                 Self::ensure_cached_response_durability(
                     &mut inner,
                     &mut existing.response,
@@ -1554,6 +1603,8 @@ impl AppendLogRecorderStorage {
                 existing.response.was_idempotent_replay = true;
                 return Ok(existing.response);
             }
+
+            Self::repair_writer(&mut inner)?;
 
             let next_offset = inner
                 .next_offset
@@ -1587,6 +1638,11 @@ impl AppendLogRecorderStorage {
                 ordinal: inner.next_ordinal,
             };
             let mut last_offset = first_offset.clone();
+            let repair_boundary = AppendRepairBoundary {
+                next_offset: inner.next_offset,
+                next_ordinal: inner.next_ordinal,
+                latest_record_start: inner.latest_record_start,
+            };
 
             for payload in encoded {
                 let payload_len = payload.len();
@@ -1600,6 +1656,7 @@ impl AppendLogRecorderStorage {
                     .and_then(|()| inner.writer.write_all(&payload));
                 if written.is_err() {
                     inner.writer_failed = true;
+                    inner.repair_boundary = Some(repair_boundary);
                     return Err(RecorderStorageError::AppendLogNeedsRecovery);
                 }
                 inner.next_offset += 4 + payload_len as u64;
@@ -7670,6 +7727,76 @@ recorder_backend = "frankensqlite"
             .unwrap()
             .committed_at_ms += 1;
         assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn owned_repair_preserves_buffered_receipts_and_removes_failed_batch_suffix() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            let mut request = AppendRequest {
+                batch_id: "acknowledged".to_string(),
+                events: vec![sample_event("acknowledged", 1, 0, "keep")],
+                required_durability: DurabilityLevel::Enqueued,
+                producer_ts_ms: 1,
+            };
+            storage.append_batch(request.clone()).await.unwrap();
+            {
+                let mut inner = storage.inner.lock().await;
+                let boundary = AppendRepairBoundary {
+                    next_offset: inner.next_offset,
+                    next_ordinal: inner.next_ordinal,
+                    latest_record_start: inner.latest_record_start,
+                };
+                // Reproduce a complete unreceipted record followed by a torn
+                // next record, leaving the earlier acknowledged record buffered.
+                let payload =
+                    serde_json::to_vec(&sample_event("unreceipted", 1, 1, "discard")).unwrap();
+                inner
+                    .writer
+                    .write_all(&(payload.len() as u32).to_le_bytes())
+                    .unwrap();
+                inner.writer.write_all(&payload).unwrap();
+                inner.latest_record_start = Some(inner.next_offset);
+                inner.next_offset += 4 + payload.len() as u64;
+                inner.next_ordinal += 1;
+                inner.writer.write_all(&100u32.to_le_bytes()).unwrap();
+                inner.writer.write_all(b"torn").unwrap();
+                inner.writer_failed = true;
+                inner.repair_boundary = Some(boundary);
+            }
+            request.batch_id = "retry".to_string();
+            request.events = vec![sample_event("retry", 1, 1, "keep too")];
+            request.required_durability = DurabilityLevel::Fsync;
+            let response = storage.append_batch(request.clone()).await.unwrap();
+            assert_eq!(response.first_offset.ordinal, 1);
+            let before_retry = std::fs::read(&config.data_path).unwrap();
+            assert!(
+                storage
+                    .append_batch(request)
+                    .await
+                    .unwrap()
+                    .was_idempotent_replay
+            );
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), before_retry);
+            let mut cursor = 0usize;
+            let mut ids = Vec::new();
+            while cursor < before_retry.len() {
+                let size = u32::from_le_bytes(before_retry[cursor..cursor + 4].try_into().unwrap())
+                    as usize;
+                cursor += 4;
+                let event: RecorderEvent =
+                    serde_json::from_slice(&before_retry[cursor..cursor + size]).unwrap();
+                ids.push(event.event_id);
+                cursor += size;
+            }
+            assert_eq!(ids, ["acknowledged", "retry"]);
+            assert!(!storage.health().await.degraded);
+            drop(storage);
+            let reopened = AppendLogRecorderStorage::open(config).unwrap();
+            assert_eq!(reopened.health().await.latest_offset.unwrap().ordinal, 1);
+        });
     }
 
     #[test]
