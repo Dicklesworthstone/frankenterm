@@ -17,8 +17,8 @@ use mux::tab::TabId;
 use ordered_float::NotNan;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use promise::spawn::sleep;
-use rayon::prelude::*;
 use rangeset::RangeSet;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -281,35 +281,23 @@ fn compute_search_row_from_viewport(
         .unwrap_or(top)
 }
 
-fn checked_stable_row_end(
-    top: StableRowIndex,
-    row_count: usize,
-) -> Option<StableRowIndex> {
+fn checked_stable_row_end(top: StableRowIndex, row_count: usize) -> Option<StableRowIndex> {
     let row_count = StableRowIndex::try_from(row_count).ok()?;
     top.checked_add(row_count)
 }
 
-fn checked_last_stable_row(
-    top: StableRowIndex,
-    row_count: usize,
-) -> Option<StableRowIndex> {
+fn checked_last_stable_row(top: StableRowIndex, row_count: usize) -> Option<StableRowIndex> {
     let last_offset = row_count.checked_sub(1)?;
     let last_offset = StableRowIndex::try_from(last_offset).ok()?;
     top.checked_add(last_offset)
 }
 
-fn checked_page_up_boundary(
-    top: StableRowIndex,
-    viewport_rows: usize,
-) -> Option<StableRowIndex> {
+fn checked_page_up_boundary(top: StableRowIndex, viewport_rows: usize) -> Option<StableRowIndex> {
     let viewport_rows = StableRowIndex::try_from(viewport_rows).ok()?;
     top.checked_sub(viewport_rows)
 }
 
-fn checked_page_down_boundary(
-    top: StableRowIndex,
-    viewport_rows: usize,
-) -> Option<StableRowIndex> {
+fn checked_page_down_boundary(top: StableRowIndex, viewport_rows: usize) -> Option<StableRowIndex> {
     checked_stable_row_end(top, viewport_rows)
 }
 
@@ -389,9 +377,7 @@ fn validate_search_geometry(
         .checked_sub(start_y)?
         .checked_add(1)
         .and_then(|span| usize::try_from(span).ok())?;
-    if (start_y == end_y && start_x >= end_x)
-        || (row_span == 2 && start_x == cols && end_x == 0)
-    {
+    if (start_y == end_y && start_x >= end_x) || (row_span == 2 && start_x == cols && end_x == 0) {
         return None;
     }
 
@@ -529,10 +515,10 @@ fn prepare_copy_search_chunk(
             if range.start >= range.end {
                 continue;
             }
-            by_line
-                .entry(row)
-                .or_default()
-                .push(MatchResult { range, result_index });
+            by_line.entry(row).or_default().push(MatchResult {
+                range,
+                result_index,
+            });
             dirty_rows.add(row);
         }
 
@@ -723,10 +709,7 @@ mod dirty_tracking_tests {
     #[test]
     fn copy_page_boundaries_fail_closed_at_stable_row_limits() {
         assert_eq!(checked_page_up_boundary(StableRowIndex::MIN, 1), None);
-        assert_eq!(
-            checked_page_down_boundary(StableRowIndex::MAX, 1),
-            None
-        );
+        assert_eq!(checked_page_down_boundary(StableRowIndex::MAX, 1), None);
     }
 
     #[test]
@@ -740,10 +723,7 @@ mod dirty_tracking_tests {
         assert_eq!(checked_stable_row_end(7, 0), Some(7));
         assert_eq!(checked_last_stable_row(7, 0), None);
         assert_eq!(checked_stable_row_end(StableRowIndex::MAX, 1), None);
-        assert_eq!(
-            checked_last_stable_row(StableRowIndex::MAX, 2),
-            None
-        );
+        assert_eq!(checked_last_stable_row(StableRowIndex::MAX, 2), None);
         assert_eq!(one_line_range(StableRowIndex::MAX), None);
     }
 
@@ -929,9 +909,7 @@ mod dirty_tracking_tests {
     #[test]
     fn copy_search_preparation_honors_latest_wins_cancellation() {
         let cancel = AtomicBool::new(true);
-        assert!(
-            prepare_copy_search_chunk(Vec::new(), &(0..10), 80, 0, 1, 1, &cancel).is_none()
-        );
+        assert!(prepare_copy_search_chunk(Vec::new(), &(0..10), 80, 0, 1, 1, &cancel).is_none());
     }
 
     #[test]
@@ -1174,9 +1152,8 @@ impl CopyRenderable {
             .min(MAX_TOTAL_EXPANDED_SEARCH_ROWS);
         self.result_source_ends
             .extend(std::iter::repeat(source_end).take(result_count));
-        self.result_source_ranges.extend(
-            std::iter::repeat_with(|| source_range.clone()).take(result_count),
-        );
+        self.result_source_ranges
+            .extend(std::iter::repeat_with(|| source_range.clone()).take(result_count));
         self.results.append(&mut prepared.results);
     }
 
@@ -1216,34 +1193,35 @@ impl CopyRenderable {
         let (abort, registration) = AbortHandle::new_pair();
         self.debounce_abort = Some(abort);
 
-        reservation.spawn_local(async move {
-            if Abortable::new(sleep(Duration::from_millis(350)), registration)
-                .await
-                .is_err()
-            {
-                return anyhow::Result::<()>::Ok(());
-            }
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let state = term_window.pane_state(pane_id);
-                if let Some(overlay) = state.overlay.as_ref() {
-                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                        let mut r = copy_overlay.render.lock();
-                        if Arc::ptr_eq(&r.instance_token, &instance_token)
-                            && cookie == r.typing_cookie
-                            && r.debounce_token
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &debounce_token))
-                        {
-                            r.debounce_abort.take();
-                            r.debounce_token.take();
-                            r.restart_search(false, 0);
+        reservation
+            .spawn_local(async move {
+                if Abortable::new(sleep(Duration::from_millis(350)), registration)
+                    .await
+                    .is_err()
+                {
+                    return anyhow::Result::<()>::Ok(());
+                }
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let state = term_window.pane_state(pane_id);
+                    if let Some(overlay) = state.overlay.as_ref() {
+                        if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                            let mut r = copy_overlay.render.lock();
+                            if Arc::ptr_eq(&r.instance_token, &instance_token)
+                                && cookie == r.typing_cookie
+                                && r.debounce_token
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &debounce_token))
+                            {
+                                r.debounce_abort.take();
+                                r.debounce_token.take();
+                                r.restart_search(false, 0);
+                            }
                         }
                     }
-                }
-            })));
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
+                })));
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
     }
 
     fn update_search(&mut self) {
@@ -1363,39 +1341,40 @@ impl CopyRenderable {
         let preparation_gate = Arc::clone(&self.search_preparation_gate);
         let (abort, registration) = AbortHandle::new_pair();
         self.search_abort = Some(abort);
-        reservation.spawn_local(async move {
-            let limit = Some(SEARCH_RESULT_REQUEST_LIMIT_PER_CHUNK);
-            log::trace!("Searching for {pattern:?} in {range:?}");
-            let preparation_range = range.clone();
-            let completion = Abortable::new(
-                async {
-                    let results = pane
-                        .search(pattern.clone(), range.clone(), limit)
+        reservation
+            .spawn_local(async move {
+                let limit = Some(SEARCH_RESULT_REQUEST_LIMIT_PER_CHUNK);
+                log::trace!("Searching for {pattern:?} in {range:?}");
+                let preparation_range = range.clone();
+                let completion = Abortable::new(
+                    async {
+                        let results = pane
+                            .search(pattern.clone(), range.clone(), limit)
+                            .await
+                            .map_err(|err| format!("{err:#}"))?;
+                        prepare_copy_search_chunk_off_thread(
+                            results,
+                            preparation_range,
+                            run.cols,
+                            result_base,
+                            result_capacity,
+                            expanded_row_capacity,
+                            preparation_cancel,
+                            preparation_gate,
+                        )
                         .await
-                        .map_err(|err| format!("{err:#}"))?;
-                    prepare_copy_search_chunk_off_thread(
-                        results,
-                        preparation_range,
-                        run.cols,
-                        result_base,
-                        result_capacity,
-                        expanded_row_capacity,
-                        preparation_cancel,
-                        preparation_gate,
-                    )
-                    .await
-                },
-                registration,
-            )
-            .await;
-            let outcome = match completion {
-                Err(_) => return anyhow::Result::<()>::Ok(()),
-                Ok(outcome) => outcome,
-            };
+                    },
+                    registration,
+                )
+                .await;
+                let outcome = match completion {
+                    Err(_) => return anyhow::Result::<()>::Ok(()),
+                    Ok(outcome) => outcome,
+                };
 
-            let pane_id = pane.pane_id();
-            let mut outcome = Some(outcome);
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let pane_id = pane.pane_id();
+                let mut outcome = Some(outcome);
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let state = term_window.pane_state(pane_id);
                 if let Some(overlay) = state.overlay.as_ref() {
                     if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
@@ -1423,9 +1402,9 @@ impl CopyRenderable {
                     }
                 }
             })));
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
     }
 
     fn schedule_search_retry(&mut self, run: SearchRunIdentity, retry_attempt: u8) {
@@ -1456,31 +1435,36 @@ impl CopyRenderable {
         let (abort, registration) = AbortHandle::new_pair();
         self.retry_abort = Some(abort);
         self.mark_search_ui_dirty();
-        reservation.spawn_local(async move {
-            if Abortable::new(sleep(delay), registration).await.is_err() {
-                return anyhow::Result::<()>::Ok(());
-            }
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let state = term_window.pane_state(pane_id);
-                if let Some(overlay) = state.overlay.as_ref() {
-                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                        let mut renderer = copy_overlay.render.lock();
-                        if Arc::ptr_eq(&renderer.instance_token, &instance_token)
-                            && renderer.searching.as_ref().is_some_and(|pending| pending.run == run)
-                            && renderer.retry_token
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &retry_token))
-                        {
-                            renderer.retry_abort.take();
-                            renderer.retry_token.take();
-                            renderer.restart_search(true, next_attempt);
+        reservation
+            .spawn_local(async move {
+                if Abortable::new(sleep(delay), registration).await.is_err() {
+                    return anyhow::Result::<()>::Ok(());
+                }
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let state = term_window.pane_state(pane_id);
+                    if let Some(overlay) = state.overlay.as_ref() {
+                        if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                            let mut renderer = copy_overlay.render.lock();
+                            if Arc::ptr_eq(&renderer.instance_token, &instance_token)
+                                && renderer
+                                    .searching
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.run == run)
+                                && renderer
+                                    .retry_token
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &retry_token))
+                            {
+                                renderer.retry_abort.take();
+                                renderer.retry_token.take();
+                                renderer.restart_search(true, next_attempt);
+                            }
                         }
                     }
-                }
-            })));
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
+                })));
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
     }
 
     fn processed_search_error(
@@ -1522,11 +1506,7 @@ impl CopyRenderable {
         let (source_end, source_dirty) = self
             .delegate
             .get_changed_since_with_source_fence(range.clone(), run.source_seqno);
-        let current_source = search_run_identity(
-            run.id,
-            source_end,
-            dims,
-        );
+        let current_source = search_run_identity(run.id, source_end, dims);
         match classify_search_completion(
             self.searching.as_ref(),
             run,
@@ -1737,19 +1717,11 @@ impl CopyRenderable {
                     let cursor_is_above_start = self.cursor.y < sel_start.y;
 
                     let start = SelectionCoordinate::x_y(
-                        if cursor_is_above_start {
-                            usize::MAX
-                        } else {
-                            0
-                        },
+                        if cursor_is_above_start { usize::MAX } else { 0 },
                         sel_start.y,
                     );
                     let end = SelectionCoordinate::x_y(
-                        if cursor_is_above_start {
-                            0
-                        } else {
-                            usize::MAX
-                        },
+                        if cursor_is_above_start { 0 } else { usize::MAX },
                         self.cursor.y,
                     );
                     (start, end)
@@ -1818,7 +1790,11 @@ impl CopyRenderable {
             return;
         }
 
-        let top_gap = self.cursor.y.checked_sub(dims.top).unwrap_or(StableRowIndex::MAX);
+        let top_gap = self
+            .cursor
+            .y
+            .checked_sub(dims.top)
+            .unwrap_or(StableRowIndex::MAX);
         if top_gap < dims.vertical_gap {
             // Increase the gap so we can "look ahead"
             self.set_viewport(Some(self.cursor.y.saturating_sub(dims.vertical_gap)));
@@ -2661,10 +2637,13 @@ impl Pane for CopyOverlay {
                     render.perform_jump(jump, false);
                 }
                 _ => {
-                    self.delegate
-                        .perform_actions(vec![termwiz::escape::Action::Control(
-                            termwiz::escape::ControlCode::Bell,
-                        )]);
+                    let registration = mux::Mux::get()
+                        .capture_pane_registration(&self.delegate)
+                        .ok_or_else(|| anyhow::anyhow!("terminal pane is no longer registered"))?;
+                    mux::localpane::schedule_control_action(
+                        registration,
+                        mux::localpane::PaneControlAction::Bell,
+                    )?;
                 }
             }
             return Ok(());
@@ -2889,16 +2868,12 @@ impl Pane for CopyOverlay {
         // Preserve the delegate's atomic post-poll fence. Falling back to the
         // Pane default would sample current-seq before ClientPane polls and then
         // perform a second, separately locked changed-row query.
-        let (source_end, dirty) = self.delegate.get_changed_since_with_source_fence(
-            lines.clone(),
-            last_observed_source_end,
-        );
+        let (source_end, dirty) = self
+            .delegate
+            .get_changed_since_with_source_fence(lines.clone(), last_observed_source_end);
         let mut renderer = self.render.lock();
         let retained = retained_row_range(renderer.delegate.get_dimensions());
-        prune_dirty_results(
-            &mut renderer.dirty_results,
-            retained,
-        );
+        prune_dirty_results(&mut renderer.dirty_results, retained);
         (
             source_end,
             take_dirty_results(lines, dirty, &mut renderer.dirty_results),

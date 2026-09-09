@@ -2007,7 +2007,23 @@ fn spawn_generated_output(
     message: &str,
     apply: impl FnOnce(Vec<Action>) + Send + 'static,
 ) -> bool {
-    if message.len() > MAX_GENERATED_OUTPUT_MESSAGE_BYTES
+    spawn_auxiliary_output(workers, message.len(), || {
+        let message = message.to_owned();
+        move || {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
+            parser.parse(message.as_bytes(), |action| actions.push(action));
+            apply(actions);
+        }
+    })
+}
+
+fn spawn_auxiliary_output<F: FnOnce() + Send + 'static>(
+    workers: &'static AtomicUsize,
+    estimated_bytes: usize,
+    make_apply: impl FnOnce() -> F,
+) -> bool {
+    if estimated_bytes > MAX_GENERATED_OUTPUT_MESSAGE_BYTES
         || workers
             .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_GENERATED_OUTPUT_WORKERS).then(|| active + 1)
@@ -2019,19 +2035,14 @@ fn spawn_generated_output(
         return false;
     }
     let permit = GeneratedOutputPermit(workers);
-    let message = message.to_owned();
+    let apply = make_apply();
     let spawned = std::thread::Builder::new()
         .name("mux-generated-output".to_string())
         .spawn(move || {
             let _permit = permit;
             if catch_recoverable(
                 RecoverablePanicSite::MuxPaneCallback,
-                AssertUnwindSafe(|| {
-                    let mut parser = termwiz::escape::parser::Parser::new();
-                    let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
-                    parser.parse(message.as_bytes(), |action| actions.push(action));
-                    apply(actions);
-                }),
+                AssertUnwindSafe(apply),
             )
             .is_err()
             {
@@ -2046,6 +2057,38 @@ fn spawn_generated_output(
         return false;
     }
     true
+}
+
+/// Fixed-size GUI controls share bounded admission with generated notices,
+/// but must not inherit the notice formatter's implicit SGR reset.
+pub enum PaneControlAction {
+    Reset,
+    Bell,
+}
+
+pub fn schedule_control_action(
+    registration: PaneRegistrationHandle,
+    control: PaneControlAction,
+) -> anyhow::Result<()> {
+    let action = match control {
+        PaneControlAction::Reset => Action::Esc(termwiz::escape::Esc::Code(
+            termwiz::escape::EscCode::FullReset,
+        )),
+        PaneControlAction::Bell => Action::Control(termwiz::escape::ControlCode::Bell),
+    };
+    anyhow::ensure!(
+        spawn_auxiliary_output(
+            &GENERATED_OUTPUT_WORKERS,
+            std::mem::size_of::<Action>(),
+            || move || {
+                let _ = registration.try_with_current_output(|pane| {
+                    pane.perform_actions(vec![action]);
+                });
+            }
+        ),
+        "terminal control could not be queued; background output capacity is unavailable"
+    );
+    Ok(())
 }
 
 pub(crate) fn emit_output_for_pane(registration: PaneRegistrationHandle, message: &str) {
@@ -3433,6 +3476,84 @@ impl Drop for LocalPane {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn auxiliary_reset_returns_while_pane_output_is_blocked() {
+        let pane = Arc::new(LocalPane::new(
+            701,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x71; 16],
+            "auxiliary-control-test".to_string(),
+        ));
+        let registered: Arc<dyn Pane> = pane.clone();
+        let mux = Arc::new(crate::Mux::new(None));
+        let generation = crate::PaneRegistrationGeneration::new(
+            pane.pane_id(),
+            &mux.pane_retirements,
+            Arc::downgrade(&mux),
+        );
+        {
+            let _registration = mux.pane_registration.lock();
+            mux.insert_pane_registration_locked(
+                pane.pane_id(),
+                pane.domain_id(),
+                &registered,
+                &generation,
+            )
+            .unwrap();
+        }
+        pane.terminal
+            .lock()
+            .perform_actions(vec![Action::Print('x')]);
+        let blocked_output = pane.output_application.lock();
+        let registration = mux.capture_pane_registration(&registered).unwrap();
+        let (tx, rx) = sync_channel(1);
+        let caller = std::thread::spawn(move || {
+            tx.send(schedule_control_action(
+                registration,
+                PaneControlAction::Reset,
+            ))
+            .unwrap();
+        });
+        let admitted = rx.recv_timeout(Duration::from_millis(500));
+        assert_eq!(pane.terminal.lock().cursor_pos().x, 1);
+        drop(blocked_output);
+        caller.join().unwrap();
+        admitted
+            .expect("GUI control must return before output can resume")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.terminal.lock().cursor_pos().x != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            pane.terminal.lock().cursor_pos().x,
+            0,
+            "reset must eventually apply"
+        );
+    }
+
+    #[test]
+    fn auxiliary_rejection_does_not_construct_owned_output() {
+        static WORKERS: AtomicUsize = AtomicUsize::new(0);
+        let mut constructed = false;
+        assert!(!spawn_auxiliary_output(
+            &WORKERS,
+            MAX_GENERATED_OUTPUT_MESSAGE_BYTES + 1,
+            || {
+                constructed = true;
+                || {}
+            }
+        ));
+        assert!(!constructed);
+        assert_eq!(WORKERS.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn generated_output_returns_before_its_terminal_can_be_locked() {

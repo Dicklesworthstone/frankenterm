@@ -7616,9 +7616,13 @@ impl TermWindow {
                 self.set_modal(Rc::new(modal));
             }
             ResetTerminal => {
-                pane.perform_actions(vec![termwiz::escape::Action::Esc(
-                    termwiz::escape::Esc::Code(termwiz::escape::EscCode::FullReset),
-                )]);
+                let registration = Mux::get()
+                    .capture_current_pane(pane.pane_id())
+                    .ok_or_else(|| anyhow::anyhow!("terminal pane is no longer registered"))?;
+                mux::localpane::schedule_control_action(
+                    registration,
+                    mux::localpane::PaneControlAction::Reset,
+                )?;
             }
             OpenUri(link) => {
                 frankenterm_open_url::open_url(link);
