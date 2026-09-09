@@ -788,10 +788,11 @@ RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
     -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
 ```
 
-This builds an uninstalled candidate process family under the requested
-`CARGO_TARGET_DIR` (`/tmp/ft-readme-release-interactive/release-interactive/`
-in this example) on the selected RCH worker. Consult the RCH artifact receipt
-for retrieved local paths. Do **not** copy only `ft` over a live
+This builds an uninstalled candidate process family on the selected RCH worker.
+The command requests `/tmp/ft-readme-release-interactive` as `CARGO_TARGET_DIR`;
+RCH can remap it to a worker-scoped build directory. Consult the RCH transcript
+and artifact receipt for actual remote and retrieved local paths. Do **not**
+copy only `ft` over a live
 installation: the CLI, mux server, and PTY guardian are an atomic family with a
 shared build identity, manifest, and selector. On Apple-Silicon macOS, build the
 complete four-role app bundle (GUI plus that process family) with
