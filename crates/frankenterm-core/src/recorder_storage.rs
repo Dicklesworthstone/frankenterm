@@ -952,6 +952,17 @@ impl RecorderStorage for RecorderStorageInstance {
         }
     }
 
+    async fn read_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        consumer: &CheckpointConsumerId,
+    ) -> Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.read_checkpoint_with_cx(cx, consumer).await,
+            Self::Rusqlite(inner) => inner.read_checkpoint_with_cx(cx, consumer).await,
+        }
+    }
+
     async fn commit_checkpoint(
         &self,
         checkpoint: RecorderCheckpoint,
@@ -980,10 +991,27 @@ impl RecorderStorage for RecorderStorageInstance {
         }
     }
 
+    async fn health_with_cx(&self, cx: &crate::cx::Cx) -> RecorderStorageHealth {
+        match self {
+            Self::AppendLog(inner) => inner.health_with_cx(cx).await,
+            Self::Rusqlite(inner) => inner.health_with_cx(cx).await,
+        }
+    }
+
     async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.lag_metrics().await,
             Self::Rusqlite(inner) => inner.lag_metrics().await,
+        }
+    }
+
+    async fn lag_metrics_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<RecorderStorageLag, RecorderStorageError> {
+        match self {
+            Self::AppendLog(inner) => inner.lag_metrics_with_cx(cx).await,
+            Self::Rusqlite(inner) => inner.lag_metrics_with_cx(cx).await,
         }
     }
 }
@@ -2112,6 +2140,7 @@ pub struct RusqliteRecorderStorage {
     in_flight: Arc<AtomicUsize>,
     checkpoint_in_flight: Arc<AtomicUsize>,
     flush_in_flight: Arc<AtomicUsize>,
+    read_in_flight: Arc<AtomicUsize>,
     inner: Arc<Mutex<RusqliteInner>>,
 }
 
@@ -2145,6 +2174,77 @@ impl std::fmt::Debug for RusqliteRecorderStorage {
 }
 
 impl RusqliteRecorderStorage {
+    // One read may occupy the blocking pool while waiting for this backend's
+    // single connection. Admission is owned through settlement, even when the
+    // caller cancels; excess diagnostics cannot accumulate blocked workers.
+    async fn read_on_worker<T, F>(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        operation: &'static str,
+        read: F,
+    ) -> Result<T, RecorderStorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&RusqliteInner) -> Result<T, RecorderStorageError> + Send + 'static,
+    {
+        if let Some(error) = cx.and_then(|cx| recorder_pre_cancelled_error(operation, cx)) {
+            return Err(error);
+        }
+        let slot = try_acquire_owned_bounded_slot(&self.read_in_flight, 1)?;
+        let inner = Arc::clone(&self.inner);
+        let work = move || {
+            let _slot = slot;
+            futures::executor::block_on(async move {
+                let settlement_cx = crate::cx::for_request();
+                let inner = inner
+                    .lock_with_cx(&settlement_cx)
+                    .await
+                    .map_err(|_| recorder_blocking_runtime_error(operation))?;
+                read(&inner)
+            })
+        };
+        if let Some(cx) = cx {
+            let result = crate::runtime_async::spawn_blocking_with_cx(cx, work)
+                .await
+                .map_err(|error| recorder_blocking_error(operation, error))?;
+            deliver_owned_blocking_result(operation, cx, result)
+        } else {
+            crate::runtime_async::spawn_blocking(work)
+                .await
+                .map_err(|_| recorder_blocking_runtime_error(operation))?
+        }
+    }
+
+    async fn health_on_worker(&self, cx: Option<&crate::cx::Cx>) -> RecorderStorageHealth {
+        let result = self
+            .read_on_worker(cx, "health", |inner| {
+                Ok((
+                    sqlite_latest_storage_offset(&inner.conn)?,
+                    inner.last_error.clone(),
+                ))
+            })
+            .await;
+        let (latest_offset, last_error) = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let diagnostic = match &error {
+                    RecorderStorageError::BlockingOperation { .. }
+                    | RecorderStorageError::QueueFull { .. } => error.to_string(),
+                    _ => format!("health failed (class={:?})", error.class()),
+                };
+                (None, Some(diagnostic))
+            }
+        };
+        RecorderStorageHealth {
+            backend: RecorderBackendKind::Rusqlite,
+            degraded: last_error.is_some(),
+            queue_depth: self.in_flight.load(Ordering::Acquire),
+            queue_capacity: self.config.queue_capacity,
+            latest_offset,
+            last_error,
+        }
+    }
+
     /// Open or create a rusqlite recorder backend.
     pub fn open(config: RusqliteStorageConfig) -> std::result::Result<Self, RecorderStorageError> {
         config.validate()?;
@@ -2167,6 +2267,7 @@ impl RusqliteRecorderStorage {
                 #[cfg(test)]
                 flush_test_hook: None,
             })),
+            read_in_flight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -2789,8 +2890,23 @@ impl RecorderStorage for RusqliteRecorderStorage {
         &self,
         consumer: &CheckpointConsumerId,
     ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
-        let inner = self.inner.lock().await;
-        read_sqlite_checkpoint(&inner.conn, consumer)
+        let consumer = consumer.clone();
+        self.read_on_worker(None, "read_checkpoint", move |inner| {
+            read_sqlite_checkpoint(&inner.conn, &consumer)
+        })
+        .await
+    }
+
+    async fn read_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        consumer: &CheckpointConsumerId,
+    ) -> Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+        let consumer = consumer.clone();
+        self.read_on_worker(Some(cx), "read_checkpoint", move |inner| {
+            read_sqlite_checkpoint(&inner.conn, &consumer)
+        })
+        .await
     }
 
     async fn commit_checkpoint(
@@ -2827,56 +2943,54 @@ impl RecorderStorage for RusqliteRecorderStorage {
     }
 
     async fn health(&self) -> RecorderStorageHealth {
-        let inner = self.inner.lock().await;
-        let latest_offset = match sqlite_latest_storage_offset(&inner.conn) {
-            Ok(offset) => offset,
-            Err(err) => {
-                return RecorderStorageHealth {
-                    backend: RecorderBackendKind::Rusqlite,
-                    degraded: true,
-                    queue_depth: self.in_flight.load(Ordering::Acquire),
-                    queue_capacity: self.config.queue_capacity,
-                    latest_offset: None,
-                    last_error: Some(err.to_string()),
-                };
-            }
-        };
-        RecorderStorageHealth {
-            backend: RecorderBackendKind::Rusqlite,
-            degraded: inner.last_error.is_some(),
-            queue_depth: self.in_flight.load(Ordering::Acquire),
-            queue_capacity: self.config.queue_capacity,
-            latest_offset,
-            last_error: inner.last_error.clone(),
-        }
+        self.health_on_worker(None).await
+    }
+
+    async fn health_with_cx(&self, cx: &crate::cx::Cx) -> RecorderStorageHealth {
+        self.health_on_worker(Some(cx)).await
     }
 
     async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
-        let inner = self.inner.lock().await;
-        let latest = sqlite_latest_storage_offset(&inner.conn)?;
-        let latest_ordinal = latest.as_ref().map_or(0, |o| o.ordinal);
-        let mut stmt = inner
-            .conn
-            .prepare(
-                "SELECT consumer, segment_id, byte_offset, ordinal, schema_version, committed_at_ms
+        self.read_on_worker(None, "lag_metrics", |inner| {
+            sqlite_recorder_lag(&inner.conn)
+        })
+        .await
+    }
+
+    async fn lag_metrics_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<RecorderStorageLag, RecorderStorageError> {
+        self.read_on_worker(Some(cx), "lag_metrics", |inner| {
+            sqlite_recorder_lag(&inner.conn)
+        })
+        .await
+    }
+}
+
+fn sqlite_recorder_lag(conn: &Connection) -> Result<RecorderStorageLag, RecorderStorageError> {
+    let latest = sqlite_latest_storage_offset(conn)?;
+    let latest_ordinal = latest.as_ref().map_or(0, |o| o.ordinal);
+    let mut stmt = conn
+        .prepare(
+            "SELECT consumer, segment_id, byte_offset, ordinal, schema_version, committed_at_ms
                  FROM recorder_checkpoints
                  ORDER BY consumer ASC",
-            )
-            .map_err(sqlite_error)?;
-        let mut rows = stmt.query([]).map_err(sqlite_error)?;
-        let mut consumers = Vec::new();
-        while let Some(row) = rows.next().map_err(sqlite_error)? {
-            let checkpoint = sqlite_checkpoint_from_row(row)?;
-            consumers.push(RecorderConsumerLag {
-                consumer: checkpoint.consumer,
-                offsets_behind: latest_ordinal.saturating_sub(checkpoint.upto_offset.ordinal),
-            });
-        }
-        Ok(RecorderStorageLag {
-            latest_offset: latest,
-            consumers,
-        })
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let mut consumers = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let checkpoint = sqlite_checkpoint_from_row(row)?;
+        consumers.push(RecorderConsumerLag {
+            consumer: checkpoint.consumer,
+            offsets_behind: latest_ordinal.saturating_sub(checkpoint.upto_offset.ordinal),
+        });
     }
+    Ok(RecorderStorageLag {
+        latest_offset: latest,
+        consumers,
+    })
 }
 
 /// Reader over a rusqlite recorder event stream.
@@ -7732,6 +7846,53 @@ recorder_backend = "frankensqlite"
             .unwrap()
             .committed_at_ms += 1;
         assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn sqlite_read_admission_and_cancel_precedence_reach_enum_dispatch() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage =
+                RusqliteRecorderStorage::open(recorder_test_config(dir.path()).rusqlite).unwrap();
+            let slot = try_acquire_owned_bounded_slot(&storage.read_in_flight, 1).unwrap();
+            let storage = RecorderStorageInstance::Rusqlite(storage);
+            let consumer = CheckpointConsumerId("reader".to_string());
+            assert!(matches!(
+                storage.read_checkpoint(&consumer).await,
+                Err(RecorderStorageError::QueueFull { capacity: 1 })
+            ));
+            let cancelled = crate::cx::for_testing();
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("private-read-canary"),
+            );
+            assert!(matches!(
+                storage.read_checkpoint_with_cx(&cancelled, &consumer).await,
+                Err(RecorderStorageError::BlockingOperation { .. })
+            ));
+            let health = storage.health_with_cx(&cancelled).await;
+            assert_eq!(health.backend, RecorderBackendKind::Rusqlite);
+            assert!(health.degraded);
+            assert!(!health.last_error.unwrap().contains("private-read-canary"));
+            drop(slot);
+            let cx = crate::cx::for_testing();
+            assert!(
+                storage
+                    .read_checkpoint_with_cx(&cx, &consumer)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .lag_metrics_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .consumers
+                    .is_empty()
+            );
+            assert!(!storage.health_with_cx(&cx).await.degraded);
+        });
     }
 
     #[test]
