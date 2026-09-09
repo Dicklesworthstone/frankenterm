@@ -2580,12 +2580,14 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => return Err(error),
     };
-    let mut builder = cap_std::fs::DirBuilder::new();
+    let builder = cap_std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use cap_std::fs::DirBuilderExt as _;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     if publication_required {
         match parent.create_dir_with(leaf, &builder) {
             Ok(()) => {}

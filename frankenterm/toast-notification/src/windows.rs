@@ -3,20 +3,12 @@
 use crate::ToastNotification as TN;
 use xml::escape::{escape_str_attribute, escape_str_pcdata};
 
-use windows::core::{Error as WinError, IInspectable, Interface, HSTRING};
+use windows::core::{IInspectable, Interface, HSTRING};
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
-use windows::Win32::Foundation::E_POINTER;
 use windows::UI::Notifications::{
     ToastActivatedEventArgs, ToastNotification, ToastNotificationManager,
 };
-
-fn unwrap_arg<T>(a: &Option<T>) -> Result<&T, WinError> {
-    match a {
-        Some(t) => Ok(t),
-        None => Err(WinError::new(E_POINTER, HSTRING::from("option is none"))),
-    }
-}
 
 fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     let xml = XmlDocument::new()?;
@@ -34,7 +26,7 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
         String::new()
     };
 
-    xml.LoadXml(HSTRING::from(format!(
+    xml.LoadXml(&HSTRING::from(format!(
         r#"<toast duration="long">
         <visual>
             <binding template="ToastGeneric">
@@ -49,12 +41,11 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
         actions
     )))?;
 
-    let notif = ToastNotification::CreateToastNotification(xml)?;
+    let notif = ToastNotification::CreateToastNotification(&xml)?;
 
-    notif.Activated(TypedEventHandler::new(
-        move |_: &Option<ToastNotification>, result: &Option<IInspectable>| {
-            // let myself = unwrap_arg(myself)?;
-            let result = unwrap_arg(result)?.cast::<ToastActivatedEventArgs>()?;
+    notif.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
+        move |_, result| {
+            let result = result.ok()?.cast::<ToastActivatedEventArgs>()?;
 
             let args = result.Arguments()?;
 
@@ -78,8 +69,8 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     */
 
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(HSTRING::from(
-        "org.wezfurlong.wezterm",
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+        "com.frankenterm.gui",
     ))?;
 
     notifier.Show(&notif)?;

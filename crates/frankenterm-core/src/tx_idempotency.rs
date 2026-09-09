@@ -2758,7 +2758,11 @@ fn persist_ledger_bytes(
         // nofollow-opened destination instead of treating a truncated ID as
         // authoritative.
         let mut persisted_reader = &persisted;
-        let persisted_bytes = read_bounded_ledger(&mut persisted_reader, &final_display)?;
+        let persisted_bytes = read_bounded_ledger_with_limit(
+            &mut persisted_reader,
+            &final_display,
+            MAX_DURABLE_LEDGER_BYTES,
+        )?;
         if persisted_bytes != bytes {
             return Err(IdempotencyError::LedgerPersist {
                 reason: format!(

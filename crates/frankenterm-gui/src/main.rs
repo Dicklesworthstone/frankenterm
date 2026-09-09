@@ -5649,7 +5649,7 @@ fn run() -> anyhow::Result<()> {
             ::windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
                 ::windows::core::PCWSTR(wide_string("com.frankenterm.gui").as_ptr()),
             )
-            .unwrap();
+            .context("register FrankenTerm Windows application identity")?;
         }
     }
 
