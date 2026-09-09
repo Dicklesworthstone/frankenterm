@@ -452,7 +452,9 @@ mod deferred_scrollback {
         // text serialization under the terminal lock. Shared attribute/image
         // payloads are not a claim about total process memory usage.
         fn row_charge(line: &Line) -> Option<usize> {
-            let cells = line.len().checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
+            let cells = line
+                .len()
+                .checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
             line.visible_cells().try_fold(
                 cells.checked_add(std::mem::size_of::<Line>())?,
                 |bytes, cell| bytes.checked_add(cell.str().len()),
@@ -463,22 +465,35 @@ mod deferred_scrollback {
         fn drain(&self) -> Result<(), ScrollbackSpillError> {
             loop {
                 let next = {
-                    let state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                    state.pending.front().map(|row| {
-                        (row.stable_row, Arc::clone(&row.line), row.retention)
-                    })
+                    let state = self
+                        .state
+                        .lock()
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    state
+                        .pending
+                        .front()
+                        .map(|row| (row.stable_row, Arc::clone(&row.line), row.retention))
                 };
                 let Some((stable_row, line, retention)) = next else {
                     return Ok(());
                 };
-                if !self.backing.store_scrollback_line(stable_row, &line, retention) {
+                if !self
+                    .backing
+                    .store_scrollback_line(stable_row, &line, retention)
+                {
                     return Err(ScrollbackSpillError::StorageUnavailable);
                 }
                 let durable_bytes = self.backing.retained_scrollback_bytes();
-                let mut state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
                 // operation excludes enqueue, clear and replacement. Keep the
                 // owned plaintext until the backing sink acknowledges durability.
-                let row = state.pending.pop_front().ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
+                let row = state
+                    .pending
+                    .pop_front()
+                    .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
                 state.pending_bytes -= row.charged_bytes;
                 state.durable_bytes = durable_bytes;
             }
@@ -486,25 +501,49 @@ mod deferred_scrollback {
     }
 
     impl ScrollbackSpillSink for DeferredScrollbackSpillSink {
-        fn store_scrollback_line(&self, stable_row: StableRowIndex, line: &Line, retention: usize) -> bool {
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> bool {
             // Queue saturation or another operation leaves the offered row in
             // Screen; never wait for filesystem IO while the terminal is held.
-            let Ok(_operation) = self.operation.try_lock() else { return false; };
-            let Ok(mut state) = self.state.lock() else { return false; };
-            if let Some(existing) = state.pending.iter().find(|row| row.stable_row == stable_row) {
+            let Ok(_operation) = self.operation.try_lock() else {
+                return false;
+            };
+            let Ok(mut state) = self.state.lock() else {
+                return false;
+            };
+            if let Some(existing) = state
+                .pending
+                .iter()
+                .find(|row| row.stable_row == stable_row)
+            {
                 return existing.line.as_ref() == line && existing.retention == retention;
             }
-            let Ok(retention_rows) = StableRowIndex::try_from(retention) else { return false; };
-            let Some(next) = stable_row.checked_add(1) else { return false; };
-            let Some(charge) = Self::row_charge(line) else { return false; };
+            let Ok(retention_rows) = StableRowIndex::try_from(retention) else {
+                return false;
+            };
+            let Some(next) = stable_row.checked_add(1) else {
+                return false;
+            };
+            let Some(charge) = Self::row_charge(line) else {
+                return false;
+            };
             if retention == 0
-                || state.newest_exclusive.is_some_and(|expected| expected != stable_row)
+                || state
+                    .newest_exclusive
+                    .is_some_and(|expected| expected != stable_row)
                 || state.pending.len() >= MAX_PENDING_ROWS
                 || charge > MAX_PENDING_BYTES.saturating_sub(state.pending_bytes)
             {
                 return false;
             }
-            let oldest = state.oldest.unwrap_or(stable_row).max(next.saturating_sub(retention_rows));
+            let oldest = state
+                .oldest
+                .unwrap_or(stable_row)
+                .max(next.saturating_sub(retention_rows));
             state.pending.push_back(PendingRow {
                 stable_row,
                 line: Arc::new(line.clone()),
@@ -517,10 +556,15 @@ mod deferred_scrollback {
             true
         }
 
-        fn requires_scrollback_flush(&self) -> bool { true }
+        fn requires_scrollback_flush(&self) -> bool {
+            true
+        }
 
         fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
-            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             self.drain()
         }
 
@@ -530,7 +574,11 @@ mod deferred_scrollback {
                 if stable_row < state.oldest? || stable_row >= state.newest_exclusive? {
                     return None;
                 }
-                if let Some(row) = state.pending.iter().find(|row| row.stable_row == stable_row) {
+                if let Some(row) = state
+                    .pending
+                    .iter()
+                    .find(|row| row.stable_row == stable_row)
+                {
                     return Some(row.line.as_ref().clone());
                 }
             }
@@ -542,28 +590,58 @@ mod deferred_scrollback {
         }
 
         fn retained_scrollback_rows(&self) -> usize {
-            self.state.lock().ok().and_then(|state| {
-                state.newest_exclusive?.checked_sub(state.oldest?).and_then(|rows| usize::try_from(rows).ok())
-            }).unwrap_or(0)
+            self.state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .newest_exclusive?
+                        .checked_sub(state.oldest?)
+                        .and_then(|rows| usize::try_from(rows).ok())
+                })
+                .unwrap_or(0)
         }
 
         fn retained_scrollback_bytes(&self) -> usize {
-            self.state.lock().map(|state| state.durable_bytes.saturating_add(state.pending_bytes)).unwrap_or(0)
+            self.state
+                .lock()
+                .map(|state| state.durable_bytes.saturating_add(state.pending_bytes))
+                .unwrap_or(0)
         }
 
-        fn snapshot_scrollback(&self, newest: StableRowIndex, limits: ScrollbackSnapshotLimits) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
-            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        fn snapshot_scrollback(
+            &self,
+            newest: StableRowIndex,
+            limits: ScrollbackSnapshotLimits,
+        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             self.drain()?;
             self.backing.snapshot_scrollback(newest, limits)
         }
 
-        fn replace_scrollback_prefix(&self, expected: Option<ScrollbackSnapshotGeneration>, prefix: ScrollbackPrefix<'_>, retention: usize) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
-            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            let mut state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        fn replace_scrollback_prefix(
+            &self,
+            expected: Option<ScrollbackSnapshotGeneration>,
+            prefix: ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             if !state.pending.is_empty() {
                 return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
             }
-            let receipt = self.backing.replace_scrollback_prefix(expected, prefix, retention)?;
+            let receipt = self
+                .backing
+                .replace_scrollback_prefix(expected, prefix, retention)?;
             *state = State {
                 pending: VecDeque::new(),
                 pending_bytes: 0,
@@ -575,10 +653,16 @@ mod deferred_scrollback {
         }
 
         fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
-            let _operation = self.operation.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             // A successful explicit clear discards both the durable generation
             // and its queued suffix. On failure every queued row stays readable.
-            let mut state = self.state.lock().map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             let receipt = self.backing.clear_scrollback()?;
             *state = State {
                 pending: VecDeque::new(),
@@ -7759,7 +7843,8 @@ pub fn install_scrollback_spill_sink_factory() {
     let base_dir = Arc::new(default_live_scrollback_dir());
     config::set_scrollback_spill_sink_factory(Some(Arc::new(move |context| {
         match LiveScrollbackSpillSink::new((*base_dir).clone(), &context) {
-            Ok(sink) => match deferred_scrollback::DeferredScrollbackSpillSink::new(Arc::new(sink)) {
+            Ok(sink) => match deferred_scrollback::DeferredScrollbackSpillSink::new(Arc::new(sink))
+            {
                 Ok(sink) => Some(Arc::new(sink)),
                 Err(error) => {
                     log::warn!("failed to initialize deferred scrollback metadata: {error}");
@@ -8071,6 +8156,379 @@ mod tests {
     use termwiz::cell::CellAttributes;
     use wezterm_term::Line;
     use wezterm_term::config::ScrollbackSpillSink;
+
+    fn deferred_test_sink() -> (
+        tempfile::TempDir,
+        Arc<LiveScrollbackSpillSink>,
+        Arc<deferred_scrollback::DeferredScrollbackSpillSink>,
+    ) {
+        let dir = tempfile::tempdir().expect("private deferred scrollback fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let backing =
+            Arc::new(LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap());
+        let deferred = Arc::new(
+            deferred_scrollback::DeferredScrollbackSpillSink::new(backing.clone()).unwrap(),
+        );
+        (dir, backing, deferred)
+    }
+
+    #[derive(Debug)]
+    struct DeferredPaneTestConfig(Arc<dyn ScrollbackSpillSink>);
+
+    impl wezterm_term::TerminalConfiguration for DeferredPaneTestConfig {
+        fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+            wezterm_term::color::ColorPalette::default()
+        }
+        fn scrollback_size(&self) -> usize {
+            2048
+        }
+        fn scrollback_tier_config(&self) -> wezterm_term::config::ScrollbackTierConfig {
+            wezterm_term::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 2,
+                warm_max_bytes: 0,
+            }
+        }
+        fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    #[cfg(unix)]
+    fn deferred_test_pane(sink: Arc<dyn ScrollbackSpillSink>) -> Arc<dyn mux::pane::Pane> {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 4,
+                cols: 80,
+                pixel_width: 80,
+                pixel_height: 4,
+            })
+            .unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/true"))
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 80,
+                pixel_width: 80,
+                pixel_height: 4,
+                dpi: 96,
+            },
+            Arc::new(DeferredPaneTestConfig(sink)),
+            "FrankenTerm",
+            "deferred-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        Arc::new(mux::localpane::LocalPane::new(
+            913,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            3,
+            [0xd3; 16],
+            "deferred-test".to_string(),
+        ))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deferred_scrollback_local_pane_releases_terminal_during_real_persistence() {
+        for use_queue in [false, true] {
+            let (_dir, backing, deferred) = deferred_test_sink();
+            let sink: Arc<dyn ScrollbackSpillSink> = if use_queue {
+                deferred.clone()
+            } else {
+                backing.clone()
+            };
+            let pane = deferred_test_pane(Arc::clone(&sink));
+            let lease = acquire_live_scrollback_filesystem_mutation_lease(
+                backing.manifest_path.parent().unwrap(),
+                false,
+            )
+            .unwrap();
+            let corpus: String = (0..270)
+                .map(|row| format!("row-{row:03} e\u{301} 日本語\r\n"))
+                .collect();
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new()
+                .parse(corpus.as_bytes(), |action| actions.push(action));
+            let writing = Arc::clone(&pane);
+            let writer = std::thread::spawn(move || writing.perform_actions(actions));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let entered = loop {
+                if backing.mutation_gate.try_lock().is_err() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let reading = Arc::clone(&pane);
+            let reader = std::thread::spawn(move || {
+                tx.send((reading.get_dimensions(), reading.get_title().to_string()))
+                    .unwrap();
+            });
+            let responsive = rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok();
+            drop(lease);
+            writer.join().unwrap();
+            reader.join().unwrap();
+            assert!(
+                entered,
+                "parser did not enter the real persistence boundary"
+            );
+            assert_eq!(
+                responsive, use_queue,
+                "queued={use_queue}: direct persistence is the negative control"
+            );
+            assert_eq!(
+                backing.retained_scrollback_rows(),
+                265,
+                "overflow beyond the queue cap must drain before returning"
+            );
+            let (first, lines) = pane.get_lines(0..271);
+            assert_eq!(first, 0);
+            assert_eq!(lines.len(), 271);
+            for (row, line) in lines.iter().take(270).enumerate() {
+                assert_eq!(line.as_str().trim_end(), format!("row-{row:03} é 日本語"));
+            }
+            assert!(lines[270].as_str().trim().is_empty());
+            // The actual GUI reload supplies a presentation-only TermConfig.
+            // Preserve the pane's exact sink instead of detaching its history.
+            pane.set_config(Arc::new(config::TermConfig::with_config(
+                config::configuration(),
+            )));
+            assert!(Arc::ptr_eq(
+                &pane.get_config().unwrap().scrollback_spill_sink().unwrap(),
+                &sink
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deferred_scrollback_parser_backpressure_is_readable_and_close_cancellable() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let pane = deferred_test_pane(deferred.clone());
+        std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(b"retained\r\n".repeat(20).as_slice(), |action| {
+                actions.push(action)
+            });
+        let writing = Arc::clone(&pane);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            writing.perform_actions(actions);
+            done_tx.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while deferred.retained_scrollback_rows() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let retained = deferred.load_scrollback_line(0);
+        let waiting = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err();
+        let _dimensions = pane.get_dimensions();
+        pane.kill();
+        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        writer.join().unwrap();
+        assert!(retained.is_some());
+        assert!(
+            waiting,
+            "a failed flush must not admit another parser batch"
+        );
+        stopped.unwrap();
+        assert_eq!(deferred.load_scrollback_line(0), retained);
+        std::fs::rename(
+            &backing.manifest_path,
+            backing.manifest_path.with_extension("retained-invalid"),
+        )
+        .unwrap();
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.load_scrollback_line(0), retained);
+    }
+
+    #[test]
+    fn deferred_scrollback_admission_retains_exact_rows_until_durable_flush() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text(
+            "queued e\u{301} 日本語 👩‍💻",
+            &CellAttributes::blank(),
+            19,
+            None,
+        );
+        assert!(deferred.store_scrollback_line(40, &line, 8));
+        assert_eq!(deferred.load_scrollback_line(40), Some(line.clone()));
+        assert_eq!(deferred.oldest_scrollback_row(), Some(40));
+        assert_eq!(deferred.retained_scrollback_rows(), 1);
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            0,
+            "admission is not a disk receipt"
+        );
+        assert!(!backing.manifest_path.exists());
+        assert!(
+            deferred.store_scrollback_line(40, &line, 8),
+            "exact queued retry"
+        );
+        let different = Line::from_text("different", &CellAttributes::blank(), 19, None);
+        assert!(!deferred.store_scrollback_line(40, &different, 8));
+        assert!(
+            !deferred.store_scrollback_line(42, &line, 8),
+            "sequence gap"
+        );
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 1);
+        assert_eq!(backing.load_scrollback_line(40), Some(line.clone()));
+        assert_eq!(deferred.load_scrollback_line(40), Some(line));
+        assert_eq!(
+            deferred.retained_scrollback_bytes(),
+            backing.retained_scrollback_bytes()
+        );
+    }
+
+    #[test]
+    fn deferred_scrollback_refuses_bounded_overflow_without_hiding_rows() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text("bounded", &CellAttributes::blank(), 0, None);
+        for row in 0..256 {
+            assert!(deferred.store_scrollback_line(row, &line, 512));
+        }
+        assert!(!deferred.store_scrollback_line(256, &line, 512));
+        assert_eq!(deferred.retained_scrollback_rows(), 256);
+        assert_eq!(deferred.load_scrollback_line(255), Some(line));
+        assert_eq!(backing.retained_scrollback_rows(), 0);
+
+        let (_byte_dir, byte_backing, byte_deferred) = deferred_test_sink();
+        let long = Line::from_text(&"x".repeat(4096), &CellAttributes::blank(), 0, None);
+        let accepted = (0..256)
+            .take_while(|row| byte_deferred.store_scrollback_line(*row, &long, 512))
+            .count();
+        assert!(
+            accepted > 0 && accepted < 256,
+            "byte charge must bound long rows before the row cap"
+        );
+        assert!(byte_deferred.retained_scrollback_bytes() <= 16 * 1024 * 1024);
+        assert_eq!(byte_backing.retained_scrollback_rows(), 0);
+    }
+
+    #[test]
+    fn deferred_scrollback_failed_flush_keeps_owned_rows_for_exact_retry() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text(
+            "survives failed publication",
+            &CellAttributes::blank(),
+            7,
+            None,
+        );
+        assert!(deferred.store_scrollback_line(0, &line, 8));
+        assert!(!backing.manifest_path.exists());
+        std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
+        assert!(deferred.flush_scrollback().is_err());
+        assert_eq!(deferred.load_scrollback_line(0), Some(line.clone()));
+        assert_eq!(deferred.retained_scrollback_rows(), 1);
+        std::fs::rename(
+            &backing.manifest_path,
+            backing.manifest_path.with_extension("retained-invalid"),
+        )
+        .unwrap();
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.load_scrollback_line(0), Some(line));
+    }
+
+    #[test]
+    fn deferred_scrollback_reads_do_not_wait_for_real_backing_file_lock() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text("readable during fsync", &CellAttributes::blank(), 3, None);
+        assert!(deferred.store_scrollback_line(0, &line, 8));
+        let lease = acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        let flushing = Arc::clone(&deferred);
+        let flush = std::thread::spawn(move || flushing.flush_scrollback());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backing.mutation_gate.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real backing write did not enter mutation boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (queued_tx, queued_rx) = std::sync::mpsc::sync_channel(1);
+        let reading = Arc::clone(&deferred);
+        let read = std::thread::spawn(move || {
+            queued_tx
+                .send((
+                    reading.retained_scrollback_rows(),
+                    reading.oldest_scrollback_row(),
+                    reading.load_scrollback_line(0),
+                ))
+                .unwrap();
+        });
+        let queued = queued_rx.recv_timeout(std::time::Duration::from_millis(500));
+        let (cold_tx, cold_rx) = std::sync::mpsc::sync_channel(1);
+        let cold = Arc::clone(&backing);
+        let control =
+            std::thread::spawn(move || cold_tx.send(cold.retained_scrollback_rows()).unwrap());
+        let cold_blocked = cold_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err();
+        drop(lease);
+        flush.join().unwrap().unwrap();
+        read.join().unwrap();
+        control.join().unwrap();
+        assert_eq!(queued.unwrap(), (1, Some(0), Some(line)));
+        assert!(
+            cold_blocked,
+            "direct backing metadata is the contended negative control"
+        );
+    }
+
+    #[test]
+    fn deferred_scrollback_snapshot_and_clear_order_queued_suffixes() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text("ordered", &CellAttributes::blank(), 5, None);
+        assert!(deferred.store_scrollback_line(10, &line, 8));
+        deferred.clear_scrollback().unwrap();
+        assert_eq!(deferred.retained_scrollback_rows(), 0);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            0,
+            "clear must not resurrect a queued row"
+        );
+        assert!(deferred.store_scrollback_line(30, &line, 8));
+        let snapshot = deferred
+            .snapshot_scrollback(
+                31,
+                wezterm_term::config::ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(snapshot.oldest_stable_row(), Some(30));
+        assert_eq!(snapshot.rows(), &[line]);
+        assert_eq!(backing.retained_scrollback_rows(), 1);
+    }
 
     fn test_lock() -> &'static RecoveringTestMutex {
         &GLOBAL_STATE_TEST_LOCK

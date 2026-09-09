@@ -163,6 +163,25 @@ impl TermConfig {
         let _previous = current.replace(config);
     }
 
+    /// Copy presentation settings while retaining the receiving pane's storage
+    /// authority. GUI reloads share a settings object across panes; the sink
+    /// must remain pane-owned and must not be detached by that shared object.
+    pub fn for_scrollback_sink(&self, sink: Arc<dyn ScrollbackSpillSink>) -> Self {
+        let _activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
+        Self {
+            recovery_activation_gate: Mutex::new(()),
+            config: Mutex::new(lock_terminal_mutex(&self.config, "terminal config").clone()),
+            client_palette: Mutex::new(
+                lock_terminal_mutex(&self.client_palette, "terminal client palette").clone(),
+            ),
+            overlay_generation: AtomicUsize::new(self.overlay_generation.load(Ordering::Acquire)),
+            scrollback_spill_sink: Some(sink),
+        }
+    }
+
     pub fn set_client_palette(&self, palette: ColorPalette) {
         let _activation = lock_terminal_mutex(
             &self.recovery_activation_gate,

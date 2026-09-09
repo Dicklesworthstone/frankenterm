@@ -1383,16 +1383,24 @@ impl Pane for LocalPane {
         let config = if let Some(existing) = terminal.get_config().scrollback_spill_sink() {
             if let Some(settings) = config.downcast_ref::<config::TermConfig>() {
                 Arc::new(settings.for_scrollback_sink(existing)) as Arc<dyn TerminalConfiguration>
-            } else if config.scrollback_spill_sink().is_some_and(|sink| Arc::ptr_eq(&sink, &existing)) {
+            } else if config
+                .scrollback_spill_sink()
+                .is_some_and(|sink| Arc::ptr_eq(&sink, &existing))
+            {
                 config
             } else {
-                log::error!("refusing to detach pane {} scrollback authority during config replacement", self.pane_id);
+                log::error!(
+                    "refusing to detach pane {} scrollback authority during config replacement",
+                    self.pane_id
+                );
                 return;
             }
         } else {
             config
         };
-        let sink = config.scrollback_spill_sink().filter(|sink| sink.requires_scrollback_flush());
+        let sink = config
+            .scrollback_spill_sink()
+            .filter(|sink| sink.requires_scrollback_flush());
         terminal.set_config(config);
         *self.scrollback_flush_sink.lock() = sink;
     }
@@ -3083,7 +3091,9 @@ impl LocalPane {
         }));
         let proc_list = Arc::new(Mutex::new(None));
         let proc_list_warm_pending = Arc::new(AtomicBool::new(false));
-        let scrollback_flush_sink = terminal.get_config().scrollback_spill_sink()
+        let scrollback_flush_sink = terminal
+            .get_config()
+            .scrollback_spill_sink()
             .filter(|sink| sink.requires_scrollback_flush());
 
         Self {
