@@ -1883,6 +1883,10 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
+            // Shutdown may be the next operation after a transient write
+            // failure. Reconcile under the same owned writer authority rather
+            // than requiring another event to make buffered receipts durable.
+            Self::repair_writer(&mut inner)?;
             Self::flush_writer(&mut inner)?;
             if mode == FlushMode::Durable {
                 inner.writer.get_ref().sync_data()?;
@@ -7962,6 +7966,65 @@ recorder_backend = "frankensqlite"
             drop(storage);
             let reopened = AppendLogRecorderStorage::open(config).unwrap();
             assert_eq!(reopened.health().await.latest_offset.unwrap().ordinal, 1);
+        });
+    }
+
+    #[test]
+    fn durable_flush_repairs_failed_writer_without_admitting_another_event() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            let request = AppendRequest {
+                batch_id: "acknowledged-before-shutdown".to_string(),
+                events: vec![sample_event("keep", 1, 0, "buffered")],
+                required_durability: DurabilityLevel::Enqueued,
+                producer_ts_ms: 1,
+            };
+            let receipt = storage.append_batch(request.clone()).await.unwrap();
+            let acknowledged_end = {
+                let mut inner = storage.inner.lock().await;
+                let boundary = AppendRepairBoundary {
+                    next_offset: inner.next_offset,
+                    next_ordinal: inner.next_ordinal,
+                    latest_record_start: inner.latest_record_start,
+                };
+                inner.writer.write_all(&100u32.to_le_bytes()).unwrap();
+                inner.writer.write_all(b"torn").unwrap();
+                inner.writer_failed = true;
+                inner.repair_boundary = Some(boundary);
+                boundary.next_offset
+            };
+            let cx = crate::cx::for_request();
+            let flushed = storage
+                .flush_with_cx(&cx, FlushMode::Durable)
+                .await
+                .unwrap();
+            assert_eq!(flushed.latest_offset, Some(receipt.last_offset.clone()));
+            assert_eq!(
+                std::fs::metadata(&config.data_path).unwrap().len(),
+                acknowledged_end
+            );
+            assert!(!storage.inner.lock().await.writer_failed);
+            assert!(storage.inner.lock().await.repair_boundary.is_none());
+            assert!(!storage.health().await.degraded);
+            let bytes = std::fs::read(&config.data_path).unwrap();
+            let mut retry = request;
+            retry.required_durability = DurabilityLevel::Fsync;
+            assert!(
+                storage
+                    .append_batch(retry)
+                    .await
+                    .unwrap()
+                    .was_idempotent_replay
+            );
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), bytes);
+            drop(storage);
+            let reopened = AppendLogRecorderStorage::open(config).unwrap();
+            assert_eq!(
+                reopened.health().await.latest_offset,
+                Some(receipt.last_offset)
+            );
         });
     }
 
