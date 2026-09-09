@@ -1604,16 +1604,20 @@ impl AppendLogRecorderStorage {
                 return Ok(existing.response);
             }
 
-            Self::repair_writer(&mut inner)?;
-
-            let next_offset = inner
-                .next_offset
-                .checked_add(total_bytes as u64)
-                .ok_or_else(|| RecorderStorageError::InvalidRequest {
+            // Validate admission against the boundary repair would restore,
+            // before allowing repair to change any bytes for this request.
+            let base_offset = inner
+                .repair_boundary
+                .map_or(inner.next_offset, |b| b.next_offset);
+            let base_ordinal = inner
+                .repair_boundary
+                .map_or(inner.next_ordinal, |b| b.next_ordinal);
+            let next_offset = base_offset.checked_add(total_bytes as u64).ok_or_else(|| {
+                RecorderStorageError::InvalidRequest {
                     message: "recorder byte offset exhausted".to_string(),
-                })?;
-            let next_ordinal = inner
-                .next_ordinal
+                }
+            })?;
+            let next_ordinal = base_ordinal
                 .checked_add(encoded.len() as u64)
                 .ok_or_else(|| RecorderStorageError::InvalidRequest {
                     message: "recorder ordinal exhausted".to_string(),
@@ -1621,8 +1625,8 @@ impl AppendLogRecorderStorage {
             // Counters are the only state fields changed by appending. Check
             // size before touching the log when their JSON representation grows;
             // otherwise the already-admitted state has exactly the same size.
-            if next_offset.to_string().len() != inner.next_offset.to_string().len()
-                || next_ordinal.to_string().len() != inner.next_ordinal.to_string().len()
+            if next_offset.to_string().len() != base_offset.to_string().len()
+                || next_ordinal.to_string().len() != base_ordinal.to_string().len()
             {
                 PersistedState {
                     segment_id: inner.segment_id,
@@ -1632,6 +1636,7 @@ impl AppendLogRecorderStorage {
                 }
                 .canonical_bytes()?;
             }
+            Self::repair_writer(&mut inner)?;
             let first_offset = RecorderOffset {
                 segment_id: inner.segment_id,
                 byte_offset: inner.next_offset,
