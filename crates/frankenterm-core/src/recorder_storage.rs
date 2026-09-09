@@ -1052,6 +1052,32 @@ struct PersistedState {
     checkpoints: HashMap<String, RecorderCheckpoint>,
 }
 
+impl PersistedState {
+    /// Stable bytes for publication identity and exact retry reconciliation.
+    /// Keep the runtime map unchanged; only the persisted object's key order
+    /// is canonical. Existing state files with arbitrary key order still load.
+    fn canonical_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct WireState<'a> {
+            segment_id: u64,
+            next_offset: u64,
+            next_ordinal: u64,
+            checkpoints: std::collections::BTreeMap<&'a str, &'a RecorderCheckpoint>,
+        }
+
+        serde_json::to_vec_pretty(&WireState {
+            segment_id: self.segment_id,
+            next_offset: self.next_offset,
+            next_ordinal: self.next_ordinal,
+            checkpoints: self
+                .checkpoints
+                .iter()
+                .map(|(key, value)| (key.as_str(), value))
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScanResult {
     valid_len: u64,
@@ -3298,7 +3324,7 @@ impl AppendLogStateFile {
 
     fn write(&self, state: &PersistedState) -> std::result::Result<(), RecorderStorageError> {
         self.check_lock()?;
-        let bytes = serde_json::to_vec_pretty(state)?;
+        let bytes = state.canonical_bytes()?;
         let mut options = recorder_open_options();
         // Do not truncate until the actual no-follow descriptor is validated.
         options.create(true).write(true);
@@ -7222,6 +7248,93 @@ recorder_backend = "frankensqlite"
     }
 
     // ── Reopen persistence ───────────────────────────────────────────
+
+    #[test]
+    fn persisted_state_canonical_bytes_preserve_legacy_fields_and_sort_keys() {
+        // Deliberately unsorted legacy JSON, independent of the serializer.
+        let legacy = r#"{
+            "segment_id": 7, "next_offset": 123, "next_ordinal": 2,
+            "checkpoints": {
+                "z-reader": {"consumer":"z-reader","upto_offset":{"segment_id":7,"byte_offset":80,"ordinal":1},"schema_version":"v1","committed_at_ms":22},
+                "a-reader": {"consumer":"a-reader","upto_offset":{"segment_id":7,"byte_offset":0,"ordinal":0},"schema_version":"v1","committed_at_ms":11}
+            }
+        }"#;
+        let state: PersistedState = serde_json::from_str(legacy).unwrap();
+        let expected = state.canonical_bytes().unwrap();
+        let text = std::str::from_utf8(&expected).unwrap();
+        assert!(text.find("\"a-reader\":").unwrap() < text.find("\"z-reader\":").unwrap());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&expected).unwrap(),
+            serde_json::from_str::<serde_json::Value>(legacy).unwrap(),
+            "canonicalization must preserve every legacy field and value"
+        );
+
+        // Freshly seeded maps and alternating insertion order must produce
+        // identical bytes, including after decoding a prior publication.
+        for reverse in [false, true].into_iter().cycle().take(32) {
+            let mut rebuilt = PersistedState {
+                checkpoints: HashMap::new(),
+                ..state.clone()
+            };
+            let keys = if reverse {
+                ["z-reader", "a-reader"]
+            } else {
+                ["a-reader", "z-reader"]
+            };
+            for key in keys {
+                rebuilt
+                    .checkpoints
+                    .insert(key.to_string(), state.checkpoints[key].clone());
+            }
+            assert_eq!(rebuilt.canonical_bytes().unwrap(), expected);
+            let decoded: PersistedState = serde_json::from_slice(&expected).unwrap();
+            assert_eq!(decoded.canonical_bytes().unwrap(), expected);
+        }
+
+        let mut advanced = state.clone();
+        advanced.next_offset += 1;
+        assert_ne!(advanced.canonical_bytes().unwrap(), expected);
+        let mut changed_checkpoint = state;
+        changed_checkpoint
+            .checkpoints
+            .get_mut("a-reader")
+            .unwrap()
+            .committed_at_ms += 1;
+        assert_ne!(changed_checkpoint.canonical_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn persisted_state_publication_uses_canonical_bytes_on_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state_file = AppendLogStateFile::open(&path).unwrap();
+        let mut state = PersistedState::default();
+        for consumer in ["z-reader", "a-reader"] {
+            state.checkpoints.insert(
+                consumer.to_string(),
+                RecorderCheckpoint {
+                    consumer: CheckpointConsumerId(consumer.to_string()),
+                    upto_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    schema_version: "v1".to_string(),
+                    committed_at_ms: 1,
+                },
+            );
+        }
+        state_file.write(&state).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.find("\"a-reader\":").unwrap() < text.find("\"z-reader\":").unwrap());
+        drop(state_file);
+        let reopened = AppendLogStateFile::open(&path).unwrap();
+        let recovered = reopened.load().unwrap();
+        assert_eq!(recovered.checkpoints, state.checkpoints);
+        reopened.write(&recovered).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
 
     #[test]
     fn reopen_continues_ordinals() {
