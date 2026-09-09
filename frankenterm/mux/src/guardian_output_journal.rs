@@ -27,11 +27,14 @@ use chacha20poly1305::{
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::{TryFrom, TryInto};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
+#[cfg(unix)]
 use std::path::{Component, Path};
 use thiserror::Error;
 use uuid::Uuid;
@@ -553,6 +556,7 @@ impl Default for GuardianOutputJournalLimits {
 }
 
 impl GuardianOutputJournalLimits {
+    #[cfg(any(unix, test))]
     fn validate(self) -> Result<Self, GuardianOutputJournalError> {
         if self.max_record_bytes == 0 {
             return Err(GuardianOutputJournalError::InvalidLimits(
@@ -2284,6 +2288,7 @@ struct JournalScan {
     tail: GuardianOutputJournalTail,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GuardianOutputDirectoryIdentity {
     device: u64,
@@ -2292,6 +2297,7 @@ struct GuardianOutputDirectoryIdentity {
     owner: u32,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GuardianOutputFileIdentity {
     device: u64,
@@ -2302,6 +2308,7 @@ struct GuardianOutputFileIdentity {
     bytes: u64,
 }
 
+#[cfg(unix)]
 struct GuardianOutputNewSegmentPublication {
     parent_directory: File,
     parent_identity: GuardianOutputDirectoryIdentity,
@@ -2389,6 +2396,7 @@ pub struct GuardianOutputJournal {
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
     authenticated_prefix_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
+    #[cfg(unix)]
     new_segment_publication: Option<GuardianOutputNewSegmentPublication>,
     poisoned: bool,
     writer_lease_held: bool,
@@ -2471,6 +2479,7 @@ fn acquire_guardian_output_writer_lease(file: &File) -> Result<(), GuardianOutpu
     target_os = "visionos",
     target_os = "watchos",
 )))]
+#[cfg(unix)]
 fn acquire_guardian_output_writer_lease(_file: &File) -> Result<(), GuardianOutputJournalError> {
     Err(GuardianOutputJournalError::AppendWriterLeaseUnsupported)
 }
@@ -2662,6 +2671,7 @@ impl GuardianOutputJournal {
         Err(GuardianOutputJournalError::NewSegmentCreationUnsupported)
     }
 
+    #[cfg(unix)]
     fn initialize_new_file(
         mut file: File,
         identity: GuardianOutputSegmentIdentity,
@@ -2764,6 +2774,7 @@ impl GuardianOutputJournal {
         Err(GuardianOutputJournalError::NewSegmentCreationUnsupported)
     }
 
+    #[cfg(unix)]
     fn open_existing_append_file(
         file: File,
         identity: GuardianOutputSegmentIdentity,
@@ -2777,6 +2788,7 @@ impl GuardianOutputJournal {
     }
 
     /// Authenticate one existing descriptor without ever modifying it.
+    #[cfg(unix)]
     fn authenticate_existing(
         mut file: File,
         identity: GuardianOutputSegmentIdentity,
@@ -2899,9 +2911,18 @@ impl GuardianOutputJournal {
 
     #[must_use]
     pub const fn directory_entry_sync_required(&self) -> bool {
-        self.new_segment_publication.is_some()
+        #[cfg(unix)]
+        {
+            self.new_segment_publication.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            // Descriptor-relative journal publication is unsupported here.
+            false
+        }
     }
 
+    #[cfg(unix)]
     fn revalidate_authenticated_prefix(&self) -> Result<(), GuardianOutputJournalError> {
         let expected_physical_bytes = match self.tail {
             GuardianOutputJournalTail::Clean => self.committed_bytes,
@@ -3397,6 +3418,7 @@ impl GuardianOutputJournalReader {
     }
 }
 
+#[cfg(any(unix, test))]
 fn encode_file_header(
     identity: GuardianOutputSegmentIdentity,
     cipher: &GuardianOutputCipher,
@@ -3601,6 +3623,7 @@ fn record_aad(
     aad
 }
 
+#[cfg(any(unix, test))]
 fn scan_journal<R: Read + Seek>(
     reader: &mut R,
     physical_bytes: u64,

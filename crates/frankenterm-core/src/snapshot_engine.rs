@@ -10720,7 +10720,7 @@ fn revalidate_checkpoint_artifact_parent(
     parent_path: &Path,
     pinned: &cap_std::fs::Dir,
 ) -> Result<(), CheckpointScrollbackArtifactError> {
-    use cap_fs_ext::OsMetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
     validate_checkpoint_artifact_final_directory_authority(pinned)?;
     let pinned_metadata = pinned.dir_metadata()?;

@@ -664,6 +664,10 @@ fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
         for entry in dir.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if let Some(pid) = parse_gui_socket_pid(name) {
+                    // All platforms validate the name; only Unix uses the PID
+                    // to prove a stale socket safe to quarantine.
+                    #[cfg(not(unix))]
+                    let _ = pid;
                     if !is_socket_entry(&entry) {
                         continue;
                     }

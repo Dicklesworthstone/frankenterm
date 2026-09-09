@@ -8508,6 +8508,7 @@ struct SshReadinessMetrics {
 }
 
 struct SshReadinessOperationMetrics {
+    #[cfg(unix)]
     registration: metrics::Counter,
     rearm: metrics::Counter,
     missing_cx: metrics::Counter,
@@ -8523,6 +8524,7 @@ enum SshIoDirection {
 impl SshReadinessOperationMetrics {
     fn new(operation: &'static str) -> Self {
         Self {
+            #[cfg(unix)]
             registration: metrics::counter!(
                 "mux.client.ssh_stream.readiness.registration.total",
                 "operation" => operation,

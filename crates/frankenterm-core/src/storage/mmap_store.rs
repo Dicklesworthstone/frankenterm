@@ -761,6 +761,8 @@ impl PaneFile {
 
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        #[cfg(not(unix))]
+        let _ = file;
         Ok(())
     }
 
@@ -787,6 +789,8 @@ impl PaneFile {
                 )));
             }
         }
+        #[cfg(not(unix))]
+        let _ = path;
         Ok(())
     }
 
