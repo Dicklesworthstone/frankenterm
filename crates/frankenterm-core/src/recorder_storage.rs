@@ -1296,8 +1296,10 @@ impl AppendLogRecorderStorage {
     /// error before tail recovery can inspect or truncate a live writer's log.
     /// A separate staging-name lease excludes writers sharing snapshot paths.
     /// Path aliases within this configuration are rejected before recovery.
-    /// This is not a security boundary for directories writable by an adversary
-    /// or a global reservation of paths used in different roles by other logs.
+    /// Role-neutral name leases also exclude cross-configuration data/state/
+    /// staging collisions. Hard-link aliases across roles remain a separate
+    /// inode-authority concern. This is not a security boundary for directories
+    /// writable by an adversary.
     pub fn open(
         mut config: AppendLogStorageConfig,
     ) -> std::result::Result<Self, RecorderStorageError> {
@@ -1310,7 +1312,10 @@ impl AppendLogRecorderStorage {
 
         // The staging-name lease also excludes distinct logs that share state
         // or whose different state extensions produce the same staging path.
-        let state_file = AppendLogStateFile::open(&config.state_path)?;
+        let path_leases = acquire_recorder_path_leases(&config)?;
+        let mut state_file = AppendLogStateFile::open(&config.state_path)?;
+        state_file.path_leases = path_leases;
+        state_file.check_lock()?;
         validate_recorder_paths(&config)?;
         let (data_dir, data_name) = recorder_parent(&config.data_path)?;
         let mut options = recorder_open_options();
@@ -3588,6 +3593,77 @@ fn recorder_state_lock_path(state_path: &Path) -> PathBuf {
     PathBuf::from(lock_path)
 }
 
+const RECORDER_PATH_LEASE_PREFIX: &str = ".ft-recorder-lease-";
+
+#[derive(Debug)]
+struct RecorderPathLease {
+    directory: CapDir,
+    name: PathBuf,
+    file: File,
+}
+
+impl RecorderPathLease {
+    fn check(&self) -> Result<(), RecorderStorageError> {
+        let named = self.directory.symlink_metadata(&self.name)?;
+        let held = CapMetadata::from_file(&self.file)?;
+        if !named.is_file()
+            || !held.is_file()
+            || recorder_link_count(&named)? != 1
+            || recorder_link_count(&held)? != 1
+            || recorder_file_identity(&named)? != recorder_file_identity(&held)?
+        {
+            return Err(invalid_recorder_path(
+                "recorder path lease identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn acquire_recorder_path_leases(
+    config: &AppendLogStorageConfig,
+) -> Result<Vec<RecorderPathLease>, RecorderStorageError> {
+    // Unix advisory locks leave independent indexer readers unaffected. Other
+    // platforms need their own qualified writer/read-sharing contract.
+    if !cfg!(unix) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "recorder path leasing is not qualified on this platform",
+        )
+        .into());
+    }
+    let mut paths = vec![
+        config.data_path.clone(),
+        config.state_path.clone(),
+        config.state_path.with_extension("tmp"),
+        recorder_state_lock_path(&config.state_path),
+    ];
+    paths.sort();
+    let mut leases = Vec::with_capacity(paths.len());
+    for path in paths {
+        let (directory, resource_name) = recorder_parent(&path)?;
+        let name = PathBuf::from(format!(
+            "{RECORDER_PATH_LEASE_PREFIX}{:x}",
+            Sha256::digest(resource_name.as_os_str().as_encoded_bytes())
+        ));
+        let mut options = recorder_open_options();
+        options.create(true).read(true).write(true);
+        let file = directory.open_with(&name, &options)?.into_std();
+        let lease = RecorderPathLease {
+            directory,
+            name,
+            file,
+        };
+        lease.check()?;
+        fs2::FileExt::try_lock_exclusive(&lease.file)?;
+        lease.check()?;
+        leases.push(lease);
+    }
+    // A failed acquisition drops every earlier descriptor. Sidecars deliberately
+    // remain: unlinking a lock name would permit a second independent inode.
+    Ok(leases)
+}
+
 /// Read-only admission. Do this before opening the log: recovery can truncate it.
 fn validate_recorder_paths(
     config: &AppendLogStorageConfig,
@@ -3601,6 +3677,14 @@ fn validate_recorder_paths(
     let mut observed = Vec::with_capacity(paths.len());
     for (role, path) in &paths {
         let canonical = resolve_recorder_path(path)?;
+        if canonical.file_name().is_some_and(|name| {
+            name.as_encoded_bytes()
+                .starts_with(RECORDER_PATH_LEASE_PREFIX.as_bytes())
+        }) {
+            return Err(invalid_recorder_path(
+                "recorder path uses reserved lease namespace",
+            ));
+        }
         let metadata = match recorder_parent(&canonical)
             .and_then(|(dir, name)| Ok(dir.metadata(name)?))
         {
@@ -3654,6 +3738,7 @@ struct AppendLogStateFile {
     temporary_name: PathBuf,
     lock_name: PathBuf,
     lock: File,
+    path_leases: Vec<RecorderPathLease>,
     #[cfg(test)]
     fail_after_rename: std::sync::atomic::AtomicBool,
 }
@@ -3683,6 +3768,7 @@ impl AppendLogStateFile {
             temporary_name,
             lock_name,
             lock,
+            path_leases: Vec::new(),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3717,6 +3803,9 @@ impl AppendLogStateFile {
 
     fn check_lock(&self) -> std::result::Result<(), RecorderStorageError> {
         self.check_directory()?;
+        for lease in &self.path_leases {
+            lease.check()?;
+        }
         let named = self.directory.symlink_metadata(&self.lock_name)?;
         let held = CapMetadata::from_file(&self.lock)?;
         if !named.is_file()
@@ -7967,6 +8056,68 @@ recorder_backend = "frankensqlite"
             let reopened = AppendLogRecorderStorage::open(config).unwrap();
             assert_eq!(reopened.health().await.latest_offset.unwrap().ordinal, 1);
         });
+    }
+
+    #[test]
+    fn role_neutral_path_leases_reject_cross_role_opens_without_mutating_owner() {
+        run_async_test(async {
+            for collision in 0..4 {
+                let root = tempdir().unwrap();
+                let config = test_config(root.path());
+                let owner = AppendLogRecorderStorage::open(config.clone()).unwrap();
+                owner
+                    .append_batch(AppendRequest {
+                        batch_id: "owner".to_string(),
+                        events: vec![sample_event("owner", 1, 0, "preserve")],
+                        required_durability: DurabilityLevel::Fsync,
+                        producer_ts_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+                let data = std::fs::read(&config.data_path).unwrap();
+                let state = std::fs::read(&config.state_path).unwrap();
+                let mut contender = AppendLogStorageConfig {
+                    data_path: root.path().join("other-events.log"),
+                    state_path: root.path().join("other-state.json"),
+                    ..config.clone()
+                };
+                match collision {
+                    0 => contender.data_path = config.state_path.clone(),
+                    1 => contender.state_path = config.data_path.clone(),
+                    2 => contender.data_path = config.state_path.with_extension("tmp"),
+                    3 => contender.data_path = recorder_state_lock_path(&config.state_path),
+                    _ => unreachable!(),
+                }
+                assert!(AppendLogRecorderStorage::open(contender).is_err());
+                assert_eq!(std::fs::read(&config.data_path).unwrap(), data);
+                assert_eq!(std::fs::read(&config.state_path).unwrap(), state);
+                owner.flush(FlushMode::Durable).await.unwrap();
+                // Failed-open rollback must release any earlier name leases.
+                let independent = AppendLogRecorderStorage::open(AppendLogStorageConfig {
+                    data_path: root.path().join("other-events.log"),
+                    state_path: root.path().join("other-state.json"),
+                    ..config.clone()
+                })
+                .unwrap();
+                drop(independent);
+                drop(owner);
+                assert!(AppendLogRecorderStorage::open(config).is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn recorder_paths_cannot_target_the_lease_namespace() {
+        let root = tempdir().unwrap();
+        let mut config = test_config(root.path());
+        config.data_path = root
+            .path()
+            .join(format!("{RECORDER_PATH_LEASE_PREFIX}reserved"));
+        assert!(matches!(
+            AppendLogRecorderStorage::open(config),
+            Err(RecorderStorageError::InvalidRequest { .. })
+        ));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
