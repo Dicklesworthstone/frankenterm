@@ -2009,7 +2009,7 @@ fn spawn_generated_output(
 ) -> bool {
     if message.len() > MAX_GENERATED_OUTPUT_MESSAGE_BYTES
         || workers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_GENERATED_OUTPUT_WORKERS).then(|| active + 1)
             })
             .is_err()
