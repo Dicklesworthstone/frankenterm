@@ -8177,9 +8177,11 @@ mod tests {
         (dir, backing, deferred)
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     struct DeferredPaneTestConfig(Arc<dyn ScrollbackSpillSink>);
 
+    #[cfg(unix)]
     impl wezterm_term::TerminalConfiguration for DeferredPaneTestConfig {
         fn color_palette(&self) -> wezterm_term::color::ColorPalette {
             wezterm_term::color::ColorPalette::default()
@@ -8302,7 +8304,7 @@ mod tests {
             assert_eq!(first, 0);
             assert_eq!(lines.len(), 271);
             for (row, line) in lines.iter().take(270).enumerate() {
-                assert_eq!(line.as_str().trim_end(), format!("row-{row:03} é 日本語"));
+                assert_eq!(line.as_str().trim_end(), format!("row-{row:03} e\u{301} 日本語"));
             }
             assert!(lines[270].as_str().trim().is_empty());
             // The actual GUI reload supplies a presentation-only TermConfig.
