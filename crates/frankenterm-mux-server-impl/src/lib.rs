@@ -3439,6 +3439,15 @@ impl LiveScrollbackSpillSink {
                         )
                     })?;
                 drop(keyring_guard);
+                if authenticated {
+                    // A previous publisher may have died with complete bytes
+                    // cached after a failed sync. Establish file durability
+                    // before following a clear or ledger-replacement authority.
+                    Self::sync_private_scrollback_stage(
+                        &manifest_path,
+                        LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+                    )?;
+                }
                 (Self::manifest_ledger_pane_id(manifest)?, authenticated)
             }
             None => (pane_id, true),
@@ -3639,6 +3648,10 @@ impl LiveScrollbackSpillSink {
                     let keyring_guard = keyring
                         .lock()
                         .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+                    Self::sync_private_scrollback_stage(
+                        &append_wal_path,
+                        LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                    )?;
                     Self::reconcile_authenticated_append_wal(
                         wal,
                         manifest,
@@ -9422,11 +9435,18 @@ mod tests {
         }
 
         let executable = std::env::current_exe().expect("current test executable");
-        for kind in ["manifest", "wal"] {
+        for kind in [
+            "manifest",
+            "wal",
+            "published_manifest",
+            "active_wal",
+            "ledger",
+            "sequence",
+        ] {
             let mut sync_ordinal = None;
             for inject_fault in [false, true] {
                 let (dir, _context, sink, wal, _appended) = append_wal_fixture(IDENTITY, 1);
-                let stage_path = if kind == "wal" {
+                let stage_path = if kind != "manifest" {
                     let path = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path)
                         .expect("WAL stage path");
                     write_complete_append_wal_fixture(&path, &wal);
@@ -9453,6 +9473,15 @@ mod tests {
                     path
                 };
                 let pane_dir = sink.manifest_path.parent().unwrap().to_path_buf();
+                let sync_path = match kind {
+                    "published_manifest" => sink.manifest_path.clone(),
+                    "active_wal" => {
+                        LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap()
+                    }
+                    "ledger" => pane_dir.join(format!("{}.log", sink.active_ledger_pane_id())),
+                    "sequence" => pane_dir.join(format!("{}.seq", sink.active_ledger_pane_id())),
+                    _ => stage_path.clone(),
+                };
                 drop(sink);
                 let pane_bytes = || {
                     std::fs::read_dir(&pane_dir)
@@ -9508,10 +9537,13 @@ mod tests {
                 );
                 let lines: Vec<_> = trace.lines().collect();
                 let stage_path = stage_path.to_str().expect("fixture path is UTF-8");
+                let sync_path = sync_path.to_str().expect("sync fixture path is UTF-8");
                 let stage_sync = lines
                     .iter()
-                    .position(|line| line.contains("fsync(") && line.contains(stage_path))
-                    .expect("the actual constructor must synchronize the retained stage file");
+                    .position(|line| {
+                        line.contains("fsync(") && line.contains(&format!("<{sync_path}>"))
+                    })
+                    .expect("the actual constructor must synchronize the retained authority file");
                 let publication = lines
                     .iter()
                     .position(|line| line.contains("rename") && line.contains(stage_path));

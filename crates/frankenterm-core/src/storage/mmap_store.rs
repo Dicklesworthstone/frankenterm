@@ -2156,6 +2156,12 @@ impl MmapScrollbackStore {
             None,
             PaneOpenPolicy::RecoverExisting,
         )?;
+        // Complete records can survive a failed append sync in the page
+        // cache. Cold recovery must reestablish durability before callers
+        // acknowledge them or publish a manifest that depends on them.
+        pane.file.sync_all()?;
+        pane.base_seq_file.sync_all()?;
+        PaneFile::sync_parent_directory(&pane.log_path)?;
         self.panes.insert(pane_id, pane);
         Ok(())
     }
@@ -3698,17 +3704,23 @@ mod tests {
             let sequence_path = dir.path().join(format!("{replacement_id}.seq"));
             // A complete-looking interrupted stage is deliberately written
             // without a durability barrier. Its retry must supply that barrier.
-            if kind == "retry" {
+            if kind == "retry" || kind == "reopen" {
                 std::fs::write(&log_path, b"first\nsecond\n").unwrap();
                 std::fs::write(&sequence_path, b"").unwrap();
             }
             let predecessor_path = dir.path().join("0.log");
             std::fs::write(&predecessor_path, b"published predecessor\n").unwrap();
-            let result =
-                store.stage_versioned_pane_replacement(replacement_id, &records, records.len(), 13);
+            let result = if kind == "reopen" {
+                store.open_existing_pane(replacement_id).map(|()| None)
+            } else {
+                store
+                    .stage_versioned_pane_replacement(replacement_id, &records, records.len(), 13)
+                    .map(Some)
+            };
             if fault == 0 {
-                let staged = result.expect("all required synchronization completed");
-                assert_eq!(staged.reused_existing(), kind == "retry");
+                if let Some(staged) = result.expect("all required synchronization completed") {
+                    assert_eq!(staged.reused_existing(), kind == "retry");
+                }
                 assert_eq!(std::fs::read(log_path).unwrap(), b"first\nsecond\n");
             } else {
                 assert!(
@@ -3728,7 +3740,7 @@ mod tests {
 
         let dir = temp_dir();
         let executable = std::env::current_exe().expect("current test binary");
-        for (kind, sync_count) in [("fresh", 6), ("retry", 3)] {
+        for (kind, sync_count) in [("fresh", 6), ("retry", 3), ("reopen", 3)] {
             for fault in 0..=sync_count {
                 let trace_path = dir.path().join(format!("{kind}-{fault}.trace"));
                 let mut command = std::process::Command::new("strace");
