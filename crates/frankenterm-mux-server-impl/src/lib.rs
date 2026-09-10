@@ -8841,10 +8841,13 @@ mod tests {
     #[test]
     fn live_scrollback_batch_corruption_is_not_a_budget_retry() {
         let (_dir, backing, _deferred) = deferred_test_sink();
-        backing
-            .lock_state("legacy corruption fixture")
-            .unwrap()
-            .initial_stable_row = Some(0);
+        {
+            let mut state = backing.lock_state("legacy corruption fixture").unwrap();
+            state.initial_stable_row = Some(0);
+            // Raw legacy ledgers have no authenticated publication manifest.
+            // Reach the decoder instead of rejecting a missing modern manifest.
+            state.authenticated_manifest = false;
+        }
         {
             let mut store = backing.lock_store("legacy corruption fixture").unwrap();
             for record in ["good", "ftsl1u:not-valid-base64", "tail"] {
@@ -8920,10 +8923,11 @@ mod tests {
                 "{prefix}{}",
                 base64::engine::general_purpose::STANDARD_NO_PAD.encode(payload)
             );
-            backing
-                .lock_state("legacy budget fixture")
-                .unwrap()
-                .initial_stable_row = Some(0);
+            {
+                let mut state = backing.lock_state("legacy budget fixture").unwrap();
+                state.initial_stable_row = Some(0);
+                state.authenticated_manifest = false;
+            }
             {
                 let mut store = backing.lock_store("legacy budget fixture").unwrap();
                 for _ in 0..3 {
