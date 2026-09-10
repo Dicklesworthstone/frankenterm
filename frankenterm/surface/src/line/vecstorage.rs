@@ -44,7 +44,10 @@ impl core::fmt::Debug for VecStorage {
 
 impl PartialEq for VecStorage {
     fn eq(&self, other: &Self) -> bool {
-        self.cells.cells == other.cells.cells
+        // Snapshot validation is normally comparing the same immutable cell
+        // allocation. All edits detach through Arc::make_mut, so this skips a
+        // full row scan without weakening equality after either side changes.
+        self.shares_cells_with(other) || self.cells.cells == other.cells.cells
     }
 }
 
@@ -254,7 +257,15 @@ mod tests {
     #[test]
     fn vec_storage_clone_eq() {
         let vs = VecStorage::new(make_cells("test"));
-        let vs2 = vs.clone();
+        let mut vs2 = vs.clone();
+        assert_eq!(vs, vs2);
+        let independent = VecStorage::new(make_cells("test"));
+        assert!(!vs.shares_cells_with(&independent));
+        assert_eq!(vs, independent);
+        vs2.set_cell(0, Cell::new('X', CellAttributes::default()), false);
+        assert!(!vs.shares_cells_with(&vs2));
+        assert_ne!(vs, vs2);
+        vs2.set_cell(0, Cell::new('t', CellAttributes::default()), false);
         assert_eq!(vs, vs2);
     }
 
