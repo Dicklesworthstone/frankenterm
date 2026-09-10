@@ -4406,24 +4406,30 @@ impl Screen {
 
         let sink = self.config.scrollback_spill_sink();
         let mut lines = Vec::with_capacity(resolved_len);
-        for stable_row in first..first + resolved_len as StableRowIndex {
+        let end = first + resolved_len as StableRowIndex;
+        let mut stable_row = first;
+        while stable_row < end {
             if let Some(phys) = self.stable_row_to_phys(stable_row) {
                 if let Some(line) = self.lines.get(phys) {
                     lines.push(line.clone());
+                    stable_row += 1;
                 } else {
                     break;
                 }
                 continue;
             }
 
-            if let Some(line) = sink
-                .as_ref()
-                .and_then(|sink| sink.load_scrollback_line(stable_row))
-            {
-                lines.push(line);
-            } else {
+            let Some(sink) = sink.as_ref() else {
+                break;
+            };
+            let cold_end = end.min(self.phys_to_stable_row_index(0));
+            let batch_end = cold_end.min(stable_row.saturating_add(32));
+            let batch = sink.load_scrollback_lines(stable_row..batch_end);
+            if batch.is_empty() || batch.len() > (batch_end - stable_row) as usize {
                 break;
             }
+            stable_row += batch.len() as StableRowIndex;
+            lines.extend(batch);
         }
 
         (first, lines)

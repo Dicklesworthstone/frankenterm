@@ -123,6 +123,12 @@ pub enum MmapStoreError {
         limit: u64,
         observed: u64,
     },
+    #[error("pane range read exceeds {limit_name} limit {limit}: observed {observed}")]
+    PaneReadLimitExceeded {
+        limit_name: &'static str,
+        limit: u64,
+        observed: u64,
+    },
     #[error(
         "pane sequence journal capacity {limit} bytes would be exceeded: attempted {attempted} bytes"
     )]
@@ -148,6 +154,47 @@ const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = PANE_BASE_SEQ_JOURNAL_MAX_BYTES
 #[cfg(test)]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
+
+fn validate_read_range(
+    range: &std::ops::Range<u64>,
+    max_rows: usize,
+) -> Result<usize, MmapStoreError> {
+    let count = range.end.saturating_sub(range.start);
+    let limit = u64::try_from(max_rows).unwrap_or(u64::MAX);
+    if count > limit {
+        return Err(MmapStoreError::PaneReadLimitExceeded {
+            limit_name: "rows",
+            limit,
+            observed: count,
+        });
+    }
+    usize::try_from(count).map_err(|_| MmapStoreError::NumericOverflow("read_rows"))
+}
+
+fn charge_read_bytes(total: u64, record_bytes: u64, limit: u64) -> Result<u64, MmapStoreError> {
+    if record_bytes > PANE_LOG_MAX_RECORD_BYTES {
+        return Err(MmapStoreError::PaneLogRecordTooLarge {
+            bytes: record_bytes,
+            max: PANE_LOG_MAX_RECORD_BYTES,
+        });
+    }
+    let observed = total
+        .checked_add(record_bytes)
+        .ok_or(MmapStoreError::NumericOverflow("read_bytes"))?;
+    if observed > limit {
+        return Err(MmapStoreError::PaneReadLimitExceeded {
+            limit_name: "stored_bytes",
+            limit,
+            observed,
+        });
+    }
+    Ok(observed)
+}
+
+/// Called only after the required record length passes both byte limits.
+fn read_record_growth_target(current: usize, required: usize, limit: usize) -> usize {
+    current.saturating_mul(2).max(required).min(limit)
+}
 
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
@@ -1259,6 +1306,110 @@ impl PaneFile {
         Ok(Some(String::from_utf8(bytes)?))
     }
 
+    fn lines_range(
+        &self,
+        range: std::ops::Range<u64>,
+        max_rows: usize,
+        max_stored_bytes: u64,
+    ) -> Result<Vec<String>, MmapStoreError> {
+        let count = validate_read_range(&range, max_rows)?;
+        if count == 0 || range.start < self.base_seq {
+            return Ok(Vec::new());
+        }
+        let first = usize::try_from(range.start - self.base_seq)
+            .map_err(|_| MmapStoreError::NumericOverflow("line_index"))?;
+        let Some(offsets) = self.line_offsets.get(first..) else {
+            return Ok(Vec::new());
+        };
+        // A cloned descriptor pins the same file, NOT an independent seek
+        // offset. The owning store must serialize this read with other users.
+        let mut reader = BufReader::new(self.file.try_clone()?);
+        let mut position = reader.stream_position()?;
+        let mut total = 0;
+        let mut lines = Vec::new();
+        // Every complete record consumes at least its newline. Bound the
+        // result slots by both budgets, without reallocating for every row.
+        lines
+            .try_reserve_exact(
+                count
+                    .min(offsets.len())
+                    .min(usize::try_from(max_stored_bytes).unwrap_or(usize::MAX)),
+            )
+            .map_err(std::io::Error::other)?;
+        for start in offsets.iter().take(count) {
+            if start.0 > self.file_len {
+                return Err(MmapStoreError::OffsetOutOfBounds {
+                    offset: start.0,
+                    len: self.file_len,
+                });
+            }
+            if position != start.0 {
+                // Interrupted appends can leave gaps between indexed rows.
+                // Sequential rows need no seek or new buffered reader.
+                reader.seek(SeekFrom::Start(start.0))?;
+                position = start.0;
+            }
+            let mut bytes = Vec::new();
+            let mut terminated = false;
+            while position < self.file_len {
+                let buffer = reader.fill_buf()?;
+                let available = usize::try_from(self.file_len - position)
+                    .unwrap_or(usize::MAX)
+                    .min(buffer.len());
+                if available == 0 {
+                    break;
+                }
+                let buffer = &buffer[..available];
+                let take = buffer
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(available, |end| end + 1);
+                let record_bytes = u64::try_from(bytes.len())
+                    .ok()
+                    .and_then(|len| len.checked_add(u64::try_from(take).ok()?))
+                    .ok_or(MmapStoreError::NumericOverflow("read_record_bytes"))?;
+                // Check before allocating/copying each chunk, including CRLF.
+                charge_read_bytes(total, record_bytes, max_stored_bytes)?;
+                let required = usize::try_from(record_bytes)
+                    .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?;
+                if required > bytes.capacity() {
+                    let limit =
+                        usize::try_from((max_stored_bytes - total).min(PANE_LOG_MAX_RECORD_BYTES))
+                            .map_err(|_| MmapStoreError::NumericOverflow("read_capacity"))?;
+                    // Geometric growth avoids copying the whole record for
+                    // every buffered chunk. Cap the requested capacity at
+                    // the remaining stored-byte budget and per-record limit.
+                    let target = read_record_growth_target(bytes.capacity(), required, limit);
+                    bytes
+                        .try_reserve_exact(target - bytes.len())
+                        .map_err(std::io::Error::other)?;
+                }
+                terminated = buffer[take - 1] == b'\n';
+                bytes.extend_from_slice(&buffer[..take]);
+                reader.consume(take);
+                position += u64::try_from(take)
+                    .map_err(|_| MmapStoreError::NumericOverflow("read_position"))?;
+                if terminated {
+                    break;
+                }
+            }
+            if !terminated {
+                break;
+            }
+            total = charge_read_bytes(
+                total,
+                u64::try_from(bytes.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?,
+                max_stored_bytes,
+            )?;
+            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                bytes.pop();
+            }
+            lines.push(String::from_utf8(bytes)?);
+        }
+        Ok(lines)
+    }
+
     fn prune_before(&mut self, seq: u64) -> Result<(), MmapStoreError> {
         if seq <= self.base_seq {
             return Ok(());
@@ -1765,6 +1916,69 @@ impl SqliteFallbackStore {
         } else {
             Ok(None)
         }
+    }
+
+    fn lines_range(
+        &self,
+        pane_id: PaneId,
+        range: std::ops::Range<u64>,
+        max_rows: usize,
+        max_stored_bytes: u64,
+    ) -> Result<Vec<String>, MmapStoreError> {
+        let count = validate_read_range(&range, max_rows)?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let pane =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let start =
+            i64::try_from(range.start).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let end = i64::try_from(range.end).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        // Keep length preflight and text reads on the same SQLite snapshot.
+        // No content column is selected until the complete prefix fits.
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut prefix_end = start;
+        let mut total = 0;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT seq, length(CAST(content AS BLOB))
+                 FROM mmap_scrollback_lines
+                 WHERE pane_id = ?1 AND seq >= ?2 AND seq < ?3
+                 ORDER BY seq",
+            )?;
+            let mut rows = statement.query(params![pane, start, end])?;
+            while let Some(row) = rows.next()? {
+                let seq: i64 = row.get(0)?;
+                if seq != prefix_end {
+                    break;
+                }
+                let bytes: i64 = row.get(1)?;
+                let stored = u64::try_from(bytes)
+                    .ok()
+                    .and_then(|bytes| bytes.checked_add(1))
+                    .ok_or(MmapStoreError::NumericOverflow("read_record_bytes"))?;
+                total = charge_read_bytes(total, stored, max_stored_bytes)?;
+                prefix_end += 1;
+            }
+        }
+        let mut lines = Vec::new();
+        if prefix_end > start {
+            let prefix_count = usize::try_from(prefix_end - start)
+                .map_err(|_| MmapStoreError::NumericOverflow("read_rows"))?;
+            lines
+                .try_reserve_exact(prefix_count)
+                .map_err(std::io::Error::other)?;
+            let mut statement = transaction.prepare(
+                "SELECT content FROM mmap_scrollback_lines
+                 WHERE pane_id = ?1 AND seq >= ?2 AND seq < ?3 ORDER BY seq",
+            )?;
+            let mut rows = statement.query(params![pane, start, prefix_end])?;
+            while let Some(row) = rows.next()? {
+                lines.push(row.get::<_, String>(0)?);
+            }
+        }
+        transaction.commit()?;
+        Ok(lines)
     }
 
     fn prune_before(&self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
@@ -2576,6 +2790,39 @@ impl MmapScrollbackStore {
         Err(MmapStoreError::UnknownPane(pane_id))
     }
 
+    /// Read a bounded contiguous prefix beginning at exactly `range.start`.
+    ///
+    /// Missing, pruned or incomplete records end the prefix; rows are never
+    /// skipped or rebased. Empty/reversed ranges return empty. Requested rows
+    /// must fit `max_rows`; stored-byte accounting includes physical delimiters
+    /// (one synthesized newline per SQLite row), before CR/LF trimming on files.
+    /// Limit errors discard the batch rather than silently returning fewer rows.
+    ///
+    /// The owner must serialize file reads with mutations and other descriptor
+    /// users: `File::try_clone` shares its seek cursor. This method pins an open
+    /// file but does not authenticate it or protect against external writers.
+    /// SQLite preflight and materialization share a single read transaction.
+    pub fn lines_range(
+        &self,
+        pane_id: PaneId,
+        range: std::ops::Range<u64>,
+        max_rows: usize,
+        max_stored_bytes: u64,
+    ) -> Result<Vec<String>, MmapStoreError> {
+        if validate_read_range(&range, max_rows)? == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.fallback_panes.contains(&pane_id)
+            && let Some(pane) = self.panes.get(&pane_id)
+        {
+            return pane.lines_range(range, max_rows, max_stored_bytes);
+        }
+        self.sqlite_fallback
+            .as_ref()
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .lines_range(pane_id, range, max_rows, max_stored_bytes)
+    }
+
     pub fn prune_before(&mut self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
         if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
             self.activate_sqlite_fallback(pane_id)?;
@@ -2811,6 +3058,209 @@ mod tests {
         let config =
             MmapStoreConfig::new(dir.to_path_buf()).with_sqlite_fallback(db_path.to_path_buf());
         MmapScrollbackStore::new(config).expect("create hybrid store")
+    }
+
+    #[test]
+    fn lines_range_real_backends_preserve_prefix_and_limits() {
+        for fallback in [false, true] {
+            let dir = temp_dir();
+            let mut store = hybrid_store(dir.path(), &dir.path().join("fallback.sqlite"));
+            if fallback {
+                store.activate_sqlite_fallback(7).unwrap();
+            }
+            for line in ["a", "é", "ccc"] {
+                store.append_line(7, line).unwrap();
+            }
+            assert_eq!(store.lines_range(7, 0..3, 3, 9).unwrap(), ["a", "é", "ccc"]);
+            assert_eq!(store.lines_range(7, 1..4, 3, 7).unwrap(), ["é", "ccc"]);
+            assert!(matches!(
+                store.lines_range(7, 0..3, 2, 100),
+                Err(MmapStoreError::PaneReadLimitExceeded {
+                    limit_name: "rows",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                store.lines_range(7, 0..3, 3, 8),
+                Err(MmapStoreError::PaneReadLimitExceeded {
+                    limit_name: "stored_bytes",
+                    ..
+                })
+            ));
+            // UTF-8 byte accounting, not SQLite's character count.
+            assert!(store.lines_range(7, 1..2, 1, 2).is_err());
+            assert!(store.lines_range(7, 3..4, 1, 0).unwrap().is_empty());
+            store.prune_before(7, 1).unwrap();
+            assert!(store.lines_range(7, 0..3, 3, 100).unwrap().is_empty());
+            assert_eq!(store.lines_range(7, 1..3, 2, 7).unwrap(), ["é", "ccc"]);
+            assert_eq!(store.line_at(7, 1).unwrap().as_deref(), Some("é"));
+        }
+    }
+
+    #[test]
+    fn lines_range_empty_and_extreme_requests_are_bounded() {
+        let dir = temp_dir();
+        let store = file_only_store(dir.path());
+        assert!(
+            store
+                .lines_range(99, u64::MAX..u64::MAX, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let reversed = std::ops::Range {
+            start: u64::MAX,
+            end: 0,
+        };
+        assert!(store.lines_range(99, reversed, 0, 0).unwrap().is_empty());
+        assert!(matches!(
+            store.lines_range(99, 0..u64::MAX, 1, 0),
+            Err(MmapStoreError::PaneReadLimitExceeded {
+                limit_name: "rows",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.lines_range(99, 0..1, 1, 10),
+            Err(MmapStoreError::UnknownPane(99))
+        ));
+    }
+
+    #[test]
+    fn lines_range_large_record_growth_is_bounded_and_geometric() {
+        let limit = 1024 * 1024 + 37;
+        let mut capacity = 0;
+        let mut growths = 0;
+        for required in (8192..limit).step_by(8192).chain([limit]) {
+            if required > capacity {
+                capacity = read_record_growth_target(capacity, required, limit);
+                growths += 1;
+            }
+            assert!(capacity >= required && capacity <= limit);
+        }
+        assert!(growths <= 10, "growth must not occur once per 8KiB chunk");
+        assert_eq!(capacity, limit);
+        assert_eq!(
+            read_record_growth_target(usize::MAX / 2 + 1, usize::MAX, usize::MAX),
+            usize::MAX
+        );
+
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let content = "x".repeat(limit - 1);
+        store.append_line(7, &content).unwrap();
+        store.append_line(7, "tail").unwrap();
+        let budget = u64::try_from(limit + 5).unwrap();
+        assert_eq!(
+            store.lines_range(7, 0..2, 2, budget).unwrap(),
+            [content, "tail".to_string()]
+        );
+        assert!(matches!(
+            store.lines_range(7, 0..2, 2, budget - 1),
+            Err(MmapStoreError::PaneReadLimitExceeded {
+                limit_name: "stored_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lines_range_file_stops_at_truncated_record_and_charges_crlf() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_line(7, "a").unwrap();
+        store.append_line(7, "bbb").unwrap();
+        let pane = store.panes.get(&7).unwrap();
+        pane.file.set_len(pane.file_len - 1).unwrap();
+        assert_eq!(store.lines_range(7, 0..2, 2, 100).unwrap(), ["a"]);
+        assert_eq!(store.line_at(7, 1).unwrap(), None);
+
+        let crlf_dir = temp_dir();
+        std::fs::write(crlf_dir.path().join("8.log"), b"a\r\nb\n").unwrap();
+        let mut store = file_only_store(crlf_dir.path());
+        store.ensure_pane(8).unwrap();
+        assert_eq!(store.lines_range(8, 0..2, 2, 5).unwrap(), ["a", "b"]);
+        assert!(matches!(
+            store.lines_range(8, 0..2, 2, 4),
+            Err(MmapStoreError::PaneReadLimitExceeded {
+                limit_name: "stored_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lines_range_sqlite_stops_at_gap_and_preflights_large_content() {
+        let dir = temp_dir();
+        let mut sqlite = SqliteFallbackStore::open(&dir.path().join("range.sqlite")).unwrap();
+        for line in ["a", "b", "c"] {
+            sqlite.append_line_auto_seq(7, line).unwrap();
+        }
+        sqlite
+            .conn
+            .execute(
+                "DELETE FROM mmap_scrollback_lines WHERE pane_id=7 AND seq=1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(sqlite.lines_range(7, 0..3, 3, 2).unwrap(), ["a"]);
+        assert!(sqlite.lines_range(7, 1..3, 2, 0).unwrap().is_empty());
+        // Oversized content is rejected by the metadata query, before the
+        // text materialization query (this BLOB would also fail String decode).
+        sqlite
+            .conn
+            .execute(
+                "INSERT INTO mmap_scrollback_lines(pane_id,seq,content) VALUES(8,0,zeroblob(?1))",
+                [PANE_LOG_MAX_RECORD_BYTES],
+            )
+            .unwrap();
+        assert!(matches!(
+            sqlite.lines_range(8, 0..1, 1, u64::MAX),
+            Err(MmapStoreError::PaneLogRecordTooLarge { .. })
+        ));
+        assert!(matches!(
+            sqlite.lines_range(7, u64::MAX - 1..u64::MAX, 1, 10),
+            Err(MmapStoreError::NumericOverflow("seq"))
+        ));
+    }
+
+    #[test]
+    fn lines_range_file_preserves_record_cap_and_invalid_utf8_errors() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_line(7, "a").unwrap();
+        let pane = store.panes.get_mut(&7).unwrap();
+        // Keep the existing index but replace the record with a physical
+        // oversize frame. A large budget must not bypass the per-record cap.
+        let mut writer = OpenOptions::new().write(true).open(&pane.log_path).unwrap();
+        writer
+            .seek(SeekFrom::Start(pane.line_offsets[0].0))
+            .unwrap();
+        let chunk = [b'x'; 8192];
+        for _ in 0..PANE_LOG_MAX_RECORD_BYTES / 8192 {
+            writer.write_all(&chunk).unwrap();
+        }
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+        pane.file_len = writer.metadata().unwrap().len();
+        assert!(matches!(
+            store.lines_range(7, 0..1, 1, u64::MAX),
+            Err(MmapStoreError::PaneLogRecordTooLarge { .. })
+        ));
+
+        let invalid_dir = temp_dir();
+        let mut store = file_only_store(invalid_dir.path());
+        store.append_line(8, "a").unwrap();
+        let pane = store.panes.get(&8).unwrap();
+        let mut writer = OpenOptions::new().write(true).open(&pane.log_path).unwrap();
+        writer
+            .seek(SeekFrom::Start(pane.line_offsets[0].0))
+            .unwrap();
+        writer.write_all(b"\xff\n").unwrap();
+        writer.flush().unwrap();
+        assert!(matches!(
+            store.lines_range(8, 0..1, 1, 2),
+            Err(MmapStoreError::InvalidPaneLogUtf8(_))
+        ));
     }
 
     fn rs_store(dir: &Path) -> MmapScrollbackStore {

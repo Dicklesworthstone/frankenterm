@@ -961,6 +961,25 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// Hydrate a previously stored stable row.
     fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line>;
 
+    /// Read a contiguous prefix beginning at exactly `rows.start`, without
+    /// rebasing or skipping missing rows. A sink may return a shorter batch
+    /// to bound decoding work; callers continue from the returned prefix.
+    /// Empty means the first requested row could not be read.
+    ///
+    /// Each call admits at most 32 rows. Storage implementations should share
+    /// publication verification and reader setup across those rows. This is
+    /// synchronous and conveys no authority to publish after a screen changes.
+    fn load_scrollback_lines(&self, rows: std::ops::Range<StableRowIndex>) -> Vec<Line> {
+        let mut lines = Vec::new();
+        for row in rows.take(32) {
+            let Some(line) = self.load_scrollback_line(row) else {
+                break;
+            };
+            lines.push(line);
+        }
+        lines
+    }
+
     /// Oldest stable row still reachable from this sink.
     fn oldest_scrollback_row(&self) -> Option<StableRowIndex>;
 

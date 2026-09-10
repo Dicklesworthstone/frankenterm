@@ -591,6 +591,76 @@ mod deferred_scrollback {
             self.state.lock().ok()?.oldest
         }
 
+        fn load_scrollback_lines(&self, rows: std::ops::Range<StableRowIndex>) -> Vec<Line> {
+            if rows.start >= rows.end {
+                return Vec::new();
+            }
+            // Pending rows are already owned and immutable. Keep them readable
+            // even while a flush is blocked on a backing filesystem lease.
+            {
+                let Ok(state) = self.state.lock() else {
+                    return Vec::new();
+                };
+                if state.oldest.is_some_and(|oldest| rows.start < oldest) {
+                    return Vec::new();
+                }
+                if let Some(first) = state
+                    .pending
+                    .iter()
+                    .position(|row| row.stable_row == rows.start)
+                {
+                    return state
+                        .pending
+                        .iter()
+                        .skip(first)
+                        .take(32)
+                        .take_while(|row| row.stable_row < rows.end)
+                        .map(|row| row.line.as_ref().clone())
+                        .collect();
+                }
+            }
+            // Freeze pending/durable transitions without holding state across
+            // storage IO. Parser admission uses try_lock and retains its rows.
+            let Ok(_operation) = self.operation.lock() else {
+                return Vec::new();
+            };
+            let (end, pending) = {
+                let Ok(state) = self.state.lock() else {
+                    return Vec::new();
+                };
+                let (Some(oldest), Some(newest)) = (state.oldest, state.newest_exclusive) else {
+                    return Vec::new();
+                };
+                if rows.start < oldest || rows.start >= newest {
+                    return Vec::new();
+                }
+                let end = rows.end.min(newest).min(rows.start.saturating_add(32));
+                let pending = state
+                    .pending
+                    .iter()
+                    .filter(|row| row.stable_row >= rows.start && row.stable_row < end)
+                    .map(|row| (row.stable_row, Arc::clone(&row.line)))
+                    .collect::<Vec<_>>();
+                (end, pending)
+            };
+            let durable_end = pending.first().map_or(end, |(row, _)| *row);
+            let mut result = if durable_end > rows.start {
+                self.backing.load_scrollback_lines(rows.start..durable_end)
+            } else {
+                Vec::new()
+            };
+            if result.len() != (durable_end - rows.start) as usize {
+                return result;
+            }
+            for (row, line) in pending {
+                if row != rows.start + result.len() as StableRowIndex {
+                    break;
+                }
+                result.push(line.as_ref().clone());
+            }
+            result
+        }
+
         fn retained_scrollback_rows(&self) -> usize {
             self.state
                 .lock()
@@ -6368,6 +6438,76 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         .map(|(line, _decoded_bytes, _fidelity)| line)
     }
 
+    fn load_scrollback_lines(
+        &self,
+        rows: std::ops::Range<wezterm_term::StableRowIndex>,
+    ) -> Vec<wezterm_term::Line> {
+        if rows.start >= rows.end {
+            return Vec::new();
+        }
+        let read = || -> anyhow::Result<Vec<wezterm_term::Line>> {
+            let _mutation_gate = self.lock_mutation_gate("load_scrollback_lines")?;
+            let _filesystem_mutation_lease =
+                self.lock_filesystem_mutation("load_scrollback_lines")?;
+            let state = *self.lock_state("load_scrollback_lines logical state")?;
+            if state.clear_manifest_published || state.transaction_quarantined {
+                return Ok(Vec::new());
+            }
+            let Some(initial) = state.initial_stable_row else {
+                return Ok(Vec::new());
+            };
+            if rows.start < initial {
+                return Ok(Vec::new());
+            }
+            let start = u64::try_from(
+                rows.start
+                    .checked_sub(initial)
+                    .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?,
+            )?;
+            let count = usize::try_from(rows.end.saturating_sub(rows.start))?.min(32);
+            let end = start
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?;
+            let ledger_pane_id = self.active_ledger_pane_id();
+            self.verify_current_published_state_before_mutation(state, ledger_pane_id, false)?;
+            // Bound serialized input independently of decoded content. Oversize
+            // batches fall back to one row after all shared guards are released.
+            let store = self.lock_store("load_scrollback_lines read")?;
+            let records = store.lines_range(ledger_pane_id, start..end, 32, 64 * 1024 * 1024)?;
+            let keyring = self.lock_keyring("load_scrollback_lines decrypt")?;
+            let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
+            let mut remaining = 32 * 1024 * 1024;
+            let mut result = Vec::with_capacity(records.len());
+            for (index, record) in records.iter().enumerate() {
+                let row = rows
+                    .start
+                    .checked_add(wezterm_term::StableRowIndex::try_from(index)?)
+                    .ok_or_else(|| anyhow::anyhow!("scrollback row overflow"))?;
+                let (line, decoded_bytes, _) = decode_persisted_scrollback_line_with_limit(
+                    record,
+                    &mut cipher_cache,
+                    self.durable_pane_id,
+                    state.content_epoch,
+                    row,
+                    start + u64::try_from(index)?,
+                    remaining.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE),
+                )?;
+                remaining = remaining
+                    .checked_sub(decoded_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("scrollback decoded byte limit exceeded"))?;
+                result.push(line);
+            }
+            Ok(result)
+        };
+        match read() {
+            Ok(lines) => lines,
+            Err(_) => {
+                metrics::counter!("mux.scrollback.batch_read_fallback").increment(1);
+                self.load_scrollback_line(rows.start).into_iter().collect()
+            }
+        }
+    }
+
     fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
         let _mutation_gate = self.lock_mutation_gate("oldest_scrollback_row").ok()?;
         let state = self.lock_state("oldest_scrollback_row initial row").ok()?;
@@ -8504,6 +8644,7 @@ mod tests {
                     reading.retained_scrollback_rows(),
                     reading.oldest_scrollback_row(),
                     reading.load_scrollback_line(0),
+                    reading.load_scrollback_lines(0..1),
                 ))
                 .unwrap();
         });
@@ -8519,11 +8660,43 @@ mod tests {
         flush.join().unwrap().unwrap();
         read.join().unwrap();
         control.join().unwrap();
-        assert_eq!(queued.unwrap(), (1, Some(0), Some(line)));
+        assert_eq!(
+            queued.unwrap(),
+            (1, Some(0), Some(line.clone()), vec![line])
+        );
         assert!(
             cold_blocked,
             "direct backing metadata is the contended negative control"
         );
+    }
+
+    #[test]
+    fn deferred_scrollback_batch_reads_cross_durable_pending_boundary_without_flushing() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let mut expected = Vec::new();
+        for row in 0..40 {
+            let line = Line::from_text(
+                &format!("batch-row-{row}"),
+                &CellAttributes::blank(),
+                0,
+                None,
+            );
+            assert!(deferred.store_scrollback_line(row, &line, 128));
+            expected.push(line);
+            if row == 15 {
+                deferred.flush_scrollback().unwrap();
+            }
+        }
+        assert_eq!(backing.retained_scrollback_rows(), 16);
+        assert_eq!(deferred.load_scrollback_lines(10..40), expected[10..40]);
+        assert_eq!(deferred.load_scrollback_lines(0..40), expected[..32]);
+        assert_eq!(backing.retained_scrollback_rows(), 16);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.load_scrollback_lines(0..40), expected[..32]);
+        assert_eq!(backing.load_scrollback_lines(32..40), expected[32..]);
+        assert!(backing.load_scrollback_lines(40..41).is_empty());
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.load_scrollback_lines(0..40).is_empty());
     }
 
     #[test]
