@@ -35,12 +35,35 @@ fn reuse_unlinked_scan_state_for_reflow() -> bool {
     })
 }
 
-/// Holds the model of a screen.  This can either be the primary screen
-/// which includes lines of scrollback text, or the alternate screen
-/// which holds no scrollback.  The intent is to have one instance of
-/// Screen for each of these things.
+/// Allocation identity for one screen coordinate generation. A cloned Screen
+/// is a distinct model, never another owner of the original authority.
+#[derive(Debug, Default)]
+struct ScreenCoordinateIdentity(Arc<()>);
+
+impl Clone for ScreenCoordinateIdentity {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// Screen-local coordinate authority only. This does not certify a retained
+/// store interval, pane registration, active-screen selection, or permission
+/// to publish a cold-read result. Those require independent validation.
+/// Configuration invalidation covers installation through Screen; interior
+/// mutation of a configuration capability requires its own revision fence.
+#[derive(Debug, Clone)]
+pub struct ScreenCoordinateWitness {
+    identity: Arc<()>,
+    rows: usize,
+    cols: usize,
+    dpi: u32,
+}
+
+/// Holds the model of a screen. This can either be the primary screen,
+/// including scrollback text, or the alternate screen without scrollback.
 #[derive(Debug, Clone)]
 pub struct Screen {
+    coordinate_identity: ScreenCoordinateIdentity,
     /// Holds the line data that comprises the screen contents.
     /// This is allocated with capacity for the entire scrollback.
     /// The last N lines are the visible lines, with those prior being
@@ -1224,6 +1247,31 @@ fn inspect_checkpoint_line(
 }
 
 impl Screen {
+    /// Capture without consulting configuration/sink callbacks or scanning
+    /// lines. Cloning the token only increments its reference count.
+    pub fn capture_coordinate_witness(&self) -> ScreenCoordinateWitness {
+        ScreenCoordinateWitness {
+            identity: Arc::clone(&self.coordinate_identity.0),
+            rows: self.physical_rows,
+            cols: self.physical_cols,
+            dpi: self.dpi,
+        }
+    }
+
+    /// Constant-time, allocation-free local check. Ordinary append and hot
+    /// eviction preserve stable coordinates, but may change interval retention;
+    /// callers must separately validate the exact requested storage interval.
+    pub fn matches_coordinate_witness(&self, witness: &ScreenCoordinateWitness) -> bool {
+        Arc::ptr_eq(&self.coordinate_identity.0, &witness.identity)
+            && self.physical_rows == witness.rows
+            && self.physical_cols == witness.cols
+            && self.dpi == witness.dpi
+    }
+
+    fn invalidate_coordinate_witnesses(&mut self) {
+        self.coordinate_identity = ScreenCoordinateIdentity::default();
+    }
+
     /// Validate and account only the resident screen model.
     ///
     /// This is intentionally non-cloning and never crosses the cold-storage
@@ -1536,6 +1584,7 @@ impl Screen {
             physical_rows,
             physical_cols,
             stable_row_index_offset: 0,
+            coordinate_identity: ScreenCoordinateIdentity::default(),
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
@@ -1574,6 +1623,7 @@ impl Screen {
         config: &Arc<dyn TerminalConfiguration>,
         resize_wrap_policy: ResizeWrapPolicy,
     ) {
+        self.invalidate_coordinate_witnesses();
         if self.resize_wrap_policy != resize_wrap_policy {
             // Width/DPI cache keys describe results under the previous policy.
             // Keep the logical content, but recompute wraps and quality evidence.
@@ -1699,6 +1749,7 @@ impl Screen {
             return Err(ScrollbackActivationError::MissingStorageCapability);
         }
 
+        let next_coordinate_identity = ScreenCoordinateIdentity::default();
         if let Some(sink) = sink {
             let (first, second) = self.lines.as_slices();
             let first_count = first.len().min(cold_prefix_line_count);
@@ -1734,6 +1785,7 @@ impl Screen {
         // The sink receipt is now verified. These operations are allocation
         // free and infallible: publish-before-remove is the activation commit
         // order, and no later step may strand the only copy of a row.
+        self.coordinate_identity = next_coordinate_identity;
         self.lines.drain(..cold_prefix_line_count);
         self.stable_row_index_offset = new_resident_oldest;
         self.scrollback_tiering.reset();
@@ -3100,6 +3152,7 @@ impl Screen {
         cursor_y: PhysRowIndex,
         seqno: SequenceNo,
     ) -> (usize, PhysRowIndex) {
+        self.invalidate_coordinate_witnesses();
         let started = Instant::now();
         let old_cols = self.physical_cols;
         let original_len = self.lines.len();
@@ -3391,6 +3444,7 @@ impl Screen {
             "resize screen to {physical_cols}x{physical_rows} dpi={}",
             size.dpi
         );
+        self.invalidate_coordinate_witnesses();
         self.retain_last_good_frame(seqno, LastGoodFrameTransition::ResizeBegin);
         let prepared =
             prepared.filter(|prepared| self.matches_reflow_preparation(prepared, size, cursor));
@@ -4024,6 +4078,9 @@ impl Screen {
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
+        if num_rows != 0 && (!scrollback_ok || !insert_at_end) {
+            self.invalidate_coordinate_witnesses();
+        }
 
         debug!(
             "scroll_up {:?} num_rows={} phys_scroll={:?}",
@@ -4218,9 +4275,11 @@ impl Screen {
         // The durable logical clear is the commit point. Keep every hot row and
         // all accounting untouched when it fails so callers can retry without
         // having created a split-brain history between memory and the sink.
+        let next_coordinate_identity = ScreenCoordinateIdentity::default();
         if let Some(sink) = self.config.scrollback_spill_sink() {
             let _commit = sink.clear_scrollback()?;
         }
+        self.coordinate_identity = next_coordinate_identity;
         self.invalidate_last_good_frame(LastGoodFrameTransition::ScrollbackErase, None);
         for _ in 0..to_clear {
             self.lines.pop_front();
@@ -4267,6 +4326,9 @@ impl Screen {
         debug!("scroll_down {:?} {}", scroll_region, num_rows);
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end.saturating_sub(phys_scroll.start));
+        if num_rows != 0 {
+            self.invalidate_coordinate_witnesses();
+        }
 
         let middle = phys_scroll.end.saturating_sub(num_rows);
 
@@ -4832,6 +4894,63 @@ mod tests {
     }
 
     #[test]
+    fn coordinate_witness_preserves_append_but_rejects_other_models() {
+        let mut screen = test_screen(3, 8, 96);
+        let witness = screen.capture_coordinate_witness();
+        assert!(screen.matches_coordinate_witness(&witness.clone()));
+        assert!(!screen.clone().matches_coordinate_witness(&witness));
+        assert!(!test_screen(3, 8, 96).matches_coordinate_witness(&witness));
+        // Includes hot retention eviction: stable coordinates of retained
+        // rows survive, but this witness deliberately does not certify retention.
+        for seq in 1..=64 {
+            screen.scroll_up(&(0..3), 1, seq, CellAttributes::blank(), bidi_mode());
+            assert!(screen.matches_coordinate_witness(&witness));
+        }
+        screen.scroll_down(&(0..3), 1, 65, CellAttributes::blank(), bidi_mode());
+        assert!(!screen.matches_coordinate_witness(&witness));
+    }
+
+    #[test]
+    fn coordinate_witness_rejects_resize_clear_and_config_aba() {
+        let mut screen = test_screen(3, 8, 96);
+        let witness = screen.capture_coordinate_witness();
+        let cursor = test_cursor(0, 0, 1);
+        let cursor = screen.resize(test_size(3, 8, 96), cursor, 1, false);
+        assert!(screen.matches_coordinate_witness(&witness));
+        let cursor = screen.resize(test_size(3, 4, 96), cursor, 2, false);
+        screen.resize(test_size(3, 8, 96), cursor, 3, false);
+        assert!(!screen.matches_coordinate_witness(&witness));
+        let witness = screen.capture_coordinate_witness();
+        screen.erase_scrollback().unwrap();
+        assert!(!screen.matches_coordinate_witness(&witness));
+        let witness = screen.capture_coordinate_witness();
+        let config = Arc::clone(&screen.config);
+        screen.set_config(&config);
+        assert!(!screen.matches_coordinate_witness(&witness));
+    }
+
+    #[test]
+    fn coordinate_witness_never_calls_sink_accessors() {
+        #[derive(Debug)]
+        struct NoSinkAccess;
+        impl TerminalConfiguration for NoSinkAccess {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+                panic!("coordinate capture/validation must not access the sink");
+            }
+        }
+        let mut screen = test_screen(3, 8, 96);
+        // Install directly to isolate the two methods under test from setup.
+        screen.config = Arc::new(NoSinkAccess);
+        let witness = screen.capture_coordinate_witness();
+        assert!(screen.matches_coordinate_witness(&witness));
+        screen.physical_cols += 1;
+        assert!(!screen.matches_coordinate_witness(&witness));
+    }
+
+    #[test]
     // The empty (`2..2`) and reversed (`2..1`) ranges are the deliberate inputs
     // under test — `stable_range` must clamp both to `0..0`. The literals trip
     // the deny-by-default `clippy::reversed_empty_ranges` correctness lint.
@@ -5235,6 +5354,7 @@ mod tests {
     fn recovery_activation_atomically_replaces_exact_prefix_before_resident_removal() {
         let generation = crate::config::ScrollbackSnapshotGeneration::new([0; 16], 0);
         let mut screen = recovered_scrollback_screen(Some(generation));
+        let coordinate_witness = screen.capture_coordinate_witness();
         let sink = Arc::new(TestColdScrollbackSink::default());
         let live_config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
             scrollback: 5,
@@ -5250,6 +5370,7 @@ mod tests {
         screen
             .activate_recovered_scrollback(&live_config)
             .expect("publish and activate exact prefix");
+        assert!(!screen.matches_coordinate_witness(&coordinate_witness));
 
         let rows = sink.rows.lock().expect("test sink mutex");
         assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![10, 11]);
@@ -7512,11 +7633,13 @@ mod tests {
         );
         let cold_rows_before = cold_sink.retained_scrollback_rows();
         cold_sink.fail_clear.store(true, Ordering::Relaxed);
+        let coordinate_witness = screen.capture_coordinate_witness();
 
         assert_eq!(
             screen.erase_scrollback(),
             Err(crate::config::ScrollbackSpillError::StorageUnavailable)
         );
+        assert!(screen.matches_coordinate_witness(&coordinate_witness));
         let lines_after: Vec<_> = screen
             .lines
             .iter()

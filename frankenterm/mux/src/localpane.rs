@@ -1171,12 +1171,11 @@ impl Pane for LocalPane {
             first: lines.start,
             lines: Vec::new(),
         };
-        terminal_with_lines_mut_and_apply_hyperlinks(
-            &mut self.locked_terminal(),
-            lines,
-            rules,
-            &mut snapshot,
-        );
+        let coordinate_witness = {
+            let mut term = self.locked_terminal();
+            terminal_with_lines_mut_and_apply_hyperlinks(&mut term, lines, rules, &mut snapshot);
+            term.screen().capture_coordinate_witness()
+        };
         // Shaping, glyph uploads and overlay callbacks must not exclude parser
         // progress or re-enter pane APIs under the terminal mutex. Hyperlinks
         // were applied to the authoritative logical lines before cloning.
@@ -1199,6 +1198,9 @@ impl Pane for LocalPane {
             return;
         };
         let screen = term.screen_mut();
+        if !screen.matches_coordinate_witness(&coordinate_witness) {
+            return;
+        }
         let physical = screen.stable_range(&(snapshot.first..end));
         if screen.phys_to_stable_row_index(physical.start) != snapshot.first {
             return;
@@ -3887,6 +3889,7 @@ mod tests {
             metadata: Arc<u32>,
             change_source: bool,
             decorate: bool,
+            clear_scrollback: bool,
             called: bool,
         }
         impl WithPaneLines for Render<'_> {
@@ -3900,6 +3903,9 @@ mod tests {
                 if self.change_source {
                     term.advance_bytes(b"\rchanged");
                 }
+                if self.clear_scrollback {
+                    term.screen_mut().erase_scrollback().unwrap();
+                }
                 if self.decorate {
                     let seqno = lines[0].current_seqno();
                     *lines[0] = Line::from_text("overlay", &Default::default(), seqno, None);
@@ -3909,7 +3915,12 @@ mod tests {
             }
         }
 
-        for (change_source, decorate) in [(false, false), (true, false), (false, true)] {
+        for (change_source, decorate, clear_scrollback) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
             let pane = LocalPane::new(
                 700,
                 guardian_lifetime_test_terminal(),
@@ -3928,6 +3939,7 @@ mod tests {
                 metadata: Arc::new(42),
                 change_source,
                 decorate,
+                clear_scrollback,
                 called: false,
             };
             pane.with_lines_mut_and_apply_hyperlinks(0..1, &[], &mut render);
@@ -3936,7 +3948,7 @@ mod tests {
             assert_eq!(lines.len(), 1);
             assert_eq!(
                 lines[0].get_appdata().is_some(),
-                !change_source && !decorate,
+                !change_source && !decorate && !clear_scrollback,
                 "only unchanged source and rendered content may retain shape metadata",
             );
             assert!(lines[0].as_str().starts_with(if change_source {
