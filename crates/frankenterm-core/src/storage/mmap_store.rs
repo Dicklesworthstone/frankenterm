@@ -3210,7 +3210,7 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO mmap_scrollback_lines(pane_id,seq,content) VALUES(8,0,zeroblob(?1))",
-                [PANE_LOG_MAX_RECORD_BYTES],
+                [i64::try_from(PANE_LOG_MAX_RECORD_BYTES).unwrap()],
             )
             .unwrap();
         assert!(matches!(
