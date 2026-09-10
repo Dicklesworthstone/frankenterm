@@ -964,7 +964,8 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// Read a contiguous prefix beginning at exactly `rows.start`, without
     /// rebasing or skipping missing rows. A sink may return a shorter batch
     /// to bound decoding work; callers continue from the returned prefix.
-    /// Empty means the first requested row could not be read.
+    /// Empty means no prefix could be returned. A storage or authentication
+    /// failure may refuse the entire batch, including any decoded prefix.
     ///
     /// Each call admits at most 32 rows. Storage implementations should share
     /// publication verification and reader setup across those rows. This is
