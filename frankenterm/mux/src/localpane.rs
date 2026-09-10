@@ -1193,7 +1193,11 @@ impl Pane for LocalPane {
         else {
             return;
         };
-        let mut term = self.locked_terminal();
+        // This is optional cache maintenance, not a terminal read. Never wait
+        // for the parser or drain staged actions after the frame is rendered.
+        let Some(mut term) = self.terminal.try_lock() else {
+            return;
+        };
         let screen = term.screen_mut();
         let physical = screen.stable_range(&(snapshot.first..end));
         if screen.phys_to_stable_row_index(physical.start) != snapshot.first {
@@ -3941,6 +3945,66 @@ mod tests {
                 "original"
             }));
         }
+    }
+
+    #[test]
+    fn native_render_snapshot_does_not_wait_for_busy_cache_writeback() {
+        struct Render {
+            start: std::sync::mpsc::Sender<()>,
+            locked: std::sync::mpsc::Receiver<()>,
+            metadata: Arc<u32>,
+        }
+        impl WithPaneLines for Render {
+            fn with_lines_mut(&mut self, _: StableRowIndex, lines: &mut [&mut Line]) {
+                assert_eq!(lines.len(), 1);
+                lines[0].set_appdata(Arc::clone(&self.metadata));
+                self.start.send(()).unwrap();
+                self.locked.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }
+        let pane = LocalPane::new(
+            700,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x70; 16],
+            "native-render-contention-test".to_string(),
+        );
+        pane.terminal.lock().advance_bytes(b"original");
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut render = Render {
+            start: start_tx,
+            locked: locked_rx,
+            metadata: Arc::new(42),
+        };
+        std::thread::scope(|scope| {
+            let pane_ref = &pane;
+            let holder = scope.spawn(move || {
+                start_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let guard = pane_ref.terminal.lock();
+                locked_tx.send(()).unwrap();
+                // The deadline bounds a regression failure: a blocking
+                // writeback can finish only after this fallback releases it.
+                let released_by_render = release_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+                drop(guard);
+                released_by_render
+            });
+            pane.with_lines_mut_and_apply_hyperlinks(0..1, &[], &mut render);
+            let _ = release_tx.send(());
+            assert!(
+                holder.join().unwrap(),
+                "render waited for optional cache writeback"
+            );
+        });
+        let (_, lines) = pane.get_lines(0..1);
+        assert!(lines[0].get_appdata().is_none());
+        assert!(lines[0].as_str().starts_with("original"));
     }
 
     #[test]
