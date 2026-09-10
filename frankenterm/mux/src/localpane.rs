@@ -1156,12 +1156,56 @@ impl Pane for LocalPane {
         rules: &[termwiz::hyperlink::Rule],
         with_lines: &mut dyn WithPaneLines,
     ) {
+        struct Snapshot {
+            first: StableRowIndex,
+            lines: Vec<Line>,
+        }
+        impl WithPaneLines for Snapshot {
+            fn with_lines_mut(&mut self, first: StableRowIndex, lines: &mut [&mut Line]) {
+                self.first = first;
+                self.lines.extend(lines.iter().map(|line| (**line).clone()));
+            }
+        }
+
+        let mut snapshot = Snapshot {
+            first: lines.start,
+            lines: Vec::new(),
+        };
         terminal_with_lines_mut_and_apply_hyperlinks(
             &mut self.locked_terminal(),
             lines,
             rules,
-            with_lines,
-        )
+            &mut snapshot,
+        );
+        // Shaping, glyph uploads and overlay callbacks must not exclude parser
+        // progress or re-enter pane APIs under the terminal mutex. Hyperlinks
+        // were applied to the authoritative logical lines before cloning.
+        let mut refs = snapshot.lines.iter_mut().collect::<Vec<_>>();
+        with_lines.with_lines_mut(snapshot.first, &mut refs);
+        drop(refs);
+
+        // Persist only renderer metadata, and only for exactly unchanged rows.
+        // A callback may decorate its copy or the parser may have changed the
+        // source while rendering. Neither can overwrite terminal content.
+        let Some(end) = StableRowIndex::try_from(snapshot.lines.len())
+            .ok()
+            .and_then(|len| snapshot.first.checked_add(len))
+        else {
+            return;
+        };
+        let mut term = self.locked_terminal();
+        let screen = term.screen_mut();
+        let physical = screen.stable_range(&(snapshot.first..end));
+        if screen.phys_to_stable_row_index(physical.start) != snapshot.first {
+            return;
+        }
+        screen.with_phys_lines(physical, |current| {
+            for (current, rendered) in current.iter().zip(&snapshot.lines) {
+                if *current == rendered {
+                    current.copy_appdata_from(rendered);
+                }
+            }
+        });
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
@@ -3830,6 +3874,73 @@ mod tests {
             Box::new(GuardianLifetimeTestOutputReader),
             Arc::new(GuardianLifetimeTestCheckpointPublisher),
         )
+    }
+
+    #[test]
+    fn native_render_snapshot_releases_terminal_and_rejects_stale_appdata() {
+        struct Render<'a> {
+            pane: &'a LocalPane,
+            metadata: Arc<u32>,
+            change_source: bool,
+            decorate: bool,
+            called: bool,
+        }
+        impl WithPaneLines for Render<'_> {
+            fn with_lines_mut(&mut self, first: StableRowIndex, lines: &mut [&mut Line]) {
+                assert_eq!(first, 0);
+                assert_eq!(lines.len(), 1);
+                let mut term =
+                    self.pane.terminal.try_lock().expect(
+                        "native rendering must release the terminal mutex before its callback",
+                    );
+                if self.change_source {
+                    term.advance_bytes(b"\rchanged");
+                }
+                if self.decorate {
+                    let seqno = lines[0].current_seqno();
+                    *lines[0] = Line::from_text("overlay", &Default::default(), seqno, None);
+                }
+                lines[0].set_appdata(Arc::clone(&self.metadata));
+                self.called = true;
+            }
+        }
+
+        for (change_source, decorate) in [(false, false), (true, false), (false, true)] {
+            let pane = LocalPane::new(
+                700,
+                guardian_lifetime_test_terminal(),
+                Box::new(KillCountingChild {
+                    kills: Arc::new(AtomicUsize::new(0)),
+                }),
+                Box::new(GuardianLifetimeTestMasterPty),
+                Box::new(Vec::<u8>::new()),
+                1,
+                [0x70; 16],
+                "native-render-snapshot-test".to_string(),
+            );
+            pane.terminal.lock().advance_bytes(b"original");
+            let mut render = Render {
+                pane: &pane,
+                metadata: Arc::new(42),
+                change_source,
+                decorate,
+                called: false,
+            };
+            pane.with_lines_mut_and_apply_hyperlinks(0..1, &[], &mut render);
+            assert!(render.called);
+            let (_, lines) = pane.get_lines(0..1);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(
+                lines[0].get_appdata().is_some(),
+                !change_source && !decorate,
+                "only unchanged source and rendered content may retain shape metadata",
+            );
+            assert!(lines[0].as_str().starts_with(if change_source {
+                "changed"
+            } else {
+                "original"
+            }));
+        }
     }
 
     #[test]
