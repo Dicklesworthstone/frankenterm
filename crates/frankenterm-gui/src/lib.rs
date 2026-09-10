@@ -1088,6 +1088,46 @@ mod selection_lifecycle_tests {
     }
 
     #[test]
+    fn static_image_shape_hash_changes_without_line_sequence_change() {
+        use std::sync::Arc;
+        use termwiz::cell::CellAttributes;
+        use termwiz::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        use termwiz::surface::Line;
+
+        let pixels = vec![1, 2, 3, 255];
+        let image = Arc::new(ImageData::with_data(ImageDataType::Rgba8 {
+            width: 1,
+            height: 1,
+            hash: ImageDataType::hash_bytes(&pixels),
+            data: pixels,
+        }));
+        let mut attrs = CellAttributes::default();
+        attrs.set_image(Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&image),
+        )));
+        let line = Line::from_text("x", &attrs, 41, None);
+        assert!(line.has_image_attachments());
+        let before = line.compute_shape_hash();
+        let seqno = line.current_seqno();
+        {
+            let mut payload = image.data_mut();
+            let ImageDataType::Rgba8 { data, .. } = &mut *payload else {
+                panic!("expected real static RGBA image");
+            };
+            data[0] = 99;
+        }
+        assert_eq!(line.current_seqno(), seqno);
+        assert!(cached_line_shape_hash_is_fresh(seqno, line.current_seqno()));
+        assert_ne!(before, line.compute_shape_hash());
+        // The negative control has no shared mutable image payload.
+        let text = Line::from_text("x", &CellAttributes::default(), 41, None);
+        assert!(!text.has_image_attachments());
+        assert_eq!(text.compute_shape_hash(), text.clone().compute_shape_hash());
+    }
+
+    #[test]
     fn cache_identity_allocation_is_sticky_at_exhaustion() {
         let mut next = u64::MAX - 1;
         assert_eq!(take_monotonic_cache_id(&mut next), Some(u64::MAX - 1));

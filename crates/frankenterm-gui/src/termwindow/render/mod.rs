@@ -69,11 +69,32 @@ pub struct CachedLineState {
     pub pane_id: PaneId,
     pub seqno: SequenceNo,
     pub shape_hash: [u8; 16],
+    // Computed only when populating this source's entry. Image payloads can
+    // change behind shared handles without changing the Line sequence.
+    pub shape_hash_cacheable: bool,
 }
 
 impl CachedLineState {
     fn belongs_to(&self, owner: &Arc<LineStateCacheOwner>, pane_id: PaneId) -> bool {
         Arc::ptr_eq(&self.owner, owner) && self.pane_id == pane_id
+    }
+
+    fn shape_hash_if_fresh(
+        &self,
+        owner: &Arc<LineStateCacheOwner>,
+        pane_id: PaneId,
+        line: &Line,
+    ) -> Option<[u8; 16]> {
+        if !self.belongs_to(owner, pane_id)
+            || !frankenterm_gui::cached_line_shape_hash_is_fresh(self.seqno, line.current_seqno())
+        {
+            return None;
+        }
+        Some(if self.shape_hash_cacheable {
+            self.shape_hash
+        } else {
+            line.compute_shape_hash()
+        })
     }
 }
 
@@ -1076,12 +1097,14 @@ impl crate::TermWindow {
         let mut id = None;
         if let Some(cached_arc) = line.get_appdata() {
             if let Some(line_state) = cached_arc.downcast_ref::<CachedLineState>() {
-                if line_state.belongs_to(&self.line_state_cache_owner, pane_id)
-                    && frankenterm_gui::cached_line_shape_hash_is_fresh(line_state.seqno, seqno)
+                if let Some(hash) =
+                    line_state.shape_hash_if_fresh(&self.line_state_cache_owner, pane_id, line)
                 {
                     // Touch the LRU
                     self.line_state_cache.borrow_mut().get(&line_state.id);
-                    return line_state.shape_hash;
+                    // Image hits keep existing metadata but compute live;
+                    // plain text hits never scan cells for attachments.
+                    return hash;
                 }
                 if line_state.belongs_to(&self.line_state_cache_owner, pane_id) {
                     id.replace(line_state.id);
@@ -1111,6 +1134,7 @@ impl crate::TermWindow {
             pane_id,
             seqno,
             shape_hash,
+            shape_hash_cacheable: !line.has_image_attachments(),
         });
 
         line.set_appdata(Arc::clone(&state));
@@ -1341,15 +1365,36 @@ mod tests {
             pane_id: 41,
             seqno: 7,
             shape_hash: [0x5a; 16],
+            shape_hash_cacheable: true,
         };
 
         assert!(state.belongs_to(&same_owner, 41));
+        let line = wezterm_term::Line::from_text("text", &Default::default(), 7, None);
+        assert_eq!(
+            state.shape_hash_if_fresh(&same_owner, 41, &line),
+            Some([0x5a; 16])
+        );
+        assert_eq!(state.shape_hash_if_fresh(&foreign_owner, 41, &line), None);
+        assert_eq!(state.shape_hash_if_fresh(&same_owner, 42, &line), None);
+        let mut image_state = CachedLineState {
+            shape_hash_cacheable: false,
+            ..state
+        };
+        assert_eq!(
+            image_state.shape_hash_if_fresh(&same_owner, 41, &line),
+            Some(line.compute_shape_hash())
+        );
+        image_state.seqno = 6;
+        assert_eq!(
+            image_state.shape_hash_if_fresh(&same_owner, 41, &line),
+            None
+        );
         assert!(
-            !state.belongs_to(&foreign_owner, 41),
+            !image_state.belongs_to(&foreign_owner, 41),
             "equal pane and numeric cache IDs from another TermWindow must not be accepted",
         );
         assert!(
-            !state.belongs_to(&same_owner, 42),
+            !image_state.belongs_to(&same_owner, 42),
             "one cache owner must still keep pane identities isolated",
         );
     }
