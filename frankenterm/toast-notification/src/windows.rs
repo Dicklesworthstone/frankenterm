@@ -69,9 +69,8 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     */
 
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
-        "com.frankenterm.gui",
-    ))?;
+    let notifier =
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from("com.frankenterm.gui"))?;
 
     notifier.Show(&notif)?;
 

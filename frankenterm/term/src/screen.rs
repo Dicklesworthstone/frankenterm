@@ -4905,6 +4905,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestColdScrollbackSink {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
+        batch_reads: AtomicU64,
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
         revision: AtomicU64,
@@ -4943,6 +4944,16 @@ mod tests {
                 .expect("test sink mutex")
                 .get(&stable_row)
                 .cloned()
+        }
+
+        fn load_scrollback_lines(&self, range: Range<StableRowIndex>) -> Vec<Line> {
+            self.batch_reads.fetch_add(1, Ordering::Relaxed);
+            let rows = self.rows.lock().expect("test sink mutex");
+            // Deliberately return short batches to exercise caller continuation.
+            range
+                .take(2)
+                .map_while(|row| rows.get(&row).cloned())
+                .collect()
         }
 
         fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
@@ -7049,10 +7060,12 @@ mod tests {
             "reachable rows should include cold sink history beyond hot memory"
         );
 
+        let batches_before = cold_sink.batch_reads.load(Ordering::Relaxed);
         let (first, lines) = screen.lines_in_stable_range(1..4);
         let texts: Vec<String> = lines.iter().map(|line| line.as_str().to_string()).collect();
         assert_eq!(first, 1);
         assert_eq!(texts, ["line-1", "line-2", "line-3"]);
+        assert!(cold_sink.batch_reads.load(Ordering::Relaxed) > batches_before);
 
         let status = screen.tiered_scrollback_status();
         assert_eq!(
