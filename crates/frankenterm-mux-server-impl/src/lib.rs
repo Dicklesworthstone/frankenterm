@@ -2106,6 +2106,97 @@ fn filesystem_metadata_changed(
 }
 
 impl LiveScrollbackSpillSink {
+    fn load_scrollback_lines_with_limits(
+        &self,
+        rows: std::ops::Range<wezterm_term::StableRowIndex>,
+        max_stored_bytes: u64,
+        max_decoded_bytes: usize,
+    ) -> anyhow::Result<Vec<wezterm_term::Line>> {
+        use frankenterm_core::storage::mmap_store::MmapStoreError;
+
+        if rows.start >= rows.end {
+            return Ok(Vec::new());
+        }
+        let _mutation_gate = self.lock_mutation_gate("load_scrollback_lines")?;
+        let _filesystem_mutation_lease = self.lock_filesystem_mutation("load_scrollback_lines")?;
+        let state = *self.lock_state("load_scrollback_lines logical state")?;
+        if state.clear_manifest_published || state.transaction_quarantined {
+            return Ok(Vec::new());
+        }
+        let Some(initial) = state.initial_stable_row else {
+            return Ok(Vec::new());
+        };
+        if rows.start < initial {
+            return Ok(Vec::new());
+        }
+        let start = u64::try_from(
+            rows.start
+                .checked_sub(initial)
+                .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?,
+        )?;
+        let mut count = usize::try_from(rows.end.saturating_sub(rows.start))?.min(32);
+        let ledger_pane_id = self.active_ledger_pane_id();
+        self.verify_current_published_state_before_mutation(state, ledger_pane_id, false)?;
+        let store = self.lock_store("load_scrollback_lines read")?;
+        // Retry only an explicitly classified aggregate stored-byte limit.
+        // All attempts share the same publication, lease and pinned store.
+        let records = loop {
+            let end = start
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?;
+            match store.lines_range(ledger_pane_id, start..end, 32, max_stored_bytes) {
+                Ok(records) => break records,
+                Err(MmapStoreError::PaneReadLimitExceeded {
+                    limit_name: "stored_bytes",
+                    ..
+                }) if count > 1 => {
+                    count /= 2;
+                    metrics::counter!("mux.scrollback.batch_stored_budget_reductions").increment(1);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let keyring = self.lock_keyring("load_scrollback_lines decrypt")?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
+        let mut remaining = max_decoded_bytes;
+        let mut result = Vec::with_capacity(records.len());
+        for (index, record) in records.iter().enumerate() {
+            let row = rows
+                .start
+                .checked_add(wezterm_term::StableRowIndex::try_from(index)?)
+                .ok_or_else(|| anyhow::anyhow!("scrollback row overflow"))?;
+            let decoded = decode_persisted_scrollback_line_with_limit(
+                record,
+                &mut cipher_cache,
+                self.durable_pane_id,
+                state.content_epoch,
+                row,
+                start + u64::try_from(index)?,
+                remaining.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE),
+            );
+            let (line, decoded_bytes, _) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error)
+                    if !result.is_empty()
+                        && error
+                            .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                            .is_some() =>
+                {
+                    // The next row remains unread, not skipped or certified.
+                    // Screen can resume exactly after this validated prefix.
+                    metrics::counter!("mux.scrollback.batch_decoded_budget_stops").increment(1);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            remaining = remaining
+                .checked_sub(decoded_bytes)
+                .ok_or_else(|| anyhow::anyhow!("scrollback decoded byte limit exceeded"))?;
+            result.push(line);
+        }
+        Ok(result)
+    }
+
     fn active_ledger_pane_id(&self) -> u64 {
         self.active_ledger_pane_id
             .load(std::sync::atomic::Ordering::Acquire)
@@ -5748,6 +5839,14 @@ fn decode_scrollback_line_record_with_limit(
     record: &str,
     max_decoded_bytes: u64,
 ) -> Option<(wezterm_term::Line, usize)> {
+    decode_scrollback_line_record_with_budget_status(record, max_decoded_bytes, &mut false)
+}
+
+fn decode_scrollback_line_record_with_budget_status(
+    record: &str,
+    max_decoded_bytes: u64,
+    budget_exceeded: &mut bool,
+) -> Option<(wezterm_term::Line, usize)> {
     let max_decoded_bytes = max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES);
     let (compressed, expected_sha256, encoded) = if let Some(record) =
         record.strip_prefix(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
@@ -5780,6 +5879,7 @@ fn decode_scrollback_line_record_with_limit(
             .checked_div(3)?
             .checked_mul(4)?;
         if u64::try_from(encoded.len()).ok()? > max_encoded_bytes {
+            *budget_exceeded = max_decoded_bytes < LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES;
             return None;
         }
     }
@@ -5788,6 +5888,7 @@ fn decode_scrollback_line_record_with_limit(
         .decode(encoded)
         .ok()?;
     if !compressed && u64::try_from(payload.len()).ok()? > max_decoded_bytes {
+        *budget_exceeded = max_decoded_bytes < LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES;
         return None;
     }
     if u64::try_from(payload.len()).ok()? > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES {
@@ -5814,6 +5915,7 @@ fn decode_scrollback_line_record_with_limit(
             .read_to_end(&mut decompressed)
             .ok()?;
         if u64::try_from(decompressed.len()).ok()? > max_decoded_bytes {
+            *budget_exceeded = max_decoded_bytes < LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES;
             return None;
         }
         decompressed
@@ -5886,6 +5988,10 @@ impl<'a> GuardianScrollbackCipherCache<'a> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("scrollback row exceeds the remaining batch decoded-byte budget")]
+struct ScrollbackDecodedBudgetExceeded;
+
 fn decode_persisted_scrollback_line_with_limit(
     record: &str,
     cipher_cache: &mut GuardianScrollbackCipherCache<'_>,
@@ -5903,9 +6009,12 @@ fn decode_persisted_scrollback_line_with_limit(
         let plaintext_bytes = usize::try_from(parsed.plaintext_bytes())
             .map_err(|_| anyhow::anyhow!("encrypted scrollback row size exceeds usize"))?;
         anyhow::ensure!(
-            plaintext_bytes <= max_decoded_bytes,
-            "encrypted scrollback row exceeds the remaining decoded-byte limit"
+            plaintext_bytes <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            "encrypted scrollback row exceeds the per-record decoded-byte limit"
         );
+        if plaintext_bytes > max_decoded_bytes {
+            return Err(ScrollbackDecodedBudgetExceeded.into());
+        }
         let stable_row = i64::try_from(stable_row)
             .map_err(|_| anyhow::anyhow!("stable row does not fit encrypted row identity"))?;
         let cipher = cipher_cache
@@ -5967,11 +6076,17 @@ fn decode_persisted_scrollback_line_with_limit(
         || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
         || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD)
     {
-        let (line, decoded_bytes) = decode_scrollback_line_record_with_limit(
+        let mut budget_exceeded = false;
+        let decoded = decode_scrollback_line_record_with_budget_status(
             record,
             u64::try_from(max_decoded_bytes).unwrap_or(u64::MAX),
-        )
-        .ok_or_else(|| anyhow::anyhow!("legacy scrollback row failed bounded decoding"))?;
+            &mut budget_exceeded,
+        );
+        if budget_exceeded {
+            return Err(ScrollbackDecodedBudgetExceeded.into());
+        }
+        let (line, decoded_bytes) = decoded
+            .ok_or_else(|| anyhow::anyhow!("legacy scrollback row failed bounded decoding"))?;
         return Ok((
             line,
             decoded_bytes,
@@ -5982,9 +6097,12 @@ fn decode_persisted_scrollback_line_with_limit(
         anyhow::bail!("scrollback row has an unrecognized reserved record prefix");
     }
     anyhow::ensure!(
-        record.len() <= max_decoded_bytes,
-        "legacy text scrollback row exceeds the remaining decoded-byte limit"
+        record.len() <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        "legacy text scrollback row exceeds the per-record decoded-byte limit"
     );
+    if record.len() > max_decoded_bytes {
+        return Err(ScrollbackDecodedBudgetExceeded.into());
+    }
     Ok((
         legacy_text_scrollback_line(record),
         record.len(),
@@ -6442,68 +6560,11 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         &self,
         rows: std::ops::Range<wezterm_term::StableRowIndex>,
     ) -> Vec<wezterm_term::Line> {
-        if rows.start >= rows.end {
-            return Vec::new();
-        }
-        let read = || -> anyhow::Result<Vec<wezterm_term::Line>> {
-            let _mutation_gate = self.lock_mutation_gate("load_scrollback_lines")?;
-            let _filesystem_mutation_lease =
-                self.lock_filesystem_mutation("load_scrollback_lines")?;
-            let state = *self.lock_state("load_scrollback_lines logical state")?;
-            if state.clear_manifest_published || state.transaction_quarantined {
-                return Ok(Vec::new());
-            }
-            let Some(initial) = state.initial_stable_row else {
-                return Ok(Vec::new());
-            };
-            if rows.start < initial {
-                return Ok(Vec::new());
-            }
-            let start = u64::try_from(
-                rows.start
-                    .checked_sub(initial)
-                    .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?,
-            )?;
-            let count = usize::try_from(rows.end.saturating_sub(rows.start))?.min(32);
-            let end = start
-                .checked_add(u64::try_from(count)?)
-                .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?;
-            let ledger_pane_id = self.active_ledger_pane_id();
-            self.verify_current_published_state_before_mutation(state, ledger_pane_id, false)?;
-            // Bound serialized input independently of decoded content. Oversize
-            // batches fall back to one row after all shared guards are released.
-            let store = self.lock_store("load_scrollback_lines read")?;
-            let records = store.lines_range(ledger_pane_id, start..end, 32, 64 * 1024 * 1024)?;
-            let keyring = self.lock_keyring("load_scrollback_lines decrypt")?;
-            let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
-            let mut remaining = 32 * 1024 * 1024;
-            let mut result = Vec::with_capacity(records.len());
-            for (index, record) in records.iter().enumerate() {
-                let row = rows
-                    .start
-                    .checked_add(wezterm_term::StableRowIndex::try_from(index)?)
-                    .ok_or_else(|| anyhow::anyhow!("scrollback row overflow"))?;
-                let (line, decoded_bytes, _) = decode_persisted_scrollback_line_with_limit(
-                    record,
-                    &mut cipher_cache,
-                    self.durable_pane_id,
-                    state.content_epoch,
-                    row,
-                    start + u64::try_from(index)?,
-                    remaining.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE),
-                )?;
-                remaining = remaining
-                    .checked_sub(decoded_bytes)
-                    .ok_or_else(|| anyhow::anyhow!("scrollback decoded byte limit exceeded"))?;
-                result.push(line);
-            }
-            Ok(result)
-        };
-        match read() {
+        match self.load_scrollback_lines_with_limits(rows, 64 * 1024 * 1024, 32 * 1024 * 1024) {
             Ok(lines) => lines,
             Err(_) => {
-                metrics::counter!("mux.scrollback.batch_read_fallback").increment(1);
-                self.load_scrollback_line(rows.start).into_iter().collect()
+                metrics::counter!("mux.scrollback.batch_read_failures").increment(1);
+                Vec::new()
             }
         }
     }
@@ -8697,6 +8758,188 @@ mod tests {
         assert!(backing.load_scrollback_lines(40..41).is_empty());
         deferred.clear_scrollback().unwrap();
         assert!(deferred.load_scrollback_lines(0..40).is_empty());
+    }
+
+    #[test]
+    fn live_scrollback_batch_budget_limits_preserve_multirow_prefix() {
+        use mux::guardian_output_journal::GuardianEncryptedScrollbackRow;
+
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let line = Line::from_text(
+            "real encrypted budget row",
+            &CellAttributes::blank(),
+            0,
+            None,
+        );
+        for row in 0..4 {
+            assert!(backing.store_scrollback_line(row, &line, 16));
+        }
+        let records = backing
+            .lock_store("budget test records")
+            .unwrap()
+            .lines_range(backing.active_ledger_pane_id(), 0..4, 4, 64 * 1024 * 1024)
+            .unwrap();
+        let stored_budget = records[..2]
+            .iter()
+            .map(|record| u64::try_from(record.len()).unwrap() + 1)
+            .sum();
+        let decoded_budget = records[..2]
+            .iter()
+            .map(|record| {
+                usize::try_from(
+                    GuardianEncryptedScrollbackRow::parse(record)
+                        .unwrap()
+                        .plaintext_bytes(),
+                )
+                .unwrap()
+            })
+            .sum();
+        assert_eq!(
+            backing
+                .load_scrollback_lines_with_limits(0..4, stored_budget, usize::MAX)
+                .unwrap(),
+            vec![line.clone(), line.clone()],
+            "stored-byte halving must make more than single-row progress"
+        );
+        assert_eq!(
+            backing
+                .load_scrollback_lines_with_limits(0..4, u64::MAX, decoded_budget)
+                .unwrap(),
+            vec![line.clone(), line.clone()],
+            "retain decoded prefix instead of discarding and rereading its first row"
+        );
+        assert_eq!(
+            backing
+                .load_scrollback_lines_with_limits(2..4, u64::MAX, decoded_budget)
+                .unwrap(),
+            vec![line.clone(), line.clone()],
+            "caller resumes at the exact first unread row"
+        );
+        assert!(
+            backing
+                .load_scrollback_lines_with_limits(0..1, 0, usize::MAX)
+                .is_err()
+        );
+        let error = backing
+            .load_scrollback_lines_with_limits(0..1, u64::MAX, 0)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                .is_some()
+        );
+        assert_eq!(backing.load_scrollback_lines(0..4), vec![line; 4]);
+        backing.clear_scrollback().unwrap();
+        assert!(
+            backing
+                .load_scrollback_lines_with_limits(0..4, u64::MAX, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_scrollback_batch_corruption_is_not_a_budget_retry() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        backing
+            .lock_state("legacy corruption fixture")
+            .unwrap()
+            .initial_stable_row = Some(0);
+        {
+            let mut store = backing.lock_store("legacy corruption fixture").unwrap();
+            for record in ["good", "ftsl1u:not-valid-base64", "tail"] {
+                store
+                    .append_line(backing.active_ledger_pane_id(), record)
+                    .unwrap();
+            }
+        }
+        for rows in [0..3, 1..3] {
+            let error = backing
+                .load_scrollback_lines_with_limits(rows.clone(), u64::MAX, usize::MAX)
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                    .is_none()
+            );
+            assert!(backing.load_scrollback_lines(rows).is_empty());
+        }
+        // A decoded prefix remains resumable, but does not certify the next
+        // record. Corruption at that next position still fails without skipping.
+        assert_eq!(
+            backing
+                .load_scrollback_lines_with_limits(0..1, u64::MAX, 4)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            backing
+                .load_scrollback_lines_with_limits(1..3, u64::MAX, 4)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_scrollback_batch_manifest_failure_is_not_a_budget_retry() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let line = Line::from_text("manifest-bound", &CellAttributes::blank(), 0, None);
+        assert!(backing.store_scrollback_line(0, &line, 16));
+        std::fs::write(&backing.manifest_path, b"not a manifest").unwrap();
+        let error = backing
+            .load_scrollback_lines_with_limits(0..1, u64::MAX, usize::MAX)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                .is_none()
+        );
+        assert!(backing.load_scrollback_lines(0..1).is_empty());
+    }
+
+    #[test]
+    fn live_scrollback_batch_legacy_budget_stops_preserve_prefix() {
+        for compressed in [false, true] {
+            let (_dir, backing, _deferred) = deferred_test_sink();
+            let line = Line::from_text(&"x".repeat(4096), &CellAttributes::blank(), 0, None);
+            let serialized = varbincode::serialize(&line).unwrap();
+            let decoded_budget = serialized.len() * 2;
+            let (prefix, payload) = if compressed {
+                (
+                    LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD,
+                    zstd::stream::encode_all(
+                        serialized.as_slice(),
+                        zstd::DEFAULT_COMPRESSION_LEVEL,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                (LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED, serialized)
+            };
+            let record = format!(
+                "{prefix}{}",
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(payload)
+            );
+            backing
+                .lock_state("legacy budget fixture")
+                .unwrap()
+                .initial_stable_row = Some(0);
+            {
+                let mut store = backing.lock_store("legacy budget fixture").unwrap();
+                for _ in 0..3 {
+                    store
+                        .append_line(backing.active_ledger_pane_id(), &record)
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                backing
+                    .load_scrollback_lines_with_limits(0..3, u64::MAX, decoded_budget)
+                    .unwrap(),
+                vec![line.clone(), line.clone()]
+            );
+            assert_eq!(backing.load_scrollback_lines(2..3), vec![line]);
+        }
     }
 
     #[test]
