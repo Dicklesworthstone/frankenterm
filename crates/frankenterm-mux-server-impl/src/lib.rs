@@ -6416,7 +6416,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if stable_row < initial {
             return None;
         }
-        let seq = u64::try_from(stable_row - initial).ok()?;
+        let seq = u64::try_from(stable_row.checked_sub(initial)?).ok()?;
         let record = self
             .lock_store("load_scrollback_line read")
             .ok()?
