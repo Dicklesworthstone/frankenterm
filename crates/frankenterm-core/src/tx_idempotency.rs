@@ -1856,6 +1856,47 @@ struct ExecutionLedgerLock {
     _lock_file: File,
 }
 
+// A fork/dup can retain the same open file description after this guard's
+// descriptor closes. Explicitly unlock at the end of logical ownership so
+// unrelated child startup cannot extend a durable mutation lease. The shared
+// proof barrier is released only when its final Arc owner drops.
+fn release_owned_advisory_lock(file: &File, kind: &'static str) {
+    if let Err(error) = FileExt::unlock(file) {
+        metrics::counter!("tx.idempotency.lock_release_errors", "kind" => kind).increment(1);
+        tracing::error!(lock_kind = kind, error_kind = ?error.kind(), "durable lock release failed; descriptor close remains the fallback");
+    }
+}
+
+impl Drop for ExecutionLedgerLock {
+    fn drop(&mut self) {
+        release_owned_advisory_lock(&self._lock_file, "execution");
+    }
+}
+
+impl Drop for DurableKeyLockGuard {
+    fn drop(&mut self) {
+        release_owned_advisory_lock(&self._lock_file, "key");
+    }
+}
+
+impl Drop for ProofBarrierGuard {
+    fn drop(&mut self) {
+        release_owned_advisory_lock(&self._lock_file, "proof_barrier");
+    }
+}
+
+impl Drop for DurablePlanLockGuard {
+    fn drop(&mut self) {
+        release_owned_advisory_lock(&self._lock_file, "plan");
+    }
+}
+
+impl Drop for DurableSpoolCatalogLockGuard {
+    fn drop(&mut self) {
+        release_owned_advisory_lock(&self._lock_file, "spool_catalog");
+    }
+}
+
 /// A verified durable ledger together with the exact filesystem object that
 /// supplied its bytes. Keeping the handle alive until publication prevents
 /// inode reuse from making a different leaf look like the ledger that the
@@ -2137,14 +2178,9 @@ fn validate_open_regular_file(
 }
 
 /// ft-0eby0: try an advisory-lock acquisition with a short bounded grace
-/// window before reporting contention. Lease release is fd-close based
-/// (the guards have no explicit unlock; the flock drops when the last
-/// duplicated fd closes), and that close can lag the LOGICAL completion
-/// of the releasing operation — guards drop on blocking-pool threads,
-/// and any concurrently forked child holds duplicated fds until its
-/// exec. A genuine holder persists far beyond this ~40 ms window, so
-/// fail-closed contention semantics (and every contention test) are
-/// preserved; only sub-window false positives are absorbed.
+/// window before reporting contention. Guards explicitly unlock at the end of
+/// logical ownership; this grace is only for a live owner that is completing
+/// concurrently. It does not substitute for releasing inherited descriptors.
 fn try_lock_with_grace<F>(mut attempt: F) -> std::io::Result<()>
 where
     F: FnMut() -> std::io::Result<()>,
@@ -2882,7 +2918,8 @@ impl IdempotencyStore {
             &lock_name,
             &lock_file,
             &lock_display,
-        )?;
+        )
+        .inspect_err(|_| release_owned_advisory_lock(&lock_file, "execution"))?;
         Ok(ExecutionLedgerLock {
             execution_id: execution_id.to_string(),
             spool_dir: Arc::clone(&spool.dir),
@@ -3339,7 +3376,8 @@ impl IdempotencyStore {
                 });
             }
         }
-        validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)
+            .inspect_err(|_| release_owned_advisory_lock(&lock_file, "spool_catalog"))?;
         Ok(DurableSpoolCatalogLockGuard {
             _lock_dir: Arc::clone(&spool.plan_lock_dir),
             _lock_name: lock_name,
@@ -3449,7 +3487,8 @@ impl IdempotencyStore {
                 });
             }
         }
-        validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        validate_pinned_file_entry(&spool.plan_lock_dir, &lock_name, &lock_file, &lock_display)
+            .inspect_err(|_| release_owned_advisory_lock(&lock_file, "plan"))?;
         Ok(DurablePlanLockGuard {
             _lock_dir: Arc::clone(&spool.plan_lock_dir),
             _lock_name: lock_name,
@@ -3575,7 +3614,8 @@ impl IdempotencyStore {
                 });
             }
         }
-        validate_pinned_file_entry(&spool.key_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        validate_pinned_file_entry(&spool.key_lock_dir, &lock_name, &lock_file, &lock_display)
+            .inspect_err(|_| release_owned_advisory_lock(&lock_file, "proof_barrier"))?;
         Ok(Arc::new(ProofBarrierGuard {
             plan_id: plan_id.to_string(),
             mode,
@@ -3635,7 +3675,8 @@ impl IdempotencyStore {
                 });
             }
         }
-        validate_pinned_file_entry(&spool.key_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        validate_pinned_file_entry(&spool.key_lock_dir, &lock_name, &lock_file, &lock_display)
+            .inspect_err(|_| release_owned_advisory_lock(&lock_file, "key"))?;
         Ok(DurableKeyLockGuard {
             lock_dir: Arc::clone(&spool.key_lock_dir),
             lock_name,
@@ -5052,6 +5093,93 @@ mod tests {
 
     #[cfg(not(windows))]
     static DURABLE_TEST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_ledger_locks_release_with_duplicate_descriptors_alive() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::open(workspace.path(), IdempotencyPolicy::default()).unwrap();
+
+        // Causal negative: fd-close alone retains the lock through a duplicate,
+        // exactly as an unrelated fork does before exec closes inherited fds.
+        let raw_path = workspace.path().join("close-only.lock");
+        let raw = File::create(&raw_path).unwrap();
+        FileExt::try_lock_exclusive(&raw).unwrap();
+        let duplicate = raw.try_clone().unwrap();
+        let contender = File::options()
+            .read(true)
+            .write(true)
+            .open(&raw_path)
+            .unwrap();
+        drop(raw);
+        assert_eq!(
+            FileExt::try_lock_exclusive(&contender).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        FileExt::unlock(&duplicate).unwrap();
+        FileExt::try_lock_exclusive(&contender).unwrap();
+        FileExt::unlock(&contender).unwrap();
+
+        let guard = store
+            .acquire_execution_lock("txe-duplicate-descriptor")
+            .unwrap();
+        let duplicate_execution = guard._lock_file.try_clone().unwrap();
+        assert!(matches!(
+            store.acquire_execution_lock("txe-duplicate-descriptor"),
+            Err(IdempotencyError::ExecutionMutationInProgress { .. })
+        ));
+        drop(guard);
+        drop(
+            store
+                .acquire_execution_lock("txe-duplicate-descriptor")
+                .expect("logical release must not wait for inherited fd"),
+        );
+
+        let guard = store.acquire_spool_catalog_lock().unwrap();
+        let duplicate_catalog = guard._lock_file.try_clone().unwrap();
+        drop(guard);
+        drop(store.acquire_spool_catalog_lock().unwrap());
+
+        let guard = store.acquire_plan_catalog_lock("plan", 1).unwrap();
+        let duplicate_plan = guard._lock_file.try_clone().unwrap();
+        drop(guard);
+        drop(store.acquire_plan_catalog_lock("plan", 1).unwrap());
+
+        let guard = store
+            .acquire_plan_proof_barrier("plan", ProofBarrierMode::Exclusive)
+            .unwrap();
+        let duplicate_barrier = guard._lock_file.try_clone().unwrap();
+        let logical_owner = Arc::clone(&guard);
+        drop(guard);
+        assert!(
+            store
+                .acquire_plan_proof_barrier("plan", ProofBarrierMode::Shared)
+                .is_err(),
+            "an actual remaining Arc owner must retain the barrier"
+        );
+        drop(logical_owner);
+        drop(
+            store
+                .acquire_plan_proof_barrier("plan", ProofBarrierMode::Exclusive)
+                .unwrap(),
+        );
+
+        let key = IdempotencyKey::new("plan", "step", "action");
+        let guard = store.acquire_durable_key_lock(&key).unwrap();
+        let duplicate_key = guard._lock_file.try_clone().unwrap();
+        drop(guard);
+        drop(store.acquire_durable_key_lock(&key).unwrap());
+
+        // Keep every duplicate alive through all successor acquisitions.
+        drop((
+            duplicate,
+            duplicate_execution,
+            duplicate_catalog,
+            duplicate_plan,
+            duplicate_barrier,
+            duplicate_key,
+        ));
+    }
 
     #[cfg(not(windows))]
     #[test]
