@@ -17,6 +17,9 @@ crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &lin
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
+# ft-8r43i: persisted_state_staging_alias_rejection_preserves_published_state
+# is #[cfg(unix)]; the symlink is beyond the bounded source lookback.
+crates/frankenterm-core/src/recorder_storage.rs	std::os::unix::fs::symlink(&victim, &staging).unwrap();
 crates/frankenterm-core/src/scrollback_mmap_writer.rs	use std::os::unix::fs::PermissionsExt as _;
 # ft-xxfwy.48: inside #[cfg(unix)] mission_store_late_leaf_attack_refuses_and_releases_lock_registry;
 # the function-level gate precedes this closure by more than the eight-line lookback.
