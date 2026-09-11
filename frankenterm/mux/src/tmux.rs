@@ -14036,6 +14036,17 @@ mod tests {
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("register atomic split tmux domain");
+        // These tests exercise cleanup ordering, not the production 500ms
+        // worker-start deadline. Keep transport admission alive for the same
+        // bounded five seconds that wait_until allows the observed write;
+        // otherwise a busy test worker can terminalize the domain before the
+        // ordering assertion runs. Deadline tests below install shorter,
+        // explicit per-domain limits and still exercise timeout behavior.
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(5),
+            write: Duration::from_secs(5),
+            response: Duration::from_secs(10),
+        });
         *tmux_domain.inner.state.lock() = State::Idle;
         (guard, tmux_domain, launcher)
     }

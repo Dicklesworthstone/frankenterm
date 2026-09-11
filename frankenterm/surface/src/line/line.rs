@@ -1758,6 +1758,11 @@ impl Line {
         self.update_last_change_seqno(seqno);
         if let CellStorage::C(cl) = &mut self.cells {
             if cl.len() == 0 {
+                if !wrapped {
+                    // Clearing an absent boundary must not materialize a
+                    // phantom space in an otherwise empty logical line.
+                    return;
+                }
                 // Need to mark that implicit space as wrapped, so
                 // explicitly add it
                 cl.append(Cell::blank());
@@ -2661,6 +2666,11 @@ mod tests {
 
     #[test]
     fn clustered_tail_wrap_matches_visible_cells_without_scanning_text() {
+        let mut empty = Line::new(1);
+        empty.compress_for_scrollback();
+        empty.set_last_cell_was_wrapped(false, 2);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.as_str(), "");
         for text in ["", "plain", "ab界", "e\u{301}🦀", &"x".repeat(131_072)] {
             let mut line = Line::from_text(text, &CellAttributes::blank(), 1, None);
             line.compress_for_scrollback();

@@ -364,6 +364,10 @@ impl ColdSeamReflow {
             serde_json::to_writer(&mut charge, line)?;
         }
         let replacement_resident = wrapped.split_off(wrapped.len() - self.resident.len());
+        anyhow::ensure!(
+            !wrapped.is_empty(),
+            "cold seam requires zero-cell continuation support"
+        );
         let mut prefix = wrapped.first().cloned().unwrap_or_else(|| Line::new(seqno));
         prefix.set_last_cell_was_wrapped(false, seqno);
         for line in wrapped.iter().skip(1) {
@@ -444,6 +448,196 @@ impl ColdSeamReflow {
 impl ScreenLineRead {
     pub const MAX_ROWS: usize = 16_384;
     pub const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_INDEX_SOURCE_ROWS: usize = 1_000_000;
+    const MAX_INDEX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_INDEX_SOURCE_BYTES: usize = 512 * 1024 * 1024;
+    const MAX_INDEX_CELL_VISITS: usize = 64 * 1024 * 1024;
+
+    /// Scan a large prefix without retaining its decoded rows. A completed
+    /// logical group is wrapped, reduced to coordinate metadata, and retired
+    /// before the next group. Viewport cells are hydrated separately after
+    /// the final visual origin is known.
+    fn streamed_cold_layout(
+        &self,
+        limit: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> anyhow::Result<(Arc<ColdVisualLayout>, usize)> {
+        let (sink, interval) = self
+            .cold
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cold index source unavailable"))?;
+        let retained = interval
+            .rows()
+            .ok_or_else(|| anyhow::anyhow!("cold index source unavailable"))?;
+        let exhausted = || {
+            self.index_budget_exhausted
+                .store(true, std::sync::atomic::Ordering::Release)
+        };
+        if self.hot_top.saturating_sub(retained.start) as usize > Self::MAX_INDEX_SOURCE_ROWS {
+            exhausted();
+            anyhow::bail!("cold index source row work limit");
+        }
+        let aligned_seam = self.fragments.as_ref().is_some_and(|fragments| {
+            fragments.alignment_retained(interval)
+                && fragments.aligned_at(
+                    self.hot_top,
+                    self.witness.cols,
+                    self.witness.dpi,
+                    self.wrap_policy,
+                )
+        });
+        let metadata_limit = limit.min(Self::MAX_INDEX_METADATA_BYTES);
+        let header_bytes =
+            std::mem::size_of::<ColdVisualLayout>() + 2 * std::mem::size_of::<usize>();
+        let entry_bytes = std::mem::size_of::<(Range<StableRowIndex>, Range<StableRowIndex>)>();
+        let maximum_entries = metadata_limit.saturating_sub(header_bytes) / entry_bytes;
+        let mut groups = Vec::new();
+        let mut row = retained.start;
+        let mut group_start = row;
+        let mut logical: Option<Line> = None;
+        let mut group_rows = 0usize;
+        let mut group_cells = 0usize;
+        let mut source_bytes = 0usize;
+        let mut cell_visits = 0usize;
+        let mut visual_rows: StableRowIndex = 0;
+        let mut source_end = self.hot_top;
+        let mut charge = ColdReadCharge {
+            used: 0,
+            limit,
+            index_failure: Some(Arc::clone(&self.index_budget_exhausted)),
+        };
+        while row < self.hot_top {
+            anyhow::ensure!(!cancelled(), "cold index cancelled");
+            let end = self.hot_top.min(row.saturating_add(32));
+            let batch = sink.load_scrollback_lines(row..end);
+            anyhow::ensure!(
+                !batch.is_empty() && batch.len() <= (end - row) as usize,
+                "cold index missing rows"
+            );
+            for original in batch {
+                anyhow::ensure!(!cancelled(), "cold index cancelled");
+                let before_bytes = charge.used;
+                serde_json::to_writer(&mut charge, &original)?;
+                let mut line = cold_row_with_fragment(self.fragments.as_deref(), row, original);
+                if self.fragments.is_some() {
+                    serde_json::to_writer(&mut charge, &line)?;
+                }
+                source_bytes = source_bytes
+                    .checked_add(charge.used - before_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("cold index source byte overflow"))?;
+                group_cells = group_cells
+                    .checked_add(line.len())
+                    .ok_or_else(|| anyhow::anyhow!("cold index group cell overflow"))?;
+                cell_visits = cell_visits
+                    .checked_add(line.len().max(1))
+                    .ok_or_else(|| anyhow::anyhow!("cold index cell work overflow"))?;
+                group_rows += 1;
+                if source_bytes > Self::MAX_INDEX_SOURCE_BYTES
+                    || cell_visits > Self::MAX_INDEX_CELL_VISITS
+                    || group_rows > Self::MAX_ROWS
+                    || group_cells > charge.limit / std::mem::size_of::<Cell>()
+                {
+                    exhausted();
+                    anyhow::bail!("cold index group or job work limit");
+                }
+                let wrapped = line.last_cell_was_wrapped();
+                let seqno = line.current_seqno();
+                line.set_last_cell_was_wrapped(false, seqno);
+                if let Some(logical) = &mut logical {
+                    logical.append_line(line, logical.current_seqno().max(seqno));
+                } else {
+                    logical = Some(line);
+                }
+                row += 1;
+                if wrapped && !(row == self.hot_top && aligned_seam) {
+                    continue;
+                }
+                let logical = logical
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("cold index empty group"))?;
+                if logical.len().div_ceil(self.witness.cols.max(1)) > Self::MAX_ROWS {
+                    exhausted();
+                    anyhow::bail!("cold index group output row limit");
+                }
+                let seqno = logical.current_seqno();
+                let wrapped = Screen::wrap_cold_logical_line(
+                    logical,
+                    self.witness.cols,
+                    seqno,
+                    self.wrap_policy,
+                    row == self.hot_top && aligned_seam,
+                );
+                if wrapped.len() > Self::MAX_ROWS {
+                    exhausted();
+                    anyhow::bail!("cold index group output row limit");
+                }
+                let next_visual = visual_rows
+                    .checked_add(StableRowIndex::try_from(wrapped.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("cold index visual coordinate overflow"))?;
+                drop(wrapped);
+                if groups.len() == groups.capacity() {
+                    let next_capacity = groups
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(64)
+                        .min(maximum_entries);
+                    if next_capacity <= groups.len() {
+                        exhausted();
+                        anyhow::bail!("cold index metadata limit");
+                    }
+                    groups.try_reserve_exact(next_capacity - groups.len())?;
+                }
+                groups.push((group_start..row, visual_rows..next_visual));
+                visual_rows = next_visual;
+                group_start = row;
+                group_rows = 0;
+                group_cells = 0;
+                charge.used = 0;
+                charge.limit = limit
+                    .checked_sub(header_bytes + groups.capacity() * entry_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("cold index metadata limit"))?;
+            }
+        }
+        if logical.is_some() {
+            source_end = group_start;
+            anyhow::ensure!(self.end <= source_end, ColdReadGeometryUnavailable);
+        }
+        let visual_first = source_end
+            .checked_sub(visual_rows)
+            .ok_or_else(|| anyhow::anyhow!("cold index visual origin overflow"))?;
+        for (_, visual) in &mut groups {
+            anyhow::ensure!(!cancelled(), "cold index cancelled");
+            visual.start = visual
+                .start
+                .checked_add(visual_first)
+                .ok_or_else(|| anyhow::anyhow!("cold index visual coordinate overflow"))?;
+            visual.end = visual
+                .end
+                .checked_add(visual_first)
+                .ok_or_else(|| anyhow::anyhow!("cold index visual coordinate overflow"))?;
+        }
+        let metadata_bytes = groups
+            .capacity()
+            .checked_mul(entry_bytes)
+            .and_then(|bytes| bytes.checked_add(header_bytes))
+            .ok_or_else(|| anyhow::anyhow!("cold index metadata overflow"))?;
+        if metadata_bytes > metadata_limit {
+            exhausted();
+            anyhow::bail!("cold index metadata limit");
+        }
+        anyhow::ensure!(!cancelled(), "cold index cancelled");
+        Ok((
+            Arc::new(ColdVisualLayout {
+                source: retained.start..source_end,
+                visual: visual_first..source_end,
+                resident_frontier: self.hot_top,
+                groups,
+                witness: self.witness.clone(),
+                interval: interval.clone(),
+            }),
+            metadata_bytes,
+        ))
+    }
 
     pub fn first_row(&self) -> StableRowIndex {
         self.first
@@ -526,6 +720,25 @@ impl ScreenLineRead {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!self.complete, "line read already hydrated");
         anyhow::ensure!(limit <= Self::MAX_PAYLOAD_BYTES, "line read payload limit");
+        if self.layout.is_none()
+            && self.attempted_index
+            && self.first < self.resident_first
+            && self
+                .cold
+                .as_ref()
+                .and_then(|(_, interval)| interval.rows())
+                .is_some_and(|rows| {
+                    self.hot_top.saturating_sub(rows.start) as usize > Self::MAX_ROWS
+                })
+        {
+            let (layout, metadata_bytes) = self.streamed_cold_layout(limit, &cancelled)?;
+            self.first = self.first.max(layout.visual.start);
+            self.end = self.end.max(self.first);
+            self.layout = Some(layout);
+            let mut ready = self.hydrate_with_payload_limit(limit - metadata_bytes, cancelled)?;
+            ready.payload_bytes += metadata_bytes;
+            return Ok(ready);
+        }
         let mut charge = ColdReadCharge {
             used: 0,
             limit,
@@ -585,10 +798,13 @@ impl ScreenLineRead {
             let mut visible = Vec::new();
             let mut context_first = None;
             let mut expanded_cells = 0usize;
-            for (source, visual) in &layout.groups {
-                if visual.end <= self.first || visual.start >= self.resident_first {
-                    continue;
-                }
+            let first_group = layout
+                .groups
+                .partition_point(|(_, visual)| visual.end <= self.first);
+            let end_group = layout
+                .groups
+                .partition_point(|(_, visual)| visual.start < self.resident_first);
+            for (source, visual) in &layout.groups[first_group..end_group.max(first_group)] {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
                 let mut source_row = source.start;
                 let mut logical: Option<Line> = None;
@@ -2473,10 +2689,11 @@ impl Screen {
                     .as_ref()
                     .zip(self.current_cold_visual_layout())
                     .is_some_and(|(before, now)| {
-                        before.source.start == now.source.start
-                            && before.visual.start == now.visual.start
-                            && (before.groups.starts_with(&now.groups)
-                                || now.groups.starts_with(&before.groups))
+                        std::ptr::eq(before.as_ref(), now)
+                            || (before.source.start == now.source.start
+                                && before.visual.start == now.visual.start
+                                && (before.groups.starts_with(&now.groups)
+                                    || now.groups.starts_with(&before.groups)))
                     });
                 if !compatible {
                     return false;
@@ -2537,6 +2754,9 @@ impl Screen {
     pub fn line_read_changes_layout(&self, read: &ScreenLineRead) -> bool {
         read.layout.as_ref().is_some_and(|next| {
             self.current_cold_visual_layout().is_none_or(|current| {
+                if std::ptr::eq(next.as_ref(), current) {
+                    return false;
+                }
                 // Extending an unchanged prefix with already-current-width
                 // rows does not invalidate older visual coordinates.
                 current.source.start != next.source.start
@@ -2590,10 +2810,11 @@ impl Screen {
     pub fn install_line_read_layout(&mut self, read: &ScreenLineRead, seqno: SequenceNo) {
         if let Some(layout) = &read.layout {
             if self.current_cold_visual_layout().is_some_and(|current| {
-                current.source.start == layout.source.start
-                    && current.visual.start == layout.visual.start
-                    && current.source.end >= layout.source.end
-                    && current.groups.starts_with(&layout.groups)
+                std::ptr::eq(layout.as_ref(), current)
+                    || (current.source.start == layout.source.start
+                        && current.visual.start == layout.visual.start
+                        && current.source.end >= layout.source.end
+                        && current.groups.starts_with(&layout.groups))
             }) {
                 return;
             }
@@ -5979,7 +6200,55 @@ impl Screen {
         }
 
         let requested_len = stable_range.end.saturating_sub(stable_range.start) as usize;
-        let oldest = self.oldest_reachable_stable_row();
+        let sink = self.config.scrollback_spill_sink();
+        // This is the synchronous semantic API, not the paint/dimensions
+        // probe. Metadata contention must not silently rebase persisted text
+        // onto the resident frontier.
+        let source_oldest = sink
+            .as_ref()
+            .and_then(|sink| sink.oldest_scrollback_row())
+            .unwrap_or_else(|| self.phys_to_stable_row_index(0))
+            .min(self.phys_to_stable_row_index(0));
+        #[cfg(feature = "use_serde")]
+        let interval = if self.cold_visual_layout.is_some() || self.cold_row_fragments.is_some() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match sink
+                    .as_ref()
+                    .map(|sink| sink.try_capture_scrollback_interval())
+                {
+                    Some(crate::config::ScrollbackIntervalCapture::Ready(now)) => break Some(now),
+                    Some(crate::config::ScrollbackIntervalCapture::Busy)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    _ => return (stable_range.start, Vec::new()),
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "use_serde")]
+        let layout = self
+            .cold_visual_layout
+            .as_ref()
+            .filter(|layout| {
+                self.matches_coordinate_witness(&layout.witness)
+                    && layout.resident_frontier <= self.phys_to_stable_row_index(0)
+                    && interval.as_ref().is_some_and(|now| {
+                        now.rows()
+                            .is_some_and(|rows| rows.start == layout.source.start)
+                            && now.retains(&layout.interval, layout.source.clone())
+                    })
+            })
+            .cloned();
+        #[cfg(feature = "use_serde")]
+        let oldest = layout
+            .as_ref()
+            .map_or(source_oldest, |layout| layout.visual.start);
+        #[cfg(not(feature = "use_serde"))]
+        let oldest = source_oldest;
         let newest_exclusive = self.phys_to_stable_row_index(self.lines.len());
         if oldest >= newest_exclusive {
             return (newest_exclusive, Vec::new());
@@ -5993,22 +6262,15 @@ impl Screen {
         }
         first = first.max(oldest);
 
-        let sink = self.config.scrollback_spill_sink();
         #[cfg(feature = "use_serde")]
         if let (Some(fragments), Some(sink)) = (&self.cold_row_fragments, &sink) {
-            let crate::config::ScrollbackIntervalCapture::Ready(now) =
-                sink.try_capture_scrollback_interval()
-            else {
-                return (first, Vec::new());
-            };
-            if !Self::fragments_match_interval(fragments, sink, &now) {
+            if !interval
+                .as_ref()
+                .is_some_and(|now| Self::fragments_match_interval(fragments, sink, now))
+            {
                 return (first, Vec::new());
             }
         }
-        #[cfg(feature = "use_serde")]
-        let layout = self
-            .current_cold_visual_layout()
-            .map(|_| Arc::clone(self.cold_visual_layout.as_ref().unwrap()));
         let mut lines = Vec::with_capacity(resolved_len);
         let end = first + resolved_len as StableRowIndex;
         let mut stable_row = first;
@@ -6756,6 +7018,120 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn synchronous_cold_read_does_not_rebase_when_metadata_probe_is_busy() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let stored = Line::from_text("disk", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(0, &stored, 10));
+        let mut screen = test_screen_with_config(
+            3,
+            4,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 1;
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        let (first, lines) = screen.lines_in_stable_range(0..4);
+        assert_eq!(first, 0);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].as_str(), "disk");
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn streamed_cold_index_maps_100001_rows_without_retaining_decoded_history() {
+        use std::cell::Cell as Counter;
+        const SOURCE_ROWS: usize = 100_001;
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let source = Line::from_text("abcd", &CellAttributes::blank(), 1, None);
+        *sink.rows.lock().unwrap() = (0..SOURCE_ROWS)
+            .map(|row| (row as StableRowIndex, source.clone()))
+            .collect();
+        let mut screen = test_screen_with_config(
+            3,
+            3,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = SOURCE_ROWS;
+        let checks = Counter::new(0usize);
+        let cancelled = screen.capture_line_read(0..1).unwrap().hydrate(|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 1000
+        });
+        assert!(cancelled.is_err());
+        assert!(sink.batch_reads.load(Ordering::Relaxed) < SOURCE_ROWS as u64 / 2);
+        assert!(screen.cold_visual_layout.is_none());
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let layout = read
+            .layout
+            .as_ref()
+            .expect("large prefix must build real visual metadata");
+        assert_eq!(layout.groups.len(), SOURCE_ROWS);
+        assert_eq!(layout.source, 0..SOURCE_ROWS as StableRowIndex);
+        assert_eq!(
+            layout.visual,
+            -(SOURCE_ROWS as StableRowIndex)..SOURCE_ROWS as StableRowIndex
+        );
+        assert!(
+            read.hydrated.is_empty(),
+            "indexing must retire all decoded source rows"
+        );
+        assert_eq!(
+            read.logical_view.as_ref().unwrap().1.len(),
+            2,
+            "only requested logical group is retained"
+        );
+        assert_eq!(read.lines().next().unwrap().as_str(), "d");
+        assert!(read.payload_bytes() <= ScreenLineRead::MAX_PAYLOAD_BYTES);
+        assert!(screen.validates_line_read(&read));
+        screen.install_line_read_layout(&read, 2);
+        assert!(screen.validates_line_read(&read));
+        assert!(!screen.line_read_changes_layout(&read));
+        assert_eq!(
+            screen.scrollback_geometry(),
+            (-(SOURCE_ROWS as StableRowIndex), SOURCE_ROWS * 2 + 3)
+        );
+        let first = -(SOURCE_ROWS as StableRowIndex);
+        let head = screen
+            .capture_line_read(first..first + 2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(
+            head.lines()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>(),
+            ["abc", "d"]
+        );
+        assert_eq!(
+            screen
+                .lines_in_stable_range(first..first + 2)
+                .1
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>(),
+            ["abc", "d"]
+        );
+        assert!(sink.store_scrollback_line(0, &source, SOURCE_ROWS));
+        assert!(
+            !screen.validates_line_read(&read),
+            "same-key source replacement rejects a complete old index"
+        );
+        assert!(!screen.validates_line_read(&head));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn owned_line_read_payload_boundary_and_resident_mutation() {
         let mut screen = test_screen(3, 8, 96);
         screen.lines[0] = Line::from_text("actual row", &CellAttributes::blank(), 1, None);
@@ -7441,6 +7817,7 @@ pub(crate) mod tests {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
         interval_identity: Mutex<crate::config::ScrollbackIntervalIdentity>,
         batch_reads: AtomicU64,
+        force_busy_probe: AtomicBool,
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
         revision: AtomicU64,
@@ -7448,6 +7825,9 @@ pub(crate) mod tests {
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
         fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
+            if self.force_busy_probe.load(Ordering::Relaxed) {
+                return crate::config::ScrollbackIntervalCapture::Busy;
+            }
             let Ok(rows) = self.rows.try_lock() else {
                 return crate::config::ScrollbackIntervalCapture::Busy;
             };
