@@ -448,6 +448,8 @@ pub struct PaneState {
     /// after every successful dirty query.
     render_dirty: frankenterm_gui::RenderDirtySequenceFence,
     selection: Selection,
+    selection_frame: crate::selection::SelectionFrameState,
+    mouse_selection_frame: Option<crate::selection::SelectionFrameStamp>,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
@@ -2666,6 +2668,7 @@ impl TermWindow {
 
             for state in self.pane_state.borrow_mut().values_mut() {
                 state.mouse_terminal_coords.take();
+                state.mouse_selection_frame.take();
             }
         }
 
@@ -5019,6 +5022,18 @@ impl TermWindow {
         if pane.downcast_ref::<CopyOverlay>().is_none()
             && pane.downcast_ref::<QuickSelectOverlay>().is_none()
         {
+            // Coordinate invalidation is independent of visible damage and
+            // must also cancel an active drag anchored in the old layout.
+            let has_selection_anchor = {
+                let selection = self.selection(pane_id);
+                selection.origin.is_some() || selection.range.is_some()
+            };
+            if has_selection_anchor && !self.selection_authority_is_current(pane) {
+                self.selection(pane_id).clear();
+                if self.active_selection_drag_pane == Some(pane_id) {
+                    self.active_selection_drag_pane = None;
+                }
+            }
             // If any of the changed lines intersect with the
             // selection, then we need to clear the selection, but not
             // when the search overlay is active; the search overlay
@@ -6724,8 +6739,12 @@ impl TermWindow {
                 }
             }
             CopyTo(dest) => {
-                let text = self.selection_text(pane);
-                self.copy_to_clipboard(*dest, text);
+                if self.selection_authority_is_current(pane) {
+                    let text = self.selection_text(pane);
+                    if self.selection_authority_is_current(pane) {
+                        self.copy_to_clipboard(*dest, text);
+                    }
+                }
             }
             CopyTextTo { text, destination } => {
                 self.copy_to_clipboard(*destination, text.clone());
@@ -6868,13 +6887,18 @@ impl TermWindow {
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
                 self.active_selection_drag_pane = None;
+                let had_selection = self.selection(pane.pane_id()).range.is_some();
+                if had_selection && !self.selection_authority_is_current(pane) {
+                    self.clear_selection(pane);
+                    return Ok(());
+                }
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
                     if let Some(window) = self.window.as_ref() {
                         window.invalidate();
                     }
-                } else {
+                } else if !had_selection || self.selection_authority_is_current(pane) {
                     self.do_open_link_at_mouse_cursor(pane);
                 }
             }

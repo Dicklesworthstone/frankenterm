@@ -12,8 +12,8 @@ use mux::pane::{
 use mux::renderable::*;
 use parking_lot::{MappedMutexGuard, Mutex};
 use promise::spawn::sleep;
-use rayon::prelude::*;
 use rangeset::RangeSet;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -235,18 +235,12 @@ fn compute_search_row_from_viewport(
         .unwrap_or(top)
 }
 
-fn checked_page_up_boundary(
-    top: StableRowIndex,
-    viewport_rows: usize,
-) -> Option<StableRowIndex> {
+fn checked_page_up_boundary(top: StableRowIndex, viewport_rows: usize) -> Option<StableRowIndex> {
     let viewport_rows = StableRowIndex::try_from(viewport_rows).ok()?;
     top.checked_sub(viewport_rows)
 }
 
-fn checked_page_down_boundary(
-    top: StableRowIndex,
-    viewport_rows: usize,
-) -> Option<StableRowIndex> {
+fn checked_page_down_boundary(top: StableRowIndex, viewport_rows: usize) -> Option<StableRowIndex> {
     let viewport_rows = StableRowIndex::try_from(viewport_rows).ok()?;
     top.checked_add(viewport_rows)
 }
@@ -378,9 +372,7 @@ fn validate_search_geometry(
         .checked_sub(start_y)?
         .checked_add(1)
         .and_then(|span| usize::try_from(span).ok())?;
-    if (start_y == end_y && start_x >= end_x)
-        || (row_span == 2 && start_x == cols && end_x == 0)
-    {
+    if (start_y == end_y && start_x >= end_x) || (row_span == 2 && start_x == cols && end_x == 0) {
         return None;
     }
     Some(ValidatedSearchGeometry {
@@ -748,10 +740,7 @@ mod alphabet_test {
     #[test]
     fn page_navigation_boundaries_fail_closed_at_stable_row_limits() {
         assert_eq!(checked_page_up_boundary(StableRowIndex::MIN, 1), None);
-        assert_eq!(
-            checked_page_down_boundary(StableRowIndex::MAX, 1),
-            None
-        );
+        assert_eq!(checked_page_down_boundary(StableRowIndex::MAX, 1), None);
     }
 
     #[test]
@@ -969,9 +958,7 @@ mod alphabet_test {
     #[test]
     fn quick_select_preparation_honors_latest_wins_cancellation() {
         let cancel = AtomicBool::new(true);
-        assert!(
-            prepare_quick_select_results(Vec::new(), &(0..10), 80, "asdf", &cancel).is_none()
-        );
+        assert!(prepare_quick_select_results(Vec::new(), &(0..10), 80, "asdf", &cancel).is_none());
     }
 
     #[test]
@@ -1180,8 +1167,7 @@ async fn prepare_quick_select_results_off_thread(
             let _ = sender.send(Err("quick-select preparation lane busy".to_string()));
             return;
         };
-        let prepared =
-            prepare_quick_select_results(results, &searched, cols, &alphabet, &cancel);
+        let prepared = prepare_quick_select_results(results, &searched, cols, &alphabet, &cancel);
         if let Some(prepared) = prepared {
             let _ = sender.send(Ok(prepared));
         } else {
@@ -1708,10 +1694,9 @@ impl Pane for QuickSelectOverlay {
         lines: Range<StableRowIndex>,
         last_observed_source_end: SequenceNo,
     ) -> (SequenceNo, RangeSet<StableRowIndex>) {
-        let (source_end, dirty) = self.delegate.get_changed_since_with_source_fence(
-            lines.clone(),
-            last_observed_source_end,
-        );
+        let (source_end, dirty) = self
+            .delegate
+            .get_changed_since_with_source_fence(lines.clone(), last_observed_source_end);
         let mut renderer = self.renderer.lock();
         let retained = retained_row_range(renderer.delegate.get_dimensions());
         prune_dirty_results(&mut renderer.dirty_results, retained);
@@ -1947,12 +1932,7 @@ impl QuickSelectRenderable {
         self.restart_search(is_initial_run, false, 0);
     }
 
-    fn restart_search(
-        &mut self,
-        is_initial_run: bool,
-        preserve_result: bool,
-        retry_attempt: u8,
-    ) {
+    fn restart_search(&mut self, is_initial_run: bool, preserve_result: bool, retry_attempt: u8) {
         self.cancel_search_task();
         self.cancel_retry();
         // Label prefixes are meaningful only for one installed result map.
@@ -2252,9 +2232,7 @@ impl QuickSelectRenderable {
                 self.cancel_retry();
                 self.searching.take();
                 self.mark_search_ui_dirty();
-                log::error!(
-                    "{err:#}; ended the exact quick-select run instead of losing a retry"
-                );
+                log::error!("{err:#}; ended the exact quick-select run instead of losing a retry");
                 return;
             }
         };
@@ -2270,33 +2248,38 @@ impl QuickSelectRenderable {
         let (abort, registration) = AbortHandle::new_pair();
         self.retry_abort = Some(abort);
         self.mark_search_ui_dirty();
-        reservation.spawn_local(async move {
-            if Abortable::new(sleep(delay), registration).await.is_err() {
-                return anyhow::Result::<()>::Ok(());
-            }
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let state = term_window.pane_state(pane_id);
-                if let Some(overlay) = state.overlay.as_ref() {
-                    if let Some(search_overlay) =
-                        overlay.pane.downcast_ref::<QuickSelectOverlay>()
-                    {
-                        let mut renderer = search_overlay.renderer.lock();
-                        if Arc::ptr_eq(&renderer.instance_token, &instance_token)
-                            && renderer.searching.as_ref().is_some_and(|pending| pending.run == run)
-                            && renderer.retry_token
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &retry_token))
+        reservation
+            .spawn_local(async move {
+                if Abortable::new(sleep(delay), registration).await.is_err() {
+                    return anyhow::Result::<()>::Ok(());
+                }
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let state = term_window.pane_state(pane_id);
+                    if let Some(overlay) = state.overlay.as_ref() {
+                        if let Some(search_overlay) =
+                            overlay.pane.downcast_ref::<QuickSelectOverlay>()
                         {
-                            renderer.retry_abort.take();
-                            renderer.retry_token.take();
-                            renderer.restart_search(is_initial_run, true, next_attempt);
+                            let mut renderer = search_overlay.renderer.lock();
+                            if Arc::ptr_eq(&renderer.instance_token, &instance_token)
+                                && renderer
+                                    .searching
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.run == run)
+                                && renderer
+                                    .retry_token
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &retry_token))
+                            {
+                                renderer.retry_abort.take();
+                                renderer.retry_token.take();
+                                renderer.restart_search(is_initial_run, true, next_attempt);
+                            }
                         }
                     }
-                }
-            })));
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
+                })));
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
     }
 
     fn clear_selection(&mut self) {
@@ -2336,6 +2319,7 @@ impl QuickSelectRenderable {
         let pane_id = self.delegate.pane_id();
         let pane = Arc::clone(&self.delegate);
         let accepted_cols = self.width;
+        let selection_authority = crate::selection::SelectionAuthority::capture(&*pane);
         let instance_token = Arc::clone(&self.instance_token);
         let action = self.args.action.clone();
         let skip_action_on_paste = self.args.skip_action_on_paste;
@@ -2391,7 +2375,7 @@ impl QuickSelectRenderable {
                     return;
                 };
                 let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
-                term_window.update_selection(&pane, |selection| {
+                term_window.update_selection(&pane, selection_authority, |selection| {
                     selection.origin = Some(start);
                     selection.range = Some(SelectionRange {
                         start,

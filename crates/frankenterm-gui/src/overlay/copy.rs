@@ -1375,33 +1375,30 @@ impl CopyRenderable {
                 let pane_id = pane.pane_id();
                 let mut outcome = Some(outcome);
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let state = term_window.pane_state(pane_id);
-                if let Some(overlay) = state.overlay.as_ref() {
-                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                        let mut renderer = copy_overlay.render.lock();
-                        if !Arc::ptr_eq(&renderer.instance_token, &instance_token) {
-                            return;
-                        }
-                        let Some(outcome) = outcome.take() else {
-                            log::warn!(
+                    let state = term_window.pane_state(pane_id);
+                    if let Some(overlay) = state.overlay.as_ref() {
+                        if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                            let mut renderer = copy_overlay.render.lock();
+                            if !Arc::ptr_eq(&renderer.instance_token, &instance_token) {
+                                return;
+                            }
+                            let Some(outcome) = outcome.take() else {
+                                log::warn!(
                                 "copy overlay search completion already consumed for pane {pane_id}"
                             );
-                            return;
-                        };
-                        match outcome {
-                            Ok(prepared) => renderer.processed_search_chunk(
-                                run,
-                                pattern,
-                                prepared,
-                                range,
-                            ),
-                            Err(error) => {
-                                renderer.processed_search_error(run, range, error);
+                                return;
+                            };
+                            match outcome {
+                                Ok(prepared) => {
+                                    renderer.processed_search_chunk(run, pattern, prepared, range)
+                                }
+                                Err(error) => {
+                                    renderer.processed_search_error(run, range, error);
+                                }
                             }
                         }
                     }
-                }
-            })));
+                })));
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
@@ -1753,10 +1750,11 @@ impl CopyRenderable {
 
     fn adjust_selection(&self, start: SelectionCoordinate, range: SelectionRange) {
         let pane = Arc::clone(&self.delegate);
+        let authority = crate::selection::SelectionAuthority::capture(&*pane);
         let mode = self.selection_mode;
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.update_selection(&pane, |selection| {
+                term_window.update_selection(&pane, authority, |selection| {
                     selection.origin = Some(start);
                     selection.range = Some(range);
                     selection.rectangular = mode == SelectionMode::Block;

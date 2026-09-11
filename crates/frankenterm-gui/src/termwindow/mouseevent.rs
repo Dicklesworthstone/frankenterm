@@ -723,6 +723,7 @@ impl super::TermWindow {
             self.current_mouse_capture,
             Some(MouseCapture::TerminalPane(_))
         );
+        let mut selection_position = None;
 
         for pos in self.get_panes_to_render() {
             if !is_already_captured
@@ -765,6 +766,7 @@ impl super::TermWindow {
                 }
                 column = column.saturating_sub(pos.left);
                 row = row.saturating_sub(pos.top as i64);
+                selection_position = Some(pos);
                 break;
             } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
                 column = column.saturating_sub(pos.left);
@@ -779,6 +781,7 @@ impl super::TermWindow {
                         * (pos.top as isize - position.row as isize);
                 }
 
+                selection_position = Some(pos);
                 break;
             }
         }
@@ -831,9 +834,15 @@ impl super::TermWindow {
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top);
         let stable_row = checked_mouse_stable_row(viewport, row);
+        let current_selection_frame = selection_position
+            .as_ref()
+            .and_then(|pos| self.selection_frame_stamp_for_position(&pane, pos));
 
         {
             let mut pane_state = self.pane_state(pane.pane_id());
+            pane_state.mouse_selection_frame = pane_state
+                .selection_frame
+                .for_mouse(current_selection_frame);
             if let Some(stable_row) = stable_row {
                 pane_state.mouse_terminal_coords.replace((
                     ClickPosition {

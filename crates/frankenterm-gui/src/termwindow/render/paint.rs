@@ -210,6 +210,9 @@ impl crate::TermWindow {
     /// swap from bypassing the bounded retry lane via an immediate animation or
     /// frame-budget repaint.
     pub(crate) fn complete_presented_paint(&mut self, outcome: PaintOutcome) {
+        for state in self.pane_state.borrow_mut().values_mut() {
+            state.selection_frame.presented();
+        }
         if outcome.post_present.should_force_frame_budget_paint {
             if let Some(window) = self.window.clone() {
                 window.invalidate();
@@ -242,6 +245,11 @@ impl crate::TermWindow {
     }
 
     pub fn paint_pass(&mut self, frame_reduce_motion: ReduceMotionState) -> anyhow::Result<()> {
+        // Every atlas retry rebuilds geometry. Never promote a candidate from
+        // a failed or earlier attempt, including a pane omitted by this pass.
+        for state in self.pane_state.borrow_mut().values_mut() {
+            state.selection_frame.begin_attempt();
+        }
         {
             let gl_state = self
                 .render_state

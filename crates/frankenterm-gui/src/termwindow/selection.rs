@@ -1,5 +1,6 @@
 use crate::selection::{
-    Selection, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX, SmartSelectionPick,
+    Selection, SelectionAuthority, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX,
+    SmartSelectionPick,
 };
 use crate::smart_selection_a11y::emit_smart_selection_pick;
 use mux::pane::{LogicalLine, Pane, PaneId};
@@ -23,84 +24,125 @@ fn announce_pick_if_smart(pick: Option<SmartSelectionPick>) {
 }
 
 impl super::TermWindow {
+    pub fn selection_frame_stamp(
+        &self,
+        pane: &Arc<dyn Pane>,
+    ) -> Option<crate::selection::SelectionFrameStamp> {
+        let pos = self
+            .get_panes_to_render()
+            .into_iter()
+            .find(|pos| Arc::ptr_eq(&pos.pane, pane))?;
+        self.selection_frame_stamp_for_position(pane, &pos)
+    }
+
+    pub fn selection_frame_stamp_for_position(
+        &self,
+        pane: &Arc<dyn Pane>,
+        pos: &mux::tab::PositionedPane,
+    ) -> Option<crate::selection::SelectionFrameStamp> {
+        if !Arc::ptr_eq(&pos.pane, pane) {
+            return None;
+        }
+        let (authority, source_sequence, dims) = SelectionAuthority::capture_source(&**pane)?;
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let top_bar = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().ok()?
+        } else {
+            0.0
+        };
+        let stamp = crate::selection::SelectionFrameStamp {
+            authority,
+            source_sequence,
+            viewport: self
+                .get_viewport(pane.pane_id())
+                .unwrap_or(dims.physical_top),
+            geometry: [
+                self.render_metrics.cell_size.width as usize,
+                self.render_metrics.cell_size.height as usize,
+                pos.left,
+                pos.top,
+                pos.width,
+                pos.height,
+                self.dimensions.pixel_width,
+                self.dimensions.pixel_height,
+                (padding_left + border.left.get() as f32).to_bits() as usize,
+                (padding_top + top_bar + border.top.get() as f32).to_bits() as usize,
+                self.shape_generation,
+                self.config.generation() as usize,
+            ],
+        };
+        (SelectionAuthority::capture_source(&**pane) == Some((authority, source_sequence, dims)))
+            .then_some(stamp)
+    }
+
+    fn mouse_selection_authority(&self, pane: &Arc<dyn Pane>) -> Option<SelectionAuthority> {
+        let current = self.selection_frame_stamp(pane);
+        let state = self.pane_state(pane.pane_id());
+        let mouse = state.mouse_selection_frame?;
+        (state.selection_frame.for_mouse(current) == Some(mouse)).then_some(mouse.authority)
+    }
     pub fn selection(&self, pane_id: PaneId) -> RefMut<'_, Selection> {
         RefMut::map(self.pane_state(pane_id), |state| &mut state.selection)
     }
 
-    pub fn update_selection(&mut self, pane: &Arc<dyn Pane>, update: impl FnOnce(&mut Selection)) {
+    pub fn update_selection(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        expected: Option<SelectionAuthority>,
+        update: impl FnOnce(&mut Selection),
+    ) {
         let pane_id = pane.pane_id();
         let current_seqno = pane.get_current_seqno();
         {
             let mut selection = self.selection(pane_id);
             update(&mut selection);
             selection.seqno = current_seqno;
+            selection.authority = expected;
+            if expected.is_none() || SelectionAuthority::capture(&**pane) != expected {
+                selection.clear();
+            }
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
     }
 
+    pub fn selection_authority_is_current(&self, pane: &Arc<dyn Pane>) -> bool {
+        let current = SelectionAuthority::capture(&**pane);
+        self.selection(pane.pane_id()).is_authorized_by(current)
+    }
+
     /// Returns the selection region as a series of Line
     pub fn selection_lines(&self, pane: &Arc<dyn Pane>) -> Vec<Line> {
-        let mut result = vec![];
-
+        let expected = self.selection(pane.pane_id()).authority;
+        if expected.is_none() || SelectionAuthority::capture(&**pane) != expected {
+            return Vec::new();
+        }
         let rectangular = self.selection(pane.pane_id()).rectangular;
-        if let Some(sel) = self
+        let result = if let Some(sel) = self
             .selection(pane.pane_id())
             .range
             .as_ref()
             .map(|r| r.normalize())
         {
-            let mut last_was_wrapped = false;
-            let first_row = sel.rows().start;
-            let last_row = sel.rows().end;
+            selected_lines_from_logical_lines(&pane.get_logical_lines(sel.rows()), sel, rectangular)
+        } else {
+            Vec::new()
+        };
 
-            for line in pane.get_logical_lines(sel.rows()) {
-                let Some(first_physical_line) = line.physical_lines.first() else {
-                    continue;
-                };
-                if result.is_empty() || !last_was_wrapped {
-                    result.push(Line::with_width(0, first_physical_line.current_seqno()));
-                }
-                let last_idx = line.physical_lines.len().saturating_sub(1);
-                for (idx, phys) in line.physical_lines.iter().enumerate() {
-                    let Ok(row_offset) = StableRowIndex::try_from(idx) else {
-                        break;
-                    };
-                    let Some(this_row) = line.first_row.checked_add(row_offset) else {
-                        break;
-                    };
-                    if this_row >= first_row && this_row < last_row {
-                        let last_phys_idx = phys.len().saturating_sub(1);
-                        let cols = sel.cols_for_row(this_row, rectangular);
-                        let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
-                        let mut col_span = phys.columns_as_line(cols);
-                        let seqno = col_span.current_seqno();
-                        // Only trim trailing whitespace if we are the last line
-                        // in a wrapped sequence
-                        if idx == last_idx {
-                            col_span.prune_trailing_blanks(seqno);
-                        }
-
-                        result
-                            .last_mut()
-                            .map(|line| line.append_line(col_span, seqno));
-
-                        last_was_wrapped = last_col_idx == last_phys_idx
-                            && phys
-                                .get_cell(last_col_idx)
-                                .map(|c| c.attrs().wrapped())
-                                .unwrap_or(false);
-                    }
-                }
-            }
+        if SelectionAuthority::capture(&**pane) != expected {
+            return Vec::new();
         }
-
         result
     }
 
     /// Returns the selection text only
     pub fn selection_text(&self, pane: &Arc<dyn Pane>) -> String {
+        let expected = self.selection(pane.pane_id()).authority;
+        if expected.is_none() || SelectionAuthority::capture(&**pane) != expected {
+            return String::new();
+        }
         let (rectangular, sel) = {
             let selection = self.selection(pane.pane_id());
             let Some(sel) = selection.range.as_ref().map(|r| r.normalize()) else {
@@ -109,15 +151,26 @@ impl super::TermWindow {
             (selection.rectangular, sel)
         };
 
-        selected_text_from_logical_lines(&pane.get_logical_lines(sel.rows()), sel, rectangular)
+        let text =
+            selected_text_from_logical_lines(&pane.get_logical_lines(sel.rows()), sel, rectangular);
+        if SelectionAuthority::capture(&**pane) != expected {
+            return String::new();
+        }
+        text
     }
 
     pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
         self.active_selection_drag_pane = None;
-        self.update_selection(pane, Selection::clear);
+        self.update_selection(pane, None, Selection::clear);
     }
 
     pub fn extend_selection_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
+        if !self.selection_authority_is_current(pane)
+            || self.mouse_selection_authority(pane).is_none()
+        {
+            self.clear_selection(pane);
+            return;
+        }
         self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
         let (position, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
             Some(coords) => coords,
@@ -237,6 +290,12 @@ impl super::TermWindow {
             }
         }
 
+        if !self.selection_authority_is_current(pane)
+            || self.mouse_selection_authority(pane).is_none()
+        {
+            self.clear_selection(pane);
+            return;
+        }
         let dims = pane.get_dimensions();
 
         // Scroll viewport when mouse mouves out of its vertical bounds
@@ -255,6 +314,11 @@ impl super::TermWindow {
     }
 
     pub fn select_text_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
+        let expected = self.mouse_selection_authority(pane);
+        if expected.is_none() {
+            self.clear_selection(pane);
+            return;
+        }
         let (x, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
             Some(coords) => (coords.0.column, coords.1),
             None => return,
@@ -294,6 +358,13 @@ impl super::TermWindow {
         }
 
         self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
+        self.selection(pane.pane_id()).authority = expected;
+        if !self.selection_authority_is_current(pane)
+            || self.mouse_selection_authority(pane) != expected
+        {
+            self.clear_selection(pane);
+            return;
+        }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -305,50 +376,64 @@ fn selected_text_from_logical_lines(
     sel: SelectionRange,
     rectangular: bool,
 ) -> String {
-    let mut s = String::new();
+    selected_lines_from_logical_lines(logical_lines, sel, rectangular)
+        .iter()
+        .map(|line| line.as_str().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn selected_lines_from_logical_lines(
+    logical_lines: &[LogicalLine],
+    sel: SelectionRange,
+    rectangular: bool,
+) -> Vec<Line> {
     let sel = sel.normalize();
-    let mut last_was_wrapped = false;
-    let first_row = sel.rows().start;
-    let last_row = sel.rows().end;
-
-    for line in logical_lines {
-        if line.physical_lines.is_empty() {
-            continue;
+    let selected_rows = sel.rows();
+    let mut rows = logical_lines
+        .iter()
+        .flat_map(|logical| {
+            logical
+                .physical_lines
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, line)| {
+                    let row = logical
+                        .first_row
+                        .checked_add(StableRowIndex::try_from(index).ok()?)?;
+                    Some((row, line))
+                })
+        })
+        .filter(|(row, _)| selected_rows.contains(row))
+        .peekable();
+    let mut result: Vec<Line> = Vec::new();
+    let mut join_previous = false;
+    while let Some((row, line)) = rows.next() {
+        let cols = sel.cols_for_row(row, rectangular);
+        // Container boundaries may be synthetic budget cuts. Only the actual
+        // selected contiguous wrapped cells determine continuation. Rectangles
+        // remain separate physical rows even across terminal soft wraps.
+        let continues = !rectangular
+            && cols.end >= line.len()
+            && line.last_cell_was_wrapped()
+            && rows.peek().is_some_and(|(next, _)| {
+                row.checked_add(1) == Some(*next) && sel.cols_for_row(*next, false).start == 0
+            });
+        let mut span = line.columns_as_line(cols);
+        let seqno = span.current_seqno();
+        if !continues {
+            span.prune_trailing_blanks(seqno);
         }
-        if !s.is_empty() && !last_was_wrapped {
-            s.push('\n');
-        }
-        let last_idx = line.physical_lines.len().saturating_sub(1);
-        for (idx, phys) in line.physical_lines.iter().enumerate() {
-            let Ok(row_offset) = StableRowIndex::try_from(idx) else {
-                break;
-            };
-            let Some(this_row) = line.first_row.checked_add(row_offset) else {
-                break;
-            };
-            if this_row >= first_row && this_row < last_row {
-                let last_phys_idx = phys.len().saturating_sub(1);
-                let cols = sel.cols_for_row(this_row, rectangular);
-                let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
-                let col_span = phys.columns_as_str(cols);
-                // Only trim trailing whitespace if we are the last line
-                // in a wrapped sequence
-                if idx == last_idx {
-                    s.push_str(col_span.trim_end());
-                } else {
-                    s.push_str(&col_span);
-                }
-
-                last_was_wrapped = last_col_idx == last_phys_idx
-                    && phys
-                        .get_cell(last_col_idx)
-                        .map(|c| c.attrs().wrapped())
-                        .unwrap_or(false);
+        if join_previous {
+            if let Some(previous) = result.last_mut() {
+                previous.append_line(span, seqno);
             }
+        } else {
+            result.push(span);
         }
+        join_previous = continues;
     }
-
-    s
+    result
 }
 
 #[cfg(test)]
@@ -360,6 +445,40 @@ mod tests {
     use proptest::prelude::*;
     use termwiz::cell::{CellAttributes, unicode_column_width};
     use termwiz::surface::SEQ_ZERO;
+
+    #[test]
+    fn bounded_logical_groups_preserve_selected_wrapped_spaces_in_text_and_lines() {
+        let prefix = format!("{}  ", "a".repeat(mux::pane::MAX_LOGICAL_LINE_LEN - 2));
+        let mut first = Line::from_text(&prefix, &CellAttributes::default(), SEQ_ZERO, None);
+        first.set_last_cell_was_wrapped(true, SEQ_ZERO);
+        let second = Line::from_text("z", &CellAttributes::default(), SEQ_ZERO, None);
+        let mut tail = logical_line_from_physical(vec![second]);
+        tail.first_row = 1;
+        let groups = vec![logical_line_from_physical(vec![first]), tail];
+        let selection = SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+            .extend(SelectionCoordinate::x_y(0, 1));
+        let expected = format!("{prefix}z");
+        assert_eq!(
+            selected_text_from_logical_lines(&groups, selection, false),
+            expected
+        );
+        let rich = selected_lines_from_logical_lines(&groups, selection, false);
+        assert_eq!(rich.len(), 1);
+        assert_eq!(rich[0].as_str(), expected);
+        assert_eq!(
+            selected_text_from_logical_lines(&groups, selection, true),
+            "a\nz"
+        );
+        // A gap is not a wrapped continuation and must not concatenate rows.
+        let mut gap = groups;
+        gap[1].first_row = 2;
+        let selection = SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+            .extend(SelectionCoordinate::x_y(0, 2));
+        assert_eq!(
+            selected_text_from_logical_lines(&gap, selection, false),
+            format!("{}\nz", "a".repeat(mux::pane::MAX_LOGICAL_LINE_LEN - 2))
+        );
+    }
 
     fn logical_line_from_physical(physical_lines: Vec<Line>) -> LogicalLine {
         let logical_text = physical_lines

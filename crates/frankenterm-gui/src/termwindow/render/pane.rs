@@ -235,6 +235,8 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
         self.check_for_dirty_lines_and_invalidate_selection(&pos.pane)?;
+        let selection_frame_before = self.selection_frame_stamp_for_position(&pos.pane, pos);
+        let complete_selection_frame;
         /*
         let zone = {
             let dims = pos.pane.get_dimensions();
@@ -577,6 +579,8 @@ impl crate::TermWindow {
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
+                expected_range: std::ops::Range<StableRowIndex>,
+                complete: bool,
             }
 
             let left_pixel_x = padding_left
@@ -607,6 +611,8 @@ impl crate::TermWindow {
                 window_is_transparent,
                 layers,
                 error: None,
+                expected_range: stable_range.clone(),
+                complete: false,
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -824,12 +830,20 @@ impl crate::TermWindow {
 
             impl<'a, 'b> WithPaneLines for LineRender<'a, 'b> {
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                    self.complete = false;
                     for (line_idx, line) in lines.iter().enumerate() {
                         if let Err(err) = self.render_line(stable_top, line_idx, line) {
                             self.error.replace(err);
                             return;
                         }
                     }
+                    self.complete = stable_top == self.expected_range.start
+                        && lines.len()
+                            == self
+                                .expected_range
+                                .end
+                                .saturating_sub(self.expected_range.start)
+                                as usize;
                 }
             }
 
@@ -842,6 +856,7 @@ impl crate::TermWindow {
                 return Err(error)
                     .context("error while calling with_lines_mut_and_apply_hyperlinks");
             }
+            complete_selection_frame = render.complete;
         }
 
         /*
@@ -851,6 +866,13 @@ impl crate::TermWindow {
         */
         metrics::histogram!("paint_pane.lines").record(start.elapsed());
         log::trace!("lines elapsed {:?}", start.elapsed());
+
+        let selection_frame_after = self.selection_frame_stamp_for_position(&pos.pane, pos);
+        self.pane_state(pane_id).selection_frame.stage(
+            selection_frame_before,
+            selection_frame_after,
+            complete_selection_frame,
+        );
 
         Ok(())
     }

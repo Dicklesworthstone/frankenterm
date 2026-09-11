@@ -30,16 +30,113 @@ pub struct Selection {
     pub range: Option<SelectionRange>,
     /// When the selection was made wrt. the pane content
     pub seqno: SequenceNo,
+    /// Authority of the coordinates, independent of the drag's damage seqno.
+    pub authority: Option<SelectionAuthority>,
     /// Whether the selection is rectangular
     pub rectangular: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct SelectionAuthority {
+    source: usize,
+    sequence: SequenceNo,
+    geometry: (usize, usize, u32, usize, usize),
+    alternate: bool,
+}
+
+impl SelectionAuthority {
+    pub fn capture(pane: &dyn Pane) -> Option<Self> {
+        Self::capture_source(pane).map(|(authority, _, _)| authority)
+    }
+
+    pub fn capture_source(
+        pane: &dyn Pane,
+    ) -> Option<(Self, SequenceNo, mux::renderable::RenderableDimensions)> {
+        // Native layout capture is atomic and nonblocking. Busy must never
+        // fall back to a fabricated stamp from separately sampled metadata.
+        let (sequence, source_sequence, dims, alternate) =
+            if let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() {
+                let (floor, source_sequence, dims) = local.selection_source_snapshot()?;
+                (floor, source_sequence, dims, false) // The native floor includes Screen identity.
+            } else {
+                // Other backends do not expose a layout floor yet. Conservatively
+                // bind to their content sequence rather than disabling selection.
+                let before = pane.get_current_seqno();
+                let dims = pane.get_dimensions();
+                let alternate = pane.is_alt_screen_active();
+                if pane.get_current_seqno() != before {
+                    return None;
+                }
+                (before, before, dims, alternate)
+            };
+        if sequence == SequenceNo::MAX {
+            return None;
+        }
+        Some((
+            Self {
+                source: pane as *const dyn Pane as *const () as usize,
+                sequence,
+                geometry: (
+                    dims.cols,
+                    dims.viewport_rows,
+                    dims.dpi,
+                    dims.pixel_width,
+                    dims.pixel_height,
+                ),
+                alternate,
+            },
+            source_sequence,
+            dims,
+        ))
+    }
+}
+
+/// Coordinates of a fully populated pane in a submitted frame. This is a
+/// synchronous presentation boundary, not a GPU-completion/scanout receipt.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct SelectionFrameStamp {
+    pub authority: SelectionAuthority,
+    pub source_sequence: SequenceNo,
+    pub viewport: StableRowIndex,
+    pub geometry: [usize; 12],
+}
+
+#[derive(Debug, Default)]
+pub struct SelectionFrameState {
+    pending: Option<SelectionFrameStamp>,
+    presented: Option<SelectionFrameStamp>,
+}
+
+impl SelectionFrameState {
+    pub fn begin_attempt(&mut self) {
+        self.pending = None;
+    }
+    pub fn stage(
+        &mut self,
+        before: Option<SelectionFrameStamp>,
+        after: Option<SelectionFrameStamp>,
+        complete: bool,
+    ) {
+        self.pending = before.filter(|_| complete && before == after);
+    }
+    pub fn presented(&mut self) {
+        self.presented = self.pending.take();
+    }
+    pub fn for_mouse(&self, current: Option<SelectionFrameStamp>) -> Option<SelectionFrameStamp> {
+        self.presented.filter(|_| self.presented == current)
+    }
 }
 
 pub use config::keyassignment::SelectionMode;
 
 impl Selection {
+    pub fn is_authorized_by(&self, current: Option<SelectionAuthority>) -> bool {
+        self.authority.is_some() && self.authority == current
+    }
     pub fn clear(&mut self) {
         self.range = None;
         self.origin = None;
+        self.authority = None;
     }
 
     pub fn begin(&mut self, origin: SelectionCoordinate) {
@@ -539,6 +636,97 @@ impl SelectionRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_coordinates_cannot_be_reauthorized_by_drag_damage_sequence() {
+        let authority = SelectionAuthority {
+            source: 1,
+            sequence: 10,
+            geometry: (80, 24, 96, 800, 480),
+            alternate: false,
+        };
+        let mut selection = Selection::default();
+        selection.begin(SelectionCoordinate::x_y(0, -100));
+        selection.range = Some(SelectionRange::start(SelectionCoordinate::x_y(0, -100)));
+        selection.authority = Some(authority);
+        selection.seqno = 10;
+        assert!(selection.is_authorized_by(Some(authority)));
+        assert!(!selection.is_authorized_by(None));
+        let changed = SelectionAuthority {
+            sequence: 11,
+            ..authority
+        };
+        selection.seqno = 100; // dragging/dirty updates do not move the anchor epoch
+        assert!(!selection.is_authorized_by(Some(changed)));
+        assert!(!selection.is_authorized_by(Some(SelectionAuthority {
+            source: 2,
+            ..authority
+        })));
+        assert!(!selection.is_authorized_by(Some(SelectionAuthority {
+            alternate: true,
+            ..authority
+        })));
+        assert!(!selection.is_authorized_by(Some(SelectionAuthority {
+            geometry: (79, 24, 96, 790, 480),
+            ..authority
+        })));
+        selection.clear();
+        assert!(!selection.is_authorized_by(Some(authority)));
+        assert!(selection.origin.is_none() && selection.range.is_none());
+    }
+
+    #[test]
+    fn selection_frame_authority_requires_complete_successful_presentation() {
+        let a = SelectionFrameStamp {
+            authority: SelectionAuthority {
+                source: 1,
+                sequence: 10,
+                geometry: (80, 24, 96, 800, 480),
+                alternate: false,
+            },
+            source_sequence: 10,
+            viewport: -100,
+            geometry: [0; 12],
+        };
+        let mut b = a;
+        b.authority.sequence = 11;
+        b.source_sequence = 11;
+        let mut state = SelectionFrameState::default();
+        state.begin_attempt();
+        state.stage(Some(a), Some(a), true);
+        assert_eq!(state.for_mouse(Some(a)), None); // geometry is not presentation
+        state.presented();
+        assert_eq!(state.for_mouse(Some(a)), Some(a));
+        state.begin_attempt();
+        state.stage(Some(b), Some(b), true);
+        // Failed swap leaves A displayed; damage/query B cannot authorize B.
+        assert_eq!(state.for_mouse(Some(b)), None);
+        assert_eq!(state.for_mouse(Some(a)), Some(a));
+        state.begin_attempt(); // atlas retry must discard the B candidate
+        state.stage(Some(b), Some(b), false); // incomplete cold rows
+        state.presented();
+        assert_eq!(state.for_mouse(Some(b)), None);
+        state.begin_attempt();
+        state.stage(Some(a), Some(b), true); // layout changed during snapshot
+        state.presented();
+        assert_eq!(state.for_mouse(Some(b)), None);
+        state.begin_attempt();
+        state.stage(Some(b), Some(b), true);
+        state.presented();
+        assert_eq!(state.for_mouse(Some(b)), Some(b));
+        let mut scrolled = b;
+        scrolled.viewport += 1;
+        assert_eq!(state.for_mouse(Some(scrolled)), None);
+        let mut rescaled = b;
+        rescaled.geometry[0] += 1;
+        assert_eq!(state.for_mouse(Some(rescaled)), None);
+        let mut output = b;
+        output.source_sequence += 1;
+        assert_eq!(state.for_mouse(Some(output)), None);
+        state.begin_attempt(); // pane omitted by successful next frame
+        state.presented();
+        assert_eq!(state.for_mouse(Some(b)), None);
+    }
 
     #[test]
     fn smart_match_logical_x_range_selects_url_inside_quotes() {

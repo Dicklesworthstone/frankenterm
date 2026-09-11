@@ -2654,6 +2654,20 @@ impl LocalPane {
         Some(floor)
     }
 
+    /// One nonblocking observation for a GUI frame's coordinate authority.
+    /// Do not split this into blocking sequence/dimension getters on the UI.
+    pub fn selection_source_snapshot(
+        &self,
+    ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions)> {
+        let mut term = self.terminal.try_lock()?;
+        let floor = self.refresh_line_layout_floor(&mut term)?;
+        Some((
+            floor,
+            term.current_seqno(),
+            terminal_get_dimensions(&mut term),
+        ))
+    }
+
     fn cold_viewport_lines(&self, requested: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let empty = || (requested.start, Vec::new());
         if requested.end.saturating_sub(requested.start).max(0) as usize
@@ -4709,6 +4723,7 @@ mod tests {
         {
             let _busy = pane.terminal.lock();
             assert!(pane.get_line_layout().is_none());
+            assert!(pane.selection_source_snapshot().is_none());
             assert!(
                 !pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1)
             );
