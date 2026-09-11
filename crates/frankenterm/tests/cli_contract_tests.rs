@@ -323,7 +323,7 @@ report() {{
                     symlink(&retained, fixture.root.join(".ft")).unwrap();
                 }
                 "hardlink" => {
-                    std::fs::hard_link(&database, fixture.base.join("database-link")).unwrap()
+                    std::fs::hard_link(&database, fixture.base.join("database-link")).unwrap();
                 }
                 "journal_symlink" => symlink(&outside, fixture.root.join(".ft/ft.db-wal")).unwrap(),
                 "lock_symlink" => symlink(
@@ -333,7 +333,7 @@ report() {{
                 .unwrap(),
                 "busy" => held_fence = Some(acquire_kill_switch_fence(&database).unwrap()),
                 "malformed_database" => {
-                    std::fs::write(&database, b"NOT_A_SQLITE_DATABASE").unwrap()
+                    std::fs::write(&database, b"NOT_A_SQLITE_DATABASE").unwrap();
                 }
                 "database_directory" => {
                     std::fs::rename(&database, database.with_extension("retained")).unwrap();

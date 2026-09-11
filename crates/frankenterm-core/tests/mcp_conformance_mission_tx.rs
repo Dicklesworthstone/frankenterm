@@ -491,7 +491,7 @@ fn canonicalize(value: &mut Value, workspace_root: &Path) {
                         *child = Value::String("<contract_file>".to_string());
                     }
                     "mission_hash" | "content_sha256" if child.is_string() => {
-                        *child = Value::String("<verified_content_hash>".to_string())
+                        *child = Value::String("<verified_content_hash>".to_string());
                     }
                     "checkpoint_id" if child.is_string() => {
                         *child = Value::String("<checkpoint_id>".to_string());
