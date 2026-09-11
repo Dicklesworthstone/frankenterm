@@ -184,7 +184,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 44,
-        "fix": 60,
+        "fix": 61,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 244,
+      "fork_side_commit_count": 245,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-10T21:38:30-04:00",
-        "sha": "bd357dee208ae8a7bbe960c557f5d7eaa857d4f0",
-        "subject": "feat(codec): add layout-bound scrollback line requests"
+        "classification": "fix",
+        "committed_at": "2026-09-11T01:41:54-04:00",
+        "sha": "61a25a181e500a1366f4acf688a86d43184fea68",
+        "subject": "fix(selection): retain wide glyph columns and trim wrapped endpoints"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -847,20 +847,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 13,
-        "fix": 34,
+        "fix": 35,
         "other": 17,
         "refactor": 2,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 99,
+      "fork_side_commit_count": 100,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-10T23:03:11-04:00",
-        "sha": "594f7b3b130f0a78f74b441f4215d918c9ea872d",
-        "subject": "fix(render): stream large scrollback layout indexes with bounded memory"
+        "committed_at": "2026-09-11T01:41:54-04:00",
+        "sha": "61a25a181e500a1366f4acf688a86d43184fea68",
+        "subject": "fix(selection): retain wide glyph columns and trim wrapped endpoints"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1061,8 +1061,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2487,
-  "generated_at": "2026-09-11T04:49:19.632882Z",
+  "fork_side_commit_total": 2489,
+  "generated_at": "2026-09-11T05:42:13.954088Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
