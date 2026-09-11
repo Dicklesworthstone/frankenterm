@@ -107,6 +107,20 @@ pub struct RenderableDimensions {
 #[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(RenderableDimensions);
 
+/// Append/retention bounds are independently validated against each read;
+/// they are not a change to the layout of retained row coordinates.
+pub fn same_line_layout_geometry(
+    left: &RenderableDimensions,
+    right: &RenderableDimensions,
+) -> bool {
+    left.cols == right.cols
+        && left.viewport_rows == right.viewport_rows
+        && left.dpi == right.dpi
+        && left.pixel_width == right.pixel_width
+        && left.pixel_height == right.pixel_height
+        && left.reverse_video == right.reverse_video
+}
+
 /// Implements Pane::get_cursor_position for Terminal
 pub fn terminal_get_cursor_position(term: &mut Terminal) -> StableCursorPosition {
     let pos = term.cursor_pos();
@@ -216,12 +230,13 @@ pub fn terminal_get_lines(
 pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
     let size = term.get_size();
     let screen = term.screen();
+    let (scrollback_top, scrollback_rows) = screen.scrollback_geometry();
     RenderableDimensions {
         cols: screen.physical_cols,
         viewport_rows: screen.physical_rows,
-        scrollback_rows: screen.reachable_scrollback_rows(),
+        scrollback_rows,
         physical_top: screen.visible_row_to_stable_row(0),
-        scrollback_top: screen.scrollback_top_stable_row(),
+        scrollback_top,
         dpi: screen.dpi,
         pixel_width: size.pixel_width,
         pixel_height: size.pixel_height,

@@ -114,6 +114,56 @@ impl Drop for CancelLineReadOnDrop {
     }
 }
 
+fn complete_owned_line_read(
+    result: anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>,
+    permit: mux::pane::LineReadPermit,
+    complete: impl FnOnce(anyhow::Result<OwnedLineReply>),
+) {
+    let (retirement, retired) = std::sync::mpsc::sync_channel(1);
+    let mut retained_cells = Vec::new();
+    let result = result.and_then(|plans| {
+        let mut rows = Vec::new();
+        for plan in &plans {
+            for (index, source) in plan.lines().enumerate() {
+                let stable = stable_row_offset(plan.first_row(), index)
+                    .ok_or_else(|| anyhow!("line read range overflow"))?;
+                let mut line = source.clone();
+                line.compress_for_scrollback();
+                rows.push((stable, line));
+            }
+        }
+        let payload = codec::SerializedLines::from(rows);
+        let counts = payload.validate_structure()?;
+        anyhow::ensure!(
+            counts.lines <= codec::MAX_RENDER_APPLICATION_LINES
+                && counts.cells <= codec::MAX_RENDER_APPLICATION_CELLS
+                && counts.hyperlink_spans <= codec::MAX_RENDER_APPLICATION_HYPERLINK_SPANS
+                && counts.images <= codec::MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+            "line reply structure limit"
+        );
+        let mut bytes_left = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+        let mut work_left = 65_536;
+        // SerializedLines normalizes cells to vector storage. Retain a forced
+        // COW owner so rejected main-thread publication cannot destroy them.
+        retained_cells = payload
+            .lines()
+            .map(|(_, line)| {
+                line.try_clone_for_snapshot(&mut bytes_left, &mut work_left)
+                    .ok_or_else(|| anyhow!("line reply retirement budget"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(OwnedLineReply {
+            plans,
+            payload: Some(payload),
+            retirement,
+        })
+    });
+    complete(result);
+    drop(retired.recv());
+    drop(retained_cells);
+    drop(permit);
+}
+
 fn record_send_key_down_scheduler_receipt(receipt: MainThreadEnqueueReceipt, sampled: bool) {
     let snapshot = receipt.snapshot_after_enqueue;
     metrics::counter!("mux.server.input_scheduler_admission", "outcome" => "admitted").increment(1);
@@ -2197,6 +2247,7 @@ impl MuxRequestErrorContext {
                 | Pdu::GetTlsCreds(_)
                 | Pdu::GetImageCell(_)
                 | Pdu::GetLines(_)
+                | Pdu::GetLinesAtLayout(_)
                 | Pdu::GetSemanticZones(_)
                 | Pdu::GetPaneDirection(_)
                 | Pdu::GetPaneRenderableDimensions(_)
@@ -2302,6 +2353,7 @@ struct PaneRenderBaseline {
     alt_screen_active: bool,
     sent_initial_palette: bool,
     seqno: SequenceNo,
+    line_layout_floor: Option<SequenceNo>,
     config_generation: usize,
     committed_input_epoch: u64,
 }
@@ -2869,6 +2921,10 @@ impl PaneRenderBaseline {
         force_with_input_dispatch_serial: Option<InputSerial>,
         force_for_atomic_effects: bool,
     ) -> SurfacePreparation {
+        let line_layout_floor = pane
+            .get_line_layout()
+            .map(|(floor, _)| floor)
+            .or(self.line_layout_floor);
         let source_start = pane.get_current_seqno();
         let mut changed = false;
         let mouse_grabbed = pane.is_mouse_grabbed();
@@ -2912,6 +2968,17 @@ impl PaneRenderBaseline {
         // under the backend's terminal/cache lock where it has one.
         let (source_query, mut all_dirty_lines) =
             pane.get_changed_since_with_source_fence(viewport_range.clone(), self.seqno);
+        if line_layout_floor != self.line_layout_floor {
+            // A compact cold-map replacement may preserve viewport geometry.
+            // Advertise the invalidation through the existing range protocol;
+            // never hydrate cold text just to send this metadata notification.
+            let start = self.dimensions.scrollback_top.min(dims.scrollback_top);
+            let end = self.dimensions.physical_top.max(dims.physical_top);
+            if start < end {
+                all_dirty_lines.add_range(start..end);
+            }
+            changed = true;
+        }
         if !all_dirty_lines.is_empty() {
             changed = true;
         }
@@ -2975,6 +3042,7 @@ impl PaneRenderBaseline {
         baseline.mouse_grabbed = mouse_grabbed;
         baseline.alt_screen_active = alt_screen_active;
         baseline.seqno = source_query;
+        baseline.line_layout_floor = line_layout_floor;
 
         let bonus_lines = bonus_lines.into();
         SurfacePreparation::Changes(Box::new(PreparedSurfaceChanges {
@@ -8296,7 +8364,14 @@ impl SessionHandler {
                 );
             }
 
-            Pdu::GetLines(GetLines { pane_id, lines }) => {
+            request @ (Pdu::GetLines(_) | Pdu::GetLinesAtLayout(_)) => {
+                let (pane_id, lines, layout) = match request {
+                    Pdu::GetLines(GetLines { pane_id, lines }) => (pane_id, lines, None),
+                    Pdu::GetLinesAtLayout(request) => {
+                        (request.pane_id, request.lines, Some(request.layout))
+                    }
+                    _ => return,
+                };
                 let Some(registration) =
                     capture_pane_or_respond(&authority, pane_id, &send_response)
                 else {
@@ -8326,27 +8401,67 @@ impl SessionHandler {
                             send_response(Err(anyhow!("cold read worker capacity exhausted")));
                             return;
                         };
+                        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let _cancel = CancelLineReadOnDrop(Arc::clone(&cancelled));
+                        let (tx, rx) = frankenterm_core::runtime_async::oneshot::channel();
+                        let worker =
+                            match permit.start(Arc::clone(&cancelled), move |result, permit| {
+                                complete_owned_line_read(result, permit, |result| {
+                                    let _ = tx.send(result);
+                                });
+                            }) {
+                                Ok(worker) => worker,
+                                Err(error) => {
+                                    send_response(Err(error.into()));
+                                    return;
+                                }
+                            };
+                        // Keep captured prefixes outside both pane authority
+                        // and panic recovery. Every exit hands them to the
+                        // already-running worker, including a later-range error.
+                        let mut plans = Vec::with_capacity(lines.len());
                         let captured = recover_line_read_callback(|| {
                             with_current_pane(&authority, &registration, |pane| {
+                                if let Some(layout) = layout {
+                                    if !pane.get_line_layout().is_some_and(|(floor, dimensions)| {
+                                        floor <= layout.seqno
+                                            && layout.seqno <= pane.get_current_seqno()
+                                            && mux::renderable::same_line_layout_geometry(
+                                                &dimensions,
+                                                &layout.dimensions,
+                                            )
+                                    }) {
+                                        pane.notify_lines_ready();
+                                        return Err(anyhow!(
+                                            "line read layout changed or unavailable"
+                                        ));
+                                    }
+                                }
                                 let mut budget =
                                     wezterm_term::screen::LineReadCaptureBudget::default();
-                                let mut plans = Vec::with_capacity(lines.len());
                                 for range in &lines {
                                     match pane.capture_line_read(range.clone(), &mut budget) {
                                         Some(plan) => plans.push(plan?),
-                                        None => return Ok(None),
+                                        None => return Ok(false),
                                     }
                                 }
-                                Ok(Some(plans))
+                                Ok(true)
                             })
                         });
-                        let plans = match captured {
-                            Ok(Some(plans)) => plans,
-                            Ok(None) => {
+                        match captured {
+                            Ok(true) => worker.submit(plans),
+                            Ok(false) => {
+                                cancelled.store(true, Ordering::Release);
+                                worker.submit(plans);
+                                if layout.is_some() {
+                                    send_response(Err(anyhow!(
+                                        "pane does not support layout-fenced reads"
+                                    )));
+                                    return;
+                                }
                                 // Non-local pane types retain their existing
                                 // transport-specific behavior; LocalPane never
                                 // falls back to synchronous storage on refusal.
-                                drop(permit);
                                 send_response(recover_line_read_callback(|| {
                                     with_current_pane(&authority, &registration, |pane| {
                                         let mut result = Vec::new();
@@ -8370,65 +8485,11 @@ impl SessionHandler {
                                 return;
                             }
                             Err(error) => {
+                                cancelled.store(true, Ordering::Release);
+                                worker.submit(plans);
                                 send_response(Err(error));
                                 return;
                             }
-                        };
-                        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let _cancel = CancelLineReadOnDrop(Arc::clone(&cancelled));
-                        let (tx, rx) = frankenterm_core::runtime_async::oneshot::channel();
-                        if let Err(error) = permit.spawn(plans, cancelled, move |result, permit| {
-                            let (retirement, retired) = std::sync::mpsc::sync_channel(1);
-                            let mut retained_cells = Vec::new();
-                            let result = result.and_then(|plans| {
-                                let mut rows = Vec::new();
-                                for plan in &plans {
-                                    for (index, source) in plan.lines().enumerate() {
-                                        let stable = stable_row_offset(plan.first_row(), index)
-                                            .ok_or_else(|| anyhow!("line read range overflow"))?;
-                                        let mut line = source.clone();
-                                        line.compress_for_scrollback();
-                                        rows.push((stable, line));
-                                    }
-                                }
-                                let payload = codec::SerializedLines::from(rows);
-                                let counts = payload.validate_structure()?;
-                                anyhow::ensure!(
-                                    counts.lines <= codec::MAX_RENDER_APPLICATION_LINES
-                                        && counts.cells <= codec::MAX_RENDER_APPLICATION_CELLS
-                                        && counts.hyperlink_spans
-                                            <= codec::MAX_RENDER_APPLICATION_HYPERLINK_SPANS
-                                        && counts.images
-                                            <= codec::MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
-                                    "line reply structure limit"
-                                );
-                                let mut bytes_left =
-                                    wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
-                                let mut work_left = 65_536;
-                                // From(rows) normalizes cells to vector storage.
-                                // Force COW sharing even in the eager profiling
-                                // mode: rejected send_response paths may destroy
-                                // the outgoing PDU synchronously on main.
-                                retained_cells = payload
-                                    .lines()
-                                    .map(|(_, line)| {
-                                        line.try_clone_for_snapshot(&mut bytes_left, &mut work_left)
-                                            .ok_or_else(|| anyhow!("line reply retirement budget"))
-                                    })
-                                    .collect::<anyhow::Result<Vec<_>>>()?;
-                                Ok(OwnedLineReply {
-                                    plans,
-                                    payload: Some(payload),
-                                    retirement,
-                                })
-                            });
-                            let _ = tx.send(result);
-                            drop(retired.recv());
-                            drop(retained_cells);
-                            drop(permit);
-                        }) {
-                            send_response(Err(error.into()));
-                            return;
                         }
                         let result = match frankenterm_core::runtime_async::oneshot_recv(rx).await {
                             Ok(result) => result,
@@ -8444,14 +8505,40 @@ impl SessionHandler {
                                 let mut response_attempted = false;
                                 let published = recover_line_read_callback(|| {
                                     with_current_pane(&authority, &registration, |pane| {
-                                        Ok(pane.publish_line_reads(plans, &mut || {
+                                        let mut publish = || {
                                             if let Some(lines) = payload.take() {
                                                 response_attempted = true;
-                                                send_response(Ok(Pdu::GetLinesResponse(
-                                                    GetLinesResponse { pane_id, lines },
-                                                )));
+                                                let response = match layout {
+                                                    Some(layout) => Pdu::GetLinesAtLayoutResponse(
+                                                        codec::GetLinesAtLayoutResponse {
+                                                            pane_id,
+                                                            layout,
+                                                            lines,
+                                                        },
+                                                    ),
+                                                    None => {
+                                                        Pdu::GetLinesResponse(GetLinesResponse {
+                                                            pane_id,
+                                                            lines,
+                                                        })
+                                                    }
+                                                };
+                                                send_response(Ok(response));
                                             }
-                                        }))
+                                        };
+                                        let accepted = match layout {
+                                            Some(layout) => pane.publish_line_reads_at_layout(
+                                                plans,
+                                                layout.seqno,
+                                                layout.dimensions,
+                                                &mut publish,
+                                            ),
+                                            None => pane.publish_line_reads(plans, &mut publish),
+                                        };
+                                        if layout.is_some() && !accepted {
+                                            pane.notify_lines_ready();
+                                        }
+                                        Ok(accepted)
                                     })
                                 });
                                 if !response_attempted && !matches!(published, Ok(true)) {
@@ -8997,6 +9084,7 @@ impl SessionHandler {
             | Pdu::GetPaneDirectionResponse { .. }
             | Pdu::SearchScrollbackResponse { .. }
             | Pdu::GetLinesResponse { .. }
+            | Pdu::GetLinesAtLayoutResponse { .. }
             | Pdu::GetSemanticZonesResponse { .. }
             | Pdu::GetCodecVersionResponse { .. }
             | Pdu::WindowWorkspaceChanged { .. }
@@ -11376,6 +11464,7 @@ mod tests {
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
+        line_layout_floor: Option<SequenceNo>,
         cursor_line_start_override: Option<StableRowIndex>,
         writer_sink: ParkingMutex<FakePaneWriter>,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
@@ -11395,6 +11484,7 @@ mod tests {
                 callback_probe: None,
                 tiered_scrollback_status_probe: None,
                 seqno_on_dimensions: None,
+                line_layout_floor: None,
                 cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(FakePaneWriter::default()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
@@ -11510,6 +11600,11 @@ mod tests {
 
         fn get_current_seqno(&self) -> SequenceNo {
             self.state.lock().unwrap().seqno
+        }
+
+        fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
+            self.line_layout_floor
+                .map(|floor| (floor, self.state.lock().unwrap().dimensions))
         }
 
         fn get_changed_since(
@@ -18745,6 +18840,50 @@ mod tests {
         let state = per_pane.lock().unwrap();
         assert_eq!(state.baseline.seqno, 11);
         assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+    }
+
+    #[test]
+    fn line_layout_change_advertises_cold_invalidation_without_hydrating_history() {
+        let mut fake = FakePane::new(None);
+        fake.line_layout_floor = Some(9);
+        fake.state.lock().unwrap().dimensions.scrollback_top = -1_000_000_000;
+        let pane: Arc<dyn Pane> = Arc::new(fake);
+        let (_mux, registration) = register_test_pane(&pane);
+        registration
+            .try_with_current(|current| {
+                let SurfacePreparation::Changes(initial) =
+                    PaneRenderBaseline::default().prepare_surface_changes(&current, None, false)
+                else {
+                    panic!("initial surface");
+                };
+                let mut baseline = initial.baseline;
+                assert!(matches!(
+                    baseline.prepare_surface_changes(&current, None, false),
+                    SurfacePreparation::NoChange { .. }
+                ));
+                baseline.line_layout_floor = Some(8);
+                let SurfacePreparation::Changes(changed) =
+                    baseline.prepare_surface_changes(&current, None, false)
+                else {
+                    panic!("layout-only change must be sent");
+                };
+                assert_eq!(changed.response.dirty_lines, vec![-1_000_000_000..0]);
+                assert_eq!(changed.baseline.line_layout_floor, Some(9));
+                assert!(
+                    changed
+                        .response
+                        .bonus_lines
+                        .lines()
+                        .all(|(row, _)| *row >= 0)
+                );
+                assert!(matches!(
+                    changed
+                        .baseline
+                        .prepare_surface_changes(&current, None, false),
+                    SurfacePreparation::NoChange { .. }
+                ));
+            })
+            .unwrap();
     }
 
     #[test]

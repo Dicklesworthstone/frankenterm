@@ -3651,6 +3651,30 @@ mod pane_registration_handle {
             self.owner.notify(MuxNotification::PaneOutput(self.pane_id));
         }
 
+        pub fn get_line_layout(
+            &self,
+        ) -> Option<(
+            termwiz::surface::SequenceNo,
+            crate::renderable::RenderableDimensions,
+        )> {
+            self.pane.get_line_layout()
+        }
+
+        pub fn publish_line_reads_at_layout(
+            &self,
+            reads: &[frankenterm_term::screen::ScreenLineRead],
+            expected_seqno: termwiz::surface::SequenceNo,
+            expected_dimensions: crate::renderable::RenderableDimensions,
+            publish: &mut dyn FnMut(),
+        ) -> bool {
+            self.pane.publish_line_reads_at_layout(
+                reads,
+                expected_seqno,
+                expected_dimensions,
+                publish,
+            )
+        }
+
         pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
             self.pane.palette()
         }

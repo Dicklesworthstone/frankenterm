@@ -81,16 +81,30 @@ impl Default for LineReadCaptureBudget {
 #[derive(Clone)]
 pub struct LineReadFailureWitness {
     screen: ScreenCoordinateWitness,
+    layout_seqno: SequenceNo,
     cold: Option<(
         Arc<dyn crate::config::ScrollbackSpillSink>,
         crate::config::ScrollbackInterval,
     )>,
+    index_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
+    attempted_index: bool,
 }
 
 #[cfg(feature = "use_serde")]
 impl LineReadFailureWitness {
+    pub fn retry_without_index(&self) -> bool {
+        self.attempted_index
+            && self
+                .index_budget_exhausted
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
     pub fn matches(&self, screen: &Screen) -> bool {
-        if !screen.matches_coordinate_witness(&self.screen) {
+        if self.retry_without_index() {
+            return false;
+        }
+        if !screen.matches_coordinate_witness(&self.screen)
+            || screen.cold_visual_seqno != self.layout_seqno
+        {
             return false;
         }
         let Some((before_sink, before)) = &self.cold else {
@@ -128,6 +142,7 @@ impl std::error::Error for ColdReadGeometryUnavailable {}
 #[cfg(feature = "use_serde")]
 pub struct ScreenLineRead {
     witness: ScreenCoordinateWitness,
+    layout_seqno: SequenceNo,
     first: StableRowIndex,
     end: StableRowIndex,
     resident_first: StableRowIndex,
@@ -143,6 +158,25 @@ pub struct ScreenLineRead {
     rendered: Option<Vec<Line>>,
     hot_top: StableRowIndex,
     wrap_policy: ResizeWrapPolicy,
+    layout: Option<Arc<ColdVisualLayout>>,
+    logical_view: Option<(StableRowIndex, Vec<Line>)>,
+    index_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
+    attempted_index: bool,
+}
+
+/// Visual coordinates never replace authenticated backing-store row keys.
+/// Each entry describes one complete logical group in both coordinate spaces.
+/// Only compact metadata is retained by Screen; decoded cells remain worker
+/// owned and are retired by the read consumer.
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+struct ColdVisualLayout {
+    source: Range<StableRowIndex>,
+    visual: Range<StableRowIndex>,
+    resident_frontier: StableRowIndex,
+    groups: Vec<(Range<StableRowIndex>, Range<StableRowIndex>)>,
+    witness: ScreenCoordinateWitness,
+    interval: crate::config::ScrollbackInterval,
 }
 
 #[cfg(feature = "use_serde")]
@@ -156,7 +190,10 @@ impl ScreenLineRead {
     pub fn failure_witness(&self) -> LineReadFailureWitness {
         LineReadFailureWitness {
             screen: self.witness.clone(),
+            layout_seqno: self.layout_seqno,
             cold: self.cold.clone(),
+            index_budget_exhausted: Arc::clone(&self.index_budget_exhausted),
+            attempted_index: self.attempted_index,
         }
     }
     pub fn row_count(&self) -> usize {
@@ -169,6 +206,23 @@ impl ScreenLineRead {
     }
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes
+    }
+
+    /// A cache may serve a subset of the complete logical context hydrated by
+    /// its worker. Borrowed cells stay owned by this read's retirement guard.
+    pub fn cached_lines(
+        &self,
+        requested: Range<StableRowIndex>,
+    ) -> Option<(StableRowIndex, &[Line])> {
+        let (first, lines) = self.logical_view.as_ref()?;
+        let end = first.checked_add(StableRowIndex::try_from(lines.len()).ok()?)?;
+        if requested.start < *first || requested.end > end || requested.end < requested.start {
+            return None;
+        }
+        Some((
+            requested.start,
+            &lines[(requested.start - first) as usize..(requested.end - first) as usize],
+        ))
     }
 
     /// Run only off the UI thread and outside terminal/registration locks.
@@ -189,6 +243,7 @@ impl ScreenLineRead {
         struct Charge {
             used: usize,
             limit: usize,
+            index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
         }
         impl std::io::Write for Charge {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -196,14 +251,23 @@ impl ScreenLineRead {
                     .used
                     .checked_add(bytes.len())
                     .filter(|n| *n <= self.limit)
-                    .ok_or_else(|| std::io::Error::other("cold read payload limit"))?;
+                    .ok_or_else(|| {
+                        if let Some(failed) = &self.index_failure {
+                            failed.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        std::io::Error::other("cold read payload limit")
+                    })?;
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
-        let mut charge = Charge { used: 0, limit };
+        let mut charge = Charge {
+            used: 0,
+            limit,
+            index_failure: None,
+        };
         fn context_batch(
             sink: &dyn crate::config::ScrollbackSpillSink,
             mut range: Range<StableRowIndex>,
@@ -226,15 +290,126 @@ impl ScreenLineRead {
             }
             Ok(result)
         }
-        let mut row = self.first;
-        while row < self.resident_first {
+        if let Some(layout) = self.layout.as_ref().map(Arc::clone) {
+            anyhow::ensure!(
+                self.resident_first <= layout.visual.end,
+                ColdReadGeometryUnavailable
+            );
+            let sink = &self
+                .cold
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?
+                .0;
+            let mut visible = Vec::new();
+            let mut context_first = None;
+            let mut expanded_cells = 0usize;
+            for (source, visual) in &layout.groups {
+                if visual.end <= self.first || visual.start >= self.resident_first {
+                    continue;
+                }
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                let mut source_row = source.start;
+                let mut logical: Option<Line> = None;
+                while source_row < source.end {
+                    let batch = context_batch(
+                        sink.as_ref(),
+                        source_row..source.end.min(source_row.saturating_add(32)),
+                        &mut charge,
+                        &cancelled,
+                    )?;
+                    for mut line in batch {
+                        let seqno = line.current_seqno();
+                        line.set_last_cell_was_wrapped(false, seqno);
+                        if let Some(logical) = &mut logical {
+                            let seqno = logical.current_seqno().max(seqno);
+                            logical.append_line(line, seqno);
+                        } else {
+                            logical = Some(line);
+                        }
+                        source_row += 1;
+                    }
+                }
+                let logical =
+                    logical.ok_or_else(|| anyhow::anyhow!("cold logical group unavailable"))?;
+                expanded_cells = expanded_cells
+                    .checked_add(logical.len())
+                    .ok_or_else(|| anyhow::anyhow!("cold reflow expanded cell overflow"))?;
+                anyhow::ensure!(
+                    expanded_cells <= limit / std::mem::size_of::<Cell>(),
+                    "cold reflow expanded cell limit"
+                );
+                let seqno = logical.current_seqno();
+                let (wrapped, _) = Screen::wrap_single_logical_line_for_resize(
+                    logical,
+                    self.witness.cols,
+                    seqno,
+                    self.wrap_policy,
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                anyhow::ensure!(
+                    wrapped.len() == (visual.end - visual.start) as usize,
+                    "cold visual index source changed"
+                );
+                context_first.get_or_insert(visual.start);
+                visible.extend(wrapped);
+            }
+            visible.extend(self.resident.iter().cloned());
+            for line in &mut visible {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                let _ = line.cells_mut_for_attr_changes_only();
+                serde_json::to_writer(&mut charge, line)?;
+            }
+            let context_first = context_first.unwrap_or(self.resident_first);
+            let selected: Vec<_> = visible
+                .iter()
+                .skip((self.first - context_first) as usize)
+                .take(self.requested_row_count())
+                .cloned()
+                .collect();
+            anyhow::ensure!(
+                selected.len() == self.requested_row_count(),
+                "cold visual index incomplete viewport"
+            );
+            self.cold_context = Some(layout.source.clone());
+            self.logical_view = Some((context_first, visible));
+            self.rendered = Some(selected);
+            self.payload_bytes = charge.used;
+            self.complete = true;
+            return Ok(self);
+        }
+        // Index the entire admitted cold prefix so a row-count change in an
+        // earlier logical group cannot silently shift only this viewport.
+        // All reads and reflow happen on the worker under one payload budget.
+        let cold_source = if self.first < self.resident_first && self.attempted_index {
+            let retained = self
+                .cold
+                .as_ref()
+                .and_then(|(_, interval)| interval.rows())
+                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?;
+            let source = retained.start..self.hot_top;
+            (source.end.saturating_sub(source.start) as usize
+                <= Self::MAX_ROWS.saturating_sub(self.resident.len()))
+            .then_some(source)
+        } else {
+            None
+        };
+        if cold_source.is_some() {
+            charge.index_failure = Some(Arc::clone(&self.index_budget_exhausted));
+        }
+        let mut row = cold_source
+            .as_ref()
+            .map_or(self.first, |source| source.start);
+        let cold_end = cold_source
+            .as_ref()
+            .map_or(self.resident_first, |source| source.end);
+        while row < cold_end {
             anyhow::ensure!(!cancelled(), "cold read cancelled");
             let sink = &self
                 .cold
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?
                 .0;
-            let end = self.resident_first.min(row.saturating_add(32));
+            let end = cold_end.min(row.saturating_add(32));
             let batch = sink.load_scrollback_lines(row..end);
             anyhow::ensure!(
                 !batch.is_empty() && batch.len() <= (end - row) as usize,
@@ -260,8 +435,11 @@ impl ScreenLineRead {
                 .rows()
                 .ok_or_else(|| anyhow::anyhow!("cold context unavailable"))?;
             let mut context: VecDeque<Line> = self.hydrated.iter().cloned().collect();
-            let mut context_first = self.first;
+            let mut context_first = cold_source
+                .as_ref()
+                .map_or(self.first, |source| source.start);
             let mut checked_first = context_first;
+            let mut predecessor_batch_rows = 1;
             // The predecessor is part of the witness even when it terminates
             // a different logical line: its wrap bit justified this boundary.
             while context_first > retained.start {
@@ -270,8 +448,8 @@ impl ScreenLineRead {
                     context.len() + self.resident.len() < Self::MAX_ROWS,
                     "cold logical context row limit"
                 );
-                let count = (Self::MAX_ROWS - context.len() - self.resident.len()).min(32)
-                    as StableRowIndex;
+                let count = (Self::MAX_ROWS - context.len() - self.resident.len())
+                    .min(predecessor_batch_rows) as StableRowIndex;
                 let from = retained.start.max(context_first.saturating_sub(count));
                 let batch =
                     context_batch(sink.as_ref(), from..context_first, &mut charge, &cancelled)?;
@@ -289,8 +467,12 @@ impl ScreenLineRead {
                 if found_start {
                     break;
                 }
+                predecessor_batch_rows = (predecessor_batch_rows * 2).min(32);
             }
-            let mut context_end = self.resident_first;
+            let mut context_end = cold_source
+                .as_ref()
+                .map_or(self.resident_first, |source| source.end);
+            let mut successor_batch_rows = 1;
             while context.back().is_some_and(Line::last_cell_was_wrapped)
                 && context_end < self.hot_top
             {
@@ -303,8 +485,8 @@ impl ScreenLineRead {
                     context_end < retained.end,
                     "cold logical successor unavailable"
                 );
-                let count = (Self::MAX_ROWS - context.len() - self.resident.len()).min(32)
-                    as StableRowIndex;
+                let count = (Self::MAX_ROWS - context.len() - self.resident.len())
+                    .min(successor_batch_rows) as StableRowIndex;
                 let to = self
                     .hot_top
                     .min(retained.end)
@@ -318,12 +500,16 @@ impl ScreenLineRead {
                         break;
                     }
                 }
+                successor_batch_rows = (successor_batch_rows * 2).min(32);
             }
             self.cold_context = Some(checked_first..context_end);
             let cold_len = context.len();
             context.extend(self.resident.iter().cloned());
             let source: Vec<Line> = context.into_iter().collect();
             let mut output = Vec::with_capacity(source.len());
+            let mut groups = Vec::new();
+            let mut expanded_cells = 0usize;
+            let mut index_source_end = self.hot_top;
             let mut start = 0;
             while start < source.len() {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
@@ -334,6 +520,17 @@ impl ScreenLineRead {
                 let mut end = start + 1;
                 while source[end - 1].last_cell_was_wrapped() && end < source.len() {
                     end += 1;
+                }
+                if cold_source.is_some()
+                    && (source[end - 1].last_cell_was_wrapped() || end > cold_len)
+                {
+                    // An unfinished trailing logical group must not make all
+                    // earlier cold history unreadable. Keep its source/visual
+                    // coordinates reserved until the seam transaction can
+                    // move its resident cells and anchors atomically.
+                    index_source_end = context_first + start as StableRowIndex;
+                    anyhow::ensure!(self.end <= index_source_end, ColdReadGeometryUnavailable);
+                    break;
                 }
                 anyhow::ensure!(
                     !source[end - 1].last_cell_was_wrapped(),
@@ -350,12 +547,21 @@ impl ScreenLineRead {
                 }
                 let seqno = logical.current_seqno();
                 logical.set_last_cell_was_wrapped(false, seqno);
+                if cold_source.is_none() {
+                    anyhow::ensure!(
+                        logical.len().div_ceil(self.witness.cols.max(1)) <= end - start,
+                        ColdReadGeometryUnavailable
+                    );
+                }
+                expanded_cells = expanded_cells
+                    .checked_add(logical.len())
+                    .ok_or_else(|| anyhow::anyhow!("cold reflow expanded cell overflow"))?;
+                if cold_source.is_some() && expanded_cells > limit / std::mem::size_of::<Cell>() {
+                    self.index_budget_exhausted
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 anyhow::ensure!(
-                    logical.len().div_ceil(self.witness.cols.max(1)) <= end - start,
-                    ColdReadGeometryUnavailable
-                );
-                anyhow::ensure!(
-                    logical.len() <= Self::MAX_PAYLOAD_BYTES / std::mem::size_of::<Cell>(),
+                    expanded_cells <= limit / std::mem::size_of::<Cell>(),
                     "cold reflow expanded cell limit"
                 );
                 let (wrapped, _) = Screen::wrap_single_logical_line_for_resize(
@@ -365,26 +571,79 @@ impl ScreenLineRead {
                     self.wrap_policy,
                     &mut LineWrapWidthPrefixScratch::default(),
                 );
-                anyhow::ensure!(wrapped.len() == end - start, ColdReadGeometryUnavailable);
+                if cold_source.is_none() {
+                    anyhow::ensure!(wrapped.len() == end - start, ColdReadGeometryUnavailable);
+                }
+                if cold_source.is_some()
+                    && output
+                        .len()
+                        .checked_add(wrapped.len())
+                        .is_none_or(|n| n > Self::MAX_ROWS)
+                {
+                    self.index_budget_exhausted
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                anyhow::ensure!(
+                    output
+                        .len()
+                        .checked_add(wrapped.len())
+                        .is_some_and(|n| n <= Self::MAX_ROWS),
+                    "cold visual index output row limit"
+                );
+                groups.push((
+                    (context_first + start as StableRowIndex)
+                        ..(context_first + end as StableRowIndex),
+                    output.len()..output.len() + wrapped.len(),
+                ));
                 output.extend(wrapped);
                 start = end;
             }
-            let skip = (self.first - context_first) as usize;
-            let mut visible: Vec<Line> = output
-                .into_iter()
+            let visual_count = output.len() - self.resident.len();
+            let visual_first = if cold_source.is_some() {
+                index_source_end
+                    .checked_sub(StableRowIndex::try_from(visual_count)?)
+                    .ok_or_else(|| anyhow::anyhow!("cold visual coordinate overflow"))?
+            } else {
+                context_first
+            };
+            self.layout = cold_source.as_ref().map(|_| {
+                Arc::new(ColdVisualLayout {
+                    source: context_first..index_source_end,
+                    visual: visual_first..index_source_end,
+                    resident_frontier: self.hot_top,
+                    groups: groups
+                        .into_iter()
+                        .map(|(source, visual)| {
+                            (
+                                source,
+                                (visual_first + visual.start as StableRowIndex)
+                                    ..(visual_first + visual.end as StableRowIndex),
+                            )
+                        })
+                        .collect(),
+                    witness: self.witness.clone(),
+                    interval: interval.clone(),
+                })
+            });
+            self.first = self.first.max(visual_first);
+            self.end = self.end.max(self.first);
+            let skip = (self.first - visual_first) as usize;
+            for line in &mut output {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                let _ = line.cells_mut_for_attr_changes_only();
+                serde_json::to_writer(&mut charge, line)?;
+            }
+            let visible: Vec<Line> = output
+                .iter()
                 .skip(skip)
                 .take(self.requested_row_count())
+                .cloned()
                 .collect();
             anyhow::ensure!(
                 visible.len() == self.requested_row_count(),
                 "cold reflow incomplete viewport"
             );
-            for line in &mut visible {
-                // Prepare COW cells on the worker, not by deep-cloning a
-                // clustered cached row for every native paint.
-                let _ = line.cells_mut_for_attr_changes_only();
-                serde_json::to_writer(&mut charge, line)?;
-            }
+            self.logical_view = Some((visual_first, output));
             self.rendered = Some(visible);
         }
         anyhow::ensure!(!cancelled(), "cold read cancelled");
@@ -407,6 +666,17 @@ impl ScreenLineRead {
 #[derive(Debug, Clone)]
 pub struct Screen {
     coordinate_identity: ScreenCoordinateIdentity,
+    #[cfg(feature = "use_serde")]
+    cold_visual_layout: Option<Arc<ColdVisualLayout>>,
+    #[cfg(feature = "use_serde")]
+    cold_visual_seqno: SequenceNo,
+    #[cfg(feature = "use_serde")]
+    cold_source_observation: Option<(
+        Arc<dyn crate::config::ScrollbackSpillSink>,
+        crate::config::ScrollbackInterval,
+    )>,
+    #[cfg(feature = "use_serde")]
+    cold_index_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
     /// Holds the line data that comprises the screen contents.
     /// This is allocated with capacity for the entire scrollback.
     /// The last N lines are the visible lines, with those prior being
@@ -1621,6 +1891,9 @@ impl Screen {
                             // a requested cold row onto resident row zero.
                             anyhow::ensure!(rows.end >= hot_top, "cold read discontinuity");
                             oldest = rows.start.min(hot_top);
+                            if let Some(layout) = self.current_cold_visual_layout() {
+                                oldest = layout.visual.start;
+                            }
                         }
                         cold = Some((sink, interval));
                     }
@@ -1645,20 +1918,22 @@ impl Screen {
             let start = self
                 .stable_row_to_phys(resident_first)
                 .ok_or_else(|| anyhow::anyhow!("resident read unavailable"))?;
-            self.lines
-                .iter()
-                .skip(start)
-                .take((end - resident_first) as usize)
-                .map(|line| {
-                    line.try_clone_for_snapshot(&mut budget.bytes_left, &mut budget.work_left)
-                        .ok_or_else(|| anyhow::anyhow!("resident snapshot allocation/work limit"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
+            let stop = start + (end - resident_first) as usize;
+            anyhow::ensure!(stop <= self.lines.len(), "resident read unavailable");
+            let (first, second) = self.lines.as_slices();
+            Line::try_clone_batch_for_snapshot(
+                &first[start.min(first.len())..stop.min(first.len())],
+                &second[start.saturating_sub(first.len())..stop.saturating_sub(first.len())],
+                &mut budget.bytes_left,
+                &mut budget.work_left,
+            )
+            .ok_or_else(|| anyhow::anyhow!("resident snapshot allocation/work limit"))?
         } else {
             Vec::new()
         };
         Ok(ScreenLineRead {
             witness: self.capture_coordinate_witness(),
+            layout_seqno: self.cold_visual_seqno,
             first,
             end,
             resident_first,
@@ -1671,6 +1946,18 @@ impl Screen {
             rendered: None,
             hot_top,
             wrap_policy: self.resize_wrap_policy,
+            layout: if first < resident_first {
+                self.current_cold_visual_layout()
+                    .filter(|layout| resident_first <= layout.visual.end)
+                    .and_then(|_| self.cold_visual_layout.as_ref().map(Arc::clone))
+            } else {
+                None
+            },
+            logical_view: None,
+            index_budget_exhausted: Arc::clone(&self.cold_index_budget_exhausted),
+            attempted_index: !self
+                .cold_index_budget_exhausted
+                .load(std::sync::atomic::Ordering::Acquire),
         })
     }
 
@@ -1684,7 +1971,25 @@ impl Screen {
         {
             return false;
         }
-        if read.first < read.resident_first {
+        if read.first < read.resident_first || read.layout.is_some() {
+            if read.layout_seqno != self.cold_visual_seqno {
+                // Another worker may have published while this read was in
+                // flight. Identical or prefix-extending mappings are safe;
+                // shifted coordinates must never roll the live map backwards.
+                let compatible = read
+                    .layout
+                    .as_ref()
+                    .zip(self.current_cold_visual_layout())
+                    .is_some_and(|(before, now)| {
+                        before.source.start == now.source.start
+                            && before.visual.start == now.visual.start
+                            && (before.groups.starts_with(&now.groups)
+                                || now.groups.starts_with(&before.groups))
+                    });
+                if !compatible {
+                    return false;
+                }
+            }
             let Some((source, before)) = &read.cold else {
                 return false;
             };
@@ -1696,7 +2001,12 @@ impl Screen {
             }
             match current.try_capture_scrollback_interval() {
                 ScrollbackIntervalCapture::Ready(now)
-                    if now.retains(
+                    if read.layout.as_ref().is_none_or(|layout| {
+                        layout.resident_frontier <= self.phys_to_stable_row_index(0)
+                            && now
+                                .rows()
+                                .is_some_and(|rows| rows.start == layout.source.start)
+                    }) && now.retains(
                         before,
                         read.cold_context
                             .clone()
@@ -1728,6 +2038,133 @@ impl Screen {
         true
     }
 
+    /// Install only after all reads in a publication transaction validate.
+    /// The stored prefix and resident coordinates are unchanged; consumers
+    /// now share this generation's visual-to-source mapping.
+    #[cfg(feature = "use_serde")]
+    pub fn line_read_changes_layout(&self, read: &ScreenLineRead) -> bool {
+        read.layout.as_ref().is_some_and(|next| {
+            self.current_cold_visual_layout().is_none_or(|current| {
+                // Extending an unchanged prefix with already-current-width
+                // rows does not invalidate older visual coordinates.
+                current.source.start != next.source.start
+                    || current.visual.start != next.visual.start
+                    || current.source.end > next.source.end
+                    || !next.groups.starts_with(&current.groups)
+            })
+        })
+    }
+
+    /// Reconcile asynchronous retention/replacement with the terminal's wire
+    /// sequence. The caller increments its sequence before publishing a pair.
+    /// Busy is not an unchanged authority and must defer the observation.
+    #[cfg(feature = "use_serde")]
+    pub fn refresh_cold_source_observation(&mut self) -> Option<bool> {
+        let Some(sink) = self
+            .config
+            .scrollback_spill_sink()
+            .filter(|_| self.allow_scrollback)
+        else {
+            return Some(self.cold_source_observation.take().is_some());
+        };
+        let crate::config::ScrollbackIntervalCapture::Ready(now) =
+            sink.try_capture_scrollback_interval()
+        else {
+            return None;
+        };
+        let changed = self
+            .cold_source_observation
+            .as_ref()
+            .is_none_or(|(before_sink, before)| {
+                !Arc::ptr_eq(before_sink, &sink)
+                    || match (before.rows(), now.rows()) {
+                        (Some(before_rows), Some(now_rows)) => {
+                            before_rows.start != now_rows.start
+                                || now_rows.end < before_rows.end
+                                || !now.retains(before, before_rows)
+                        }
+                        (None, None) => false,
+                        _ => true,
+                    }
+            });
+        if changed {
+            self.cold_index_budget_exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        }
+        self.cold_source_observation = Some((sink, now));
+        Some(changed)
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn install_line_read_layout(&mut self, read: &ScreenLineRead, seqno: SequenceNo) {
+        if let Some(layout) = &read.layout {
+            if self.current_cold_visual_layout().is_some_and(|current| {
+                current.source.start == layout.source.start
+                    && current.visual.start == layout.visual.start
+                    && current.source.end >= layout.source.end
+                    && current.groups.starts_with(&layout.groups)
+            }) {
+                return;
+            }
+            if self.line_read_changes_layout(read) {
+                self.cold_visual_seqno = seqno;
+            }
+            self.cold_visual_layout = Some(Arc::clone(layout));
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn cold_visual_layout_seqno(&self) -> SequenceNo {
+        self.cold_visual_seqno
+    }
+
+    /// Expand presentation work to complete indexed logical groups before
+    /// hyperlink scanning. Binary search touches metadata only, never storage.
+    #[cfg(feature = "use_serde")]
+    pub fn expand_cold_logical_range(
+        &self,
+        requested: Range<StableRowIndex>,
+    ) -> Range<StableRowIndex> {
+        let Some(layout) = self.current_cold_visual_layout() else {
+            return requested;
+        };
+        if requested.start >= requested.end {
+            return requested;
+        }
+        let first = layout
+            .groups
+            .partition_point(|(_, visual)| visual.end <= requested.start);
+        let end = layout
+            .groups
+            .partition_point(|(_, visual)| visual.start < requested.end);
+        if first >= end {
+            return requested;
+        }
+        layout.groups[first].1.start.min(requested.start)
+            ..layout.groups[end - 1].1.end.max(requested.end)
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn current_cold_visual_layout(&self) -> Option<&ColdVisualLayout> {
+        let layout = self.cold_visual_layout.as_deref()?;
+        if !self.matches_coordinate_witness(&layout.witness)
+            || layout.resident_frontier > self.phys_to_stable_row_index(0)
+        {
+            return None;
+        }
+        let sink = self.config.scrollback_spill_sink()?;
+        match sink.try_capture_scrollback_interval() {
+            crate::config::ScrollbackIntervalCapture::Ready(now)
+                if now
+                    .rows()
+                    .is_some_and(|rows| rows.start == layout.source.start)
+                    && now.retains(&layout.interval, layout.source.clone()) =>
+            {
+                Some(layout)
+            }
+            _ => None,
+        }
+    }
+
     /// Capture without consulting configuration/sink callbacks or scanning
     /// lines. Cloning the token only increments its reference count.
     pub fn capture_coordinate_witness(&self) -> ScreenCoordinateWitness {
@@ -1749,8 +2186,12 @@ impl Screen {
             && self.dpi == witness.dpi
     }
 
-    fn invalidate_coordinate_witnesses(&mut self) {
+    pub(crate) fn invalidate_coordinate_witnesses(&mut self) {
         self.coordinate_identity = ScreenCoordinateIdentity::default();
+        #[cfg(feature = "use_serde")]
+        {
+            self.cold_index_budget_exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        }
     }
 
     /// Validate and account only the resident screen model.
@@ -2066,6 +2507,14 @@ impl Screen {
             physical_cols,
             stable_row_index_offset: 0,
             coordinate_identity: ScreenCoordinateIdentity::default(),
+            #[cfg(feature = "use_serde")]
+            cold_visual_layout: None,
+            #[cfg(feature = "use_serde")]
+            cold_visual_seqno: 0,
+            #[cfg(feature = "use_serde")]
+            cold_source_observation: None,
+            #[cfg(feature = "use_serde")]
+            cold_index_budget_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
@@ -2334,10 +2783,19 @@ impl Screen {
     }
 
     fn oldest_reachable_stable_row(&self) -> StableRowIndex {
+        #[cfg(feature = "use_serde")]
+        if let Some(layout) = self.current_cold_visual_layout() {
+            return layout.visual.start;
+        }
         let hot_top = self.phys_to_stable_row_index(0);
         self.config
             .scrollback_spill_sink()
-            .and_then(|sink| sink.oldest_scrollback_row())
+            .and_then(|sink| match sink.try_capture_scrollback_interval() {
+                crate::config::ScrollbackIntervalCapture::Ready(interval) => {
+                    interval.rows().map(|rows| rows.start)
+                }
+                _ => None,
+            })
             .unwrap_or(hot_top)
             .min(hot_top)
     }
@@ -4127,6 +4585,17 @@ impl Screen {
         usize::try_from(newest_exclusive.saturating_sub(oldest)).unwrap_or(0)
     }
 
+    /// Derive both values from one metadata observation, not two potentially
+    /// different asynchronous retention states.
+    pub fn scrollback_geometry(&self) -> (StableRowIndex, usize) {
+        let oldest = self.oldest_reachable_stable_row();
+        let newest = self.phys_to_stable_row_index(self.lines.len());
+        (
+            oldest,
+            usize::try_from(newest.saturating_sub(oldest)).unwrap_or(0),
+        )
+    }
+
     /// Returns the number of in-memory scrollback rows retained above the
     /// visible viewport.
     pub fn in_memory_scrollback_rows(&self) -> usize {
@@ -4948,6 +5417,10 @@ impl Screen {
         first = first.max(oldest);
 
         let sink = self.config.scrollback_spill_sink();
+        #[cfg(feature = "use_serde")]
+        let layout = self
+            .current_cold_visual_layout()
+            .map(|_| Arc::clone(self.cold_visual_layout.as_ref().unwrap()));
         let mut lines = Vec::with_capacity(resolved_len);
         let end = first + resolved_len as StableRowIndex;
         let mut stable_row = first;
@@ -4965,6 +5438,63 @@ impl Screen {
             let Some(sink) = sink.as_ref() else {
                 break;
             };
+            #[cfg(feature = "use_serde")]
+            if let Some(layout) = layout
+                .as_ref()
+                .filter(|layout| layout.visual.contains(&stable_row))
+            {
+                let Some((source, visual)) = layout
+                    .groups
+                    .iter()
+                    .find(|(_, visual)| visual.contains(&stable_row))
+                else {
+                    break;
+                };
+                let mut source_row = source.start;
+                let mut logical: Option<Line> = None;
+                while source_row < source.end {
+                    let batch = sink.load_scrollback_lines(
+                        source_row..source.end.min(source_row.saturating_add(32)),
+                    );
+                    if batch.is_empty() || batch.len() > (source.end - source_row) as usize {
+                        return (first, lines);
+                    }
+                    for mut line in batch {
+                        let seqno = line.current_seqno();
+                        line.set_last_cell_was_wrapped(false, seqno);
+                        if let Some(logical) = &mut logical {
+                            let seqno = logical.current_seqno().max(seqno);
+                            logical.append_line(line, seqno);
+                        } else {
+                            logical = Some(line);
+                        }
+                        source_row += 1;
+                    }
+                }
+                let Some(logical) = logical else {
+                    break;
+                };
+                let seqno = logical.current_seqno();
+                let (wrapped, _) = Self::wrap_single_logical_line_for_resize(
+                    logical,
+                    self.physical_cols,
+                    seqno,
+                    self.resize_wrap_policy,
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                if wrapped.len() != (visual.end - visual.start) as usize {
+                    break;
+                }
+                let count = (end.min(visual.end) - stable_row) as usize;
+                lines.extend(
+                    wrapped
+                        .into_iter()
+                        .skip((stable_row - visual.start) as usize)
+                        .take(count),
+                );
+                stable_row += count as StableRowIndex;
+                continue;
+            }
             let cold_end = end.min(self.phys_to_stable_row_index(0));
             let batch_end = cold_end.min(stable_row.saturating_add(32));
             let batch = sink.load_scrollback_lines(stable_row..batch_end);
@@ -4983,8 +5513,24 @@ impl Screen {
         stable_lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> Vec<StableRowIndex> {
-        let phys = self.stable_range(&stable_lines);
+        // Unlike a text fetch, a dirty query must never substitute nearby rows
+        // for an unavailable interval. Intersect before stable_range applies
+        // its deliberate top/bottom clamping semantics.
+        let resident = stable_lines.start.max(self.phys_to_stable_row_index(0))
+            ..stable_lines
+                .end
+                .min(self.phys_to_stable_row_index(self.lines.len()));
+        let phys = self.stable_range(&resident);
         let mut set = vec![];
+        #[cfg(feature = "use_serde")]
+        if self.cold_visual_seqno > seqno {
+            if let Some(layout) = self.current_cold_visual_layout() {
+                set.extend(
+                    stable_lines.start.max(layout.visual.start)
+                        ..stable_lines.end.min(layout.visual.end),
+                );
+            }
+        }
         for (idx, line) in self
             .lines
             .iter()
@@ -5605,8 +6151,8 @@ mod tests {
         }
         sink.state.lock().unwrap().1.remove(&-1);
         assert!(
-            screen.validates_line_read(&read),
-            "trimming outside the exact interval is harmless"
+            !screen.validates_line_read(&read),
+            "a whole-prefix visual index must be rebuilt after prefix trim"
         );
         // Retention trims a contiguous prefix; an interior hole cannot be
         // represented by the sink's interval witness.
@@ -5690,14 +6236,48 @@ mod tests {
         let plan = screen.capture_line_read(0..2).unwrap();
         let failure = plan.failure_witness();
         assert!(failure.matches(&screen));
-        let error = match plan.hydrate(|| false) {
-            Ok(_) => panic!("three target rows cannot reuse two persisted coordinates"),
-            Err(error) => error,
-        };
-        assert!(
-            error.is::<ColdReadGeometryUnavailable>(),
-            "structural failure is not transient Busy"
+        let read = plan.hydrate(|| false).unwrap();
+        assert!(screen.validates_line_read(&read));
+        screen.install_line_read_layout(&read, 5);
+        assert_eq!(screen.scrollback_top_stable_row(), -1);
+        assert_eq!(screen.reachable_scrollback_rows(), screen.lines.len() + 3);
+        let read = screen
+            .capture_line_read(-1..2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(read.first_row(), -1);
+        assert_eq!(
+            read.lines()
+                .map(|line| line.as_str().to_string())
+                .collect::<Vec<_>>(),
+            ["abc", "def", "gh"]
         );
+        let (first, lines) = screen.lines_in_stable_range(-1..2);
+        assert_eq!(first, -1);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.as_str().to_string())
+                .collect::<Vec<_>>(),
+            ["abc", "def", "gh"]
+        );
+        assert_eq!(
+            sink.state
+                .lock()
+                .unwrap()
+                .1
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "visual remapping never rewrites stored keys"
+        );
+        assert!(
+            !failure.matches(&screen),
+            "publishing a new layout invalidates an old remembered failure"
+        );
+        let failure = screen.capture_line_read(0..1).unwrap().failure_witness();
         assert!(failure.matches(&screen));
         screen.physical_cols = 5;
         assert!(
@@ -5709,6 +6289,154 @@ mod tests {
         assert!(
             !failure.matches(&screen),
             "same-coordinate replacement invalidates remembered failure"
+        );
+        // An unrelated trailing cold/resident seam must not suppress earlier
+        // complete logical groups, including groups whose row count changes.
+        let mut tail = Line::from_text("part", &CellAttributes::blank(), 6, None);
+        tail.set_last_cell_was_wrapped(true, 6);
+        {
+            let mut state = sink.state.lock().unwrap();
+            state.0 = ScrollbackIntervalIdentity::default();
+            state.1 = vec![
+                (
+                    0,
+                    Line::from_text("older", &CellAttributes::blank(), 6, None),
+                ),
+                (1, tail),
+            ]
+            .into_iter()
+            .collect();
+        }
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(read.lines().next().unwrap().as_str(), "er");
+        assert!(screen.validates_line_read(&read));
+        screen.install_line_read_layout(&read, 6);
+        assert_eq!(screen.scrollback_top_stable_row(), -1);
+        assert_eq!(screen.get_changed_stable_rows(-1..1, 5), [-1, 0]);
+        let before_reads = sink.reads.load(Ordering::Relaxed);
+        let indexed = screen
+            .capture_line_read(-1..0)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(indexed.lines().next().unwrap().as_str(), "old");
+        assert_eq!(
+            sink.reads.load(Ordering::Relaxed) - before_reads,
+            1,
+            "index reuse reads only the intersecting source group, not the trailing seam"
+        );
+        assert_eq!(
+            indexed.cached_lines(-1..1).unwrap().1.len(),
+            2,
+            "logical context survives a partial viewport request"
+        );
+        assert!(
+            screen
+                .capture_line_read(1..2)
+                .unwrap()
+                .hydrate(|| false)
+                .is_err(),
+            "seam remains explicitly unavailable until its atomic transaction"
+        );
+        assert_eq!(screen.refresh_cold_source_observation(), Some(true));
+        assert_eq!(screen.refresh_cold_source_observation(), Some(false));
+        sink.state.lock().unwrap().0 = ScrollbackIntervalIdentity::default();
+        assert_eq!(
+            screen.refresh_cold_source_observation(),
+            Some(true),
+            "same bounds with new source lineage changes wire authority"
+        );
+        {
+            let _busy = sink.state.lock().unwrap();
+            assert_eq!(screen.refresh_cold_source_observation(), None);
+        }
+        // A full-index budget failure is a one-time optimization refusal,
+        // not a permanent refusal of a small previously admissible read.
+        {
+            let mut state = sink.state.lock().unwrap();
+            state.0 = ScrollbackIntervalIdentity::default();
+            state.1 = (0..41)
+                .map(|row| {
+                    (
+                        row,
+                        Line::from_text("small", &CellAttributes::blank(), 7, None),
+                    )
+                })
+                .collect();
+            state.1.insert(
+                0,
+                Line::from_text(&"x".repeat(64 * 1024), &CellAttributes::blank(), 7, None),
+            );
+        }
+        screen.stable_row_index_offset = 41;
+        screen.physical_cols = 8;
+        assert_eq!(screen.refresh_cold_source_observation(), Some(true));
+        let plan = screen.capture_line_read(40..41).unwrap();
+        let failure = plan.failure_witness();
+        assert!(plan
+            .hydrate_with_payload_limit(16 * 1024, || false)
+            .is_err());
+        assert!(failure.retry_without_index());
+        let fallback = screen.capture_line_read(40..41).unwrap();
+        assert!(!fallback.failure_witness().retry_without_index());
+        let fallback = fallback
+            .hydrate_with_payload_limit(16 * 1024, || false)
+            .unwrap();
+        assert_eq!(fallback.first_row(), 40);
+        assert_eq!(fallback.lines().next().unwrap().as_str(), "small");
+        assert!(screen.validates_line_read(&fallback));
+        assert!(
+            fallback.layout.is_none(),
+            "fallback does not claim a complete geometry index"
+        );
+        // A slower worker captured before a count-changing extension cannot
+        // replace the newer map, even though its immutable source rows remain.
+        let mut head = Line::from_text("abcd", &CellAttributes::blank(), 9, None);
+        head.set_last_cell_was_wrapped(true, 9);
+        {
+            let mut state = sink.state.lock().unwrap();
+            state.0 = ScrollbackIntervalIdentity::default();
+            state.1 = vec![
+                (0, head),
+                (
+                    1,
+                    Line::from_text("efgh", &CellAttributes::blank(), 9, None),
+                ),
+            ]
+            .into_iter()
+            .collect();
+        }
+        screen.physical_cols = 3;
+        screen.stable_row_index_offset = 2;
+        screen.refresh_cold_source_observation().unwrap();
+        let initial = screen
+            .capture_line_read(0..2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        screen.install_line_read_layout(&initial, 100);
+        let older = screen.capture_line_read(0..1).unwrap();
+        sink.state.lock().unwrap().1.insert(
+            2,
+            Line::from_text("ijklmn", &CellAttributes::blank(), 9, None),
+        );
+        screen.stable_row_index_offset = 3;
+        let newer = screen
+            .capture_line_read(2..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&newer));
+        screen.install_line_read_layout(&newer, 101);
+        assert_eq!(screen.scrollback_top_stable_row(), -2);
+        let older = older.hydrate(|| false).unwrap();
+        assert!(
+            !screen.validates_line_read(&older),
+            "retained source is not authority to roll back a shifted layout"
         );
     }
 
@@ -5799,6 +6527,40 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn dirty_rows_intersect_instead_of_clamping_to_nearby_resident_rows() {
+        let mut screen = test_screen(5, 8, 96);
+        screen.stable_row_index_offset = 10;
+        for line in &mut screen.lines {
+            line.update_last_change_seqno(7);
+        }
+
+        for range in [-2..0, 0..10, 15..16, 16..18, 12..12, 12..11] {
+            assert!(
+                screen.get_changed_stable_rows(range.clone(), 6).is_empty(),
+                "{:?}",
+                range
+            );
+        }
+        for (range, expected) in [
+            (9..12, vec![10, 11]),
+            (14..16, vec![14]),
+            (11..14, vec![11, 12, 13]),
+            (
+                StableRowIndex::MIN..StableRowIndex::MAX,
+                vec![10, 11, 12, 13, 14],
+            ),
+        ] {
+            assert_eq!(
+                screen.get_changed_stable_rows(range.clone(), 6),
+                expected,
+                "{range:?}"
+            );
+            assert!(screen.get_changed_stable_rows(range, 7).is_empty());
+        }
+    }
+
+    #[test]
     fn stable_range_excludes_unrepresentable_resident_rows() {
         let max_offset = usize::try_from(StableRowIndex::MAX).unwrap();
         for (offset, expected_rows) in [(max_offset - 1, 1), (max_offset, 0), (max_offset + 1, 0)] {
@@ -5843,6 +6605,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestColdScrollbackSink {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
+        interval_identity: Mutex<crate::config::ScrollbackIntervalIdentity>,
         batch_reads: AtomicU64,
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
@@ -5850,6 +6613,25 @@ mod tests {
     }
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
+        fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
+            let Ok(rows) = self.rows.try_lock() else {
+                return crate::config::ScrollbackIntervalCapture::Busy;
+            };
+            let Ok(identity) = self.interval_identity.try_lock() else {
+                return crate::config::ScrollbackIntervalCapture::Busy;
+            };
+            let range = match (rows.first_key_value(), rows.last_key_value()) {
+                (Some((first, _)), Some((last, _))) => {
+                    let Some(end) = last.checked_add(1) else {
+                        return crate::config::ScrollbackIntervalCapture::Unavailable;
+                    };
+                    Some(*first..end)
+                }
+                _ => None,
+            };
+            identity.capture(range)
+        }
+
         fn store_scrollback_line(
             &self,
             stable_row: StableRowIndex,
@@ -5865,6 +6647,9 @@ mod tests {
             };
 
             let mut rows = self.rows.lock().expect("test sink mutex");
+            if rows.contains_key(&stable_row) {
+                *self.interval_identity.lock().unwrap() = Default::default();
+            }
             rows.insert(stable_row, line.clone());
             while rows.len() > max_retained_rows {
                 let Some(oldest) = rows.keys().next().copied() else {
@@ -6043,6 +6828,7 @@ mod tests {
                 }
             }
             *rows = replacement;
+            *self.interval_identity.lock().unwrap() = Default::default();
             self.revision.store(next_revision, Ordering::Relaxed);
             Ok(crate::config::ScrollbackReplaceCommit::new(
                 crate::config::ScrollbackSnapshotGeneration::new([0; 16], next_revision),
@@ -6063,7 +6849,9 @@ mod tests {
                 .load(Ordering::Relaxed)
                 .checked_add(1)
                 .ok_or(crate::config::ScrollbackSpillError::RevisionExhausted)?;
-            self.rows.lock().expect("test sink mutex").clear();
+            let mut rows = self.rows.lock().expect("test sink mutex");
+            rows.clear();
+            *self.interval_identity.lock().unwrap() = Default::default();
             self.revision.store(next_revision, Ordering::Relaxed);
             Ok(crate::config::ScrollbackClearCommit::new(
                 crate::config::ScrollbackSnapshotGeneration::new([0; 16], next_revision),

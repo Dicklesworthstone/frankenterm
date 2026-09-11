@@ -40,6 +40,38 @@ pub struct LineReadPermit {
     _private: (),
 }
 
+type LineReadPlans = Vec<frankenterm_term::screen::ScreenLineRead>;
+
+struct LineReadInput {
+    // None: waiting; Some(None): abandoned; Some(Some(plans)): submitted.
+    plans: parking_lot::Mutex<Option<Option<LineReadPlans>>>,
+    ready: parking_lot::Condvar,
+}
+
+/// A worker successfully started before any source rows are cloned. The
+/// receiver never consults cancellation until it owns the submitted payload,
+/// so cancellation cannot strand a partial capture on the submitting thread.
+pub struct LineReadWorker {
+    input: Arc<LineReadInput>,
+}
+
+impl LineReadWorker {
+    pub fn submit(self, plans: LineReadPlans) {
+        *self.input.plans.lock() = Some(Some(plans));
+        self.input.ready.notify_one();
+    }
+}
+
+impl Drop for LineReadWorker {
+    fn drop(&mut self) {
+        let mut plans = self.input.plans.lock();
+        if plans.is_none() {
+            *plans = Some(None);
+            self.input.ready.notify_one();
+        }
+    }
+}
+
 impl LineReadPermit {
     pub fn try_acquire() -> Option<Self> {
         LINE_READ_WORKERS
@@ -52,34 +84,64 @@ impl LineReadPermit {
             .map(|_| Self { _private: () })
     }
 
-    pub fn spawn<F>(
+    pub fn start<F>(
         self,
-        plans: Vec<frankenterm_term::screen::ScreenLineRead>,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
         complete: F,
-    ) -> std::io::Result<()>
+    ) -> std::io::Result<LineReadWorker>
     where
-        F: FnOnce(anyhow::Result<Vec<frankenterm_term::screen::ScreenLineRead>>, Self)
-            + Send
-            + 'static,
+        F: FnOnce(anyhow::Result<LineReadPlans>, Self) + Send + 'static,
     {
-        let rows = plans.iter().try_fold(0usize, |sum, plan| {
-            sum.checked_add(plan.requested_row_count())
+        self.start_with_spawn(cancelled, complete, |run| {
+            std::thread::Builder::new()
+                .name("ft-cold-read".into())
+                .spawn(run)
+                .map(|_| ())
+        })
+    }
+
+    fn start_with_spawn<F>(
+        self,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        complete: F,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> std::io::Result<LineReadWorker>
+    where
+        F: FnOnce(anyhow::Result<LineReadPlans>, Self) + Send + 'static,
+    {
+        let input = Arc::new(LineReadInput {
+            plans: parking_lot::Mutex::new(None),
+            ready: parking_lot::Condvar::new(),
         });
-        if plans.len() > frankenterm_term::screen::ScreenLineRead::MAX_ROWS
-            || rows.is_none_or(|rows| rows > frankenterm_term::screen::ScreenLineRead::MAX_ROWS)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "line read row limit",
-            ));
-        }
-        std::thread::Builder::new()
-            .name("ft-cold-read".into())
-            .spawn(move || {
-                let result = frankenterm_sigpipe::catch_recoverable(
+        let receiver = Arc::clone(&input);
+        spawn(Box::new(move || {
+            let plans = {
+                let mut slot = receiver.plans.lock();
+                while slot.is_none() {
+                    receiver.ready.wait(&mut slot);
+                }
+                match slot.take() {
+                    Some(Some(plans)) => plans,
+                    _ => return,
+                }
+            };
+            let result =
+                frankenterm_sigpipe::catch_recoverable(
                     frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
                     std::panic::AssertUnwindSafe(|| {
+                        anyhow::ensure!(
+                            !cancelled.load(std::sync::atomic::Ordering::Acquire),
+                            "cold read cancelled"
+                        );
+                        let rows = plans.iter().try_fold(0usize, |sum, plan| {
+                            sum.checked_add(plan.requested_row_count())
+                        });
+                        anyhow::ensure!(
+                            plans.len() <= frankenterm_term::screen::ScreenLineRead::MAX_ROWS
+                                && rows.is_some_and(|rows| rows
+                                    <= frankenterm_term::screen::ScreenLineRead::MAX_ROWS),
+                            "line read row limit"
+                        );
                         let mut bytes = 0usize;
                         let mut result = Vec::with_capacity(plans.len());
                         for plan in plans {
@@ -96,14 +158,14 @@ impl LineReadPermit {
                     }),
                 )
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("cold read worker failed")));
-                // Completion owns the permit through queued publication, so a busy
-                // UI cannot accumulate uncharged finished read payloads.
-                let _ = frankenterm_sigpipe::catch_recoverable(
-                    frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
-                    std::panic::AssertUnwindSafe(|| complete(result, self)),
-                );
-            })
-            .map(|_| ())
+            // Completion owns the permit through queued publication, so a busy
+            // UI cannot accumulate uncharged finished read payloads.
+            let _ = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
+                std::panic::AssertUnwindSafe(|| complete(result, self)),
+            );
+        }))
+        .map(|_| LineReadWorker { input })
     }
 }
 
@@ -600,6 +662,25 @@ pub trait Pane: Downcast + Send + Sync {
         false
     }
 
+    /// Atomic, nonblocking observation of the last layout-changing sequence
+    /// floor and current dimensions. Content-only sequence advances do not
+    /// raise the floor. Callers bind their observed render sequence at or
+    /// above it; publication separately rejects future sequences.
+    /// Unsupported pane kinds must not fabricate a pair from separate reads.
+    fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
+        None
+    }
+
+    fn publish_line_reads_at_layout(
+        &self,
+        _reads: &[frankenterm_term::screen::ScreenLineRead],
+        _expected_seqno: SequenceNo,
+        _expected_dimensions: RenderableDimensions,
+        _publish: &mut dyn FnMut(),
+    ) -> bool {
+        false
+    }
+
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);
 
     /// Provide one mutable line view after applying the configured implicit
@@ -934,8 +1015,12 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     let mut back_len = 0;
 
     // Look backwards to find the start of the first logical line
-    while first > 0 {
-        let (prior, back) = pane.get_lines(first - 1..first);
+    let oldest = pane.get_dimensions().scrollback_top;
+    while first > oldest {
+        let Some(previous) = first.checked_sub(1) else {
+            break;
+        };
+        let (prior, back) = pane.get_lines(previous..first);
         if prior == first {
             break;
         }
@@ -1053,6 +1138,84 @@ mod test {
     use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
     use std::borrow::Cow;
     use termwiz::surface::SEQ_ZERO;
+
+    #[test]
+    fn line_read_worker_abandonment_and_start_failure_do_not_capture_rows() {
+        struct CompletionDrop(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for CompletionDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let caller = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let guard = CompletionDrop(sender);
+        let worker = LineReadPermit::try_acquire()
+            .unwrap()
+            .start(
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                move |_, _| {
+                    drop(guard);
+                    panic!("abandoned worker must not invoke completion");
+                },
+            )
+            .unwrap();
+        drop(worker);
+        assert_ne!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            caller
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let guard = CompletionDrop(sender);
+        let failed = LineReadPermit::try_acquire().unwrap().start_with_spawn(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move |_, _| {
+                drop(guard);
+                panic!("failed start cannot complete");
+            },
+            |run| {
+                drop(run);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected thread creation refusal",
+                ))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            caller
+        );
+        // No plans can be supplied to a failed start: submit requires the
+        // successfully constructed handle, rather than accepting rows first.
+    }
+
+    #[test]
+    fn line_read_worker_cancellation_rejects_even_empty_submission_off_caller() {
+        let caller = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = LineReadPermit::try_acquire()
+            .unwrap()
+            .start(
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                move |result, permit| {
+                    let _ = sender.send((result.is_err(), std::thread::current().id()));
+                    drop(permit);
+                },
+            )
+            .unwrap();
+        worker.submit(Vec::new());
+        let (rejected, thread) = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(rejected);
+        assert_ne!(thread, caller);
+    }
 
     struct FakePane {
         lines: Mutex<Vec<Line>>,

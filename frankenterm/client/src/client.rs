@@ -4354,6 +4354,11 @@ macro_rules! rpc_surface {
         );
         rpc!(get_lines, GetLines, GetLinesResponse);
         rpc!(
+            get_lines_at_layout,
+            GetLinesAtLayout,
+            GetLinesAtLayoutResponse
+        );
+        rpc!(
             get_dimensions,
             GetPaneRenderableDimensions,
             GetPaneRenderableDimensionsResponse

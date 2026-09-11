@@ -270,11 +270,19 @@ impl ScreenOrAlt {
     }
 
     pub fn activate_alt_screen(&mut self, seqno: SequenceNo) {
+        if !self.alt_screen_is_active {
+            self.screen.invalidate_coordinate_witnesses();
+            self.alt_screen.invalidate_coordinate_witnesses();
+        }
         self.alt_screen_is_active = true;
         self.dirty_top_phys_rows(seqno);
     }
 
     pub fn activate_primary_screen(&mut self, seqno: SequenceNo) {
+        if self.alt_screen_is_active {
+            self.screen.invalidate_coordinate_witnesses();
+            self.alt_screen.invalidate_coordinate_witnesses();
+        }
         self.alt_screen_is_active = false;
         self.dirty_top_phys_rows(seqno);
     }

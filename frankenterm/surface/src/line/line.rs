@@ -214,6 +214,37 @@ impl Line {
         bytes_left: &mut usize,
         work_left: &mut usize,
     ) -> Option<Self> {
+        self.charge_snapshot(bytes_left, work_left)?;
+        Some(self.clone_precharged_snapshot())
+    }
+
+    /// Admit both slices before cloning any row. This is intended for a
+    /// resident VecDeque window: late-row refusal cannot destroy an already
+    /// cloned clustered prefix while the caller still holds its terminal lock.
+    /// Both admission and materialization visits share the caller's work
+    /// budget. Failed admission never refunds charges from earlier rows.
+    pub fn try_clone_batch_for_snapshot(
+        first: &[Self],
+        second: &[Self],
+        bytes_left: &mut usize,
+        work_left: &mut usize,
+    ) -> Option<Vec<Self>> {
+        let work_before = *work_left;
+        for line in first.iter().chain(second) {
+            line.charge_snapshot(bytes_left, work_left)?;
+        }
+        let clone_work = work_before.checked_sub(*work_left)?;
+        *work_left = work_left.checked_sub(clone_work)?;
+        Some(
+            first
+                .iter()
+                .chain(second)
+                .map(Self::clone_precharged_snapshot)
+                .collect(),
+        )
+    }
+
+    fn charge_snapshot(&self, bytes_left: &mut usize, work_left: &mut usize) -> Option<()> {
         let zone_bytes = self
             .zones
             .len()
@@ -230,7 +261,11 @@ impl Line {
         let remaining_work = available_work.checked_sub(visits)?;
         *bytes_left = remaining;
         *work_left = remaining_work;
-        Some(Self {
+        Some(())
+    }
+
+    fn clone_precharged_snapshot(&self) -> Self {
+        Self {
             cells: match &self.cells {
                 CellStorage::V(cells) => CellStorage::V(cells.snapshot_clone()),
                 CellStorage::C(line) => CellStorage::C(line.clone()),
@@ -240,7 +275,7 @@ impl Line {
             bits: self.bits,
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(self.appdata.try_lock().ok().and_then(|cache| cache.clone())),
-        })
+        }
     }
 
     /// Conservative, exact source check for work prepared from a cloned line.
@@ -2619,6 +2654,59 @@ mod tests {
         snapshot.set_last_cell_was_wrapped(true, 2);
         assert!(!line.last_cell_was_wrapped());
         assert!(snapshot.last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn bounded_snapshot_batch_preflights_both_slices_before_materializing() {
+        let mut first = Line::from_text(&"a".repeat(2048), &CellAttributes::blank(), 1, None);
+        let mut second = Line::from_text(&"b".repeat(4096), &CellAttributes::blank(), 2, None);
+        first.compress_for_scrollback();
+        second.compress_for_scrollback();
+        assert!(matches!(first.cells, CellStorage::C(_)));
+        assert!(matches!(second.cells, CellStorage::C(_)));
+        let mut bytes = usize::MAX;
+        let mut work = usize::MAX;
+        first.charge_snapshot(&mut bytes, &mut work).unwrap();
+        let first_cost = usize::MAX - bytes;
+        second.charge_snapshot(&mut bytes, &mut work).unwrap();
+        let byte_cost = usize::MAX - bytes;
+        let work_cost = (usize::MAX - work) * 2;
+        let first_slice = core::slice::from_ref(&first);
+        let second_slice = core::slice::from_ref(&second);
+
+        let mut bytes = byte_cost - 1;
+        let mut work = work_cost;
+        assert!(Line::try_clone_batch_for_snapshot(
+            first_slice,
+            second_slice,
+            &mut bytes,
+            &mut work,
+        )
+        .is_none());
+        assert_eq!(
+            bytes,
+            byte_cost - 1 - first_cost,
+            "no refund of admitted prefix"
+        );
+
+        let mut bytes = byte_cost;
+        let mut work = work_cost - 1;
+        assert!(
+            Line::try_clone_batch_for_snapshot(first_slice, second_slice, &mut bytes, &mut work,)
+                .is_none(),
+            "materialization work is admitted before cloning"
+        );
+
+        let mut bytes = byte_cost;
+        let mut work = work_cost;
+        let snapshots =
+            Line::try_clone_batch_for_snapshot(first_slice, second_slice, &mut bytes, &mut work)
+                .unwrap();
+        assert_eq!((bytes, work), (0, 0));
+        assert_eq!(snapshots[0], first);
+        assert_eq!(snapshots[1], second);
+        assert_eq!(first.as_str(), "a".repeat(2048));
+        assert_eq!(second.as_str(), "b".repeat(4096));
     }
 
     // ── ZoneRange ──────────────────────────────────────────

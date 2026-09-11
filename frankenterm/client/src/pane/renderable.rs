@@ -1095,7 +1095,10 @@ impl RenderableInner {
             return false;
         }
         let alt_screen_changed = self.alt_screen_active != delta.alt_screen_active;
-        if authoritative_snapshot || alt_screen_changed {
+        if authoritative_snapshot
+            || alt_screen_changed
+            || !mux::renderable::same_line_layout_geometry(&self.dimensions, &delta.dimensions)
+        {
             // Stable row coordinates belong to the active screen epoch. Never
             // combine cached main-screen rows with an alternate-screen delta
             // (or vice versa), and never carry a speculative main-screen glyph
@@ -1177,22 +1180,28 @@ impl RenderableInner {
         let mut to_fetch = RangeSet::new();
         let mut fetch_token = None;
         log::trace!("dirty as of seq {} -> {:?}", delta.seqno, dirty);
-        for r in dirty.iter() {
+        let viewport_end = delta.dimensions.physical_top.saturating_add(
+            StableRowIndex::try_from(
+                delta
+                    .dimensions
+                    .viewport_rows
+                    .min(MAX_RENDER_APPLICATION_LINES),
+            )
+            .unwrap_or(StableRowIndex::MAX),
+        );
+        let viewport = delta.dimensions.physical_top..viewport_end;
+        self.evict_dirty_outside_viewport(&dirty, &viewport);
+        // A cold invalidation can span millions of coordinates. Only cached
+        // cold rows need eviction; only the bounded viewport needs fetching.
+        let viewport_dirty = dirty.intersection_with_range(viewport);
+        for r in viewport_dirty.iter() {
             for stable_row in r.clone() {
                 // If a line is in the (probable) viewport region,
                 // then we'll likely want to fetch it.
                 // If it is outside that region, remove it from our cache
                 // so that we'll fetch it on demand later.
-                let fetchable = stable_row >= delta.dimensions.physical_top;
                 let prior = self.lines.pop(&stable_row);
                 let prior_kind = prior.as_ref().map(|e| e.kind());
-                if !fetchable {
-                    log::trace!(
-                        "evict {} because it is outside the fetchable viewport",
-                        stable_row
-                    );
-                    continue;
-                }
                 to_fetch.add(stable_row);
                 let fetch_token = fetch_token
                     .get_or_insert_with(|| FetchToken::new(now))
@@ -1247,6 +1256,29 @@ impl RenderableInner {
                 self.lines.put(stable_row, LineEntry::Stale(old));
             }
             Some(LineEntry::Fetching(_)) | None => {}
+        }
+    }
+
+    fn evict_dirty_outside_viewport(
+        &mut self,
+        dirty: &RangeSet<StableRowIndex>,
+        viewport: &std::ops::Range<StableRowIndex>,
+    ) {
+        if !dirty
+            .iter()
+            .any(|range| range.start < viewport.start || range.end > viewport.end)
+        {
+            return;
+        }
+        let evicted: Vec<_> = self
+            .lines
+            .iter()
+            .filter_map(|(row, _)| {
+                (!viewport.contains(row) && dirty.contains(*row)).then_some(*row)
+            })
+            .collect();
+        for row in evicted {
+            self.lines.pop(&row);
         }
     }
 
@@ -1567,7 +1599,6 @@ impl RenderableInner {
             }
             return;
         };
-        let local_pane_id = self.local_pane_id;
         log::trace!(
             "will fetch lines {:?} for remote tab id {} at {:?}",
             to_fetch,
@@ -1578,14 +1609,41 @@ impl RenderableInner {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let rpc = client.client.rpc_scope();
-        let request = rpc.get_lines(GetLines {
-            pane_id: remote_pane_id,
-            lines: to_fetch.clone().into(),
-        });
+        let Some(codec_version) = rpc.agreed_codec_version() else {
+            // An unnegotiated connection is not an older peer. Wait for its
+            // actual authority rather than sending one unfenced bootstrap read.
+            self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
+            return;
+        };
+        let layout = LineReadLayout {
+            seqno: self.seqno,
+            dimensions: self.dimensions,
+        };
+        let fenced = codec_version >= GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION;
 
         reservation
             .spawn_local(async move {
-                let result = request.await;
+                let result = if fenced {
+                    rpc.get_lines_at_layout(GetLinesAtLayout {
+                        pane_id: remote_pane_id,
+                        layout,
+                        lines: to_fetch.clone().into(),
+                    })
+                    .await
+                    .and_then(|response| {
+                        anyhow::ensure!(response.layout == layout, "line reply layout mismatch");
+                        Ok(GetLinesResponse {
+                            pane_id: response.pane_id,
+                            lines: response.lines,
+                        })
+                    })
+                } else {
+                    rpc.get_lines(GetLines {
+                        pane_id: remote_pane_id,
+                        lines: to_fetch.clone().into(),
+                    })
+                    .await
+                };
 
                 let result = match result {
                     Ok(result) if result.pane_id == remote_pane_id => {
@@ -1600,11 +1658,11 @@ impl RenderableInner {
                 Self::apply_lines(
                     registration,
                     renderable,
-                    local_pane_id,
                     rpc,
                     result,
                     to_fetch,
                     fetch_token,
+                    layout,
                 )
             })
             .detach();
@@ -1613,12 +1671,13 @@ impl RenderableInner {
     fn apply_lines(
         registration: PaneRegistrationHandle,
         renderable: Arc<parking_lot::Mutex<RenderableState>>,
-        local_pane_id: PaneId,
         rpc: RpcGenerationScope,
         result: anyhow::Result<HydratedLines>,
         to_fetch: RangeSet<StableRowIndex>,
         fetch_token: FetchToken,
+        layout: LineReadLayout,
     ) -> anyhow::Result<()> {
+        let local_pane_id = registration.pane_id();
         // Fetch cleanup is intentionally allowed after this RPC generation has
         // retired: it releases only the exact reservation created by this
         // request. Pointer identity, rather than timestamp equality, prevents a
@@ -1637,32 +1696,19 @@ impl RenderableInner {
                 registration.try_with_current_output(|_| {
                     let renderable = renderable.lock();
                     let mut inner = renderable.inner.borrow_mut();
-                    let (lines, incomplete_rows) = hydrated.into_parts();
+                    // Image hydration can yield after the line RPC itself has
+                    // completed. Never promote an old-layout row to the new
+                    // sequence number in put_line, even when its fetch token
+                    // survived a resize or another render-state transition.
+                    if !inner.admit_fetched_layout(layout, &to_fetch, &fetch_token) {
+                        return;
+                    }
                     log::trace!(
                         "fetch complete for {:?} at {:?}",
                         to_fetch,
                         fetch_token.started_at()
                     );
-                    let mut hyperlink_rows = Vec::with_capacity(lines.len());
-                    for (stable_row, line) in lines.into_iter() {
-                        if incomplete_rows.contains(&stable_row) {
-                            // Image-bearing lines are a row-level transaction.
-                            // Keep a previously complete row visible while the
-                            // replacement is incomplete; publishing a text-only
-                            // or partial z-stack causes flicker and can expose a
-                            // composition that never existed on the server.
-                            inner.make_stale(stable_row);
-                            continue;
-                        }
-                        if inner.put_line(stable_row, line, Some(&fetch_token)) {
-                            hyperlink_rows.push(stable_row);
-                        }
-                    }
-                    // A successful response is still allowed to be partial.
-                    // Sweep exact markers after applying returned rows so an
-                    // omitted row cannot remain Fetching forever.
-                    inner.release_exact_fetch_reservations(&to_fetch, &fetch_token);
-                    inner.normalize_current_implicit_hyperlinks_for_rows(hyperlink_rows);
+                    inner.apply_fetched_lines(hydrated, &to_fetch, &fetch_token);
                 })
             }) {
                 Ok(applied) => applied,
@@ -1687,6 +1733,45 @@ impl RenderableInner {
             local_pane_id,
         );
         Ok(())
+    }
+
+    fn apply_fetched_lines(
+        &mut self,
+        hydrated: HydratedLines,
+        requested: &RangeSet<StableRowIndex>,
+        fetch_token: &FetchToken,
+    ) {
+        let (lines, incomplete_rows) = hydrated.into_parts();
+        let mut hyperlink_rows = Vec::with_capacity(lines.len());
+        for (stable_row, line) in lines {
+            if incomplete_rows.contains(&stable_row) {
+                // Preserve the last complete image composition. The exact-token
+                // sweep below releases this row without clearing a successor
+                // request that started while image hydration was suspended.
+                continue;
+            }
+            if self.put_line(stable_row, line, Some(fetch_token)) {
+                hyperlink_rows.push(stable_row);
+            }
+        }
+        // Omitted rows must not remain Fetching forever either.
+        self.release_exact_fetch_reservations(requested, fetch_token);
+        self.normalize_current_implicit_hyperlinks_for_rows(hyperlink_rows);
+    }
+
+    fn admit_fetched_layout(
+        &mut self,
+        layout: LineReadLayout,
+        to_fetch: &RangeSet<StableRowIndex>,
+        fetch_token: &FetchToken,
+    ) -> bool {
+        if self.seqno < layout.seqno
+            || !mux::renderable::same_line_layout_geometry(&self.dimensions, &layout.dimensions)
+        {
+            self.release_exact_fetch_reservations(to_fetch, fetch_token);
+            return false;
+        }
+        true
     }
 
     fn poll(&mut self) -> anyhow::Result<()> {
@@ -4405,6 +4490,82 @@ mod tests {
         assert!(first.same_request(&first_clone));
         assert!(!first.same_request(&successor));
         assert_eq!(first.started_at(), successor.started_at());
+    }
+
+    #[test]
+    fn fetched_layout_rejects_delayed_resize_and_same_width_successors() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        let original = codec::LineReadLayout {
+            seqno: inner.seqno,
+            dimensions: inner.dimensions,
+        };
+        let token = FetchToken::new(Instant::now());
+        let successor = FetchToken::new(token.started_at());
+        let mut requested = rangeset::RangeSet::new();
+        requested.add_range(0..2);
+        inner.lines.put(0, LineEntry::Fetching(token.clone()));
+        inner.lines.put(1, LineEntry::Fetching(successor.clone()));
+        assert!(inner.admit_fetched_layout(original, &requested, &token));
+        inner.dimensions.cols += 1;
+        assert!(!inner.admit_fetched_layout(original, &requested, &token));
+        assert!(inner.lines.peek(&0).is_none());
+        assert!(
+            matches!(inner.lines.peek(&1), Some(LineEntry::Fetching(current)) if current.same_request(&successor))
+        );
+
+        // Ordinary output and append-only scrolling must not starve a valid
+        // cold fetch. A same-geometry map replacement separately retires the
+        // exact token through the server's cold dirty-range notification.
+        inner.dimensions = original.dimensions;
+        inner.seqno = original.seqno + 1;
+        inner.dimensions.physical_top += 1;
+        inner.dimensions.scrollback_rows += 1;
+        inner.lines.put(0, LineEntry::Fetching(token.clone()));
+        assert!(inner.admit_fetched_layout(original, &requested, &token));
+        let mut cold_dirty = rangeset::RangeSet::new();
+        cold_dirty.add_range(-1_000_000_000..1);
+        inner.evict_dirty_outside_viewport(&cold_dirty, &(1..25));
+        assert!(!inner.put_line(0, Line::with_width(80, original.seqno), Some(&token)));
+        assert!(inner.lines.peek(&0).is_none());
+        assert!(
+            matches!(inner.lines.peek(&1), Some(LineEntry::Fetching(current)) if current.same_request(&successor))
+        );
+    }
+
+    #[test]
+    fn incomplete_fetched_images_preserve_successors_and_last_complete_rows() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        let exact = FetchToken::new(Instant::now());
+        let successor = FetchToken::new(exact.started_at());
+        let mut requested = rangeset::RangeSet::new();
+        requested.add_range(0..3);
+        inner.lines.put(0, LineEntry::Fetching(successor.clone()));
+        inner.lines.put(
+            1,
+            LineEntry::LineAndFetching(Line::with_width(3, 7), exact.clone()),
+        );
+        inner.lines.put(2, LineEntry::Fetching(exact.clone()));
+        inner.apply_fetched_lines(
+            super::HydratedLines {
+                lines: vec![(0, Line::with_width(9, 8)), (1, Line::with_width(9, 8))],
+                incomplete_rows: [0, 1].iter().copied().collect(),
+            },
+            &requested,
+            &exact,
+        );
+        assert!(matches!(
+            inner.lines.peek(&0),
+            Some(LineEntry::Fetching(current)) if current.same_request(&successor)
+        ));
+        assert!(matches!(
+            inner.lines.peek(&1),
+            Some(LineEntry::Stale(line)) if line.len() == 3
+        ));
+        assert!(inner.lines.peek(&2).is_none(), "omitted row is released");
     }
 
     #[test]

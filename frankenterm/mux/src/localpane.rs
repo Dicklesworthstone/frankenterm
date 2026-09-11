@@ -1122,6 +1122,12 @@ pub struct LocalPane {
     cold_viewport_pending: Arc<Mutex<Option<ColdViewportPending>>>,
     cold_viewport_retry: Arc<AtomicBool>,
     cold_viewport_failure: Arc<Mutex<Option<ColdViewportFailure>>>,
+    line_layout_observation: Mutex<
+        Option<(
+            frankenterm_term::screen::ScreenCoordinateWitness,
+            SequenceNo,
+        )>,
+    >,
     // Serializes complete producer batches, including deferred persistence,
     // without preventing GUI readers or resize workers from taking terminal.
     output_application: Mutex<()>,
@@ -1246,15 +1252,25 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         for_line: &mut dyn ForEachPaneLogicalLine,
     ) {
-        terminal_for_each_logical_line_in_stable_range_mut(
-            &mut self.locked_terminal(),
-            lines,
-            for_line,
-        );
+        let mut term = self.locked_terminal();
+        let cold = lines.start < term.screen().phys_to_stable_row_index(0);
+        if cold {
+            drop(term);
+            crate::pane::impl_for_each_logical_line_via_get_logical_lines(self, lines, for_line);
+            return;
+        }
+        terminal_for_each_logical_line_in_stable_range_mut(&mut term, lines, for_line);
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        terminal_with_lines_mut(&mut self.locked_terminal(), lines, with_lines)
+        let mut term = self.locked_terminal();
+        let cold = lines.start < term.screen().phys_to_stable_row_index(0);
+        if cold {
+            drop(term);
+            crate::pane::impl_with_lines_via_get_lines(self, lines, with_lines);
+            return;
+        }
+        terminal_with_lines_mut(&mut term, lines, with_lines)
     }
 
     fn with_lines_mut_and_apply_hyperlinks(
@@ -1274,9 +1290,10 @@ impl Pane for LocalPane {
             return;
         };
         let cold = lines.start < term.screen().phys_to_stable_row_index(0);
+        let logical_context = term.screen().expand_cold_logical_range(lines.clone());
         drop(term);
         if cold {
-            let (first, mut snapshot) = self.cold_viewport_lines(lines);
+            let (first, mut snapshot) = self.cold_viewport_lines(logical_context);
             let mut start = 0;
             for end in 0..snapshot.len() {
                 if !snapshot[end].last_cell_was_wrapped() || end + 1 == snapshot.len() {
@@ -1287,7 +1304,17 @@ impl Pane for LocalPane {
                     start = end + 1;
                 }
             }
-            with_lines.with_lines_mut(first, &mut snapshot.iter_mut().collect::<Vec<_>>());
+            let visible_first = lines.start.max(first);
+            let skip = visible_first.saturating_sub(first) as usize;
+            let count = lines.end.saturating_sub(visible_first).max(0) as usize;
+            with_lines.with_lines_mut(
+                visible_first,
+                &mut snapshot
+                    .iter_mut()
+                    .skip(skip)
+                    .take(count)
+                    .collect::<Vec<_>>(),
+            );
             return;
         }
         if let Some(pending) = self
@@ -1356,6 +1383,10 @@ impl Pane for LocalPane {
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+        // This synchronous API is also used by copy/semantic consumers which
+        // treat an empty result as complete. Only paint uses the loading cache;
+        // RPCs use owned worker plans. Preserve complete synchronous results
+        // until these remaining consumers acquire an awaited read contract.
         terminal_get_lines(&mut self.locked_terminal(), lines)
     }
 
@@ -1377,13 +1408,77 @@ impl Pane for LocalPane {
         reads: &[frankenterm_term::screen::ScreenLineRead],
         publish: &mut dyn FnMut(),
     ) -> bool {
-        let Some(term) = self.terminal.try_lock() else {
+        let Some(mut term) = self.terminal.try_lock() else {
             return false;
         };
         if !reads
             .iter()
             .all(|read| term.screen().validates_line_read(read))
         {
+            return false;
+        }
+        let changed = reads
+            .iter()
+            .any(|read| term.screen().line_read_changes_layout(read));
+        if changed {
+            if term.current_seqno() == SequenceNo::MAX {
+                return false;
+            }
+            term.increment_seqno();
+        }
+        let seqno = term.current_seqno();
+        for read in reads {
+            term.screen_mut().install_line_read_layout(read, seqno);
+        }
+        publish();
+        true
+    }
+
+    fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
+        let mut term = self.terminal.try_lock()?;
+        let floor = self.refresh_line_layout_floor(&mut term)?;
+        Some((floor, terminal_get_dimensions(&mut term)))
+    }
+
+    fn publish_line_reads_at_layout(
+        &self,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        expected_seqno: SequenceNo,
+        expected_dimensions: RenderableDimensions,
+        publish: &mut dyn FnMut(),
+    ) -> bool {
+        let Some(mut term) = self.terminal.try_lock() else {
+            return false;
+        };
+        let Some(floor) = self.refresh_line_layout_floor(&mut term) else {
+            return false;
+        };
+        if expected_seqno == SequenceNo::MAX
+            || expected_seqno < floor
+            || expected_seqno > term.current_seqno()
+            || !crate::renderable::same_line_layout_geometry(
+                &terminal_get_dimensions(&mut term),
+                &expected_dimensions,
+            )
+            || !reads
+                .iter()
+                .all(|read| term.screen().validates_line_read(read))
+        {
+            return false;
+        }
+        if reads
+            .iter()
+            .any(|read| term.screen().line_read_changes_layout(read))
+        {
+            term.increment_seqno();
+            let seqno = term.current_seqno();
+            for read in reads {
+                term.screen_mut().install_line_read_layout(read, seqno);
+            }
+            // The request named the previous layout. Advertise the new state
+            // before accepting coordinates from a refreshed client request.
+            // The CurrentPane caller sends notify_lines_ready after this
+            // false result; do not reacquire registration authority here.
             return false;
         }
         publish();
@@ -2535,6 +2630,30 @@ fn split_child(
 }
 
 impl LocalPane {
+    fn refresh_line_layout_floor(&self, term: &mut Terminal) -> Option<SequenceNo> {
+        let mut observation = self.line_layout_observation.try_lock()?;
+        let source_changed = term.screen_mut().refresh_cold_source_observation()?;
+        let screen_changed = observation
+            .as_ref()
+            .is_some_and(|(witness, _)| !term.screen().matches_coordinate_witness(witness));
+        if source_changed || screen_changed {
+            term.increment_seqno();
+        }
+        if term.current_seqno() == SequenceNo::MAX {
+            return None;
+        }
+        let floor = if source_changed || screen_changed {
+            term.current_seqno()
+        } else {
+            observation
+                .as_ref()
+                .map_or(term.current_seqno(), |(_, floor)| *floor)
+        }
+        .max(term.screen().cold_visual_layout_seqno());
+        *observation = Some((term.screen().capture_coordinate_witness(), floor));
+        Some(floor)
+    }
+
     fn cold_viewport_lines(&self, requested: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let empty = || (requested.start, Vec::new());
         if requested.end.saturating_sub(requested.start).max(0) as usize
@@ -2561,7 +2680,8 @@ impl LocalPane {
                 .iter()
                 .find(|entry| {
                     entry.registration == registration.wire_identity()
-                        && entry.requested == requested
+                        && (entry.requested == requested
+                            || entry.read.cached_lines(requested.clone()).is_some())
                 })
                 .map(|entry| Arc::clone(&entry.read))
         });
@@ -2572,11 +2692,17 @@ impl LocalPane {
                     let mut bytes_left =
                         frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
                     let mut work_left = 65_536;
-                    let rows = read
-                        .lines()
+                    let cached = read.cached_lines(requested.clone());
+                    let (first, source): (_, Vec<_>) = if let Some((first, lines)) = cached {
+                        (first, lines.iter().collect())
+                    } else {
+                        (read.first_row(), read.lines().collect())
+                    };
+                    let rows = source
+                        .into_iter()
                         .map(|line| line.try_clone_for_snapshot(&mut bytes_left, &mut work_left))
                         .collect::<Option<Vec<_>>>();
-                    snapshot = rows.map(|rows| (read.first_row(), rows));
+                    snapshot = rows.map(|rows| (first, rows));
                 });
             });
             if let Some(snapshot) = snapshot {
@@ -2600,13 +2726,9 @@ impl LocalPane {
             retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
             return empty();
         };
-        let Some(Ok(plan)) = self.capture_line_read(requested.clone(), &mut Default::default())
-        else {
-            retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
-            return empty();
-        };
         let cancelled = Arc::new(AtomicBool::new(false));
-        let failure_witness = plan.failure_witness();
+        let captured_witness = Arc::new(Mutex::new(None));
+        let worker_witness = Arc::clone(&captured_witness);
         let failure_state = Arc::clone(&self.cold_viewport_failure);
         let terminal_for_failure = Arc::downgrade(&self.terminal);
         *pending = Some(ColdViewportPending {
@@ -2620,12 +2742,22 @@ impl LocalPane {
         };
         let response_range = requested.clone();
         let retry = Arc::clone(&self.cold_viewport_retry);
-        if permit.spawn(vec![plan], cancelled, move |result, permit| {
+        let capture_registration = registration.clone();
+        let capture_retry = Arc::clone(&retry);
+        let worker = permit.start(Arc::clone(&cancelled), move |result, permit| {
             let mut plans = match result {
                 Ok(plans) => plans,
                 Err(error) => {
+                    let Some(failure_witness): Option<frankenterm_term::screen::LineReadFailureWitness> = worker_witness.lock().take() else { return; };
                     metrics::counter!("mux.local_pane.cold_viewport", "outcome" => "read_rejected").increment(1);
                     if !completion.cancelled.load(Ordering::Acquire) {
+                        if failure_witness.retry_without_index() {
+                            // Retry once as a separately admitted bounded
+                            // viewport read; do not turn an optional full-index
+                            // budget refusal into permanent missing history.
+                            retry_cold_viewport(registration, retry);
+                            return;
+                        }
                         let geometry = error.is::<frankenterm_term::screen::ColdReadGeometryUnavailable>();
                         *failure_state.lock() = Some(ColdViewportFailure { requested: response_range.clone(), witness: failure_witness.clone() });
                         schedule_local_pane_main_thread(
@@ -2699,9 +2831,27 @@ impl LocalPane {
             // retirement guard, so it also returns source ownership here.
             drop(retired.recv());
             drop(permit);
-        }).is_err() {
-            metrics::counter!("mux.local_pane.cold_viewport", "outcome" => "worker_rejected").increment(1);
-        }
+        });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(_) => {
+                metrics::counter!("mux.local_pane.cold_viewport", "outcome" => "worker_rejected")
+                    .increment(1);
+                retry_cold_viewport(capture_registration, capture_retry);
+                return empty();
+            }
+        };
+        // Thread creation has succeeded before the first source clone. A
+        // failed capture has no partial resident allocation (batch preflight),
+        // and abandoning the handle retires the permit on its waiting worker.
+        let Some(Ok(plan)) = self.capture_line_read(requested.clone(), &mut Default::default())
+        else {
+            drop(worker);
+            retry_cold_viewport(capture_registration, capture_retry);
+            return empty();
+        };
+        *captured_witness.lock() = Some(plan.failure_witness());
+        worker.submit(vec![plan]);
         empty()
     }
 
@@ -2931,6 +3081,7 @@ impl LocalPane {
                 Arc::clone(&self.action_ring),
                 Arc::clone(&self.pty),
                 Arc::clone(&self.resize_queue),
+                Arc::clone(&self.mux_registration),
             );
         }
 
@@ -2943,12 +3094,14 @@ impl LocalPane {
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
+        registration: Arc<PaneRegistrationSlot>,
     ) {
         let worker_terminal = Arc::clone(&terminal);
         #[cfg(feature = "disruptor-pane-io")]
         let worker_action_ring = Arc::clone(&action_ring);
         let worker_pty = Arc::clone(&pty);
         let worker_queue = Arc::clone(&resize_queue);
+        let worker_registration = Arc::clone(&registration);
         let spawn_result = std::thread::Builder::new()
             .name(format!("pane-resize-{}", pane_id))
             .spawn(move || {
@@ -2959,6 +3112,8 @@ impl LocalPane {
                     worker_action_ring,
                     worker_pty,
                     worker_queue,
+                    worker_registration,
+                    true,
                 );
             });
 
@@ -2982,6 +3137,8 @@ impl LocalPane {
                 action_ring,
                 pty,
                 resize_queue,
+                registration,
+                false,
             );
         });
     }
@@ -2992,6 +3149,8 @@ impl LocalPane {
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
+        registration: Arc<PaneRegistrationSlot>,
+        allow_cold_preparation: bool,
     ) {
         while let Some(pending) = {
             let mut queue = resize_queue.lock();
@@ -3000,6 +3159,7 @@ impl LocalPane {
             let queue_wait = pending.enqueued_at.elapsed();
             let completion_start = Instant::now();
             let token = ResizeCancellationToken::new(pending.seq);
+            let pending_registration = registration.load();
             let apply_result = catch_resize_intent(resize_queue.as_ref(), pending, || {
                 Self::apply_resize_sync(
                     pane_id,
@@ -3016,6 +3176,18 @@ impl LocalPane {
             });
             let settled_apply_result = apply_result
                 .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
+            if allow_cold_preparation
+                && matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled)
+            {
+                if let Some(registration) = pending_registration {
+                    Self::prepare_cold_layout_after_resize(
+                        &terminal,
+                        &resize_queue,
+                        token,
+                        registration,
+                    );
+                }
+            }
             match settled_apply_result {
                 Ok(Ok(metrics)) => {
                     if metrics.cancelled {
@@ -3146,6 +3318,90 @@ impl LocalPane {
                 }
             }
         }
+    }
+
+    /// Runs only on a successfully spawned resize worker, never the inline
+    /// thread-creation-failure fallback. Indexing is optional preparation;
+    /// failure leaves the already-committed resident resize intact.
+    fn prepare_cold_layout_after_resize(
+        terminal: &Mutex<Terminal>,
+        resize_queue: &Mutex<ResizeQueueState>,
+        token: ResizeCancellationToken,
+        registration: PaneRegistrationHandle,
+    ) {
+        let Some(_permit) = crate::pane::LineReadPermit::try_acquire() else {
+            return;
+        };
+        let result = catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| -> anyhow::Result<bool> {
+                let Some(plan) = registration
+                    .try_with_current(|_| -> anyhow::Result<_> {
+                        let Some(term) = terminal.try_lock() else {
+                            return Ok(None);
+                        };
+                        let screen = term.screen();
+                        let first = screen.scrollback_top_stable_row();
+                        if first >= screen.phys_to_stable_row_index(0) {
+                            return Ok(None);
+                        }
+                        let end = first
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("cold layout coordinate overflow"))?;
+                        screen.capture_line_read(first..end).map(Some)
+                    })
+                    .transpose()?
+                    .flatten()
+                else {
+                    return Ok(false);
+                };
+                let read = plan.hydrate(|| {
+                    let superseded = resize_queue.lock().superseded_by(token).is_some();
+                    superseded || registration.try_with_current(|_| ()).is_none()
+                })?;
+                let committed = registration
+                    .try_with_current(|_| {
+                        let Some(mut term) = terminal.try_lock() else {
+                            return false;
+                        };
+                        let (decision, _) = with_resize_commit_barrier(resize_queue, token, || {
+                            if !term.screen().validates_line_read(&read)
+                                || term.current_seqno() == SequenceNo::MAX
+                            {
+                                return false;
+                            }
+                            if term.screen().line_read_changes_layout(&read) {
+                                term.increment_seqno();
+                            }
+                            let seqno = term.current_seqno();
+                            term.screen_mut().install_line_read_layout(&read, seqno);
+                            true
+                        });
+                        matches!(decision, ResizeCommitDecision::Committed(true))
+                    })
+                    .unwrap_or(false);
+                // `read` and any replaced decoded buffers retire here on this
+                // worker, after both locks and before the global permit.
+                Ok(committed)
+            }),
+        );
+        if matches!(&result, Ok(Ok(true))) {
+            schedule_local_pane_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+                "cold_resize_layout_ready",
+                || async move {
+                    let _ = registration.try_with_current(|pane| pane.notify_lines_ready());
+                },
+            );
+        }
+        metrics::counter!("mux.localpane.resize.cold_layout", "outcome" => match result {
+            Ok(Ok(true)) => "installed",
+            Ok(Ok(false)) => "stale_or_busy",
+            Ok(Err(_)) => "unavailable",
+            Err(_) => "recovered_panic",
+        })
+        .increment(1);
     }
 
     fn prepare_resize_reflow(
@@ -3563,6 +3819,7 @@ impl LocalPane {
             cold_viewport_pending: Arc::new(Mutex::new(None)),
             cold_viewport_retry: Arc::new(AtomicBool::new(false)),
             cold_viewport_failure: Arc::new(Mutex::new(None)),
+            line_layout_observation: Mutex::new(None),
             output_application: Mutex::new(()),
             scrollback_flush_sink: Mutex::new(scrollback_flush_sink),
             process: Arc::clone(&process),
@@ -4389,6 +4646,27 @@ mod tests {
             .hydrate(|| false)
             .unwrap();
         let mut publications = 0;
+        let (layout_seqno, layout_dimensions) = pane.get_line_layout().unwrap();
+        assert!(pane.publish_line_reads_at_layout(
+            std::slice::from_ref(&read),
+            layout_seqno,
+            layout_dimensions,
+            &mut || {}
+        ));
+        let mut wrong_dimensions = layout_dimensions;
+        wrong_dimensions.cols += 1;
+        assert!(!pane.publish_line_reads_at_layout(
+            std::slice::from_ref(&read),
+            layout_seqno,
+            wrong_dimensions,
+            &mut || panic!("wrong layout published")
+        ));
+        assert!(!pane.publish_line_reads_at_layout(
+            std::slice::from_ref(&read),
+            SequenceNo::MAX,
+            layout_dimensions,
+            &mut || panic!("saturated authority published")
+        ));
         assert!(
             pane.publish_line_reads(std::slice::from_ref(&read), &mut || {
                 assert!(
@@ -4400,6 +4678,7 @@ mod tests {
         );
         {
             let _busy = pane.terminal.lock();
+            assert!(pane.get_line_layout().is_none());
             assert!(
                 !pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1)
             );
@@ -4409,8 +4688,47 @@ mod tests {
                 .is_err());
         }
         pane.terminal.lock().advance_bytes(b" changed");
+        assert!(!pane.publish_line_reads_at_layout(
+            std::slice::from_ref(&read),
+            layout_seqno,
+            layout_dimensions,
+            &mut || panic!("stale layout published")
+        ));
         assert!(!pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1));
         assert_eq!(publications, 1);
+        // Continued output on another row must not starve an exact retained
+        // row read. The terminal content sequence advances, layout floor does
+        // not, and the old read still passes its independent source check.
+        let fresh = pane
+            .capture_line_read(0..1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let (floor, dimensions) = pane.get_line_layout().unwrap();
+        let observed = pane.get_current_seqno();
+        pane.terminal.lock().advance_bytes(b"\r\nother row");
+        assert!(pane.get_current_seqno() > observed);
+        assert_eq!(pane.get_line_layout().unwrap().0, floor);
+        assert!(pane.publish_line_reads_at_layout(
+            std::slice::from_ref(&fresh),
+            observed,
+            dimensions,
+            &mut || {}
+        ));
+        pane.terminal
+            .lock()
+            .advance_bytes(b"\x1b[?1049h\x1b[?1049l");
+        assert!(
+            pane.get_line_layout().unwrap().0 > observed,
+            "unobserved alternate-screen round trip cannot reuse layout authority"
+        );
+        assert!(!pane.publish_line_reads_at_layout(
+            std::slice::from_ref(&fresh),
+            observed,
+            dimensions,
+            &mut || panic!("alternate-screen ABA published")
+        ));
     }
 
     #[test]
