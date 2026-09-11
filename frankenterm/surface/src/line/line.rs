@@ -205,6 +205,44 @@ impl PartialEq for Line {
 }
 
 impl Line {
+    /// Bounded UI snapshot. Vector cells share their immutable allocation even
+    /// in the eager-clone profiling mode; clustered rows precharge every owned
+    /// clone buffer and bound metadata visits. Payload serialization is never
+    /// used for admission. Appdata is an optional weak cache, not source data.
+    pub fn try_clone_for_snapshot(
+        &self,
+        bytes_left: &mut usize,
+        work_left: &mut usize,
+    ) -> Option<Self> {
+        let zone_bytes = self
+            .zones
+            .len()
+            .checked_mul(core::mem::size_of::<ZoneRange>())?;
+        let base = core::mem::size_of::<Self>().checked_add(zone_bytes)?;
+        let work = self.zones.len().checked_add(1)?;
+        let available_work = work_left.checked_sub(work)?;
+        let (payload, visits) = match &self.cells {
+            CellStorage::V(_) => (0, 0),
+            CellStorage::C(line) => line.snapshot_clone_cost(available_work)?,
+        };
+        let charge = base.checked_add(payload)?;
+        let remaining = bytes_left.checked_sub(charge)?;
+        let remaining_work = available_work.checked_sub(visits)?;
+        *bytes_left = remaining;
+        *work_left = remaining_work;
+        Some(Self {
+            cells: match &self.cells {
+                CellStorage::V(cells) => CellStorage::V(cells.snapshot_clone()),
+                CellStorage::C(line) => CellStorage::C(line.clone()),
+            },
+            zones: self.zones.clone(),
+            seqno: self.seqno,
+            bits: self.bits,
+            #[cfg(feature = "appdata")]
+            appdata: Mutex::new(self.appdata.try_lock().ok().and_then(|cache| cache.clone())),
+        })
+    }
+
     /// Conservative, exact source check for work prepared from a cloned line.
     /// Image payloads can change through shared handles, so they never qualify.
     /// Renderer appdata and a no-match hyperlink scan do not change wrapping;
@@ -2546,6 +2584,42 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn bounded_snapshot_charges_clustered_text_before_clone() {
+        let mut line = Line::from_text(&"x".repeat(8192), &CellAttributes::blank(), 1, None);
+        line.compress_for_scrollback();
+        assert!(matches!(line.cells, CellStorage::C(_)));
+        let mut bytes = 128;
+        let mut work = 100;
+        assert!(line.try_clone_for_snapshot(&mut bytes, &mut work).is_none());
+        assert_eq!(
+            (bytes, work),
+            (128, 100),
+            "refusal allocates no snapshot and does not consume budget"
+        );
+        let mut bytes = 16384;
+        let mut work = 100;
+        let snapshot = line.try_clone_for_snapshot(&mut bytes, &mut work).unwrap();
+        assert_eq!(snapshot, line);
+        assert!(bytes <= 16384 - 8192);
+    }
+
+    #[test]
+    fn bounded_snapshot_vector_cells_share_and_detach_on_edit() {
+        let line = Line::from_cells(vec![Cell::new('x', CellAttributes::blank())], 1);
+        let mut bytes = core::mem::size_of::<Line>();
+        let mut work = 1;
+        let mut snapshot = line.try_clone_for_snapshot(&mut bytes, &mut work).unwrap();
+        assert_eq!((bytes, work), (0, 0));
+        match (&line.cells, &snapshot.cells) {
+            (CellStorage::V(a), CellStorage::V(b)) => assert!(a.shares_cells_with(b)),
+            _ => panic!("expected vector storage"),
+        }
+        snapshot.set_last_cell_was_wrapped(true, 2);
+        assert!(!line.last_cell_was_wrapped());
+        assert!(snapshot.last_cell_was_wrapped());
+    }
 
     // ── ZoneRange ──────────────────────────────────────────
 

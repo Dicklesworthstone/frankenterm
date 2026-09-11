@@ -32,6 +32,87 @@ use url::Url;
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type PaneId = usize;
 
+static LINE_READ_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reserve before capturing row snapshots. Four workers, each with at most
+/// 16K rows/32MiB retained serialized payload plus one bounded storage batch.
+pub struct LineReadPermit {
+    _private: (),
+}
+
+impl LineReadPermit {
+    pub fn try_acquire() -> Option<Self> {
+        LINE_READ_WORKERS
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| if n < 4 { Some(n + 1) } else { None },
+            )
+            .ok()
+            .map(|_| Self { _private: () })
+    }
+
+    pub fn spawn<F>(
+        self,
+        plans: Vec<frankenterm_term::screen::ScreenLineRead>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        complete: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(anyhow::Result<Vec<frankenterm_term::screen::ScreenLineRead>>, Self)
+            + Send
+            + 'static,
+    {
+        let rows = plans.iter().try_fold(0usize, |sum, plan| {
+            sum.checked_add(plan.requested_row_count())
+        });
+        if plans.len() > frankenterm_term::screen::ScreenLineRead::MAX_ROWS
+            || rows.is_none_or(|rows| rows > frankenterm_term::screen::ScreenLineRead::MAX_ROWS)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "line read row limit",
+            ));
+        }
+        std::thread::Builder::new()
+            .name("ft-cold-read".into())
+            .spawn(move || {
+                let result = frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| {
+                        let mut bytes = 0usize;
+                        let mut result = Vec::with_capacity(plans.len());
+                        for plan in plans {
+                            let ready = plan.hydrate_with_payload_limit(
+                                frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES - bytes,
+                                || cancelled.load(std::sync::atomic::Ordering::Acquire),
+                            )?;
+                            bytes = bytes.checked_add(ready.payload_bytes()).filter(|n|
+                            *n <= frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES)
+                            .ok_or_else(|| anyhow::anyhow!("line read aggregate payload limit"))?;
+                            result.push(ready);
+                        }
+                        Ok(result)
+                    }),
+                )
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("cold read worker failed")));
+                // Completion owns the permit through queued publication, so a busy
+                // UI cannot accumulate uncharged finished read payloads.
+                let _ = frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| complete(result, self)),
+                );
+            })
+            .map(|_| ())
+    }
+}
+
+impl Drop for LineReadPermit {
+    fn drop(&mut self) {
+        LINE_READ_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub fn reserve_pane_ids(count: usize) -> Result<std::ops::Range<PaneId>, crate::IdAllocationError> {
     crate::try_reserve_usize_ids(&PANE_ID, count, "pane")
 }
@@ -498,6 +579,26 @@ pub trait Pane: Downcast + Send + Sync {
     /// Because of this, we also return the adjusted StableRowIndex for
     /// the first row in the range.
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>);
+
+    /// Local terminal read plans perform storage IO only after leaving pane
+    /// authority and terminal locks. Other pane implementations retain their
+    /// existing transport-specific read path.
+    fn capture_line_read(
+        &self,
+        _lines: Range<StableRowIndex>,
+        _budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
+    ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+        None
+    }
+
+    /// Execute publication while the exact active Screen is still validated.
+    fn publish_line_reads(
+        &self,
+        _reads: &[frankenterm_term::screen::ScreenLineRead],
+        _publish: &mut dyn FnMut(),
+    ) -> bool {
+        false
+    }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);
 

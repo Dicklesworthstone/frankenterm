@@ -59,6 +59,349 @@ pub struct ScreenCoordinateWitness {
     dpi: u32,
 }
 
+/// Owned read work, captured without storage IO. Only the sink and COW row
+/// snapshots cross the worker boundary; no Screen or pane lock escapes.
+#[cfg(feature = "use_serde")]
+pub struct LineReadCaptureBudget {
+    bytes_left: usize,
+    work_left: usize,
+}
+
+#[cfg(feature = "use_serde")]
+impl Default for LineReadCaptureBudget {
+    fn default() -> Self {
+        Self {
+            bytes_left: ScreenLineRead::MAX_PAYLOAD_BYTES,
+            work_left: 65_536,
+        }
+    }
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Clone)]
+pub struct LineReadFailureWitness {
+    screen: ScreenCoordinateWitness,
+    cold: Option<(
+        Arc<dyn crate::config::ScrollbackSpillSink>,
+        crate::config::ScrollbackInterval,
+    )>,
+}
+
+#[cfg(feature = "use_serde")]
+impl LineReadFailureWitness {
+    pub fn matches(&self, screen: &Screen) -> bool {
+        if !screen.matches_coordinate_witness(&self.screen) {
+            return false;
+        }
+        let Some((before_sink, before)) = &self.cold else {
+            return false;
+        };
+        let Some(now_sink) = screen.config.scrollback_spill_sink() else {
+            return false;
+        };
+        if !Arc::ptr_eq(before_sink, &now_sink) {
+            return false;
+        }
+        match (before.rows(), now_sink.try_capture_scrollback_interval()) {
+            (Some(rows), crate::config::ScrollbackIntervalCapture::Ready(now)) => {
+                now.rows().as_ref() == Some(&rows) && now.retains(before, rows)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+pub struct ColdReadGeometryUnavailable;
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for ColdReadGeometryUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cold history requires a coherent layout index at this width")
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for ColdReadGeometryUnavailable {}
+
+#[cfg(feature = "use_serde")]
+pub struct ScreenLineRead {
+    witness: ScreenCoordinateWitness,
+    first: StableRowIndex,
+    end: StableRowIndex,
+    resident_first: StableRowIndex,
+    resident: Vec<Line>,
+    cold: Option<(
+        Arc<dyn crate::config::ScrollbackSpillSink>,
+        crate::config::ScrollbackInterval,
+    )>,
+    hydrated: Vec<Line>,
+    payload_bytes: usize,
+    complete: bool,
+    cold_context: Option<Range<StableRowIndex>>,
+    rendered: Option<Vec<Line>>,
+    hot_top: StableRowIndex,
+    wrap_policy: ResizeWrapPolicy,
+}
+
+#[cfg(feature = "use_serde")]
+impl ScreenLineRead {
+    pub const MAX_ROWS: usize = 16_384;
+    pub const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+    pub fn first_row(&self) -> StableRowIndex {
+        self.first
+    }
+    pub fn failure_witness(&self) -> LineReadFailureWitness {
+        LineReadFailureWitness {
+            screen: self.witness.clone(),
+            cold: self.cold.clone(),
+        }
+    }
+    pub fn row_count(&self) -> usize {
+        self.rendered
+            .as_ref()
+            .map_or(self.hydrated.len() + self.resident.len(), Vec::len)
+    }
+    pub fn requested_row_count(&self) -> usize {
+        self.end.saturating_sub(self.first) as usize
+    }
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    /// Run only off the UI thread and outside terminal/registration locks.
+    /// The bounded writer counts full serialized attributes and image payloads,
+    /// not just row pointers. Shared source allocations are not new allocations
+    /// and remain subject to the source store's own admission limits.
+    pub fn hydrate(self, cancelled: impl Fn() -> bool) -> anyhow::Result<Self> {
+        self.hydrate_with_payload_limit(Self::MAX_PAYLOAD_BYTES, cancelled)
+    }
+
+    pub fn hydrate_with_payload_limit(
+        mut self,
+        limit: usize,
+        cancelled: impl Fn() -> bool,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!self.complete, "line read already hydrated");
+        anyhow::ensure!(limit <= Self::MAX_PAYLOAD_BYTES, "line read payload limit");
+        struct Charge {
+            used: usize,
+            limit: usize,
+        }
+        impl std::io::Write for Charge {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.used = self
+                    .used
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= self.limit)
+                    .ok_or_else(|| std::io::Error::other("cold read payload limit"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut charge = Charge { used: 0, limit };
+        fn context_batch(
+            sink: &dyn crate::config::ScrollbackSpillSink,
+            mut range: Range<StableRowIndex>,
+            charge: &mut Charge,
+            cancelled: &impl Fn() -> bool,
+        ) -> anyhow::Result<Vec<Line>> {
+            let mut result = Vec::new();
+            while range.start < range.end {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                let batch = sink.load_scrollback_lines(range.clone());
+                anyhow::ensure!(
+                    !batch.is_empty() && batch.len() <= (range.end - range.start) as usize,
+                    "cold logical context unavailable"
+                );
+                for line in batch {
+                    serde_json::to_writer(&mut *charge, &line)?;
+                    result.push(line);
+                    range.start += 1;
+                }
+            }
+            Ok(result)
+        }
+        let mut row = self.first;
+        while row < self.resident_first {
+            anyhow::ensure!(!cancelled(), "cold read cancelled");
+            let sink = &self
+                .cold
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?
+                .0;
+            let end = self.resident_first.min(row.saturating_add(32));
+            let batch = sink.load_scrollback_lines(row..end);
+            anyhow::ensure!(
+                !batch.is_empty() && batch.len() <= (end - row) as usize,
+                "cold read missing rows"
+            );
+            for line in batch {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                serde_json::to_writer(&mut charge, &line)?;
+                self.hydrated.push(line);
+                row += 1;
+            }
+        }
+        for line in &self.resident {
+            anyhow::ensure!(!cancelled(), "cold read cancelled");
+            serde_json::to_writer(&mut charge, line)?;
+        }
+        if !self.hydrated.is_empty() {
+            let (sink, interval) = self
+                .cold
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("cold context unavailable"))?;
+            let retained = interval
+                .rows()
+                .ok_or_else(|| anyhow::anyhow!("cold context unavailable"))?;
+            let mut context: VecDeque<Line> = self.hydrated.iter().cloned().collect();
+            let mut context_first = self.first;
+            let mut checked_first = context_first;
+            // The predecessor is part of the witness even when it terminates
+            // a different logical line: its wrap bit justified this boundary.
+            while context_first > retained.start {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                anyhow::ensure!(
+                    context.len() + self.resident.len() < Self::MAX_ROWS,
+                    "cold logical context row limit"
+                );
+                let count = (Self::MAX_ROWS - context.len() - self.resident.len()).min(32)
+                    as StableRowIndex;
+                let from = retained.start.max(context_first.saturating_sub(count));
+                let batch =
+                    context_batch(sink.as_ref(), from..context_first, &mut charge, &cancelled)?;
+                let mut found_start = false;
+                for line in batch.into_iter().rev() {
+                    let previous = context_first - 1;
+                    checked_first = previous;
+                    if !line.last_cell_was_wrapped() {
+                        found_start = true;
+                        break;
+                    }
+                    context.push_front(line);
+                    context_first = previous;
+                }
+                if found_start {
+                    break;
+                }
+            }
+            let mut context_end = self.resident_first;
+            while context.back().is_some_and(Line::last_cell_was_wrapped)
+                && context_end < self.hot_top
+            {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                anyhow::ensure!(
+                    context.len() + self.resident.len() < Self::MAX_ROWS,
+                    "cold logical context row limit"
+                );
+                anyhow::ensure!(
+                    context_end < retained.end,
+                    "cold logical successor unavailable"
+                );
+                let count = (Self::MAX_ROWS - context.len() - self.resident.len()).min(32)
+                    as StableRowIndex;
+                let to = self
+                    .hot_top
+                    .min(retained.end)
+                    .min(context_end.saturating_add(count));
+                let batch = context_batch(sink.as_ref(), context_end..to, &mut charge, &cancelled)?;
+                for line in batch {
+                    let wrapped = line.last_cell_was_wrapped();
+                    context.push_back(line);
+                    context_end += 1;
+                    if !wrapped {
+                        break;
+                    }
+                }
+            }
+            self.cold_context = Some(checked_first..context_end);
+            let cold_len = context.len();
+            context.extend(self.resident.iter().cloned());
+            let source: Vec<Line> = context.into_iter().collect();
+            let mut output = Vec::with_capacity(source.len());
+            let mut start = 0;
+            while start < source.len() {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                if start >= cold_len {
+                    output.extend(source[start..].iter().cloned());
+                    break;
+                }
+                let mut end = start + 1;
+                while source[end - 1].last_cell_was_wrapped() && end < source.len() {
+                    end += 1;
+                }
+                anyhow::ensure!(
+                    !source[end - 1].last_cell_was_wrapped(),
+                    ColdReadGeometryUnavailable
+                );
+                anyhow::ensure!(end <= cold_len, ColdReadGeometryUnavailable);
+                let mut logical = source[start].clone();
+                logical.set_last_cell_was_wrapped(false, logical.current_seqno());
+                for line in &source[start + 1..end] {
+                    let seqno = logical.current_seqno().max(line.current_seqno());
+                    let mut line = line.clone();
+                    line.set_last_cell_was_wrapped(false, seqno);
+                    logical.append_line(line, seqno);
+                }
+                let seqno = logical.current_seqno();
+                logical.set_last_cell_was_wrapped(false, seqno);
+                anyhow::ensure!(
+                    logical.len().div_ceil(self.witness.cols.max(1)) <= end - start,
+                    ColdReadGeometryUnavailable
+                );
+                anyhow::ensure!(
+                    logical.len() <= Self::MAX_PAYLOAD_BYTES / std::mem::size_of::<Cell>(),
+                    "cold reflow expanded cell limit"
+                );
+                let (wrapped, _) = Screen::wrap_single_logical_line_for_resize(
+                    logical,
+                    self.witness.cols,
+                    seqno,
+                    self.wrap_policy,
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                anyhow::ensure!(wrapped.len() == end - start, ColdReadGeometryUnavailable);
+                output.extend(wrapped);
+                start = end;
+            }
+            let skip = (self.first - context_first) as usize;
+            let mut visible: Vec<Line> = output
+                .into_iter()
+                .skip(skip)
+                .take(self.requested_row_count())
+                .collect();
+            anyhow::ensure!(
+                visible.len() == self.requested_row_count(),
+                "cold reflow incomplete viewport"
+            );
+            for line in &mut visible {
+                // Prepare COW cells on the worker, not by deep-cloning a
+                // clustered cached row for every native paint.
+                let _ = line.cells_mut_for_attr_changes_only();
+                serde_json::to_writer(&mut charge, line)?;
+            }
+            self.rendered = Some(visible);
+        }
+        anyhow::ensure!(!cancelled(), "cold read cancelled");
+        self.payload_bytes = charge.used;
+        self.complete = true;
+        Ok(self)
+    }
+
+    pub fn lines(&self) -> impl Iterator<Item = &Line> {
+        let (first, rest) = match &self.rendered {
+            Some(lines) => (lines.as_slice(), &[][..]),
+            None => (self.hydrated.as_slice(), self.resident.as_slice()),
+        };
+        first.iter().chain(rest)
+    }
+}
+
 /// Holds the model of a screen. This can either be the primary screen,
 /// including scrollback text, or the alternate screen without scrollback.
 #[derive(Debug, Clone)]
@@ -1247,6 +1590,144 @@ fn inspect_checkpoint_line(
 }
 
 impl Screen {
+    /// Capture a bounded request without invoking any blocking sink method.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_line_read(
+        &self,
+        requested: Range<StableRowIndex>,
+    ) -> anyhow::Result<ScreenLineRead> {
+        self.capture_line_read_with_budget(requested, &mut LineReadCaptureBudget::default())
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn capture_line_read_with_budget(
+        &self,
+        requested: Range<StableRowIndex>,
+        budget: &mut LineReadCaptureBudget,
+    ) -> anyhow::Result<ScreenLineRead> {
+        use crate::config::ScrollbackIntervalCapture;
+        let count = requested.end.saturating_sub(requested.start).max(0) as usize;
+        anyhow::ensure!(count <= ScreenLineRead::MAX_ROWS, "line read row limit");
+        let hot_top = self.phys_to_stable_row_index(0);
+        let newest = self.phys_to_stable_row_index(self.lines.len());
+        let mut oldest = hot_top;
+        let mut cold = None;
+        if self.allow_scrollback {
+            if let Some(sink) = self.config.scrollback_spill_sink() {
+                match sink.try_capture_scrollback_interval() {
+                    ScrollbackIntervalCapture::Ready(interval) => {
+                        if let Some(rows) = interval.rows() {
+                            // A missing cold/hot seam is not permission to rebase
+                            // a requested cold row onto resident row zero.
+                            anyhow::ensure!(rows.end >= hot_top, "cold read discontinuity");
+                            oldest = rows.start.min(hot_top);
+                        }
+                        cold = Some((sink, interval));
+                    }
+                    _ if requested.start >= hot_top && requested.end <= newest => {}
+                    _ => anyhow::bail!("cold read metadata busy or unavailable"),
+                }
+            }
+        }
+        let len = count.min(newest.saturating_sub(oldest).max(0) as usize);
+        let first = if count == 0 {
+            requested.start
+        } else if requested.end > newest {
+            newest.saturating_sub(len as StableRowIndex).max(oldest)
+        } else {
+            requested.start.max(oldest)
+        };
+        let end = first
+            .checked_add(len as StableRowIndex)
+            .ok_or_else(|| anyhow::anyhow!("line read range overflow"))?;
+        let resident_first = first.max(hot_top).min(end);
+        let resident = if resident_first < end {
+            let start = self
+                .stable_row_to_phys(resident_first)
+                .ok_or_else(|| anyhow::anyhow!("resident read unavailable"))?;
+            self.lines
+                .iter()
+                .skip(start)
+                .take((end - resident_first) as usize)
+                .map(|line| {
+                    line.try_clone_for_snapshot(&mut budget.bytes_left, &mut budget.work_left)
+                        .ok_or_else(|| anyhow::anyhow!("resident snapshot allocation/work limit"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(ScreenLineRead {
+            witness: self.capture_coordinate_witness(),
+            first,
+            end,
+            resident_first,
+            resident,
+            cold,
+            hydrated: Vec::new(),
+            payload_bytes: 0,
+            complete: false,
+            cold_context: None,
+            rendered: None,
+            hot_top,
+            wrap_policy: self.resize_wrap_policy,
+        })
+    }
+
+    /// Call under the terminal lock, in the same critical section as publication.
+    #[cfg(feature = "use_serde")]
+    pub fn validates_line_read(&self, read: &ScreenLineRead) -> bool {
+        use crate::config::ScrollbackIntervalCapture;
+        if !read.complete
+            || !self.matches_coordinate_witness(&read.witness)
+            || read.row_count() != read.end.saturating_sub(read.first) as usize
+        {
+            return false;
+        }
+        if read.first < read.resident_first {
+            let Some((source, before)) = &read.cold else {
+                return false;
+            };
+            let Some(current) = self.config.scrollback_spill_sink() else {
+                return false;
+            };
+            if !Arc::ptr_eq(source, &current) {
+                return false;
+            }
+            match current.try_capture_scrollback_interval() {
+                ScrollbackIntervalCapture::Ready(now)
+                    if now.retains(
+                        before,
+                        read.cold_context
+                            .clone()
+                            .unwrap_or(read.first..read.resident_first),
+                    ) => {}
+                _ => return false,
+            }
+        }
+        if !read.resident.is_empty() {
+            let Some(start) = self.stable_row_to_phys(read.resident_first) else {
+                return false;
+            };
+            if start
+                .checked_add(read.resident.len())
+                .is_none_or(|end| end > self.lines.len())
+            {
+                return false;
+            }
+            if !self
+                .lines
+                .iter()
+                .skip(start)
+                .zip(&read.resident)
+                .all(|(now, before)| now == before)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Capture without consulting configuration/sink callbacks or scanning
     /// lines. Cloning the token only increments its reference count.
     pub fn capture_coordinate_witness(&self) -> ScreenCoordinateWitness {
@@ -4891,6 +5372,344 @@ mod tests {
 
     fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn owned_line_read_payload_boundary_and_resident_mutation() {
+        let mut screen = test_screen(3, 8, 96);
+        screen.lines[0] = Line::from_text("actual row", &CellAttributes::blank(), 1, None);
+        let bytes = serde_json::to_vec(&screen.lines[0]).unwrap().len();
+        assert!(
+            !screen.validates_line_read(&screen.capture_line_read(0..1).unwrap()),
+            "uncounted resident plans cannot publish"
+        );
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate_with_payload_limit(bytes, || false)
+            .unwrap();
+        assert_eq!(read.payload_bytes(), bytes);
+        assert_eq!(read.lines().next().unwrap().as_str(), "actual row");
+        assert!(screen.validates_line_read(&read));
+        assert!(!screen.clone().validates_line_read(&read));
+        assert!(screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate_with_payload_limit(bytes - 1, || false)
+            .is_err());
+        assert!(screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| true)
+            .is_err());
+        screen.lines[0] = Line::from_text("changed", &CellAttributes::blank(), 2, None);
+        assert!(!screen.validates_line_read(&read));
+        assert!(
+            read.hydrate(|| false).is_err(),
+            "a read cannot amplify its retained rows by hydrating twice"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn owned_line_read_checks_requested_rows_before_clamping() {
+        let screen = test_screen(3, 8, 96);
+        assert!(screen
+            .capture_line_read(0..ScreenLineRead::MAX_ROWS as StableRowIndex)
+            .is_ok());
+        assert!(screen
+            .capture_line_read(0..ScreenLineRead::MAX_ROWS as StableRowIndex + 1)
+            .is_err());
+        let read = screen
+            .capture_line_read(-10..-8)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(read.first_row(), 0);
+        assert_eq!(read.row_count(), 2);
+        assert!(screen.validates_line_read(&read));
+        let read = screen
+            .capture_line_read(100..102)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(read.first_row(), 1);
+        assert_eq!(read.row_count(), 2);
+        assert!(screen.validates_line_read(&read));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn owned_line_read_capture_budget_is_shared_before_clustered_clone() {
+        let mut screen = test_screen(3, 8, 96);
+        screen.lines[0] = Line::from_text(&"x".repeat(4096), &CellAttributes::blank(), 1, None);
+        screen.lines[0].compress_for_scrollback();
+        let mut bytes = usize::MAX;
+        let mut work = 65_536;
+        let _ = screen.lines[0]
+            .try_clone_for_snapshot(&mut bytes, &mut work)
+            .unwrap();
+        let cost = usize::MAX - bytes;
+        assert!(cost >= 4096);
+        let mut budget = LineReadCaptureBudget {
+            bytes_left: cost - 1,
+            work_left: 65_536,
+        };
+        assert!(screen
+            .capture_line_read_with_budget(0..1, &mut budget)
+            .is_err());
+        assert_eq!(budget.bytes_left, cost - 1);
+        let mut budget = LineReadCaptureBudget {
+            bytes_left: cost,
+            work_left: 65_536,
+        };
+        let first = screen
+            .capture_line_read_with_budget(0..1, &mut budget)
+            .unwrap();
+        assert_eq!(budget.bytes_left, 0);
+        assert!(
+            screen
+                .capture_line_read_with_budget(0..1, &mut budget)
+                .is_err(),
+            "separate ranges cannot reset the request budget"
+        );
+        drop(first);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn owned_line_read_cold_interval_busy_trim_and_replacement() {
+        use crate::config::{
+            ScrollbackIntervalCapture, ScrollbackIntervalIdentity, ScrollbackSpillSink,
+        };
+        #[derive(Debug)]
+        struct Sink {
+            state: Mutex<(ScrollbackIntervalIdentity, BTreeMap<StableRowIndex, Line>)>,
+            reads: AtomicU64,
+            entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        }
+        impl ScrollbackSpillSink for Sink {
+            fn store_scrollback_line(&self, _: StableRowIndex, _: &Line, _: usize) -> bool {
+                false
+            }
+            fn load_scrollback_line(&self, row: StableRowIndex) -> Option<Line> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if let Some(entered) = self.entered.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                }
+                self.state.lock().unwrap().1.get(&row).cloned()
+            }
+            fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+                panic!("blocking metadata accessor")
+            }
+            fn retained_scrollback_rows(&self) -> usize {
+                panic!("blocking metadata accessor")
+            }
+            fn retained_scrollback_bytes(&self) -> usize {
+                panic!("blocking metadata accessor")
+            }
+            fn snapshot_scrollback(
+                &self,
+                _: StableRowIndex,
+                _: crate::config::ScrollbackSnapshotLimits,
+            ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError>
+            {
+                panic!("bounded read must not request a full snapshot")
+            }
+            fn replace_scrollback_prefix(
+                &self,
+                _: Option<crate::config::ScrollbackSnapshotGeneration>,
+                _: crate::config::ScrollbackPrefix<'_>,
+                _: usize,
+            ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
+            {
+                panic!("read must not replace storage")
+            }
+            fn clear_scrollback(
+                &self,
+            ) -> Result<crate::config::ScrollbackClearCommit, crate::config::ScrollbackSpillError>
+            {
+                panic!("read must not clear storage")
+            }
+            fn try_capture_scrollback_interval(&self) -> ScrollbackIntervalCapture {
+                let Ok(state) = self.state.try_lock() else {
+                    return ScrollbackIntervalCapture::Busy;
+                };
+                let range = state
+                    .1
+                    .first_key_value()
+                    .zip(state.1.last_key_value())
+                    .map(|((first, _), (last, _))| *first..*last + 1);
+                state.0.capture(range)
+            }
+        }
+        let sink = Arc::new(Sink {
+            state: Mutex::new((
+                ScrollbackIntervalIdentity::default(),
+                (-1..4)
+                    .map(|row| {
+                        (
+                            row,
+                            Line::from_text(
+                                &format!("cold-{row}"),
+                                &CellAttributes::blank(),
+                                1,
+                                None,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )),
+            reads: AtomicU64::new(0),
+            entered: Mutex::new(None),
+        });
+        let mut screen = test_screen_with_config(
+            3,
+            8,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 4;
+        let plan = screen.capture_line_read(1..6).unwrap();
+        assert_eq!(
+            sink.reads.load(Ordering::Relaxed),
+            0,
+            "capture performs no backing reads"
+        );
+        let read = std::thread::spawn(move || plan.hydrate(|| false))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.first_row(), 1);
+        assert_eq!(read.row_count(), 5);
+        assert_eq!(
+            read.lines()
+                .take(3)
+                .map(|line| line.as_str().to_string())
+                .collect::<Vec<_>>(),
+            ["cold-1", "cold-2", "cold-3"]
+        );
+        assert!(screen.validates_line_read(&read));
+        {
+            let _busy = sink.state.lock().unwrap();
+            assert!(screen.capture_line_read(1..2).is_err());
+            assert!(!screen.validates_line_read(&read));
+            assert!(
+                screen.capture_line_read(4..5).is_ok(),
+                "resident capture does not wait for backing IO"
+            );
+        }
+        sink.state.lock().unwrap().1.remove(&-1);
+        assert!(
+            screen.validates_line_read(&read),
+            "trimming outside the exact interval is harmless"
+        );
+        // Retention trims a contiguous prefix; an interior hole cannot be
+        // represented by the sink's interval witness.
+        sink.state.lock().unwrap().1.remove(&0);
+        sink.state.lock().unwrap().1.remove(&1);
+        assert!(!screen.validates_line_read(&read));
+        let read = screen
+            .capture_line_read(2..4)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        sink.state.lock().unwrap().0 = ScrollbackIntervalIdentity::default();
+        assert!(
+            !screen.validates_line_read(&read),
+            "same-coordinate replacement is a new authority"
+        );
+        let plan = screen.capture_line_read(2..5).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        *sink.entered.lock().unwrap() = Some(entered_tx);
+        let blocked_io = sink.state.lock().unwrap();
+        let worker = std::thread::spawn(move || plan.hydrate(|| false));
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Mutate the real Screen while storage is blocked: no terminal/Screen
+        // guard can have escaped in the owned plan.
+        screen.lines[0] = Line::from_text("main remains live", &CellAttributes::blank(), 3, None);
+        assert!(screen.capture_line_read(4..5).is_ok());
+        drop(blocked_io);
+        let read = worker.join().unwrap().unwrap();
+        assert!(entered.is_ok(), "worker reached backing IO");
+        assert!(
+            !screen.validates_line_read(&read),
+            "resident mutation during IO rejects publication"
+        );
+
+        // Real worker-side reflow with complete predecessor/successor context:
+        // 4-column source rows occupy the same two coordinates at width5.
+        let mut first = Line::from_text("abcd", &CellAttributes::blank(), 4, None);
+        first.set_last_cell_was_wrapped(true, 4);
+        {
+            let mut state = sink.state.lock().unwrap();
+            state.0 = ScrollbackIntervalIdentity::default();
+            state.1 = vec![
+                (0, first),
+                (
+                    1,
+                    Line::from_text("efgh", &CellAttributes::blank(), 4, None),
+                ),
+            ]
+            .into_iter()
+            .collect();
+        }
+        screen.stable_row_index_offset = 2;
+        screen.physical_cols = 5;
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(
+            read.lines().next().unwrap().as_str(),
+            "abcde",
+            "successor context contributes its first cell"
+        );
+        assert!(screen.validates_line_read(&read));
+        let read = screen
+            .capture_line_read(1..2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(
+            read.lines().next().unwrap().as_str(),
+            "fgh",
+            "predecessor context shifts cells without shifting row identity"
+        );
+        assert!(screen.validates_line_read(&read));
+        screen.physical_cols = 3;
+        assert!(
+            !screen.validates_line_read(&read),
+            "width witness rejects pre-resize layout"
+        );
+        let plan = screen.capture_line_read(0..2).unwrap();
+        let failure = plan.failure_witness();
+        assert!(failure.matches(&screen));
+        let error = match plan.hydrate(|| false) {
+            Ok(_) => panic!("three target rows cannot reuse two persisted coordinates"),
+            Err(error) => error,
+        };
+        assert!(
+            error.is::<ColdReadGeometryUnavailable>(),
+            "structural failure is not transient Busy"
+        );
+        assert!(failure.matches(&screen));
+        screen.physical_cols = 5;
+        assert!(
+            !failure.matches(&screen),
+            "a new width can retry a previously refused layout"
+        );
+        screen.physical_cols = 3;
+        sink.state.lock().unwrap().0 = ScrollbackIntervalIdentity::default();
+        assert!(
+            !failure.matches(&screen),
+            "same-coordinate replacement invalidates remembered failure"
+        );
     }
 
     #[test]

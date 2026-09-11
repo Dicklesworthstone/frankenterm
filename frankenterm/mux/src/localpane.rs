@@ -53,6 +53,110 @@ use crossbeam::queue::ArrayQueue;
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 const LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+struct ColdViewportEntry {
+    registration: [u8; 16],
+    requested: Range<StableRowIndex>,
+    read: Arc<frankenterm_term::screen::ScreenLineRead>,
+}
+
+type ColdViewportRetired = (
+    Arc<frankenterm_term::screen::ScreenLineRead>,
+    Vec<ColdViewportEntry>,
+);
+
+// Return both rejected publications and evictions to the originating worker.
+// That worker keeps its permit until this queue is drained and destroyed.
+struct ColdViewportRetirement {
+    read: Option<Arc<frankenterm_term::screen::ScreenLineRead>>,
+    evicted: Vec<ColdViewportEntry>,
+    sender: std::sync::mpsc::SyncSender<ColdViewportRetired>,
+}
+
+impl Drop for ColdViewportRetirement {
+    fn drop(&mut self) {
+        if let Some(read) = self.read.take() {
+            let _ = self.sender.send((read, std::mem::take(&mut self.evicted)));
+        }
+    }
+}
+
+// Global, not per pane: a fleet cannot multiply the retained payload allowance.
+// Four entries at the shared 32MiB serialized-payload limit. Active workers and
+// queued publications have their independent four-permit admission bound.
+static COLD_VIEWPORT_CACHE: Mutex<std::collections::VecDeque<ColdViewportEntry>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+static COLD_VIEWPORT_RETRIES: AtomicUsize = AtomicUsize::new(0);
+
+struct ColdViewportRetry(Arc<AtomicBool>);
+
+impl Drop for ColdViewportRetry {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+        COLD_VIEWPORT_RETRIES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn retry_cold_viewport(registration: PaneRegistrationHandle, pending: Arc<AtomicBool>) {
+    if pending
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if COLD_VIEWPORT_RETRIES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            if count < 32 {
+                Some(count + 1)
+            } else {
+                None
+            }
+        })
+        .is_err()
+    {
+        pending.store(false, Ordering::Release);
+        return;
+    }
+    let retry = ColdViewportRetry(pending);
+    schedule_local_pane_main_thread(
+        promise::spawn::MainThreadServiceClass::Interactive,
+        LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+        "cold_viewport_retry",
+        || async move {
+            promise::spawn::sleep(Duration::from_millis(100)).await;
+            drop(retry);
+            let _ = registration.try_with_current(|pane| pane.notify_lines_ready());
+        },
+    );
+}
+
+struct ColdViewportPending {
+    requested: Range<StableRowIndex>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct ColdViewportFailure {
+    requested: Range<StableRowIndex>,
+    witness: frankenterm_term::screen::LineReadFailureWitness,
+}
+
+struct ColdViewportCompletion {
+    state: Arc<Mutex<Option<ColdViewportPending>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for ColdViewportCompletion {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if state
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.cancelled, &self.cancelled))
+        {
+            *state = None;
+        }
+    }
+}
+
 fn schedule_local_pane_main_thread<MAKE, FUT>(
     service_class: promise::spawn::MainThreadServiceClass,
     estimated_bytes: usize,
@@ -1015,6 +1119,9 @@ pub struct LocalPane {
     durable_pane_id: [u8; 16],
     ownership: LocalPaneOwnership,
     terminal: Arc<Mutex<Terminal>>,
+    cold_viewport_pending: Arc<Mutex<Option<ColdViewportPending>>>,
+    cold_viewport_retry: Arc<AtomicBool>,
+    cold_viewport_failure: Arc<Mutex<Option<ColdViewportFailure>>>,
     // Serializes complete producer batches, including deferred persistence,
     // without preventing GUI readers or resize workers from taking terminal.
     output_application: Mutex<()>,
@@ -1156,6 +1263,40 @@ impl Pane for LocalPane {
         rules: &[termwiz::hyperlink::Rule],
         with_lines: &mut dyn WithPaneLines,
     ) {
+        // Never substitute resident row zero for a requested persisted row.
+        // A missing cold snapshot is a loading frame, followed by a targeted
+        // repaint after exact-registration publication of the worker result.
+        let Some(term) = self.terminal.try_lock() else {
+            if let Some(registration) = self.mux_registration.load() {
+                retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
+            }
+            with_lines.with_lines_mut(lines.start, &mut []);
+            return;
+        };
+        let cold = lines.start < term.screen().phys_to_stable_row_index(0);
+        drop(term);
+        if cold {
+            let (first, mut snapshot) = self.cold_viewport_lines(lines);
+            let mut start = 0;
+            for end in 0..snapshot.len() {
+                if !snapshot[end].last_cell_was_wrapped() || end + 1 == snapshot.len() {
+                    Line::apply_hyperlink_rules(
+                        rules,
+                        &mut snapshot[start..=end].iter_mut().collect::<Vec<_>>(),
+                    );
+                    start = end + 1;
+                }
+            }
+            with_lines.with_lines_mut(first, &mut snapshot.iter_mut().collect::<Vec<_>>());
+            return;
+        }
+        if let Some(pending) = self
+            .cold_viewport_pending
+            .try_lock()
+            .and_then(|mut pending| pending.take())
+        {
+            pending.cancelled.store(true, Ordering::Release);
+        }
         struct Snapshot {
             first: StableRowIndex,
             lines: Vec<Line>,
@@ -1216,6 +1357,37 @@ impl Pane for LocalPane {
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         terminal_get_lines(&mut self.locked_terminal(), lines)
+    }
+
+    fn capture_line_read(
+        &self,
+        lines: Range<StableRowIndex>,
+        budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
+    ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+        Some(
+            self.terminal
+                .try_lock()
+                .ok_or_else(|| anyhow::anyhow!("terminal busy"))
+                .and_then(|term| term.screen().capture_line_read_with_budget(lines, budget)),
+        )
+    }
+
+    fn publish_line_reads(
+        &self,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        publish: &mut dyn FnMut(),
+    ) -> bool {
+        let Some(term) = self.terminal.try_lock() else {
+            return false;
+        };
+        if !reads
+            .iter()
+            .all(|read| term.screen().validates_line_read(read))
+        {
+            return false;
+        }
+        publish();
+        true
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -2363,6 +2535,176 @@ fn split_child(
 }
 
 impl LocalPane {
+    fn cold_viewport_lines(&self, requested: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+        let empty = || (requested.start, Vec::new());
+        if requested.end.saturating_sub(requested.start).max(0) as usize
+            > frankenterm_term::screen::ScreenLineRead::MAX_ROWS
+        {
+            return empty();
+        }
+        let Some(registration) = self.mux_registration.load() else {
+            return empty();
+        };
+        if let Some(failure) = self.cold_viewport_failure.try_lock() {
+            if let Some(failure) = failure.as_ref() {
+                if failure.requested == requested {
+                    if let Some(term) = self.terminal.try_lock() {
+                        if failure.witness.matches(term.screen()) {
+                            return empty();
+                        }
+                    }
+                }
+            }
+        }
+        let cached = COLD_VIEWPORT_CACHE.try_lock().and_then(|cache| {
+            cache
+                .iter()
+                .find(|entry| {
+                    entry.registration == registration.wire_identity()
+                        && entry.requested == requested
+                })
+                .map(|entry| Arc::clone(&entry.read))
+        });
+        if let Some(read) = cached {
+            let mut snapshot = None;
+            let _ = registration.try_with_current(|pane| {
+                pane.publish_line_reads(std::slice::from_ref(read.as_ref()), &mut || {
+                    let mut bytes_left =
+                        frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+                    let mut work_left = 65_536;
+                    let rows = read
+                        .lines()
+                        .map(|line| line.try_clone_for_snapshot(&mut bytes_left, &mut work_left))
+                        .collect::<Option<Vec<_>>>();
+                    snapshot = rows.map(|rows| (read.first_row(), rows));
+                });
+            });
+            if let Some(snapshot) = snapshot {
+                return snapshot;
+            }
+        }
+        let Some(mut pending) = self.cold_viewport_pending.try_lock() else {
+            retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
+            return empty();
+        };
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.requested == requested)
+        {
+            return empty();
+        }
+        if let Some(previous) = pending.take() {
+            previous.cancelled.store(true, Ordering::Release);
+        }
+        let Some(permit) = crate::pane::LineReadPermit::try_acquire() else {
+            retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
+            return empty();
+        };
+        let Some(Ok(plan)) = self.capture_line_read(requested.clone(), &mut Default::default())
+        else {
+            retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
+            return empty();
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let failure_witness = plan.failure_witness();
+        let failure_state = Arc::clone(&self.cold_viewport_failure);
+        let terminal_for_failure = Arc::downgrade(&self.terminal);
+        *pending = Some(ColdViewportPending {
+            requested: requested.clone(),
+            cancelled: Arc::clone(&cancelled),
+        });
+        drop(pending);
+        let completion = ColdViewportCompletion {
+            state: Arc::clone(&self.cold_viewport_pending),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let response_range = requested.clone();
+        let retry = Arc::clone(&self.cold_viewport_retry);
+        if permit.spawn(vec![plan], cancelled, move |result, permit| {
+            let mut plans = match result {
+                Ok(plans) => plans,
+                Err(error) => {
+                    metrics::counter!("mux.local_pane.cold_viewport", "outcome" => "read_rejected").increment(1);
+                    if !completion.cancelled.load(Ordering::Acquire) {
+                        let geometry = error.is::<frankenterm_term::screen::ColdReadGeometryUnavailable>();
+                        *failure_state.lock() = Some(ColdViewportFailure { requested: response_range.clone(), witness: failure_witness.clone() });
+                        schedule_local_pane_main_thread(
+                            promise::spawn::MainThreadServiceClass::Interactive,
+                            LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+                            "cold_viewport_failure",
+                            || async move {
+                                if completion.cancelled.load(Ordering::Acquire) { return; }
+                                let _ = registration.try_with_current(|pane| {
+                                    let Some(terminal) = terminal_for_failure.upgrade() else { return; };
+                                    let Some(term) = terminal.try_lock() else { return; };
+                                    let current = failure_witness.matches(term.screen());
+                                    drop(term);
+                                    if current {
+                                        pane.dispatch_alert(Alert::ToastNotification {
+                                            title: Some("Cold history unavailable".to_string()),
+                                            body: if geometry { "This history needs a layout-index update before it can be displayed at this width. Stored content has not been changed." }
+                                                else { "Cold history could not be loaded. Stored content has not been changed." }.to_string(),
+                                            focus: false,
+                                        });
+                                    }
+                                });
+                            },
+                        );
+                    }
+                    return;
+                }
+            };
+            let Some(read) = plans.pop() else { return; };
+            let (sender, retired) = sync_channel(1);
+            let retirement = ColdViewportRetirement { read: Some(Arc::new(read)), evicted: Vec::with_capacity(1), sender };
+            schedule_local_pane_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+                "cold_viewport_publish",
+                || async move {
+                    let mut retirement = retirement;
+                    if completion.cancelled.load(Ordering::Acquire) {
+                        retry_cold_viewport(registration, retry);
+                        return;
+                    }
+                    if let Some(read) = retirement.read.as_ref().map(Arc::clone) {
+                            let _ = registration.try_with_current(|pane| {
+                                let Some(pending) = completion.state.try_lock() else {
+                                    retry_cold_viewport(registration.clone(), Arc::clone(&retry));
+                                    return;
+                                };
+                                if !pending.as_ref().is_some_and(|pending| Arc::ptr_eq(&pending.cancelled, &completion.cancelled)) { return; }
+                                let mut published = false;
+                                pane.publish_line_reads(std::slice::from_ref(read.as_ref()), &mut || {
+                                    let Some(mut cache) = COLD_VIEWPORT_CACHE.try_lock() else { return; };
+                                    if let Some(index) = cache.iter().position(|entry| entry.registration == registration.wire_identity()) {
+                                        if let Some(entry) = cache.remove(index) { retirement.evicted.push(entry); }
+                                    }
+                                    while cache.len() >= 4 {
+                                        if let Some(entry) = cache.pop_front() { retirement.evicted.push(entry); }
+                                    }
+                                    cache.push_back(ColdViewportEntry {
+                                        registration: registration.wire_identity(), requested: response_range.clone(), read: Arc::clone(&read),
+                                    });
+                                    published = true;
+                                });
+                                drop(pending);
+                                if published { pane.notify_lines_ready(); }
+                                else { retry_cold_viewport(registration.clone(), Arc::clone(&retry)); }
+                            });
+                    }
+                },
+            );
+            // Only the blocking worker waits. Queue cancellation drops the
+            // retirement guard, so it also returns source ownership here.
+            drop(retired.recv());
+            drop(permit);
+        }).is_err() {
+            metrics::counter!("mux.local_pane.cold_viewport", "outcome" => "worker_rejected").increment(1);
+        }
+        empty()
+    }
+
     fn drain_scrollback_outside_terminal(
         &self,
         mut sink: Arc<dyn frankenterm_term::config::ScrollbackSpillSink>,
@@ -3218,6 +3560,9 @@ impl LocalPane {
             durable_pane_id,
             ownership,
             terminal: Arc::new(Mutex::new(terminal)),
+            cold_viewport_pending: Arc::new(Mutex::new(None)),
+            cold_viewport_retry: Arc::new(AtomicBool::new(false)),
+            cold_viewport_failure: Arc::new(Mutex::new(None)),
             output_application: Mutex::new(()),
             scrollback_flush_sink: Mutex::new(scrollback_flush_sink),
             process: Arc::clone(&process),
@@ -3503,6 +3848,9 @@ impl LocalPane {
 
 impl Drop for LocalPane {
     fn drop(&mut self) {
+        if let Some(pending) = self.cold_viewport_pending.lock().take() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
         let tmux_domain = self.tmux_domain.lock().take();
         if let Some(tmux) = tmux_domain {
             // Eagerly tear down tmux-domain state if this pane is being dropped
@@ -4017,6 +4365,121 @@ mod tests {
         let (_, lines) = pane.get_lines(0..1);
         assert!(lines[0].get_appdata().is_none());
         assert!(lines[0].as_str().starts_with("original"));
+    }
+
+    #[test]
+    fn native_owned_read_publication_is_nonblocking_and_rejects_mutation() {
+        let pane = LocalPane::new(
+            700,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x70; 16],
+            "native-owned-read".to_string(),
+        );
+        pane.terminal.lock().advance_bytes(b"original");
+        let read = pane
+            .capture_line_read(0..1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let mut publications = 0;
+        assert!(
+            pane.publish_line_reads(std::slice::from_ref(&read), &mut || {
+                assert!(
+                    pane.terminal.try_lock().is_none(),
+                    "validation and publication share the terminal fence"
+                );
+                publications += 1;
+            })
+        );
+        {
+            let _busy = pane.terminal.lock();
+            assert!(
+                !pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1)
+            );
+            assert!(pane
+                .capture_line_read(0..1, &mut Default::default())
+                .unwrap()
+                .is_err());
+        }
+        pane.terminal.lock().advance_bytes(b" changed");
+        assert!(!pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1));
+        assert_eq!(publications, 1);
+    }
+
+    #[test]
+    fn cold_viewport_old_completion_cannot_clear_new_request() {
+        let old = Arc::new(AtomicBool::new(false));
+        let new = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(Some(ColdViewportPending {
+            requested: 20..30,
+            cancelled: Arc::clone(&new),
+        })));
+        drop(ColdViewportCompletion {
+            state: Arc::clone(&state),
+            cancelled: old,
+        });
+        assert!(state
+            .lock()
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.cancelled, &new)));
+        drop(ColdViewportCompletion {
+            state: Arc::clone(&state),
+            cancelled: new,
+        });
+        assert!(state.lock().is_none());
+    }
+
+    #[test]
+    fn cold_viewport_retirement_transfers_last_owner_to_worker() {
+        let pane = LocalPane::new(
+            700,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x70; 16],
+            "native-read-retirement".to_string(),
+        );
+        let read = Arc::new(
+            pane.capture_line_read(0..1, &mut Default::default())
+                .unwrap()
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap(),
+        );
+        let weak = Arc::downgrade(&read);
+        let (sender, receiver) = sync_channel(1);
+        let retirement = ColdViewportRetirement {
+            evicted: vec![ColdViewportEntry {
+                registration: [1; 16],
+                requested: 0..1,
+                read: Arc::clone(&read),
+            }],
+            read: Some(read),
+            sender,
+        };
+        drop(retirement);
+        assert!(
+            weak.upgrade().is_some(),
+            "publication drop must not destroy queued payload"
+        );
+        std::thread::spawn(move || drop(receiver.recv_timeout(Duration::from_secs(5)).unwrap()))
+            .join()
+            .unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "worker retired both publication and evicted owners"
+        );
     }
 
     #[test]

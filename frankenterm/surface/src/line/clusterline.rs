@@ -601,6 +601,34 @@ impl Clone for ClusteredLine {
     }
 }
 
+impl ClusteredLine {
+    pub(crate) fn snapshot_clone_cost(&self, max_clusters: usize) -> Option<(usize, usize)> {
+        if self.clusters.len() > max_clusters {
+            return None;
+        }
+        let mut bytes = self.text.len().checked_add(
+            self.clusters
+                .len()
+                .checked_mul(core::mem::size_of::<Cluster>())?,
+        )?;
+        if let Some(mask) = &self.is_double_wide {
+            bytes = bytes
+                .checked_add(core::mem::size_of::<FixedBitSet>())?
+                // fixedbitset 0.5.7 Clone copies SIMD blocks (up to32 bytes),
+                // while as_slice exposes only logical usize words.
+                .checked_add(
+                    core::mem::size_of_val(mask.as_slice())
+                        .div_ceil(32)
+                        .checked_mul(32)?,
+                )?;
+        }
+        for cluster in &self.clusters {
+            bytes = bytes.checked_add(cluster.attrs.snapshot_clone_heap_bytes()?)?;
+        }
+        Some((bytes, self.clusters.len()))
+    }
+}
+
 pub(crate) struct ClusterLineCellIter<'a> {
     graphemes: Graphemes<'a>,
     clusters: core::slice::Iter<'a, Cluster>,
@@ -642,6 +670,14 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn snapshot_clone_charges_simd_rounding_for_width_mask() {
+        let mut line = super::ClusteredLine::new();
+        line.is_double_wide = Some(Box::new(fixedbitset::FixedBitSet::with_capacity(1)));
+        let (bytes, visits) = line.snapshot_clone_cost(0).unwrap();
+        assert_eq!(visits, 0);
+        assert_eq!(bytes, core::mem::size_of::<fixedbitset::FixedBitSet>() + 32);
+    }
     use super::*;
     use alloc::string::ToString;
 

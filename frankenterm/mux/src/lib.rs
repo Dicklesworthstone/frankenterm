@@ -3631,6 +3631,26 @@ mod pane_registration_handle {
             self.pane.get_lines(range)
         }
 
+        pub fn capture_line_read(
+            &self,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+            budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
+        ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+            self.pane.capture_line_read(range, budget)
+        }
+
+        pub fn publish_line_reads(
+            &self,
+            reads: &[frankenterm_term::screen::ScreenLineRead],
+            publish: &mut dyn FnMut(),
+        ) -> bool {
+            self.pane.publish_line_reads(reads, publish)
+        }
+
+        pub fn notify_lines_ready(&self) {
+            self.owner.notify(MuxNotification::PaneOutput(self.pane_id));
+        }
+
         pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
             self.pane.palette()
         }

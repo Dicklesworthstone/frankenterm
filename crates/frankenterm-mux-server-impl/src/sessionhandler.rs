@@ -89,6 +89,31 @@ const PRODUCTION_TRACE_TOTAL_SLOTS: u32 = 16_384;
 const PRODUCTION_TRACE_BYTE_CEILING: u64 = 32 * 1024 * 1024;
 const PRODUCTION_TRACE_SAMPLE_DENOMINATOR: u64 = 1_024;
 
+struct CancelLineReadOnDrop(Arc<std::sync::atomic::AtomicBool>);
+type RetiredLineReply = (
+    Vec<wezterm_term::screen::ScreenLineRead>,
+    Option<codec::SerializedLines>,
+);
+
+struct OwnedLineReply {
+    plans: Vec<wezterm_term::screen::ScreenLineRead>,
+    payload: Option<codec::SerializedLines>,
+    retirement: std::sync::mpsc::SyncSender<RetiredLineReply>,
+}
+
+impl Drop for OwnedLineReply {
+    fn drop(&mut self) {
+        let _ = self
+            .retirement
+            .send((std::mem::take(&mut self.plans), self.payload.take()));
+    }
+}
+impl Drop for CancelLineReadOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 fn record_send_key_down_scheduler_receipt(receipt: MainThreadEnqueueReceipt, sampled: bool) {
     let snapshot = receipt.snapshot_after_enqueue;
     metrics::counter!("mux.server.input_scheduler_admission", "outcome" => "admitted").increment(1);
@@ -6233,6 +6258,16 @@ fn process_reorder_window_tabs_request(
     Ok(response)
 }
 
+fn recover_line_read_callback<R>(
+    callback: impl FnOnce() -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(callback),
+    )
+    .map_err(|_| anyhow!("line read callback failed"))?
+}
+
 fn with_current_pane<R>(
     authority: &SessionAuthority,
     registration: &PaneRegistrationHandle,
@@ -8267,6 +8302,17 @@ impl SessionHandler {
                 else {
                     return;
                 };
+                let requested_rows = lines.iter().try_fold(0usize, |sum, range| {
+                    usize::try_from(range.end.saturating_sub(range.start).max(0))
+                        .ok()
+                        .and_then(|count| sum.checked_add(count))
+                });
+                if lines.len() > codec::MAX_RENDER_APPLICATION_LINES
+                    || requested_rows.is_none_or(|rows| rows > codec::MAX_RENDER_APPLICATION_LINES)
+                {
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
+                    return;
+                }
                 let estimated_bytes = main_thread_rpc_estimated_bytes(
                     lines
                         .len()
@@ -8276,31 +8322,143 @@ impl SessionHandler {
                     MainThreadServiceClass::Interactive,
                     estimated_bytes,
                     |send_response| async move {
-                        catch(
-                            move || {
-                                with_current_pane(&authority, &registration, |pane| {
-                                    let mut lines_and_indices = vec![];
-
-                                    for range in lines {
-                                        let (first_row, lines) = pane.get_lines(range);
-                                        for (idx, mut line) in lines.into_iter().enumerate() {
-                                            let Some(stable_row) =
-                                                stable_row_offset(first_row, idx)
-                                            else {
-                                                break;
-                                            };
-                                            line.compress_for_scrollback();
-                                            lines_and_indices.push((stable_row, line));
-                                        }
+                        let Some(permit) = mux::pane::LineReadPermit::try_acquire() else {
+                            send_response(Err(anyhow!("cold read worker capacity exhausted")));
+                            return;
+                        };
+                        let captured = recover_line_read_callback(|| {
+                            with_current_pane(&authority, &registration, |pane| {
+                                let mut budget =
+                                    wezterm_term::screen::LineReadCaptureBudget::default();
+                                let mut plans = Vec::with_capacity(lines.len());
+                                for range in &lines {
+                                    match pane.capture_line_read(range.clone(), &mut budget) {
+                                        Some(plan) => plans.push(plan?),
+                                        None => return Ok(None),
                                     }
-                                    Ok(Pdu::GetLinesResponse(GetLinesResponse {
-                                        pane_id,
-                                        lines: lines_and_indices.into(),
-                                    }))
+                                }
+                                Ok(Some(plans))
+                            })
+                        });
+                        let plans = match captured {
+                            Ok(Some(plans)) => plans,
+                            Ok(None) => {
+                                // Non-local pane types retain their existing
+                                // transport-specific behavior; LocalPane never
+                                // falls back to synchronous storage on refusal.
+                                drop(permit);
+                                send_response(recover_line_read_callback(|| {
+                                    with_current_pane(&authority, &registration, |pane| {
+                                        let mut result = Vec::new();
+                                        for range in lines {
+                                            let (first, rows) = pane.get_lines(range);
+                                            for (index, mut line) in rows.into_iter().enumerate() {
+                                                let stable = stable_row_offset(first, index)
+                                                    .ok_or_else(|| {
+                                                        anyhow!("line read range overflow")
+                                                    })?;
+                                                line.compress_for_scrollback();
+                                                result.push((stable, line));
+                                            }
+                                        }
+                                        Ok(Pdu::GetLinesResponse(GetLinesResponse {
+                                            pane_id,
+                                            lines: result.into(),
+                                        }))
+                                    })
+                                }));
+                                return;
+                            }
+                            Err(error) => {
+                                send_response(Err(error));
+                                return;
+                            }
+                        };
+                        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let _cancel = CancelLineReadOnDrop(Arc::clone(&cancelled));
+                        let (tx, rx) = frankenterm_core::runtime_async::oneshot::channel();
+                        if let Err(error) = permit.spawn(plans, cancelled, move |result, permit| {
+                            let (retirement, retired) = std::sync::mpsc::sync_channel(1);
+                            let mut retained_cells = Vec::new();
+                            let result = result.and_then(|plans| {
+                                let mut rows = Vec::new();
+                                for plan in &plans {
+                                    for (index, source) in plan.lines().enumerate() {
+                                        let stable = stable_row_offset(plan.first_row(), index)
+                                            .ok_or_else(|| anyhow!("line read range overflow"))?;
+                                        let mut line = source.clone();
+                                        line.compress_for_scrollback();
+                                        rows.push((stable, line));
+                                    }
+                                }
+                                let payload = codec::SerializedLines::from(rows);
+                                let counts = payload.validate_structure()?;
+                                anyhow::ensure!(
+                                    counts.lines <= codec::MAX_RENDER_APPLICATION_LINES
+                                        && counts.cells <= codec::MAX_RENDER_APPLICATION_CELLS
+                                        && counts.hyperlink_spans
+                                            <= codec::MAX_RENDER_APPLICATION_HYPERLINK_SPANS
+                                        && counts.images
+                                            <= codec::MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+                                    "line reply structure limit"
+                                );
+                                let mut bytes_left =
+                                    wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+                                let mut work_left = 65_536;
+                                // From(rows) normalizes cells to vector storage.
+                                // Force COW sharing even in the eager profiling
+                                // mode: rejected send_response paths may destroy
+                                // the outgoing PDU synchronously on main.
+                                retained_cells = payload
+                                    .lines()
+                                    .map(|(_, line)| {
+                                        line.try_clone_for_snapshot(&mut bytes_left, &mut work_left)
+                                            .ok_or_else(|| anyhow!("line reply retirement budget"))
+                                    })
+                                    .collect::<anyhow::Result<Vec<_>>>()?;
+                                Ok(OwnedLineReply {
+                                    plans,
+                                    payload: Some(payload),
+                                    retirement,
                                 })
-                            },
-                            send_response,
-                        );
+                            });
+                            let _ = tx.send(result);
+                            drop(retired.recv());
+                            drop(retained_cells);
+                            drop(permit);
+                        }) {
+                            send_response(Err(error.into()));
+                            return;
+                        }
+                        let result = match frankenterm_core::runtime_async::oneshot_recv(rx).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                send_response(Err(anyhow!("cold read worker unavailable")));
+                                return;
+                            }
+                        };
+                        match result {
+                            Err(error) => send_response(Err(error)),
+                            Ok(mut reply) => {
+                                let OwnedLineReply { plans, payload, .. } = &mut reply;
+                                let mut response_attempted = false;
+                                let published = recover_line_read_callback(|| {
+                                    with_current_pane(&authority, &registration, |pane| {
+                                        Ok(pane.publish_line_reads(plans, &mut || {
+                                            if let Some(lines) = payload.take() {
+                                                response_attempted = true;
+                                                send_response(Ok(Pdu::GetLinesResponse(
+                                                    GetLinesResponse { pane_id, lines },
+                                                )));
+                                            }
+                                        }))
+                                    })
+                                });
+                                if !response_attempted && !matches!(published, Ok(true)) {
+                                    send_response(Err(anyhow!("cold read source changed or busy")));
+                                }
+                            }
+                        }
                     },
                     send_response,
                 );
@@ -9036,6 +9194,47 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn line_read_reply_returns_rejected_payload_to_worker_queue() {
+        let (retirement, retired) = std::sync::mpsc::sync_channel(1);
+        let payload = codec::SerializedLines::from(vec![(
+            7,
+            termwiz::surface::Line::from_text(
+                "retained reply",
+                &termwiz::cell::CellAttributes::blank(),
+                1,
+                None,
+            ),
+        )]);
+        let expected = serde_json::to_value(&payload).unwrap();
+        drop(OwnedLineReply {
+            plans: Vec::new(),
+            payload: Some(payload),
+            retirement,
+        });
+        let actual = std::thread::spawn(move || {
+            let (plans, payload) = retired
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(plans.is_empty());
+            serde_json::to_value(payload.unwrap()).unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn line_read_callback_quarantines_panics_and_preserves_results() {
+        assert_eq!(super::recover_line_read_callback(|| Ok(42)).unwrap(), 42);
+        let error = super::recover_line_read_callback::<()>(|| panic!("private callback payload"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "line read callback failed");
+        assert!(
+            super::recover_line_read_callback::<()>(|| Err(anyhow::anyhow!("ordinary error")))
+                .is_err()
+        );
+    }
     use super::*;
     use config::keyassignment::PaneDirection;
     use frankenterm_core_audit_types::interaction_flight_recorder_v1::{

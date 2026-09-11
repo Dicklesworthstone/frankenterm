@@ -161,6 +161,37 @@ impl NewlineCanon {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scrollback_interval_checks_identity_and_both_retained_bounds() {
+        let identity = ScrollbackIntervalIdentity::default();
+        let ready = |identity: &ScrollbackIntervalIdentity, rows| match identity.capture(rows) {
+            ScrollbackIntervalCapture::Ready(interval) => interval,
+            other => panic!("expected ready interval, got {:?}", other),
+        };
+        let before = ready(&identity, Some(10..20));
+        let appended = ready(&identity, Some(10..30));
+        assert!(appended.retains(&before, 10..20));
+        assert!(!appended.retains(&before, 19..21));
+        let pruned = ready(&identity, Some(15..30));
+        assert!(pruned.retains(&before, 15..20));
+        assert!(!pruned.retains(&before, 14..20));
+        assert!(!pruned.retains(&before, 15..15));
+        assert!(
+            !ready(&ScrollbackIntervalIdentity::default(), Some(10..20)).retains(&before, 10..20)
+        );
+        assert!(!ready(&identity, None).retains(&before, 10..11));
+        assert!(matches!(
+            identity.capture(Some(std::ops::Range { start: 20, end: 10 })),
+            ScrollbackIntervalCapture::Unavailable
+        ));
+        assert!(matches!(
+            identity.capture(Some(10..10)),
+            ScrollbackIntervalCapture::Unavailable
+        ));
+        let extreme = ready(&identity, Some(StableRowIndex::MIN..StableRowIndex::MAX));
+        assert!(extreme.retains(&extreme, StableRowIndex::MIN..StableRowIndex::MAX));
+    }
+
     // ── ft-io922 OSC 52 write-policy gate tests ────────────────────────────
 
     /// Default `Allow` preserves the prior behavior so existing
@@ -918,6 +949,68 @@ impl Default for ScrollbackTierConfig {
     }
 }
 
+/// Process-local identity of one append-only cold-row lineage. Create a fresh
+/// identity for every sink and successful destructive change; clones retain
+/// identity. Outstanding snapshots keep the allocation alive, preventing ABA.
+#[derive(Clone, Debug, Default)]
+pub struct ScrollbackIntervalIdentity(Arc<()>);
+
+impl ScrollbackIntervalIdentity {
+    /// Publish metadata captured under the same guard as this identity.
+    /// `None` denotes an empty store, not unavailable metadata.
+    pub fn capture(
+        &self,
+        rows: Option<std::ops::Range<StableRowIndex>>,
+    ) -> ScrollbackIntervalCapture {
+        if rows.as_ref().is_some_and(|rows| rows.start >= rows.end) {
+            return ScrollbackIntervalCapture::Unavailable;
+        }
+        ScrollbackIntervalCapture::Ready(ScrollbackInterval {
+            identity: self.clone(),
+            rows,
+        })
+    }
+}
+
+/// Coherent retained bounds, including owned pending rows (not a durability
+/// receipt). This token does not certify pane registration, Screen coordinates,
+/// mutable image payloads, or successful authenticated row decoding.
+#[derive(Clone, Debug)]
+pub struct ScrollbackInterval {
+    identity: ScrollbackIntervalIdentity,
+    rows: Option<std::ops::Range<StableRowIndex>>,
+}
+
+impl ScrollbackInterval {
+    pub fn rows(&self) -> Option<std::ops::Range<StableRowIndex>> {
+        self.rows.clone()
+    }
+
+    /// Does this fresh capture still retain the requested part of an earlier
+    /// capture's append-only lineage? No allocation, row scan, or storage IO.
+    /// Callers must serialize capture + publication against destructive changes;
+    /// comparing two old snapshots is not a live validity check. Busy or
+    /// unavailable capture must defer publication, never reuse an old verdict.
+    pub fn retains(&self, earlier: &Self, rows: std::ops::Range<StableRowIndex>) -> bool {
+        rows.start < rows.end
+            && Arc::ptr_eq(&self.identity.0, &earlier.identity.0)
+            && [&self.rows, &earlier.rows].iter().all(|interval| {
+                interval.as_ref().is_some_and(|interval| {
+                    interval.start <= rows.start && rows.end <= interval.end
+                })
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ScrollbackIntervalCapture {
+    Ready(ScrollbackInterval),
+    /// Retry later; no blocking fallback is permitted on a UI thread.
+    Busy,
+    /// Unsupported, poisoned, or uncertain publication authority.
+    Unavailable,
+}
+
 /// External cold-scrollback sink used by tiered scrollback integrations.
 ///
 /// The terminal model owns full-fidelity [`Line`] values and knows exactly when
@@ -927,6 +1020,15 @@ impl Default for ScrollbackTierConfig {
 /// and a higher layer may persist and hydrate them without forcing this crate to
 /// depend on storage/redaction crates.
 pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
+    /// Nonblocking coherent retained interval and destructive-change identity.
+    /// Implementations must not call blocking metadata getters, perform IO, or
+    /// scan rows here. Append/flush may preserve identity; clear/replacement
+    /// must exclude capture until their outcome is known. Indeterminate outcomes
+    /// remain unavailable until authoritative reopen/reconciliation.
+    fn try_capture_scrollback_interval(&self) -> ScrollbackIntervalCapture {
+        ScrollbackIntervalCapture::Unavailable
+    }
+
     /// Retain a row that just left the in-memory hot tier.
     ///
     /// Success transfers responsibility for keeping the exact row readable to

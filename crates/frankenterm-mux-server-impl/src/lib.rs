@@ -373,13 +373,15 @@ pub fn reconcile_client_domain_config(
 
 /// The parser owns draining this bounded warm queue. No worker thread, disk
 /// operation or acknowledgement is hidden in queue admission. In particular,
-/// readers of queued rows and metadata never wait for the durable sink's
-/// mutation lock while it synchronizes files.
+/// queued reads can proceed during append synchronization. UI metadata callers
+/// must use try_capture_scrollback_interval: legacy getters can block while a
+/// destructive operation holds state across durable publication.
 mod deferred_scrollback {
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, TryLockError};
     use wezterm_term::config::{
-        ScrollbackClearCommit, ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
+        ScrollbackClearCommit, ScrollbackIntervalCapture, ScrollbackIntervalIdentity,
+        ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
         ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
         ScrollbackSpillSink,
     };
@@ -396,6 +398,8 @@ mod deferred_scrollback {
     }
 
     struct State {
+        interval_identity: ScrollbackIntervalIdentity,
+        publication_uncertain: bool,
         pending: VecDeque<PendingRow>,
         pending_bytes: usize,
         durable_bytes: usize,
@@ -440,6 +444,8 @@ mod deferred_scrollback {
                 })
                 .transpose()?;
             Ok(State {
+                interval_identity: ScrollbackIntervalIdentity::default(),
+                publication_uncertain: false,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 durable_bytes: backing.retained_scrollback_bytes(),
@@ -469,6 +475,9 @@ mod deferred_scrollback {
                         .state
                         .lock()
                         .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    if state.publication_uncertain {
+                        return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+                    }
                     state
                         .pending
                         .front()
@@ -502,6 +511,23 @@ mod deferred_scrollback {
     }
 
     impl ScrollbackSpillSink for DeferredScrollbackSpillSink {
+        fn try_capture_scrollback_interval(&self) -> ScrollbackIntervalCapture {
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::WouldBlock) => return ScrollbackIntervalCapture::Busy,
+                Err(TryLockError::Poisoned(_)) => return ScrollbackIntervalCapture::Unavailable,
+            };
+            if state.publication_uncertain {
+                return ScrollbackIntervalCapture::Unavailable;
+            }
+            let rows = match (state.oldest, state.newest_exclusive) {
+                (Some(oldest), Some(newest)) => Some(oldest..newest),
+                (None, _) => None,
+                _ => return ScrollbackIntervalCapture::Unavailable,
+            };
+            state.interval_identity.capture(rows)
+        }
+
         fn store_scrollback_line(
             &self,
             stable_row: StableRowIndex,
@@ -516,6 +542,9 @@ mod deferred_scrollback {
             let Ok(mut state) = self.state.lock() else {
                 return false;
             };
+            if state.publication_uncertain {
+                return false;
+            }
             if let Some(existing) = state
                 .pending
                 .iter()
@@ -708,13 +737,46 @@ mod deferred_scrollback {
                 .state
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            if state.publication_uncertain {
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
             if !state.pending.is_empty() {
                 return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
             }
-            let receipt = self
+            // Allocate before the durable commit; capture remains Busy until
+            // bounds and identity are installed together under this guard.
+            let interval_identity = ScrollbackIntervalIdentity::default();
+            let oldest = prefix.oldest_stable_row();
+            let newest = prefix.newest_stable_row_exclusive();
+            let receipt = match self
                 .backing
-                .replace_scrollback_prefix(expected, prefix, retention)?;
+                .replace_scrollback_prefix(expected, prefix, retention)
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    state.publication_uncertain =
+                        error == ScrollbackSpillError::CommitOutcomeIndeterminate;
+                    return Err(error);
+                }
+            };
+            let generation = receipt.generation();
+            let valid_generation = match expected {
+                Some(expected) => {
+                    generation.content_epoch() == expected.content_epoch()
+                        && expected.revision().checked_add(1) == Some(generation.revision())
+                }
+                None => generation.revision() == 1,
+            };
+            if receipt.oldest_stable_row() != oldest
+                || receipt.newest_stable_row_exclusive() != newest
+                || !valid_generation
+            {
+                state.publication_uncertain = true;
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
             *state = State {
+                interval_identity,
+                publication_uncertain: false,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 durable_bytes: self.backing.retained_scrollback_bytes(),
@@ -730,13 +792,27 @@ mod deferred_scrollback {
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             // A successful explicit clear discards both the durable generation
-            // and its queued suffix. On failure every queued row stays readable.
+            // and its queued suffix. On failure every queued row stays owned,
+            // but indeterminate publication cannot authorize new UI results.
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            let receipt = self.backing.clear_scrollback()?;
+            if state.publication_uncertain {
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            let interval_identity = ScrollbackIntervalIdentity::default();
+            let receipt = match self.backing.clear_scrollback() {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    state.publication_uncertain =
+                        error == ScrollbackSpillError::CommitOutcomeIndeterminate;
+                    return Err(error);
+                }
+            };
             *state = State {
+                interval_identity,
+                publication_uncertain: false,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 durable_bytes: 0,
@@ -8384,6 +8460,143 @@ mod tests {
     #[derive(Debug)]
     struct DeferredPaneTestConfig(Arc<dyn ScrollbackSpillSink>);
 
+    fn deferred_interval(
+        sink: &dyn ScrollbackSpillSink,
+    ) -> wezterm_term::config::ScrollbackInterval {
+        match sink.try_capture_scrollback_interval() {
+            wezterm_term::config::ScrollbackIntervalCapture::Ready(interval) => interval,
+            other => panic!("expected coherent ready interval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deferred_scrollback_interval_survives_append_flush_but_not_retention_or_clear() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        assert_eq!(deferred_interval(deferred.as_ref()).rows(), None);
+        let line = Line::from_text("interval", &CellAttributes::blank(), 5, None);
+        assert!(deferred.store_scrollback_line(10, &line, 2));
+        let before = deferred_interval(deferred.as_ref());
+        assert_eq!(before.rows(), Some(10..11));
+        assert!(deferred.store_scrollback_line(11, &line, 2));
+        assert!(deferred_interval(deferred.as_ref()).retains(&before, 10..11));
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.load_scrollback_line(10), Some(line.clone()));
+        assert!(deferred_interval(deferred.as_ref()).retains(&before, 10..11));
+        let appended = deferred_interval(deferred.as_ref());
+        assert!(deferred.store_scrollback_line(12, &line, 2));
+        let pruned = deferred_interval(deferred.as_ref());
+        assert_eq!(pruned.rows(), Some(11..13));
+        assert!(!pruned.retains(&before, 10..11));
+        assert!(pruned.retains(&appended, 11..12));
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.store_scrollback_line(11, &line, 2));
+        let reused_rows = deferred_interval(deferred.as_ref());
+        assert!(!reused_rows.retains(&pruned, 11..12), "clear ABA");
+    }
+
+    #[test]
+    fn deferred_scrollback_interval_replacement_and_uncertain_outcomes() {
+        use wezterm_term::config::{
+            ScrollbackIntervalCapture, ScrollbackPrefix, ScrollbackSnapshotLimits,
+        };
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text("same rows", &CellAttributes::blank(), 5, None);
+        assert!(deferred.store_scrollback_line(10, &line, 8));
+        let snapshot = deferred
+            .snapshot_scrollback(
+                11,
+                ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap();
+        let before = deferred_interval(deferred.as_ref());
+        let prefix = || ScrollbackPrefix::from_slices(Some(10), 11, snapshot.rows(), &[]).unwrap();
+        assert_eq!(
+            deferred.replace_scrollback_prefix(None, prefix(), 8),
+            Err(wezterm_term::config::ScrollbackSpillError::SnapshotGenerationMismatch)
+        );
+        assert!(
+            deferred_interval(deferred.as_ref()).retains(&before, 10..11),
+            "noncommitted failure preserves authority"
+        );
+        deferred
+            .replace_scrollback_prefix(Some(snapshot.generation()), prefix(), 8)
+            .unwrap();
+        let replaced = deferred_interval(deferred.as_ref());
+        assert_eq!(replaced.rows(), before.rows());
+        assert!(
+            !replaced.retains(&before, 10..11),
+            "same-range replacement ABA"
+        );
+        assert_eq!(deferred.load_scrollback_line(10), Some(line.clone()));
+
+        // Inject the real backing sink's quarantine state; do not fake a
+        // successful IO result or claim this is a power-loss reproduction.
+        backing
+            .lock_state("interval quarantine regression")
+            .unwrap()
+            .transaction_quarantined = true;
+        assert_eq!(
+            deferred.clear_scrollback(),
+            Err(wezterm_term::config::ScrollbackSpillError::CommitOutcomeIndeterminate)
+        );
+        assert!(matches!(
+            deferred.try_capture_scrollback_interval(),
+            ScrollbackIntervalCapture::Unavailable
+        ));
+        assert!(!deferred.store_scrollback_line(11, &line, 8));
+        assert!(deferred.flush_scrollback().is_err());
+        assert!(
+            deferred.clear_scrollback().is_err(),
+            "uncertainty requires reopen"
+        );
+    }
+
+    #[test]
+    fn deferred_scrollback_interval_capture_is_busy_during_real_clear_io() {
+        use wezterm_term::config::ScrollbackIntervalCapture;
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text("clear contention", &CellAttributes::blank(), 5, None);
+        assert!(deferred.store_scrollback_line(10, &line, 8));
+        let before = deferred_interval(deferred.as_ref());
+        let lease = acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        let clearing = Arc::clone(&deferred);
+        let clear = std::thread::spawn(move || clearing.clear_scrollback());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let entered = loop {
+            if backing.mutation_gate.try_lock().is_err() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reading = Arc::clone(&deferred);
+        let read = std::thread::spawn(move || {
+            tx.send(reading.try_capture_scrollback_interval()).unwrap();
+        });
+        let captured = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(lease);
+        clear.join().unwrap().unwrap();
+        read.join().unwrap();
+        assert!(entered, "clear entered backing IO with state locked");
+        assert!(
+            matches!(captured, Ok(ScrollbackIntervalCapture::Busy)),
+            "capture must finish before blocked IO is released: {captured:?}"
+        );
+        assert!(!deferred_interval(deferred.as_ref()).retains(&before, 10..11));
+    }
+
     #[cfg(unix)]
     impl wezterm_term::TerminalConfiguration for DeferredPaneTestConfig {
         fn color_palette(&self) -> wezterm_term::color::ColorPalette {
@@ -8702,6 +8915,7 @@ mod tests {
         let read = std::thread::spawn(move || {
             queued_tx
                 .send((
+                    deferred_interval(reading.as_ref()).rows(),
                     reading.retained_scrollback_rows(),
                     reading.oldest_scrollback_row(),
                     reading.load_scrollback_line(0),
@@ -8723,7 +8937,7 @@ mod tests {
         control.join().unwrap();
         assert_eq!(
             queued.unwrap(),
-            (1, Some(0), Some(line.clone()), vec![line])
+            (Some(0..1), 1, Some(0), Some(line.clone()), vec![line])
         );
         assert!(
             cold_blocked,

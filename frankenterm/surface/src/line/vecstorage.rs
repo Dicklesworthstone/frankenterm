@@ -74,6 +74,12 @@ impl Clone for VecStorage {
 }
 
 impl VecStorage {
+    pub(crate) fn snapshot_clone(&self) -> Self {
+        Self {
+            cells: Arc::clone(&self.cells),
+        }
+    }
+
     pub(crate) fn shares_cells_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cells, &other.cells)
     }

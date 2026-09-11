@@ -675,6 +675,20 @@ impl Default for CellAttributes {
 }
 
 impl CellAttributes {
+    /// New heap bytes required by Clone; shared hyperlink/image payloads are
+    /// retained by Arc, not copied. Does not lock or inspect image contents.
+    pub fn snapshot_clone_heap_bytes(&self) -> Option<usize> {
+        if self.fat.is_none() {
+            return Some(0);
+        }
+        let bytes = core::mem::size_of::<FatAttributes>();
+        #[cfg(feature = "use_image")]
+        let bytes = bytes.checked_add(self.fat.as_ref()?.image.len().checked_mul(
+            core::mem::size_of::<Box<ImageCell>>() + core::mem::size_of::<ImageCell>(),
+        )?)?;
+        Some(bytes)
+    }
+
     bitfield!(intensity, set_intensity, Intensity, 0b11, 0);
     bitfield!(underline, set_underline, Underline, 0b111, 2);
     bitfield!(blink, set_blink, Blink, 0b11, 5);
