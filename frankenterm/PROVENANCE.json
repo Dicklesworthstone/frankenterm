@@ -108,19 +108,19 @@
         "docs": 1,
         "feat": 5,
         "fix": 14,
-        "other": 2,
+        "other": 3,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 33,
+      "fork_side_commit_count": 34,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-04T01:48:04-04:00",
-        "sha": "c9cd69175041d8ff349aba070f732730e525d4d7",
-        "subject": "fix(cell): silence needless_bool under the new nightly without breaking the no-std path"
+        "classification": "other",
+        "committed_at": "2026-09-10T20:52:11-04:00",
+        "sha": "f9a5d41c4522b40fefaaa8941bb5ae604b8a38f8",
+        "subject": "perf(render): hydrate cold scrollback outside native UI locks"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 51,
-        "fix": 75,
+        "fix": 77,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 27
       },
-      "fork_side_commit_count": 204,
+      "fork_side_commit_count": 206,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-08T05:21:10-04:00",
-        "sha": "e1b8dea3898a851bcf1d136d2063b105114eb8a7",
-        "subject": "test(client): drive real stream handshake through production I/O scheduler"
+        "classification": "fix",
+        "committed_at": "2026-09-10T22:10:15-04:00",
+        "sha": "0aa226ebd21cb29c1f09fd5e88c74989c10efaf3",
+        "subject": "fix(render): fence cold layouts and retire reads off the UI thread"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -183,7 +183,7 @@
         "cleanup": 1,
         "cosmetic": 21,
         "docs": 2,
-        "feat": 43,
+        "feat": 44,
         "fix": 60,
         "other": 21,
         "refactor": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 243,
+      "fork_side_commit_count": 244,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-07T05:41:50-04:00",
-        "sha": "2eed7f59a985f6e6e09820fc5b4d75022a53590e",
-        "subject": "fix(codec): retain the newest legacy row snapshot"
+        "classification": "feat",
+        "committed_at": "2026-09-10T21:38:30-04:00",
+        "sha": "bd357dee208ae8a7bbe960c557f5d7eaa857d4f0",
+        "subject": "feat(codec): add layout-bound scrollback line requests"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -233,7 +233,7 @@
         "cleanup": 1,
         "cosmetic": 4,
         "feat": 42,
-        "fix": 41,
+        "fix": 42,
         "other": 10,
         "refactor": 5,
         "rename": 1,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 131,
+      "fork_side_commit_count": 132,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-05T04:55:48-04:00",
-        "sha": "01da23e3e03275e7c24ee50e81935c08a0fe7523",
-        "subject": "feat(clipboard): wire bounded OSC52 consent to the originating GUI pane"
+        "classification": "fix",
+        "committed_at": "2026-09-08T23:12:30-04:00",
+        "sha": "0ef03fb62a8385a0a2d24bd6f439554dd1e092b3",
+        "subject": "fix(scrollback): preserve queued history across reload and publication boundaries"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -637,22 +637,22 @@
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
-        "feat": 185,
-        "fix": 193,
-        "other": 34,
+        "feat": 186,
+        "fix": 202,
+        "other": 38,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
         "test": 73
       },
-      "fork_side_commit_count": 553,
+      "fork_side_commit_count": 567,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-08T05:01:30-04:00",
-        "sha": "b559bb1be0776d6974263b59726555a308c81aff",
-        "subject": "fix(resize): skip terminal dimension reads for flexible panes"
+        "committed_at": "2026-09-10T23:03:11-04:00",
+        "sha": "594f7b3b130f0a78f74b441f4215d918c9ea872d",
+        "subject": "fix(render): stream large scrollback layout indexes with bounded memory"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -847,20 +847,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 13,
-        "fix": 31,
-        "other": 15,
+        "fix": 34,
+        "other": 17,
         "refactor": 2,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 94,
+      "fork_side_commit_count": 99,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-08T01:55:57-04:00",
-        "sha": "308eb8b17a81d3e3f68d42ebbe814a2fd9400f1a",
-        "subject": "fix(reflow): clamp lookahead without overflowing its endpoint"
+        "committed_at": "2026-09-10T23:03:11-04:00",
+        "sha": "594f7b3b130f0a78f74b441f4215d918c9ea872d",
+        "subject": "fix(render): stream large scrollback layout indexes with bounded memory"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -890,22 +890,23 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cleanup": 3,
-        "cosmetic": 14,
-        "feat": 50,
-        "fix": 85,
-        "other": 31,
+        "cosmetic": 15,
+        "docs": 1,
+        "feat": 52,
+        "fix": 92,
+        "other": 32,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 45
+        "test": 47
       },
-      "fork_side_commit_count": 241,
+      "fork_side_commit_count": 255,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-08T00:34:37-04:00",
-        "sha": "3a26f3681f8c0e29b89fe6669ac186404e81cfa1",
-        "subject": "fix(reflow): support minimal features and validate live-source changes"
+        "classification": "test",
+        "committed_at": "2026-09-10T23:12:15-04:00",
+        "sha": "cb38d6bef19cd81c438f15d3ca3bf649f30d0706",
+        "subject": "test(render): separate synchronous history parity from owned read guard"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -943,18 +944,19 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 4,
+        "fix": 5,
         "other": 3,
         "refactor": 1,
-        "rename": 1
+        "rename": 1,
+        "test": 1
       },
-      "fork_side_commit_count": 13,
+      "fork_side_commit_count": 15,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-06-14T21:11:53-04:00",
-        "sha": "ba8f580b4a5a767d8d6a3eaec36d9206fdea784b",
-        "subject": "ft-3qe22: prove rgb workspace-dep materialization resolved on remote"
+        "classification": "test",
+        "committed_at": "2026-09-09T22:04:16-04:00",
+        "sha": "dd2e096109fee880547b7f2c0bc0a89ca7994b0e",
+        "subject": "test(term): exercise short cold-read batches through screen retrieval"
       },
       "name": "frankenterm-toast-notification",
       "path": "frankenterm/toast-notification",
@@ -1031,22 +1033,22 @@
         "chore": 3,
         "cleanup": 1,
         "cosmetic": 8,
-        "docs": 1,
+        "docs": 2,
         "feat": 15,
-        "fix": 81,
+        "fix": 83,
         "other": 12,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 132,
+      "fork_side_commit_count": 135,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-31T23:16:28-04:00",
-        "sha": "a17cb485c15b77298955d30708d1f77fa75b46e3",
-        "subject": "feat(config,client,window): enhance config loading, discovery, and macos window connections"
+        "classification": "docs",
+        "committed_at": "2026-09-08T19:25:25-04:00",
+        "sha": "c8e167ff7738c36fc13cd77a863a013b636d1e0e",
+        "subject": "docs(atlas): describe current footprint reporting"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1059,8 +1061,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2442,
-  "generated_at": "2026-09-08T21:20:10.329225Z",
+  "fork_side_commit_total": 2485,
+  "generated_at": "2026-09-11T03:12:39.378289Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
