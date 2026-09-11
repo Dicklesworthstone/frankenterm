@@ -37,6 +37,8 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...mai
 
 - Recorder flush, health and lag positions now identify the start of the last record in both storage backends, including after reopening the log.
 - Cold-scrollback reads capture bounded snapshots, hydrate persisted text outside native UI locks, and validate the retained source before publication. Shared cold visual coordinates and codec v65 layout checks prevent delayed line replies from populating a newer layout. Cold invalidation visits cached rows rather than iterating the entire history range.
+- Mouse selection coordinates are tied to complete, successfully submitted pane layouts. Reflow invalidates stale selections even outside the visible viewport, and plain/formatted copying checks layout authority before and after reading text.
+- Wrapped-line context expansion uses one bounded budget in both directions. Artificial grouping boundaries preserve significant spaces when copying; rectangular selections retain separate physical rows.
 - Durable transaction guards explicitly release their file locks when ownership ends, including after validation failure, so inherited file descriptors cannot prolong a completed operation's lock.
 
 These changes are under release qualification. Native profiling of earlier candidates found synchronous scrollback persistence holding the terminal lock during output. Deferred persistence and bounded off-UI reads now address that lock path; complete cold/resident seam reflow and large-history layout coverage remain in progress. Native resize/font latency, streaming-output behavior and memory qualification remain pending. This entry does not announce a release or an instant-resize result.

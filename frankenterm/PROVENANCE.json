@@ -638,7 +638,7 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 186,
-        "fix": 202,
+        "fix": 204,
         "other": 38,
         "refactor": 11,
         "rename": 2,
@@ -646,13 +646,13 @@
         "security-fix": 7,
         "test": 73
       },
-      "fork_side_commit_count": 567,
+      "fork_side_commit_count": 569,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-10T23:03:11-04:00",
-        "sha": "594f7b3b130f0a78f74b441f4215d918c9ea872d",
-        "subject": "fix(render): stream large scrollback layout indexes with bounded memory"
+        "committed_at": "2026-09-11T00:46:40-04:00",
+        "sha": "10de7e32518885e8ba3e5593d2608376e78c9486",
+        "subject": "fix(gui): bind selections to submitted layouts and preserve wrapped spaces"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1061,8 +1061,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2485,
-  "generated_at": "2026-09-11T03:12:39.378289Z",
+  "fork_side_commit_total": 2487,
+  "generated_at": "2026-09-11T04:49:19.632882Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
