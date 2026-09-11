@@ -7243,6 +7243,7 @@ pub(crate) mod tests {
         struct Sink {
             state: Mutex<(ScrollbackIntervalIdentity, BTreeMap<StableRowIndex, Line>)>,
             reads: AtomicU64,
+            synchronous_metadata_calls_remaining: AtomicU64,
             entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
         }
         impl ScrollbackSpillSink for Sink {
@@ -7257,7 +7258,22 @@ pub(crate) mod tests {
                 self.state.lock().unwrap().1.get(&row).cloned()
             }
             fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
-                panic!("blocking metadata accessor")
+                assert_eq!(
+                    self.synchronous_metadata_calls_remaining.compare_exchange(
+                        1,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ),
+                    Ok(1),
+                    "owned reads must not call the blocking metadata accessor"
+                );
+                self.state
+                    .lock()
+                    .unwrap()
+                    .1
+                    .first_key_value()
+                    .map(|(row, _)| *row)
             }
             fn retained_scrollback_rows(&self) -> usize {
                 panic!("blocking metadata accessor")
@@ -7318,6 +7334,7 @@ pub(crate) mod tests {
                     .collect(),
             )),
             reads: AtomicU64::new(0),
+            synchronous_metadata_calls_remaining: AtomicU64::new(0),
             entered: Mutex::new(None),
         });
         let mut screen = test_screen_with_config(
@@ -7463,7 +7480,17 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             ["abc", "def", "gh"]
         );
+        // The synchronous semantic API needs authoritative metadata even when
+        // storage is busy. Permit exactly its one metadata read; owned capture,
+        // hydration, publication and later native checks retain the panic guard.
+        sink.synchronous_metadata_calls_remaining
+            .store(1, Ordering::Relaxed);
         let (first, lines) = screen.lines_in_stable_range(-1..2);
+        assert_eq!(
+            sink.synchronous_metadata_calls_remaining
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(first, -1);
         assert_eq!(
             lines
