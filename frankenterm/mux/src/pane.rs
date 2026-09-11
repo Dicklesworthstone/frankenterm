@@ -1012,28 +1012,29 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     // (such as 1.5MB of json) that we previously wrapped.  We don't want to
     // un-wrap, scan, and re-wrap that thing.
     // This is an imperfect length constraint to partially manage the cost.
-    let mut back_len = 0;
+    // Preserve explicitly requested rows, but bound all additional context
+    // together. Charging empty rows too bounds the number of sink calls.
+    let mut context_len = phys
+        .iter()
+        .fold(0usize, |used, line| used.saturating_add(line.len().max(1)));
 
     // Look backwards to find the start of the first logical line
     let oldest = pane.get_dimensions().scrollback_top;
-    while first > oldest {
+    while first > oldest && context_len < MAX_LOGICAL_LINE_LEN {
         let Some(previous) = first.checked_sub(1) else {
             break;
         };
         let (prior, back) = pane.get_lines(previous..first);
-        if prior == first {
-            break;
-        }
-        if back.is_empty() {
+        if prior != previous || back.len() != 1 {
             break;
         }
         if !back[0].last_cell_was_wrapped() {
             break;
         }
-        if logical_len_exceeds_limit(back_len, back[0].len(), MAX_LOGICAL_LINE_LEN) {
+        if logical_len_exceeds_limit(context_len, back[0].len().max(1), MAX_LOGICAL_LINE_LEN) {
             break;
         }
-        back_len = back_len.saturating_add(back[0].len());
+        context_len += back[0].len().max(1);
         first = prior;
         for (idx, line) in back.into_iter().enumerate() {
             phys.insert(idx, line);
@@ -1045,7 +1046,7 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
         if !last.last_cell_was_wrapped() {
             break;
         }
-        if last.len() > MAX_LOGICAL_LINE_LEN {
+        if context_len >= MAX_LOGICAL_LINE_LEN {
             break;
         }
 
@@ -1059,9 +1060,12 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
         if last_row != next_row {
             break;
         }
-        if ahead.is_empty() {
+        if ahead.len() != 1
+            || logical_len_exceeds_limit(context_len, ahead[0].len().max(1), MAX_LOGICAL_LINE_LEN)
+        {
             break;
         }
+        context_len += ahead[0].len().max(1);
         phys.append(&mut ahead);
     }
 
@@ -1082,7 +1086,11 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
             }
             Some(prior)
                 if prior.logical.last_cell_was_wrapped()
-                    && prior.logical.len() <= MAX_LOGICAL_LINE_LEN =>
+                    && !logical_len_exceeds_limit(
+                        prior.logical.len(),
+                        line.len(),
+                        MAX_LOGICAL_LINE_LEN,
+                    ) =>
             {
                 let seqno = prior.logical.current_seqno().max(line.current_seqno());
                 prior.logical.set_last_cell_was_wrapped(false, seqno);
@@ -1893,6 +1901,38 @@ mod test {
         assert_eq!(
             summarize_logical_lines(&lines),
             vec![(0, Cow::Borrowed("wrapped"))]
+        );
+    }
+
+    #[test]
+    fn logical_context_budget_is_shared_by_both_directions() {
+        let pane = FakePane::new(
+            (0..MAX_LOGICAL_LINE_LEN * 3)
+                .map(|_| line("x", true))
+                .collect(),
+        );
+        for requested in [0..1, 400..401, 0..MAX_LOGICAL_LINE_LEN as StableRowIndex] {
+            let lines = pane.get_logical_lines(requested);
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|line| line.physical_lines.len())
+                    .sum::<usize>(),
+                MAX_LOGICAL_LINE_LEN
+            );
+            assert!(lines
+                .iter()
+                .all(|line| line.logical.len() <= MAX_LOGICAL_LINE_LEN));
+        }
+        // Explicitly requested content is not silently truncated by the
+        // surrounding-context budget.
+        let lines = pane.get_logical_lines(0..(MAX_LOGICAL_LINE_LEN + 1) as StableRowIndex);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.physical_lines.len())
+                .sum::<usize>(),
+            MAX_LOGICAL_LINE_LEN + 1
         );
     }
 
