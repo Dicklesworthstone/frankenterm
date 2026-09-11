@@ -1132,8 +1132,8 @@ mod tests {
         let lifecycle = WebStreamLifecycle::new();
         let waiter = lifecycle.shutdown_waiter(&crate::cx::for_request());
         let (mut stream, drops) = owned_stream_fixture(waiter);
-        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&wakes));
+        let notifications = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&notifications));
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             Pin::new(&mut stream).poll_next(&mut cx),
@@ -1141,10 +1141,10 @@ mod tests {
         ));
         assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        let before_signal = wakes.0.load(Ordering::SeqCst);
+        let before_signal = notifications.0.load(Ordering::SeqCst);
         lifecycle.signal_shutdown();
         assert!(
-            wakes.0.load(Ordering::SeqCst) > before_signal,
+            notifications.0.load(Ordering::SeqCst) > before_signal,
             "shutdown must wake the response's registered task"
         );
         assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));

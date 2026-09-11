@@ -759,15 +759,15 @@ mod tests {
 
         let lifecycle = super::WebStreamLifecycle::new();
         let cx = crate::cx::for_request();
-        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&wakes));
+        let notifications = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&notifications));
         let mut poll_cx = Context::from_waker(&waker);
         let mut parked = lifecycle.shutdown_waiter(&cx);
         assert!(parked.as_mut().poll(&mut poll_cx).is_pending());
-        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(notifications.0.load(Ordering::SeqCst), 0);
         lifecycle.signal_shutdown();
         assert!(
-            wakes.0.load(Ordering::SeqCst) > 0,
+            notifications.0.load(Ordering::SeqCst) > 0,
             "parked waiter must be woken"
         );
         assert!(parked.as_mut().poll(&mut poll_cx).is_ready());

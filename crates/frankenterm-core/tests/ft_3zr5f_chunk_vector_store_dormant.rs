@@ -198,7 +198,7 @@ fn scan_lines(text: &str) -> Vec<(usize, String)> {
 
 #[test]
 fn test_module_literals_cannot_hide_following_production_calls() {
-    let source = r###"#[cfg(test)]
+    let source = r##"#[cfg(test)]
 mod tests {
     // {{{ comments do not open modules.
     const NORMAL: &str = "{{{";
@@ -209,7 +209,7 @@ fn production() {
     ChunkVectorStore::open("production.db");
     prune_chunks_through_ordinal(10);
 }
-"###;
+"##;
     let cleaned = strip_cfg_test_modules(source).expect("valid Rust fixture");
     assert_eq!(
         scan_lines(&cleaned),
@@ -240,7 +240,7 @@ fn blanking_preserves_unicode_bytes_and_original_line_numbers() {
 
 #[test]
 fn nested_attributed_test_modules_are_excluded_without_overlapping_spans() {
-    let source = r#"mod production {
+    let source = r"mod production {
     #[allow(dead_code)]
     #[cfg ( test )]
     pub(crate) mod fixtures {
@@ -250,7 +250,7 @@ fn nested_attributed_test_modules_are_excluded_without_overlapping_spans() {
     }
     fn real() { ChunkVectorStore::new(); }
 }
-"#;
+";
     let cleaned = strip_cfg_test_modules(source).expect("valid nested modules");
     assert_eq!(
         scan_lines(&cleaned),

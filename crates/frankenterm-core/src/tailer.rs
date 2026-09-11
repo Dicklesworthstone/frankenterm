@@ -5530,7 +5530,7 @@ mod tests {
         let mut bridge = StreamingBridge::new();
         let mut cursor = PaneCursor::from_seq(5, 41);
         let cursor_before = format!("{cursor:?}");
-        let segments: Vec<_> = bridge
+        let segments = bridge
             .process_delta(
                 PaneDelta::Output {
                     pane_id: 5,
@@ -5542,11 +5542,9 @@ mod tests {
                 },
                 &mut cursor,
             )
-            .unwrap()
-            .into_iter()
-            .collect();
+            .unwrap();
 
-        assert!(segments.is_empty());
+        assert!(segments.is_none());
         assert_eq!(bridge.events_processed(), 1);
         assert_eq!(bridge.dirty_range_total(), 3);
         assert_eq!(bridge.dirty_row_total(), 11);

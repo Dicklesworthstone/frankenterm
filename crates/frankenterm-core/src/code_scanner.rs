@@ -2160,7 +2160,9 @@ report 0"#,
                         &mut PolicyEngine::permissive(),
                         ActorKind::Human,
                         &fixture.request(),
-                        Instant::now() - Duration::from_secs(1),
+                        Instant::now()
+                            .checked_sub(Duration::from_secs(1))
+                            .expect("test clock supports a one-second expired deadline"),
                     )
                     .await
                     .unwrap_err();

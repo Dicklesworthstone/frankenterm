@@ -21780,13 +21780,13 @@ mod tests {
         let dir = workspace_tempdir();
         let path = write_mission_file(&dir, MissionLifecycleState::Running);
         let cfg = config();
-        let state = WaMissionStateTool::new(Arc::clone(&cfg));
+        let query = WaMissionStateTool::new(Arc::clone(&cfg));
         let pause = WaMissionPauseTool::new(Arc::clone(&cfg));
         let resume = WaMissionResumeTool::new(Arc::clone(&cfg));
         let abort = WaMissionAbortTool::new(Arc::clone(&cfg));
         let context = test_mcp_context();
         let initial = parse_json_content(
-            state
+            query
                 .call(&context, serde_json::json!({"mission_file": path}))
                 .unwrap(),
         );

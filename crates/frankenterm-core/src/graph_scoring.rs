@@ -610,7 +610,7 @@ mod tests {
         assert!(scores[&0].is_finite());
         assert!(scores[&0] > 0.0);
         let n = usize::MAX as f64;
-        assert!((scores[&0] * n * n - 1.0).abs() < 1e-14);
+        assert!((scores[&0] * n).mul_add(n, -1.0).abs() < 1e-14);
     }
 
     fn chain(n: usize) -> AdjGraph {

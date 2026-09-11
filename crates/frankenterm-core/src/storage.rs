@@ -35918,7 +35918,7 @@ fn prepared_plan_query_rejects_negative_pane_id() {
 // longer leaks across `#[test]` boundaries on asupersync.
 
 #[cfg(test)]
-pub(crate) fn run_storage_async_test<F>(future: F)
+pub fn run_storage_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {

@@ -49123,14 +49123,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     #[cfg(feature = "subprocess-bridge")]
     match command.as_ref() {
         Some(Commands::Scan { args, json }) => {
-            let response = code_scan_command_response(
+            let response = Box::pin(code_scan_command_response(
                 cx,
                 &config,
                 &workspace_root,
                 &layout.db_path,
                 args,
                 frankenterm_core::policy::ActorKind::Human,
-            )
+            ))
             .await;
             if *json {
                 print_robot_response(&response, RobotOutputFormat::Json, false)?;
@@ -49147,14 +49147,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             stats,
             command: Some(RobotCommands::Scan { args }),
         }) => {
-            let response = code_scan_command_response(
+            let response = Box::pin(code_scan_command_response(
                 cx,
                 &config,
                 &workspace_root,
                 &layout.db_path,
                 args,
                 frankenterm_core::policy::ActorKind::Robot,
-            )
+            ))
             .await;
             print_robot_response(&response, resolve_robot_output_format(*format), *stats)?;
             if !response.ok {
@@ -77431,8 +77431,10 @@ fn validate_mission_objective_plan_args(
             hint: None,
         });
     }
+    let graph_version_without_snapshot =
+        args.beads_graph_version.is_some() && args.beads_graph.is_none();
     if args.beads_graph.is_some() != args.beads_graph_sha256.is_some()
-        || (args.beads_graph_version.is_some() && args.beads_graph.is_none())
+        || graph_version_without_snapshot
         || (args.beads_graph.is_some()
             && (args.target_bead.is_some()
                 || args.candidate_id.is_some()
@@ -102497,11 +102499,11 @@ reason = "overly conservative pending threshold"
                     "owner" => restricted.active_assignee = Some("current-owner".to_string()),
                     "dependency" => restricted.dependency_blocked = true,
                     "capacity" => {
-                        restricted.capacity_posture = MissionObjectiveCapacityPostureArg::Pause
+                        restricted.capacity_posture = MissionObjectiveCapacityPostureArg::Pause;
                     }
                     "proof" => {
                         restricted.proof_availability =
-                            MissionObjectiveProofAvailabilityArg::Blocked
+                            MissionObjectiveProofAvailabilityArg::Blocked;
                     }
                     _ => unreachable!(),
                 }
