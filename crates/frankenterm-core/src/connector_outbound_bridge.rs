@@ -1555,6 +1555,17 @@ impl ConnectorOutboundBridge {
         &mut self,
         event: &OutboundEvent,
     ) -> Result<OutboundDispatchResult, OutboundBridgeError> {
+        self.process_event_for_rule(event, None)
+    }
+
+    /// Evaluate a single configured route with its actual operation payload.
+    /// The durable transport supplies the route identity; event data cannot
+    /// select another route or borrow its policy/classification decision.
+    pub(crate) fn process_event_for_rule(
+        &mut self,
+        event: &OutboundEvent,
+        rule_id: Option<&str>,
+    ) -> Result<OutboundDispatchResult, OutboundBridgeError> {
         self.telemetry.events_received = self.telemetry.events_received.saturating_add(1);
 
         // Generate or use an explicit non-blank correlation ID.
@@ -1618,7 +1629,7 @@ impl ConnectorOutboundBridge {
         let matched_rules: Vec<OutboundRoutingRule> = self
             .rules
             .iter()
-            .filter(|r| r.matches(event))
+            .filter(|r| rule_id.is_none_or(|id| r.rule_id == id) && r.matches(event))
             .cloned()
             .collect();
 

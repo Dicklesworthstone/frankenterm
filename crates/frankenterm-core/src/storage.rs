@@ -3041,6 +3041,27 @@ impl StorageHandle {
         pending_only: bool,
         limit: usize,
     ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
+        self.connector_outbox_query_with_cx(cx, generation, i64::from(pending_only), limit)
+            .await
+    }
+
+    pub(crate) async fn dispatchable_connector_outbox_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        generation: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
+        self.connector_outbox_query_with_cx(cx, generation, 2, limit)
+            .await
+    }
+
+    async fn connector_outbox_query_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        generation: &str,
+        selection: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
         Self::checkpoint_storage_operation(cx, "connector_outbox")?;
         if !connector_hash_valid(generation) || !(1..=256).contains(&limit) {
             return Err(connector_storage_invalid());
@@ -3053,10 +3074,13 @@ impl StorageHandle {
                 let rows = backend.query_map_cells(
                     "SELECT item_key, generation, source_event_id, state, revision, due_at, record_json
                      FROM connector_outbox WHERE generation = ?1
-                     AND (?2 = 0 OR state IN ('admitted','dispatched'))
+                     AND (?2 = 0 OR (?2 = 1 AND state IN ('admitted','dispatched'))
+                          OR (?2 = 2 AND state = 'admitted'))
+                     AND (?2 != 2 OR due_at <= ?4)
                      ORDER BY due_at, item_key LIMIT ?3",
-                    &[ToSqlValue::Text(&generation), ToSqlValue::Integer(i64::from(pending_only)),
-                        ToSqlValue::Integer(i64::try_from(limit).map_err(|_| connector_storage_invalid())?)],
+                    &[ToSqlValue::Text(&generation), ToSqlValue::Integer(selection),
+                        ToSqlValue::Integer(i64::try_from(limit).map_err(|_| connector_storage_invalid())?),
+                        ToSqlValue::Integer(now_ms_strict()?)],
                 ).map_err(|_| connector_storage_invalid())?;
                 rows.iter().map(|row| connector_outbox_from_cells(row)).collect()
             })
@@ -23363,7 +23387,9 @@ fn connector_mutation_bytes(
         Mutation::AcknowledgeIngress { event_ids } => {
             serde_json::to_writer(&mut counter, event_ids)
         }
-        Mutation::Initialize { .. } | Mutation::Transition { .. } => return 1024,
+        Mutation::Initialize { .. } | Mutation::Transition { .. } | Mutation::Reschedule { .. } => {
+            return 1024;
+        }
     };
     if result.is_err() {
         u64::MAX
@@ -23596,6 +23622,49 @@ fn connector_mutation_backend(
             ).map_err(|_| connector_storage_invalid())?;
             Ok(Outcome::Admitted)
         }
+        Mutation::Reschedule {
+            key,
+            expected_revision,
+            now_ms,
+            due_at_ms,
+        } => {
+            if !connector_hash_valid(&key)
+                || expected_revision < 0
+                || now_ms < 0
+                || due_at_ms <= now_ms
+                || due_at_ms.saturating_sub(now_ms) > 300_000
+            {
+                return Err(connector_storage_invalid());
+            }
+            let row = backend.query_row_cells(
+                "SELECT item_key, generation, source_event_id, state, revision, due_at, record_json
+                 FROM connector_outbox WHERE item_key = ?1", &[ToSqlValue::Text(&key)],
+            ).map_err(|_| connector_storage_invalid())?;
+            let Some(row) = row else {
+                return Ok(Outcome::Conflict);
+            };
+            let mut entry = connector_outbox_from_cells(&row)?;
+            if entry.revision != expected_revision || entry.state != State::Admitted {
+                return Ok(Outcome::Conflict);
+            }
+            if now_ms < entry.updated_at_ms {
+                return Err(connector_storage_invalid());
+            }
+            entry.revision = entry
+                .revision
+                .checked_add(1)
+                .ok_or_else(connector_storage_invalid)?;
+            entry.updated_at_ms = now_ms;
+            entry.due_at_ms = due_at_ms;
+            entry.reason_code = Some("connector_preflight_unavailable".into());
+            let json = serde_json::to_string(&entry).map_err(|_| connector_storage_invalid())?;
+            execute_typed(backend,
+                "UPDATE connector_outbox SET revision = ?1, due_at = ?2, record_json = ?3 WHERE item_key = ?4",
+                &[ToSqlValue::Integer(entry.revision), ToSqlValue::Integer(due_at_ms),
+                    ToSqlValue::Text(&json), ToSqlValue::Text(&key)],
+            ).map_err(|_| connector_storage_invalid())?;
+            Ok(Outcome::Transitioned(Box::new(entry)))
+        }
         Mutation::Transition {
             key,
             expected_revision,
@@ -23643,6 +23712,9 @@ fn connector_mutation_backend(
                 return Ok(Outcome::Conflict);
             }
             if now_ms < entry.updated_at_ms {
+                return Err(connector_storage_invalid());
+            }
+            if next_state == State::Dispatched && now_ms < entry.due_at_ms {
                 return Err(connector_storage_invalid());
             }
             entry.revision = entry
@@ -35846,7 +35918,7 @@ fn prepared_plan_query_rejects_negative_pane_id() {
 // longer leaks across `#[test]` boundaries on asupersync.
 
 #[cfg(test)]
-pub(super) fn run_storage_async_test<F>(future: F)
+pub(crate) fn run_storage_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
@@ -43297,7 +43369,10 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
 }
 
 #[cfg(test)]
-use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
+// Connector integration tests exercise the same real writer/runtime lifecycle.
+pub(crate) use fts_async_flat_tests::run_storage_async_test;
+#[cfg(test)]
+use fts_async_flat_tests::run_storage_proptest_async;
 
 #[cfg(test)]
 mod write_command_sender_tests {

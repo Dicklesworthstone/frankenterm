@@ -116,6 +116,14 @@ pub(crate) enum ConnectorStorageMutation {
         receipt_hash: Option<String>,
         reason_code: Option<String>,
     },
+    /// A failed preflight has not sent an invocation. Rescheduling still uses
+    /// revision CAS and is forbidden once dispatch ownership was acquired.
+    Reschedule {
+        key: String,
+        expected_revision: i64,
+        now_ms: i64,
+        due_at_ms: i64,
+    },
     Ingest {
         subscription_key: String,
         expected_cursor: i64,

@@ -1,9 +1,8 @@
 //! Connector host runtime lifecycle and protocol envelopes.
 //!
-//! This module provides a deterministic, testable host-runtime core for
-//! connector-fabric embedding. It intentionally avoids side effects and uses
-//! caller-provided timestamps so lifecycle behavior is reproducible in tests.
-//! The explicit FCP client below owns bounded I/O; model admission never invokes it.
+//! The host-runtime model uses caller-provided timestamps and performs no
+//! transport I/O. The separate FCP client and durable delivery session own
+//! bounded network/storage work; model admission alone never invokes a provider.
 
 use std::collections::VecDeque;
 
@@ -12,6 +11,728 @@ use thiserror::Error;
 
 const TRANSITION_HISTORY_CAPACITY: usize = 64;
 const SANDBOX_DECISION_HISTORY_CAPACITY: usize = 128;
+
+#[derive(Debug, Error)]
+pub(crate) enum FcpDeliveryError {
+    #[error("{0}")]
+    State(&'static str),
+    #[error("connector_storage_failed")]
+    Storage(#[from] crate::Error),
+    #[error("connector_transport_failed")]
+    Transport(#[from] FcpTransportError),
+    #[error("connector_payload_invalid")]
+    Payload(#[from] serde_json::Error),
+    #[error("connector_clock_invalid")]
+    Clock(#[from] std::time::SystemTimeError),
+    #[error("connector_integer_out_of_range")]
+    Integer(#[from] std::num::TryFromIntError),
+}
+
+type DeliveryResult<T> = Result<T, FcpDeliveryError>;
+
+/// One runtime-owned durable transport loop. A dispatched row is never
+/// automatically replayed, including after process restart or receipt loss.
+pub(crate) struct FcpDeliverySession {
+    config: FcpTransportConfig,
+    client: FcpHostClient,
+    storage: crate::storage::StorageHandle,
+    generation: String,
+    cursor: i64,
+    cursor_epoch: String,
+    bridge: crate::connector_outbound_bridge::ConnectorOutboundBridge,
+    inbound: crate::connector_inbound_bridge::ConnectorInboundBridge,
+    event_bus: std::sync::Arc<crate::events::EventBus>,
+    next_poll: Vec<std::time::Instant>,
+    poll_cursor: usize,
+    pending_admission: Option<(i64, Vec<crate::connector_reliability::ConnectorOutboxEntry>)>,
+}
+
+impl FcpDeliverySession {
+    pub(crate) async fn open(
+        cx: &crate::cx::Cx,
+        safety: &crate::config::SafetyConfig,
+        storage: crate::storage::StorageHandle,
+        event_bus: std::sync::Arc<crate::events::EventBus>,
+    ) -> DeliveryResult<Self> {
+        use crate::connector_reliability::{
+            ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+        };
+        let config = safety
+            .connector_transport
+            .clone()
+            .ok_or(FcpTransportError::InvalidConfig)?;
+        let client = FcpHostClient::new(config.clone(), &safety.connector_host_runtime)?;
+        // Host/zone policy is part of the persisted authority, not only routes.
+        let generation = fcp_identity_hash(&format!(
+            "{}:{}",
+            config.generation()?,
+            serde_json::to_string(safety)?
+        ));
+        let Outcome::Cursor {
+            after_event_id,
+            cursor_epoch,
+        } = storage
+            .connector_mutation_with_cx(
+                cx,
+                Mutation::Initialize {
+                    generation: generation.clone(),
+                    now_ms: delivery_now_ms()?,
+                },
+            )
+            .await?
+        else {
+            return Err(FcpDeliveryError::State("connector_cursor_unavailable"));
+        };
+        let mut bridge =
+            crate::connector_outbound_bridge::ConnectorOutboundBridge::new(Default::default());
+        bridge.set_policy_engine(crate::policy::PolicyEngine::from_safety_config(safety));
+        for route in &config.outbound {
+            bridge.add_rule(route.rule.clone());
+            bridge.register_sandbox_zone(
+                &route.invoke.connector_id,
+                safety.connector_host_runtime.sandbox.clone(),
+            );
+        }
+        let inbound = crate::connector_inbound_bridge::ConnectorInboundBridge::new(
+            std::sync::Arc::clone(&event_bus),
+            crate::connector_inbound_bridge::ConnectorInboundBridgeConfig {
+                classifier: safety.data_classifier.clone(),
+                ..Default::default()
+            },
+        );
+        let next_poll = vec![std::time::Instant::now(); config.inbound.len()];
+        Ok(Self {
+            config,
+            client,
+            storage,
+            generation,
+            cursor: after_event_id,
+            cursor_epoch,
+            bridge,
+            inbound,
+            event_bus,
+            next_poll,
+            poll_cursor: 0,
+            pending_admission: None,
+        })
+    }
+
+    pub(crate) async fn tick(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
+        self.deliver_ingress(cx).await?;
+        self.dispatch_pending(cx).await?;
+        self.admit_events(cx).await?;
+        for offset in 0..self.config.inbound.len() {
+            let index = (self.poll_cursor + offset) % self.config.inbound.len();
+            cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            if std::time::Instant::now() >= self.next_poll[index] {
+                self.next_poll[index] = std::time::Instant::now()
+                    + std::time::Duration::from_millis(self.config.inbound[index].poll_interval_ms);
+                self.poll_cursor = (index + 1) % self.config.inbound.len();
+                self.poll_ingress(cx, index).await?;
+                // At most one provider poll per tick. A large subscription
+                // set cannot monopolize the task for N network deadlines.
+                break;
+            }
+        }
+        self.deliver_ingress(cx).await
+    }
+
+    async fn admit_events(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
+        use crate::connector_outbound_bridge::{
+            OutboundEvent, OutboundEventSource, OutboundSeverity,
+        };
+        use crate::connector_reliability::{ConnectorDeliveryState as State, ConnectorOutboxEntry};
+        if !self.flush_admission(cx).await? {
+            return Ok(());
+        }
+        let page = self
+            .storage
+            .get_events_stream_page_with_cx(
+                cx,
+                crate::storage::EventStreamQuery {
+                    after_id: Some(self.cursor),
+                    limit: Some(16),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let through = page
+            .events
+            .last()
+            .map_or(page.retention.max_event_id, |event| event.id);
+        let retention = self
+            .storage
+            .check_event_retention_in_epoch_with_cx(cx, self.cursor, through, &self.cursor_epoch)
+            .await?;
+        if !matches!(
+            retention.status,
+            crate::storage::EventRetentionStatus::CompleteNoPruning
+        ) {
+            return Err(FcpDeliveryError::State(
+                "connector_source_history_unavailable",
+            ));
+        }
+        for event in page.events {
+            let now_ms = delivery_now_ms()?;
+            let mut outbound = OutboundEvent {
+                source: OutboundEventSource::PatternDetected,
+                event_type: format!("pattern.{}", event.event_type),
+                // Durable cursor CAS owns deduplication. Volatile bridge dedup
+                // must not suppress a transaction retried after saturation.
+                correlation_id: None,
+                timestamp_ms: u64::try_from(now_ms)?,
+                pane_id: Some(event.pane_id),
+                workflow_id: None,
+                payload: serde_json::Value::Null,
+                severity: match event.severity.as_str() {
+                    "critical" => OutboundSeverity::Critical,
+                    "warning" => OutboundSeverity::Warning,
+                    _ => OutboundSeverity::Info,
+                },
+            };
+            let mut entries = Vec::new();
+            for route in &self.config.outbound {
+                if !route.rule.matches(&outbound) {
+                    continue;
+                }
+                let key = fcp_identity_hash(&serde_json::to_string(&(
+                    &self.generation,
+                    event.id,
+                    &route.rule.rule_id,
+                ))?);
+                let correlation_id = delivery_request_id();
+                let mut invoke = route.invoke.clone();
+                if let Some(pointer) = &route.correlation_input_pointer {
+                    *invoke
+                        .input
+                        .pointer_mut(pointer)
+                        .ok_or(FcpTransportError::InvalidConfig)? =
+                        serde_json::Value::String(correlation_id.clone());
+                }
+                // Classify the exact configured bytes to be sent. Neither
+                // raw captured text nor an unrelated route's approval can
+                // authorize this invocation.
+                outbound.payload = serde_json::json!({
+                    "input": invoke.input, "capability": invoke.capability.as_str(),
+                    "target": invoke.target,
+                });
+                let admission = self
+                    .bridge
+                    .process_event_for_rule(&outbound, Some(&route.rule.rule_id))
+                    .map_err(|_| FcpDeliveryError::State("connector_policy_admission_failed"))?;
+                let planned = self.bridge.drain_actions();
+                let approved_input = planned
+                    .first()
+                    .and_then(|action| action.params.get("input"));
+                let binding_preserved = planned.first().is_some_and(|action| {
+                    action.params.get("target") == Some(&serde_json::json!(invoke.target))
+                        && action
+                            .params
+                            .get("capability")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(invoke.capability.as_str())
+                });
+                let admitted = binding_preserved
+                    && planned.len() == 1
+                    && approved_input.is_some()
+                    && admission
+                        .actions_dispatched
+                        .iter()
+                        .any(|action| action.rule_id == route.rule.rule_id);
+                // Rejected input is not retained in the durable record. In
+                // particular, privacy-denied credentials must not enter SQLite.
+                invoke.input = if admitted {
+                    approved_input.cloned().unwrap_or_default()
+                } else {
+                    serde_json::Value::Null
+                };
+                if !admitted {
+                    invoke.target = None;
+                }
+                let mut entry = ConnectorOutboxEntry {
+                    key,
+                    generation: self.generation.clone(),
+                    source_event_id: event.id,
+                    rule_id: route.rule.rule_id.clone(),
+                    invoke,
+                    action_kind: route.rule.action_kind,
+                    correlation_id,
+                    state: if admitted {
+                        State::Admitted
+                    } else {
+                        State::Rejected
+                    },
+                    revision: 0,
+                    due_at_ms: now_ms,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                    receipt_id: None,
+                    receipt_hash: None,
+                    reason_code: (!admitted).then(|| "connector_admission_denied".to_string()),
+                };
+                // Admission is one atomic cursor transaction. Reserve an equal
+                // share for every configured route, plus JSON-array and writer
+                // overhead, so a large/redaction-expanded input cannot wedge
+                // the cursor permanently. Leave room in each persisted row for
+                // its later receipt and revision updates as well.
+                let entry_budget = ((4 * 1024 * 1024 - 2048) / self.config.outbound.len().max(1))
+                    .min(1024 * 1024 - 4096);
+                if serde_json::to_vec(&entry)?.len() > entry_budget {
+                    entry.state = State::Rejected;
+                    entry.invoke.input = serde_json::Value::Null;
+                    entry.invoke.target = None;
+                    entry.reason_code = Some("connector_admission_payload_too_large".into());
+                }
+                entries.push(entry);
+            }
+            self.pending_admission = Some((event.id, entries));
+            if !self.flush_admission(cx).await? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_admission(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<bool> {
+        use crate::connector_reliability::{
+            ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+        };
+        let Some((through_event_id, entries)) = &self.pending_admission else {
+            return Ok(true);
+        };
+        match self
+            .storage
+            .connector_mutation_with_cx(
+                cx,
+                Mutation::Admit {
+                    generation: self.generation.clone(),
+                    expected_cursor: self.cursor,
+                    through_event_id: *through_event_id,
+                    entries: entries.clone(),
+                    max_pending: self.config.max_pending_actions,
+                    max_retained: self.config.max_retained_actions,
+                },
+            )
+            .await?
+        {
+            Outcome::Admitted => {
+                self.cursor = *through_event_id;
+                self.pending_admission = None;
+            }
+            Outcome::Saturated => return Ok(false),
+            _ => return Err(FcpDeliveryError::State("connector_admission_conflict")),
+        }
+        Ok(true)
+    }
+
+    async fn transition(
+        &self,
+        cx: &crate::cx::Cx,
+        entry: &crate::connector_reliability::ConnectorOutboxEntry,
+        next_state: crate::connector_reliability::ConnectorDeliveryState,
+        receipt: Option<&FcpAcknowledgement>,
+        reason: Option<&str>,
+    ) -> DeliveryResult<crate::connector_reliability::ConnectorOutboxEntry> {
+        use crate::connector_reliability::{
+            ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+        };
+        match self
+            .storage
+            .connector_mutation_with_cx(
+                cx,
+                Mutation::Transition {
+                    key: entry.key.clone(),
+                    expected_revision: entry.revision,
+                    expected_state: entry.state,
+                    next_state,
+                    now_ms: delivery_now_ms()?.max(entry.updated_at_ms),
+                    receipt_id: receipt.map(|ack| ack.receipt_id.clone()),
+                    receipt_hash: receipt.map(|ack| ack.receipt_hash.clone()),
+                    reason_code: reason.map(str::to_string),
+                },
+            )
+            .await?
+        {
+            Outcome::Transitioned(entry) => Ok(*entry),
+            _ => Err(FcpDeliveryError::State(
+                "connector_dispatch_ownership_conflict",
+            )),
+        }
+    }
+
+    async fn dispatch_pending(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+        let pending = self
+            .storage
+            .dispatchable_connector_outbox_with_cx(cx, &self.generation, 1)
+            .await?;
+        for entry in pending {
+            cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            if entry.state == State::Dispatched {
+                // Another owner may still be settling this exact request.
+                // Preserve its CAS revision and never resend. Dispatched is
+                // explicitly unresolved, not successful or safe to retry.
+                continue;
+            }
+            if entry.due_at_ms > delivery_now_ms()? {
+                continue;
+            }
+            let request = ConnectorOperationRequest {
+                action: entry.invoke.operation.clone(),
+                correlation_id: entry.correlation_id.clone(),
+                capability: entry.invoke.capability,
+                target: entry.invoke.target.clone(),
+            };
+            if self
+                .bridge
+                .policy_engine()
+                .connector_host_runtime()
+                .validate_operation_request(&request)
+                .is_err()
+            {
+                self.transition(
+                    cx,
+                    &entry,
+                    State::Rejected,
+                    None,
+                    Some("connector_sandbox_denied"),
+                )
+                .await?;
+                continue;
+            }
+            let deadline = self.client.operation_deadline()?;
+            let preflight = async {
+                self.client
+                    .observe_operation(cx, deadline, &entry.invoke)
+                    .await?;
+                self.client
+                    .prepare_invocation(
+                        cx,
+                        deadline,
+                        &entry.invoke,
+                        &entry.correlation_id,
+                        &entry.key,
+                    )
+                    .await
+            }
+            .await;
+            let prepared = match preflight {
+                Ok(prepared) => prepared,
+                Err(FcpTransportError::Cancelled) => {
+                    return Err(FcpTransportError::Cancelled.into());
+                }
+                Err(FcpTransportError::Unavailable | FcpTransportError::CredentialUnavailable) => {
+                    use crate::connector_reliability::{
+                        ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+                    };
+                    let now_ms = delivery_now_ms()?.max(entry.updated_at_ms);
+                    let delay = 1000_i64 << u32::try_from(entry.revision.clamp(0, 8))?;
+                    let due_at_ms = now_ms
+                        .checked_add(delay)
+                        .ok_or(FcpDeliveryError::State("connector_retry_clock_overflow"))?;
+                    if !matches!(
+                        self.storage
+                            .connector_mutation_with_cx(
+                                cx,
+                                Mutation::Reschedule {
+                                    key: entry.key.clone(),
+                                    expected_revision: entry.revision,
+                                    now_ms,
+                                    due_at_ms,
+                                }
+                            )
+                            .await?,
+                        Outcome::Transitioned(_)
+                    ) {
+                        return Err(FcpDeliveryError::State(
+                            "connector_preflight_ownership_conflict",
+                        ));
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    self.transition(
+                        cx,
+                        &entry,
+                        State::Rejected,
+                        None,
+                        Some("connector_preflight_rejected"),
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let dispatched = self
+                .transition(cx, &entry, State::Dispatched, None, None)
+                .await?;
+            match self.client.invoke(cx, deadline, prepared).await {
+                Ok(ack) => {
+                    self.transition(
+                        cx,
+                        &dispatched,
+                        if ack.success {
+                            State::Completed
+                        } else {
+                            State::Failed
+                        },
+                        Some(&ack),
+                        None,
+                    )
+                    .await?;
+                    let action = delivery_action(&dispatched);
+                    if ack.success {
+                        self.bridge
+                            .record_action_success(&action, u64::try_from(delivery_now_ms()?)?);
+                    } else {
+                        self.bridge.record_action_failure(
+                            &action,
+                            "connector_provider_failed",
+                            crate::connector_reliability::ConnectorErrorKind::Permanent,
+                            u64::try_from(delivery_now_ms()?)?,
+                        );
+                    }
+                }
+                Err(_) => {
+                    // If cancellation prevents this settlement, the persisted
+                    // Dispatched state still forbids replay after restart.
+                    self.transition(
+                        cx,
+                        &dispatched,
+                        State::Indeterminate,
+                        None,
+                        Some("connector_receipt_unconfirmed"),
+                    )
+                    .await?;
+                    self.bridge.record_action_failure(
+                        &delivery_action(&dispatched),
+                        "connector_receipt_unconfirmed",
+                        crate::connector_reliability::ConnectorErrorKind::Indeterminate,
+                        u64::try_from(delivery_now_ms()?)?,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn poll_ingress(&mut self, cx: &crate::cx::Cx, index: usize) -> DeliveryResult<()> {
+        use crate::connector_inbound_bridge::{ConnectorSignal, ConnectorSignalKind};
+        use crate::connector_reliability::{
+            ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+        };
+        let subscription = &self.config.inbound[index];
+        let key = fcp_identity_hash(&serde_json::to_string(&(
+            &self.generation,
+            &subscription.subscription_id,
+        ))?);
+        let cursor = self
+            .storage
+            .connector_ingress_cursor_with_cx(cx, &key)
+            .await?;
+        let mut operation = subscription.invoke.clone();
+        *operation
+            .input
+            .pointer_mut(&subscription.cursor_input_pointer)
+            .ok_or(FcpTransportError::InvalidConfig)? = cursor.into();
+        let request_id = delivery_request_id();
+        let request = ConnectorOperationRequest {
+            action: operation.operation.clone(),
+            correlation_id: request_id.clone(),
+            capability: operation.capability,
+            target: operation.target.clone(),
+        };
+        self.bridge
+            .policy_engine()
+            .connector_host_runtime()
+            .validate_operation_request(&request)
+            .map_err(|_| FcpDeliveryError::State("connector_ingress_sandbox_denied"))?;
+        let deadline = self.client.operation_deadline()?;
+        self.client
+            .observe_operation(cx, deadline, &operation)
+            .await?;
+        let prepared = self
+            .client
+            .prepare_invocation(
+                cx,
+                deadline,
+                &operation,
+                &request_id,
+                &fcp_identity_hash(&request_id),
+            )
+            .await?;
+        let ack = self.client.invoke(cx, deadline, prepared).await?;
+        if !ack.success {
+            return Err(FcpDeliveryError::State("connector_ingress_poll_failed"));
+        }
+        let rows = ack
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer(&subscription.records_pointer))
+            .and_then(serde_json::Value::as_array)
+            .ok_or(FcpTransportError::ProtocolInvalid)?;
+        if rows.len() > self.config.max_ingress_batch {
+            return Err(FcpDeliveryError::State("connector_ingress_batch_limit"));
+        }
+        let mut records = Vec::with_capacity(rows.len());
+        let mut previous = cursor;
+        for row in rows {
+            let id = row
+                .pointer(&subscription.identity_pointer)
+                .and_then(serde_json::Value::as_i64)
+                .ok_or(FcpTransportError::ProtocolInvalid)?;
+            if id <= previous {
+                return Err(FcpDeliveryError::State(
+                    "connector_ingress_cursor_not_increasing",
+                ));
+            }
+            previous = id;
+            let signal = ConnectorSignal::new(
+                &operation.connector_id,
+                ConnectorSignalKind::Poll,
+                row.clone(),
+            )
+            .with_pane_id(subscription.pane_id)
+            .with_correlation_id(format!("{key}:{id}"));
+            let detection = self
+                .inbound
+                .prepare_signal(&signal)
+                .map_err(|_| FcpDeliveryError::State("connector_ingress_classification_denied"))?;
+            records.push((
+                id,
+                crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: subscription.pane_id,
+                    rule_id: detection.rule_id,
+                    agent_type: detection.agent_type.to_string(),
+                    event_type: detection.event_type,
+                    severity: serde_json::to_value(detection.severity)?
+                        .as_str()
+                        .ok_or(FcpTransportError::ProtocolInvalid)?
+                        .to_string(),
+                    confidence: detection.confidence,
+                    extracted: Some(detection.extracted),
+                    matched_text: Some(detection.matched_text),
+                    segment_id: None,
+                    detected_at: delivery_now_ms()?,
+                    dedupe_key: Some(format!("connector:{key}:{id}")),
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                },
+            ));
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+        let count = records.len();
+        match self
+            .storage
+            .connector_mutation_with_cx(
+                cx,
+                Mutation::Ingest {
+                    subscription_key: key,
+                    expected_cursor: cursor,
+                    records,
+                },
+            )
+            .await?
+        {
+            Outcome::Ingested(outcomes) => {
+                if outcomes.len() != count || outcomes.iter().any(|outcome| outcome.event_id() <= 0)
+                {
+                    return Err(FcpDeliveryError::State("connector_ingress_invalid_commit"));
+                }
+            }
+            Outcome::Saturated => {}
+            _ => return Err(FcpDeliveryError::State("connector_ingress_commit_conflict")),
+        }
+        Ok(())
+    }
+
+    async fn deliver_ingress(&self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
+        use crate::connector_reliability::{
+            ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+        };
+        let pending = self.storage.pending_connector_ingress_with_cx(cx).await?;
+        let mut delivered = Vec::new();
+        for event in pending {
+            cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            let detection = crate::patterns::Detection {
+                rule_id: event.rule_id,
+                agent_type: crate::patterns::AgentType::Unknown,
+                event_type: event.event_type,
+                severity: serde_json::from_value(event.severity.into())?,
+                confidence: event.confidence,
+                extracted: event.extracted.unwrap_or_default(),
+                matched_text: event.matched_text.unwrap_or_default(),
+                span: (0, 0),
+            };
+            if self
+                .event_bus
+                .publish(crate::events::Event::PatternDetected {
+                    pane_id: event.pane_id,
+                    pane_uuid: None,
+                    detection,
+                    event_id: Some(event.id),
+                })
+                > 0
+            {
+                delivered.push(event.id);
+            }
+        }
+        if !delivered.is_empty() {
+            if !matches!(
+                self.storage
+                    .connector_mutation_with_cx(
+                        cx,
+                        Mutation::AcknowledgeIngress {
+                            event_ids: delivered
+                        }
+                    )
+                    .await?,
+                Outcome::IngressAcknowledged
+            ) {
+                return Err(FcpDeliveryError::State("connector_ingress_ack_conflict"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn delivery_now_ms() -> DeliveryResult<i64> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?)
+}
+
+fn delivery_action(
+    entry: &crate::connector_reliability::ConnectorOutboxEntry,
+) -> crate::connector_outbound_bridge::ConnectorAction {
+    crate::connector_outbound_bridge::ConnectorAction {
+        target_connector: entry.invoke.connector_id.clone(),
+        action_kind: entry.action_kind,
+        correlation_id: entry.correlation_id.clone(),
+        params: entry.invoke.input.clone(),
+        created_at_ms: entry.created_at_ms.try_into().unwrap_or_default(),
+    }
+}
+
+fn delivery_request_id() -> String {
+    let mut bytes: [u8; 16] = rand::random();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
 
 /// Operator-owned operation binding. Event payloads cannot select an operation,
 /// capability, destination, or credential source.
@@ -206,6 +927,7 @@ impl FcpTransportConfig {
             || !(1..=30_000).contains(&self.request_timeout_ms)
             || !(1024..=1_048_576).contains(&self.max_payload_bytes)
             || !(1..=4096).contains(&self.max_pending_actions)
+            || self.max_pending_actions < self.outbound.len()
             || self.max_retained_actions < self.max_pending_actions
             || self.max_retained_actions > 65_536
             || !(1..=256).contains(&self.max_ingress_batch)
@@ -222,6 +944,15 @@ impl FcpTransportConfig {
         let mut identities = std::collections::BTreeSet::new();
         for route in &self.outbound {
             if !valid_fcp_label(&route.rule.rule_id)
+                // CredentialAction is an in-process broker transaction with
+                // different prepared parameters, not an FCP invoke envelope.
+                // Refuse it at startup rather than acknowledge an unusable
+                // configuration or perform broker work during outbox admission.
+                || route.rule.action_kind
+                    == crate::connector_outbound_bridge::ConnectorActionKind::CredentialAction
+                || route.rule.source_filter.is_some_and(|source| {
+                    source != crate::connector_outbound_bridge::OutboundEventSource::PatternDetected
+                })
                 || !identities.insert(route.rule.rule_id.as_str())
                 || route.rule.target_connector != route.invoke.connector_id
                 || route
@@ -1830,6 +2561,369 @@ pub enum ConnectorHostRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_request_ids_are_distinct_wire_uuids() {
+        let first = delivery_request_id();
+        let second = delivery_request_id();
+        assert!(valid_fcp_request_id(&first));
+        assert!(valid_fcp_request_id(&second));
+        assert_ne!(first, second);
+        assert_eq!(first.as_bytes()[14], b'4');
+        assert!(b"89ab".contains(&first.as_bytes()[19]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_durable_dispatch_cas_prevents_restart_replay() {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+        crate::storage::run_storage_async_test(async {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = crate::storage::StorageHandle::new(
+                temp.path().join("delivery.db").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "delivery-test".into(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let cx = crate::cx::for_request();
+            let mut safety = crate::config::SafetyConfig::default();
+            safety.connector_transport = Some(FcpTransportConfig {
+                endpoint: "http://127.0.0.1:1/".into(),
+                capability_token_file: temp.path().join("absent-capability"),
+                admin_token_file: temp.path().join("absent-admin"),
+                request_timeout_ms: 100,
+                max_payload_bytes: 4096,
+                max_pending_actions: 8,
+                max_retained_actions: 16,
+                max_ingress_batch: 4,
+                outbound: vec![FcpOutboundRoute {
+                    rule: crate::connector_outbound_bridge::OutboundRoutingRule {
+                        rule_id: "test-route".into(),
+                        source_filter: None,
+                        event_type_prefix: Some("pattern.test".into()),
+                        min_severity: None,
+                        target_connector: "fcp.sqlite".into(),
+                        action_kind: crate::connector_outbound_bridge::ConnectorActionKind::Invoke,
+                        enabled: true,
+                        priority: 0,
+                    },
+                    invoke: introspection_operation(),
+                    correlation_input_pointer: None,
+                }],
+                inbound: vec![FcpInboundSubscription {
+                    subscription_id: "test-poll".into(),
+                    invoke: FcpOperation {
+                        input: serde_json::json!({"cursor": 0}),
+                        ..introspection_operation()
+                    },
+                    pane_id: 1,
+                    records_pointer: "/records".into(),
+                    identity_pointer: "/id".into(),
+                    cursor_input_pointer: "/cursor".into(),
+                    poll_interval_ms: 1000,
+                }],
+            });
+            let bus = std::sync::Arc::new(crate::events::EventBus::new(8));
+            let mut session = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::clone(&bus),
+            )
+            .await
+            .unwrap();
+            let event_id = storage
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: "test.rule".into(),
+                    agent_type: "unknown".into(),
+                    event_type: "test".into(),
+                    severity: "info".into(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: Some("source-private-canary".into()),
+                    segment_id: None,
+                    detected_at: 1,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .unwrap();
+            session.admit_events(&cx).await.unwrap();
+            assert_eq!(session.cursor, event_id);
+            let admitted = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(admitted.len(), 1);
+            let entry = &admitted[0];
+            assert_eq!(entry.state, State::Admitted);
+            assert_eq!(entry.source_event_id, event_id);
+            assert!(
+                !serde_json::to_string(entry)
+                    .unwrap()
+                    .contains("source-private-canary")
+            );
+            session.admit_events(&cx).await.unwrap();
+            assert_eq!(
+                storage
+                    .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let dispatched = session
+                .transition(&cx, entry, State::Dispatched, None, None)
+                .await
+                .unwrap();
+            assert_eq!(dispatched.revision, 1);
+            assert!(
+                session
+                    .transition(&cx, entry, State::Dispatched, None, None)
+                    .await
+                    .is_err(),
+                "stale ownership must not authorize a second send"
+            );
+            drop(session);
+            let mut reopened = FcpDeliverySession::open(&cx, &safety, storage.clone(), bus)
+                .await
+                .unwrap();
+            assert_eq!(reopened.cursor, event_id);
+            // No credentials or server exist. Scanning must neither issue the
+            // request again nor revoke a still-running owner's settlement CAS.
+            reopened.dispatch_pending(&cx).await.unwrap();
+            let rows = storage
+                .get_connector_outbox_with_cx(&cx, &reopened.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, State::Dispatched);
+            assert_eq!(rows[0].revision, dispatched.revision);
+            assert!(
+                reopened
+                    .transition(&cx, &rows[0], State::Dispatched, None, None)
+                    .await
+                    .is_err()
+            );
+            let acknowledged = FcpAcknowledgement {
+                receipt_id: fcp_identity_hash("receipt"),
+                receipt_hash: fcp_identity_hash("receipt-content"),
+                success: true,
+                result: None,
+            };
+            assert_eq!(
+                reopened
+                    .transition(
+                        &cx,
+                        &dispatched,
+                        State::Completed,
+                        Some(&acknowledged),
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .state,
+                State::Completed
+            );
+            // A changed sandbox is a different admission generation. Denied
+            // configured bytes must not be retained, dispatched or silently
+            // borrow the preceding owner's approval.
+            safety
+                .connector_host_runtime
+                .sandbox
+                .capability_envelope
+                .allowed_capabilities = vec![ConnectorCapability::Invoke];
+            let mut denied = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::clone(&reopened.event_bus),
+            )
+            .await
+            .unwrap();
+            assert_ne!(denied.generation, reopened.generation);
+            let mut source = storage
+                .get_events_stream_with_cx(
+                    &cx,
+                    crate::storage::EventStreamQuery {
+                        after_id: Some(0),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .remove(0);
+            source.id = 0;
+            source.dedupe_key = None;
+            storage.record_event(source.clone()).await.unwrap();
+            denied.admit_events(&cx).await.unwrap();
+            let denied_rows = storage
+                .get_connector_outbox_with_cx(&cx, &denied.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(denied_rows.len(), 1);
+            assert_eq!(denied_rows[0].state, State::Rejected);
+            assert!(denied_rows[0].invoke.input.is_null());
+            denied.dispatch_pending(&cx).await.unwrap();
+
+            // Backoff on the oldest admitted row must not hide a later ready
+            // row. The serialized writer also rejects dispatch before due_at.
+            use crate::connector_reliability::{
+                ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+            };
+            reopened.admit_events(&cx).await.unwrap();
+            let ready = storage
+                .dispatchable_connector_outbox_with_cx(&cx, &reopened.generation, 1)
+                .await
+                .unwrap();
+            assert_eq!(ready.len(), 1);
+            let now_ms = delivery_now_ms().unwrap();
+            let Outcome::Transitioned(delayed) = storage
+                .connector_mutation_with_cx(
+                    &cx,
+                    Mutation::Reschedule {
+                        key: ready[0].key.clone(),
+                        expected_revision: ready[0].revision,
+                        now_ms,
+                        due_at_ms: now_ms + 60_000,
+                    },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("backoff was not committed");
+            };
+            assert!(
+                reopened
+                    .transition(&cx, &delayed, State::Dispatched, None, None)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                storage
+                    .dispatchable_connector_outbox_with_cx(&cx, &reopened.generation, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let next_event = storage.record_event(source.clone()).await.unwrap();
+            reopened.admit_events(&cx).await.unwrap();
+            let ready = storage
+                .dispatchable_connector_outbox_with_cx(&cx, &reopened.generation, 1)
+                .await
+                .unwrap();
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].source_event_id, next_event);
+
+            // An individually valid transport input can still exceed the
+            // durable row budget after its ownership/receipt envelope is added.
+            // It must become a terminal rejection, never wedge the event cursor.
+            let mut oversized_safety = safety.clone();
+            oversized_safety.connector_host_runtime = ConnectorHostConfig::default();
+            let oversized_config = oversized_safety.connector_transport.as_mut().unwrap();
+            oversized_config.max_payload_bytes = 1_048_576;
+            oversized_config.outbound[0].invoke.input =
+                serde_json::json!({"query": "x".repeat(1_046_000)});
+            let mut oversized = FcpDeliverySession::open(
+                &cx,
+                &oversized_safety,
+                storage.clone(),
+                std::sync::Arc::clone(&reopened.event_bus),
+            )
+            .await
+            .unwrap();
+            let oversized_event_id = storage.record_event(source.clone()).await.unwrap();
+            oversized.admit_events(&cx).await.unwrap();
+            assert_eq!(oversized.cursor, oversized_event_id);
+            let rejected = storage
+                .get_connector_outbox_with_cx(&cx, &oversized.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(rejected.len(), 1);
+            assert_eq!(rejected[0].state, State::Rejected);
+            assert_eq!(
+                rejected[0].reason_code.as_deref(),
+                Some("connector_admission_payload_too_large")
+            );
+            assert_eq!(rejected[0].invoke.input, serde_json::Value::Null);
+            drop(oversized);
+
+            // Real SQLite ingress is retained until there is a live consumer.
+            // This covers storage/publication, not a live-provider poll.
+            let subscription_key = fcp_identity_hash("durable-ingress-test");
+            source.dedupe_key = Some(format!("connector:{subscription_key}:1"));
+            source.event_type = "connector.poll".into();
+            let Outcome::Ingested(outcomes) = storage
+                .connector_mutation_with_cx(
+                    &cx,
+                    Mutation::Ingest {
+                        subscription_key,
+                        expected_cursor: 0,
+                        records: vec![(1, source)],
+                    },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("ingress commit missing");
+            };
+            assert_eq!(outcomes.len(), 1);
+            assert!(outcomes[0].was_inserted());
+            reopened.deliver_ingress(&cx).await.unwrap();
+            assert_eq!(
+                storage
+                    .pending_connector_ingress_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let mut subscriber = reopened.event_bus.subscribe_detections();
+            reopened.deliver_ingress(&cx).await.unwrap();
+            let Some(Ok(crate::events::Event::PatternDetected {
+                event_id: Some(published_id),
+                ..
+            })) = subscriber.try_recv()
+            else {
+                panic!("durably committed ingress was not published");
+            };
+            assert_eq!(published_id, outcomes[0].event_id());
+            assert!(
+                storage
+                    .pending_connector_ingress_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            reopened.deliver_ingress(&cx).await.unwrap();
+            assert!(subscriber.try_recv().is_none());
+            drop(denied);
+            drop(reopened);
+            storage.shutdown().await.unwrap();
+        });
+    }
 
     fn introspection_operation() -> FcpOperation {
         FcpOperation {

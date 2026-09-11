@@ -4676,6 +4676,8 @@ pub struct ObservationRuntime {
     connector_inbound_bridge_config: ConnectorInboundBridgeConfig,
     /// Runtime-owned outbound connector bridge draining live EventBus traffic.
     connector_outbound_bridge: Option<Arc<StdMutex<ConnectorOutboundBridge>>>,
+    /// Explicit operator transport and policy; absent means no external I/O.
+    connector_transport_safety: Option<crate::config::SafetyConfig>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
     /// Selected durable recorder backend for every authority-admitted capture.
@@ -4734,6 +4736,7 @@ impl ObservationRuntime {
             connector_inbound_bridge: None,
             connector_inbound_bridge_config: ConnectorInboundBridgeConfig::default(),
             connector_outbound_bridge: None,
+            connector_transport_safety: None,
             recording: None,
             recorder_persistence: None,
             replay_capture: None,
@@ -4766,6 +4769,22 @@ impl ObservationRuntime {
     /// Get a clone-friendly handle to the tuning config (for spawned tasks).
     pub fn tuning_arc(&self) -> Arc<crate::tuning_config::TuningConfig> {
         Arc::clone(&self.tuning)
+    }
+
+    /// Install the validated, opt-in durable connector transport.
+    pub fn with_connector_transport(
+        mut self,
+        safety: &crate::config::SafetyConfig,
+    ) -> Result<Self> {
+        if let Some(transport) = &safety.connector_transport {
+            transport
+                .validate(&safety.connector_host_runtime)
+                .map_err(|_| {
+                    Error::runtime_backend("connector.configure", "invalid connector transport")
+                })?;
+            self.connector_transport_safety = Some(safety.clone());
+        }
+        Ok(self)
     }
 
     /// Set an event bus for publishing detection events.
@@ -4916,9 +4935,8 @@ impl ObservationRuntime {
     /// (see runtime_loop_cx() in shutdown_with_summary), so the seal is
     /// preserved at every boundary the runtime crosses.
     // This source-level `async fn` identity is part of runtime-proof coverage.
-    // Startup currently completes synchronously once polled; adding an
-    // artificial yield would change task-admission and cancellation ordering.
-    #[allow(clippy::unused_async_trait_impl)]
+    // Configured connector startup awaits durable cursor initialization before
+    // producers are admitted; recheck cancellation at that admission boundary.
     pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
         cx.checkpoint().map_err(|_| {
             runtime_cx_error(
@@ -4927,7 +4945,37 @@ impl ObservationRuntime {
                 "capability checkpoint failed before runtime startup",
             )
         })?;
-        self.start_impl()
+        // Establish the durable initial cursor before capture producers start.
+        let connector_session = if let Some(safety) = &self.connector_transport_safety {
+            let event_bus = self.event_bus.clone().ok_or_else(|| {
+                Error::runtime_backend("connector.start", "connector transport requires event bus")
+            })?;
+            Some(
+                crate::connector_host_runtime::FcpDeliverySession::open(
+                    cx,
+                    safety,
+                    self.storage.clone(),
+                    event_bus,
+                )
+                .await
+                .map_err(|_| {
+                    Error::runtime_backend(
+                        "connector.start",
+                        "connector durable initialization failed",
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        cx.checkpoint().map_err(|_| {
+            runtime_cx_error(
+                "runtime.start",
+                cx,
+                "capability checkpoint failed after connector initialization",
+            )
+        })?;
+        self.start_impl(connector_session)
     }
 
     #[instrument(skip(self))]
@@ -4936,7 +4984,10 @@ impl ObservationRuntime {
         self.start_with_cx(&cx).await
     }
 
-    fn start_impl(&self) -> Result<RuntimeHandle> {
+    fn start_impl(
+        &self,
+        connector_session: Option<crate::connector_host_runtime::FcpDeliverySession>,
+    ) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
 
         // Register before any producer can publish on another worker. The
@@ -5044,7 +5095,42 @@ impl ObservationRuntime {
 
         // Spawn outbound connector bridge task. It is dormant unless both an
         // EventBus and runtime-owned bridge exist.
-        let connector_outbound = self.spawn_connector_outbound_task();
+        let connector_outbound = if let Some(mut session) = connector_session {
+            let shutdown = Arc::clone(&self.shutdown_flag);
+            let loop_cx = runtime_loop_cx();
+            Some(spawn_runtime_task(&loop_cx, move |cx| async move {
+                let mut consecutive_failures = 0_u64;
+                while !shutdown.load(Ordering::SeqCst) && cx.checkpoint().is_ok() {
+                    if session.tick(&cx).await.is_err() {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures.is_power_of_two() {
+                            warn!(
+                                error_code = "connector_delivery_tick_failed",
+                                consecutive_failures,
+                                "durable connector processing deferred; unacknowledged effects are not replayed"
+                            );
+                        }
+                    } else {
+                        consecutive_failures = 0;
+                    }
+                    if runtime_sleep(
+                        &cx,
+                        Duration::from_millis(if consecutive_failures == 0 {
+                            CONNECTOR_OUTBOUND_BRIDGE_TICK_MS
+                        } else {
+                            1000
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }))
+        } else {
+            self.spawn_connector_outbound_task()
+        };
 
         // Spawn snapshot engine task (session persistence) if configured
         let (

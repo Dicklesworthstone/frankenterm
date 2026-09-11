@@ -46292,6 +46292,7 @@ async fn run_distributed_agent(
 
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_tuning(config.tuning.clone())
+        .with_connector_transport(&config.safety)?
         .with_connector_inbound_bridge_config(
             frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
                 classifier: config.safety.data_classifier.clone(),
@@ -47399,6 +47400,7 @@ async fn run_watcher(
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_tuning(config.tuning.clone())
         .with_recorder_storage(Arc::clone(&recorder_storage))?
+        .with_connector_transport(&config.safety)?
         .with_connector_inbound_bridge_config(
             frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
                 classifier: config.safety.data_classifier.clone(),
@@ -125002,10 +125004,22 @@ printf x > "$MINISIGN_MARKER"
             .iter()
             .filter(|row| row["fields"]["event"] == "command_process_started")
             .collect::<Vec<_>>();
+        // Keep failure diagnostics content-free: only static tracing metadata
+        // and finite event names, never raw child output or request fields.
+        let structural_events = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["target"].as_str().unwrap_or_default(),
+                    row["level"].as_str().unwrap_or_default(),
+                    row["fields"]["event"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             starts.len(),
             1,
-            "only the finite child reached actual spawn"
+            "only the finite child reached actual spawn; captured events: {structural_events:?}"
         );
         assert!(
             starts[0]["span"]["correlation_hash"]

@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::connector_data_classification::{
     ClassificationAuditEntry, ClassificationPolicy, ClassificationTelemetry,
@@ -520,6 +520,10 @@ impl ConnectorInboundBridge {
     ) -> Result<BridgeRouteResult, ConnectorBridgeError> {
         self.telemetry.signals_received = self.telemetry.signals_received.saturating_add(1);
 
+        // Classification must succeed before this attempt acquires a dedup
+        // entry. Otherwise a rejected attempt can suppress a later valid one.
+        let detection = self.prepare_signal(signal)?;
+
         // 1. Deduplication
         //
         // [ft-dijpe] Dedup bookkeeping uses the LOCAL receive clock,
@@ -557,7 +561,31 @@ impl ConnectorInboundBridge {
             }
         }
 
-        // 2. Unknown-kind rejection
+        let rule_id = detection.rule_id.clone();
+        let delivered_count = self.event_bus.publish(Event::PatternDetected {
+            pane_id: signal.pane_id.unwrap_or(0),
+            pane_uuid: None,
+            detection,
+            event_id: None,
+        });
+        self.telemetry.signals_routed = self.telemetry.signals_routed.saturating_add(1);
+        self.telemetry.events_published = self.telemetry.events_published.saturating_add(1);
+        Ok(BridgeRouteResult {
+            rule_id,
+            deduplicated: false,
+            delivered_count,
+            correlation_id: signal.correlation_id.clone(),
+        })
+    }
+
+    /// Classify and redact without publication or volatile deduplication.
+    /// Durable ingress stores this result and its source cursor in one
+    /// transaction before exposing the event to runtime subscribers.
+    pub(crate) fn prepare_signal(
+        &mut self,
+        signal: &ConnectorSignal,
+    ) -> Result<Detection, ConnectorBridgeError> {
+        // Unknown-kind rejection applies to durable and direct ingress alike.
         if self.config.reject_unknown_kinds && signal.signal_kind == ConnectorSignalKind::Custom {
             self.telemetry.signals_rejected = self.telemetry.signals_rejected.saturating_add(1);
             warn!(
@@ -630,44 +658,9 @@ impl ConnectorInboundBridge {
             IngestionDecision::Accept | IngestionDecision::AcceptRedacted => {}
         }
 
-        let detection = Self::map_to_detection(&redacted, signal, &rule_id, &decision);
-
-        // 4. Determine pane_id (default to 0 for system-level signals)
-        let pane_id = signal.pane_id.unwrap_or(0);
-
-        // 5. Publish
-        let event = Event::PatternDetected {
-            pane_id,
-            pane_uuid: None,
-            detection,
-            event_id: None,
-        };
-
-        let delivered = self.event_bus.publish(event);
-        self.telemetry.signals_routed = self.telemetry.signals_routed.saturating_add(1);
-        self.telemetry.events_published = self.telemetry.events_published.saturating_add(1);
-
-        info!(
-            rule_id = %rule_id,
-            source = %signal.source_connector,
-            kind = %signal.signal_kind,
-            pane_id = pane_id,
-            delivered = delivered,
-            correlation_id = ?signal.correlation_id,
-            ingestion_decision = %decision,
-            overall_sensitivity = %redacted.classification.overall_sensitivity,
-            fields_redacted = redacted.fields_redacted(),
-            fields_removed = redacted.fields_removed(),
-            secrets_detected = redacted.classification.secrets_detected,
-            "connector signal routed to event bus"
-        );
-
-        Ok(BridgeRouteResult {
-            rule_id,
-            deduplicated: false,
-            delivered_count: delivered,
-            correlation_id: signal.correlation_id.clone(),
-        })
+        Ok(Self::map_to_detection(
+            &redacted, signal, &rule_id, &decision,
+        ))
     }
 
     /// Resolve the rule_id, checking config overrides first.
@@ -1103,6 +1096,46 @@ mod tests {
         assert_eq!(snap.signals_received, 2);
         assert_eq!(snap.signals_routed, 1);
         assert_eq!(snap.signals_deduplicated, 1);
+    }
+
+    #[test]
+    fn rejected_signal_does_not_reserve_correlation_identity() {
+        let bus = make_bus();
+        let _subscriber = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(
+            bus,
+            ConnectorInboundBridgeConfig {
+                reject_unknown_kinds: true,
+                ..Default::default()
+            },
+        );
+        let rejected =
+            test_signal("test", ConnectorSignalKind::Custom).with_correlation_id("same-attempt");
+        assert!(bridge.route_signal(&rejected).is_err());
+        assert_eq!(bridge.dedup_cache_len(), 0);
+        let accepted =
+            test_signal("test", ConnectorSignalKind::Webhook).with_correlation_id("same-attempt");
+        let result = bridge.route_signal(&accepted).unwrap();
+        assert!(!result.deduplicated);
+        assert_eq!(result.delivered_count, 1);
+        assert!(bridge.route_signal(&accepted).unwrap().deduplicated);
+    }
+
+    #[test]
+    fn durable_signal_preparation_does_not_publish_or_deduplicate() {
+        let bus = make_bus();
+        let _subscriber = bus.subscribe_detections();
+        let mut bridge = default_bridge(bus);
+        let signal =
+            test_signal("test", ConnectorSignalKind::Poll).with_correlation_id("durable-record");
+        let first = bridge.prepare_signal(&signal).unwrap();
+        let second = bridge.prepare_signal(&signal).unwrap();
+        assert_eq!(first.rule_id, second.rule_id);
+        assert_eq!(first.extracted, second.extracted);
+        assert_eq!(bridge.telemetry_snapshot().events_published, 0);
+        assert_eq!(bridge.dedup_cache_len(), 0);
+        let published = bridge.route_signal(&signal).unwrap();
+        assert_eq!(published.delivered_count, 1);
     }
 
     #[test]
