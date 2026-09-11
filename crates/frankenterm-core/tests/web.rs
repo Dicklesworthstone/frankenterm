@@ -335,7 +335,7 @@ mod web_tests {
             .expect("owned loopback startup exceeded its deadline")
             .expect("owned loopback server must start");
             let addr = server.bound_addr();
-            let scenario = timeout(Duration::from_secs(5), async {
+            let scenario = Box::pin(timeout(Duration::from_secs(5), async {
                 // Return failures instead of panicking while the server is
                 // live: both failed and successful scenarios attempt cleanup.
                 ensure!(addr.ip().is_loopback(), "server must remain loopback-only");
@@ -439,7 +439,7 @@ mod web_tests {
                     .context("health response must be JSON")?;
                 ensure!(body["ok"] == true, "health must report success");
                 Ok::<_, anyhow::Error>((paths.len(), document.len()))
-            })
+            }))
             .await;
             let shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
             let (routes, document_bytes) = scenario
@@ -540,7 +540,7 @@ mod web_tests {
                 .expect("owned HTTP server startup deadline")
                 .expect("owned HTTP server starts");
             let addr = server.bound_addr();
-            let scenario = timeout(Duration::from_secs(5), async {
+            let scenario = Box::pin(timeout(Duration::from_secs(5), async {
                 let canary = "sk-livetest1234567890abcdefghij";
                 let mut nested = serde_json::Value::String(canary.to_owned());
                 for _ in 0..70 {
@@ -581,7 +581,7 @@ mod web_tests {
                 ensure!(event["matched_text"] == "ordinary event", "ordinary text must survive");
                 ensure!(raw.contains("[REDACTED: depth limit]"), "omitted subtree must be explicit");
                 Ok::<_, anyhow::Error>(raw.len())
-            }).await;
+            })).await;
             let http_shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
             let storage_shutdown = timeout(Duration::from_secs(5), storage.shutdown()).await;
             let response_bytes = scenario
@@ -887,7 +887,7 @@ mod web_tests {
             // Let the accept loop hand the partial request to a connection
             // task before opening the independent health request.
             sleep(Duration::from_millis(50)).await;
-            let health = timeout(Duration::from_millis(750), fetch_health(addr))
+            let health = Box::pin(timeout(Duration::from_millis(750), fetch_health(addr)))
                 .await
                 .expect("health request must not wait for the stalled connection")
                 .expect("health request should succeed");

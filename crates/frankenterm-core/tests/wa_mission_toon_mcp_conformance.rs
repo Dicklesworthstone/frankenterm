@@ -211,13 +211,13 @@ fn canonicalize(value: &mut Value) {
                     "input_schema" => {}
                     "now" | "elapsed_ms" if child.is_number() => *child = Value::from(0_u64),
                     "mission_file" if child.is_string() => {
-                        *child = Value::String("<mission_file>".to_string())
+                        *child = Value::String("<mission_file>".to_string());
                     }
                     "mission_hash" | "content_sha256" if child.is_string() => {
-                        *child = Value::String("<verified_content_hash>".to_string())
+                        *child = Value::String("<verified_content_hash>".to_string());
                     }
                     "checkpoint_id" if child.is_string() => {
-                        *child = Value::String("<verified_checkpoint_id>".to_string())
+                        *child = Value::String("<verified_checkpoint_id>".to_string());
                     }
                     _ if key.ends_with("_ms") && child.is_number() => *child = Value::from(0_i64),
                     _ => canonicalize(child),
@@ -517,7 +517,7 @@ fn assert_toon_token_can_authorize_exactly_one_mutation() {
     );
     let accepted = fs::read(&path).unwrap();
 
-    let stale = parse_tool_envelope(
+    let conflict = parse_tool_envelope(
         &harness
             .client
             .call_tool(
@@ -530,8 +530,8 @@ fn assert_toon_token_can_authorize_exactly_one_mutation() {
             .unwrap(),
         "toon",
     );
-    assert_common_envelope_fields(&stale, false, "stale large revision");
-    assert_eq!(stale["error_code"], "mission.revision_conflict");
+    assert_common_envelope_fields(&conflict, false, "stale large revision");
+    assert_eq!(conflict["error_code"], "mission.revision_conflict");
     assert_eq!(fs::read(&path).unwrap(), accepted);
 
     let mut numeric_token = paused["data"]["mutation"]["current"].clone();
