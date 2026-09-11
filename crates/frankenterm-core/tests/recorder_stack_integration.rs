@@ -226,7 +226,7 @@ fn append_log_path_admission_resolves_symlink_parents_and_leaves() {
             }
             "state_leaf" => symlink(&config.data_path, &config.state_path).unwrap(),
             "staging_leaf" => {
-                symlink(&config.data_path, config.state_path.with_extension("tmp")).unwrap()
+                symlink(&config.data_path, config.state_path.with_extension("tmp")).unwrap();
             }
             _ => unreachable!(),
         }
