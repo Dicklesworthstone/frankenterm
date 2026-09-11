@@ -407,7 +407,7 @@ mod deferred_scrollback {
         newest_exclusive: Option<StableRowIndex>,
     }
 
-    pub(super) struct DeferredScrollbackSpillSink {
+    pub struct DeferredScrollbackSpillSink {
         backing: Arc<dyn ScrollbackSpillSink>,
         operation: Mutex<()>,
         state: Mutex<State>,
@@ -8673,9 +8673,11 @@ mod tests {
                 false,
             )
             .unwrap();
-            let corpus: String = (0..270)
-                .map(|row| format!("row-{row:03} e\u{301} 日本語\r\n"))
-                .collect();
+            let mut corpus = String::new();
+            for row in 0..270 {
+                use std::fmt::Write as _;
+                write!(corpus, "row-{row:03} e\u{301} 日本語\r\n").unwrap();
+            }
             let mut actions = Vec::new();
             termwiz::escape::parser::Parser::new()
                 .parse(corpus.as_bytes(), |action| actions.push(action));
@@ -8758,10 +8760,12 @@ mod tests {
         let pane = deferred_test_pane(deferred.clone());
         std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
         let mut actions = Vec::new();
-        termwiz::escape::parser::Parser::new()
-            .parse(b"retained\r\n".repeat(20).as_slice(), |action| {
-                actions.push(action)
-            });
+        termwiz::escape::parser::Parser::new().parse(
+            b"retained\r\n".repeat(20).as_slice(),
+            |action| {
+                actions.push(action);
+            },
+        );
         let writing = Arc::clone(&pane);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let writer = std::thread::spawn(move || {
@@ -8773,7 +8777,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let retained = deferred.load_scrollback_line(0);
-        let waiting = done_rx
+        let parser_blocked = done_rx
             .recv_timeout(std::time::Duration::from_millis(200))
             .is_err();
         let _dimensions = pane.get_dimensions();
@@ -8782,7 +8786,7 @@ mod tests {
         writer.join().unwrap();
         assert!(retained.is_some());
         assert!(
-            waiting,
+            parser_blocked,
             "a failed flush must not admit another parser batch"
         );
         stopped.unwrap();

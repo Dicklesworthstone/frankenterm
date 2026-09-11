@@ -3453,7 +3453,7 @@ impl WeztermClient {
             Some("RenderApplicationResultV1" | "RenderApplicationResult") => {
                 MuxOperation::ReportRenderApplicationResult
             }
-            Some("GetLines") => MuxOperation::ReadPaneText,
+            Some("GetLines" | "GetLinesAtLayout") => MuxOperation::ReadPaneText,
             Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
             Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1" | "ReliablePaneWriteV1") => {
@@ -7713,6 +7713,17 @@ mod tests {
                 <codec::ReliableKeyEventTracedV1 as codec::PduWireIdent>::IDENT,
             ),
             MuxOperation::KeyInput,
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn layout_bound_line_reads_retain_text_operation_identity() {
+        assert_eq!(
+            WeztermClient::mux_operation_from_request_ident(
+                <codec::GetLinesAtLayout as codec::PduWireIdent>::IDENT,
+            ),
+            MuxOperation::ReadPaneText,
         );
     }
 
