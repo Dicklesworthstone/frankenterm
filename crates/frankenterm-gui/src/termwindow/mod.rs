@@ -6890,7 +6890,7 @@ impl TermWindow {
                 let had_selection = self.selection(pane.pane_id()).range.is_some();
                 if had_selection && !self.selection_authority_is_current(pane) {
                     self.clear_selection(pane);
-                    return Ok(());
+                    return Ok(PerformAssignmentResult::Handled);
                 }
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
