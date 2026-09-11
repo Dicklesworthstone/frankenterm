@@ -422,6 +422,9 @@ fn selected_lines_from_logical_lines(
         let mut span = line.columns_as_line(cols);
         let seqno = span.current_seqno();
         if !continues {
+            // This is a selected endpoint, even if the source row wraps.
+            // WRAPPED alone must not make an otherwise blank tail significant.
+            span.set_last_cell_was_wrapped(false, seqno);
             span.prune_trailing_blanks(seqno);
         }
         if join_previous {

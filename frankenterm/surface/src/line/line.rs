@@ -1243,6 +1243,12 @@ impl Line {
                 break;
             }
             cells.push(c.as_cell());
+            // VecStorage uses physical columns, including the placeholders
+            // hidden by wide graphemes. Omitting them hides the next glyph
+            // when visible_cells walks the newly constructed line.
+            for _ in 1..c.width() {
+                cells.push(Cell::new(' ', c.attrs().clone()));
+            }
         }
         Self {
             bits: LineBits::NONE,
@@ -3066,6 +3072,28 @@ mod tests {
         let line: Line = "abcdef".into();
         let sub = line.columns_as_line(1..4);
         assert_eq!(sub.as_str().as_ref(), "bcd");
+    }
+
+    #[test]
+    fn line_columns_as_line_preserves_wide_and_combining_cells() {
+        for vector_storage in [false, true] {
+            let mut line = Line::new(SEQ_ZERO);
+            line.append_line("A界e\u{301}💀Z".into(), SEQ_ZERO);
+            if vector_storage {
+                line.coerce_vec_storage();
+            }
+            assert_eq!(matches!(line.cells, CellStorage::V(_)), vector_storage);
+            let whole = line.columns_as_line(0..line.len());
+            assert_eq!(whole.as_str(), "A界e\u{301}💀Z");
+            assert_eq!(whole.len(), line.len());
+            let middle = line.columns_as_line(1..4);
+            assert_eq!(middle.as_str(), "界e\u{301}");
+            assert_eq!(middle.len(), 3);
+            // Match columns_as_str: select a whole grapheme by its leading
+            // column, never emit a partial wide glyph or its placeholder.
+            assert_eq!(line.columns_as_line(1..2).as_str(), "界");
+            assert_eq!(line.columns_as_line(2..4).as_str(), "e\u{301}");
+        }
     }
 
     #[test]

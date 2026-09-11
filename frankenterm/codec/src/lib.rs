@@ -23811,7 +23811,7 @@ mod test {
         let request = GetLinesAtLayout {
             pane_id: 7,
             layout,
-            lines: vec![-20..4],
+            lines: std::iter::once(-20..4).collect(),
         };
         let pdu = Pdu::GetLinesAtLayout(request.clone());
         for mode in [CompressionMode::Never, CompressionMode::Always] {
@@ -23820,9 +23820,9 @@ mod test {
         }
         assert_eq!(pdu.minimum_codec_version(), Some(65));
         let mut invalid = request.clone();
-        invalid.lines = vec![StableRowIndex::MIN..StableRowIndex::MAX];
+        invalid.lines = std::iter::once(StableRowIndex::MIN..StableRowIndex::MAX).collect();
         assert!(invalid.validate().is_err());
-        invalid.lines = vec![4..3];
+        invalid.lines = std::iter::once(std::ops::Range { start: 4, end: 3 }).collect();
         assert!(invalid.validate().is_err());
         let response = Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse {
             pane_id: 7,
