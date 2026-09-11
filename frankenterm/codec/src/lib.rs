@@ -16,7 +16,7 @@
 // so mixed graphs must keep the canonical runtime's I/O traits. A smol-only
 // consumer still receives the legacy smol API.
 
-use anyhow::{anyhow, bail, Context as _, Error};
+use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::RecorderContractError;
 pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -3455,6 +3455,18 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (GetLinesAtLayout, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: 512 * 1024,
+            max_zstd_encoded_bytes: 1024 * 1024,
+        }
+    };
+    (GetLinesAtLayoutResponse, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: 32 * 1024 * 1024,
+            max_zstd_encoded_bytes: 64 * 1024 * 1024,
+        }
+    };
     (ErrorResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES,
@@ -4270,7 +4282,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 64;
+pub const CODEC_VERSION: usize = 65;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4828,6 +4840,12 @@ pdu! {
     ReliablePaneWriteV1Response: 101, 64, server_reply, none,
         interactive_input, interactive_input, interactive
         => deserialize_reliable_pane_write_v1_response;
+    GetLinesAtLayout: 102, 65, client_request, none,
+        query, query, normal
+        => deserialize_get_lines_at_layout;
+    GetLinesAtLayoutResponse: 103, 65, server_reply, none,
+        bulk_data, bulk_data, bulk
+        => deserialize_get_lines_at_layout_response;
 }
 
 impl Pdu {
@@ -4851,6 +4869,8 @@ impl Pdu {
             Self::ReliableKeyEventTracedV1(value) => value.validate()?,
             Self::ReliablePaneWriteV1(value) => value.validate()?,
             Self::ReliablePaneWriteV1Response(value) => value.validate()?,
+            Self::GetLinesAtLayout(value) => value.validate()?,
+            Self::GetLinesAtLayoutResponse(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -6322,6 +6342,8 @@ impl Pdu {
                 ..
             }) => pane_id.try_into_mux().ok(),
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
+            | Pdu::GetLinesAtLayout(GetLinesAtLayout { pane_id, .. })
+            | Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse { pane_id, .. })
             | Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse { pane_id, .. })
             | Pdu::RenderApplicationUpdate(RenderApplicationUpdate {
                 identity: RenderApplicationIdentity { pane_id, .. },
@@ -15341,6 +15363,91 @@ pub struct GetLines {
     pub lines: Vec<Range<StableRowIndex>>,
 }
 
+pub const GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION: usize = 65;
+
+/// The render state the caller used to interpret stable row coordinates.
+/// Checking it again after asynchronous hydration prevents a reply from an
+/// older layout being promoted to the caller's current line sequence number.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct LineReadLayout {
+    pub seqno: SequenceNo,
+    pub dimensions: RenderableDimensions,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct GetLinesAtLayout {
+    pub pane_id: PaneId,
+    pub layout: LineReadLayout,
+    pub lines: Vec<Range<StableRowIndex>>,
+}
+
+impl GetLinesAtLayout {
+    pub fn validate(&self) -> Result<(), Error> {
+        ensure!(
+            self.lines.len() <= MAX_RENDER_APPLICATION_LINES,
+            "line range limit"
+        );
+        let mut total = 0usize;
+        for range in &self.lines {
+            let count = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(|| anyhow!("invalid line range"))?;
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("line range overflow"))?;
+            ensure!(total <= MAX_RENDER_APPLICATION_LINES, "line row limit");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct GetLinesAtLayoutResponse {
+    pub pane_id: PaneId,
+    pub layout: LineReadLayout,
+    pub lines: SerializedLines,
+}
+
+impl GetLinesAtLayoutResponse {
+    pub fn validate(&self) -> Result<(), Error> {
+        let counts = self.lines.validate_structure()?;
+        ensure!(
+            counts.lines <= MAX_RENDER_APPLICATION_LINES
+                && counts.cells <= MAX_RENDER_APPLICATION_CELLS
+                && counts.hyperlink_spans <= MAX_RENDER_APPLICATION_HYPERLINK_SPANS
+                && counts.images <= MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+            "line reply structure limit"
+        );
+        Ok(())
+    }
+}
+
+fn deserialize_get_lines_at_layout(
+    data: &[u8],
+    compressed: bool,
+) -> Result<GetLinesAtLayout, Error> {
+    let request: GetLinesAtLayout =
+        deserialize_exact_payload_with_limit(data, compressed, "GetLinesAtLayout", 512 * 1024)?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_get_lines_at_layout_response(
+    data: &[u8],
+    compressed: bool,
+) -> Result<GetLinesAtLayoutResponse, Error> {
+    let response: GetLinesAtLayoutResponse = deserialize_exact_payload_with_limit(
+        data,
+        compressed,
+        "GetLinesAtLayoutResponse",
+        32 * 1024 * 1024,
+    )?;
+    response.validate()?;
+    Ok(response)
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 struct CellCoordinates {
     line_idx: usize,
@@ -21835,8 +21942,8 @@ mod test {
     }
 
     #[test]
-    fn codec_v64_additive_reliable_pane_write_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 64);
+    fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
+        assert_eq!(CODEC_VERSION, 65);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -23689,7 +23796,48 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 64);
+        assert_eq!(CODEC_VERSION, 65);
+    }
+
+    #[test]
+    fn line_layout_wire_round_trip_and_admission_are_exact() {
+        let layout = LineReadLayout {
+            seqno: 9,
+            dimensions: RenderableDimensions {
+                cols: 80,
+                ..Default::default()
+            },
+        };
+        let request = GetLinesAtLayout {
+            pane_id: 7,
+            layout,
+            lines: vec![-20..4],
+        };
+        let pdu = Pdu::GetLinesAtLayout(request.clone());
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = pdu.encode_frame_with_mode(1, mode).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, pdu);
+        }
+        assert_eq!(pdu.minimum_codec_version(), Some(65));
+        let mut invalid = request.clone();
+        invalid.lines = vec![StableRowIndex::MIN..StableRowIndex::MAX];
+        assert!(invalid.validate().is_err());
+        invalid.lines = vec![4..3];
+        assert!(invalid.validate().is_err());
+        let response = Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse {
+            pane_id: 7,
+            layout,
+            lines: vec![(-20, Line::with_width(80, 9))].into(),
+        });
+        let frame = response
+            .encode_frame_with_mode(2, CompressionMode::Never)
+            .unwrap();
+        assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, response);
+        let mut trailing = serialize_with_mode(&request, CompressionMode::Never)
+            .unwrap()
+            .0;
+        trailing.push(0);
+        assert!(deserialize_get_lines_at_layout(&trailing, false).is_err());
     }
 
     #[test]
@@ -23978,7 +24126,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=101 {
+        for ident in 0..=103 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -23992,9 +24140,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(102).is_none());
+        assert!(Pdu::wire_spec_for_ident(104).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 102 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 104 - GAPS.len());
     }
 
     #[test]
@@ -24034,6 +24182,7 @@ mod test {
                 98 => 62,
                 99 => 63,
                 100..=101 => 64,
+                102..=103 => 65,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -24068,11 +24217,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101,
+            97, 101, 103,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -24171,8 +24320,8 @@ mod test {
                     Class::StateSync
                 }
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Class::Render,
-                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 => Class::Query,
-                23 | 32 | 42 | 47 | 78 | 94 => Class::BulkData,
+                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 => Class::Query,
+                23 | 32 | 42 | 47 | 78 | 94 | 103 => Class::BulkData,
                 ident => panic!("PDU {} is missing from the semantic-class census", ident),
             };
             let expected_cap = match spec.ident {
@@ -24183,8 +24332,12 @@ mod test {
                 }
                 37 | 39 | 44 | 53..=55 | 83 | 90 => Cap::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
-                3 | 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 75 | 77 | 81 | 86 | 93 => Cap::Query,
-                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 => Cap::BulkData,
+                3 | 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 75 | 77 | 81 | 86 | 93 | 102 => {
+                    Cap::Query
+                }
+                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 => {
+                    Cap::BulkData
+                }
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
             };
             let expected_qos = match spec.ident {
@@ -24220,8 +24373,9 @@ mod test {
                 | 77
                 | 79..=81
                 | 83..=86
-                | 90..=93 => Qos::Normal,
-                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 => Qos::Bulk,
+                | 90..=93
+                | 102 => Qos::Normal,
+                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
 
@@ -25166,9 +25320,9 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_keeps_v61_floor_after_additive_v64() {
+    fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 64);
+        assert_eq!(CODEC_VERSION, 65);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -25947,7 +26101,7 @@ mod test {
     fn async_selector_truncated_discard_fails_closed() {
         runtime::block_on(async {
             let mut wire = Vec::new();
-            encode_raw(102, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
+            encode_raw(104, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
             wire.pop().expect("encoded frame has a payload byte");
             let mut reader = runtime::Cursor::new(wire);
 
@@ -25995,21 +26149,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xE6, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xE8, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 102 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 104 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xE6, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xE8, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 102 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 104 });
         });
     }
 
