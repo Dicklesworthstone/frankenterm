@@ -4869,6 +4869,143 @@ mod tests {
     }
 
     #[test]
+    fn cold_seam_checkpoint_replays_and_activates_the_canonical_replacement() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let before = TerminalCheckpointV2::capture_with_limits(&live, limits).unwrap();
+        let oldest = sink.oldest_scrollback_row().unwrap();
+        let frontier = live.screen().phys_to_stable_row_index(0);
+        let stored_before: Vec<_> = (oldest..frontier)
+            .map(|row| sink.load_scrollback_line(row).unwrap())
+            .collect();
+        let mut prepared = live
+            .screen()
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("fixture must exercise a real cold/resident seam")
+            .hydrate(|| false)
+            .unwrap();
+        assert!(prepared.is_ready());
+        live.increment_seqno();
+        let seqno = live.current_seqno();
+        assert!(live
+            .screen_mut()
+            .install_cold_seam_reflow(&mut prepared, seqno));
+        let captured = TerminalCheckpointV2::capture_with_limits(&live, limits).unwrap();
+        let text = |screen: &CheckpointScreen| {
+            screen
+                .lines
+                .iter()
+                .map(|line| line.clone().into_live().unwrap().as_str().into_owned())
+                .collect::<String>()
+        };
+        assert_eq!(text(&before.primary_screen), text(&captured.primary_screen));
+        assert_ne!(before.primary_screen.lines, captured.primary_screen.lines);
+        assert_eq!(
+            before.primary_screen.cold_snapshot_generation,
+            captured.primary_screen.cold_snapshot_generation,
+            "canonical overlay retains the original storage CAS authority"
+        );
+        assert_eq!(
+            (oldest..frontier)
+                .map(|row| sink.load_scrollback_line(row).unwrap())
+                .collect::<Vec<_>>(),
+            stored_before,
+            "live seam installation must not rewrite immutable storage"
+        );
+        let canonical = captured.to_canonical_json(limits).unwrap();
+        let mut inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        assert_eq!(
+            inert
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            canonical
+        );
+        inert.replay_bytes(b"tail").unwrap();
+        let replayed = inert.checkpoint().unwrap();
+        let activated = inert.into_live(Box::new(std::io::sink())).unwrap();
+        let after = TerminalCheckpointV2::capture_with_limits(&activated, limits).unwrap();
+        assert_eq!(after.primary_screen.lines, replayed.primary_screen.lines);
+        assert_eq!(after.cursor, replayed.cursor);
+        assert_eq!(after.wrap_next, replayed.wrap_next);
+        let original_generation = captured.primary_screen.cold_snapshot_generation.unwrap();
+        let committed_generation = after.primary_screen.cold_snapshot_generation.unwrap();
+        assert_eq!(
+            committed_generation.content_epoch,
+            original_generation.content_epoch
+        );
+        assert_eq!(
+            committed_generation.revision,
+            original_generation.revision + 1
+        );
+    }
+
+    #[test]
+    fn cold_seam_checkpoint_rejects_replaced_source_and_preserves_retryable_text() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let mut prepared = live
+            .screen()
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("fixture must exercise a real cold/resident seam")
+            .hydrate(|| false)
+            .unwrap();
+        assert!(prepared.is_ready());
+        live.increment_seqno();
+        let seqno = live.current_seqno();
+        assert!(live
+            .screen_mut()
+            .install_cold_seam_reflow(&mut prepared, seqno));
+        let canonical = TerminalCheckpointV2::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        let oldest = sink.oldest_scrollback_row().unwrap();
+        let original = sink.load_scrollback_line(oldest).unwrap();
+        assert!(sink.store_scrollback_line(oldest, &original, 32));
+        assert!(TerminalCheckpointV2::capture_with_limits(&live, limits).is_err());
+        let failure = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(_) => panic!("stale cold generation cannot activate replacement text"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.error(),
+            &crate::InertTerminalError::ScrollbackActivation(
+                crate::config::ScrollbackActivationError::Spill(
+                    crate::config::ScrollbackSpillError::SnapshotGenerationMismatch,
+                ),
+            )
+        );
+        let (_, recovered) = failure.into_parts();
+        assert_eq!(
+            recovered
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap(),
+            canonical,
+            "failed activation retains the complete canonical model"
+        );
+        assert_eq!(sink.load_scrollback_line(oldest).unwrap(), original);
+    }
+
+    #[test]
     fn canonical_restore_roundtrips_complete_semantic_projection() {
         let config: Arc<dyn TerminalConfiguration + Send + Sync> =
             Arc::new(RichCheckpointTestConfig);

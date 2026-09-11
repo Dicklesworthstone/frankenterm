@@ -1743,6 +1743,9 @@ impl Line {
     /// Return true if the last cell in the line has the wrapped attribute,
     /// indicating that the following line is logically a part of this one.
     pub fn last_cell_was_wrapped(&self) -> bool {
+        if let CellStorage::C(line) = &self.cells {
+            return line.last_cell_was_wrapped();
+        }
         self.visible_cells()
             .last()
             .map(|c| c.attrs().wrapped())
@@ -2654,6 +2657,22 @@ mod tests {
         snapshot.set_last_cell_was_wrapped(true, 2);
         assert!(!line.last_cell_was_wrapped());
         assert!(snapshot.last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn clustered_tail_wrap_matches_visible_cells_without_scanning_text() {
+        for text in ["", "plain", "ab界", "e\u{301}🦀", &"x".repeat(131_072)] {
+            let mut line = Line::from_text(text, &CellAttributes::blank(), 1, None);
+            line.compress_for_scrollback();
+            for wrapped in [false, true, false] {
+                line.set_last_cell_was_wrapped(wrapped, 2);
+                let expected = line
+                    .visible_cells()
+                    .last()
+                    .is_some_and(|cell| cell.attrs().wrapped());
+                assert_eq!(line.last_cell_was_wrapped(), expected);
+            }
+        }
     }
 
     #[test]

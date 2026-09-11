@@ -5,3 +5,9 @@ RUST_MIN_STACK = "16777216"
 
 [build]
 rustflags = ["-Z", "threads=4"]
+
+# RCH and DSR preserve source timestamps while reusing compilation directories.
+# A different snapshot can therefore contain changed files older than cached
+# artifacts. Compare source content so those artifacts cannot pass as current.
+[unstable]
+checksum-freshness = true

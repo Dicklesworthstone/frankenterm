@@ -549,6 +549,16 @@ impl ClusteredLine {
         self.last_cell_width
     }
 
+    pub fn last_cell_was_wrapped(&self) -> bool {
+        // Canonical clusters cover the text in order, so the final run owns
+        // the final visible cell's attributes. No grapheme scan is necessary.
+        !self.text.is_empty()
+            && self
+                .clusters
+                .last()
+                .is_some_and(|cluster| cluster.attrs.wrapped())
+    }
+
     pub fn set_last_cell_was_wrapped(&mut self, wrapped: bool) {
         if let Some(width) = self.compute_last_cell_width() {
             let width = width.get() as u16;

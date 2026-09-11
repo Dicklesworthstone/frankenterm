@@ -1139,6 +1139,20 @@ mod test {
     use std::borrow::Cow;
     use termwiz::surface::SEQ_ZERO;
 
+    fn acquire_line_read_test_permit() -> LineReadPermit {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(permit) = LineReadPermit::try_acquire() {
+                return permit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "line read test admission timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn line_read_worker_abandonment_and_start_failure_do_not_capture_rows() {
         struct CompletionDrop(std::sync::mpsc::Sender<std::thread::ThreadId>);
@@ -1150,13 +1164,14 @@ mod test {
         let caller = std::thread::current().id();
         let (sender, receiver) = std::sync::mpsc::channel();
         let guard = CompletionDrop(sender);
-        let worker = LineReadPermit::try_acquire()
-            .unwrap()
+        let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion_invoked = Arc::clone(&invoked);
+        let worker = acquire_line_read_test_permit()
             .start(
                 Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 move |_, _| {
+                    completion_invoked.store(true, std::sync::atomic::Ordering::Release);
                     drop(guard);
-                    panic!("abandoned worker must not invoke completion");
                 },
             )
             .unwrap();
@@ -1167,10 +1182,11 @@ mod test {
                 .unwrap(),
             caller
         );
+        assert!(!invoked.load(std::sync::atomic::Ordering::Acquire));
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let guard = CompletionDrop(sender);
-        let failed = LineReadPermit::try_acquire().unwrap().start_with_spawn(
+        let failed = acquire_line_read_test_permit().start_with_spawn(
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             move |_, _| {
                 drop(guard);
@@ -1199,8 +1215,7 @@ mod test {
     fn line_read_worker_cancellation_rejects_even_empty_submission_off_caller() {
         let caller = std::thread::current().id();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let worker = LineReadPermit::try_acquire()
-            .unwrap()
+        let worker = acquire_line_read_test_permit()
             .start(
                 Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 move |result, permit| {

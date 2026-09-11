@@ -13,6 +13,8 @@ use frankenterm_surface::line::{
 };
 use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
+#[cfg(feature = "use_serde")]
+use std::collections::BTreeMap;
 use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
@@ -88,6 +90,7 @@ pub struct LineReadFailureWitness {
     )>,
     index_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
     attempted_index: bool,
+    fragments: Option<Arc<ColdRowFragments>>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -104,6 +107,7 @@ impl LineReadFailureWitness {
         }
         if !screen.matches_coordinate_witness(&self.screen)
             || screen.cold_visual_seqno != self.layout_seqno
+            || !screen.same_cold_fragments(&self.fragments)
         {
             return false;
         }
@@ -162,6 +166,7 @@ pub struct ScreenLineRead {
     logical_view: Option<(StableRowIndex, Vec<Line>)>,
     index_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
     attempted_index: bool,
+    fragments: Option<Arc<ColdRowFragments>>,
 }
 
 /// Visual coordinates never replace authenticated backing-store row keys.
@@ -180,6 +185,262 @@ struct ColdVisualLayout {
 }
 
 #[cfg(feature = "use_serde")]
+#[derive(Debug, Clone)]
+struct ColdRowFragments {
+    sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+    interval: crate::config::ScrollbackInterval,
+    rows: BTreeMap<StableRowIndex, Line>,
+    aligned_frontier: StableRowIndex,
+    aligned_source_start: StableRowIndex,
+    cols: usize,
+    dpi: u32,
+    policy: ResizeWrapPolicy,
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdRowFragments {
+    fn alignment_retained(&self, interval: &crate::config::ScrollbackInterval) -> bool {
+        interval.rows().is_some_and(|rows| {
+            rows.start <= self.aligned_source_start && rows.end >= self.aligned_frontier
+        })
+    }
+    fn aligned_at(
+        &self,
+        frontier: StableRowIndex,
+        cols: usize,
+        dpi: u32,
+        policy: ResizeWrapPolicy,
+    ) -> bool {
+        self.aligned_frontier == frontier
+            && self.cols == cols
+            && self.dpi == dpi
+            && self.policy == policy
+    }
+}
+
+/// Off-lock preparation for a complete logical group crossing the cold/hot
+/// frontier. Stored keys and the resident row count never change. Displaced
+/// allocations remain in this owner until its worker retires it.
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+pub struct ColdSeamReflow {
+    witness: ScreenCoordinateWitness,
+    sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+    interval: crate::config::ScrollbackInterval,
+    frontier: StableRowIndex,
+    resident: Vec<Line>,
+    previous: Option<Arc<ColdRowFragments>>,
+    policy: ResizeWrapPolicy,
+    replacement: Option<(Arc<ColdRowFragments>, Vec<Line>)>,
+    source: Option<Range<StableRowIndex>>,
+    retired_layout: Option<Arc<ColdVisualLayout>>,
+}
+
+#[cfg(feature = "use_serde")]
+struct ColdReadCharge {
+    used: usize,
+    limit: usize,
+    index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[cfg(feature = "use_serde")]
+impl std::io::Write for ColdReadCharge {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.used = self
+            .used
+            .checked_add(bytes.len())
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| {
+                if let Some(failed) = &self.index_failure {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                std::io::Error::other("cold read payload limit")
+            })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "use_serde")]
+fn cold_row_with_fragment(
+    fragments: Option<&ColdRowFragments>,
+    row: StableRowIndex,
+    original: Line,
+) -> Line {
+    fragments
+        .and_then(|fragments| fragments.rows.get(&row))
+        .cloned()
+        .unwrap_or(original)
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdSeamReflow {
+    pub fn is_ready(&self) -> bool {
+        self.replacement.is_some()
+    }
+
+    pub fn hydrate(mut self, cancelled: impl Fn() -> bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.replacement.is_none(), "cold seam already prepared");
+        let retained = self
+            .interval
+            .rows()
+            .ok_or_else(|| anyhow::anyhow!("cold seam unavailable"))?;
+        let mut charge = ColdReadCharge {
+            used: 0,
+            limit: ScreenLineRead::MAX_PAYLOAD_BYTES,
+            index_failure: None,
+        };
+        let mut rows = VecDeque::new();
+        let mut first = self.frontier;
+        while first > retained.start {
+            anyhow::ensure!(!cancelled(), "cold seam cancelled");
+            anyhow::ensure!(
+                rows.len() + self.resident.len() < ScreenLineRead::MAX_ROWS,
+                "cold seam row limit"
+            );
+            let key = first - 1;
+            let mut batch = self.sink.load_scrollback_lines(key..first);
+            anyhow::ensure!(batch.len() == 1, "cold seam source unavailable");
+            let original = batch
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("cold seam source unavailable"))?;
+            serde_json::to_writer(&mut charge, &original)?;
+            let line = cold_row_with_fragment(self.previous.as_deref(), key, original);
+            serde_json::to_writer(&mut charge, &line)?;
+            if !line.last_cell_was_wrapped() {
+                if rows.is_empty() {
+                    return Ok(self);
+                }
+                break;
+            }
+            rows.push_front(line);
+            first = key;
+        }
+        if rows.is_empty() {
+            return Ok(self);
+        }
+        let mut logical: Option<Line> = None;
+        let mut cells = 0usize;
+        for source in rows.iter().chain(&self.resident) {
+            anyhow::ensure!(!cancelled(), "cold seam cancelled");
+            anyhow::ensure!(
+                !source.has_image_attachments(),
+                "cold seam mutable image source"
+            );
+            cells = cells
+                .checked_add(source.len())
+                .ok_or_else(|| anyhow::anyhow!("cold seam cell overflow"))?;
+            anyhow::ensure!(
+                cells <= ScreenLineRead::MAX_PAYLOAD_BYTES / std::mem::size_of::<Cell>(),
+                "cold seam cell limit"
+            );
+            serde_json::to_writer(&mut charge, source)?;
+            let mut line = source.clone();
+            let seqno = line.current_seqno();
+            line.set_last_cell_was_wrapped(false, seqno);
+            if let Some(logical) = &mut logical {
+                logical.append_line(line, logical.current_seqno().max(seqno));
+            } else {
+                logical = Some(line);
+            }
+        }
+        let logical = logical.ok_or_else(|| anyhow::anyhow!("cold seam empty context"))?;
+        let seqno = logical.current_seqno();
+        let (mut wrapped, _) = Screen::wrap_single_logical_line_for_resize(
+            logical,
+            self.witness.cols,
+            seqno,
+            self.policy,
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        anyhow::ensure!(
+            wrapped.len() >= self.resident.len() && wrapped.len() <= ScreenLineRead::MAX_ROWS,
+            "cold seam resident geometry unavailable"
+        );
+        for line in &mut wrapped {
+            let _ = line.cells_mut_for_attr_changes_only();
+            serde_json::to_writer(&mut charge, line)?;
+        }
+        let replacement_resident = wrapped.split_off(wrapped.len() - self.resident.len());
+        let mut prefix = wrapped.first().cloned().unwrap_or_else(|| Line::new(seqno));
+        prefix.set_last_cell_was_wrapped(false, seqno);
+        for line in wrapped.iter().skip(1) {
+            let mut line = line.clone();
+            line.set_last_cell_was_wrapped(false, seqno);
+            prefix.append_line(line, seqno);
+        }
+        // A cold-only consumer must reproduce exactly these prefix rows. A
+        // paragraph-global policy can choose different breaks without the
+        // resident suffix; refuse that transaction rather than publish two
+        // geometries. Empty prefixes deliberately occupy zero visual rows.
+        if !wrapped.is_empty() {
+            let (mut independent, _) = Screen::wrap_single_logical_line_for_resize(
+                prefix.clone(),
+                self.witness.cols,
+                seqno,
+                self.policy,
+                &mut LineWrapWidthPrefixScratch::default(),
+            );
+            if let Some(last) = independent.last_mut() {
+                last.set_last_cell_was_wrapped(true, seqno);
+            }
+            anyhow::ensure!(
+                independent == wrapped,
+                "cold seam prefix requires full paragraph geometry"
+            );
+        }
+        let mut replacements = BTreeMap::new();
+        if let Some(previous) = &self.previous {
+            for (key, line) in previous.rows.range(retained.clone()) {
+                anyhow::ensure!(!cancelled(), "cold seam cancelled");
+                serde_json::to_writer(&mut charge, line)?;
+                replacements.insert(*key, line.clone());
+            }
+        }
+        for (index, original) in rows.iter().enumerate() {
+            let take = if index + 1 == rows.len() {
+                prefix.len()
+            } else {
+                original.len().min(prefix.len())
+            };
+            // Empty Lines cannot retain WRAPPED without fabricating a space.
+            anyhow::ensure!(
+                take > 0,
+                "cold seam requires zero-cell continuation support"
+            );
+            let remainder = prefix.split_off(take, seqno);
+            prefix.set_last_cell_was_wrapped(true, seqno);
+            let _ = prefix.cells_mut_for_attr_changes_only();
+            serde_json::to_writer(&mut charge, &prefix)?;
+            replacements.insert(first + index as StableRowIndex, prefix);
+            prefix = remainder;
+        }
+        anyhow::ensure!(
+            replacements.len() <= ScreenLineRead::MAX_ROWS,
+            "cold seam fragment row limit"
+        );
+        anyhow::ensure!(!cancelled(), "cold seam cancelled");
+        self.source = Some(first..self.frontier);
+        self.replacement = Some((
+            Arc::new(ColdRowFragments {
+                sink: Arc::clone(&self.sink),
+                interval: self.interval.clone(),
+                rows: replacements,
+                aligned_frontier: self.frontier,
+                aligned_source_start: first,
+                cols: self.witness.cols,
+                dpi: self.witness.dpi,
+                policy: self.policy,
+            }),
+            replacement_resident,
+        ));
+        Ok(self)
+    }
+}
+
+#[cfg(feature = "use_serde")]
 impl ScreenLineRead {
     pub const MAX_ROWS: usize = 16_384;
     pub const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
@@ -194,6 +455,7 @@ impl ScreenLineRead {
             cold: self.cold.clone(),
             index_budget_exhausted: Arc::clone(&self.index_budget_exhausted),
             attempted_index: self.attempted_index,
+            fragments: self.fragments.clone(),
         }
     }
     pub fn row_count(&self) -> usize {
@@ -225,6 +487,30 @@ impl ScreenLineRead {
         ))
     }
 
+    /// Clone a cached viewport only after every row is structurally admitted.
+    /// The caller already holds the publication/source fence. No temporary
+    /// reference vector or partially cloned prefix is allocated on refusal.
+    pub fn try_clone_viewport_for_snapshot(
+        &self,
+        requested: Range<StableRowIndex>,
+        bytes_left: &mut usize,
+        work_left: &mut usize,
+    ) -> Option<(StableRowIndex, Vec<Line>)> {
+        let (first, head, tail) = if let Some((first, lines)) = self.cached_lines(requested) {
+            (first, lines, &[][..])
+        } else if let Some(lines) = self.rendered.as_ref() {
+            (self.first, lines.as_slice(), &[][..])
+        } else {
+            (
+                self.first,
+                self.hydrated.as_slice(),
+                self.resident.as_slice(),
+            )
+        };
+        Line::try_clone_batch_for_snapshot(head, tail, bytes_left, work_left)
+            .map(|rows| (first, rows))
+    }
+
     /// Run only off the UI thread and outside terminal/registration locks.
     /// The bounded writer counts full serialized attributes and image payloads,
     /// not just row pointers. Shared source allocations are not new allocations
@@ -240,39 +526,31 @@ impl ScreenLineRead {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!self.complete, "line read already hydrated");
         anyhow::ensure!(limit <= Self::MAX_PAYLOAD_BYTES, "line read payload limit");
-        struct Charge {
-            used: usize,
-            limit: usize,
-            index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
-        }
-        impl std::io::Write for Charge {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.used = self
-                    .used
-                    .checked_add(bytes.len())
-                    .filter(|n| *n <= self.limit)
-                    .ok_or_else(|| {
-                        if let Some(failed) = &self.index_failure {
-                            failed.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        std::io::Error::other("cold read payload limit")
-                    })?;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut charge = Charge {
+        let mut charge = ColdReadCharge {
             used: 0,
             limit,
             index_failure: None,
         };
+        let fragment_alignment_retained = self.fragments.as_ref().is_some_and(|fragments| {
+            self.cold
+                .as_ref()
+                .is_some_and(|(_, interval)| fragments.alignment_retained(interval))
+        });
+        let aligned_seam = fragment_alignment_retained
+            && self.fragments.as_ref().is_some_and(|fragments| {
+                fragments.aligned_at(
+                    self.hot_top,
+                    self.witness.cols,
+                    self.witness.dpi,
+                    self.wrap_policy,
+                )
+            });
         fn context_batch(
             sink: &dyn crate::config::ScrollbackSpillSink,
             mut range: Range<StableRowIndex>,
-            charge: &mut Charge,
+            charge: &mut ColdReadCharge,
             cancelled: &impl Fn() -> bool,
+            fragments: Option<&ColdRowFragments>,
         ) -> anyhow::Result<Vec<Line>> {
             let mut result = Vec::new();
             while range.start < range.end {
@@ -284,6 +562,10 @@ impl ScreenLineRead {
                 );
                 for line in batch {
                     serde_json::to_writer(&mut *charge, &line)?;
+                    let line = cold_row_with_fragment(fragments, range.start, line);
+                    if fragments.is_some() {
+                        serde_json::to_writer(&mut *charge, &line)?;
+                    }
                     result.push(line);
                     range.start += 1;
                 }
@@ -316,6 +598,7 @@ impl ScreenLineRead {
                         source_row..source.end.min(source_row.saturating_add(32)),
                         &mut charge,
                         &cancelled,
+                        self.fragments.as_deref(),
                     )?;
                     for mut line in batch {
                         let seqno = line.current_seqno();
@@ -339,12 +622,20 @@ impl ScreenLineRead {
                     "cold reflow expanded cell limit"
                 );
                 let seqno = logical.current_seqno();
-                let (wrapped, _) = Screen::wrap_single_logical_line_for_resize(
+                let wrapped = Screen::wrap_cold_logical_line(
                     logical,
                     self.witness.cols,
                     seqno,
                     self.wrap_policy,
-                    &mut LineWrapWidthPrefixScratch::default(),
+                    fragment_alignment_retained
+                        && self.fragments.as_ref().is_some_and(|fragments| {
+                            fragments.aligned_at(
+                                source.end,
+                                self.witness.cols,
+                                self.witness.dpi,
+                                self.wrap_policy,
+                            )
+                        }),
                 );
                 anyhow::ensure!(
                     wrapped.len() == (visual.end - visual.start) as usize,
@@ -418,6 +709,10 @@ impl ScreenLineRead {
             for line in batch {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
                 serde_json::to_writer(&mut charge, &line)?;
+                let line = cold_row_with_fragment(self.fragments.as_deref(), row, line);
+                if self.fragments.is_some() {
+                    serde_json::to_writer(&mut charge, &line)?;
+                }
                 self.hydrated.push(line);
                 row += 1;
             }
@@ -451,8 +746,13 @@ impl ScreenLineRead {
                 let count = (Self::MAX_ROWS - context.len() - self.resident.len())
                     .min(predecessor_batch_rows) as StableRowIndex;
                 let from = retained.start.max(context_first.saturating_sub(count));
-                let batch =
-                    context_batch(sink.as_ref(), from..context_first, &mut charge, &cancelled)?;
+                let batch = context_batch(
+                    sink.as_ref(),
+                    from..context_first,
+                    &mut charge,
+                    &cancelled,
+                    self.fragments.as_deref(),
+                )?;
                 let mut found_start = false;
                 for line in batch.into_iter().rev() {
                     let previous = context_first - 1;
@@ -491,7 +791,13 @@ impl ScreenLineRead {
                     .hot_top
                     .min(retained.end)
                     .min(context_end.saturating_add(count));
-                let batch = context_batch(sink.as_ref(), context_end..to, &mut charge, &cancelled)?;
+                let batch = context_batch(
+                    sink.as_ref(),
+                    context_end..to,
+                    &mut charge,
+                    &cancelled,
+                    self.fragments.as_deref(),
+                )?;
                 for line in batch {
                     let wrapped = line.last_cell_was_wrapped();
                     context.push_back(line);
@@ -518,11 +824,16 @@ impl ScreenLineRead {
                     break;
                 }
                 let mut end = start + 1;
-                while source[end - 1].last_cell_was_wrapped() && end < source.len() {
+                while source[end - 1].last_cell_was_wrapped()
+                    && end < source.len()
+                    && !(aligned_seam && end == cold_len)
+                {
                     end += 1;
                 }
                 if cold_source.is_some()
-                    && (source[end - 1].last_cell_was_wrapped() || end > cold_len)
+                    && ((source[end - 1].last_cell_was_wrapped()
+                        && !(aligned_seam && end == cold_len))
+                        || end > cold_len)
                 {
                     // An unfinished trailing logical group must not make all
                     // earlier cold history unreadable. Keep its source/visual
@@ -533,7 +844,7 @@ impl ScreenLineRead {
                     break;
                 }
                 anyhow::ensure!(
-                    !source[end - 1].last_cell_was_wrapped(),
+                    !source[end - 1].last_cell_was_wrapped() || (aligned_seam && end == cold_len),
                     ColdReadGeometryUnavailable
                 );
                 anyhow::ensure!(end <= cold_len, ColdReadGeometryUnavailable);
@@ -564,12 +875,12 @@ impl ScreenLineRead {
                     expanded_cells <= limit / std::mem::size_of::<Cell>(),
                     "cold reflow expanded cell limit"
                 );
-                let (wrapped, _) = Screen::wrap_single_logical_line_for_resize(
+                let wrapped = Screen::wrap_cold_logical_line(
                     logical,
                     self.witness.cols,
                     seqno,
                     self.wrap_policy,
-                    &mut LineWrapWidthPrefixScratch::default(),
+                    aligned_seam && end == cold_len,
                 );
                 if cold_source.is_none() {
                     anyhow::ensure!(wrapped.len() == end - start, ColdReadGeometryUnavailable);
@@ -668,6 +979,8 @@ pub struct Screen {
     coordinate_identity: ScreenCoordinateIdentity,
     #[cfg(feature = "use_serde")]
     cold_visual_layout: Option<Arc<ColdVisualLayout>>,
+    #[cfg(feature = "use_serde")]
+    cold_row_fragments: Option<Arc<ColdRowFragments>>,
     #[cfg(feature = "use_serde")]
     cold_visual_seqno: SequenceNo,
     #[cfg(feature = "use_serde")]
@@ -1860,6 +2173,175 @@ fn inspect_checkpoint_line(
 }
 
 impl Screen {
+    #[cfg(feature = "use_serde")]
+    fn fragments_match_interval(
+        fragments: &ColdRowFragments,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        now: &crate::config::ScrollbackInterval,
+    ) -> bool {
+        if !Arc::ptr_eq(&fragments.sink, sink) {
+            return false;
+        }
+        let Some(rows) = now.rows() else {
+            return true;
+        };
+        let mut retained = fragments.rows.range(rows);
+        let Some((&first, _)) = retained.next() else {
+            return true;
+        };
+        let last = retained.next_back().map_or(first, |(&key, _)| key);
+        last.checked_add(1)
+            .is_some_and(|end| now.retains(&fragments.interval, first..end))
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn same_cold_fragments(&self, previous: &Option<Arc<ColdRowFragments>>) -> bool {
+        match (&self.cold_row_fragments, previous) {
+            (None, None) => true,
+            (Some(now), Some(before)) => Arc::ptr_eq(now, before),
+            _ => false,
+        }
+    }
+
+    /// Capture only a complete resident-head logical group wholly above the
+    /// live viewport. This transaction cannot move an active/saved cursor.
+    /// Visible-head seams require the separate cursor-anchor transaction.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_cold_seam_reflow(&self) -> anyhow::Result<Option<ColdSeamReflow>> {
+        use crate::config::ScrollbackIntervalCapture;
+        if !self.allow_scrollback || self.recovery_scrollback.is_some() {
+            return Ok(None);
+        }
+        let Some(sink) = self.config.scrollback_spill_sink() else {
+            return Ok(None);
+        };
+        let ScrollbackIntervalCapture::Ready(interval) = sink.try_capture_scrollback_interval()
+        else {
+            anyhow::bail!("cold seam metadata busy or unavailable");
+        };
+        let frontier = self.phys_to_stable_row_index(0);
+        let Some(rows) = interval.rows() else {
+            return Ok(None);
+        };
+        if rows.start >= frontier {
+            return Ok(None);
+        }
+        anyhow::ensure!(rows.end >= frontier, "cold seam discontinuity");
+        if let Some(fragments) = &self.cold_row_fragments {
+            anyhow::ensure!(
+                Self::fragments_match_interval(fragments, &sink, &interval),
+                "cold seam source replaced"
+            );
+            if fragments.aligned_at(
+                frontier,
+                self.physical_cols,
+                self.dpi,
+                self.resize_wrap_policy,
+            ) && fragments.alignment_retained(&interval)
+            {
+                return Ok(None);
+            }
+        }
+        let maximum = self
+            .lines
+            .len()
+            .saturating_sub(self.physical_rows)
+            .min(ScreenLineRead::MAX_ROWS - 1);
+        let mut budget = LineReadCaptureBudget::default();
+        let mut count = None;
+        for (index, line) in self.lines.iter().take(maximum).enumerate() {
+            // Vector tail lookup visits visible cells; clustered tail lookup
+            // is constant-time. Conservatively charge columns for both before
+            // inspecting either, sharing the eventual snapshot work budget.
+            budget.work_left = budget
+                .work_left
+                .checked_sub(line.len().max(1))
+                .ok_or_else(|| anyhow::anyhow!("cold seam boundary work limit"))?;
+            if !line.last_cell_was_wrapped() {
+                count = Some(index + 1);
+                break;
+            }
+        }
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        let (first, second) = self.lines.as_slices();
+        let resident = Line::try_clone_batch_for_snapshot(
+            &first[..count.min(first.len())],
+            &second[..count.saturating_sub(first.len())],
+            &mut budget.bytes_left,
+            &mut budget.work_left,
+        )
+        .ok_or_else(|| anyhow::anyhow!("cold seam resident snapshot limit"))?;
+        Ok(Some(ColdSeamReflow {
+            witness: self.capture_coordinate_witness(),
+            sink,
+            interval,
+            frontier,
+            resident,
+            previous: self.cold_row_fragments.clone(),
+            policy: self.resize_wrap_policy,
+            replacement: None,
+            source: None,
+            retired_layout: None,
+        }))
+    }
+
+    /// Commit under the caller's exact pane/resize authority and terminal
+    /// lock. Swaps retain all displaced payloads in the worker-owned plan.
+    #[cfg(feature = "use_serde")]
+    pub fn install_cold_seam_reflow(
+        &mut self,
+        prepared: &mut ColdSeamReflow,
+        seqno: SequenceNo,
+    ) -> bool {
+        use crate::config::ScrollbackIntervalCapture;
+        if seqno == SequenceNo::MAX
+            || prepared.replacement.is_none()
+            || !self.matches_coordinate_witness(&prepared.witness)
+            || !self.same_cold_fragments(&prepared.previous)
+            || self.phys_to_stable_row_index(0) != prepared.frontier
+            || prepared.resident.len() > self.lines.len().saturating_sub(self.physical_rows)
+            || !self
+                .lines
+                .iter()
+                .zip(&prepared.resident)
+                .all(|(now, before)| now.is_same_reflow_source(before))
+        {
+            return false;
+        }
+        let Some(sink) = self.config.scrollback_spill_sink() else {
+            return false;
+        };
+        if !Arc::ptr_eq(&sink, &prepared.sink) {
+            return false;
+        }
+        let ScrollbackIntervalCapture::Ready(now) = sink.try_capture_scrollback_interval() else {
+            return false;
+        };
+        let Some(source) = prepared.source.as_ref() else {
+            return false;
+        };
+        if !now.retains(&prepared.interval, source.clone()) {
+            return false;
+        }
+        let Some((replacement, rows)) = prepared.replacement.as_mut() else {
+            return false;
+        };
+        if !Self::fragments_match_interval(replacement, &sink, &now) {
+            return false;
+        }
+        for (live, replacement) in self.lines.iter_mut().zip(rows) {
+            replacement.update_last_change_seqno(seqno);
+            std::mem::swap(live, replacement);
+        }
+        let previous = self.cold_row_fragments.replace(Arc::clone(replacement));
+        prepared.previous = previous;
+        prepared.retired_layout = self.cold_visual_layout.take();
+        self.invalidate_coordinate_witnesses();
+        self.cold_visual_seqno = seqno;
+        true
+    }
     /// Capture a bounded request without invoking any blocking sink method.
     #[cfg(feature = "use_serde")]
     pub fn capture_line_read(
@@ -1886,6 +2368,14 @@ impl Screen {
             if let Some(sink) = self.config.scrollback_spill_sink() {
                 match sink.try_capture_scrollback_interval() {
                     ScrollbackIntervalCapture::Ready(interval) => {
+                        if requested.start < hot_top {
+                            if let Some(fragments) = &self.cold_row_fragments {
+                                anyhow::ensure!(
+                                    Self::fragments_match_interval(fragments, &sink, &interval),
+                                    "cold fragment source replaced"
+                                );
+                            }
+                        }
                         if let Some(rows) = interval.rows() {
                             // A missing cold/hot seam is not permission to rebase
                             // a requested cold row onto resident row zero.
@@ -1958,6 +2448,7 @@ impl Screen {
             attempted_index: !self
                 .cold_index_budget_exhausted
                 .load(std::sync::atomic::Ordering::Acquire),
+            fragments: self.cold_row_fragments.clone(),
         })
     }
 
@@ -1967,6 +2458,7 @@ impl Screen {
         use crate::config::ScrollbackIntervalCapture;
         if !read.complete
             || !self.matches_coordinate_witness(&read.witness)
+            || !self.same_cold_fragments(&read.fragments)
             || read.row_count() != read.end.saturating_sub(read.first) as usize
         {
             return false;
@@ -2311,6 +2803,23 @@ impl Screen {
                                 "cold_scrollback_bytes",
                             )
                         })?;
+                    let fragment_interval = if let Some(fragments) = &self.cold_row_fragments {
+                        let crate::config::ScrollbackIntervalCapture::Ready(before) =
+                            sink.try_capture_scrollback_interval()
+                        else {
+                            return Err(
+                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                            );
+                        };
+                        if !Self::fragments_match_interval(fragments, &sink, &before) {
+                            return Err(
+                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                            );
+                        }
+                        Some(before)
+                    } else {
+                        None
+                    };
                     let snapshot = sink
                         .snapshot_scrollback(
                             expected_newest_exclusive,
@@ -2360,10 +2869,46 @@ impl Screen {
                     }
                     let generation = snapshot.generation();
                     let cold_prefix_line_count = snapshot.rows().len();
+                    if let Some(before) = fragment_interval {
+                        let crate::config::ScrollbackIntervalCapture::Ready(after) =
+                            sink.try_capture_scrollback_interval()
+                        else {
+                            return Err(
+                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                            );
+                        };
+                        if cold_prefix_line_count > 0
+                            && (!after.retains(
+                                &before,
+                                oldest as StableRowIndex..expected_newest_exclusive,
+                            ) || before
+                                .rows()
+                                .is_none_or(|rows| rows.start != oldest as StableRowIndex)
+                                || after
+                                    .rows()
+                                    .is_none_or(|rows| rows.start != oldest as StableRowIndex))
+                        {
+                            return Err(
+                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                            );
+                        }
+                    }
                     let mut cold_lines = snapshot.into_rows();
-                    for line in &mut cold_lines {
-                        inspect_checkpoint_line(line, limits, usage)?;
-                        *line = line.semantic_checkpoint_clone();
+                    for (index, line) in cold_lines.iter_mut().enumerate() {
+                        if let Some(replacement) =
+                            self.cold_row_fragments.as_ref().and_then(|fragments| {
+                                fragments.rows.get(&((oldest + index) as StableRowIndex))
+                            })
+                        {
+                            // Flatten semantic replacements into the existing
+                            // checkpoint. Keep the authenticated snapshot's
+                            // generation as recovery's prefix-replacement CAS.
+                            inspect_checkpoint_line(replacement, limits, usage)?;
+                            *line = replacement.semantic_checkpoint_clone();
+                        } else {
+                            inspect_checkpoint_line(line, limits, usage)?;
+                            *line = line.semantic_checkpoint_clone();
+                        }
                     }
                     (oldest, Some(generation), cold_prefix_line_count, cold_lines)
                 } else {
@@ -2509,6 +3054,8 @@ impl Screen {
             coordinate_identity: ScreenCoordinateIdentity::default(),
             #[cfg(feature = "use_serde")]
             cold_visual_layout: None,
+            #[cfg(feature = "use_serde")]
+            cold_row_fragments: None,
             #[cfg(feature = "use_serde")]
             cold_visual_seqno: 0,
             #[cfg(feature = "use_serde")]
@@ -3181,6 +3728,32 @@ impl Screen {
             width_prefix_scratch,
         );
         (wrapped, None)
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn wrap_cold_logical_line(
+        logical: Line,
+        cols: usize,
+        seqno: SequenceNo,
+        policy: ResizeWrapPolicy,
+        aligned_seam: bool,
+    ) -> Vec<Line> {
+        if aligned_seam && logical.len() == 0 {
+            return Vec::new();
+        }
+        let (mut rows, _) = Self::wrap_single_logical_line_for_resize(
+            logical,
+            cols,
+            seqno,
+            policy,
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        if aligned_seam {
+            if let Some(last) = rows.last_mut() {
+                last.set_last_cell_was_wrapped(true, seqno);
+            }
+        }
+        rows
     }
 
     fn clear_rewrap_line_cache(&mut self) {
@@ -5230,6 +5803,10 @@ impl Screen {
             let _commit = sink.clear_scrollback()?;
         }
         self.coordinate_identity = next_coordinate_identity;
+        #[cfg(feature = "use_serde")]
+        {
+            self.cold_row_fragments = None;
+        }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ScrollbackErase, None);
         for _ in 0..to_clear {
             self.lines.pop_front();
@@ -5418,6 +5995,17 @@ impl Screen {
 
         let sink = self.config.scrollback_spill_sink();
         #[cfg(feature = "use_serde")]
+        if let (Some(fragments), Some(sink)) = (&self.cold_row_fragments, &sink) {
+            let crate::config::ScrollbackIntervalCapture::Ready(now) =
+                sink.try_capture_scrollback_interval()
+            else {
+                return (first, Vec::new());
+            };
+            if !Self::fragments_match_interval(fragments, sink, &now) {
+                return (first, Vec::new());
+            }
+        }
+        #[cfg(feature = "use_serde")]
         let layout = self
             .current_cold_visual_layout()
             .map(|_| Arc::clone(self.cold_visual_layout.as_ref().unwrap()));
@@ -5459,7 +6047,12 @@ impl Screen {
                     if batch.is_empty() || batch.len() > (source.end - source_row) as usize {
                         return (first, lines);
                     }
-                    for mut line in batch {
+                    for line in batch {
+                        let mut line = cold_row_with_fragment(
+                            self.cold_row_fragments.as_deref(),
+                            source_row,
+                            line,
+                        );
                         let seqno = line.current_seqno();
                         line.set_last_cell_was_wrapped(false, seqno);
                         if let Some(logical) = &mut logical {
@@ -5475,12 +6068,19 @@ impl Screen {
                     break;
                 };
                 let seqno = logical.current_seqno();
-                let (wrapped, _) = Self::wrap_single_logical_line_for_resize(
+                let wrapped = Self::wrap_cold_logical_line(
                     logical,
                     self.physical_cols,
                     seqno,
                     self.resize_wrap_policy,
-                    &mut LineWrapWidthPrefixScratch::default(),
+                    self.cold_row_fragments.as_ref().is_some_and(|fragments| {
+                        fragments.aligned_at(
+                            source.end,
+                            self.physical_cols,
+                            self.dpi,
+                            self.resize_wrap_policy,
+                        )
+                    }),
                 );
                 if wrapped.len() != (visual.end - visual.start) as usize {
                     break;
@@ -5501,8 +6101,13 @@ impl Screen {
             if batch.is_empty() || batch.len() > (batch_end - stable_row) as usize {
                 break;
             }
-            stable_row += batch.len() as StableRowIndex;
-            lines.extend(batch);
+            for line in batch {
+                #[cfg(feature = "use_serde")]
+                let line =
+                    cold_row_with_fragment(self.cold_row_fragments.as_deref(), stable_row, line);
+                lines.push(line);
+                stable_row += 1;
+            }
         }
 
         (first, lines)
@@ -5779,7 +6384,7 @@ fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Rang
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::color::ColorPalette;
     use crate::config::ScrollbackSpillSink;
@@ -5918,6 +6523,235 @@ mod tests {
 
     fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn cold_seam_test_terminal() -> (crate::Terminal, Arc<TestColdScrollbackSink>) {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            scrollback: 32,
+            scrollback_tier: crate::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 1,
+                warm_max_bytes: 0,
+            },
+            cold_sink: Some(sink.clone()),
+            ..TestTermConfig::default()
+        });
+        let mut terminal = crate::Terminal::new(
+            test_size(2, 4, 96),
+            config,
+            "FrankenTerm",
+            "cold-seam-test",
+            Box::new(std::io::sink()),
+        );
+        terminal.advance_bytes(b"abcdefgh\r\none\r\n");
+        terminal.resize(test_size(2, 3, 96));
+        (terminal, sink)
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_seam_transaction_preserves_keys_and_moves_real_cells_atomically() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut cold = Line::from_text("abcd", &CellAttributes::blank(), 1, None);
+        cold.set_last_cell_was_wrapped(true, 1);
+        assert!(sink.store_scrollback_line(0, &cold, 32));
+        let mut screen = test_screen_with_config(
+            2,
+            3,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 1;
+        let mut head = Line::from_text("efg", &CellAttributes::blank(), 1, None);
+        head.set_last_cell_was_wrapped(true, 1);
+        screen.lines = [
+            head,
+            Line::from_text("h", &CellAttributes::blank(), 1, None),
+            Line::new(1),
+            Line::new(1),
+        ]
+        .into();
+        let before = screen.lines.clone();
+        let plan = screen.capture_cold_seam_reflow().unwrap().unwrap();
+        assert!(plan.hydrate(|| true).is_err());
+        assert_eq!(screen.lines, before);
+        let mut stale = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        screen.lines[0].update_last_change_seqno(2);
+        assert!(!screen.install_cold_seam_reflow(&mut stale, 3));
+        screen.lines[0].update_last_change_seqno(1);
+        let mut plan = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(plan.is_ready());
+        assert!(screen.install_cold_seam_reflow(&mut plan, 2));
+        assert_eq!(screen.lines[0].as_str(), "def");
+        assert_eq!(screen.lines[1].as_str(), "gh");
+        assert_eq!(screen.stable_row_index_offset, 1);
+        assert_eq!(
+            sink.load_scrollback_line(0).unwrap(),
+            cold,
+            "immutable source unchanged"
+        );
+        assert!(
+            screen.capture_cold_seam_reflow().unwrap().is_none(),
+            "same-width transaction is idempotent"
+        );
+        let read = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        assert_eq!(
+            read.lines()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>(),
+            ["abc", "def", "gh"]
+        );
+        screen.install_line_read_layout(&read, 3);
+        assert_eq!(
+            screen
+                .lines_in_stable_range(0..3)
+                .1
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>(),
+            ["abc", "def", "gh"]
+        );
+        assert!(
+            !screen.install_cold_seam_reflow(&mut plan, 4),
+            "old authority cannot publish twice"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_seam_refuses_empty_continuation_and_visible_head_without_mutation() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut cold = Line::from_text("a", &CellAttributes::blank(), 1, None);
+        cold.set_last_cell_was_wrapped(true, 1);
+        assert!(sink.store_scrollback_line(0, &cold, 32));
+        let mut screen = test_screen_with_config(
+            2,
+            3,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 1;
+        let mut head = Line::from_text("bcd", &CellAttributes::blank(), 1, None);
+        head.set_last_cell_was_wrapped(true, 1);
+        screen.lines = [
+            head,
+            Line::from_text("ef", &CellAttributes::blank(), 1, None),
+            Line::new(1),
+            Line::new(1),
+        ]
+        .into();
+        let before = screen.lines.clone();
+        let error = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("zero-cell continuation"));
+        assert_eq!(screen.lines, before);
+        assert_eq!(sink.load_scrollback_line(0).unwrap(), cold);
+        assert!(screen.cold_row_fragments.is_none());
+        screen.physical_rows = 3;
+        assert!(
+            screen.capture_cold_seam_reflow().unwrap().is_none(),
+            "never modify a logical head crossing into the live viewport"
+        );
+        screen.physical_rows = 2;
+        screen.lines[0] = Line::from_text(&"x".repeat(65_537), &CellAttributes::blank(), 1, None);
+        screen.lines[0].compress_for_scrollback();
+        assert!(screen
+            .capture_cold_seam_reflow()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("boundary work limit"));
+        assert_eq!(
+            screen.lines[0].len(),
+            65_537,
+            "bounded refusal preserves source"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_seam_partial_retention_invalidates_alignment_without_reusing_keys() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        for (key, text) in [(0, "abcd"), (1, "efg")] {
+            let mut line = Line::from_text(text, &CellAttributes::blank(), 1, None);
+            line.set_last_cell_was_wrapped(true, 1);
+            assert!(sink.store_scrollback_line(key, &line, 32));
+        }
+        let mut screen = test_screen_with_config(
+            2,
+            3,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 2;
+        screen.lines = [
+            Line::from_text("h", &CellAttributes::blank(), 1, None),
+            Line::new(1),
+            Line::new(1),
+        ]
+        .into();
+        let mut plan = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.install_cold_seam_reflow(&mut plan, 2));
+        assert_eq!(screen.lines[0].as_str(), "gh");
+        sink.rows.lock().unwrap().remove(&0);
+        let mut after_trim = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("partial trim must not reuse old alignment")
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.install_cold_seam_reflow(&mut after_trim, 3));
+        assert_eq!(screen.lines[0].as_str(), "h");
+        assert_eq!(screen.stable_row_index_offset, 2);
+        assert_eq!(sink.load_scrollback_line(1).unwrap().as_str(), "efg");
+        let read = screen
+            .capture_line_read(1..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        assert_eq!(
+            read.lines()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>(),
+            ["efg", "h"]
+        );
     }
 
     #[cfg(feature = "use_serde")]
@@ -6603,7 +7437,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct TestColdScrollbackSink {
+    pub(crate) struct TestColdScrollbackSink {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
         interval_identity: Mutex<crate::config::ScrollbackIntervalIdentity>,
         batch_reads: AtomicU64,

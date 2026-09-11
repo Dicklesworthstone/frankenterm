@@ -124915,6 +124915,15 @@ printf x > "$MINISIGN_MARKER"
         let grammar = ipc_rpc_command_grammar();
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
+        // Keep ambient no-subscriber threads represented in tracing's registry.
+        // tracing-core 0.1.36's single-dispatch fast path registers a new
+        // callsite against the *current thread's* default. A concurrent IPC
+        // test with no scoped subscriber can otherwise cache Interest::never
+        // for the shared process/settlement callsites while this capture is
+        // active. Two retained dispatches force registration to consult both
+        // subscribers. This does not install or change the global subscriber.
+        let _ambient_dispatch =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         #[derive(Clone)]
         struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Capture {

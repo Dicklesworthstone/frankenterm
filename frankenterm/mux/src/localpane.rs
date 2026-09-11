@@ -2692,17 +2692,11 @@ impl LocalPane {
                     let mut bytes_left =
                         frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
                     let mut work_left = 65_536;
-                    let cached = read.cached_lines(requested.clone());
-                    let (first, source): (_, Vec<_>) = if let Some((first, lines)) = cached {
-                        (first, lines.iter().collect())
-                    } else {
-                        (read.first_row(), read.lines().collect())
-                    };
-                    let rows = source
-                        .into_iter()
-                        .map(|line| line.try_clone_for_snapshot(&mut bytes_left, &mut work_left))
-                        .collect::<Option<Vec<_>>>();
-                    snapshot = rows.map(|rows| (first, rows));
+                    snapshot = read.try_clone_viewport_for_snapshot(
+                        requested.clone(),
+                        &mut bytes_left,
+                        &mut work_left,
+                    );
                 });
             });
             if let Some(snapshot) = snapshot {
@@ -3332,9 +3326,45 @@ impl LocalPane {
         let Some(_permit) = crate::pane::LineReadPermit::try_acquire() else {
             return;
         };
+        let mut seam_committed = false;
         let result = catch_recoverable(
             RecoverablePanicSite::MuxPaneCallback,
             AssertUnwindSafe(|| -> anyhow::Result<bool> {
+                let seam = registration
+                    .try_with_current(|_| {
+                        let term = terminal.try_lock()?;
+                        term.screen().capture_cold_seam_reflow().ok().flatten()
+                    })
+                    .flatten();
+                if let Some(seam) = seam {
+                    match seam.hydrate(|| {
+                        let superseded = resize_queue.lock().superseded_by(token).is_some();
+                        superseded || registration.try_with_current(|_| ()).is_none()
+                    }) {
+                        Ok(mut seam) if seam.is_ready() => {
+                            let _ = registration.try_with_current(|_| {
+                                let Some(mut term) = terminal.try_lock() else {
+                                    return;
+                                };
+                                let (decision, _) =
+                                    with_resize_commit_barrier(resize_queue, token, || {
+                                        if term.current_seqno() == SequenceNo::MAX {
+                                            return false;
+                                        }
+                                        term.increment_seqno();
+                                        let seqno = term.current_seqno();
+                                        term.screen_mut().install_cold_seam_reflow(&mut seam, seqno)
+                                    });
+                                seam_committed |=
+                                    matches!(decision, ResizeCommitDecision::Committed(true));
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            metrics::counter!("mux.localpane.resize.cold_seam", "outcome" => "unavailable").increment(1);
+                        }
+                    }
+                }
                 let Some(plan) = registration
                     .try_with_current(|_| -> anyhow::Result<_> {
                         let Some(term) = terminal.try_lock() else {
@@ -3385,7 +3415,7 @@ impl LocalPane {
                 Ok(committed)
             }),
         );
-        if matches!(&result, Ok(Ok(true))) {
+        if seam_committed || matches!(&result, Ok(Ok(true))) {
             schedule_local_pane_main_thread(
                 promise::spawn::MainThreadServiceClass::Interactive,
                 LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
@@ -4699,6 +4729,9 @@ mod tests {
         // Continued output on another row must not starve an exact retained
         // row read. The terminal content sequence advances, layout floor does
         // not, and the old read still passes its independent source check.
+        // CR marks the previous cursor row dirty even without changing text;
+        // move off the requested row before capturing the exact source.
+        pane.terminal.lock().advance_bytes(b"\r\n");
         let fresh = pane
             .capture_line_read(0..1, &mut Default::default())
             .unwrap()
@@ -4707,7 +4740,9 @@ mod tests {
             .unwrap();
         let (floor, dimensions) = pane.get_line_layout().unwrap();
         let observed = pane.get_current_seqno();
-        pane.terminal.lock().advance_bytes(b"\r\nother row");
+        let source_seqno = fresh.lines().next().unwrap().current_seqno();
+        pane.terminal.lock().advance_bytes(b"other row");
+        assert_eq!(pane.get_lines(0..1).1[0].current_seqno(), source_seqno);
         assert!(pane.get_current_seqno() > observed);
         assert_eq!(pane.get_line_layout().unwrap().0, floor);
         assert!(pane.publish_line_reads_at_layout(
