@@ -445,18 +445,18 @@
         "cosmetic": 8,
         "docs": 1,
         "feat": 2,
-        "fix": 18,
+        "fix": 19,
         "other": 4,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 36,
+      "fork_side_commit_count": 37,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-08T17:19:23-04:00",
-        "sha": "14aaa7fe77712282e4c73b8feae1605df8e0451d",
-        "subject": "style(font): format the invalid-size regression cases"
+        "classification": "fix",
+        "committed_at": "2026-09-11T20:36:35-04:00",
+        "sha": "d91147f2a23c1386943fbf3372100a70d47ba678",
+        "subject": "fix(font): surface DirectWrite lookup errors and LLP64 seek offsets"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -1061,8 +1061,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2489,
-  "generated_at": "2026-09-11T05:42:13.954088Z",
+  "fork_side_commit_total": 2490,
+  "generated_at": "2026-09-12T00:55:54.468153Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

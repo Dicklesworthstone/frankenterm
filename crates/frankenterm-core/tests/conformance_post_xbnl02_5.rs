@@ -176,8 +176,7 @@ fn spec_xbnl_2_5_must_2_asupersync_has_tls_feature() {
         })
         .expect("[MUST-2] asupersync dep line must be present");
     assert!(
-        asupersync_line
-            .parse::<toml::Value>()
+        toml::from_str::<toml::Table>(asupersync_line)
             .expect("asupersync dependency must parse")["asupersync"]["features"]
             .as_array()
             .expect("asupersync features must be an array")
