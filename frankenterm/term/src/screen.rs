@@ -6,7 +6,6 @@ use crate::config::{
     ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
     ScrollbackSnapshotLimits,
 };
-use crossbeam::thread;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
     MonospaceKpCostModel, MonospaceWrapMode,
@@ -35,6 +34,46 @@ fn reuse_unlinked_scan_state_for_reflow() -> bool {
         std::env::var_os("FT_DISABLE_REFLOW_SCAN_STATE_REUSE").as_deref()
             != Some(std::ffi::OsStr::new("1"))
     })
+}
+
+struct ReflowComputePool {
+    pool: rayon::ThreadPool,
+    // One admitted reflow at a time bounds the queued batch count. Contending
+    // callers retain the synchronous scalar path instead of waiting here.
+    admission: std::sync::Mutex<()>,
+}
+
+fn reflow_compute_pool() -> Option<&'static ReflowComputePool> {
+    static POOL: LazyLock<Option<ReflowComputePool>> = LazyLock::new(|| {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1))
+            .unwrap_or(0);
+        // Process-start diagnostic override supports same-binary scalar and
+        // worker-count comparisons. Never consume all reported CPUs.
+        let requested = std::env::var("FT_REFLOW_COMPUTE_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4);
+        let workers = requested.min(available).min(8);
+        if workers < 2 {
+            return None;
+        }
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|idx| format!("ft-reflow-{idx}"))
+            .build()
+        {
+            Ok(pool) => Some(ReflowComputePool {
+                pool,
+                admission: std::sync::Mutex::new(()),
+            }),
+            Err(err) => {
+                warn!("reflow compute pool unavailable; using scalar reflow: {err}");
+                None
+            }
+        }
+    });
+    POOL.as_ref()
 }
 
 /// Allocation identity for one screen coordinate generation. A cloned Screen
@@ -4619,6 +4658,31 @@ impl Screen {
     where
         T: ReflowLogicalLine + Sync,
     {
+        let compute_pool = (logical_lines.len() >= 256)
+            .then(reflow_compute_pool)
+            .flatten();
+        self.wrap_logical_lines_with_compute_pool(
+            logical_lines,
+            physical_cols,
+            seqno,
+            reflow_plan,
+            is_cancelled,
+            compute_pool,
+        )
+    }
+
+    fn wrap_logical_lines_with_compute_pool<T>(
+        &mut self,
+        logical_lines: &[T],
+        physical_cols: usize,
+        seqno: SequenceNo,
+        reflow_plan: Option<&ViewportReflowPlan>,
+        is_cancelled: &dyn Fn() -> bool,
+        compute_pool: Option<&ReflowComputePool>,
+    ) -> bool
+    where
+        T: ReflowLogicalLine + Sync,
+    {
         let logical_count = logical_lines.len();
         if logical_count == 0 {
             return true;
@@ -4656,10 +4720,12 @@ impl Screen {
         let mut cold_lines_completed = 0usize;
         let mut cold_batches_completed = 0usize;
 
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(logical_count);
+        // Do not initialize the pool for small screens. A retained admission
+        // guard prevents concurrent panes from flooding its queue; each batch
+        // below joins before the next cancellation checkpoint.
+        let admission = compute_pool.and_then(|pool| pool.admission.try_lock().ok());
+        let compute_pool = compute_pool.filter(|_| admission.is_some());
+        let worker_count = compute_pool.map_or(1, |pool| pool.pool.current_num_threads());
 
         for (batch_idx, batch) in plan.batches.iter().enumerate() {
             if is_cancelled() {
@@ -4688,8 +4754,8 @@ impl Screen {
                 batch.priority.rationale()
             );
 
-            let batch_workers = worker_count.min(batch_len);
-            if batch_workers <= 1 || batch_len < batch_workers.saturating_mul(8) {
+            let batch_workers = worker_count.min(batch_len / 8).max(1);
+            if batch_workers <= 1 {
                 for idx in batch.logical_range.clone() {
                     let logical_line = &logical_lines[idx];
                     let (wrapped, line_scorecard) = self.wrap_logical_line_for_resize_cached(
@@ -4717,92 +4783,110 @@ impl Screen {
             let mut pending_line_cache_inserts = Vec::new();
             #[cfg(test)]
             let mut pending_line_cache_hits = 0usize;
-            let _ = thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(batch_workers);
-                for worker_idx in 0..batch_workers {
-                    let start = batch.logical_range.start + worker_idx * chunk_size;
-                    if start >= batch.logical_range.end {
-                        break;
-                    }
-                    let end = (start + chunk_size).min(batch.logical_range.end);
-                    let logical_slice = &logical_lines[start..end];
-                    let physical_lines = &self.lines;
-                    let line_cache = &self.rewrap_line_cache;
-                    let dpi = self.dpi;
-                    handles.push(scope.spawn(move |_| {
-                        let mut wrapped = Vec::with_capacity(end - start);
-                        let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
-                        for (offset, line) in logical_slice.iter().enumerate() {
-                            let idx = start + offset;
-                            let cache_key = {
-                                let source_line = line.line(physical_lines);
-                                (source_line.len() > physical_cols).then(|| {
-                                    WrapLineCacheKey::new(
-                                        source_line,
-                                        physical_cols,
-                                        dpi,
-                                        wrap_policy,
-                                    )
-                                })
-                            };
-                            if let Some(key) = cache_key {
-                                if let Some(cached) = line_cache.get(&key) {
-                                    wrapped.push((
-                                        idx,
-                                        RewrapScratch::SharedLines(Arc::clone(&cached.lines)),
-                                        cached.scorecard,
-                                        None,
-                                        true,
-                                    ));
-                                    continue;
+            let mut results: Vec<_> = (0..batch_workers).map(|_| None).collect();
+            compute_pool
+                .expect("parallel reflow requires admission")
+                .pool
+                .in_place_scope(|scope| {
+                    for (worker_idx, result) in results.iter_mut().enumerate() {
+                        let start = batch.logical_range.start + worker_idx * chunk_size;
+                        if start >= batch.logical_range.end {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(batch.logical_range.end);
+                        let logical_slice = &logical_lines[start..end];
+                        let physical_lines = &self.lines;
+                        let line_cache = &self.rewrap_line_cache;
+                        let dpi = self.dpi;
+                        scope.spawn(move |_| {
+                            let mut wrapped = Vec::with_capacity(end - start);
+                            let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
+                            for (offset, line) in logical_slice.iter().enumerate() {
+                                let idx = start + offset;
+                                let cache_key = {
+                                    let source_line = line.line(physical_lines);
+                                    (source_line.len() > physical_cols).then(|| {
+                                        WrapLineCacheKey::new(
+                                            source_line,
+                                            physical_cols,
+                                            dpi,
+                                            wrap_policy,
+                                        )
+                                    })
+                                };
+                                if let Some(key) = cache_key {
+                                    if let Some(cached) = line_cache.get(&key) {
+                                        wrapped.push((
+                                            idx,
+                                            RewrapScratch::SharedLines(Arc::clone(&cached.lines)),
+                                            cached.scorecard,
+                                            None,
+                                            true,
+                                        ));
+                                        continue;
+                                    }
                                 }
+
+                                let (wrapped_lines, line_scorecard) =
+                                    Self::wrap_logical_line_source_for_resize(
+                                        line,
+                                        physical_lines,
+                                        physical_cols,
+                                        seqno,
+                                        wrap_policy,
+                                        &mut width_prefix_scratch,
+                                    );
+                                if let RewrapScratch::Lines(lines) = &wrapped_lines {
+                                    // Populate immutable row metadata while this
+                                    // worker owns the freshly wrapped chunk. The
+                                    // final ordered signature uses the same oracle
+                                    // and benefits from these per-buffer caches.
+                                    for line in lines {
+                                        line.compute_shape_hash();
+                                        line.last_cell_was_wrapped();
+                                    }
+                                }
+                                let cache_insert = match (cache_key, &wrapped_lines) {
+                                    (Some(key), RewrapScratch::Lines(lines)) => Some((
+                                        key,
+                                        CachedWrappedLine {
+                                            lines: Arc::from(lines.clone()),
+                                            scorecard: line_scorecard,
+                                        },
+                                    )),
+                                    _ => None,
+                                };
+                                wrapped.push((
+                                    idx,
+                                    wrapped_lines,
+                                    line_scorecard,
+                                    cache_insert,
+                                    false,
+                                ));
                             }
-
-                            let (wrapped_lines, line_scorecard) =
-                                Self::wrap_logical_line_source_for_resize(
-                                    line,
-                                    physical_lines,
-                                    physical_cols,
-                                    seqno,
-                                    wrap_policy,
-                                    &mut width_prefix_scratch,
-                                );
-                            let cache_insert = match (cache_key, &wrapped_lines) {
-                                (Some(key), RewrapScratch::Lines(lines)) => Some((
-                                    key,
-                                    CachedWrappedLine {
-                                        lines: Arc::from(lines.clone()),
-                                        scorecard: line_scorecard,
-                                    },
-                                )),
-                                _ => None,
-                            };
-                            wrapped.push((idx, wrapped_lines, line_scorecard, cache_insert, false));
-                        }
-                        wrapped
-                    }));
-                }
-
-                for handle in handles {
-                    for (idx, lines, line_scorecard, cache_insert, cache_hit) in
-                        handle.join().unwrap()
-                    {
-                        pending_line_cache_inserts.extend(cache_insert);
-                        #[cfg(not(test))]
-                        let _ = cache_hit;
-                        #[cfg(test)]
-                        if cache_hit {
-                            pending_line_cache_hits = pending_line_cache_hits.saturating_add(1);
-                        }
-                        if let (Some(scorecard), Some(line_scorecard)) =
-                            (wrap_scorecard.as_mut(), line_scorecard)
-                        {
-                            scorecard.record_line(line_scorecard);
-                        }
-                        self.rewrap_scratch_slots[idx] = Some(lines);
+                            *result = Some(wrapped);
+                        });
                     }
+                });
+            for result in results {
+                for (idx, lines, line_scorecard, cache_insert, cache_hit) in
+                    result.expect("joined reflow chunk must have a result")
+                {
+                    pending_line_cache_inserts.extend(cache_insert);
+                    #[cfg(not(test))]
+                    let _ = cache_hit;
+                    #[cfg(test)]
+                    if cache_hit {
+                        pending_line_cache_hits = pending_line_cache_hits.saturating_add(1);
+                    }
+                    if let (Some(scorecard), Some(line_scorecard)) =
+                        (wrap_scorecard.as_mut(), line_scorecard)
+                    {
+                        scorecard.record_line(line_scorecard);
+                    }
+                    self.rewrap_scratch_slots[idx] = Some(lines);
                 }
-            });
+            }
             for (key, cached) in pending_line_cache_inserts {
                 self.insert_rewrap_line_cache(key, cached);
             }
@@ -4987,25 +5071,7 @@ impl Screen {
                 rewrapped
             }
         };
-        if let (Some(start), Some(cursor), Some(wraps), Some(prefix)) =
-            (profile_start, cursor_elapsed, wraps_elapsed, prefix_elapsed)
-        {
-            log::debug!(
-                target: "frankenterm_term::screen::reflow_profile",
-                "reflow_stages seq={} old_cols={} cols={} source_rows={} target_rows={} logical_lines={} cursor_us={} wraps_us={} prefix_us={} materialize_us={} wrap_cache_hit={}",
-                seqno,
-                old_cols,
-                physical_cols,
-                original_len,
-                self.lines.len(),
-                logical_count,
-                cursor.as_micros(),
-                wraps.saturating_sub(cursor).as_micros(),
-                prefix.saturating_sub(wraps).as_micros(),
-                start.elapsed().saturating_sub(prefix).as_micros(),
-                wrap_cache_hit,
-            );
-        }
+        let materialize_elapsed = profile_start.map(|start| start.elapsed());
 
         if logical_cache_hit && reuse_unlinked_scan_state_for_reflow() {
             for line in &mut self.lines {
@@ -5047,6 +5113,7 @@ impl Screen {
             pruned_rows += 1;
         }
 
+        let cursor_map_elapsed = profile_start.map(|start| start.elapsed());
         if pruned_rows > 0 {
             self.rewrap_cache = None;
         } else {
@@ -5070,6 +5137,7 @@ impl Screen {
             }
         }
 
+        let signature_elapsed = profile_start.map(|start| start.elapsed());
         let final_cache_entries = self
             .rewrap_cache
             .as_ref()
@@ -5092,6 +5160,47 @@ impl Screen {
             started.elapsed().as_millis()
         );
         self.record_cursor_consistency_telemetry(seqno, adjusted_cursor.0, adjusted_cursor.1);
+        if let (
+            Some(start),
+            Some(cursor),
+            Some(wraps),
+            Some(prefix),
+            Some(materialize),
+            Some(cursor_map),
+            Some(signature),
+        ) = (
+            profile_start,
+            cursor_elapsed,
+            wraps_elapsed,
+            prefix_elapsed,
+            materialize_elapsed,
+            cursor_map_elapsed,
+            signature_elapsed,
+        ) {
+            // Emit once, after all measured work. The final bucket includes
+            // cache bookkeeping and the existing summary log as well as the
+            // cursor audit; it is deliberately labeled as a remainder.
+            let total = start.elapsed();
+            log::debug!(
+                target: "frankenterm_term::screen::reflow_profile",
+                "reflow_stages seq={} old_cols={} cols={} source_rows={} target_rows={} logical_lines={} cursor_us={} wraps_us={} prefix_us={} materialize_us={} cursor_map_prune_us={} signature_us={} remainder_us={} total_us={} wrap_cache_hit={}",
+                seqno,
+                old_cols,
+                physical_cols,
+                original_len,
+                self.lines.len(),
+                logical_count,
+                cursor.as_micros(),
+                wraps.saturating_sub(cursor).as_micros(),
+                prefix.saturating_sub(wraps).as_micros(),
+                materialize.saturating_sub(prefix).as_micros(),
+                cursor_map.saturating_sub(materialize).as_micros(),
+                signature.saturating_sub(cursor_map).as_micros(),
+                total.saturating_sub(signature).as_micros(),
+                total.as_micros(),
+                wrap_cache_hit,
+            );
+        }
 
         adjusted_cursor
     }
@@ -6843,6 +6952,101 @@ pub(crate) mod tests {
 
     fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    #[test]
+    fn compute_pool_matches_scalar_wraps_and_bounded_cancellation() {
+        let pool = ReflowComputePool {
+            pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+            admission: std::sync::Mutex::new(()),
+        };
+        let logical: Vec<_> = (0..257)
+            .map(|idx| {
+                Line::from_text(
+                    &format!("{idx}:{}", "界👩‍💻e\u{301}אב abcdefghijklmnop".repeat(8)),
+                    &CellAttributes::blank(),
+                    1,
+                    None,
+                )
+            })
+            .collect();
+        let mut scalar = test_screen_with_scorecard(4, 120);
+        let mut parallel = scalar.clone();
+        for cols in [61, 200, 79, 61] {
+            assert!(scalar.wrap_logical_lines_with_compute_pool(
+                &logical,
+                cols,
+                2,
+                None,
+                &|| false,
+                None,
+            ));
+            assert!(parallel.wrap_logical_lines_with_compute_pool(
+                &logical,
+                cols,
+                2,
+                None,
+                &|| false,
+                Some(&pool),
+            ));
+            let expected = scalar.clone_wrapped_from_scratch(logical.len());
+            let actual = parallel.clone_wrapped_from_scratch(logical.len());
+            assert_eq!(actual, expected);
+            assert_eq!(
+                parallel.rewrap_line_cache_hits,
+                scalar.rewrap_line_cache_hits
+            );
+            assert_eq!(
+                parallel.last_resize_wrap_scorecard,
+                scalar.last_resize_wrap_scorecard
+            );
+            assert_eq!(
+                Screen::compute_layout_signature_for_lines(
+                    actual.iter().flat_map(|rows| rows.iter())
+                ),
+                Screen::compute_layout_signature_for_lines(
+                    expected.iter().flat_map(|rows| rows.iter())
+                ),
+            );
+        }
+        // A busy pool must not wait (including recursively on the same thread).
+        let guard = pool.admission.lock().unwrap();
+        assert!(parallel.wrap_logical_lines_with_compute_pool(
+            &logical,
+            79,
+            3,
+            None,
+            &|| false,
+            Some(&pool),
+        ));
+        drop(guard);
+        for selected_pool in [None, Some(&pool)] {
+            let polls = std::cell::Cell::new(0);
+            let mut screen = test_screen(4, 120, 96);
+            assert!(!screen.wrap_logical_lines_with_compute_pool(
+                &logical,
+                61,
+                4,
+                None,
+                &|| {
+                    polls.set(polls.get() + 1);
+                    polls.get() == 2
+                },
+                selected_pool,
+            ));
+            assert_eq!(polls.get(), 2);
+            assert_eq!(
+                screen
+                    .rewrap_scratch_slots
+                    .iter()
+                    .filter(|slot| slot.is_some())
+                    .count(),
+                MAX_REFLOW_BATCH_LOGICAL_LINES
+            );
+        }
     }
 
     #[cfg(feature = "use_serde")]
