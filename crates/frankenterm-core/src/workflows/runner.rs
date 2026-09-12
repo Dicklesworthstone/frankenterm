@@ -1236,6 +1236,27 @@ impl WorkflowRunner {
         // Prevent infinite loops from backward JumpTo cycles.
         // A workflow with N steps should never need more than N*10 jumps.
         let max_total_jumps = step_count.saturating_mul(10).max(100);
+        // A trigger context is optional; the durable execution that owns it is
+        // not. Require that record before creating audit/undo state or running
+        // any workflow code with side effects.
+        let execution_record = match self.storage.get_workflow_with_cx(cx, execution_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return workflow_execution_error(
+                    execution_id,
+                    crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                        execution_id.to_string(),
+                    )),
+                );
+            }
+            Err(error) => {
+                let reason = format!("Workflow execution-record lookup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return workflow_execution_error(execution_id, error);
+            }
+        };
         let start_action_id_result = if start_step == 0 {
             record_workflow_start_action_with_cx(
                 cx,
@@ -1325,24 +1346,9 @@ impl WorkflowRunner {
         )
         .with_injector(self.injector.clone());
 
-        // Attach persisted trigger context (if any) so workflows can interpret extracted fields.
-        let maybe_wf = match self.storage.get_workflow_with_cx(cx, execution_id).await {
-            Ok(record) => record,
-            Err(error) => {
-                let reason = format!("Workflow trigger-context lookup failed: {error}");
-                let error = self
-                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
-                    .await;
-                return WorkflowExecutionResult::Error {
-                    execution_id: Some(execution_id.to_string()),
-                    error,
-                };
-            }
-        };
-        if let Some(record) = maybe_wf {
-            if let Some(trigger) = record.context {
-                ctx = ctx.with_trigger(trigger);
-            }
+        // Attach the already-validated execution's optional trigger context.
+        if let Some(trigger) = execution_record.context {
+            ctx = ctx.with_trigger(trigger);
         }
 
         let maybe_pane = match self.storage.get_pane_with_cx(cx, pane_id).await {
@@ -4765,7 +4771,22 @@ mod tests {
         assert_eq!(config.workflow_total_deadline_ms, 0);
     }
 
-    struct CompletionPersistenceProbeWorkflow;
+    fn reject_terminal_workflow_updates(db_path: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open fault-injection database");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_terminal_workflow_updates
+             BEFORE UPDATE ON workflow_executions
+             WHEN NEW.status IN ('completed', 'failed', 'aborted')
+             BEGIN
+               SELECT RAISE(ABORT, 'injected terminal persistence failure');
+             END;",
+        )
+        .expect("install terminal-write fault");
+    }
+
+    struct CompletionPersistenceProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     impl Workflow for CompletionPersistenceProbeWorkflow {
         fn name(&self) -> &'static str {
@@ -4789,7 +4810,9 @@ mod tests {
             _ctx: &mut WorkflowContext,
             step_idx: usize,
         ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
             Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 match step_idx {
                     0 => StepResult::done(serde_json::json!({ "ok": true })),
                     _ => StepResult::abort("unexpected step"),
@@ -4821,29 +4844,37 @@ mod tests {
                 injector,
                 WorkflowRunnerConfig::default(),
             );
-            let execution_id = "missing-completion-record";
+            let execution_id = "completion-write-rejected";
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cx = crate::cx::for_testing();
+            seed_test_pane(&storage, 77, now_ms()).await;
+            reject_terminal_workflow_updates(&db_path);
             let result = runner
-                .run_workflow(
+                .run_workflow_manual_with_cx(
+                    &cx,
                     77,
-                    Arc::new(CompletionPersistenceProbeWorkflow),
+                    Arc::new(CompletionPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
                     execution_id,
-                    0,
+                    None,
                 )
                 .await;
 
             match result {
-                WorkflowExecutionResult::Error {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error {
                     execution_id: Some(id),
                     error,
-                } => {
+                }) => {
                     assert_eq!(id, execution_id);
                     assert!(
-                        error.contains(execution_id),
-                        "completion persistence error should identify the execution: {error}"
+                        error.contains("injected terminal persistence failure"),
+                        "the terminal-write fault must cause the failure: {error}"
                     );
                 }
-                other => panic!("missing terminal persistence must not report success: {other:?}"),
+                other => panic!("failed terminal persistence must not report success: {other:?}"),
             }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
             storage.shutdown().await.unwrap();
         });
@@ -5283,6 +5314,9 @@ mod tests {
                 WorkflowRunnerConfig::default(),
             );
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Keep the pane valid so an unrelated audit foreign key cannot
+            // accidentally enforce the missing-execution precondition.
+            seed_test_pane(&storage, 77, now_ms()).await;
             let execution_id = "missing-progress-record";
             let result = runner
                 .run_workflow(
@@ -5311,14 +5345,43 @@ mod tests {
             assert_eq!(
                 calls.load(std::sync::atomic::Ordering::SeqCst),
                 0,
-                "runner must not execute side effects before its durable start audit exists"
+                "runner must not execute side effects without its durable execution record"
             );
+            let cx = crate::cx::for_testing();
+            assert!(
+                fetch_workflow_start_action_id_with_cx(&cx, &storage, execution_id)
+                    .await
+                    .expect("query start audit")
+                    .is_none(),
+                "missing executions must not acquire start-audit or undo authority"
+            );
+            let valid_result = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(ProgressPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    "present-progress-record",
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    valid_result,
+                    ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Completed { .. })
+                ),
+                "a persisted execution must still run: {valid_result:?}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
             storage.shutdown().await.unwrap();
         });
     }
 
-    struct InvalidJumpPersistenceProbeWorkflow;
+    struct InvalidJumpPersistenceProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     impl Workflow for InvalidJumpPersistenceProbeWorkflow {
         fn name(&self) -> &'static str {
@@ -5342,7 +5405,11 @@ mod tests {
             _ctx: &mut WorkflowContext,
             _step_idx: usize,
         ) -> BoxFuture<'_, StepResult> {
-            Box::pin(async move { StepResult::JumpTo { step: 99 } })
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StepResult::JumpTo { step: 99 }
+            })
         }
     }
 
@@ -5369,29 +5436,37 @@ mod tests {
                 injector,
                 WorkflowRunnerConfig::default(),
             );
-            let execution_id = "missing-invalid-jump-record";
+            let execution_id = "invalid-jump-write-rejected";
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cx = crate::cx::for_testing();
+            seed_test_pane(&storage, 77, now_ms()).await;
+            reject_terminal_workflow_updates(&db_path);
             let result = runner
-                .run_workflow(
+                .run_workflow_manual_with_cx(
+                    &cx,
                     77,
-                    Arc::new(InvalidJumpPersistenceProbeWorkflow),
+                    Arc::new(InvalidJumpPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
                     execution_id,
-                    0,
+                    None,
                 )
                 .await;
 
             match result {
-                WorkflowExecutionResult::Error {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error {
                     execution_id: Some(id),
                     error,
-                } => {
+                }) => {
                     assert_eq!(id, execution_id);
                     assert!(
-                        error.contains(execution_id),
-                        "abort persistence error should identify the execution: {error}"
+                        error.contains("injected terminal persistence failure"),
+                        "the terminal-write fault must cause the failure: {error}"
                     );
                 }
-                other => panic!("missing abort persistence must not report aborted: {other:?}"),
+                other => panic!("failed abort persistence must not report aborted: {other:?}"),
             }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
             storage.shutdown().await.unwrap();
         });
