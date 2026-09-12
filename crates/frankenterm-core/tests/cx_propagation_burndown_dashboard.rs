@@ -17,7 +17,8 @@
 //!   commit reintroduces an uncovered `pub async fn`, this test
 //!   fails before the file even reaches CI).
 //! - `totals.total_sites` accounts for every site exactly once
-//!   (covered + wrapper_exempt + exempt_file + uncovered).
+//!   (covered + eager settled futures + independent adapters +
+//!   wrapper_exempt + exempt_file + uncovered).
 //! - Per-bucket `total` sums across all buckets equal the
 //!   top-level `total_sites` (no site dropped on the floor).
 //!
@@ -261,7 +262,7 @@ fn schema_version_matches_documented_value() {
     let snap = load_snapshot();
     assert_eq!(
         snap.get("schema_version").as_int(),
-        2,
+        3,
         "schema version drifted — bump SCHEMA_VERSION in the generator + the doc"
     );
 }
@@ -358,13 +359,15 @@ fn totals_arithmetic_is_consistent() {
     let totals = snap.get("totals");
     let total = totals.get("total_sites").as_int();
     let covered = totals.get("covered_sites").as_int();
+    let eager = totals.get("eager_settled_future_sites").as_int();
+    let independent = totals.get("independent_context_adapter_sites").as_int();
     let wrapper_exempt = totals.get("wrapper_exempt_sites").as_int();
     let exempt_file = totals.get("exempt_file_sites").as_int();
     let uncovered = totals.get("uncovered_sites").as_int();
     assert_eq!(
         total,
-        covered + wrapper_exempt + exempt_file + uncovered,
-        "totals arithmetic broke: total({total}) != covered({covered}) + wrapper_exempt({wrapper_exempt}) + exempt_file({exempt_file}) + uncovered({uncovered})"
+        covered + eager + independent + wrapper_exempt + exempt_file + uncovered,
+        "totals arithmetic broke: total({total}) != covered({covered}) + eager({eager}) + independent({independent}) + wrapper_exempt({wrapper_exempt}) + exempt_file({exempt_file}) + uncovered({uncovered})"
     );
 }
 
@@ -426,9 +429,23 @@ fn each_bucket_has_documented_subkeys() {
         let bucket = buckets.get(name);
         let _ = bucket.get("total");
         let _ = bucket.get("covered");
+        let _ = bucket.get("eager_settled_future");
+        let _ = bucket.get("independent_adapter");
         let _ = bucket.get("wrapper_exempt");
         let _ = bucket.get("exempt_file");
         let _ = bucket.get("uncovered");
         let _ = bucket.get("files");
+        let classified: i64 = [
+            "covered",
+            "eager_settled_future",
+            "independent_adapter",
+            "wrapper_exempt",
+            "exempt_file",
+            "uncovered",
+        ]
+        .iter()
+        .map(|key| bucket.get(key).as_int())
+        .sum();
+        assert_eq!(bucket.get("total").as_int(), classified, "bucket {name}");
     }
 }

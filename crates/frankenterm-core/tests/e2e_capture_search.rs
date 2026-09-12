@@ -226,7 +226,7 @@ fn e2e_capture_search_real_sqlite_roundtrip() {
 
         assert_eq!(decoded_json["ok"], true);
         assert_eq!(decoded_json["query"], "capture_target*");
-        assert_eq!(decoded_json["hit_count"], 10);
+        assert_eq!(decoded_json["hit_count"].as_f64(), Some(10.0));
         assert_eq!(
             decoded_json["segment_ids"].as_array().map_or(0, Vec::len),
             10

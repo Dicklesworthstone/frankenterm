@@ -75,11 +75,12 @@
       ]
     }
   ],
-  "ci_binding": {
-    "workflow_path": ".github/workflows/finish-line-guards.yml",
-    "triggers": ["pull_request", "push"],
+  "release_binding": {
+    "system": "dsr",
+    "gate_path": "scripts/release-gates.sh",
     "required_commands": [
-      "bash scripts/check_finish_line_guards.sh --output $RUNNER_TEMP/finish-line-guards.json"
+      "dsr quality frankenterm",
+      "bash scripts/check_finish_line_guards.sh"
     ]
   },
   "local_contributor_path": {

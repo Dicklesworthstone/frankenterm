@@ -90,17 +90,24 @@ fn probe_for_safety(name: &str) -> SafetyConstraintProbe {
 }
 
 fn inherited_passport(generation: u64) -> CapabilityPassport {
+    let observed_at_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("timestamp fits u64");
     CapabilityPassport {
         agent_id: "inherited-agent".into(),
         pane_id: Some(99),
         capabilities: vec![CapabilityEntry {
             class: CapabilityClass::ToolAvailability("bash".into()),
             verification: CapabilityVerification::Verified,
-            last_observed_at_ms: Some(900_000),
+            last_observed_at_ms: Some(observed_at_ms),
             proof: RedactedProof::from_value(b"bash-handshake"),
         }],
         generation,
-        signed_at_ms: 900_000,
+        signed_at_ms: observed_at_ms,
     }
 }
 

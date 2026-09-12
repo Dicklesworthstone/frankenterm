@@ -69,7 +69,7 @@ enabled = ["handle_compaction"]   # empty = all built-in workflows
 max_concurrent = 10
 
 [safety]
-require_prompt_active = true
+require_prompt_active = true      # needs OSC 133 prompt markers in the pane's shell: run `ft setup shell` (bash/zsh/fish, idempotent)
 block_alt_screen = true
 rate_limit_per_pane = 30
 rate_limit_global = 100

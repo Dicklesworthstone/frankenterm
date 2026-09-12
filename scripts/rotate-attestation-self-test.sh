@@ -99,7 +99,7 @@ echo "Retained fixture-only corpus: $OUT_DIR" >&2
 # Real local tools only. Excluding cosign deliberately exercises the verifier's
 # unavailable-tool negative, without permitting a trust-root/network fetch.
 # OpenSSL still verifies the malformed Ed25519 signatures offline.
-for tool in bash jq git awk shasum openssl xxd tr find sort wc grep date mkdir basename dirname cat cp mktemp env; do
+for tool in bash jq awk shasum openssl xxd tr find sort wc grep date mkdir basename dirname cat cp mktemp env; do
   require_cmd "$tool"
   tool_path="$(command -v "$tool")"
   [[ "$tool_path" == /* && -f "$tool_path" && -x "$tool_path" ]] || { echo "tool must resolve to an absolute executable: $tool" >&2; exit 2; }
@@ -117,19 +117,47 @@ if [[ -z "$SOURCE_BUNDLE" ]]; then
           media_type:"application/json", produced_by_bead:"ft-xxfwy.49", proof_categories:[1],
           description:"Fixture only: exercises verifier integrity, not product capability."}))
   }' > "$MANIFEST"
+  artifact_records='[]'
   for index in 0 1 2 3 4; do
     jq -n --argjson index "$index" '{fixture_only:true, fixture_index:$index}' > "$SOURCE_BUILD_DIR/artifact-$index.json"
+    artifact_hash="$(sha256_file "$SOURCE_BUILD_DIR/artifact-$index.json")"
+    artifact_size="$(wc -c < "$SOURCE_BUILD_DIR/artifact-$index.json" | tr -d ' ')"
+    artifact_record="$(jq --argjson index "$index" --arg hash "$artifact_hash" --argjson size "$artifact_size" \
+      '.slots[$index] + {sha256:$hash, size_bytes:$size}' "$MANIFEST")"
+    artifact_records="$(jq -n --argjson records "$artifact_records" --argjson record "$artifact_record" '$records + [$record]')"
   done
-  if ! FT_ATTESTATION_OUT_DIR="$SOURCE_BUILD_DIR" \
-    "${ROOT_DIR}/scripts/attestation-build.sh" \
-      --version 0.0.0-verifier-fixture \
-      --channel dev \
-      --sign unsigned \
-      --strict-deferred > "$OUT_DIR/build.stdout" 2> "$OUT_DIR/build.stderr"; then
-    cat "$OUT_DIR/build.stdout" "$OUT_DIR/build.stderr" >&2
-    exit 1
-  fi
   SOURCE_BUNDLE="$SOURCE_BUILD_DIR/0.0.0-verifier-fixture.json"
+  # Reuse only the tracked dev fixture's schema scaffolding and historical Git
+  # identity. These are synthetic verifier inputs, not a build of this checkout.
+  # The production builder must continue requiring real Git/source authority;
+  # RCH source mirrors intentionally do not contain .git.
+  fixture_payload="$(jq -S -c --argjson artifacts "$artifact_records" --slurpfile manifest "$MANIFEST" '
+    del(.signature)
+    | .release = {channel:"dev", tag:"v0.0.0-verifier-fixture", version:"0.0.0-verifier-fixture"}
+    | .artifacts = $artifacts
+    | .required_categories = $manifest[0].required_categories
+    | .deferred_slots = [] | .retractions = []
+    | .taxonomy_coverage.category_counts |= map(
+        .artifact_count = (if .id == 1 then ($artifacts|length) else 0 end)
+        | .deferred_slot_count = 0 | .below_threshold = (.artifact_count == 0))
+    | .taxonomy_coverage.below_threshold_count = ([.taxonomy_coverage.category_counts[] | select(.below_threshold)]|length)
+    | .taxonomy_coverage.uncategorized_artifact_count = 0
+    | .taxonomy_coverage.delta_from_prior_release = {
+        status:"no_prior_bundle",
+        category_deltas:[.taxonomy_coverage.category_counts[] | {id,slug,artifact_delta:.artifact_count,deferred_slot_delta:0}]}
+    | .confidence_summary.best_confidence_by_category = [
+        .confidence_summary.best_confidence_by_category[] | select(.proof_category == 1)
+        | .claim = "Fixture-only verifier input; no product capability or current source identity is attested."
+        | .source_artifact_path = $artifacts[0].path
+        | .source_artifact_hash = $artifacts[0].sha256
+        | .sample_size_or_state_count.value = ($artifacts|length)]
+    | .confidence_summary.records = .confidence_summary.best_confidence_by_category
+  ' "$ROOT_DIR/crates/frankenterm-core/tests/fixtures/attestation-dev-bundle.json")"
+  fixture_hash="$(printf '%s' "$fixture_payload" | shasum -a 256 | awk '{print $1}')"
+  jq -S --arg hash "$fixture_hash" '
+    .signature = {method:"unsigned", canonical_sha256:$hash,
+      reason:"Fixture-only corpus tracked by ft-a428r. Historical Git and generator metadata belong to the tracked seed, not this checkout; this is not release evidence."}
+  ' <<< "$fixture_payload" > "$SOURCE_BUNDLE"
 else
   [[ -f "$SOURCE_MANIFEST" ]] || { echo "custom source requires FT_ATTESTATION_SELF_TEST_MANIFEST" >&2; exit 2; }
   cp "$SOURCE_MANIFEST" "$MANIFEST"

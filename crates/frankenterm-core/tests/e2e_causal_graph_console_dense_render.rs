@@ -349,7 +349,7 @@ fn operator_text_composes_timeline_tree_and_evidence_without_overlap_ft_1650n_16
         "timeline section header present"
     );
     assert!(
-        text.contains("=== dependency tree"),
+        text.contains("=== causal descendants tree (focus=n1, max_depth=3) ==="),
         "dependency tree section header present"
     );
     assert!(
@@ -358,6 +358,7 @@ fn operator_text_composes_timeline_tree_and_evidence_without_overlap_ft_1650n_16
     );
     // No section header appears more than once (no overlapping
     // double-render).
+    assert_eq!(text.matches("=== causal descendants tree").count(), 1);
     assert_eq!(
         text.matches("=== causal graph timeline ===").count(),
         1,

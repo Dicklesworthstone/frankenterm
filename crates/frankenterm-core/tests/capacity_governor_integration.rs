@@ -26,7 +26,7 @@ fn robot_heavy_cargo_without_rch_requires_policy_approval() {
     assert!(
         decision
             .reason()
-            .is_some_and(|reason| reason.contains("rch exec")),
+            .is_some_and(|reason| reason.contains("rch --no-self-healing exec --")),
         "reason should explain the rch requirement: {:?}",
         decision.reason()
     );
@@ -34,7 +34,7 @@ fn robot_heavy_cargo_without_rch_requires_policy_approval() {
 
 #[test]
 fn robot_heavy_cargo_with_rch_prefix_is_allowed() {
-    let command = "TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core -- --nocapture";
+    let command = "TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core -- --nocapture";
     assert!(is_heavy_cargo_command(command));
     assert!(!requires_rch_offload(command));
 

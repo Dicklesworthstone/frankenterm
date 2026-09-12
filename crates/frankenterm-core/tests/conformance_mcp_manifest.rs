@@ -8,7 +8,7 @@
 #![cfg(feature = "mcp")]
 
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -103,7 +103,11 @@ struct PromptArgumentEntry {
 }
 
 fn capture_manifest_lists(db_path: Option<PathBuf>) -> Value {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let server = match db_path {
+        Some(path) => build_server_with_db(&Config::default(), Some(path)),
+        None => build_server_degraded(&Config::default()),
+    }
+    .expect("build explicitly selected MCP catalog");
 
     let mut tools: Vec<Value> = server
         .tools()
@@ -179,7 +183,11 @@ fn capture_manifest_lists(db_path: Option<PathBuf>) -> Value {
 }
 
 fn capture_resource_template_lists(db_path: Option<PathBuf>) -> Value {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let server = match db_path {
+        Some(path) => build_server_with_db(&Config::default(), Some(path)),
+        None => build_server_degraded(&Config::default()),
+    }
+    .expect("build explicitly selected MCP catalog");
 
     let mut resource_templates: Vec<Value> = server
         .resource_templates()

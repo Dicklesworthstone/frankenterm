@@ -165,11 +165,10 @@ fn scrollback_compaction_preserves_retained_content_and_shrinks_file() {
         "compaction must shrink the physical file to the retained suffix"
     );
 
-    // Golden: the on-disk log holds EXACTLY the retained suffix (proves the file
-    // was atomically replaced via rename, not re-grown from a zeroed file), and
-    // no interrupted-compaction temp leaks.
+    // Golden: the durable base-sequence header precedes exactly the retained
+    // suffix. The header is needed to recover sequence identity on reopen.
     let raw = std::fs::read_to_string(dir.path().join("1.log")).expect("read log");
-    assert_eq!(raw, "line-6\nline-7\n");
+    assert_eq!(raw, "\0FTMMAP1:6\nline-6\nline-7\n");
     assert!(
         !dir.path().join("1.log.compact.tmp").exists(),
         "ft-odrq7: compaction temp must be renamed away, never leaked"

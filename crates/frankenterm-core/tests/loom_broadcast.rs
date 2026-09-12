@@ -24,7 +24,6 @@
 //! Mazurkiewicz trace catalog for broadcast lives at
 //! [docs/runtime/mazurkiewicz-traces.md](../../../../docs/runtime/mazurkiewicz-traces.md).
 
-use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
 
@@ -157,7 +156,6 @@ fn loom_broadcast_cancel_trace_classes_are_declared() {
 fn loom_broadcast_preserves_total_order_across_receivers() {
     loom::model(|| {
         let bus: Arc<LoomBroadcast<usize>> = Arc::new(LoomBroadcast::new());
-        let received_count = Arc::new(AtomicUsize::new(0));
 
         let bus_send = Arc::clone(&bus);
         let sender = thread::spawn(move || {
@@ -166,22 +164,16 @@ fn loom_broadcast_preserves_total_order_across_receivers() {
         });
 
         let bus_a = Arc::clone(&bus);
-        let count_a = Arc::clone(&received_count);
         let receiver_a = thread::spawn(move || {
             let (s0, v0) = bus_a.recv_at(0).unwrap();
-            count_a.fetch_add(1, Ordering::SeqCst);
             let (s1, v1) = bus_a.recv_at(1).unwrap();
-            count_a.fetch_add(1, Ordering::SeqCst);
             (s0, v0, s1, v1)
         });
 
         let bus_b = Arc::clone(&bus);
-        let count_b = Arc::clone(&received_count);
         let receiver_b = thread::spawn(move || {
             let (s0, v0) = bus_b.recv_at(0).unwrap();
-            count_b.fetch_add(1, Ordering::SeqCst);
             let (s1, v1) = bus_b.recv_at(1).unwrap();
-            count_b.fetch_add(1, Ordering::SeqCst);
             (s0, v0, s1, v1)
         });
 
@@ -191,7 +183,9 @@ fn loom_broadcast_preserves_total_order_across_receivers() {
 
         assert_eq!(observed_a, (0, 10, 1, 20));
         assert_eq!(observed_b, (0, 10, 1, 20));
-        assert_eq!(received_count.load(Ordering::SeqCst), 4);
+        // Joining both receivers and checking both complete tuples proves all
+        // four deliveries. A separate shared counter adds unrelated atomic
+        // interleavings to Loom without strengthening the broadcast contract.
     });
 }
 

@@ -182,9 +182,9 @@ fn validate_token_works_with_token_and_mtls_mode() {
 }
 
 #[test]
-fn validate_token_empty_identity_part_treated_as_no_identity() {
-    // ":secret" should parse as identity=None, secret=":secret" (whole thing)
-    // because the identity part is empty after trim
+fn validate_token_empty_identity_is_rejected() {
+    // An identity separator must not downgrade a malformed identity into a
+    // bare shared secret, even when both malformed tokens match.
     assert!(
         validate_token(
             DistributedAuthMode::Token,
@@ -192,7 +192,7 @@ fn validate_token_empty_identity_part_treated_as_no_identity() {
             Some(":secret"),
             None,
         )
-        .is_ok()
+        .is_err()
     );
 }
 
@@ -876,19 +876,16 @@ fn credential_error_display_messages() {
 
 #[test]
 fn validate_token_colon_only_token() {
-    // Just ":" — identity is empty, secret is empty
-    // This should fail because empty secret after identity
-    // The parser treats ":something" as identity=None, secret=":something"
-    // And ":" as identity=None, secret=":"
+    // Both the identity and secret are empty. Equality cannot authenticate it.
     assert!(
-        validate_token(DistributedAuthMode::Token, Some(":"), Some(":"), None,).is_ok(),
-        "matching colon-only tokens should pass"
+        validate_token(DistributedAuthMode::Token, Some(":"), Some(":"), None,).is_err(),
+        "matching colon-only tokens must be rejected"
     );
 }
 
 #[test]
 fn validate_token_whitespace_identity() {
-    // " :secret" — identity is whitespace-only, treated as no identity
+    // Whitespace-only identities must not downgrade to bare shared secrets.
     assert!(
         validate_token(
             DistributedAuthMode::Token,
@@ -896,7 +893,7 @@ fn validate_token_whitespace_identity() {
             Some(" :secret"),
             None,
         )
-        .is_ok()
+        .is_err()
     );
 }
 

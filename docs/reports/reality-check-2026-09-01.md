@@ -43,7 +43,7 @@ _Bead: `ft-at08r` (BR-RC-WEEKLY-DRUMBEAT)._
 | ------ | -- | ----- |
 | closed | ft-i2eni | [BR-RC-DOCTRINE] Reality-check Doctrine epic — make code+docs match stated doctrine |
 | closed | ft-i2eni.1 | [BR-RC-DOCTRINE.G1.1] RuntimeProof sealed trait + tokio type-level seal |
-| closed | ft-i2eni.2 | [BR-RC-DOCTRINE.G1.2] asupersync_test! proc-macro replacing 60 #[tokio::test] sites |
+| closed | ft-i2eni.2 | [BR-RC-DOCTRINE.G1.2] asupersync_test! proc-macro replacing 60 legacy Tokio test attributes |
 | closed | ft-i2eni.3 | [BR-RC-DOCTRINE.G1.3] cargo-deny ban on tokio in first-party crates |
 | closed | ft-i2eni.4 | [BR-RC-DOCTRINE.G4] Rename 4 vendored wezterm-* crates to frankenterm-* |
 | closed | ft-i2eni.5 | [BR-RC-DOCTRINE.G6] Auto-stamp README/AGENTS counts via build-time queries |
@@ -258,7 +258,7 @@ _Bead: `ft-at08r` (BR-RC-WEEKLY-DRUMBEAT)._
 | closed | ft-tf6g3.56 | [mock-code-finder][perf-gate] Reconcile SNC service-curve API with direct-delay quantile implementation |
 | closed | ft-tf6g3.6 | [reality-check-2026-05-12 G21] Mazurkiewicz cancel-trace equivalence classes for runtime_async primitives |
 | closed | ft-tf6g3.6.1 | [attestation][runtime-async] Mark cancel-trace binary hashes as transient provenance |
-| closed | ft-tf6g3.7 | [reality-check-2026-05-12 G22] cargo-deny tokio CI step + supported-path #[tokio::test] purge |
+| closed | ft-tf6g3.7 | [reality-check-2026-05-12 G22] cargo-deny Tokio gate + supported-path legacy Tokio test attribute purge |
 | closed | ft-tf6g3.8 | [reality-check-2026-05-12 G23] Lindley-equation latency derivation finalize + per-release publish |
 | closed | ft-tf6g3.9 | [reality-check-2026-05-12 G24] Fano-inequality redaction recall lower bound + per-release publish |
 | closed | ft-ux9kb | [test][rch-admission] e2e: live collector populates from real probes + doctor surface is accurate/data-driven (ft-69gwh.5/.9) |

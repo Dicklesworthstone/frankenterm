@@ -141,29 +141,27 @@ fn manifest_is_well_formed_and_lists_expected_guards() {
 }
 
 #[test]
-fn ci_binding_points_to_expected_workflow() {
+fn release_binding_points_to_dsr_gate() {
     let manifest_path = workspace_root().join("docs/ft-xbnl0-5-2-finish-line-guards.json");
     let parsed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    let workflow_rel = parsed["ci_binding"]["workflow_path"]
+    assert_eq!(parsed["release_binding"]["system"], "dsr");
+    let gate_rel = parsed["release_binding"]["gate_path"]
         .as_str()
-        .expect("ci_binding.workflow_path required");
-    let workflow_abs = workspace_root().join(workflow_rel);
+        .expect("release_binding.gate_path required");
+    assert_eq!(gate_rel, "scripts/release-gates.sh");
+    let gate_abs = workspace_root().join(gate_rel);
     assert!(
-        workflow_abs.exists(),
-        "ci_binding.workflow_path points to missing file: {}",
-        workflow_abs.display()
+        gate_abs.exists(),
+        "release_binding.gate_path points to missing file: {}",
+        gate_abs.display()
     );
 
-    // The workflow must name the composition script so CI actually runs it.
-    let workflow = std::fs::read_to_string(&workflow_abs).expect("workflow readable");
+    let gate = std::fs::read_to_string(&gate_abs).expect("DSR gate readable");
     assert!(
-        workflow.contains("check_finish_line_guards.sh"),
-        "CI workflow must invoke the composition script"
-    );
-    assert!(
-        workflow.contains("ft_xbnl0_5_2_finish_line_guards"),
-        "CI workflow must exercise the ft-xbnl0.5.2 integration test surface"
+        gate.lines().any(|line| line.starts_with("cargo_gate ")
+            && line.contains("bash scripts/check_finish_line_guards.sh")),
+        "DSR release gates must invoke the composition script"
     );
 }
 

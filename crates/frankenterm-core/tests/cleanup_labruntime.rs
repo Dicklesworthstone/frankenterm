@@ -1560,9 +1560,19 @@ fn multiple_tiers_all_zero_retention_produces_no_event_entries() {
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
         assert!(
-            !plan.tables.iter().any(|t| t.table.starts_with("events")),
+            !plan
+                .tables
+                .iter()
+                .any(|t| t.table.starts_with("events (tier:")),
             "all zero-retention tiers should be skipped"
         );
+        let fallback = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "events (global fallback)")
+            .expect("global fallback remains observable");
+        assert_eq!(fallback.eligible_rows, 0);
+        assert_eq!(fallback.deleted_rows, 0);
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
         assert_eq!(remaining, 2);

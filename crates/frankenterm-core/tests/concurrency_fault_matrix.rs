@@ -45,8 +45,8 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use asupersync::lab::explorer::ScheduleExplorer;
 use asupersync::{Budget, LabRuntime};
@@ -56,6 +56,33 @@ use frankenterm_core::chaos::{
 };
 
 use common::lab::{ExplorationTestConfig, LabTestConfig, run_lab_test};
+
+// FaultInjector is process-global. Serialize complete scenarios, including
+// teardown, while preserving the concurrency explored inside each scenario.
+static FAULT_SCENARIO: Mutex<()> = Mutex::new(());
+
+struct FaultScenarioGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for FaultScenarioGuard {
+    fn drop(&mut self) {
+        FaultInjector::reset_global();
+    }
+}
+
+fn fault_scenario_guard() -> FaultScenarioGuard {
+    let guard = FAULT_SCENARIO.lock().unwrap_or_else(|err| err.into_inner());
+    FaultInjector::reset_global();
+    FaultScenarioGuard { _guard: guard }
+}
+
+fn workload_region(runtime: &mut LabRuntime) -> asupersync::types::RegionId {
+    runtime
+        .state
+        .root_region
+        .unwrap_or_else(|| runtime.state.create_root_region(Budget::INFINITE))
+}
 
 // =============================================================================
 // Shared test state
@@ -203,7 +230,7 @@ fn pool_acquire_release_workload(
     state: &Arc<SharedWorkloadState>,
     task_count: u64,
 ) {
-    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let region = workload_region(runtime);
     for task_id in 0..task_count {
         let st = Arc::clone(state);
         let (tid, _handle) = runtime
@@ -240,7 +267,7 @@ fn channel_pipeline_workload(
     consumer_count: u64,
 ) {
     let events = Arc::new(AtomicU64::new(0));
-    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let region = workload_region(runtime);
 
     // Producers
     for task_id in 0..producer_count {
@@ -291,7 +318,7 @@ fn shared_mutation_workload(
     ops_per_task: u64,
 ) {
     let shared_counter = Arc::new(AtomicU64::new(0));
-    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let region = workload_region(runtime);
 
     for task_id in 0..task_count {
         let st = Arc::clone(state);
@@ -322,7 +349,7 @@ fn event_dispatch_workload(
     dispatcher_count: u64,
 ) {
     let dispatch_results = Arc::new(AtomicU64::new(0));
-    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let region = workload_region(runtime);
 
     for task_id in 0..dispatcher_count {
         let st = Arc::clone(state);
@@ -362,6 +389,7 @@ struct MatrixCellResult {
     ops_attempted: u64,
     ops_succeeded: u64,
     ops_failed: u64,
+    fault_triggers: usize,
 }
 
 /// Run a single matrix cell: workload x fault profile across DPOR seeds.
@@ -375,14 +403,12 @@ fn run_matrix_cell<W>(
 where
     W: Fn(&mut LabRuntime, &Arc<SharedWorkloadState>) + Send + Sync,
 {
+    let _scenario = fault_scenario_guard();
     let test_name = format!("cfm/{workload_name}/{scenario_name}");
 
     // Set up global fault injector
     let injector = FaultInjector::init_global();
     injector.clear_all();
-    for (point, mode) in faults {
-        injector.set_fault(*point, mode.clone());
-    }
 
     let final_state = SharedWorkloadState::new();
     let captured_state = Arc::clone(&final_state);
@@ -395,14 +421,18 @@ where
     let explorer_config = config.to_explorer_config();
     let mut explorer = ScheduleExplorer::new(explorer_config);
 
+    let fault_triggers = AtomicU64::new(0);
     let inner = explorer.explore(|runtime| {
-        // Reset fault counters per exploration run
-        if let Some(inj) = FaultInjector::global() {
-            let _ = inj.drain_log();
+        // Each schedule must start with the same fault budget and RNG state.
+        // Draining the log alone leaves fail_n_times exhausted on later runs.
+        injector.clear_all();
+        for (point, mode) in faults {
+            injector.set_fault(*point, mode.clone());
         }
 
         workload_fn(runtime, &captured_state);
         runtime.run_until_quiescent();
+        fault_triggers.fetch_add(injector.total_fired() as u64, Ordering::Relaxed);
     });
 
     let has_violations = inner.has_violations();
@@ -422,6 +452,7 @@ where
         ops_attempted: final_state.ops_attempted.load(Ordering::SeqCst),
         ops_succeeded: final_state.ops_succeeded.load(Ordering::SeqCst),
         ops_failed: final_state.ops_failed.load(Ordering::SeqCst),
+        fault_triggers: fault_triggers.load(Ordering::Relaxed) as usize,
     }
 }
 
@@ -456,6 +487,8 @@ fn cfm_pool_single_fault() {
         |runtime, state| pool_acquire_release_workload(runtime, state, 4),
     );
     assert!(result.all_passed, "pool/single_db_write failed: {result:?}");
+    assert_eq!(result.ops_failed, result.total_runs as u64);
+    assert_eq!(result.fault_triggers, result.total_runs);
 }
 
 #[test]
@@ -654,6 +687,7 @@ fn cfm_dispatch_cascade() {
 /// Run the full matrix as a ChaosScenario, validating assertion predicates.
 #[test]
 fn cfm_full_matrix_chaos_scenario() {
+    let _scenario = fault_scenario_guard();
     let scenario = ChaosScenario::new(
         "full_cfm_chaos",
         "Full concurrency fault matrix with chaos assertions",
@@ -712,6 +746,7 @@ fn cfm_full_matrix_chaos_scenario() {
 /// Verify CFM-5: after faults are cleared, operations resume successfully.
 #[test]
 fn cfm_recovery_after_fault_clearance() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -759,6 +794,7 @@ fn cfm_recovery_after_fault_clearance() {
 /// Verify CFM-7: cancelled tasks don't corrupt shared state.
 #[test]
 fn cfm_cancellation_safety() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -1070,6 +1106,7 @@ fn cfm_drain_timeout_race() {
 /// doesn't drop work during rate-limit waits.
 #[test]
 fn cfm_scenario_rate_limit_wait() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -1124,6 +1161,7 @@ fn cfm_scenario_rate_limit_wait() {
 /// Verifies CFM-5 (recovery) in a user-facing context.
 #[test]
 fn cfm_scenario_reconnect_storm() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -1180,6 +1218,7 @@ fn cfm_scenario_reconnect_storm() {
 /// WezTerm CLI is temporarily unreachable.
 #[test]
 fn cfm_scenario_remote_command_retry() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -1236,6 +1275,7 @@ fn cfm_scenario_remote_command_retry() {
 /// initialize and serve requests once I/O recovers.
 #[test]
 fn cfm_scenario_startup_degraded_io() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -1313,6 +1353,7 @@ fn cfm_scenario_startup_degraded_io() {
 /// shared state remains consistent when many tasks are abruptly stopped.
 #[test]
 fn cfm_scenario_cancellation_storm() {
+    let _scenario = fault_scenario_guard();
     let injector = FaultInjector::init_global();
     injector.clear_all();
 
@@ -1445,10 +1486,7 @@ where
 {
     let result = run_matrix_cell(workload_name, scenario_name, faults, max_runs, workload_fn);
 
-    let triggers = FaultInjector::global()
-        .map(|inj| inj.total_fired())
-        .unwrap_or(0);
-    let telemetry = CfmTestResult::from_cell(&result, triggers);
+    let telemetry = CfmTestResult::from_cell(&result, result.fault_triggers);
 
     if let Ok(json) = serde_json::to_string(&telemetry) {
         tracing::info!(
@@ -1537,6 +1575,7 @@ fn cfm_full_telemetry_matrix() {
 /// produces identical results (CFM determinism guarantee).
 #[test]
 fn cfm_determinism() {
+    let _scenario = fault_scenario_guard();
     let run = |seed: u64| -> (u64, u64, u64) {
         let injector = FaultInjector::init_global();
         injector.clear_all();

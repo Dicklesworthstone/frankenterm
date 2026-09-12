@@ -263,12 +263,12 @@ fn running_agents_without_installed_inventory_still_generate_configs() {
     // Agent running in pane but NOT in filesystem (e.g., installed in non-default location)
     correlator.ingest_detections(5, &[detection("core.codex:tool_use", AgentType::Codex)]);
 
-    let inv = correlator.inventory();
+    let mut inv = correlator.inventory();
     assert_eq!(inv.running.len(), 1);
-    assert_eq!(
-        inv.installed,
-        [] as [frankenterm_core::agent_correlator::InstalledAgentInventoryEntry; 0]
-    ); // No filesystem detection happened
+    // inventory() performs best-effort discovery when enabled. Explicitly
+    // exercise a consumer snapshot without installation evidence, independent
+    // of tools installed on the build worker.
+    inv.installed.clear();
 
     // Should still be able to generate configs from running slugs
     let slugs: Vec<String> = inv.running.values().map(|r| r.slug.clone()).collect();

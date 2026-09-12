@@ -139,8 +139,14 @@ fn production_storage_redacts_split_secret_in_sqlite_and_mmap_mirror() {
             .await
             .expect("append second split");
 
-        assert_eq!(first_segment.content, "pane wrote ");
-        assert_eq!(first_segment.content_hash, None);
+        // Append returns an immutable snapshot. The incomplete prefix is not
+        // yet a credential; completing it must retroactively redact the durable
+        // first row, which the SQLite and mirror assertions below verify.
+        assert_eq!(first_segment.content, first);
+        assert_eq!(
+            first_segment.content_hash.as_deref(),
+            Some("raw-hash-first")
+        );
         assert!(!second_segment.content.contains(secret));
         assert!(second_segment.content.contains(REDACTED_MARKER));
         assert_eq!(second_segment.content_hash, None);

@@ -13,6 +13,38 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Clock for the signed January/February 2026 TLS fixtures. The production
+/// verifier still checks certificate validity; only the test's wall clock is
+/// deterministic. Freshly generated PKI integration tests use the real clock.
+#[cfg(feature = "distributed")]
+#[derive(Debug)]
+pub struct FixtureTlsClock(pub u64);
+
+#[cfg(feature = "distributed")]
+impl rustls::time_provider::TimeProvider for FixtureTlsClock {
+    fn current_time(&self) -> Option<rustls::pki_types::UnixTime> {
+        Some(rustls::pki_types::UnixTime::since_unix_epoch(
+            std::time::Duration::from_secs(self.0),
+        ))
+    }
+}
+
+#[cfg(feature = "distributed")]
+pub fn build_fixture_tls_bundle(
+    config: &frankenterm_core::config::DistributedConfig,
+    server_ca_path: Option<&std::path::Path>,
+) -> Result<
+    frankenterm_core::distributed::DistributedTlsBundle,
+    frankenterm_core::distributed::DistributedTlsError,
+> {
+    let mut bundle = frankenterm_core::distributed::build_tls_bundle(config, server_ca_path)?;
+    // 2026-02-15T00:00:00Z lies inside both the original and rotated fixtures.
+    let clock = Arc::new(FixtureTlsClock(1_771_113_600));
+    Arc::make_mut(&mut bundle.server).time_provider = clock.clone();
+    Arc::make_mut(&mut bundle.client).time_provider = clock;
+    Ok(bundle)
+}
+
 // ---------------------------------------------------------------------------
 // MockPool — simulates a connection pool using Semaphore + Mutex
 // ---------------------------------------------------------------------------

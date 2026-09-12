@@ -1,5 +1,10 @@
 #![cfg(feature = "distributed")]
 
+#[path = "common/fixtures.rs"]
+mod fixtures;
+
+use fixtures::{FixtureTlsClock, build_fixture_tls_bundle};
+
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,8 +14,7 @@ use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
 use frankenterm_core::config::{DistributedAuthMode, DistributedConfig, DistributedTlsConfig};
 use frankenterm_core::distributed::{
-    DistributedSecurityError, SessionReplayGuard, build_tls_bundle, resolve_expected_token,
-    validate_token,
+    DistributedSecurityError, SessionReplayGuard, resolve_expected_token, validate_token,
 };
 use frankenterm_core::runtime_async::{task, timeout};
 
@@ -156,7 +160,7 @@ fn distributed_security_e2e_tls_required_happy_path_with_artifacts() {
             ..Default::default()
         };
 
-        let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
+        let bundle = build_fixture_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
         let payload = b"secure-path";
         let received = tls_round_trip(
             Arc::clone(&bundle.server),
@@ -255,9 +259,10 @@ fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
             ..Default::default()
         };
 
-        let trusted_bundle = build_tls_bundle(&config, Some(trusted_ca.path())).expect("trusted");
+        let trusted_bundle =
+            build_fixture_tls_bundle(&config, Some(trusted_ca.path())).expect("trusted");
         let untrusted_bundle =
-            build_tls_bundle(&config, Some(untrusted_ca.path())).expect("untrusted");
+            build_fixture_tls_bundle(&config, Some(untrusted_ca.path())).expect("untrusted");
 
         assert!(
             tls_handshake_rejected(
@@ -274,6 +279,23 @@ fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
         .await
         .expect("trusted success");
         assert_eq!(success.as_slice(), b"ok");
+
+        // The fixture clock must not bypass validity checks. The same trusted
+        // certificate is rejected after its March 2026 expiry, with every
+        // other TLS input unchanged.
+        let mut expired_client = (*trusted_bundle.client).clone();
+        expired_client.time_provider = Arc::new(FixtureTlsClock(1_800_000_000));
+        let expired = tls_round_trip(
+            Arc::clone(&trusted_bundle.server),
+            Arc::new(expired_client),
+            b"expired",
+        )
+        .await
+        .expect_err("expired certificate must fail validation");
+        assert!(
+            expired.contains("expired"),
+            "unexpected rejection: {expired}"
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -424,8 +446,10 @@ fn distributed_security_e2e_auth_replay_and_rotation() {
             ..Default::default()
         };
 
-        let old_bundle = build_tls_bundle(&old_config, Some(old_ca.path())).expect("old bundle");
-        let new_bundle = build_tls_bundle(&new_config, Some(new_ca.path())).expect("new bundle");
+        let old_bundle =
+            build_fixture_tls_bundle(&old_config, Some(old_ca.path())).expect("old bundle");
+        let new_bundle =
+            build_fixture_tls_bundle(&new_config, Some(new_ca.path())).expect("new bundle");
 
         let old_exchange = tls_round_trip(
             Arc::clone(&old_bundle.server),
@@ -487,7 +511,7 @@ fn distributed_security_perf_budgets_within_initial_thresholds() {
             ..Default::default()
         };
 
-        let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
+        let bundle = build_fixture_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
 
         let mut handshake_samples_ms = Vec::with_capacity(PERF_HANDSHAKE_ROUNDS);
         for _ in 0..PERF_HANDSHAKE_ROUNDS {

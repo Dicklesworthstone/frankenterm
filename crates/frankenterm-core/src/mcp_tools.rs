@@ -14622,7 +14622,7 @@ mod tests {
     }
 
     fn test_mcp_context() -> McpContext {
-        McpContext::new(fastmcp::Cx::for_testing(), 1)
+        McpContext::new(crate::mcp_framework::FrameworkCx::for_testing(), 1)
     }
 
     fn set_tx_run_test_wezterm_override(handle: Option<crate::wezterm::WeztermHandle>) {
@@ -20871,7 +20871,7 @@ mod tests {
                 Arc::clone(&db),
                 backend as crate::wezterm::WeztermHandle,
             );
-            let request_cx = fastmcp::Cx::for_testing();
+        let request_cx = crate::mcp_framework::FrameworkCx::for_testing();
             let context = McpContext::new(request_cx, 1);
 
             let envelope = parse_json_content(
@@ -20947,7 +20947,7 @@ mod tests {
                 Arc::clone(&db),
                 backend as crate::wezterm::WeztermHandle,
             );
-            let context = McpContext::new(fastmcp::Cx::for_testing(), 1);
+            let context = McpContext::new(crate::mcp_framework::FrameworkCx::for_testing(), 1);
 
             let envelope = parse_json_content(
                 tool.call(

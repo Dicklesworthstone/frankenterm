@@ -1705,7 +1705,7 @@ fn verify_degraded_fixture_emits_operator_summary() {
     );
     assert_eq!(
         result.summary.proof_rch_status.as_deref(),
-        Some("timeout after 300000ms")
+        Some("timeout:unknown:unknown after 300000ms")
     );
     assert_eq!(
         result.summary.process_sample.as_deref(),

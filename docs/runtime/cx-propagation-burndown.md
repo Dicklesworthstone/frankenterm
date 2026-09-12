@@ -31,21 +31,23 @@ exits 1 and CI fails the PR.
 ## Snapshot shape
 
 `docs/runtime/cx-propagation.json` is overwritten on each run.
-Its shape (schema v2):
+Its shape (schema v3; eager settled futures and independent adapters remain distinct):
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "generated_at": "<UTC ISO-8601>",
   "totals": {
     "total_sites": <int>,
+    "eager_settled_future_sites": <int>,
+    "independent_context_adapter_sites": <int>,
     "covered_sites": <int>,
     "wrapper_exempt_sites": <int>,
     "exempt_file_sites": <int>,
     "uncovered_sites": <int>
   },
   "buckets": {
-    "capture":     { "total", "covered", "wrapper_exempt", "exempt_file", "uncovered", "files": [...] },
+    "capture":     { "total", "covered", "eager_settled_future", "independent_adapter", "wrapper_exempt", "exempt_file", "uncovered", "files": [...] },
     "workflow":    {...},
     "web_sse":     {...},
     "mcp":         {...},

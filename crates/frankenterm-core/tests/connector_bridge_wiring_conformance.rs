@@ -151,8 +151,8 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
             "no_silent_drop": contains_all(
                 &inbound,
                 &[
-                    "let delivered = self.event_bus.publish(event);",
-                    "delivered_count: delivered",
+                    "let delivered_count = self.event_bus.publish(Event::PatternDetected",
+                    "delivered_count,",
                     "events_published",
                 ],
             ),

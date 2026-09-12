@@ -91,40 +91,69 @@ fn execution_error_without_id() -> WorkflowExecutionResult {
 #[test]
 fn workflow_start_started_matches_golden() {
     assert_json_snapshot!(
-        "workflow_start_started",
         started_result(),
-        { ".execution_id" => "[execution_id]" }
+        { ".execution_id" => "[execution_id]" },
+        @r###"
+    {
+      "type": "started",
+      "execution_id": "[execution_id]",
+      "workflow_name": "handle_usage_limits"
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_start_pane_locked_matches_golden() {
     assert_json_snapshot!(
-        "workflow_start_pane_locked",
         pane_locked_result(),
         {
             ".held_by_execution" => "[execution_id]",
             ".pane_id" => "[pane_id]",
-        }
+        },
+        @r###"
+    {
+      "type": "pane_locked",
+      "pane_id": "[pane_id]",
+      "held_by_workflow": "handle_compaction",
+      "held_by_execution": "[execution_id]"
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_start_no_matching_workflow_matches_golden() {
-    assert_json_snapshot!("workflow_start_no_matching", no_matching_workflow_result());
+    assert_json_snapshot!(no_matching_workflow_result(), @r###"
+    {
+      "type": "no_matching_workflow",
+      "rule_id": "codex.unknown_event"
+    }
+    "###);
 }
 
 #[test]
 fn workflow_start_concurrency_limit_matches_golden() {
     assert_json_snapshot!(
-        "workflow_start_concurrency_limit",
-        concurrency_limit_result()
+        concurrency_limit_result(),
+        @r###"
+    {
+      "type": "concurrency_limit_reached",
+      "active": 8,
+      "limit": 8
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_start_error_matches_golden() {
-    assert_json_snapshot!("workflow_start_error", start_error_result());
+    assert_json_snapshot!(start_error_result(), @r###"
+    {
+      "type": "error",
+      "error": "workflow registry unavailable"
+    }
+    "###);
 }
 
 // ── WorkflowExecutionResult variants ────────────────────────────────────────
@@ -132,50 +161,88 @@ fn workflow_start_error_matches_golden() {
 #[test]
 fn workflow_execution_completed_matches_golden() {
     assert_json_snapshot!(
-        "workflow_execution_completed",
         completed_result(),
         {
             ".execution_id" => "[execution_id]",
             ".elapsed_ms" => "[elapsed_ms]",
-        }
+        },
+        @r###"
+    {
+      "type": "completed",
+      "execution_id": "[execution_id]",
+      "result": {
+        "account_switched": true,
+        "new_account": "alice@codex"
+      },
+      "elapsed_ms": "[elapsed_ms]",
+      "steps_executed": 6
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_execution_aborted_matches_golden() {
     assert_json_snapshot!(
-        "workflow_execution_aborted",
         aborted_result(),
         {
             ".execution_id" => "[execution_id]",
             ".elapsed_ms" => "[elapsed_ms]",
-        }
+        },
+        @r###"
+    {
+      "type": "aborted",
+      "execution_id": "[execution_id]",
+      "reason": "user cancelled via Ctrl-C",
+      "step_index": 3,
+      "elapsed_ms": "[elapsed_ms]"
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_execution_policy_denied_matches_golden() {
     assert_json_snapshot!(
-        "workflow_execution_policy_denied",
         policy_denied_result(),
-        { ".execution_id" => "[execution_id]" }
+        { ".execution_id" => "[execution_id]" },
+        @r###"
+    {
+      "type": "policy_denied",
+      "execution_id": "[execution_id]",
+      "step_index": 2,
+      "reason": "send blocked by send_text_policy"
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_execution_error_with_id_matches_golden() {
     assert_json_snapshot!(
-        "workflow_execution_error_with_id",
         execution_error_with_id(),
-        { ".execution_id" => "[execution_id]" }
+        { ".execution_id" => "[execution_id]" },
+        @r###"
+    {
+      "type": "error",
+      "execution_id": "[execution_id]",
+      "error": "workflow handler panicked"
+    }
+    "###
     );
 }
 
 #[test]
 fn workflow_execution_error_without_id_matches_golden() {
     assert_json_snapshot!(
-        "workflow_execution_error_without_id",
-        execution_error_without_id()
+        execution_error_without_id(),
+        @r###"
+    {
+      "type": "error",
+      "execution_id": null,
+      "error": "registry lookup failed before execution id was assigned"
+    }
+    "###
     );
 }
 

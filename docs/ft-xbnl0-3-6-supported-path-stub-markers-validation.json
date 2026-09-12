@@ -65,7 +65,7 @@
     }
   ],
   "bead_id": "ft-g6lfc",
-  "checked_at": "2026-08-31T06:08:39Z",
+  "checked_at": "2026-09-12T00:50:30Z",
   "contract_id": "ft.xbnl0.3.6.supported_path_stub_markers.v1",
   "scan_roots": [
     "crates",
@@ -74,7 +74,7 @@
   "status": "passed",
   "totals": {
     "allowed_markers": 9,
-    "rust_files_scanned": 1267,
+    "rust_files_scanned": 1265,
     "unexpected_markers": 0
   },
   "unexpected_markers": [],

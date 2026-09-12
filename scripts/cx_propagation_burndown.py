@@ -2,19 +2,21 @@
 """Cx-propagation burn-down dashboard generator (ft-t9a6q.2).
 
 Reads the audit script's --json output, categorizes every
-`pub async fn` site into one of 7 priority buckets per the
+`pub async fn` site into seven priority buckets or the remaining `other` bucket per the
 parent bead's call-path criticality ranking, and emits:
 
   docs/runtime/cx-propagation.json
       Latest snapshot. Overwritten on each run. Shape:
       {
-        "schema_version": 1,
+        "schema_version": 3,
         "generated_at": "<UTC ISO-8601>",
         "totals": { "total_sites", "covered_sites",
+                    "eager_settled_future_sites", "independent_context_adapter_sites",
                     "wrapper_exempt_sites", "exempt_file_sites",
                     "uncovered_sites" },
         "buckets": {
-          "capture":     { "total", "covered", "wrapper_exempt",
+          "capture":     { "total", "covered", "wrapper_exempt", "exempt_file",
+                           "eager_settled_future", "independent_adapter",
                            "uncovered", "files": ["..."] },
           "workflow":    {...},
           "web_sse":     {...},
@@ -29,12 +31,12 @@ parent bead's call-path criticality ranking, and emits:
   docs/runtime/cx-propagation-trend.jsonl
       Append-only weekly trend. One JSON object per line:
       { "timestamp": "...", "totals": {...}, "buckets": {...} }
-      Run from CI on a weekly cron — tail-truncated reads
+      Run from a scheduled quality gate — tail-truncated reads
       give the burn-down curve.
 
 Usage:
   scripts/cx_propagation_burndown.py            # write snapshot + append trend
-  scripts/cx_propagation_burndown.py --no-trend # snapshot only (CI dry-runs)
+  scripts/cx_propagation_burndown.py --no-trend # snapshot only (quality dry-runs)
   scripts/cx_propagation_burndown.py --check    # exit 1 if uncovered_sites > 0
 
 Bead: ft-t9a6q.2 (BR-RC-RUNTIME-SEMANTICS.G14.2).
@@ -58,7 +60,7 @@ SNAPSHOT_PATH = REPO_ROOT / "docs" / "runtime" / "cx-propagation.json"
 TREND_PATH = REPO_ROOT / "docs" / "runtime" / "cx-propagation-trend.jsonl"
 CORE_SRC = REPO_ROOT / "crates" / "frankenterm-core" / "src"
 CORE_TESTS = REPO_ROOT / "crates" / "frankenterm-core" / "tests"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Regex matching the LabRuntime fixture's call sites. Three
 # variants (lab_runtime_test / _with_seed / _with_config) plus
@@ -168,13 +170,19 @@ def run_audit() -> dict:
             "stderr:\n" + res.stderr
         )
         sys.exit(2)
-    return json.loads(res.stdout)
+    audit = json.loads(res.stdout)
+    if audit.get("wrapper_audit_errors"):
+        raise ValueError("Cx audit contains invalid wrapper/proof classifications: "
+                         + repr(audit["wrapper_audit_errors"]))
+    return audit
 
 
 def empty_bucket() -> dict:
     return {
         "total": 0,
         "covered": 0,
+        "eager_settled_future": 0,
+        "independent_adapter": 0,
         "wrapper_exempt": 0,
         "exempt_file": 0,
         "uncovered": 0,
@@ -275,10 +283,11 @@ def build_snapshot(audit: dict) -> dict:
             continue
         b["total"] += stats["total"]
         b["covered"] += stats.get("covered", 0)
+        b["eager_settled_future"] += stats.get("eager_settled_future", 0)
+        b["independent_adapter"] += stats.get("independent_adapter", 0)
         b["wrapper_exempt"] += stats.get("wrapper_exempt", 0)
         b["uncovered"] += stats.get("uncovered", 0)
-        if stats.get("exempt_file"):
-            b["exempt_file"] += stats["total"]
+        b["exempt_file"] += stats.get("exempt", 0)
         b["files"].append(rel_path)
     for bucket in buckets.values():
         bucket["files"].sort()
@@ -286,10 +295,20 @@ def build_snapshot(audit: dict) -> dict:
     totals = {
         "total_sites": audit.get("total_sites", 0),
         "covered_sites": audit.get("covered_sites", 0),
+        "eager_settled_future_sites": audit.get("eager_settled_future_sites", 0),
+        "independent_context_adapter_sites": audit.get("independent_context_adapter_sites", 0),
         "wrapper_exempt_sites": audit.get("wrapper_exempt_sites", 0),
         "exempt_file_sites": audit.get("exempt_files_sites", 0),
         "uncovered_sites": audit.get("uncovered_sites", 0),
     }
+    classified = sum(value for key, value in totals.items() if key != "total_sites")
+    if classified != totals["total_sites"]:
+        raise ValueError("Cx audit classifications do not sum to the total census")
+    for name, bucket in buckets.items():
+        classified = sum(value for key, value in bucket.items()
+                         if key not in ("total", "files"))
+        if classified != bucket["total"]:
+            raise ValueError(f"Cx bucket {name} classifications do not sum to its census")
     lab_calls = scan_labruntime_calls()
     labruntime_coverage = build_labruntime_coverage(audit, lab_calls)
 

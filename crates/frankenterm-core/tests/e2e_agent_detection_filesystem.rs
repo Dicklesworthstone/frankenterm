@@ -5,7 +5,7 @@
 //! layer in `agent_correlator`.
 //!
 //! Coverage targets:
-//! - All 9 known connectors with fixture directories
+//! - Nine explicitly scoped connectors with fixture directories
 //! - Partial, empty, and corrupt installations
 //! - Evidence string validation per detected agent
 //! - Detection timing (sub-50ms on mock filesystem)
@@ -21,7 +21,8 @@ mod filesystem_detection {
     };
     use tempfile::TempDir;
 
-    /// All 9 known connector slugs in sorted order (matching KNOWN_CONNECTORS).
+    /// Stable fixture coverage, scoped explicitly so other connectors never
+    /// inspect the build worker's real home directory.
     const ALL_SLUGS: &[&str] = &[
         "claude",
         "cline",
@@ -76,12 +77,12 @@ mod filesystem_detection {
     // =====================================================================
 
     #[test]
-    fn detect_all_9_agents_with_fixtures() {
+    fn detect_all_fixture_agents() {
         let (_tmp, overrides) = fixture_with_agents(ALL_SLUGS);
 
         let report =
             frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
-                only_connectors: None,
+                only_connectors: Some(ALL_SLUGS.iter().map(|slug| (*slug).to_string()).collect()),
                 include_undetected: true,
                 root_overrides: overrides,
             })
@@ -111,7 +112,7 @@ mod filesystem_detection {
 
         let report =
             frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
-                only_connectors: None,
+                only_connectors: Some(ALL_SLUGS.iter().map(|slug| (*slug).to_string()).collect()),
                 include_undetected: true,
                 root_overrides: overrides,
             })
@@ -174,7 +175,7 @@ mod filesystem_detection {
 
         let report =
             frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
-                only_connectors: None,
+                only_connectors: Some(ALL_SLUGS.iter().map(|slug| (*slug).to_string()).collect()),
                 include_undetected: true,
                 root_overrides: overrides,
             })
@@ -250,7 +251,7 @@ mod filesystem_detection {
 
         let report =
             frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
-                only_connectors: None,
+                only_connectors: Some(ALL_SLUGS.iter().map(|slug| (*slug).to_string()).collect()),
                 include_undetected: true,
                 root_overrides: overrides,
             })
@@ -371,7 +372,7 @@ mod filesystem_detection {
         let start = std::time::Instant::now();
         let _report =
             frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
-                only_connectors: None,
+                only_connectors: Some(ALL_SLUGS.iter().map(|slug| (*slug).to_string()).collect()),
                 include_undetected: true,
                 root_overrides: overrides,
             })
@@ -395,7 +396,7 @@ mod filesystem_detection {
 
         let report =
             frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
-                only_connectors: None,
+                only_connectors: Some(ALL_SLUGS.iter().map(|slug| (*slug).to_string()).collect()),
                 include_undetected: true,
                 root_overrides: overrides,
             })
@@ -563,9 +564,19 @@ mod filesystem_detection {
             })
             .expect("detection should succeed");
 
-        // Should always return all 9 connectors when include_undetected=true
-        assert_eq!(report.summary.total_count, 9);
-        assert_eq!(report.installed_agents.len(), 9);
+        // Unscoped discovery must cover the complete dependency catalog,
+        // including connectors added since these fixtures were introduced.
+        let catalog = frankenterm_core::agent_detection::default_probe_paths_tilde();
+        assert_eq!(report.summary.total_count, catalog.len());
+        assert_eq!(report.installed_agents.len(), catalog.len());
+        for (slug, _) in catalog {
+            assert!(
+                report
+                    .installed_agents
+                    .iter()
+                    .any(|entry| entry.slug == slug)
+            );
+        }
 
         // Verify entries are sorted by slug
         let slugs: Vec<&str> = report

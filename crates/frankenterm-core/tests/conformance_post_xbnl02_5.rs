@@ -35,13 +35,13 @@
 //!
 //! * MUST-1: `asupersync` is listed as a non-optional dependency of
 //!   `frankenterm-core` — the line must NOT contain `optional = true`.
-//! * MUST-2: `asupersync` is always compiled with `features = ["tls"]`.
+//! * MUST-2: `asupersync` always enables the `tls` feature.
 //! * MUST-3: The `asupersync-runtime` feature is declared and has an
 //!   empty feature list (it is a no-op).
 //! * MUST-4: `sync` feature has an empty feature list — no
 //!   `dep:asupersync`.
-//! * MUST-5: `native-wezterm` feature has an empty feature list — no
-//!   `asupersync-runtime`.
+//! * MUST-5: `native-wezterm` enables the native `nix` dependency without
+//!   reintroducing an optional runtime gate.
 //! * MUST-6: `web` feature declares exactly `["dep:fastapi"]` — no
 //!   `dep:asupersync`, no `asupersync-runtime`.
 //! * MUST-7: `distributed` feature does NOT declare `dep:asupersync`.
@@ -53,10 +53,11 @@
 //!   unix))]`. Dropping it is a reversion.
 //! * MUST-9: The adapter fn `mux_cancelled_error` is declared on
 //!   `WeztermClient` with the same cfg gate.
-//! * MUST-10: The four regression tests landed in `2cc8d5a6`
+//! * MUST-10: The regression tests established by `2cc8d5a6`, including
+//!   the subsequently strengthened pool-admission contract,
 //!   (`mux_pool_cancelled_does_not_fallback_to_cli`,
 //!   `mux_transport_cancellation_does_not_fallback_to_cli`,
-//!   `mux_acquire_timeout_still_falls_back_to_cli`,
+//!   `mux_pool_admission_errors_do_not_escape_bounded_concurrency`,
 //!   `mux_cancelled_error_maps_to_cancelled_core_error`) are present in
 //!   `wezterm.rs`. Removing any of them drops the classifier's regression net.
 //! * MUST-11: Every pub mux-caller path that catches a `MuxPoolError` cites the
@@ -65,11 +66,17 @@
 //!   shape. The caller set is: {list_panes, list_panes_with_cx, get_text,
 //!   pane_tiered_scrollback_summary, pane_tiered_scrollback_summary_with_cx,
 //!   send_text, send_text_with_cx} — at least 7 call sites of
-//!   `mux_error_should_fallback_to_cli` must exist in `wezterm.rs`.
+//!   the client-bound `mux_error_should_fallback_to_cli_for_client` must
+//!   exist in `wezterm.rs`.
 //!
 //! # Discrepancies
 //!
-//! None at time of authorship (2026-04-21). If a future refactor
+//! DISC-001: pool admission failures now preserve bounded concurrency instead
+//! of escaping into CLI fallback. Callers use the client-bound classifier,
+//! which also forbids fallback away from an explicitly selected socket.
+//! DISC-002: native events require nix; asupersync additionally enables
+//! test-internals. Neither change makes the runtime optional.
+//! If a future refactor
 //! intentionally collapses the classifier back into its callers, it
 //! must document the divergence here with a `DISC-NNN` tag and update
 //! MUST-8/MUST-9/MUST-11 accordingly.
@@ -83,11 +90,10 @@
 //! # How the harness reads the spec
 //!
 //! The conformance source-of-truth is the two Cargo / Rust files
-//! themselves. The assertions here are deliberately string-based
-//! against the on-disk text rather than parsing TOML / Rust — a strict
-//! string match is exactly the signal we want. A reformatting pass
-//! that legitimately changes whitespace is a single-line fix here;
-//! silently re-adding `optional = true` is a single-test failure.
+//! themselves. Source guards pin the Rust control-flow markers; TOML feature
+//! assertions parse arrays where formatting and additional legitimate features
+//! do not change the contract. Silently re-adding `optional = true` remains a
+//! single-test failure.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -170,8 +176,13 @@ fn spec_xbnl_2_5_must_2_asupersync_has_tls_feature() {
         })
         .expect("[MUST-2] asupersync dep line must be present");
     assert!(
-        asupersync_line.contains("features = [\"tls\"]")
-            || asupersync_line.contains("features=[\"tls\"]"),
+        asupersync_line
+            .parse::<toml::Value>()
+            .expect("asupersync dependency must parse")["asupersync"]["features"]
+            .as_array()
+            .expect("asupersync features must be an array")
+            .iter()
+            .any(|feature| feature.as_str() == Some("tls")),
         "[MUST-2] asupersync must enable the `tls` feature. \
          Line: {asupersync_line:?}"
     );
@@ -204,15 +215,14 @@ fn spec_xbnl_2_5_must_4_sync_feature_is_empty() {
 }
 
 #[test]
-fn spec_xbnl_2_5_must_5_native_wezterm_feature_is_empty() {
+fn spec_xbnl_2_5_must_5_native_wezterm_keeps_runtime_unconditional() {
     let (_, text) = read_frankenterm_core_cargo_toml();
     let body = feature_body(&text, "native-wezterm")
         .expect("[MUST-5] `native-wezterm` feature must still be declared");
-    assert!(
-        body.trim().is_empty(),
-        "[MUST-5] `native-wezterm` feature must have an empty body — \
-         asupersync-runtime is a no-op so pulling it here is redundant. \
-         Got: {body:?}"
+    assert_eq!(
+        body.trim(),
+        "\"dep:nix\"",
+        "[MUST-5] native events need nix without an optional runtime gate"
     );
 }
 
@@ -299,7 +309,7 @@ fn spec_2h5wv_must_10_four_regression_tests_are_present() {
     let required = [
         "fn mux_pool_cancelled_does_not_fallback_to_cli",
         "fn mux_transport_cancellation_does_not_fallback_to_cli",
-        "fn mux_acquire_timeout_still_falls_back_to_cli",
+        "fn mux_pool_admission_errors_do_not_escape_bounded_concurrency",
         "fn mux_cancelled_error_maps_to_cancelled_core_error",
     ];
     let missing: Vec<&&str> = required
@@ -335,7 +345,7 @@ fn spec_2h5wv_must_11_every_mux_caller_cites_classifier() {
     // `Self::mux_error_should_fallback_to_cli(` — count only the
     // caller form.
     let call_sites = text
-        .matches("Self::mux_error_should_fallback_to_cli")
+        .matches("if !self.mux_error_should_fallback_to_cli_for_client(")
         .count();
     assert!(
         call_sites >= MIN_CALL_SITES,
@@ -365,7 +375,10 @@ fn coverage_matrix_reports_every_must_clause() {
         .join("tests")
         .join("conformance_post_xbnl02_5.rs");
     let source = fs::read_to_string(&path).expect("self-read conformance source");
-    let must_tests = source.matches("fn spec_").count();
+    let must_tests = source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("fn spec_"))
+        .count();
     // `fn spec_*` appears once per test signature; we counted 11 MUST
     // clauses in the doc header. Meta-test catches drift between the
     // MUST enumeration and the actual test bodies.

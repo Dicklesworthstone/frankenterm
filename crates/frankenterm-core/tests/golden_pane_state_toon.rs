@@ -55,7 +55,6 @@ fn sample_ignored_pane() -> PaneStateData {
 fn pane_state_single_pane_json_matches_golden() {
     let pane = sample_pane(42, "builder");
     assert_json_snapshot!(
-        "pane_state_single_pane_json",
         pane,
         {
             ".pane_id" => "[pane_id]",
@@ -63,21 +62,46 @@ fn pane_state_single_pane_json_matches_golden() {
             ".tab_id" => "[tab_id]",
             ".window_id" => "[window_id]",
             ".cwd" => "[cwd]",
-        }
+        },
+        @r###"
+    {
+      "pane_id": "[pane_id]",
+      "pane_uuid": "[uuid]",
+      "tab_id": "[tab_id]",
+      "window_id": "[window_id]",
+      "domain": "local",
+      "title": "builder",
+      "cwd": "[cwd]",
+      "observed": true,
+      "ignore_reason": null
+    }
+    "###
     );
 }
 
 #[test]
-fn pane_state_ignored_pane_omits_uuid_and_cwd() {
+fn pane_state_ignored_pane_has_null_uuid_and_cwd() {
     let pane = sample_ignored_pane();
     assert_json_snapshot!(
-        "pane_state_ignored_pane_json",
         pane,
         {
             ".pane_id" => "[pane_id]",
             ".tab_id" => "[tab_id]",
             ".window_id" => "[window_id]",
-        }
+        },
+        @r###"
+    {
+      "pane_id": "[pane_id]",
+      "pane_uuid": null,
+      "tab_id": "[tab_id]",
+      "window_id": "[window_id]",
+      "domain": "ssh:build-host",
+      "title": "ignored tmux pane",
+      "cwd": null,
+      "observed": false,
+      "ignore_reason": "tmux_passthrough"
+    }
+    "###
     );
 }
 
@@ -110,7 +134,6 @@ fn pane_state_with_text_envelope_json_matches_golden() {
     };
 
     assert_json_snapshot!(
-        "pane_state_with_text_envelope_json",
         envelope,
         {
             ".panes[].pane_id" => "[pane_id]",
@@ -118,7 +141,51 @@ fn pane_state_with_text_envelope_json_matches_golden() {
             ".panes[].tab_id" => "[tab_id]",
             ".panes[].window_id" => "[window_id]",
             ".panes[].cwd" => "[cwd]",
+        },
+        @r###"
+    {
+      "panes": [
+        {
+          "pane_id": "[pane_id]",
+          "pane_uuid": "[uuid]",
+          "tab_id": "[tab_id]",
+          "window_id": "[window_id]",
+          "domain": "local",
+          "title": "builder",
+          "cwd": "[cwd]",
+          "observed": true,
+          "ignore_reason": null
+        },
+        {
+          "pane_id": "[pane_id]",
+          "pane_uuid": "[uuid]",
+          "tab_id": "[tab_id]",
+          "window_id": "[window_id]",
+          "domain": "ssh:build-host",
+          "title": "ignored tmux pane",
+          "cwd": "[cwd]",
+          "observed": false,
+          "ignore_reason": "tmux_passthrough"
         }
+      ],
+      "tail_lines": 200,
+      "escapes_included": false,
+      "pane_text": {
+        "42": {
+          "status": "ok",
+          "text": "hello\nworld\n",
+          "truncated": false,
+          "truncation_info": null
+        },
+        "99": {
+          "status": "error",
+          "code": "pane_ignored",
+          "message": "tmux passthrough pane is not readable",
+          "hint": "attach via tmux directly"
+        }
+      }
+    }
+    "###
     );
 }
 
@@ -129,21 +196,21 @@ fn pane_state_toon_roundtrip_preserves_json_semantics() {
 
     // Encode to TOON and decode back — parity must hold for the operator
     // format-negotiation contract.
-    let toon_value = toon_rust::JsonValue::from(json_value.clone());
-    let toon_text = toon_rust::cli::json_stringify::json_stringify_lines(&toon_value, 0).join("\n");
+    let toon_value = toon_rust::JsonValue::from(json_value);
+    let toon_text = toon_rust::encode(toon_value.clone(), None);
     let decoded = toon_rust::try_decode(&toon_text, None).expect("TOON decode");
-    let decoded_json_text =
-        toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
-    let roundtripped: serde_json::Value =
-        serde_json::from_str(&decoded_json_text).expect("roundtrip JSON parse");
 
     assert_eq!(
-        json_value, roundtripped,
+        toon_value, decoded,
         "PaneStateData TOON roundtrip must preserve JSON semantics"
     );
 
     // Freeze the canonical TOON shape so we catch encoder drift.
-    assert_snapshot!("pane_state_toon_canonical", toon_text);
+    assert_snapshot!(toon_text, @r###"
+    [2]{pane_id,pane_uuid,tab_id,window_id,domain,title,cwd,observed,ignore_reason}:
+      42,uuid-0000002a-abcd-1234-5678-900000000000,420,1042,local,builder,/tmp/workspace-42,true,null
+      99,null,990,1099,"ssh:build-host",ignored tmux pane,null,false,tmux_passthrough
+    "###);
 }
 
 #[test]
@@ -164,6 +231,25 @@ fn pane_text_result_ok_and_error_variants_match_golden() {
         hint: Some("run 'ft robot state' to list active panes".to_string()),
     };
 
-    assert_json_snapshot!("pane_text_result_ok_truncated", ok);
-    assert_json_snapshot!("pane_text_result_error", err);
+    assert_json_snapshot!(ok, @r###"
+    {
+      "status": "ok",
+      "text": "alpha\nbeta\n",
+      "truncated": true,
+      "truncation_info": {
+        "original_bytes": 4096,
+        "returned_bytes": 512,
+        "original_lines": 200,
+        "returned_lines": 20
+      }
+    }
+    "###);
+    assert_json_snapshot!(err, @r###"
+    {
+      "status": "error",
+      "code": "pane_not_found",
+      "message": "pane 7 is not registered with the mux",
+      "hint": "run 'ft robot state' to list active panes"
+    }
+    "###);
 }

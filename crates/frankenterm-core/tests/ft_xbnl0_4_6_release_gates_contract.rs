@@ -34,7 +34,8 @@ fn release_gate_contract_has_named_blocking_gates() {
             "REL-01-leak-oracle",
             "REL-02-guard-surface",
             "REL-03-soak-confidence",
-            "REL-04-performance-budget"
+            "REL-04-performance-budget",
+            "REL-05-proof-ledger-quality"
         ],
         "ft-xbnl0.4.6 must keep the canonical leak, soak, and performance gates",
     );

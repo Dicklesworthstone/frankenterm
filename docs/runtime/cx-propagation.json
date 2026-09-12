@@ -2,46 +2,55 @@
   "buckets": {
     "capture": {
       "covered": 11,
+      "eager_settled_future": 0,
       "exempt_file": 0,
       "files": [
         "capture_authority.rs",
         "ingest.rs",
         "recorder_migration.rs"
       ],
+      "independent_adapter": 0,
       "total": 18,
       "uncovered": 0,
       "wrapper_exempt": 7
     },
     "connectors": {
-      "covered": 0,
+      "covered": 5,
+      "eager_settled_future": 0,
       "exempt_file": 0,
-      "files": [],
-      "total": 0,
+      "files": [
+        "connector_host_runtime.rs"
+      ],
+      "independent_adapter": 0,
+      "total": 5,
       "uncovered": 0,
       "wrapper_exempt": 0
     },
     "distributed": {
       "covered": 2,
+      "eager_settled_future": 0,
       "exempt_file": 0,
       "files": [
         "distributed.rs"
       ],
+      "independent_adapter": 0,
       "total": 2,
       "uncovered": 0,
       "wrapper_exempt": 0
     },
     "mcp": {
-      "covered": 5,
+      "covered": 0,
+      "eager_settled_future": 0,
       "exempt_file": 0,
-      "files": [
-        "mcp_helpers.rs"
-      ],
-      "total": 10,
+      "files": [],
+      "independent_adapter": 0,
+      "total": 0,
       "uncovered": 0,
-      "wrapper_exempt": 5
+      "wrapper_exempt": 0
     },
     "other": {
-      "covered": 470,
+      "covered": 481,
+      "eager_settled_future": 3,
       "exempt_file": 51,
       "files": [
         "alerts.rs",
@@ -50,9 +59,9 @@
         "cass.rs",
         "caut.rs",
         "cleanup.rs",
+        "code_scanner.rs",
         "cpu_pressure.rs",
         "cx.rs",
-        "cx_stub.rs",
         "diagnostic.rs",
         "environment.rs",
         "event_stream.rs",
@@ -66,6 +75,7 @@
         "notifications.rs",
         "orphan_reaper.rs",
         "policy.rs",
+        "policy_kill_switch_state.rs",
         "pool.rs",
         "protocol_recovery.rs",
         "recording.rs",
@@ -105,32 +115,38 @@
         "web_framework.rs",
         "wezterm.rs"
       ],
-      "total": 918,
+      "independent_adapter": 0,
+      "total": 929,
       "uncovered": 0,
       "wrapper_exempt": 394
     },
     "tx": {
       "covered": 0,
+      "eager_settled_future": 0,
       "exempt_file": 0,
       "files": [],
+      "independent_adapter": 0,
       "total": 0,
       "uncovered": 0,
       "wrapper_exempt": 0
     },
     "web_sse": {
-      "covered": 5,
+      "covered": 6,
+      "eager_settled_future": 0,
       "exempt_file": 0,
       "files": [
         "web.rs",
         "web/server.rs",
         "webhook.rs"
       ],
-      "total": 10,
+      "independent_adapter": 0,
+      "total": 11,
       "uncovered": 0,
       "wrapper_exempt": 5
     },
     "workflow": {
       "covered": 35,
+      "eager_settled_future": 0,
       "exempt_file": 0,
       "files": [
         "workflows/account_steps.rs",
@@ -143,12 +159,13 @@
         "workflows/runner.rs",
         "workflows/wait_execution.rs"
       ],
+      "independent_adapter": 0,
       "total": 59,
       "uncovered": 0,
       "wrapper_exempt": 24
     }
   },
-  "generated_at": "2026-08-31T18:19:31Z",
+  "generated_at": "2026-09-12T00:42:47Z",
   "labruntime_coverage": {
     "by_bucket": {
       "capture": {
@@ -206,12 +223,14 @@
     "tested_files_intersect_covered": 4,
     "total_call_sites": 30
   },
-  "schema_version": 2,
+  "schema_version": 3,
   "totals": {
-    "covered_sites": 528,
+    "covered_sites": 540,
+    "eager_settled_future_sites": 3,
     "exempt_file_sites": 51,
-    "total_sites": 1017,
+    "independent_context_adapter_sites": 0,
+    "total_sites": 1024,
     "uncovered_sites": 0,
-    "wrapper_exempt_sites": 435
+    "wrapper_exempt_sites": 430
   }
 }

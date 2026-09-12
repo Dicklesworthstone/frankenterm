@@ -3014,7 +3014,10 @@ mod tests {
     #[test]
     fn herd_wave_resource_reads_v1_contract_without_mutation() {
         let resource = WaHerdWaveResource;
-        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
         let contents = resource.read(&ctx).expect("read herd-wave resource");
         let payload: serde_json::Value =
             serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
@@ -3046,7 +3049,10 @@ mod tests {
     #[test]
     fn swarm_capacity_current_resource_reads_without_pane_mutation_or_raw_content() {
         let resource = WaSwarmCapacityCurrentResource;
-        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
         let contents = resource
             .read(&ctx)
             .expect("read swarm-capacity current resource");
@@ -3091,7 +3097,10 @@ mod tests {
     #[test]
     fn operating_envelope_current_resource_reads_without_pane_mutation_or_raw_content() {
         let resource = WaOperatingEnvelopeCurrentResource;
-        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
         let contents = resource
             .read(&ctx)
             .expect("read operating-envelope current resource");
@@ -3136,7 +3145,10 @@ mod tests {
     #[test]
     fn renderer_input_to_photon_resource_reads_doctor_contract() {
         let resource = WaRendererInputToPhotonResource;
-        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
         let contents = resource
             .read(&ctx)
             .expect("read renderer input-to-photon resource");
@@ -3161,7 +3173,10 @@ mod tests {
     #[test]
     fn renderer_ssim_parity_resource_reads_doctor_contract() {
         let resource = WaRendererSsimParityResource;
-        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
         let contents = resource
             .read(&ctx)
             .expect("read renderer SSIM parity resource");
@@ -3330,7 +3345,10 @@ mod tests {
         drop(conn);
 
         let resource = WaContextHorizonResource::new(Arc::new(db_path));
-        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
         let contents = resource.read(&ctx).expect("read context horizon resource");
         let payload: serde_json::Value =
             serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");

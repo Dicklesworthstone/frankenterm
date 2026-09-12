@@ -227,6 +227,7 @@ fn matrix_entries_are_unique_and_have_remote_proofs() {
         assert!(
             keys.insert((
                 entry.surface.as_str(),
+                entry.action.as_str(),
                 entry.transport.as_str(),
                 entry.format.as_str(),
                 entry.scenario.as_str(),

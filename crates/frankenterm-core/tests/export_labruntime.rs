@@ -1245,7 +1245,7 @@ fn export_redact_false_does_not_alter_content() {
         let (storage, db_path) = test_db_with_pane("no_redact").await;
 
         let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
-        storage
+        let stored = storage
             .append_segment(1, &format!("has secret: {}", secret), None)
             .await
             .unwrap();
@@ -1265,11 +1265,15 @@ fn export_redact_false_does_not_alter_content() {
         let output = String::from_utf8(buf).unwrap();
         let (_header, records) = parse_jsonl(&output);
         let content = records[0]["content"].as_str().unwrap();
-        assert!(
-            content.contains(secret),
-            "Content should contain secret when redact is false"
+        assert_eq!(
+            content, stored.content,
+            "export must preserve stored content"
         );
-        assert!(!content.contains("[REDACTED]"));
+        assert!(
+            !content.contains(secret),
+            "export cannot recover an at-rest secret"
+        );
+        assert!(content.contains("[REDACTED]"));
 
         teardown(storage, &db_path).await;
     });

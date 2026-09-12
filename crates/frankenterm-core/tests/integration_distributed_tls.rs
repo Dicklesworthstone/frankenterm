@@ -318,7 +318,20 @@ fn mtls_handshake_rejects_missing_client_cert() -> TestResult {
             .connect("localhost", TcpStream::connect(addr).await?)
             .await;
         assert_tls_accept_fails(server_task).await?;
-        assert!(client_result.is_err());
+        if let Ok(mut stream) = client_result {
+            // TLS 1.3 lets the client finish before receiving the server's
+            // client-certificate rejection. It must reject application I/O.
+            let read = runtime_async::timeout(Duration::from_secs(2), async {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await
+            })
+            .await
+            .map_err(|_| io_other("client did not observe TLS rejection"))?;
+            assert!(
+                read.is_err(),
+                "unauthenticated client received application data"
+            );
+        }
         Ok(())
     })
 }
@@ -347,7 +360,15 @@ fn mtls_handshake_rejects_disallowed_client() -> TestResult {
             .connect("localhost", TcpStream::connect(addr).await?)
             .await;
         assert_tls_accept_fails(server_task).await?;
-        assert!(client_result.is_err());
+        if let Ok(mut stream) = client_result {
+            let read = runtime_async::timeout(Duration::from_secs(2), async {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await
+            })
+            .await
+            .map_err(|_| io_other("client did not observe TLS rejection"))?;
+            assert!(read.is_err(), "disallowed client received application data");
+        }
         Ok(())
     })
 }

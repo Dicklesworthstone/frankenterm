@@ -63,6 +63,7 @@ fn collect_named_files(root: &Path, file_name: &str) -> Vec<PathBuf> {
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
                         matches!(name, ".git" | "target")
+                            || name.starts_with(".rch-")
                             || name.starts_with(".cargo")
                             || name.starts_with(".rustup")
                     })
@@ -155,6 +156,7 @@ fn framework_manifest_references_stay_centralized_to_workspace_root_and_core_man
     let allowed: BTreeSet<PathBuf> = BTreeSet::from([
         workspace_root.join("Cargo.toml"),
         workspace_root.join("crates/frankenterm-core/Cargo.toml"),
+        workspace_root.join("crates/frankenterm-core-mcp/Cargo.toml"),
     ]);
     let mut violations = Vec::new();
 

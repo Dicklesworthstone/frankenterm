@@ -724,7 +724,7 @@ mod tests {
 
         let contents = handler
             .call(
-                &McpContext::new(fastmcp::Cx::for_testing(), 1),
+                &McpContext::new(crate::mcp_framework::FrameworkCx::for_testing(), 1),
                 serde_json::json!({"format": "toon"}),
             )
             .expect("TOON transcode failure should return the established error envelope");
@@ -1030,7 +1030,9 @@ mod tests {
 
         // Construct a Cx with a near-Time::ZERO absolute deadline so checkpoint()
         // fails immediately. The asupersync-side test helper exposes this.
-        let cx = fastmcp::Cx::for_testing_with_budget(fastmcp::Budget::with_deadline_at_ns(1));
+        let cx = crate::mcp_framework::FrameworkCx::for_testing_with_budget(
+            crate::mcp_framework::FrameworkBudget::with_deadline_at_ns(1),
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
         let ctx = McpContext::new(cx, 1);
 

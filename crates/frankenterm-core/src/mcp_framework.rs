@@ -20,7 +20,8 @@ pub use fastmcp::testing::TestClient as FrameworkTestClient;
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[allow(unused_imports)]
 pub use fastmcp::{
-    Content as FrameworkContent, McpContext as FrameworkMcpContext, McpError as FrameworkMcpError,
+    Budget as FrameworkBudget, Content as FrameworkContent, Cx as FrameworkCx,
+    McpContext as FrameworkMcpContext, McpError as FrameworkMcpError,
     McpResult as FrameworkMcpResult, Tool as FrameworkTool,
     ToolAnnotations as FrameworkToolAnnotations,
 };

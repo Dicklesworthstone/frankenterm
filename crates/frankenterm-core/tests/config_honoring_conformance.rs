@@ -292,20 +292,38 @@ fn retention_max_mb_value_drives_eviction() {
     });
 }
 
-fn make_session_db() -> Connection {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
+fn make_session_db() -> (tempfile::NamedTempFile, Connection) {
+    let file = tempfile::NamedTempFile::new().expect("session database");
+    let conn = Connection::open(file.path()).expect("open session db");
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .expect("enable fks");
     conn.execute_batch(frankenterm_core::storage::SCHEMA_SQL)
         .expect("apply schema");
-    conn
+    (file, conn)
 }
 
-fn insert_closed_session(conn: &Connection, id: &str, created_at: i64) {
+fn insert_closed_session(conn: &Connection, path: &std::path::Path, created_at: i64) {
+    use frankenterm_core::config::SnapshotConfig;
+    use frankenterm_core::runtime_async::CompatRuntime;
+    use frankenterm_core::snapshot_engine::SnapshotEngine;
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("snapshot fixture runtime");
+    let engine = SnapshotEngine::new(
+        std::sync::Arc::new(path.to_str().expect("fixture path").to_string()),
+        SnapshotConfig::default(),
+    );
+    let receipt = runtime
+        .block_on(engine.shutdown_checkpoint(&[], std::time::Duration::from_secs(10)))
+        .expect("persist verified clean shutdown");
+    // Model a closed process rather than the still-live test process. Keep the
+    // real checkpoint witness and clean authority created by SnapshotEngine.
     conn.execute(
-        "INSERT INTO mux_sessions (session_id, created_at, shutdown_clean, topology_json, ft_version)
-         VALUES (?1, ?2, 1, '{}', '0.1.0')",
-        rusqlite::params![id, created_at],
+        "UPDATE mux_sessions SET created_at = ?2, host_id = NULL,
+         owner_pid = NULL, owner_process_start = NULL, owner_heartbeat_at = NULL
+         WHERE session_id = ?1",
+        rusqlite::params![receipt.session_id, created_at],
     )
     .expect("insert session");
 }
@@ -327,9 +345,9 @@ fn count_sessions(conn: &Connection) -> i64 {
 fn session_retention_max_closed_sessions_drives_cleanup() {
     use frankenterm_core::session_retention::cleanup_sessions;
 
-    let conn = make_session_db();
+    let (file, conn) = make_session_db();
     for i in 0..5 {
-        insert_closed_session(&conn, &format!("sess-{i}"), 1_000 + i64::from(i));
+        insert_closed_session(&conn, file.path(), 1_000 + i64::from(i));
     }
     assert_eq!(
         count_sessions(&conn),
@@ -362,9 +380,23 @@ fn session_retention_max_closed_sessions_drives_cleanup() {
         max_total_size_mb: 0,
         cleanup_interval_hours: 24,
     };
-    let r1 = cleanup_sessions(&conn, &capped).expect("cleanup capped");
+    let mut r1 = cleanup_sessions(&conn, &capped).expect("cleanup capped");
+    // Recovery authority is reconciled in bounded batches across cleanup ticks.
+    // Five rows need at most three phases each plus terminal empty batches.
+    let mut deleted = r1.deleted_by_count;
+    for _ in 0..21 {
+        if !r1.recovery_reconciliation_pending {
+            break;
+        }
+        r1 = cleanup_sessions(&conn, &capped).expect("reconcile then clean up");
+        deleted += r1.deleted_by_count;
+    }
+    assert!(
+        !r1.recovery_reconciliation_pending,
+        "finite fixture must reconcile"
+    );
     assert_eq!(
-        r1.deleted_by_count, 3,
+        deleted, 3,
         "max_closed_sessions=2 must evict the 3 excess closed sessions"
     );
     assert_eq!(

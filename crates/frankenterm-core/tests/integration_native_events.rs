@@ -31,6 +31,13 @@ use std::time::Duration;
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+fn private_socket_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("private socket directory")
+}
+
 fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
@@ -93,7 +100,7 @@ async fn write_line(socket_path: &std::path::Path, line: &str) {
 #[test]
 fn listener_decodes_wire_events_and_ignores_hello() {
     run_async_test(async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_socket_dir();
         let socket_path = dir.path().join("native-events-decode.sock");
         let listener = NativeEventListener::bind(socket_path.clone())
             .await
@@ -160,7 +167,7 @@ fn listener_decodes_wire_events_and_ignores_hello() {
 #[test]
 fn listener_reports_truncated_output_as_recoverable_gap() {
     run_async_test(async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_socket_dir();
         let socket_path = dir.path().join("native-events-truncate.sock");
         let listener = NativeEventListener::bind(socket_path.clone())
             .await
@@ -200,7 +207,7 @@ fn listener_reports_truncated_output_as_recoverable_gap() {
 #[test]
 fn listener_skips_invalid_and_oversized_lines_then_recovers() {
     run_async_test(async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_socket_dir();
         let socket_path = dir.path().join("native-events-recover.sock");
         let listener = NativeEventListener::bind(socket_path.clone())
             .await
@@ -246,7 +253,7 @@ fn listener_skips_invalid_and_oversized_lines_then_recovers() {
 #[test]
 fn listener_accepts_reconnect_and_rapid_events() {
     run_async_test(async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_socket_dir();
         let socket_path = dir.path().join("native-events-reconnect.sock");
         let listener = NativeEventListener::bind(socket_path.clone())
             .await
@@ -310,7 +317,7 @@ fn bind_errors_and_drop_cleanup_are_public_contracts() {
         let empty = NativeEventListener::bind(std::path::PathBuf::from("")).await;
         assert!(matches!(empty, Err(NativeEventError::EmptySocketPath)));
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_socket_dir();
         let file_path = dir.path().join("exists.sock");
         std::fs::write(&file_path, b"").expect("create collision file");
         let collision = NativeEventListener::bind(file_path).await;
@@ -411,7 +418,7 @@ fn listener_rejects_symlinked_socket_parent() {
 #[test]
 fn listener_drop_preserves_replacement_socket_identity() {
     run_async_test(async {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = private_socket_dir();
         let socket_path = root.path().join("identity.sock");
         let displaced_path = root.path().join("identity.original.sock");
         let listener = NativeEventListener::bind(socket_path.clone())
