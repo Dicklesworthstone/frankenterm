@@ -147,6 +147,44 @@ fn workflow_start_concurrency_limit_matches_golden() {
 }
 
 #[test]
+fn workflow_start_source_pane_not_trusted_matches_golden() {
+    let result = WorkflowStartResult::SourcePaneNotTrusted {
+        source_pane_id: 7,
+        workflow_name: "handle_usage_limits".into(),
+        rule_id: "codex.usage_limit".into(),
+    };
+    assert_json_snapshot!(result, @r###"
+    {
+      "type": "source_pane_not_trusted",
+      "source_pane_id": 7,
+      "workflow_name": "handle_usage_limits",
+      "rule_id": "codex.usage_limit"
+    }
+    "###);
+}
+
+#[test]
+fn workflow_start_pane_rate_limited_matches_golden() {
+    let result = WorkflowStartResult::PaneRateLimited {
+        pane_id: 7,
+        workflow_name: "handle_usage_limits".into(),
+        rule_id: "codex.usage_limit".into(),
+        reset_at_ms: 1_700_000_000_000,
+        reset_known: false,
+    };
+    assert_json_snapshot!(result, @r###"
+    {
+      "type": "pane_rate_limited",
+      "pane_id": 7,
+      "workflow_name": "handle_usage_limits",
+      "rule_id": "codex.usage_limit",
+      "reset_at_ms": 1700000000000,
+      "reset_known": false
+    }
+    "###);
+}
+
+#[test]
 fn workflow_start_error_matches_golden() {
     assert_json_snapshot!(start_error_result(), @r###"
     {
@@ -255,6 +293,18 @@ fn workflow_start_all_variants_roundtrip_through_json() {
         pane_locked_result(),
         no_matching_workflow_result(),
         concurrency_limit_result(),
+        WorkflowStartResult::SourcePaneNotTrusted {
+            source_pane_id: 7,
+            workflow_name: "handle_usage_limits".into(),
+            rule_id: "codex.usage_limit".into(),
+        },
+        WorkflowStartResult::PaneRateLimited {
+            pane_id: 7,
+            workflow_name: "handle_usage_limits".into(),
+            rule_id: "codex.usage_limit".into(),
+            reset_at_ms: 1_700_000_000_000,
+            reset_known: false,
+        },
         start_error_result(),
     ] {
         let serialized = serde_json::to_string(&original).expect("serialize start result");
