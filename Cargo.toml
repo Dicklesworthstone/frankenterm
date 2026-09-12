@@ -582,8 +582,8 @@ wasmtime-wasi = { version = "47.0.4", default-features = false, features = ["p1"
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.4.10" }
-asupersync-macros = { version = "0.4.9" }
+asupersync = { version = "=0.5.0" }
+asupersync-macros = { version = "=0.5.0" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3.3"
@@ -601,15 +601,16 @@ trybuild = { version = "1.0.116", default-features = false }
 # defaults (logging, std, tls12) so behavior is otherwise unchanged.
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 rustls-pemfile = "2.2.0"
-fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1038dd4e64cc7df8ea8122dbfb8806b0b04a7130", package = "fastmcp-rust" }
-fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "1718091b6bbb14279a20a8a49f020010fb4fc338", package = "fastapi-rust" }
+fastmcp = { version = "=0.9.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "180a7c88890705217bb8e202d19555adabf24187", package = "fastmcp-rust", features = ["legacy-2024-11-05", "testing-lab"] }
+fastmcp-server = { version = "=0.9.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "180a7c88890705217bb8e202d19555adabf24187" }
+fastapi = { version = "=0.4.4", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "fb15fa5025cfdc23ab99344db5e2a4939dbcf38e", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "4a75fd706917df915e644b00248540786df438f2", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { version = "=0.6.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Narrow registry alias for the audited descriptor-bound ACL presence probe.
 # Keep this isolated from the existing full-stack FrankenSearch git pin above.
-frankensearch-index-acl = { package = "frankensearch-index", version = "=0.2.3", default-features = false }
+frankensearch-index-acl = { package = "frankensearch-index", version = "=0.3.0", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.2.2"
 
@@ -680,10 +681,9 @@ debug = 1
 # external contributors). Do NOT use absolute /dp/... path patches: they break every
 # build outside the dev fleet (and CI's --locked jobs), since /dp only exists there.
 #
-# asupersync no longer needs a patch here: 0.3.10 is published on crates.io, so
-# frankenterm's own crates depend on it by version (see [workspace.dependencies]) and
-# the fastmcp/fastapi/frankensearch deps resolve that same registry 0.3.10 — the whole
-# graph unifies on a single source without any git-rev redirect.
+# FrankenTerm's own crates use the published Asupersync version declared in
+# [workspace.dependencies]. Git-pinned integrations resolve their own declared
+# versions; keep those aligned before passing runtime types across crate boundaries.
 [patch.crates-io]
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.

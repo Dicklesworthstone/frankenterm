@@ -138,6 +138,7 @@ ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui", rev = 
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
+fastmcp-server = { workspace = true, optional = true }
 toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
@@ -1021,4 +1022,4 @@ vc-export = ["subprocess-bridge"]
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term"]
 vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
-mcp-server = ["dep:fastmcp", "dep:toon_rust"]
+mcp-server = ["dep:fastmcp", "dep:fastmcp-server", "dep:toon_rust"]
