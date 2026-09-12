@@ -12,6 +12,218 @@
 //! - Secret-like strings never leak unredacted
 
 use assert_cmd::Command;
+// Compile the production build metadata resolver directly; its Cargo entry
+// point is intentionally not invoked by this integration harness.
+#[allow(
+    dead_code,
+    reason = "build-script entry point is not run inside integration tests"
+)]
+#[path = "../build.rs"]
+mod build_metadata;
+
+mod dsr_source_metadata_contract {
+    use super::build_metadata::{DsrSourceIdentity, resolve_source_identity, tracked_source_paths};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+        let mut command = Command::new("git");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            command.env_remove(name);
+        }
+        let output = command
+            .current_dir(root)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .arg("-c")
+            .arg(format!(
+                "core.hooksPath={}",
+                root.join("no-fixture-hooks").display()
+            ))
+            .args(args)
+            .output()
+            .expect("Git fixture command");
+        assert!(
+            output.status.success(),
+            "Git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn identity(revision: String) -> DsrSourceIdentity {
+        let version = "0.15.5";
+        let target = "aarch64-apple-darwin";
+        let profile = "release-interactive";
+        // The canonical existing producer is the independent oracle for the
+        // Rust resolver's source/version/target/profile identity binding.
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/atomic-component-manifest.sh");
+        let output = Command::new("bash")
+            .arg(script)
+            .args([
+                "derive-build-id",
+                "--source-revision",
+                &revision,
+                "--version",
+                version,
+                "--target",
+                target,
+                "--profile",
+                profile,
+                "--feature-contract",
+                "application-family-gui-ft-mux-server-pty-guardian-default-features-v1",
+            ])
+            .output()
+            .expect("canonical atomic identity producer");
+        assert!(
+            output.status.success(),
+            "canonical identity producer failed"
+        );
+        DsrSourceIdentity {
+            revision,
+            reference: format!("v{version}"),
+            version: version.to_owned(),
+            target: target.to_owned(),
+            profile: profile.to_owned(),
+            atomic_identity: String::from_utf8(output.stdout).unwrap().trim().to_owned(),
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, DsrSourceIdentity) {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(repository.join("src/input.txt"), b"original source\n").unwrap();
+        git(&repository, &["add", "src/input.txt"]);
+        git(&repository, &["commit", "-m", "source fixture"]);
+        let revision = String::from_utf8(git(&repository, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let archive = git(&repository, &["archive", "--format=tar", "HEAD"]);
+        fs::write(owner.path().join(".source.tar"), &archive).unwrap();
+        let source = owner.path().join("source");
+        fs::create_dir(&source).unwrap();
+        tar::Archive::new(archive.as_slice())
+            .unpack(&source)
+            .unwrap();
+        let identity = identity(revision);
+        (owner, repository, source, identity)
+    }
+
+    #[test]
+    fn gitless_dsr_archive_supplies_exact_clean_metadata() {
+        let (_owner, _repository, source, identity) = fixture();
+        let metadata = resolve_source_identity(&source, Some(&identity)).unwrap();
+        assert_eq!(metadata.revision, identity.revision);
+        assert!(!metadata.dirty);
+    }
+
+    #[test]
+    fn gitless_metadata_rejects_tampered_or_extra_source() {
+        let (_owner, _repository, source, identity) = fixture();
+        fs::write(source.join("src/input.txt"), b"modified source\n").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+        fs::write(source.join("src/input.txt"), b"original source\n").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_ok());
+        fs::write(source.join("src/injected.rs"), b"extra source").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+
+    #[test]
+    fn gitless_metadata_rejects_environment_only_or_mismatched_authority() {
+        let (owner, _repository, source, good) = fixture();
+        let absent = owner.path().join("no-archive/source");
+        fs::create_dir_all(&absent).unwrap();
+        assert!(resolve_source_identity(&absent, Some(&good)).is_err());
+        let development = resolve_source_identity(&source, None).unwrap();
+        assert_eq!(development.revision, "unknown");
+        assert!(development.dirty);
+
+        let mut wrong_atomic = good.clone();
+        wrong_atomic.target = "x86_64-pc-windows-msvc".to_owned();
+        assert!(resolve_source_identity(&source, Some(&wrong_atomic)).is_err());
+        let mut wrong_version = good.clone();
+        wrong_version.reference = "v0.0.0".to_owned();
+        assert!(resolve_source_identity(&source, Some(&wrong_version)).is_err());
+        // A self-consistent identity for another commit still cannot authorize
+        // this archive. Merely supplying a plausible sealed hash is not enough.
+        let wrong_commit = identity("1".repeat(40));
+        assert!(resolve_source_identity(&source, Some(&wrong_commit)).is_err());
+    }
+
+    #[test]
+    fn git_tracked_dirt_cannot_be_erased_by_valid_dsr_metadata() {
+        let (_owner, repository, _source, identity) = fixture();
+        let clean = resolve_source_identity(&repository, Some(&identity)).unwrap();
+        assert!(!clean.dirty);
+        fs::write(repository.join("src/input.txt"), b"tracked dirty source\n").unwrap();
+        let dirty = resolve_source_identity(&repository, Some(&identity)).unwrap();
+        assert_eq!(dirty.revision, identity.revision);
+        assert!(dirty.dirty);
+    }
+
+    #[test]
+    fn metadata_rerun_inputs_track_unstaged_source_but_exclude_build_caches() {
+        let (_owner, repository, _source, identity) = fixture();
+        let tracked = repository.join("src/input.txt");
+        let expected = vec![tracked.clone()];
+        assert_eq!(tracked_source_paths(&repository).unwrap(), expected);
+        fs::create_dir(repository.join("target")).unwrap();
+        fs::write(repository.join("target/generated.txt"), b"build cache").unwrap();
+        fs::write(repository.join("src/untracked.rs"), b"untracked source").unwrap();
+        assert_eq!(tracked_source_paths(&repository).unwrap(), expected);
+        assert!(
+            !resolve_source_identity(&repository, Some(&identity))
+                .unwrap()
+                .dirty
+        );
+        fs::write(&tracked, b"unstaged source edit").unwrap();
+        assert_eq!(tracked_source_paths(&repository).unwrap(), expected);
+        assert!(
+            resolve_source_identity(&repository, Some(&identity))
+                .unwrap()
+                .dirty
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitless_metadata_rejects_symlinks_and_executable_mode_drift() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (_owner, _repository, source, identity) = fixture();
+        fs::set_permissions(
+            source.join("src/input.txt"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+        fs::set_permissions(
+            source.join("src/input.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink("input.txt", source.join("src/linked.txt")).unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+}
 #[cfg(unix)]
 #[path = "../../frankenterm-core/tests/common/wezterm_subprocess.rs"]
 mod wezterm_subprocess;
