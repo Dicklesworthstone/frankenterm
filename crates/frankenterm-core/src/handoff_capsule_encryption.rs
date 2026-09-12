@@ -48,8 +48,9 @@
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
 };
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -357,7 +358,12 @@ impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
     }
 
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut nonce = XNonce::default();
+        SysRng
+            .try_fill_bytes(nonce.as_mut())
+            .map_err(|_| EncryptionError::EncryptionFailed {
+                reason: "XChaCha20Poly1305 nonce entropy unavailable".into(),
+            })?;
         let encrypted = self.cipher.encrypt(&nonce, plaintext).map_err(|_| {
             EncryptionError::EncryptionFailed {
                 reason: "XChaCha20Poly1305 seal failed".into(),
@@ -399,7 +405,10 @@ impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
                 reason: "truncated XChaCha20Poly1305 nonce".into(),
             });
         };
-        let nonce = XNonce::from_slice(nonce_bytes);
+        let nonce =
+            <&XNonce>::try_from(nonce_bytes).map_err(|_| EncryptionError::DecryptionFailed {
+                reason: "invalid XChaCha20Poly1305 nonce length".into(),
+            })?;
         self.cipher
             .decrypt(nonce, encrypted)
             .map_err(|_| EncryptionError::DecryptionFailed {
