@@ -353,7 +353,7 @@ fn operator_text_composes_timeline_tree_and_evidence_without_overlap_ft_1650n_16
         "dependency tree section header present"
     );
     assert!(
-        text.contains("=== evidence snippets ==="),
+        text.contains("=== causal evidence snippets ==="),
         "evidence snippets section header present"
     );
     // No section header appears more than once (no overlapping
@@ -365,7 +365,7 @@ fn operator_text_composes_timeline_tree_and_evidence_without_overlap_ft_1650n_16
         "timeline header should appear exactly once"
     );
     assert_eq!(
-        text.matches("=== evidence snippets ===").count(),
+        text.matches("=== causal evidence snippets ===").count(),
         1,
         "evidence header should appear exactly once"
     );
