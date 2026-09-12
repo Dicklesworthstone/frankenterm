@@ -34,7 +34,7 @@ fn arb_timeout_ms() -> impl Strategy<Value = u64> {
 
 fn arb_scored_result(id_prefix: &'static str) -> impl Strategy<Value = ScoredResult> {
     (0..100u32, prop::num::f32::NORMAL).prop_map(move |(idx, score)| ScoredResult {
-        doc_id: format!("{id_prefix}-{idx}"),
+        doc_id: format!("{id_prefix}-{idx}").into(),
         score: score.abs().clamp(0.0, 1.0),
         source: frankensearch::ScoreSource::Hybrid,
         index: None,
@@ -263,6 +263,8 @@ fn make_phase_metrics() -> frankensearch::PhaseMetrics {
         vectors_searched: 0,
         lexical_candidates: 0,
         fused_count: 0,
+        skip_reason: None,
+        hash_control_candidates: 0,
     }
 }
 
