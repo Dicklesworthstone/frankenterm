@@ -98,7 +98,7 @@ const WIRED: &[(&str, &str, &str)] = &[
     ),
     (
         "ipc.rs",
-        "return stream_subscribe_events(",
+        "Box::pin(stream_subscribe_events(",
         "IPC SubscribeEvents must dispatch to the FilteredEventStream-backed streamer",
     ),
     // Kill-switch tiers — consulted by production policy authorization.
@@ -110,14 +110,19 @@ const WIRED: &[(&str, &str, &str)] = &[
     // storage.retention_max_mb — the size cap must actually be enforced (ft-rrqhm).
     (
         "runtime.rs",
-        "enforce_size_limit_with_cx(&loop_cx, retention_max_mb)",
+        "enforce_size_limit_progress_with_cx(&loop_cx, retention_max_mb)",
         "storage.retention_max_mb size cap must be enforced in the maintenance loop (ft-rrqhm)",
     ),
     // retention_tiers — config changes must be applied on hot-reload.
     (
         "runtime.rs",
-        "new_config.retention_tiers != retention_tiers",
+        "new_config.retention_policy.as_ref() != retention_policy.as_ref()",
         "retention_tiers config changes must be applied on hot-reload",
+    ),
+    (
+        "runtime.rs",
+        "retention_policy = Arc::clone(&new_config.retention_policy)",
+        "hot-reload must install the newly compiled retention policy",
     ),
 ];
 

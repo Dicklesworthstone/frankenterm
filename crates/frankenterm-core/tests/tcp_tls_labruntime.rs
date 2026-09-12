@@ -50,7 +50,7 @@ fn signed_cert(
     ca_key: &KeyPair,
     cn: &str,
 ) -> (GeneratedCert, CertificateDer<'static>) {
-    let mut params = CertificateParams::default();
+    let mut params = CertificateParams::new(vec![cn.to_string()]).expect("leaf DNS names");
     params.distinguished_name.push(DnType::CommonName, cn);
     params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     params.key_usages.push(KeyUsagePurpose::KeyEncipherment);
@@ -74,28 +74,8 @@ fn tls_bundle(mtls: bool) -> (TlsAcceptor, TlsConnector) {
     let mut key_file = NamedTempFile::new().expect("key temp");
     let key_path = write_pem(&mut key_file, server_cert.key.serialize_pem().as_bytes());
 
-    let mut _client_cert_path = None;
-    let mut _client_key_path = None;
-
-    if mtls {
-        let (client_cert, _client_der) = signed_cert(&ca_params, &ca.key, "wa-client");
-        let mut cc = NamedTempFile::new().expect("client cert temp");
-        _client_cert_path = Some(write_pem(&mut cc, client_cert.cert.pem().as_bytes()));
-        let mut ck = NamedTempFile::new().expect("client key temp");
-        _client_key_path = Some(write_pem(
-            &mut ck,
-            client_cert.key.serialize_pem().as_bytes(),
-        ));
-        // keep files alive until end of scope
-        Box::leak(Box::new(cc));
-        Box::leak(Box::new(ck));
-    }
-
-    // keep server files alive
-    Box::leak(Box::new(ca_file));
-    Box::leak(Box::new(cert_file));
-    Box::leak(Box::new(key_file));
-
+    // build_tls_bundle loads the files before these owners leave scope. In
+    // mTLS mode the configured peer identity is also the client identity.
     let auth_mode = if mtls {
         DistributedAuthMode::Mtls
     } else {
@@ -167,6 +147,31 @@ fn concurrent_tls_clients_all_handshake() {
 }
 
 #[test]
+fn tls_rejects_a_server_name_outside_the_certificate_san() {
+    let (acceptor, connector) = tls_bundle(false);
+    let rt = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = task::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            assert!(acceptor.accept(stream).await.is_err());
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            connector
+                .connect("wrong-host.invalid", stream)
+                .await
+                .is_err()
+        );
+        server.await.expect("server observes rejected handshake");
+    });
+}
+
+#[test]
 fn listener_shutdown_race() {
     let (acceptor, connector) = tls_bundle(false);
     let rt = RuntimeBuilder::current_thread()
@@ -215,7 +220,9 @@ fn listener_shutdown_race() {
             })
         };
 
-        let _ = client_task.await;
+        client_task
+            .await
+            .expect("client completes before listener shutdown");
         acceptor_task.await.unwrap();
     });
 }

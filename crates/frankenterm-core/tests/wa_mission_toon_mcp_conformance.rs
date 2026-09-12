@@ -164,9 +164,10 @@ fn assert_common_envelope_fields(envelope: &Value, ok: bool, label: &str) {
         envelope["mcp_version"], "v1",
         "{label} unexpected mcp_version: {envelope}"
     );
-    assert!(
-        envelope["version"].is_string(),
-        "{label} missing version: {envelope}"
+    assert_eq!(
+        envelope["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{label} version"
     );
 }
 
@@ -341,7 +342,12 @@ fn assert_matches_golden(name: &str, captures: &[ToolContractCapture]) {
     // Schema objects preserve every constraint but their member order is not
     // part of the JSON contract. Compare parsed values, preserving array order
     // and exact scalar types, rather than incidental map insertion order.
-    let expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    for capture in expected_value.as_array_mut().expect("golden captures") {
+        for field in ["json_success_envelope", "toon_success_envelope"] {
+            capture[field]["version"] = Value::from(env!("CARGO_PKG_VERSION"));
+        }
+    }
     let canonical_value: Value = serde_json::from_str(&actual_text).expect("parse actual capture");
     if expected_value != canonical_value {
         let actual_path = retain_actual_contract(&actual_text);

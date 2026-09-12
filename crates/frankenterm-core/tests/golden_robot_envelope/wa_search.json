@@ -74,7 +74,7 @@
         "lexical_weight": 0.3,
         "requested_mode": "hybrid",
         "rrf_k": 60,
-        "semantic_backoff_until_ms": 0,
+        "semantic_backoff_until_ms": null,
         "semantic_budget_state": "active",
         "semantic_cache_hit": false,
         "semantic_candidates": 1,

@@ -1,16 +1,10 @@
-//! ft-zeo5o: `ft web` builds a publisher-less `EventBus`, so `/stream/events`
-//! emits only the `ready` frame + keepalives when run standalone.
+//! ft-zeo5o: standalone `ft web` tails persisted detection events onto its bus.
 //!
-//! Reality (reality-check sweep, verified): the `Commands::Web` arm constructs a
-//! fresh `EventBus` with no publisher and spawns no watcher/capture/detection
-//! task, and an in-memory `EventBus` cannot be shared across processes — so a
-//! separate `ft watch` does not feed this server. The SSE handler is correct; the
-//! defect is the missing in-process producer plus docs advertising "live
-//! EventBus" streaming that does not happen standalone.
+//! The storage bridge supplies events written by a separate watcher; an
+//! in-memory EventBus itself cannot span processes. These source/documentation
+//! guards preserve the bridge wiring and its explicit in-process opt-out.
 //!
-//! These guards lock in the honest `web.rs` module doc. **If you wire a producer
-//! (an in-process capture pipeline or a storage-tail -> `EventBus` bridge), update
-//! `web.rs`'s module doc AND these guards together.**
+//! Transport and delivery behavior still requires the executable web tests.
 
 use std::path::PathBuf;
 
@@ -22,13 +16,23 @@ fn web_src() -> String {
 }
 
 #[test]
-fn web_module_doc_states_stream_events_has_no_standalone_publisher() {
+fn web_module_doc_and_source_preserve_the_storage_event_bridge() {
     let src = web_src();
     assert!(
-        src.contains("carries live events only when an in-process producer"),
-        "web.rs module doc must state that /stream/events carries live events only with an \
-         in-process producer — standalone `ft web` has none (ft-zeo5o)"
+        src.contains("server tails newly persisted")
+            && src.contains("server::spawn_storage_event_tail")
+            && src.contains("with_storage_event_tail(false)"),
+        "web.rs must document persisted-event delivery and the in-process producer opt-out"
     );
+    assert!(src.contains("storage_event_tail: true"));
+    let server = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/web/server.rs"),
+    )
+    .expect("read web/server.rs");
+    assert!(server.contains("if config.storage_event_tail_enabled()"));
+    assert!(server.contains("spawn_storage_event_tail("));
+    assert!(server.contains("storage.get_events_stream(query).await"));
+    assert!(server.contains("bus.publish(stored_event_to_bus_event(stored))"));
 }
 
 #[test]

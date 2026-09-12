@@ -63,6 +63,7 @@ max_sender_id_len = 144
 
 [tuning.ipc]
 max_message_size = 262144
+max_concurrent_connections = 512
 accept_poll_interval_ms = 250
 ",
     );
@@ -74,6 +75,7 @@ accept_poll_interval_ms = 250
 
     let ipc_limits = frankenterm_core::ipc::resolve_limits(Some(&config.tuning.ipc));
     assert_eq!(ipc_limits.max_message_size, 262_144);
+    assert_eq!(ipc_limits.max_concurrent_connections, 512);
     assert_eq!(ipc_limits.accept_poll_interval_ms, 250);
 }
 
@@ -154,7 +156,7 @@ fn t5_policy_and_audit_surfaces_use_loaded_tuning() {
     let config = load_config(
         r"
 [tuning.policy]
-rate_limit_window_secs = 1
+rate_limit_window_secs = 10
 
 [tuning.audit]
 retention_days = 365
@@ -172,10 +174,10 @@ approval_ttl_secs = 77
 
     assert!(engine.authorize(&send_input()).is_allowed());
     assert!(engine.authorize(&send_input()).requires_approval());
-    thread::sleep(Duration::from_millis(1_100));
+    thread::sleep(Duration::from_millis(10_100));
     assert!(
         engine.authorize(&send_input()).is_allowed(),
-        "custom 1s rate-limit window should expire before the third send"
+        "custom 10s rate-limit window should expire before the third send"
     );
 
     let audit_config = AuditLogConfig::from_tuning(&config.tuning);
@@ -189,8 +191,8 @@ fn t6_workflow_descriptor_validation_uses_loaded_limits() {
     let config = load_config(
         r"
 [tuning.workflows]
-max_steps = 1
-max_wait_timeout_ms = 5
+max_steps = 4
+max_wait_timeout_ms = 1000
 max_sleep_ms = 5
 max_text_len = 4
 max_match_len = 4
@@ -202,24 +204,19 @@ max_match_len = 4
         name: "tiny".to_string(),
         description: None,
         triggers: vec![],
-        steps: vec![
-            frankenterm_core::workflows::DescriptorStep::Sleep {
-                id: "sleep-1".to_string(),
+        steps: (1..=5)
+            .map(|index| frankenterm_core::workflows::DescriptorStep::Sleep {
+                id: format!("sleep-{index}"),
                 description: None,
                 duration_ms: 1,
-            },
-            frankenterm_core::workflows::DescriptorStep::Sleep {
-                id: "sleep-2".to_string(),
-                description: None,
-                duration_ms: 1,
-            },
-        ],
+            })
+            .collect(),
         on_failure: None,
     };
     let limits = DescriptorLimits::from_tuning(&config.tuning);
     let err = descriptor
         .validate(&limits)
-        .expect_err("two steps should exceed the configured max_steps=1");
+        .expect_err("five steps should exceed the configured max_steps=4");
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("too many steps"),

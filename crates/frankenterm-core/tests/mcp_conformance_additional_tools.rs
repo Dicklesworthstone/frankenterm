@@ -118,7 +118,7 @@ PANES = [
 ]
 
 args = sys.argv[1:]
-if len(args) >= 4 and args[0] == "cli" and args[1] == "list" and args[2] == "--format" and args[3] == "json":
+if args == ["cli", "--no-auto-start", "list", "--format", "json"]:
     print(json.dumps(PANES))
     sys.exit(0)
 

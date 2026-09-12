@@ -5,3 +5,4 @@ data[2]{pane_id,pane_uuid,tab_id,window_id,domain,title,cwd,observed,ignore_reas
 elapsed_ms: 4
 version: 0.1.0
 now: 1777000000001
+schema_version: 1

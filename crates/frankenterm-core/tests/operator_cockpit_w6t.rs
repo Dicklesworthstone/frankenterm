@@ -73,7 +73,7 @@ fn observation(
 /// | ConnectorBreaker           | ConnectorBreakerOpen    | BlockedInfra   | High     |
 /// | StuckPaneClassification    | StuckPaneClassification | StaleClaim     | Medium   |
 fn cockpit_input() -> AttentionRouterSourceAdapterInput {
-    AttentionRouterSourceAdapterInput::new(GENERATED_AT_MS, "/repo")
+    let mut input = AttentionRouterSourceAdapterInput::new(GENERATED_AT_MS, "/repo")
         .with_observation(observation(
             "git.overlap",
             AttentionRouterSourceKind::Git,
@@ -118,7 +118,29 @@ fn cockpit_input() -> AttentionRouterSourceAdapterInput {
                 "pane 9 idle for 40m",
             )
             .with_agent_name("agent-x"),
-        ))
+        ));
+
+    // Required collectors with no attention-worthy facts are still present.
+    // Omitting them means unavailable telemetry, which correctly adds alerts.
+    for kind in [
+        AttentionRouterSourceKind::Beads,
+        AttentionRouterSourceKind::AgentMail,
+        AttentionRouterSourceKind::Rch,
+        AttentionRouterSourceKind::OperatingEnvelope,
+    ] {
+        input = input.with_observation(
+            AttentionRouterSourceObservation::new(
+                format!("{kind:?}.healthy"),
+                kind,
+                AttentionRouterSourceHealth::Available,
+                "fixture.read_only",
+                "collector completed with no attention-worthy facts",
+            )
+            .live(GENERATED_AT_MS, FRESHNESS_MS)
+            .items_seen(0),
+        );
+    }
+    input
 }
 
 const EXPECTED_DOMAINS: [&str; 5] = [
@@ -132,6 +154,31 @@ const EXPECTED_DOMAINS: [&str; 5] = [
 // =============================================================================
 // W6.1 — read-only aggregation across every source
 // =============================================================================
+
+#[test]
+fn w6_1_missing_required_collector_adds_an_unavailable_source_item() {
+    let mut input = cockpit_input();
+    input.observations.retain(|observation| {
+        observation.source_kind != AttentionRouterSourceKind::OperatingEnvelope
+    });
+    let snapshot = build_attention_router_snapshot(&input);
+    assert_eq!(snapshot.items.len(), 6);
+    let unavailable: Vec<_> = snapshot
+        .items
+        .iter()
+        .filter(|item| item.domain == "operating_envelope")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert!(unavailable[0].evidence.iter().any(|evidence| {
+        evidence.source_kind == AttentionRouterSourceKind::OperatingEnvelope
+            && evidence.fact == AttentionRouterSourceFactKind::SourceUnavailable
+            && evidence
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "source.operating_envelope.missing")
+    }));
+    assert!(!snapshot.side_effects_executed);
+}
 
 #[test]
 fn w6_1_attention_items_aggregate_from_every_source_kind() {
