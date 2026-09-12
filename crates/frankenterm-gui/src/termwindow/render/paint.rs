@@ -213,6 +213,23 @@ impl crate::TermWindow {
         for state in self.pane_state.borrow_mut().values_mut() {
             state.selection_frame.presented();
         }
+        if let Some(pane_id) = self.active_selection_drag_pane {
+            if let Some(pos) = self
+                .get_panes_to_render()
+                .into_iter()
+                .find(|pos| pos.pane.pane_id() == pane_id)
+            {
+                self.retry_pending_selection_start(&pos.pane);
+                let retry = self
+                    .pane_state(pane_id)
+                    .pending_selection_start
+                    .as_mut()
+                    .is_some_and(|pending| pending.take_paint_retry());
+                if retry {
+                    self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
+                }
+            }
+        }
         if outcome.post_present.should_force_frame_budget_paint {
             if let Some(window) = self.window.clone() {
                 window.invalidate();

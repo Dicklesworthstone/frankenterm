@@ -199,9 +199,34 @@ proptest! {
 #[test]
 fn api_version_current_matches_crate_version() {
     let current = ApiVersion::current();
-    assert_eq!(current.to_string(), VERSION);
+    assert_eq!(
+        current.to_string(),
+        format!(
+            "{}.{}.{}",
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH")
+        )
+    );
     let parsed = ApiVersion::parse(VERSION).expect("VERSION should be valid semver");
     assert_eq!(current, parsed);
+    for suffix in ["-rc.1", "+build.7", "-rc.1+build.7"] {
+        assert_eq!(
+            ApiVersion::parse(&format!("{current}{suffix}")),
+            Some(current.clone())
+        );
+    }
+}
+
+#[test]
+fn api_version_rejects_extra_numeric_components() {
+    for invalid in ["1.2.3.4", "1.2.3.4-rc.1", "1.2.3.4+build.7", "1.2.3."] {
+        assert!(ApiVersion::parse(invalid).is_none(), "{invalid}");
+    }
+    assert_eq!(
+        ApiVersion::parse("1.2.3-rc.1+build.7"),
+        ApiVersion::parse("1.2.3")
+    );
 }
 
 // =============================================================================

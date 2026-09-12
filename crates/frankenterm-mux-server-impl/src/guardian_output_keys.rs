@@ -13,6 +13,7 @@ use cap_std::fs::DirBuilder as CapDirBuilder;
 #[cfg(windows)]
 use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
 use cap_std::fs::OpenOptions as CapOpenOptions;
+#[cfg(unix)]
 use cap_std::fs::OpenOptionsExt as _;
 use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
 #[cfg(unix)]
@@ -512,9 +513,13 @@ fn scrollback_keyring_path(
 
 #[cfg(not(target_os = "wasi"))]
 fn create_private_directory(parent: &CapDir, name: &str) -> std::io::Result<()> {
-    let mut builder = CapDirBuilder::new();
+    let builder = CapDirBuilder::new();
     #[cfg(unix)]
-    builder.mode(0o700);
+    let builder = {
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
     parent.create_dir_with(name, &builder)
 }
 
@@ -1558,7 +1563,7 @@ fn validate_file_metadata(
 }
 
 fn validate_private_regular_metadata(
-    directory: &CapDir,
+    _directory: &CapDir,
     metadata: CapMetadata,
 ) -> Result<CapMetadata, GuardianOutputKeyringError> {
     if !metadata.is_file() {
@@ -1566,7 +1571,7 @@ fn validate_private_regular_metadata(
     }
     #[cfg(unix)]
     {
-        let directory_metadata = directory.dir_metadata()?;
+        let directory_metadata = _directory.dir_metadata()?;
         if metadata.permissions().mode() & 0o7777 != 0o600
             || metadata.nlink() != 1
             || metadata.uid() != directory_metadata.uid()
@@ -1606,9 +1611,9 @@ fn same_file_identity(_left: &CapMetadata, _right: &CapMetadata) -> bool {
     false
 }
 
-fn sync_directory(directory: &CapDir) -> Result<(), GuardianOutputKeyringError> {
+fn sync_directory(_directory: &CapDir) -> Result<(), GuardianOutputKeyringError> {
     #[cfg(unix)]
-    directory.open(".")?.sync_all()?;
+    _directory.open(".")?.sync_all()?;
     Ok(())
 }
 

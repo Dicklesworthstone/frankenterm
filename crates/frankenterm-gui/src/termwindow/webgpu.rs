@@ -818,26 +818,32 @@ impl Texture2d for WebGpuTexture {
 
         // wgpu 25 removed caller-specified timeouts from PollType::Wait, so
         // preserve FrankenTerm's 5-second readback deadline with a bounded poll loop.
-        wait_for_webgpu_readback_map(
-            WEBGPU_READBACK_TIMEOUT,
-            Duration::from_millis(10),
-            || {
-                self.device
-                    .poll(wgpu::PollType::Poll)
-                    .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
-                Ok(())
-            },
-            |poll_interval| receiver.recv_timeout(poll_interval),
-            Instant::now,
-        )?;
+        let read_result = (|| {
+            wait_for_webgpu_readback_map(
+                WEBGPU_READBACK_TIMEOUT,
+                Duration::from_millis(10),
+                || {
+                    self.device
+                        .poll(wgpu::PollType::Poll)
+                        .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
+                    Ok(())
+                },
+                |poll_interval| receiver.recv_timeout(poll_interval),
+                Instant::now,
+            )?;
 
-        let data = slice.get_mapped_range();
-        // wgpu requires 256-byte row alignment for copy-to-buffer, but the
-        // BitmapImage contract is tightly packed RGBA bytes.
-        copy_padded_readback_to_image(&data, bytes_per_row as usize, im);
-        drop(data);
+            let data = slice
+                .get_mapped_range()
+                .map_err(|err| anyhow!("accessing mapped webgpu readback failed: {err:?}"))?;
+            // wgpu requires 256-byte row alignment for copy-to-buffer, but the
+            // BitmapImage contract is tightly packed RGBA bytes.
+            copy_padded_readback_to_image(&data, bytes_per_row as usize, im);
+            Ok(())
+        })();
+        // Release the mapping (or cancel a pending map after timeout) on both
+        // success and error, after any mapped view has been dropped.
         readback_buffer.unmap();
-        Ok(())
+        read_result
     }
 
     fn width(&self) -> usize {
@@ -1164,10 +1170,7 @@ fn should_configure_surface(
     requested: (u32, u32),
     force: bool,
 ) -> bool {
-    force
-        || configured != requested
-        || previous_requested.0 == 0
-        || previous_requested.1 == 0
+    force || configured != requested || previous_requested.0 == 0 || previous_requested.1 == 0
 }
 
 fn select_composite_alpha_mode(
@@ -1274,6 +1277,7 @@ impl WebGpuState {
                         },
                         compatible_surface: Some(&surface),
                         force_fallback_adapter: config.webgpu_force_fallback_adapter,
+                        apply_limit_buckets: false,
                     })
                     .await?,
             );
@@ -1374,6 +1378,7 @@ impl WebGpuState {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: surface_width,
             height: surface_height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -1472,7 +1477,7 @@ impl WebGpuState {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
+                buffers: &[Some(Vertex::desc())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1507,7 +1512,8 @@ impl WebGpuState {
 
         let glyph_quad_instance_render_pipeline =
             moonshot_instanced_glyph_quads_enabled().then(|| {
-                let glyph_quad_instance_buffer_layouts = glyph_quad_instance_buffer_layouts();
+                let glyph_quad_instance_buffer_layouts =
+                    glyph_quad_instance_buffer_layouts().map(Some);
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("Instanced Glyph Quad Render Pipeline"),
                     layout: Some(&render_pipeline_layout),
@@ -1734,9 +1740,8 @@ impl WebGpuState {
         let target = unsafe {
             wgpu::SurfaceTargetUnsafe::from_display_and_window(&self.handle, &self.handle)?
         };
-        let candidate: wgpu::Surface<'static> = unsafe {
-            self.instance.create_surface_unsafe(target)?
-        };
+        let candidate: wgpu::Surface<'static> =
+            unsafe { self.instance.create_surface_unsafe(target)? };
         if !self.adapter.is_surface_supported(&candidate) {
             return Err(anyhow!(
                 "replacement surface is incompatible with the active webgpu adapter"
@@ -1806,9 +1811,7 @@ impl WebGpuState {
             wgpu::CurrentSurfaceTexture::Occluded => Err(WebGpuSurfaceTextureError::Occluded),
             wgpu::CurrentSurfaceTexture::Outdated => Err(WebGpuSurfaceTextureError::Outdated),
             wgpu::CurrentSurfaceTexture::Lost => Err(WebGpuSurfaceTextureError::Lost),
-            wgpu::CurrentSurfaceTexture::Validation => {
-                Err(WebGpuSurfaceTextureError::Validation)
-            }
+            wgpu::CurrentSurfaceTexture::Validation => Err(WebGpuSurfaceTextureError::Validation),
         }
     }
 }
@@ -1910,7 +1913,8 @@ mod tests {
             backend: wgpu::Backend::Vulkan,
             subgroup_min_size: wgpu::MINIMUM_SUBGROUP_MIN_SIZE,
             subgroup_max_size: wgpu::MAXIMUM_SUBGROUP_MAX_SIZE,
-            transient_saves_memory: false,
+            transient_saves_memory: Some(false),
+            limit_bucket: None,
         }
     }
 

@@ -32,6 +32,9 @@ struct CellBuffer {
     // None marks image-bearing buffers: image payloads can mutate through a
     // shared handle without any cell edit, so their hashes must stay live.
     shape_hash: std::sync::OnceLock<Option<(u16, [u8; 16])>>,
+    #[cfg(feature = "std")]
+    #[cfg_attr(feature = "use_serde", serde(skip))]
+    wrap_boundary: std::sync::OnceLock<bool>,
 }
 
 impl core::fmt::Debug for VecStorage {
@@ -90,8 +93,26 @@ impl VecStorage {
                 cells,
                 #[cfg(feature = "std")]
                 shape_hash: std::sync::OnceLock::new(),
+                #[cfg(feature = "std")]
+                wrap_boundary: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    pub(crate) fn cached_wrap_boundary(&self, compute: impl FnOnce() -> bool) -> bool {
+        #[cfg(feature = "std")]
+        {
+            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *DISABLED.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_LINE_WRAP_BOUNDARY_CACHE")
+                    .is_some_and(|value| value == "1")
+            }) {
+                return compute();
+            }
+            *self.cells.wrap_boundary.get_or_init(compute)
+        }
+        #[cfg(not(feature = "std"))]
+        compute()
     }
 
     #[cfg(feature = "std")]
@@ -132,7 +153,10 @@ impl VecStorage {
     fn cells_mut(&mut self) -> &mut Vec<Cell> {
         let buffer = Arc::make_mut(&mut self.cells);
         #[cfg(feature = "std")]
-        buffer.shape_hash.take();
+        {
+            buffer.shape_hash.take();
+            buffer.wrap_boundary.take();
+        }
         &mut buffer.cells
     }
 
@@ -235,6 +259,22 @@ mod tests {
         let vs = VecStorage::new(vec![]);
         assert_eq!(vs.len(), 0);
         assert!(vs.is_empty());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn wrap_boundary_cache_detaches_and_invalidates_on_mutation() {
+        let mut cells = VecStorage::new(make_cells("ab"));
+        assert!(cells.cached_wrap_boundary(|| true));
+        assert!(cells.cached_wrap_boundary(|| panic!("rescanned immutable cells")));
+        let frozen = cells.snapshot_clone();
+        cells.set_cell(0, Cell::blank(), false);
+        assert!(!cells.cached_wrap_boundary(|| false));
+        assert!(frozen.cached_wrap_boundary(|| panic!("snapshot cache lost")));
+        cells.push(Cell::blank());
+        assert!(cells.cached_wrap_boundary(|| true));
+        cells[0].attrs_mut().set_wrapped(false);
+        assert!(!cells.cached_wrap_boundary(|| false));
     }
 
     #[test]

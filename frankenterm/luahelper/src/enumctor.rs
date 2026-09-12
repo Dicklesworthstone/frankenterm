@@ -8,13 +8,12 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 struct EnumVariant<T> {
-    phantom: PhantomData<T>,
+    // The constructor names T but never retains a T across Lua calls.
+    // Function-return markers preserve covariance without inheriting T's
+    // Send/Sync requirements: only the variant name is shared.
+    phantom: PhantomData<fn() -> T>,
     variant: String,
 }
-
-// Safety: <T> is used only in PhantomData so it doesn't actually
-// need to be Send.
-unsafe impl<T> Send for EnumVariant<T> {}
 
 impl<T> EnumVariant<T>
 where
@@ -94,12 +93,9 @@ where
 /// table, and it has a __call method that will perform that final stage
 /// of construction.
 pub struct Enum<T> {
-    phantom: PhantomData<T>,
+    // T is constructed and consumed locally by each call, never stored here.
+    phantom: PhantomData<fn() -> T>,
 }
-
-// Safety: <T> is used only in PhantomData so it doesn't actually
-// need to be Send.
-unsafe impl<T> Send for Enum<T> {}
 
 impl<T> Enum<T> {
     pub fn new() -> Self {
@@ -188,5 +184,20 @@ where
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Enum, EnumVariant};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn constructors_are_send_and_sync_without_owning_the_constructed_type() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Enum<Rc<RefCell<()>>>>();
+        assert_send_sync::<EnumVariant<Rc<RefCell<()>>>>();
     }
 }

@@ -450,6 +450,8 @@ pub struct PaneState {
     selection: Selection,
     selection_frame: crate::selection::SelectionFrameState,
     mouse_selection_frame: Option<crate::selection::SelectionFrameStamp>,
+    pending_selection_start: Option<crate::selection::PendingSelectionStart>,
+    suppress_selection_link: bool,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
@@ -1076,6 +1078,7 @@ pub struct TermWindow {
     current_mouse_buttons: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
     active_selection_drag_pane: Option<PaneId>,
+    active_selection_drag_button: Option<MousePress>,
 
     opengl_info: Option<String>,
 
@@ -1298,13 +1301,14 @@ pub(crate) fn is_clean_line_for_cache_hit_accounting(
     !bm.contains(line_idx)
 }
 
-/// True only while an active terminal-pane left-drag is extending a selection.
+/// True only while the initiating button of a terminal selection drag is held.
 /// Dirty PTY output may redraw under that in-flight selection, but it must not
 /// clear the selection before the matching mouse-up can copy it.
 pub(crate) fn should_preserve_selection_during_dirty_line_update(
     current_mouse_capture: &Option<MouseCapture>,
     current_mouse_buttons: &[MousePress],
     active_selection_drag_pane: Option<PaneId>,
+    active_selection_drag_button: Option<MousePress>,
     pane_id: PaneId,
 ) -> bool {
     let captured_pane_id = match current_mouse_capture {
@@ -1314,7 +1318,7 @@ pub(crate) fn should_preserve_selection_during_dirty_line_update(
     frankenterm_gui::should_preserve_dirty_selection_during_mouse_drag(
         active_selection_drag_pane,
         captured_pane_id,
-        current_mouse_buttons.contains(&MousePress::Left),
+        active_selection_drag_button.is_some_and(|button| current_mouse_buttons.contains(&button)),
         pane_id,
     )
 }
@@ -3325,6 +3329,7 @@ impl TermWindow {
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             active_selection_drag_pane: None,
+            active_selection_drag_button: None,
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,
@@ -4275,7 +4280,7 @@ impl TermWindow {
                             self.current_mouse_buttons.clear();
                         }
                         if mouse_cleanup.clear_selection_drag {
-                            self.active_selection_drag_pane = None;
+                            self.clear_selection_drag();
                         }
                         self.prune_tab_state_to_live_window();
                         if detached_retired_overlay {
@@ -5028,10 +5033,10 @@ impl TermWindow {
                 let selection = self.selection(pane_id);
                 selection.origin.is_some() || selection.range.is_some()
             };
-            if has_selection_anchor && !self.selection_authority_is_current(pane) {
+            if has_selection_anchor && self.selection_authority_has_changed(pane) {
                 self.selection(pane_id).clear();
                 if self.active_selection_drag_pane == Some(pane_id) {
-                    self.active_selection_drag_pane = None;
+                    self.clear_selection_drag();
                 }
             }
             // If any of the changed lines intersect with the
@@ -5074,10 +5079,11 @@ impl TermWindow {
                     &self.current_mouse_capture,
                     &self.current_mouse_buttons,
                     self.active_selection_drag_pane,
+                    self.active_selection_drag_button,
                     pane_id,
                 )
             {
-                self.active_selection_drag_pane = None;
+                self.clear_selection_drag();
                 self.selection(pane.pane_id()).range.take();
                 self.selection(pane.pane_id()).origin.take();
                 self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
@@ -6865,15 +6871,15 @@ impl TermWindow {
                 }
             }
             SelectTextAtMouseCursor(mode) => {
-                self.active_selection_drag_pane = Some(pane.pane_id());
+                self.begin_selection_drag(pane);
                 self.select_text_at_mouse_cursor(*mode, pane);
             }
             ExtendSelectionToMouseCursor(mode) => {
-                self.active_selection_drag_pane = Some(pane.pane_id());
+                self.begin_selection_drag(pane);
                 self.extend_selection_at_mouse_cursor(*mode, pane);
             }
             ClearSelection => {
-                self.active_selection_drag_pane = None;
+                self.clear_selection_drag();
                 self.clear_selection(pane);
             }
             StartWindowDrag => {
@@ -6886,10 +6892,18 @@ impl TermWindow {
                 self.emit_window_event(name, None);
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
-                self.active_selection_drag_pane = None;
+                self.retry_pending_selection_start(pane);
+                self.clear_selection_drag();
+                let suppress_link = {
+                    let mut state = self.pane_state(pane.pane_id());
+                    state.pending_selection_start = None;
+                    std::mem::take(&mut state.suppress_selection_link)
+                };
                 let had_selection = self.selection(pane.pane_id()).range.is_some();
                 if had_selection && !self.selection_authority_is_current(pane) {
-                    self.clear_selection(pane);
+                    if self.selection_authority_has_changed(pane) {
+                        self.clear_selection(pane);
+                    }
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let text = self.selection_text(pane);
@@ -6898,12 +6912,20 @@ impl TermWindow {
                     if let Some(window) = self.window.as_ref() {
                         window.invalidate();
                     }
-                } else if !had_selection || self.selection_authority_is_current(pane) {
+                } else if !suppress_link
+                    && (!had_selection || self.selection_authority_is_current(pane))
+                {
                     self.do_open_link_at_mouse_cursor(pane);
                 }
             }
             CompleteSelection(dest) => {
-                self.active_selection_drag_pane = None;
+                self.retry_pending_selection_start(pane);
+                self.clear_selection_drag();
+                {
+                    let mut state = self.pane_state(pane.pane_id());
+                    state.pending_selection_start = None;
+                    state.suppress_selection_link = false;
+                }
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);

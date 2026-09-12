@@ -19,10 +19,7 @@
 
 use base64::Engine as _;
 use chacha20poly1305::{
-    aead::{
-        rand_core::{OsRng, RngCore as _},
-        Aead, KeyInit, Payload,
-    },
+    aead::{common::getrandom, Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use sha2::{Digest as _, Sha256};
@@ -608,7 +605,7 @@ impl GuardianOutputKey {
     /// Generate a new key from the operating system random source.
     pub fn generate() -> Result<Self, GuardianOutputJournalError> {
         let mut bytes = [0_u8; GuardianOutputCipher::KEY_BYTES];
-        if OsRng.try_fill_bytes(&mut bytes).is_err() {
+        if getrandom::fill(&mut bytes).is_err() {
             bytes.zeroize();
             return Err(GuardianOutputJournalError::EntropyUnavailable);
         }
@@ -746,7 +743,7 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackRowError::RecordByteLimit);
         }
         let mut nonce = [0; NONCE_BYTES];
-        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+        if getrandom::fill(&mut nonce).is_err() {
             nonce.zeroize();
             return Err(GuardianScrollbackRowError::EntropyUnavailable);
         }
@@ -754,7 +751,7 @@ impl GuardianOutputCipher {
         let ciphertext = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -811,7 +808,7 @@ impl GuardianOutputCipher {
         let plaintext = Zeroizing::new(
             self.cipher
                 .decrypt(
-                    XNonce::from_slice(&record.nonce),
+                    &XNonce::from(record.nonce),
                     Payload {
                         msg: &record.ciphertext,
                         aad: &aad,
@@ -840,7 +837,7 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
         }
         let mut nonce = [0; NONCE_BYTES];
-        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+        if getrandom::fill(&mut nonce).is_err() {
             nonce.zeroize();
             return Err(GuardianScrollbackManifestError::EntropyUnavailable);
         }
@@ -848,7 +845,7 @@ impl GuardianOutputCipher {
         let authentication_tag = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: &[],
                     aad: &aad,
@@ -888,7 +885,7 @@ impl GuardianOutputCipher {
         let plaintext = self
             .cipher
             .decrypt(
-                XNonce::from_slice(&authentication.nonce),
+                &XNonce::from(authentication.nonce),
                 Payload {
                     msg: &authentication.authentication_tag,
                     aad: &aad,
@@ -914,7 +911,7 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackAppendWalError::CanonicalByteLimit);
         }
         let mut nonce = [0; NONCE_BYTES];
-        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+        if getrandom::fill(&mut nonce).is_err() {
             nonce.zeroize();
             return Err(GuardianScrollbackAppendWalError::EntropyUnavailable);
         }
@@ -922,7 +919,7 @@ impl GuardianOutputCipher {
         let authentication_tag = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: &[],
                     aad: &aad,
@@ -960,7 +957,7 @@ impl GuardianOutputCipher {
         let plaintext = self
             .cipher
             .decrypt(
-                XNonce::from_slice(&authentication.nonce),
+                &XNonce::from(authentication.nonce),
                 Payload {
                     msg: &authentication.authentication_tag,
                     aad: &aad,
@@ -986,14 +983,14 @@ impl GuardianOutputCipher {
         aad: &[u8],
     ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        if OsRng.try_fill_bytes(&mut nonce_bytes).is_err() {
+        if getrandom::fill(&mut nonce_bytes).is_err() {
             nonce_bytes.zeroize();
             return Err(GuardianOutputJournalError::EntropyUnavailable);
         }
         let ciphertext = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce_bytes),
+                &XNonce::from(nonce_bytes),
                 Payload {
                     msg: plaintext,
                     aad,
@@ -1045,7 +1042,7 @@ impl GuardianOutputCipher {
         let ciphertext = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce_bytes),
+                &XNonce::from(nonce_bytes),
                 Payload {
                     msg: plaintext,
                     aad,
@@ -1065,7 +1062,7 @@ impl GuardianOutputCipher {
     ) -> Result<Zeroizing<Vec<u8>>, GuardianOutputJournalError> {
         self.cipher
             .decrypt(
-                XNonce::from_slice(nonce_bytes),
+                &XNonce::from(*nonce_bytes),
                 Payload {
                     msg: ciphertext,
                     aad,
@@ -1083,16 +1080,16 @@ impl GuardianOutputCipher {
         plaintext: &[u8],
     ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        if OsRng.try_fill_bytes(&mut nonce_bytes).is_err() {
+        if getrandom::fill(&mut nonce_bytes).is_err() {
             nonce_bytes.zeroize();
             return Err(GuardianOutputJournalError::EntropyUnavailable);
         }
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::from(nonce_bytes);
         let aad = record_aad(identity, sequence, plaintext_bytes);
         let ciphertext = self
             .cipher
             .encrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -1110,11 +1107,11 @@ impl GuardianOutputCipher {
         nonce_bytes: &[u8; NONCE_BYTES],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, GuardianOutputJournalError> {
-        let nonce = XNonce::from_slice(nonce_bytes);
+        let nonce = XNonce::from(*nonce_bytes);
         let aad = record_aad(identity, sequence, plaintext_bytes);
         self.cipher
             .decrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: ciphertext,
                     aad: &aad,
@@ -3439,14 +3436,12 @@ fn encode_file_header(
     }
     header[112..120].copy_from_slice(&cipher.key_id);
     let mut nonce = [0_u8; NONCE_BYTES];
-    OsRng
-        .try_fill_bytes(&mut nonce)
-        .map_err(|_| GuardianOutputJournalError::EntropyUnavailable)?;
+    getrandom::fill(&mut nonce).map_err(|_| GuardianOutputJournalError::EntropyUnavailable)?;
     let aad = file_header_aad(&header[0..136]);
     let authentication_tag = cipher
         .cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: &[],
                 aad: &aad,
@@ -3512,7 +3507,7 @@ fn validate_file_header(
     let plaintext = cipher
         .cipher
         .decrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: &header[160..176],
                 aad: &aad,
@@ -4472,7 +4467,7 @@ mod tests {
         let ciphertext = cipher
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: payload,
                     aad: &legacy_aad,

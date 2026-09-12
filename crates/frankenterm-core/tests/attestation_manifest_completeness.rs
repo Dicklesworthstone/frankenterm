@@ -399,14 +399,21 @@ fn is_safe_repo_relative_path(path: &str) -> bool {
         .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-fn deferred_bead_has_root_edge(bead_id: &str, record: &BeadRecord) -> bool {
+fn deferred_bead_has_root_edge(bead_id: &str, beads: &HashMap<String, BeadRecord>) -> bool {
     let root_child_prefix = format!("{ROOT_BEAD_ID}.");
-    record.edges.iter().any(|edge| {
-        matches!(edge.edge_type.as_str(), "parent-child" | "blocks")
-            && ((edge.issue_id == bead_id
-                && (edge.depends_on_id == ROOT_BEAD_ID
-                    || edge.depends_on_id.starts_with(&root_child_prefix)))
-                || (edge.issue_id == ROOT_BEAD_ID && edge.depends_on_id == bead_id))
+    // Dependencies belong to their source issue. A release blocked by this
+    // producer therefore stores its edge on the root, not on the producer.
+    [bead_id, ROOT_BEAD_ID].into_iter().any(|owner| {
+        beads.get(owner).is_some_and(|record| {
+            record.edges.iter().any(|edge| {
+                edge.issue_id == owner
+                    && matches!(edge.edge_type.as_str(), "parent-child" | "blocks")
+                    && ((owner == bead_id
+                        && (edge.depends_on_id == ROOT_BEAD_ID
+                            || edge.depends_on_id.starts_with(&root_child_prefix)))
+                        || (owner == ROOT_BEAD_ID && edge.depends_on_id == bead_id))
+            })
+        })
     })
 }
 
@@ -537,7 +544,7 @@ fn validate_manifest_text(
                         status: record.status.clone(),
                     });
                 }
-                if !deferred_bead_has_root_edge(bead_id, record) {
+                if !deferred_bead_has_root_edge(bead_id, &beads) {
                     errors.push(ManifestError::DeferredBeadOrphan {
                         slot_index,
                         category: category.to_string(),
@@ -799,6 +806,46 @@ fn deferred_beads_have_proper_graph_edges() {
         &workspace_root(),
     )
     .expect("deferred bead with ft-e87u6 blocks edge should validate");
+}
+
+#[test]
+fn deferred_bead_accepts_only_correctly_owned_incoming_root_edges() {
+    let producer = "ft-7h5da.10.2";
+    for (record_owner, edge_owner, target, edge_type, accepted) in [
+        (ROOT_BEAD_ID, ROOT_BEAD_ID, producer, "blocks", true),
+        (ROOT_BEAD_ID, ROOT_BEAD_ID, producer, "parent-child", true),
+        (ROOT_BEAD_ID, ROOT_BEAD_ID, producer, "related", false),
+        (ROOT_BEAD_ID, "ft-other", producer, "blocks", false),
+        ("ft-other", ROOT_BEAD_ID, producer, "blocks", false),
+        (producer, ROOT_BEAD_ID, producer, "blocks", false),
+        (ROOT_BEAD_ID, ROOT_BEAD_ID, "ft-other", "blocks", false),
+    ] {
+        let mut slot = valid_manifest_slot();
+        slot["path"] = Value::Null;
+        slot["deferred_to_bead"] = json!(producer);
+        slot["deferred_reason"] = json!("release awaits this producer");
+        let issues = [
+            json!({"id": producer, "status": "in_progress", "dependencies": []}),
+            json!({
+                "id": record_owner,
+                "status": "in_progress",
+                "dependencies": [{
+                    "issue_id": edge_owner,
+                    "depends_on_id": target,
+                    "type": edge_type
+                }]
+            }),
+        ]
+        .map(|record| record.to_string())
+        .join("\n");
+        let result = validate_manifest_text(&manifest_with_slot(slot), &issues, &workspace_root());
+        if accepted {
+            result.expect("correctly owned incoming root edge must resolve deferred graph linkage");
+        } else {
+            let errors = result.expect_err("wrong owner, target, or type must not resolve linkage");
+            assert_error_contains(&errors, "orphan_deferred_bead", producer);
+        }
+    }
 }
 
 #[test]

@@ -5,6 +5,21 @@ fn text_cell() -> impl Strategy<Value = String> {
     "[A-Za-z0-9 _.,:/?&=-]{0,64}".prop_map(String::from)
 }
 
+#[test]
+fn canonical_numeric_strings_preserve_only_canonical_numeric_encodings() {
+    for (raw, expected) in [
+        ("", SqlCell::Null),
+        ("0", SqlCell::Integer(0)),
+        ("-42", SqlCell::Integer(-42)),
+        ("1.5", SqlCell::Real(1.5)),
+        ("01", SqlCell::Text("01".into())),
+        ("1.50", SqlCell::Text("1.50".into())),
+        ("?", SqlCell::Text("?".into())),
+    ] {
+        assert_eq!(SqlCell::from_canonical_string(raw), expected, "{raw:?}");
+    }
+}
+
 fn blob_cell() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..64)
 }
@@ -125,10 +140,12 @@ proptest! {
         prop_assert!(SqlCell::from_canonical_string("").is_null());
 
         let from_text = SqlCell::from_canonical_string(&text);
-        if text.is_empty() {
-            prop_assert!(from_text.is_null());
-        } else {
-            prop_assert_eq!(from_text.as_text(), Some(text.as_str()));
+        match from_text {
+            SqlCell::Null => prop_assert!(text.is_empty()),
+            SqlCell::Integer(value) => prop_assert_eq!(value.to_string(), text),
+            SqlCell::Real(value) => prop_assert_eq!(value.to_string(), text),
+            SqlCell::Text(value) => prop_assert_eq!(value, text),
+            SqlCell::Blob(_) => prop_assert!(false, "canonical text cannot reconstruct a blob"),
         }
 
         let from_nonempty = SqlCell::from_canonical_string(&nonempty);

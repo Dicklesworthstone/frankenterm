@@ -159,7 +159,9 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<(UnixListene
         }
     }
 
-    let mut socket_lock = acquire_socket_lock(sock_path)?;
+    let socket_lock = acquire_socket_lock(sock_path)?;
+    #[cfg(unix)]
+    let mut socket_lock = socket_lock;
 
     #[cfg(unix)]
     quarantine_existing_socket_under_lease(sock_path, &socket_lock)?;

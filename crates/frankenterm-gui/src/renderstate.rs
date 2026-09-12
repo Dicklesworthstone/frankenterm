@@ -1008,6 +1008,7 @@ mod tests {
                     compatible_surface: None,
                     force_fallback_adapter: false,
                     power_preference: wgpu::PowerPreference::LowPower,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .expect("vertex qualification requires an actual adapter");
@@ -1131,7 +1132,9 @@ mod tests {
                     other => panic!("GPU readback did not complete: {other:?}"),
                 }
             }
-            let actual = slice.get_mapped_range();
+            let actual = slice
+                .get_mapped_range()
+                .expect("access mapped vertex readback");
             assert_eq!(&*actual, expected.as_slice(), "queued frame bytes changed");
             drop(actual);
             readback.unmap();
