@@ -5,9 +5,9 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.15.2` tag has a published GitHub Release; `backup-before-rewrite` is a tag only. The `v0.15.0` release was source-only, `v0.15.1` restored the platform matrix, and `v0.15.2` makes that matrix signed and installer-verifiable.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published release verified on 2026-09-12 is `v0.15.1`. The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Version `0.15.2` was installed locally, but its GitHub release and remote tag are absent; its changes below do not establish public artifact availability.
 
-Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) (2026-09-05). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
+Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through the local `0.15.2` build (2026-09-05) and subsequent development. The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
 ## Version Timeline
 
@@ -15,8 +15,8 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main) | HEAD | — | Next release |
-| [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2) | Release | 2026-09-05 | Entry ramp: CLI finds the GUI, mux survives connects, `ft web` answers and streams live, signed assets |
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main) | HEAD | — | Next public release |
+| `v0.15.2` | Local build; no current GitHub Release | 2026-09-05 | CLI finds the GUI, mux survives connects, `ft web` answers and streams live; signing and installer verification implemented |
 | [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-21 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
 | [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
@@ -26,9 +26,9 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- development on `main` since [v0.15.2](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2)
+## [Unreleased] -- development on `main` since the local `0.15.2` build
 
-Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...main>
+Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
 - Local-pane resize prepares text wrapping outside the terminal and resize-admission locks. It validates the captured text, cursor, geometry and policy before applying the result; parser output or a superseding resize invalidates stale work. Image-bearing content retains the synchronous path.
 - Flexible-pane layout no longer reads terminal dimensions while planning a resize. This avoids waiting on the parser's terminal lock for dimensions that only fixed-size panes require.
@@ -43,15 +43,17 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.2...mai
 - Durable transaction guards explicitly release their file locks when ownership ends, including after validation failure, so inherited file descriptors cannot prolong a completed operation's lock.
 - Windows font loading widens FreeType stream offsets correctly on LLP64 and handles DirectWrite lookup failures through fallible APIs.
 - Onboarding refuses high-risk eligibility when any required check is missing or skipped, and reports which check lacks passing evidence.
+- Schema 47 preserves an audit action's target pane identity even when the pane has not been observed or is later removed. Native read and search audits no longer fail the observation foreign key. The migration is forward-only; retain a database backup with the previous application for rollback.
+- Optional mmap capture mirrors cannot override committed SQLite text with stale or empty cache contents after redaction. Mirror reads are bounded and read-only, and fall back to SQLite when the cached records differ.
 
 These changes are under release qualification. Native profiling of earlier candidates found synchronous scrollback persistence holding the terminal lock during output. Deferred persistence and bounded off-UI reads now address that lock path; complete cold/resident seam reflow and large-history layout coverage remain in progress. Native resize/font latency, streaming-output behavior and memory qualification remain pending. This entry does not announce a release or an instant-resize result.
 
 ---
 
-## [0.15.2] -- 2026-09-05 (GitHub Release)
+## [0.15.2] -- 2026-09-05 (local build)
 
-GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.2>
-Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...v0.15.2>
+Local tag: `v0.15.2`, commit `319a56da7595a67df2bfb54c60eb777bc6d4ead7`.
+GitHub release lookup returned 404 and the remote tag was absent on 2026-09-12. The following records the local build's changes, not a verified public release.
 
 ### Entry ramp: attach, observe, and serve on the shipped binaries (2026-09-01/02 reality check, epic ft-xxfwy)
 
