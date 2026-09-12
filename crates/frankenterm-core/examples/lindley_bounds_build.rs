@@ -239,10 +239,85 @@ mod live_measurement {
         #[derive(Clone, Serialize)]
         struct Observation {
             sequence: u32,
+            transient_read_rejections: u32,
             // Monotonic nanoseconds relative to the measurement epoch. Stage
             // boundaries include batching wait before storage admission.
             stages_ns: [[u64; 2]; 3],
             content_sha256: String,
+        }
+
+        fn retryable_capture_read(error: &frankenterm_core::Error) -> bool {
+            use frankenterm_core::error::{
+                MuxEffectCertainty, MuxOperation, MuxRejectionCode, MuxRetryAuthority, WeztermError,
+            };
+            matches!(error, frankenterm_core::Error::Wezterm(WeztermError::MuxRejection(rejection))
+                if rejection.has_consistent_authority()
+                    && rejection.operation == MuxOperation::ReadPaneText
+                    && rejection.code == MuxRejectionCode::BackendFailure
+                    && rejection.effect == MuxEffectCertainty::NotApplied
+                    && rejection.retry == MuxRetryAuthority::SafeAfterBackoff)
+        }
+
+        async fn poll_frame<F, Fut>(
+            cx: &Cx,
+            marker: &str,
+            deadline: Instant,
+            mut read: F,
+        ) -> Result<(String, u32), String>
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = frankenterm_core::Result<String>>,
+        {
+            let mut rejections = 0_u32;
+            loop {
+                cx.checkpoint().map_err(|error| error.to_string())?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "producer frame deadline expired; transient_read_rejections={rejections}"
+                    ));
+                }
+                let result = frankenterm_core::runtime_async::timeout_with_cx(
+                    cx,
+                    remaining,
+                    read(),
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "capture read deadline: {error}; transient_read_rejections={rejections}"
+                    )
+                })?;
+                cx.checkpoint().map_err(|error| error.to_string())?;
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "producer frame deadline expired; transient_read_rejections={rejections}"
+                    ));
+                }
+                match result {
+                    Ok(text) => {
+                        if text.len() > 8192 {
+                            return Err("dedicated pane snapshot exceeds 8KiB".into());
+                        }
+                        if text.contains(marker) {
+                            return Ok((text, rejections));
+                        }
+                    }
+                    Err(error) if retryable_capture_read(&error) => {
+                        rejections = rejections.checked_add(1).ok_or("retry count overflow")?;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "producer frame deadline expired; transient_read_rejections={rejections}"
+                    ));
+                }
+                sleep_with_cx(cx, remaining.min(Duration::from_millis(1)))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
 
         fn elapsed(epoch: Instant) -> Result<u64, String> {
@@ -337,7 +412,7 @@ mod live_measurement {
                     )),
                 }
             })?;
-            let (model, observations) = result;
+            let (model, observations, initial_read_rejections) = result;
             let (arrival, stages) = model.to_network_calculus_inputs()?;
             let bound = pipeline_delay_bound(arrival, &stages);
             let held_out = &observations[BURST * BURSTS_PER_PHASE..];
@@ -380,6 +455,8 @@ mod live_measurement {
                 "platform": std::env::consts::OS,
                 "architecture": std::env::consts::ARCH,
                 "payload_bytes": 4096,
+                "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
+                "initial_read_rejections": initial_read_rejections,
                 "overlap_bytes": 4096,
                 "burst_events": BURST,
                 "calibration_rows": BURST * BURSTS_PER_PHASE,
@@ -417,7 +494,7 @@ mod live_measurement {
             socket: &str,
             pane_id: u64,
             arrival_rate: f64,
-        ) -> Result<(LindleyTelemetryModel, Vec<Observation>), String> {
+        ) -> Result<(LindleyTelemetryModel, Vec<Observation>, u32), String> {
             let pool = Arc::new(MuxPool::new(MuxPoolConfig {
                 mux: DirectMuxClientConfig::default().with_socket_path(socket),
                 ..MuxPoolConfig::default()
@@ -426,20 +503,16 @@ mod live_measurement {
                 .with_mux_pool(pool)
                 .with_timeout(5)
                 .with_retries(1);
-            let initial = client
-                .get_text_with_cx(cx, pane_id, false)
-                .await
-                .map_err(|error| error.to_string())?;
-            if initial.len() > 8192 {
-                return Err(
-                    "dedicated pane snapshot exceeds 8KiB; configure bounded scrollback".into(),
-                );
-            }
-            if !initial.contains("FT LINDLEY READY V1") {
-                return Err(
-                    "owned pane must run --pane-producer with terminal echo disabled".into(),
-                );
-            }
+            // Socket/pane readiness does not prove the producer has finished
+            // its warmup output. Use the same bounded, typed capture polling
+            // before establishing the baseline; do not add a startup sleep.
+            let (initial, initial_read_rejections) = poll_frame(
+                cx,
+                "FT LINDLEY READY V1",
+                Instant::now() + Duration::from_secs(5),
+                || client.get_text_with_cx(cx, pane_id, false),
+            )
+            .await?;
             storage
                 .upsert_pane_with_cx(
                     cx,
@@ -488,24 +561,11 @@ mod live_measurement {
                         .map_err(|error| error.to_string())?;
                     let marker = format!("FT LINDLEY END {sequence:08}");
                     let capture_deadline = Instant::now() + Duration::from_secs(5);
-                    let snapshot = loop {
-                        let text = client
-                            .get_text_with_cx(cx, pane_id, false)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        if text.len() > 8192 {
-                            return Err("dedicated pane snapshot exceeds 8KiB".into());
-                        }
-                        if text.contains(&marker) {
-                            break text;
-                        }
-                        if Instant::now() >= capture_deadline {
-                            return Err(format!("producer frame {sequence} did not arrive"));
-                        }
-                        sleep_with_cx(cx, Duration::from_millis(1))
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    };
+                    let (snapshot, transient_read_rejections) =
+                        poll_frame(cx, &marker, capture_deadline, || {
+                            client.get_text_with_cx(cx, pane_id, false)
+                        })
+                        .await?;
                     let captured = elapsed(epoch)?;
                     let segment = cursor
                         .capture_snapshot(&snapshot, 4096, None)
@@ -525,30 +585,46 @@ mod live_measurement {
                         extracted,
                         hash,
                         segment.content,
+                        transient_read_rejections,
                     ));
                 }
-                let results = futures::future::join_all(pending.iter().map(
-                    |(sequence, started, captured, extracted, hash, content)| async move {
-                        let stored = storage
-                            .append_segment_with_cx(cx, pane_id, content, None)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let completed = elapsed(epoch)?;
-                        if stored.content != *content || stored.seq != u64::from(*sequence) {
-                            return Err("committed segment content or sequence differs".to_string());
-                        }
-                        Ok(Observation {
-                            sequence: *sequence,
-                            stages_ns: [
-                                [*started, *captured],
-                                [*captured, *extracted],
-                                [*extracted, completed],
-                            ],
-                            content_sha256: hash.clone(),
-                        })
-                    },
-                ))
-                .await;
+                let results =
+                    futures::future::join_all(
+                        pending.iter().map(
+                            |(
+                                sequence,
+                                started,
+                                captured,
+                                extracted,
+                                hash,
+                                content,
+                                rejections,
+                            )| async move {
+                                let stored = storage
+                                    .append_segment_with_cx(cx, pane_id, content, None)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                let completed = elapsed(epoch)?;
+                                if stored.content != *content || stored.seq != u64::from(*sequence)
+                                {
+                                    return Err(
+                                        "committed segment content or sequence differs".to_string()
+                                    );
+                                }
+                                Ok(Observation {
+                                    sequence: *sequence,
+                                    transient_read_rejections: *rejections,
+                                    stages_ns: [
+                                        [*started, *captured],
+                                        [*captured, *extracted],
+                                        [*extracted, completed],
+                                    ],
+                                    content_sha256: hash.clone(),
+                                })
+                            },
+                        ),
+                    )
+                    .await;
                 for result in results {
                     observations.push(result?);
                 }
@@ -577,6 +653,7 @@ mod live_measurement {
             Ok((
                 calibration_model.ok_or("missing calibration model")?,
                 observations,
+                initial_read_rejections,
             ))
         }
 
@@ -669,9 +746,104 @@ mod live_measurement {
         mod tests {
             use super::*;
 
+            #[test]
+            fn frame_poll_retries_only_typed_read_authority_and_preserves_deadline() {
+                use frankenterm_core::error::{MuxOperation, MuxRejection, WeztermError};
+                let runtime = RuntimeBuilder::current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let cx = Cx::for_testing();
+                    let rejection = || {
+                        frankenterm_core::Error::Wezterm(WeztermError::MuxRejection(
+                            MuxRejection::backend_failure(MuxOperation::ReadPaneText),
+                        ))
+                    };
+                    let mut attempts = 0;
+                    let (text, count) = poll_frame(
+                        &cx,
+                        "ready",
+                        Instant::now() + Duration::from_secs(1),
+                        || {
+                            attempts += 1;
+                            std::future::ready(if attempts == 1 {
+                                Err(rejection())
+                            } else {
+                                Ok("ready".into())
+                            })
+                        },
+                    )
+                    .await
+                    .expect("safe rejection followed by complete frame");
+                    assert_eq!((text.as_str(), count, attempts), ("ready", 1, 2));
+
+                    for authority in [
+                        MuxRejection::backend_failure(MuxOperation::SendText),
+                        MuxRejection::pane_not_found(MuxOperation::ReadPaneText, 0),
+                        MuxRejection::deadline_exceeded(MuxOperation::ReadPaneText),
+                    ] {
+                        let mut attempts = 0;
+                        let result = poll_frame(
+                            &cx,
+                            "ready",
+                            Instant::now() + Duration::from_secs(1),
+                            || {
+                                attempts += 1;
+                                std::future::ready(Err(frankenterm_core::Error::Wezterm(
+                                    WeztermError::MuxRejection(authority),
+                                )))
+                            },
+                        )
+                        .await;
+                        assert!(result.is_err());
+                        assert_eq!(attempts, 1);
+                    }
+                    let mut attempts = 0;
+                    let result = poll_frame(&cx, "ready", Instant::now(), || {
+                        attempts += 1;
+                        std::future::ready(Ok("ready".into()))
+                    })
+                    .await;
+                    assert!(result.is_err());
+                    assert_eq!(attempts, 0, "expired deadline must not invoke read");
+
+                    let result = poll_frame(
+                        &cx,
+                        "ready",
+                        Instant::now() + Duration::from_millis(1),
+                        || {
+                            std::thread::sleep(Duration::from_millis(5));
+                            std::future::ready(Ok("ready".into()))
+                        },
+                    )
+                    .await;
+                    assert!(
+                        result.is_err(),
+                        "late ready result must not outrun deadline"
+                    );
+
+                    let result = poll_frame(
+                        &cx,
+                        "ready",
+                        Instant::now() + Duration::from_secs(1),
+                        || {
+                            cx.cancel_with(
+                                frankenterm_core::outcome::CancelKind::User,
+                                Some("poll control"),
+                            );
+                            std::future::ready(Ok("ready".into()))
+                        },
+                    )
+                    .await;
+                    assert!(result.is_err(), "cancelled read cannot publish a frame");
+                });
+            }
+
             fn row(sequence: u32, start: u64, end: u64) -> Observation {
                 Observation {
                     sequence,
+                    transient_read_rejections: 0,
                     stages_ns: [[start, end]; 3],
                     content_sha256: String::new(),
                 }
