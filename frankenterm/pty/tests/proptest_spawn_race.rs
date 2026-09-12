@@ -3,6 +3,7 @@
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use proptest::prelude::*;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::mpsc;
 use std::thread;
