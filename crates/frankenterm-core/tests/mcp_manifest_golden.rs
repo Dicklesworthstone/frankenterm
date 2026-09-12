@@ -24,7 +24,9 @@
 use std::path::PathBuf;
 
 use frankenterm_core::config::Config;
+use frankenterm_core::cx::Cx;
 use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
+use frankenterm_core::runtime_async::RuntimeBuilder;
 use serde_json::{Map, Value, json};
 
 /// Produce a deterministic manifest of tools/resources/templates from the
@@ -35,12 +37,17 @@ fn capture_manifest(db_path: Option<PathBuf>) -> Value {
     // silent no-db degradation path was removed); the database-less surface is
     // now opt-in via build_server_degraded. Branch so the no-db golden variant
     // exercises the real degraded catalog instead of panicking.
-    let server = match db_path {
-        Some(path) => {
-            build_server_with_db(&Config::default(), Some(path)).expect("build MCP server")
-        }
-        None => build_server_degraded(&Config::default()).expect("build degraded MCP server"),
-    };
+    let server = RuntimeBuilder::current_thread()
+        .build()
+        .expect("metadata runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("runtime-owned metadata context");
+            match db_path {
+                Some(path) => build_server_with_db(&cx, &Config::default(), Some(path)).await,
+                None => build_server_degraded(&cx, &Config::default()).await,
+            }
+        })
+        .expect("build explicitly selected MCP catalog");
 
     let mut tools: Vec<Value> = server
         .tools()

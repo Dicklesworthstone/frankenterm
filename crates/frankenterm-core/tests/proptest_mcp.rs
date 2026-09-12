@@ -20,20 +20,32 @@ struct ServerSnapshot {
 
 fn spawn_client(db_path: Option<PathBuf>) -> (FrameworkTestClient, ServerSnapshot) {
     let config = Config::default();
-    let server = match db_path {
-        Some(db_path) => build_server_with_db(&config, Some(db_path)),
-        None => build_server_degraded(&config),
-    }
-    .expect("build MCP server");
-    let snapshot = ServerSnapshot {
-        tool_names: tool_names(server.tools()),
-        resource_uris: resource_uris(server.resources()),
-        template_uris: template_uris(server.resource_templates()),
-    };
+    let (snapshot_sender, snapshot_receiver) = std::sync::mpsc::sync_channel(1);
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build MCP test runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            let server = match db_path {
+                Some(db_path) => build_server_with_db(&cx, &config, Some(db_path)).await,
+                None => build_server_degraded(&cx, &config).await,
+            }
+            .expect("build MCP server");
+            snapshot_sender
+                .send(ServerSnapshot {
+                    tool_names: tool_names(server.tools()),
+                    resource_uris: resource_uris(server.resources()),
+                    template_uris: template_uris(server.resource_templates()),
+                })
+                .expect("publish MCP metadata");
+            server
+                .run_transport_returning_with_cx(&cx, server_transport)
+                .expect("run MCP transport");
+        });
     });
+    let snapshot = snapshot_receiver.recv().expect("receive MCP metadata");
     (FrameworkTestClient::new(client_transport), snapshot)
 }
 

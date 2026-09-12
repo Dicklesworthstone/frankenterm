@@ -8,11 +8,28 @@
 #![cfg(feature = "mcp")]
 
 use frankenterm_core::config::Config;
+use frankenterm_core::cx::Cx;
 use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
+use frankenterm_core::mcp_framework::FrameworkDeliveryServer;
+use frankenterm_core::runtime_async::RuntimeBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+fn metadata_server(db_path: Option<PathBuf>) -> FrameworkDeliveryServer {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("metadata runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("runtime-owned metadata context");
+            match db_path {
+                Some(path) => build_server_with_db(&cx, &Config::default(), Some(path)).await,
+                None => build_server_degraded(&cx, &Config::default()).await,
+            }
+        })
+        .expect("build explicitly selected MCP catalog")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,11 +120,7 @@ struct PromptArgumentEntry {
 }
 
 fn capture_manifest_lists(db_path: Option<PathBuf>) -> Value {
-    let server = match db_path {
-        Some(path) => build_server_with_db(&Config::default(), Some(path)),
-        None => build_server_degraded(&Config::default()),
-    }
-    .expect("build explicitly selected MCP catalog");
+    let server = metadata_server(db_path);
 
     let mut tools: Vec<Value> = server
         .tools()
@@ -183,11 +196,7 @@ fn capture_manifest_lists(db_path: Option<PathBuf>) -> Value {
 }
 
 fn capture_resource_template_lists(db_path: Option<PathBuf>) -> Value {
-    let server = match db_path {
-        Some(path) => build_server_with_db(&Config::default(), Some(path)),
-        None => build_server_degraded(&Config::default()),
-    }
-    .expect("build explicitly selected MCP catalog");
+    let server = metadata_server(db_path);
 
     let mut resource_templates: Vec<Value> = server
         .resource_templates()
@@ -319,7 +328,7 @@ fn live_server_manifests_conform_with_and_without_db() {
 #[test]
 fn every_tool_input_schema_denies_additional_properties() {
     let (_dir, db_path) = isolated_db_path();
-    let server = build_server_with_db(&Config::default(), Some(db_path)).expect("build server");
+    let server = metadata_server(Some(db_path));
 
     let tools = server.tools();
     assert!(

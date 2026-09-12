@@ -1,11 +1,13 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
 
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
+use frankenterm_core::cx::Cx;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
+    FrameworkContent, FrameworkDeliveryServer, FrameworkTestClient,
+    framework_create_memory_transport_pair,
 };
 use frankenterm_core::policy::{ActionKind, ActorKind, DecisionContext, PolicySurface};
+use frankenterm_core::runtime_async::RuntimeBuilder;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -14,6 +16,30 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+// These helpers inspect startup metadata/errors without driving a transport.
+fn build_server_with_db(
+    config: &Config,
+    db_path: Option<PathBuf>,
+) -> frankenterm_core::Result<FrameworkDeliveryServer> {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("metadata runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("runtime-owned metadata context");
+            frankenterm_core::mcp::build_server_with_db(&cx, config, db_path).await
+        })
+}
+
+fn build_server_degraded(config: &Config) -> frankenterm_core::Result<FrameworkDeliveryServer> {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("metadata runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("runtime-owned metadata context");
+            frankenterm_core::mcp::build_server_degraded(&cx, config).await
+        })
+}
 
 fn init_test_logging() {
     static INIT: Once = Once::new();
@@ -325,11 +351,22 @@ fn proxy_routes_calls_to_remote_tools() {
     );
     let config = make_proxy_config(&discovery_path, "mock");
     let db_path = temp_dir.path().join("proxy_route.sqlite3");
-    let server = build_server_with_db(&config, Some(db_path)).expect("build proxy-enabled server");
 
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("proxy transport runtime");
+        let (server, cx) = runtime.block_on(async {
+            let cx = Cx::current().expect("runtime-owned proxy context");
+            let server = frankenterm_core::mcp::build_server_with_db(&cx, &config, Some(db_path))
+                .await
+                .expect("build proxy-enabled server");
+            (server, cx)
+        });
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("run proxy transport");
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -364,12 +401,24 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
     );
     let config = make_proxy_config(&discovery_path, "mock");
     let db_path = temp_dir.path().join("mcp_proxy_audit.sqlite3");
-    let server =
-        build_server_with_db(&config, Some(db_path.clone())).expect("build proxy-enabled server");
+    let server_db_path = db_path.clone();
 
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("proxy transport runtime");
+        let (server, cx) = runtime.block_on(async {
+            let cx = Cx::current().expect("runtime-owned proxy context");
+            let server =
+                frankenterm_core::mcp::build_server_with_db(&cx, &config, Some(server_db_path))
+                    .await
+                    .expect("build proxy-enabled server");
+            (server, cx)
+        });
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("run proxy transport");
     });
 
     let mut client = FrameworkTestClient::new(client_transport);

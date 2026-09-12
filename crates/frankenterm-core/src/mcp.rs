@@ -1188,6 +1188,42 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::TempDir;
 
+    // These tests inspect metadata only; transport tests keep the owning runtime alive.
+    fn build_server(config: &Config) -> Result<crate::mcp_framework::FrameworkDeliveryServer> {
+        CompatRuntimeBuilder::current_thread()
+            .build()
+            .expect("metadata runtime")
+            .block_on(async {
+                let cx = crate::cx::Cx::current().expect("runtime-owned metadata context");
+                super::build_server(&cx, config).await
+            })
+    }
+
+    fn build_server_degraded(
+        config: &Config,
+    ) -> Result<crate::mcp_framework::FrameworkDeliveryServer> {
+        CompatRuntimeBuilder::current_thread()
+            .build()
+            .expect("metadata runtime")
+            .block_on(async {
+                let cx = crate::cx::Cx::current().expect("runtime-owned metadata context");
+                super::build_server_degraded(&cx, config).await
+            })
+    }
+
+    fn build_server_with_db(
+        config: &Config,
+        db_path: Option<PathBuf>,
+    ) -> Result<crate::mcp_framework::FrameworkDeliveryServer> {
+        CompatRuntimeBuilder::current_thread()
+            .build()
+            .expect("metadata runtime")
+            .block_on(async {
+                let cx = crate::cx::Cx::current().expect("runtime-owned metadata context");
+                super::build_server_with_db(&cx, config, db_path).await
+            })
+    }
+
     fn uri_set(values: impl IntoIterator<Item = String>) -> BTreeSet<String> {
         values.into_iter().collect()
     }
@@ -1457,7 +1493,7 @@ mod tests {
             // shared lock so mcp_bridge's exact-delta counter tests can't
             // observe our bumps mid-assertion.
             let _counter_guard = crate::mcp::mcp_bridge::mcp_bridge_counter_test_lock();
-            let server = crate::mcp::build_server_degraded(&config)
+            let server = build_server_degraded(&config)
                 .expect("public degraded constructor named by the error must be callable");
             let _observed_counter = crate::mcp::mcp_bridge_tools_skipped_no_db_count();
 

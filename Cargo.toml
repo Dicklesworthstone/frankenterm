@@ -601,12 +601,16 @@ trybuild = { version = "1.0.116", default-features = false }
 # defaults (logging, std, tls12) so behavior is otherwise unchanged.
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 rustls-pemfile = "2.2.0"
-fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1038dd4e64cc7df8ea8122dbfb8806b0b04a7130", package = "fastmcp-rust" }
-fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "1718091b6bbb14279a20a8a49f020010fb4fc338", package = "fastapi-rust" }
+# These revisions share the workspace's Asupersync 0.4.10 context and I/O types.
+fastmcp = { version = "0.8.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "ef1e310a22c6f1444ef131ea35af850033b2e335", package = "fastmcp-rust" }
+# The delivery adapter needs catalog inspection and the acknowledgment-aware
+# custom transport lifecycle, which the protocol facade does not expose.
+fastmcp-server = { version = "0.8.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "ef1e310a22c6f1444ef131ea35af850033b2e335", default-features = false, features = ["legacy-2024-11-05"] }
+fastapi = { version = "0.4.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "badcf8ad05c161f9a83c41d7641183f1b1fc7288", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "4a75fd706917df915e644b00248540786df438f2", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "520164439ff4cbc55573d1c79d2346e313fc778f", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Narrow registry alias for the audited descriptor-bound ACL presence probe.
 # Keep this isolated from the existing full-stack FrankenSearch git pin above.
 frankensearch-index-acl = { package = "frankensearch-index", version = "=0.2.3", default-features = false }

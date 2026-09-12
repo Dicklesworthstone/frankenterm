@@ -46,10 +46,20 @@ struct RulesTestGoldenCapture {
 fn spawn_client() -> FrameworkTestClient {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
-    let server = build_server_degraded(&config).expect("build degraded MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build MCP test runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            let server = build_server_degraded(&cx, &config)
+                .await
+                .expect("build degraded MCP server");
+            server
+                .run_transport_returning_with_cx(&cx, server_transport)
+                .expect("run MCP transport");
+        });
     });
     let mut client = FrameworkTestClient::new(client_transport);
     client
@@ -76,13 +86,21 @@ proptest! {
         let mut config = Config::default();
         config.safety.require_prompt_active = require_prompt_active;
 
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build().expect("build MCP test runtime");
+        let (strict, degraded) = runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            (
+                build_server_with_db(&cx, &config, None).await,
+                build_server_degraded(&cx, &config).await,
+            )
+        });
         prop_assert!(
-            build_server_with_db(&config, None).is_err(),
+            strict.is_err(),
             "build_server_with_db(None) must stay on the strict bridge error path"
         );
 
-        let server = build_server_degraded(&config)
-            .expect("explicit degraded MCP server should build");
+        let server = degraded.expect("explicit degraded MCP server should build");
         let tool_names: BTreeSet<String> =
             server.tools().into_iter().map(|tool| tool.name).collect();
 

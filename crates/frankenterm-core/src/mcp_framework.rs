@@ -22,8 +22,8 @@ pub use fastmcp::testing::TestClient as FrameworkTestClient;
 pub use fastmcp::{
     Budget as FrameworkBudget, Content as FrameworkContent, Cx as FrameworkCx,
     McpContext as FrameworkMcpContext, McpError as FrameworkMcpError,
-    McpResult as FrameworkMcpResult, Tool as FrameworkTool,
-    ToolAnnotations as FrameworkToolAnnotations,
+    McpResult as FrameworkMcpResult, ProtocolPolicy as FrameworkProtocolPolicy,
+    Tool as FrameworkTool, ToolAnnotations as FrameworkToolAnnotations,
 };
 
 #[cfg(feature = "mcp-client")]
@@ -36,7 +36,8 @@ pub use fastmcp::mcp_config::{
 #[allow(unused_imports)]
 pub use fastmcp::{
     Client as FrameworkClient, ClientBuilder as FrameworkClientBuilder,
-    McpErrorCode as FrameworkMcpErrorCode,
+    ClientProtocolPlan as FrameworkClientProtocolPlan, McpErrorCode as FrameworkMcpErrorCode,
+    RequestTimeoutPolicy as FrameworkRequestTimeoutPolicy,
 };
 
 #[cfg(feature = "mcp")]
@@ -45,11 +46,13 @@ pub use fastmcp::{
     JsonRpcMessage as FrameworkJsonRpcMessage, Prompt as FrameworkPrompt,
     Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
     ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
-    Server as FrameworkServer, ServerBuilder as FrameworkServerBuilder,
     ServerCapabilities as FrameworkServerCapabilities, ServerInfo as FrameworkServerInfo,
     StdioTransport as FrameworkStdioTransport, ToolHandler as FrameworkToolHandler,
     Transport as FrameworkTransport, TransportError as FrameworkTransportError,
 };
+
+#[cfg(feature = "mcp")]
+pub use fastmcp_server::{Server as FrameworkServer, ServerBuilder as FrameworkServerBuilder};
 
 #[cfg(feature = "mcp")]
 use std::sync::{Arc, Mutex};
@@ -414,18 +417,6 @@ impl FrameworkDeliveryServer {
         self.inner.prompts()
     }
 
-    /// Run forever on an acknowledgment-capable transport using a root request context.
-    pub fn run_transport<T>(self, transport: T) -> !
-    where
-        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
-    {
-        self.inner
-            .run_transport(FrameworkDeliveryAwareTransport::new(
-                transport,
-                self.coordinator,
-            ))
-    }
-
     /// Run forever on an acknowledgment-capable transport with an explicit context.
     pub fn run_transport_with_cx<T>(self, cx: &crate::cx::Cx, transport: T) -> !
     where
@@ -437,43 +428,44 @@ impl FrameworkDeliveryServer {
         )
     }
 
-    /// Run until the acknowledgment-capable transport closes, then return.
-    pub fn run_transport_returning<T>(self, transport: T)
-    where
-        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
-    {
-        self.inner
-            .run_transport_returning(FrameworkDeliveryAwareTransport::new(
-                transport,
-                self.coordinator,
-            ));
-    }
-
     /// Run with an explicit context until the transport closes, then return.
-    pub fn run_transport_returning_with_cx<T>(self, cx: &crate::cx::Cx, transport: T)
+    pub fn run_transport_returning_with_cx<T>(
+        self,
+        cx: &crate::cx::Cx,
+        transport: T,
+    ) -> FrameworkMcpResult<()>
     where
         T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
     {
         self.inner.run_transport_returning_with_cx(
             cx,
             FrameworkDeliveryAwareTransport::new(transport, self.coordinator),
-        );
+        )
     }
 }
 
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
 pub(crate) fn framework_server_builder(name: &str, version: &str) -> FrameworkServerBuilder {
-    fastmcp::Server::new(name, version)
+    FrameworkServer::new(name, version)
 }
 
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
-pub(crate) fn run_framework_stdio_server(
+pub(crate) async fn run_framework_stdio_server(
+    cx: &crate::cx::Cx,
     server: FrameworkDeliveryServer,
 ) -> FrameworkMcpResult<()> {
-    let transport = FrameworkStdioTransport::stdio();
-    server.run_transport(transport)
+    cx.checkpoint()
+        .map_err(|_| FrameworkMcpError::request_cancelled())?;
+    let transport_cx = cx.clone();
+    // Await transport settlement even after cancellation: response delivery
+    // and shutdown must finish before the process runtime can be torn down.
+    crate::runtime_async::spawn_blocking(move || {
+        server.run_transport_returning_with_cx(&transport_cx, FrameworkStdioTransport::stdio())
+    })
+    .await
+    .map_err(|_| FrameworkMcpError::internal_error("MCP transport worker failed"))?
 }
 
 #[cfg(feature = "mcp-client")]
@@ -489,7 +481,7 @@ pub(crate) struct OutboundFrameworkClient {
     /// Configured FastMCP response-timeout value, cached for forensic
     /// visibility. [ft-bd3vr]
     ///
-    /// `FrameworkClientBuilder::timeout_ms` is consumed when the
+    /// `FrameworkClientBuilder::request_timeout_policy` is consumed when the
     /// `FrameworkClient` is built; the constructed client offers no
     /// public accessor for the value it locked in. We mirror it here
     /// so:
@@ -500,9 +492,8 @@ pub(crate) struct OutboundFrameworkClient {
     ///   2. Future upstream support for caller-specific deadline propagation
     ///      (tracked under ft-bd3vr) has a stable wrapper-side field to bind
     ///      against.
-    ///   3. Diagnostics do not mistake configuration for enforcement. At the
-    ///      pinned FastMCP revision, the deadline is checked only between
-    ///      receive attempts; synchronous stdio `read_line` can block past it.
+    ///   3. Diagnostics distinguish Unix readiness-polling enforcement from
+    ///      non-Unix child-pipe reads, which remain frame-boundary-only.
     configured_response_timeout_ms: u64,
 }
 
@@ -514,13 +505,18 @@ pub(crate) enum OutboundFrameworkError {
 
 #[cfg(feature = "mcp-client")]
 impl OutboundFrameworkClient {
-    pub(crate) fn connect_stdio(
+    pub(crate) async fn connect_stdio(
+        cx: &crate::cx::Cx,
         server: &ExternalServerConfig,
         settings: &McpClientConfig,
     ) -> Result<Self, FrameworkMcpError> {
+        let timeout = std::time::Duration::from_millis(settings.timeout_ms);
         let mut builder = FrameworkClientBuilder::new()
+            .protocol_plan(FrameworkClientProtocolPlan::stdio(
+                FrameworkProtocolPolicy::LegacyOnly,
+            ))
             .client_info("frankenterm-mcp-client", env!("CARGO_PKG_VERSION"))
-            .timeout_ms(settings.timeout_ms)
+            .request_timeout_policy(FrameworkRequestTimeoutPolicy::new(timeout, timeout)?)
             .max_retries(settings.max_retries)
             .retry_delay_ms(settings.retry_delay_ms);
 
@@ -532,7 +528,9 @@ impl OutboundFrameworkClient {
         }
 
         let args_ref: Vec<&str> = server.args.iter().map(String::as_str).collect();
-        let client = builder.connect_stdio(&server.command, &args_ref)?;
+        let client = builder
+            .connect_stdio_with_cx(&server.command, &args_ref, cx)
+            .await?;
         Ok(Self {
             inner: client,
             configured_response_timeout_ms: settings.timeout_ms,
@@ -542,11 +540,10 @@ impl OutboundFrameworkClient {
     /// Response-timeout value configured on the wrapped `FrameworkClient`.
     /// [ft-bd3vr]
     ///
-    /// **CONTRACT**: this is diagnostic configuration, not a proven wall-clock
-    /// upper bound. The pinned FastMCP client checks the deadline only before
-    /// each synchronous transport receive; its stdio `read_line` can remain
-    /// blocked after the configured duration. It also cannot be overridden by
-    /// an individual caller until FastMCP exposes a Cx/deadline-aware call API.
+    /// The same duration bounds idle and absolute request time. FastMCP checks
+    /// silent and partial Unix pipe reads through readiness polling; non-Unix
+    /// pipe reads remain bounded only at frame boundaries. This value does not
+    /// establish an end-to-end per-caller deadline for proxy dispatch.
     ///
     /// Forensic / diagnostic tooling can read this to verify which
     /// timeout an operator-configured config actually settled on
@@ -558,16 +555,9 @@ impl OutboundFrameworkClient {
 
     /// List tools from the connected server.
     ///
-    /// FastMCP receives [`Self::configured_response_timeout_ms`] as its
-    /// request-timeout setting, but the synchronous stdio receive can block
-    /// beyond that value. Per-call deadline propagation from a caller's `Cx`
-    /// budget is not enforced at this layer (ft-bd3vr — blocked on a
-    /// cancellation-safe FastMCP transport/call API). The proxy layer at
-    /// `mcp_proxy::RemoteProxyToolHandler::call` performs a Cx
-    /// pre-flight checkpoint (br-ft-xhj38) so PRE-EXPIRED callers
-    /// short-circuit before reaching this point; that's the
-    /// available defense-in-depth until fastmcp adds a per-call
-    /// timeout parameter.
+    /// Uses the connection's owner context and configured idle/absolute
+    /// timeout. The proxy layer also checks the incoming request context
+    /// before dispatch; this method does not claim per-call context authority.
     pub(crate) fn list_tool_definitions(
         &mut self,
     ) -> std::result::Result<Vec<McpClientToolDefinition>, OutboundFrameworkError> {
@@ -582,9 +572,8 @@ impl OutboundFrameworkClient {
 
     /// Call a remote tool.
     ///
-    /// Uses the configured FastMCP response-timeout policy but is not a hard
-    /// wall-clock-bounded operation. See [`Self::list_tool_definitions`] for
-    /// the exact deadline limitation (ft-bd3vr).
+    /// Uses the connection's owner context and configured response timers.
+    /// See [`Self::configured_response_timeout_ms`] for platform limitations.
     pub(crate) fn call_tool_content(
         &mut self,
         name: &str,
@@ -594,47 +583,78 @@ impl OutboundFrameworkClient {
             .call_tool(name, arguments)
             .map_err(OutboundFrameworkError::Transport)?
             .into_iter()
-            .map(McpClientContentItem::from_framework)
+            .map(|content| {
+                serde_json::to_value(content)
+                    .map(McpClientContentItem)
+                    .map_err(|_| {
+                        McpClientError::new(
+                            "mcp_client.protocol",
+                            "Failed to map remote legacy tool content",
+                        )
+                    })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(OutboundFrameworkError::Mapping)
     }
 
-    /// br-ft-dnzum: gracefully terminate the stdio connection.
-    ///
-    /// Delegates to `fastmcp::Client::close` (lib.rs:1138) which:
-    /// 1. Closes the underlying transport (best-effort).
-    /// 2. Sends SIGKILL to the spawned subprocess.
-    /// 3. Reaps the subprocess via `child.wait()`.
-    ///
-    /// This is a **deterministic** teardown — callers don't have
-    /// to rely on `Drop` running at scope-end (which Rust gives
-    /// no scheduling guarantees about, especially across panic
-    /// boundaries). Drop also runs after the wrapping `Mutex` /
-    /// `Arc` cycle drains, which can be later than the caller
-    /// expects.
-    ///
-    /// **Consumes self** — the client is unusable after this
-    /// call. Mirrors `fastmcp::Client::close`'s by-value
-    /// signature; matches the bead's proposed `shutdown(self)`
-    /// shape.
-    ///
-    /// **Not yet wired**: `is_alive()` requires upstream
-    /// fastmcp API support (`fastmcp::Client` has no
-    /// `is_connected` / `is_alive` getter as of pin
-    /// 884d45b1). Tracked as a follow-up — until then, callers
-    /// must treat the wrapper as "alive until the next failed
-    /// `call_tool_content`", matching the existing implicit
-    /// contract.
-    pub(crate) fn shutdown(self) {
-        // fastmcp::Client::close consumes self; the inner field
-        // here is the wrapped Client, so unwrap the wrapper and
-        // hand the live Client to close().
-        self.inner.close();
+    /// Close the transport and reap the subprocess, reporting cleanup failure.
+    /// Consuming the wrapper prevents further calls; the framework's drop
+    /// boundary retains responsibility for any unfinished cleanup.
+    pub(crate) fn shutdown(mut self) -> FrameworkMcpResult<()> {
+        self.inner.close()
     }
 }
 
 #[cfg(feature = "mcp-client")]
-pub(crate) fn discover_server_configs(settings: &McpClientConfig) -> DiscoveredFrameworkServers {
+pub(crate) fn project_legacy_proxy_content(
+    content: McpClientContentItem,
+) -> Result<FrameworkContent, McpClientError> {
+    use fastmcp::legacy_2024::{LegacyContent, LegacyResourceContent};
+
+    // The legacy ToolHandler return type cannot carry annotations or open
+    // metadata. Preserve its existing payload projection explicitly; the
+    // direct outbound client retains the complete JSON in its neutral DTO.
+    let content: LegacyContent = serde_json::from_value(content.0).map_err(|_| {
+        McpClientError::new("mcp_client.protocol", "Invalid remote legacy tool content")
+    })?;
+    Ok(match content {
+        LegacyContent::Text { text, .. } => FrameworkContent::Text { text },
+        LegacyContent::Image {
+            data, mime_type, ..
+        } => FrameworkContent::Image { data, mime_type },
+        LegacyContent::Resource { resource, .. } => FrameworkContent::Resource {
+            resource: match resource {
+                LegacyResourceContent::Text {
+                    uri,
+                    text,
+                    mime_type,
+                    ..
+                } => fastmcp::ResourceContent {
+                    uri,
+                    mime_type,
+                    text: Some(text),
+                    blob: None,
+                },
+                LegacyResourceContent::Blob {
+                    uri,
+                    blob,
+                    mime_type,
+                    ..
+                } => fastmcp::ResourceContent {
+                    uri,
+                    mime_type,
+                    text: None,
+                    blob: Some(blob),
+                },
+            },
+        },
+    })
+}
+
+#[cfg(feature = "mcp-client")]
+pub(crate) fn discover_server_configs(
+    settings: &McpClientConfig,
+) -> Result<DiscoveredFrameworkServers, McpClientError> {
     let Some(loader) = build_loader(settings) else {
         tracing::warn!(
             target: "ft::mcp_framework",
@@ -643,17 +663,23 @@ pub(crate) fn discover_server_configs(settings: &McpClientConfig) -> DiscoveredF
              no MCP configuration sources are enabled. Set discovery_paths or \
              enable include_default_paths to discover remote MCP servers."
         );
-        return DiscoveredFrameworkServers {
+        return Ok(DiscoveredFrameworkServers {
             search_paths: Vec::new(),
             servers: Vec::new(),
-        };
+        });
     };
     let search_paths = loader
         .search_paths()
         .iter()
         .map(|path| path.display().to_string())
         .collect();
-    let merged = loader.load_all();
+    let merged = loader.load_all().map_err(|_| {
+        McpClientError::new(
+            "mcp_client.discovery_failed",
+            "Failed to read or parse an enabled MCP discovery configuration",
+        )
+        .with_hint("Check the syntax and permissions of configured MCP discovery files.")
+    })?;
 
     let mut servers: Vec<ExternalServerConfig> = merged
         .mcp_servers
@@ -673,10 +699,10 @@ pub(crate) fn discover_server_configs(settings: &McpClientConfig) -> DiscoveredF
             .cmp(&b.name.to_ascii_lowercase())
     });
 
-    DiscoveredFrameworkServers {
+    Ok(DiscoveredFrameworkServers {
         search_paths,
         servers,
-    }
+    })
 }
 
 #[cfg(feature = "mcp-client")]
@@ -722,7 +748,7 @@ mod tests {
         };
         settings.discovery_paths.clear();
 
-        let discovered = discover_server_configs(&settings);
+        let discovered = discover_server_configs(&settings).expect("unconfigured discovery");
 
         assert!(
             discovered.servers.is_empty(),
@@ -845,6 +871,39 @@ mod tests {
 
         assert_eq!(recovered, content);
         assert_eq!(recovered.as_text(), Some("hello from seam test"));
+    }
+
+    #[test]
+    fn proxy_projects_valid_legacy_metadata_without_rejecting_payloads() {
+        for payload in [
+            serde_json::json!({"type": "text", "text": "hello"}),
+            serde_json::json!({"type": "image", "data": "YQ==", "mimeType": "image/png"}),
+            serde_json::json!({"type": "resource", "resource": {"uri": "file:///a", "text": "hello"}}),
+            serde_json::json!({"type": "resource", "resource": {"uri": "file:///a", "blob": "YQ=="}}),
+        ] {
+            let mut annotated = payload.clone();
+            annotated["annotations"] = serde_json::json!({"audience": ["user"]});
+            annotated["_meta"] = serde_json::json!({"origin": "remote"});
+            annotated["extension"] = serde_json::json!(42);
+            if let Some(resource) = annotated.get_mut("resource") {
+                resource["_meta"] = serde_json::json!({"nested": true});
+            }
+            let neutral = McpClientContentItem(annotated.clone());
+            let projected = super::project_legacy_proxy_content(neutral.clone())
+                .expect("valid legacy extensions must not reject a proxy response");
+            assert_eq!(serde_json::to_value(projected).expect("encode"), payload);
+            assert_eq!(neutral.0, annotated, "direct-client DTO retains metadata");
+        }
+    }
+
+    #[test]
+    fn proxy_rejects_invalid_legacy_payload_without_echoing_remote_content() {
+        let error = super::project_legacy_proxy_content(McpClientContentItem(
+            serde_json::json!({"type": "image", "url": "private-remote-content"}),
+        ))
+        .expect_err("an extension cannot substitute for required image data");
+        assert_eq!(error.code, "mcp_client.protocol");
+        assert!(!error.message.contains("private-remote-content"));
     }
 
     #[test]

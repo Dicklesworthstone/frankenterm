@@ -49,7 +49,8 @@ pub struct FtMcpClient {
 
 impl FtMcpClient {
     /// Connect to an external MCP server via stdio subprocess.
-    pub fn connect_external(
+    pub async fn connect_external(
+        cx: &crate::cx::Cx,
         server: ExternalServerConfig,
         settings: &McpClientConfig,
     ) -> McpClientResult<Self> {
@@ -62,7 +63,8 @@ impl FtMcpClient {
         }
 
         let start = Instant::now();
-        let client = OutboundFrameworkClient::connect_stdio(&server, settings)
+        let client = OutboundFrameworkClient::connect_stdio(cx, &server, settings)
+            .await
             .map_err(|err| map_mcp_error(&server.name, err))?;
         let configured_response_timeout_ms = client.configured_response_timeout_ms();
         let log_server = redact_mcp_client_text(&server.name);
@@ -87,13 +89,14 @@ impl FtMcpClient {
     /// 1. `requested_server` if provided,
     /// 2. first enabled entry in `mcp_client.preferred_servers`,
     /// 3. first enabled discovered server (alphabetical by name).
-    pub fn connect_from_config(
+    pub async fn connect_from_config(
+        cx: &crate::cx::Cx,
         config: &Config,
         requested_server: Option<&str>,
     ) -> McpClientResult<Self> {
         let discovered = discover_servers(config)?;
         let selected = select_server(config, &discovered, requested_server)?;
-        Self::connect_external(selected, &config.mcp_client)
+        Self::connect_external(cx, selected, &config.mcp_client).await
     }
 
     /// List tools from the connected server.
@@ -178,8 +181,10 @@ impl FtMcpClient {
     }
 
     /// Gracefully terminate the outbound MCP subprocess.
-    pub fn shutdown(self) {
-        self.client.shutdown();
+    pub fn shutdown(self) -> McpClientResult<()> {
+        self.client
+            .shutdown()
+            .map_err(|err| map_mcp_error(&self.server.name, err))
     }
 }
 
@@ -205,7 +210,7 @@ pub fn discover_servers(config: &Config) -> McpClientResult<Vec<ExternalServerCo
     let DiscoveredFrameworkServers {
         search_paths,
         servers: discovered,
-    } = discover_server_configs(settings);
+    } = discover_server_configs(settings)?;
 
     tracing::info!(
         target: LOG_TARGET,
@@ -791,6 +796,24 @@ mod tests {
     }
 
     #[test]
+    fn discover_servers_rejects_malformed_configuration_without_exposing_contents() {
+        let temp_dir = tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("mcp-config.json");
+        let secret = "private-discovery-config-content";
+        std::fs::write(&config_path, format!("{{invalid-json:{secret}"))
+            .expect("write malformed config");
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        config.mcp_client.discovery_paths = vec![config_path.display().to_string()];
+
+        let error = discover_servers(&config).expect_err("malformed source must fail discovery");
+        assert_eq!(error.code, "mcp_client.discovery_failed");
+        assert!(!error.message.contains(secret));
+        assert!(!error.message.contains(&config_path.display().to_string()));
+    }
+
+    #[test]
     fn discover_servers_no_defaults_and_no_paths_returns_empty() {
         let mut config = Config::default();
         config.mcp_client.enabled = true;
@@ -929,6 +952,35 @@ mod tests {
     }
 
     #[test]
+    fn outbound_connect_preserves_owner_cancellation_before_spawn() {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("MCP cancellation test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            cx.cancel_with(crate::outcome::CancelKind::User, Some("MCP startup test"));
+            let server = ExternalServerConfig {
+                name: "cancelled-startup".to_string(),
+                command: "frankenterm-nonexistent-mcp-server-for-cancellation-test".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            };
+            let settings = McpClientConfig {
+                enabled: true,
+                ..McpClientConfig::default()
+            };
+            let result = FtMcpClient::connect_external(&cx, server, &settings).await;
+            match result {
+                Err(err) => assert_eq!(err.code, ERR_REQUEST_CANCELLED),
+                Ok(_) => panic!("cancelled owner must not connect a subprocess"),
+            }
+        });
+    }
+
+    #[test]
     fn outbound_mcp_roundtrip_with_mock_stdio_server_emits_logs() {
         if std::process::Command::new("python3")
             .arg("--version")
@@ -957,8 +1009,17 @@ mod tests {
         };
 
         let (_guard, events) = install_capture();
-        let mut client =
-            FtMcpClient::connect_external(server, &settings).expect("connect to mock server");
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
         let tools = client.list_tools().expect("list tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
@@ -1001,6 +1062,7 @@ mod tests {
                     .get("tool")
                     .is_some_and(|value| field_matches(value, "echo"))
         }));
+        client.shutdown().expect("settle MCP subprocess cleanup");
     }
 
     #[test]
@@ -1032,8 +1094,17 @@ mod tests {
         };
 
         let (_guard, events) = install_capture();
-        let mut client =
-            FtMcpClient::connect_external(server, &settings).expect("connect to mock server");
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
         client.list_tools().expect("list tools");
 
         let captured = events.lock().expect("lock logs").clone();
@@ -1059,6 +1130,7 @@ mod tests {
                 );
             }
         }
+        client.shutdown().expect("settle MCP subprocess cleanup");
     }
 
     #[test]

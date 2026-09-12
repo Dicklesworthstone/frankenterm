@@ -137,7 +137,10 @@ ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = 
 ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
 
 # MCP server (optional, behind feature)
-fastmcp = { workspace = true, optional = true }
+# FrameworkTestClient is a public integration surface. This feature exposes
+# production-faithful helpers; it does not enable test-internals/testing-lab.
+fastmcp = { workspace = true, optional = true, features = ["testing"] }
+fastmcp-server = { workspace = true, optional = true }
 toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
@@ -1021,4 +1024,4 @@ vc-export = ["subprocess-bridge"]
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term"]
 vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
-mcp-server = ["dep:fastmcp", "dep:toon_rust"]
+mcp-server = ["dep:fastmcp", "dep:fastmcp-server", "dep:toon_rust"]

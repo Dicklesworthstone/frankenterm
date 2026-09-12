@@ -68,10 +68,21 @@ fn workspace_root_lock() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let server = build_server_with_db(config, db_path).expect("build MCP server");
+    let config = config.clone();
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build MCP test runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            let server = build_server_with_db(&cx, &config, db_path)
+                .await
+                .expect("build MCP server");
+            server
+                .run_transport_returning_with_cx(&cx, server_transport)
+                .expect("run MCP transport");
+        });
     });
 
     let mut client = FrameworkTestClient::new(client_transport);

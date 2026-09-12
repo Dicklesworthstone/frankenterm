@@ -174,7 +174,7 @@ pub fn rrf_fuse_weighted(
 /// the weight-adjusted RRF formula: `weight / (k + rank + 1)` per lane.
 ///
 /// This preserves frankensearch's deduplication and rank-assignment logic while
-/// adding weight support that frankensearch's raw `rrf_fuse()` does not expose.
+/// preserving FrankenTerm's weight handling and numeric-ID tiebreak ordering.
 ///
 /// When the `frankensearch` feature is disabled, falls back to the local
 /// `rrf_fuse_weighted()` implementation.
@@ -197,7 +197,7 @@ fn rrf_fuse_with_frankensearch(
         let lexical_hits: Vec<frankensearch::ScoredResult> = lexical
             .iter()
             .map(|(id, score)| frankensearch::ScoredResult {
-                doc_id: id.to_string(),
+                doc_id: id.to_string().into(),
                 score: *score,
                 source: frankensearch::ScoreSource::Lexical,
                 index: None,
@@ -216,11 +216,18 @@ fn rrf_fuse_with_frankensearch(
             .map(|(index, (id, score))| frankensearch::VectorHit {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 score: *score,
-                doc_id: id.to_string(),
+                doc_id: id.to_string().into(),
             })
             .collect();
 
-        let config = frankensearch::RrfConfig { k: f64::from(k) };
+        // Keep upstream fusion neutral: weights and numeric-ID tiebreaks are
+        // applied below after retaining every candidate's original lane rank.
+        let config = frankensearch::RrfConfig {
+            k: f64::from(k),
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+            tiebreak: frankensearch::fusion::rrf::RrfTiebreak::LexicalThenId,
+        };
         let limit = lexical_hits.len().saturating_add(semantic_hits.len());
 
         let mut results: Vec<FusedResult> =

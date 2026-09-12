@@ -105,10 +105,20 @@ struct ToolContractCapture {
 }
 
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build MCP test runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            let server = build_server_with_db(&cx, &Config::default(), db_path)
+                .await
+                .expect("build MCP server");
+            server
+                .run_transport_returning_with_cx(&cx, server_transport)
+                .expect("run MCP transport");
+        });
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -1277,16 +1287,24 @@ fn assert_await_event_claim_send_failure_releases_lease(
 ) {
     let workspace = tempfile::tempdir().expect("create temp workspace");
     let db_path = workspace.path().join(db_name);
-    let server =
-        build_server_with_db(&Config::default(), Some(db_path.clone())).expect("build MCP server");
+    let server_db_path = db_path.clone();
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     let failure_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_failure_armed = std::sync::Arc::clone(&failure_armed);
     let server_thread = std::thread::spawn(move || {
-        server.run_transport_returning(FailResponseTransport::new(
-            server_transport,
-            server_failure_armed,
-        ));
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build MCP test runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            let server = build_server_with_db(&cx, &Config::default(), Some(server_db_path))
+                .await
+                .expect("build MCP server");
+            server.run_transport_returning_with_cx(
+                &cx,
+                FailResponseTransport::new(server_transport, server_failure_armed),
+            )
+        })
     });
     let mut client = FrameworkTestClient::new(client_transport);
     client.initialize().expect("initialize MCP client");
@@ -1317,7 +1335,16 @@ fn assert_await_event_claim_send_failure_releases_lease(
         error.to_string().contains("closed") || error.to_string().contains("Closed"),
         "unexpected transport failure: {error}"
     );
-    server_thread.join().expect("join failed-response server");
+    let server_error = server_thread
+        .join()
+        .expect("join failed-response server")
+        .expect_err("failed response transport must report its error");
+    assert!(
+        server_error
+            .to_string()
+            .contains("injected MCP response write failure"),
+        "unexpected server transport failure: {server_error}"
+    );
 
     let events = load_fixture_events(&db_path);
     assert_eq!(events.len(), 1);

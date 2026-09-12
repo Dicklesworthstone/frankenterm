@@ -1744,10 +1744,21 @@ printf '%s\n' '{"schemaVersion":"caut.v1","generatedAt":"2026-02-27T21:05:00Z","
     let mut config = frankenterm_core::config::Config::default();
     config.safety.require_prompt_active = false;
     let db = mcp_dir.path().join(".ft/ft.db");
-    let server = build_server_with_db(&config, Some(db)).unwrap();
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
-    let server_thread =
-        std::thread::spawn(move || server.run_transport_returning(server_transport));
+    let server_thread = std::thread::spawn(move || {
+        use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
+        let runtime = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP parity server runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("MCP parity runtime context");
+            let server = build_server_with_db(&cx, &config, Some(db)).await.unwrap();
+            server
+                .run_transport_returning_with_cx(&cx, server_transport)
+                .expect("MCP parity transport");
+        });
+    });
     let mut client = FrameworkTestClient::new(client_transport);
     client.initialize().unwrap();
 

@@ -4,10 +4,36 @@
 
 use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::{build_server, build_server_with_db};
+use frankenterm_core::cx::Cx;
+use frankenterm_core::mcp_framework::FrameworkDeliveryServer;
+use frankenterm_core::runtime_async::RuntimeBuilder;
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+// Metadata inspection does not drive a transport after construction.
+fn build_server(config: &Config) -> frankenterm_core::Result<FrameworkDeliveryServer> {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("metadata runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("runtime-owned metadata context");
+            frankenterm_core::mcp::build_server(&cx, config).await
+        })
+}
+
+fn build_server_with_db(
+    config: &Config,
+    db_path: Option<PathBuf>,
+) -> frankenterm_core::Result<FrameworkDeliveryServer> {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("metadata runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("runtime-owned metadata context");
+            frankenterm_core::mcp::build_server_with_db(&cx, config, db_path).await
+        })
+}
 
 fn as_btree_set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|item| (*item).to_string()).collect()

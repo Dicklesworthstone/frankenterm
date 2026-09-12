@@ -29,8 +29,8 @@ use super::{
     WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
-    FrameworkDeliveryServer as Server, FrameworkResponseDeliveryCoordinator,
-    framework_server_builder, run_framework_stdio_server,
+    FrameworkDeliveryServer as Server, FrameworkProtocolPolicy,
+    FrameworkResponseDeliveryCoordinator, framework_server_builder, run_framework_stdio_server,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -197,8 +197,8 @@ fn record_mcp_bridge_degraded_startup() {
 /// [`MCP_BRIDGE_TOOLS_SKIPPED_NO_DB`] by
 /// [`mcp_bridge_degraded_mode_skipped_entries`] and emits a structured
 /// `tracing::warn!` listing the absent registrations.
-pub fn build_server_degraded(config: &Config) -> Result<Server> {
-    build_server_inner(config, None)
+pub async fn build_server_degraded(cx: &crate::cx::Cx, config: &Config) -> Result<Server> {
+    build_server_inner(cx, config, None).await
 }
 
 /// Build the MCP server with tools that have robot parity.
@@ -207,8 +207,8 @@ pub fn build_server_degraded(config: &Config) -> Result<Server> {
 /// only path `build_server` exercised. Callers wanting the full
 /// surface should use [`build_server_with_db`] with an explicit
 /// `Some(path)`.
-pub fn build_server(config: &Config) -> Result<Server> {
-    build_server_degraded(config)
+pub async fn build_server(cx: &crate::cx::Cx, config: &Config) -> Result<Server> {
+    build_server_degraded(cx, config).await
 }
 
 /// Build the MCP server with an explicit `db_path` for tools
@@ -220,7 +220,11 @@ pub fn build_server(config: &Config) -> Result<Server> {
 /// path OR call [`build_server_degraded`] by name to acknowledge
 /// the missing-storage shape. The silent-strip path no longer
 /// exists in the public API.
-pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
+pub async fn build_server_with_db(
+    cx: &crate::cx::Cx,
+    config: &Config,
+    db_path: Option<PathBuf>,
+) -> Result<Server> {
     if db_path.is_none() {
         let skipped_entries = mcp_bridge_degraded_mode_skipped_entries();
         return Err(crate::error::Error::RuntimeOperation {
@@ -236,7 +240,7 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
             )),
         });
     }
-    build_server_inner(config, db_path)
+    build_server_inner(cx, config, db_path).await
 }
 
 /// Internal implementation shared by [`build_server_with_db`]
@@ -246,7 +250,18 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 /// reachable via the explicit `build_server_degraded` entry —
 /// this private helper does NOT enforce that invariant
 /// (callers above are responsible for gating).
-fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
+async fn build_server_inner(
+    cx: &crate::cx::Cx,
+    config: &Config,
+    db_path: Option<PathBuf>,
+) -> Result<Server> {
+    cx.checkpoint()
+        .map_err(|_| crate::error::Error::RuntimeOperation {
+            operation: "mcp_bridge.build_server",
+            source: crate::error::RuntimeOperationSource::Backend(
+                "MCP startup cancelled".to_string(),
+            ),
+        })?;
     let filter = config.ingest.panes.clone();
     let config = Arc::new(config.clone());
     let shared_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
@@ -255,6 +270,15 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
     let response_delivery = Arc::new(FrameworkResponseDeliveryCoordinator::default());
 
     let mut builder = framework_server_builder("wezterm-automata", crate::VERSION)
+        // Delivery completion currently follows the sequential 2024 response
+        // stream. Modern concurrent dispatch requires request-keyed authority.
+        .protocol_policy(FrameworkProtocolPolicy::LegacyOnly)
+        .map_err(|_| crate::error::Error::RuntimeOperation {
+            operation: "mcp_bridge.protocol_policy",
+            source: crate::error::RuntimeOperationSource::Backend(
+                "MCP 2024 protocol adapter unavailable".to_string(),
+            ),
+        })?
         .request_timeout(request_timeout_secs)
         .instructions("ft MCP server (robot parity). See docs/mcp-api-spec.md.")
         .on_startup(|| -> std::result::Result<(), std::io::Error> {
@@ -575,10 +599,31 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
 
     #[cfg(feature = "mcp-client")]
     {
-        builder = super::mcp_proxy::compose_proxy_tools(builder, config.as_ref(), db_path.clone())?;
+        builder =
+            super::mcp_proxy::compose_proxy_tools(cx, builder, config.as_ref(), db_path.clone())
+                .await?;
     }
 
-    let server = Server::new(builder.build(), response_delivery);
+    let framework_server =
+        builder
+            .try_build()
+            .map_err(|_| crate::error::Error::RuntimeOperation {
+                operation: "mcp_bridge.build_server",
+                source: crate::error::RuntimeOperationSource::Backend(
+                    "MCP server configuration was rejected".to_string(),
+                ),
+            })?;
+    // FastMCP launch policy can take precedence over builder selection. Never
+    // install sequential response authority around a different dispatch policy.
+    if framework_server.protocol_policy() != FrameworkProtocolPolicy::LegacyOnly {
+        return Err(crate::error::Error::RuntimeOperation {
+            operation: "mcp_bridge.protocol_policy",
+            source: crate::error::RuntimeOperationSource::Backend(
+                "MCP response delivery requires the 2024 sequential protocol".to_string(),
+            ),
+        });
+    }
+    let server = Server::new(framework_server, response_delivery);
 
     Ok(server)
 }
@@ -587,21 +632,27 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
 ///
 /// This keeps transport details inside `frankenterm-core` so callers don't
 /// need a direct `fastmcp` dependency.
-pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()> {
+pub async fn run_stdio_server(
+    cx: &crate::cx::Cx,
+    config: &Config,
+    db_path: Option<PathBuf>,
+) -> Result<()> {
     // br-ft-647cj: route db_path=None through the explicit
     // degraded-mode entry rather than the now-erroring
     // build_server_with_db(_, None) path. Operators invoking
     // `ft mcp` without --db get the same legacy behavior; the
     // build_server_with_db surface stays strict.
     let server = match db_path {
-        Some(path) => build_server_with_db(config, Some(path))?,
-        None => build_server_degraded(config)?,
+        Some(path) => build_server_with_db(cx, config, Some(path)).await?,
+        None => build_server_degraded(cx, config).await?,
     };
-    run_framework_stdio_server(server).map_err(|err| crate::error::Error::RuntimeOperation {
-        operation: "mcp_bridge.run_stdio_server",
-        source: crate::error::RuntimeOperationSource::Backend(format!(
-            "MCP stdio server failed: {err}"
-        )),
+    run_framework_stdio_server(cx, server).await.map_err(|err| {
+        crate::error::Error::RuntimeOperation {
+            operation: "mcp_bridge.run_stdio_server",
+            source: crate::error::RuntimeOperationSource::Backend(format!(
+                "MCP stdio server failed: {err}"
+            )),
+        }
     })
 }
 
@@ -626,6 +677,54 @@ pub fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_async::CompatRuntime;
+
+    // These catalog tests own a runtime for construction; no proxy subprocess
+    // survives this boundary. Transport tests retain their runtime through EOF.
+    fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("MCP catalog test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned catalog context");
+            super::build_server_with_db(&cx, config, db_path).await
+        })
+    }
+
+    fn build_server_degraded(config: &Config) -> Result<Server> {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("MCP catalog test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned catalog context");
+            super::build_server_degraded(&cx, config).await
+        })
+    }
+
+    fn build_server(config: &Config) -> Result<Server> {
+        build_server_degraded(config)
+    }
+
+    #[test]
+    fn cancelled_owner_rejects_startup_before_catalog_registration() {
+        let _guard = mcp_bridge_counter_test_lock();
+        let before = mcp_bridge_tools_skipped_no_db_count();
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("MCP cancellation test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned startup context");
+            cx.cancel_with(crate::outcome::CancelKind::User, Some("MCP startup test"));
+            assert!(matches!(
+                super::build_server_degraded(&cx, &Config::default()).await,
+                Err(crate::error::Error::RuntimeOperation {
+                    operation: "mcp_bridge.build_server",
+                    ..
+                })
+            ));
+        });
+        assert_eq!(mcp_bridge_tools_skipped_no_db_count(), before);
+    }
 
     #[test]
     fn storage_backed_request_budget_exceeds_the_longest_await_and_degraded_stays_bounded() {

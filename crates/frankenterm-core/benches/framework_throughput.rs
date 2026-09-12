@@ -14,6 +14,7 @@ use frankenterm_core::mcp_framework::{
     FrameworkTestClient as FrameworkMcpTestClient, FrameworkTool, FrameworkToolHandler,
     framework_create_memory_transport_pair,
 };
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::web_framework::{
     FrameworkApp, FrameworkMethod, FrameworkRequest, FrameworkRequestBody, FrameworkRequestContext,
     FrameworkResponse, FrameworkStatusCode, FrameworkWebTestClient, json_response_with_status,
@@ -183,7 +184,17 @@ impl McpBenchHarness {
             .tool(BenchEchoTool)
             .build();
         let server_join = thread::spawn(move || {
-            server.run_transport_returning(server_transport);
+            let runtime = RuntimeBuilder::multi_thread()
+                .worker_threads(2)
+                .build()
+                .expect("benchmark server runtime");
+            runtime.block_on(async {
+                let cx =
+                    frankenterm_core::cx::Cx::current().expect("benchmark server runtime context");
+                server
+                    .run_transport_returning_with_cx(&cx, server_transport)
+                    .expect("benchmark server transport");
+            });
         });
 
         let mut client =
@@ -214,7 +225,10 @@ impl Drop for McpBenchHarness {
     fn drop(&mut self) {
         self.client.close();
         if let Some(join) = self.server_join.take() {
-            let _ = join.join();
+            let result = join.join();
+            if !thread::panicking() {
+                result.expect("benchmark server thread");
+            }
         }
     }
 }

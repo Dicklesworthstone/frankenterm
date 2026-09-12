@@ -19,14 +19,22 @@ const RULES_LIST_SCHEMA: &str = include_str!(concat!(
 
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let config = Config::default();
-    let server = match db_path {
-        Some(db_path) => build_server_with_db(&config, Some(db_path)),
-        None => build_server_degraded(&config),
-    }
-    .expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport_returning(server_transport);
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build MCP test runtime");
+        runtime.block_on(async {
+            let cx = frankenterm_core::cx::Cx::current().expect("runtime-owned MCP context");
+            let server = match db_path {
+                Some(db_path) => build_server_with_db(&cx, &config, Some(db_path)).await,
+                None => build_server_degraded(&cx, &config).await,
+            }
+            .expect("build MCP server");
+            server
+                .run_transport_returning_with_cx(&cx, server_transport)
+                .expect("run MCP transport");
+        });
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -253,6 +261,11 @@ fn assert_resource_template_metadata(template: &FrameworkResourceTemplate) {
 #[test]
 fn mcp_conformance_tool_schemas_advertise_optional_format_negotiation() {
     let mut client = spawn_client(None);
+    assert_eq!(
+        client.protocol_version(),
+        Some("2024-11-05"),
+        "the sequential delivery coordinator requires legacy protocol negotiation"
+    );
     let tools = client.list_tools().expect("list tools");
     assert!(!tools.is_empty(), "server should advertise MCP tools");
 

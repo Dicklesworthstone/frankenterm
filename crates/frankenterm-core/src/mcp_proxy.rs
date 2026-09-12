@@ -226,14 +226,14 @@ use super::mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
 use crate::Result;
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_client::{
-    ExternalServerConfig, FtMcpClient, McpClientContentItem, McpClientToolDefinition,
-    discover_servers,
+    ExternalServerConfig, FtMcpClient, McpClientToolDefinition, discover_servers,
 };
 use crate::policy::Redactor;
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 
-pub(super) fn compose_proxy_tools(
+pub(super) async fn compose_proxy_tools(
+    cx: &crate::cx::Cx,
     mut builder: FrameworkServerBuilder,
     config: &Config,
     db_path: Option<Arc<PathBuf>>,
@@ -368,9 +368,19 @@ pub(super) fn compose_proxy_tools(
     for server in selected {
         let server_name = server.name.clone();
         let route_prefix = format!("{base_prefix}/{}", sanitize_prefix_segment(&server_name));
-        let remote = match FtMcpClient::connect_external(server, settings) {
+        let remote = match FtMcpClient::connect_external(cx, server, settings).await {
             Ok(client) => client,
             Err(err) => {
+                // Cancellation terminates startup even when connection errors
+                // would ordinarily permit a local-only fallback.
+                if cx.checkpoint().is_err() {
+                    return Err(crate::error::Error::RuntimeOperation {
+                        operation: "mcp_proxy.connect",
+                        source: crate::error::RuntimeOperationSource::Backend(
+                            "MCP proxy startup cancelled".to_string(),
+                        ),
+                    });
+                }
                 if fail_fast {
                     return Err(crate::error::ConfigError::ValidationError(format!(
                         "mcp proxy connect failed for server '{server_name}': {}",
@@ -983,7 +993,7 @@ impl ToolHandler for RemoteProxyToolHandler {
             Ok(content) => {
                 let content = content
                     .into_iter()
-                    .map(McpClientContentItem::into_framework)
+                    .map(crate::mcp_framework::project_legacy_proxy_content)
                     .collect::<crate::mcp_client::McpClientResult<Vec<Content>>>()
                     .map_err(|err| {
                         // br-ft-wzk10 site F: remote returned content
@@ -1042,13 +1052,28 @@ impl ToolHandler for RemoteProxyToolHandler {
 mod tests {
     use super::{
         Config, ExternalServerConfig, McpClientConfig, McpClientToolDefinition, Server,
-        compose_proxy_tools, filter_remote_tools, insert_route_prefix,
-        mcp_proxy_destructive_filtered_count, reset_mcp_proxy_destructive_filtered_count_for_test,
-        sanitize_prefix_segment, select_proxy_servers,
+        filter_remote_tools, insert_route_prefix, mcp_proxy_destructive_filtered_count,
+        reset_mcp_proxy_destructive_filtered_count_for_test, sanitize_prefix_segment,
+        select_proxy_servers,
     };
+    use crate::runtime_async::CompatRuntime;
     use proptest::prelude::*;
     use std::collections::HashMap;
     use std::collections::HashSet;
+
+    fn compose_proxy_tools(
+        builder: super::FrameworkServerBuilder,
+        config: &Config,
+        db_path: Option<std::sync::Arc<std::path::PathBuf>>,
+    ) -> crate::Result<super::FrameworkServerBuilder> {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("proxy composition test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned proxy test context");
+            super::compose_proxy_tools(&cx, builder, config, db_path).await
+        })
+    }
 
     fn make_server(name: &str, disabled: bool) -> ExternalServerConfig {
         ExternalServerConfig {

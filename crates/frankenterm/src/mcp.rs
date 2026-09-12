@@ -8,13 +8,23 @@ use frankenterm_core::config::Config;
 
 use super::McpCommands;
 
-pub fn run_mcp(command: McpCommands, config: &Config, workspace_root: &Path) -> anyhow::Result<()> {
+pub async fn run_mcp(
+    cx: &frankenterm_core::cx::Cx,
+    command: McpCommands,
+    config: &Config,
+    workspace_root: &Path,
+) -> anyhow::Result<()> {
     match command {
-        McpCommands::Serve { transport } => serve_mcp(&transport, config, workspace_root),
+        McpCommands::Serve { transport } => serve_mcp(cx, &transport, config, workspace_root).await,
     }
 }
 
-fn serve_mcp(transport: &str, config: &Config, workspace_root: &Path) -> anyhow::Result<()> {
+async fn serve_mcp(
+    cx: &frankenterm_core::cx::Cx,
+    transport: &str,
+    config: &Config,
+    workspace_root: &Path,
+) -> anyhow::Result<()> {
     if transport != "stdio" {
         bail!("Unsupported transport: {transport}");
     }
@@ -22,7 +32,8 @@ fn serve_mcp(transport: &str, config: &Config, workspace_root: &Path) -> anyhow:
     let layout = config
         .workspace_layout(Some(workspace_root))
         .context("Failed to resolve workspace layout for MCP server")?;
-    frankenterm_core::mcp::run_stdio_server(config, Some(layout.db_path))
+    frankenterm_core::mcp::run_stdio_server(cx, config, Some(layout.db_path))
+        .await
         .context("Failed to start MCP stdio transport")?;
     Ok(())
 }
