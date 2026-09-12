@@ -43,6 +43,29 @@
 //! The default development profile runs a diagnostic calculation; it provides
 //! no performance measurement.
 //!
+//! `--measure-live` is a separate, opt-in real mux capture experiment. Build
+//! with `--features vendored --profile release-interactive` on the same host as
+//! an isolated DSR-built mux. Launch one owned pane at >=80 columns with
+//! `sh -c 'stty -echo; exec <this-example-binary> --pane-producer'`, 24 visible
+//! rows and 64 lines of scrollback. The bounded snapshot must retain the complete
+//! 4KiB frame while keeping inter-snapshot overlap <=4KiB. Supply
+//! `FT_LINDLEY_MUX_SOCKET`, `FT_LINDLEY_PANE_ID`, a NEW
+//! `FT_LINDLEY_DB_PATH`, `FT_RELEASE_VERSION`, `FT_LINDLEY_SOURCE_SHA`, and
+//! `FT_LINDLEY_ARRIVAL_RATE_EVENTS_PER_MS` (for example 0.1, declared before
+//! measuring). `FT_WEZTERM_CLI` must name the same candidate CLI if the normal
+//! read-only fallback is needed. The example never creates or discovers panes.
+//! Invoke through `scripts/lindley-bounds-build.sh --measure-live-executable
+//! <this-example-binary>`: its external process watchdog bounds initialization,
+//! synchronous file writes and shutdown, which cooperative async timers cannot.
+//! Live mode requires this declared watchdog contract and regular-file stdout.
+//! Retain stdout, stderr, database, source/build/host/filesystem receipts and
+//! exact mux/example executable hashes. It emits 100 calibration bursts of ten
+//! 4096-byte frames, freezes its model, then measures 100 held-out bursts.
+//! A failed delay/service/arrival check OR failed 20% agreement exits 1 while
+//! retaining the JSON. Exit 2 is an execution/input/integrity failure. Per-burst
+//! trace lines survive partial failures. Neither exit 0 nor a declared source
+//! SHA authenticates the build or proves future, renderer or full-watch SLOs.
+//!
 //! Or via the wrapper:
 //!
 //! ```text
@@ -77,6 +100,30 @@ struct InputPayload<'a> {
 }
 
 fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args == ["--pane-producer"] {
+        return match live_measurement::pane_producer() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lindley pane producer: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if args == ["--measure-live"] {
+        return match live_measurement::run() {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(1),
+            Err(error) => {
+                eprintln!("lindley live measurement: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if !args.is_empty() {
+        eprintln!("expected no arguments, --pane-producer or --measure-live");
+        return ExitCode::from(2);
+    }
     match build_diagnostic() {
         Ok(within_tolerance) => {
             if within_tolerance {
@@ -88,6 +135,571 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("lindley_bounds_build: {error}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Actual mux/overlap/storage workload, separate from supplied-input diagnostics.
+/// The operator owns the dedicated mux, pane, database path and retained stdout.
+/// This producer never discovers or creates panes, launches a mux, or publishes
+/// an attestation. Final source/build identity requires the external DSR receipt.
+mod live_measurement {
+    use std::io::{BufRead, Read, Write};
+
+    pub fn frame(sequence: u32) -> String {
+        let mut text = format!("\nFT LINDLEY BEGIN {sequence:08}\n");
+        let end = format!("FT LINDLEY END {sequence:08}");
+        while text.len() + end.len() + 65 <= 4096 {
+            text.push_str("bounded terminal capture workload with ordinary public text only\n");
+        }
+        text.push_str(&"x".repeat(4096 - text.len() - end.len() - 1));
+        text.push('\n');
+        text.push_str(&end);
+        text
+    }
+
+    pub fn pane_producer() -> Result<(), String> {
+        let mut output = std::io::stdout().lock();
+        // Fill the initial screen before baselining. Leave the cursor on the
+        // ready marker, so the next leading newline is a true append rather
+        // than replacement of the terminal's trailing blank screen rows.
+        for _ in 0..96 {
+            writeln!(output, "bounded warmup line").map_err(|error| error.to_string())?;
+        }
+        write!(output, "FT LINDLEY READY V1").map_err(|error| error.to_string())?;
+        output.flush().map_err(|error| error.to_string())?;
+        let mut expected = 0_u32;
+        // read_line is bounded by the trusted harness's numeric protocol; use
+        // take to reject oversized or unterminated input without growing a line.
+        let mut input = std::io::stdin().lock();
+        loop {
+            let mut line = Vec::new();
+            let count = std::io::Read::by_ref(&mut input)
+                .take(32)
+                .read_until(b'\n', &mut line)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                return Ok(());
+            }
+            let request = std::str::from_utf8(&line).map_err(|error| error.to_string())?;
+            if !request.ends_with('\n') || request.trim() != expected.to_string() {
+                return Err("expected the next numeric sequence followed by newline".into());
+            }
+            output
+                .write_all(frame(expected).as_bytes())
+                .and_then(|()| output.flush())
+                .map_err(|error| error.to_string())?;
+            expected = expected.checked_add(1).ok_or("sequence exhausted")?;
+        }
+    }
+
+    #[cfg(not(all(unix, feature = "vendored")))]
+    pub fn run() -> Result<bool, String> {
+        Err("--measure-live requires a Unix host and --features vendored".into())
+    }
+
+    #[cfg(all(unix, feature = "vendored"))]
+    pub fn run() -> Result<bool, String> {
+        measured::run()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn frame_is_bounded_distinguishable_and_terminal_append_safe() {
+            for sequence in [0, 999, u32::MAX] {
+                let frame = super::frame(sequence);
+                assert_eq!(frame.len(), 4096);
+                assert!(frame.starts_with('\n'));
+                assert!(!frame.ends_with('\n'));
+                assert!(frame.lines().all(|line| line.len() < 80));
+                assert!(frame.contains(&format!("FT LINDLEY BEGIN {sequence:08}")));
+                assert!(frame.ends_with(&format!("FT LINDLEY END {sequence:08}")));
+            }
+            assert_ne!(super::frame(0), super::frame(1));
+        }
+    }
+
+    #[cfg(all(unix, feature = "vendored"))]
+    mod measured {
+        use super::super::*;
+        use frankenterm_core::cx::Cx;
+        use frankenterm_core::ingest::{CapturedSegmentKind, PaneCursor};
+        use frankenterm_core::latency_stages::{LatencyStage, LindleyStageTelemetry};
+        use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, sleep_with_cx};
+        use frankenterm_core::storage::{PaneRecord, StorageHandle};
+        use frankenterm_core::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
+        use frankenterm_core::wezterm::WeztermClient;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const BURST: usize = 10;
+        const BURSTS_PER_PHASE: usize = 100;
+
+        #[derive(Clone, Serialize)]
+        struct Observation {
+            sequence: u32,
+            // Monotonic nanoseconds relative to the measurement epoch. Stage
+            // boundaries include batching wait before storage admission.
+            stages_ns: [[u64; 2]; 3],
+            content_sha256: String,
+        }
+
+        fn elapsed(epoch: Instant) -> Result<u64, String> {
+            u64::try_from(epoch.elapsed().as_nanos()).map_err(|error| error.to_string())
+        }
+
+        fn required(name: &str) -> Result<String, String> {
+            optional_env(name)?
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{name} is required"))
+        }
+
+        pub fn run() -> Result<bool, String> {
+            #[cfg(unix)]
+            use std::os::fd::AsFd;
+            let watchdog_seconds = required("FT_LINDLEY_EXTERNAL_WATCHDOG_SECS")?
+                .parse::<u32>()
+                .map_err(|error| error.to_string())?;
+            if !(1..=2400).contains(&watchdog_seconds) {
+                return Err("external watchdog must be between 1 and 2400 seconds".into());
+            }
+            let output = fs::File::from(
+                std::io::stdout()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(|error| error.to_string())?,
+            );
+            if !output
+                .metadata()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("live measurement stdout must be an ordinary retained file".into());
+            }
+            let socket = required("FT_LINDLEY_MUX_SOCKET")?;
+            let pane_id: u64 = required("FT_LINDLEY_PANE_ID")?
+                .parse::<u64>()
+                .map_err(|error| error.to_string())?;
+            let db_path = required("FT_LINDLEY_DB_PATH")?;
+            let version = required("FT_RELEASE_VERSION")?;
+            let source = required("FT_LINDLEY_SOURCE_SHA")?;
+            if source.len() != 40 || !source.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("FT_LINDLEY_SOURCE_SHA must be a full commit SHA".into());
+            }
+            let arrival_rate = required("FT_LINDLEY_ARRIVAL_RATE_EVENTS_PER_MS")?
+                .parse::<f64>()
+                .map_err(|error| error.to_string())?;
+            if !arrival_rate.is_finite() || !(0.001..=100.0).contains(&arrival_rate) {
+                return Err("arrival rate must be finite in [0.001, 100] events/ms".into());
+            }
+            // Reserve a new file atomically; never reuse or overwrite an existing
+            // database. Keep it for independent row verification after shutdown.
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&db_path)
+                .map_err(|error| format!("reserve new database: {error}"))?;
+            let runtime = RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let result = runtime.block_on(async {
+                let cx = Cx::for_request();
+                let storage = frankenterm_core::runtime_async::timeout_with_cx(
+                    &cx,
+                    Duration::from_secs(60),
+                    StorageHandle::new_with_cx(&cx, &db_path),
+                )
+                .await
+                .map_err(|error| format!("storage initialization timeout: {error}"))?
+                .map_err(|error| error.to_string())?;
+                let result = frankenterm_core::runtime_async::timeout_with_cx(
+                    &cx,
+                    Duration::from_secs(2400),
+                    measure(&cx, &storage, &socket, pane_id, arrival_rate),
+                )
+                .await
+                .map_err(|error| format!("overall workload timeout: {error}"))
+                .and_then(std::convert::identity);
+                // Cleanup must run even after capture/integrity errors and must
+                // use an independent context if the workload was cancelled.
+                let shutdown = storage
+                    .shutdown_with_cx(&Cx::for_request())
+                    .await
+                    .map_err(|error| error.to_string());
+                match (result, shutdown) {
+                    (Ok(value), Ok(())) => Ok(value),
+                    (Err(error), Ok(())) => Err(error),
+                    (result, Err(error)) => Err(format!(
+                        "writer shutdown failed: {error}; workload failed={}",
+                        result.is_err()
+                    )),
+                }
+            })?;
+            let (model, observations) = result;
+            let (arrival, stages) = model.to_network_calculus_inputs()?;
+            let bound = pipeline_delay_bound(arrival, &stages);
+            let held_out = &observations[BURST * BURSTS_PER_PHASE..];
+            let mut latencies: Vec<f64> = held_out
+                .iter()
+                .map(|row| (row.stages_ns[2][1] - row.stages_ns[0][0]) as f64 / 1e6)
+                .collect();
+            latencies.sort_by(f64::total_cmp);
+            let empirical = latencies[(99 * latencies.len()).div_ceil(100) - 1];
+            let artifact = LindleyBoundsArtifact {
+                release_version: version,
+                arrival,
+                stages,
+                analytical_bound_ms: bound.unwrap_or(f64::INFINITY),
+                empirical_p99_ms: empirical,
+            };
+            let mut output: serde_json::Value =
+                serde_json::from_str(&artifact.render_attestation_json())
+                    .map_err(|error| error.to_string())?;
+            let maximum = latencies.last().copied().ok_or("missing held-out rows")?;
+            let observed_bound_holds = bound.is_some_and(|value| maximum <= value);
+            let arrival_holds = arrival_conforms(&observations, arrival_rate);
+            let service_holds: Vec<bool> = (0..3)
+                .map(|index| service_conforms(held_out, index, &model.stages[index]))
+                .collect();
+            let trace_json =
+                serde_json::to_string(&observations).map_err(|error| error.to_string())?;
+            let trace_hash = hex::encode(Sha256::digest(trace_json.as_bytes()));
+            output["measurement"] = serde_json::json!({
+                "schema": "frankenterm.lindley-live-capture.v1",
+                "scope": "dedicated_mux_capture_delta_grouped_storage_finite_workload",
+                "declared_source_sha": source,
+                "declared_source_verified": false,
+                "build_profile_verified": false,
+                "declared_external_watchdog_seconds": watchdog_seconds,
+                "release_ready": false,
+                "mux_socket": socket,
+                "pane_id": pane_id,
+                "database_path": db_path,
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "payload_bytes": 4096,
+                "overlap_bytes": 4096,
+                "burst_events": BURST,
+                "calibration_rows": BURST * BURSTS_PER_PHASE,
+                "held_out_rows": BURST * BURSTS_PER_PHASE,
+                "maximum_held_out_latency_ms": maximum,
+                "observed_delay_bound_holds": observed_bound_holds,
+                "arrival_envelope_holds": arrival_holds,
+                "held_out_service_curves_hold": service_holds,
+                "calibration_method": "per-stage minimum burst throughput; maximum per-request latency, including batch wait; frozen before held-out requests",
+                "latency_field_semantics": "model p99_latency_ms fields contain calibration maximums, not quantile guarantees",
+                "capture_timing": "numeric stimulus dispatch through complete mux snapshot receipt; includes producer response and any bounded snapshot polling",
+                "trace_encoding": "serde-json-observations-v1",
+                "trace_json": trace_json,
+                "trace_sha256": trace_hash,
+                "telemetry_model": model,
+                "observations": observations,
+                "excluded": ["production_watch_scheduler", "pattern_detection", "event_dispatch", "renderer", "future_workload_guarantee", "power_loss_durability"],
+                "grouping": "concurrent append_segment requests through production writer; physical transaction group size not observed",
+            });
+            println!("{JSON_BEGIN}");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).map_err(|error| error.to_string())?
+            );
+            println!("{JSON_END}");
+            Ok(observed_bound_holds
+                && arrival_holds
+                && service_holds.iter().all(|value| *value)
+                && artifact.comparison().within_tolerance())
+        }
+
+        async fn measure(
+            cx: &Cx,
+            storage: &StorageHandle,
+            socket: &str,
+            pane_id: u64,
+            arrival_rate: f64,
+        ) -> Result<(LindleyTelemetryModel, Vec<Observation>), String> {
+            let pool = Arc::new(MuxPool::new(MuxPoolConfig {
+                mux: DirectMuxClientConfig::default().with_socket_path(socket),
+                ..MuxPoolConfig::default()
+            }));
+            let client = WeztermClient::with_socket(socket)
+                .with_mux_pool(pool)
+                .with_timeout(5)
+                .with_retries(1);
+            let initial = client
+                .get_text_with_cx(cx, pane_id, false)
+                .await
+                .map_err(|error| error.to_string())?;
+            if initial.len() > 8192 {
+                return Err(
+                    "dedicated pane snapshot exceeds 8KiB; configure bounded scrollback".into(),
+                );
+            }
+            if !initial.contains("FT LINDLEY READY V1") {
+                return Err(
+                    "owned pane must run --pane-producer with terminal echo disabled".into(),
+                );
+            }
+            storage
+                .upsert_pane_with_cx(
+                    cx,
+                    PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "lindley-dedicated-mux".into(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 0,
+                        last_seen_at: 0,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut cursor = PaneCursor::new(pane_id);
+            cursor.capture_snapshot(&initial, 4096, None);
+            let epoch = Instant::now();
+            let mut observations = Vec::with_capacity(2 * BURST * BURSTS_PER_PHASE);
+            let interval = Duration::from_secs_f64(BURST as f64 / arrival_rate / 1000.0);
+            let mut previous_burst = None;
+            let mut expected_content = Vec::new();
+            let mut calibration_model = None;
+            for burst in 0..2 * BURSTS_PER_PHASE {
+                if let Some(started) = previous_burst {
+                    let wait = interval.saturating_sub(Instant::now().duration_since(started));
+                    sleep_with_cx(cx, wait)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                previous_burst = Some(Instant::now());
+                let mut pending = Vec::with_capacity(BURST);
+                for offset in 0..BURST {
+                    let sequence =
+                        u32::try_from(burst * BURST + offset).map_err(|error| error.to_string())?;
+                    let started = elapsed(epoch)?;
+                    client
+                        .send_text_no_paste_with_cx(cx, pane_id, &sequence.to_string())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let marker = format!("FT LINDLEY END {sequence:08}");
+                    let capture_deadline = Instant::now() + Duration::from_secs(5);
+                    let snapshot = loop {
+                        let text = client
+                            .get_text_with_cx(cx, pane_id, false)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if text.len() > 8192 {
+                            return Err("dedicated pane snapshot exceeds 8KiB".into());
+                        }
+                        if text.contains(&marker) {
+                            break text;
+                        }
+                        if Instant::now() >= capture_deadline {
+                            return Err(format!("producer frame {sequence} did not arrive"));
+                        }
+                        sleep_with_cx(cx, Duration::from_millis(1))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    };
+                    let captured = elapsed(epoch)?;
+                    let segment = cursor
+                        .capture_snapshot(&snapshot, 4096, None)
+                        .ok_or("new frame produced no delta")?;
+                    if !matches!(segment.kind, CapturedSegmentKind::Delta)
+                        || segment.content.trim_matches('\n')
+                            != super::frame(sequence).trim_matches('\n')
+                    {
+                        return Err(format!("gap or missing frame in delta {sequence}"));
+                    }
+                    let extracted = elapsed(epoch)?;
+                    let hash = hex::encode(Sha256::digest(segment.content.as_bytes()));
+                    pending.push((
+                        sequence,
+                        started,
+                        captured,
+                        extracted,
+                        hash,
+                        segment.content,
+                    ));
+                }
+                let results = futures::future::join_all(pending.iter().map(
+                    |(sequence, started, captured, extracted, hash, content)| async move {
+                        let stored = storage
+                            .append_segment_with_cx(cx, pane_id, content, None)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let completed = elapsed(epoch)?;
+                        if stored.content != *content || stored.seq != u64::from(*sequence) {
+                            return Err("committed segment content or sequence differs".to_string());
+                        }
+                        Ok(Observation {
+                            sequence: *sequence,
+                            stages_ns: [
+                                [*started, *captured],
+                                [*captured, *extracted],
+                                [*extracted, completed],
+                            ],
+                            content_sha256: hash.clone(),
+                        })
+                    },
+                ))
+                .await;
+                for result in results {
+                    observations.push(result?);
+                }
+                println!(
+                    "__FT_LINDLEY_TRACE_BURST__ {}",
+                    serde_json::to_string(&observations[observations.len() - BURST..])
+                        .map_err(|error| error.to_string())?
+                );
+                expected_content.extend(pending.into_iter().map(|row| row.5));
+                if burst + 1 == BURSTS_PER_PHASE {
+                    calibration_model = Some(calibrate(&observations, arrival_rate)?);
+                }
+            }
+            let mut stored = storage
+                .get_segments_with_cx(cx, pane_id, expected_content.len() + 1)
+                .await
+                .map_err(|error| error.to_string())?;
+            stored.sort_by_key(|row| row.seq);
+            if stored.len() != expected_content.len()
+                || stored.iter().zip(&expected_content).enumerate().any(
+                    |(index, (row, content))| row.seq != index as u64 || row.content != *content,
+                )
+            {
+                return Err("persisted corpus differs from captured deltas".into());
+            }
+            Ok((
+                calibration_model.ok_or("missing calibration model")?,
+                observations,
+            ))
+        }
+
+        fn calibrate(
+            rows: &[Observation],
+            arrival_rate: f64,
+        ) -> Result<LindleyTelemetryModel, String> {
+            let mut stages = Vec::new();
+            for (index, stage) in [
+                LatencyStage::PtyCapture,
+                LatencyStage::DeltaExtraction,
+                LatencyStage::StorageWrite,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let latency_ns = rows
+                    .iter()
+                    .map(|row| row.stages_ns[index][1] - row.stages_ns[index][0])
+                    .max()
+                    .ok_or("empty calibration")?;
+                let rate = rows
+                    .chunks_exact(BURST)
+                    .map(|batch| {
+                        let first = batch
+                            .iter()
+                            .map(|row| row.stages_ns[index][0])
+                            .min()
+                            .unwrap();
+                        let last = batch
+                            .iter()
+                            .map(|row| row.stages_ns[index][1])
+                            .max()
+                            .unwrap();
+                        BURST as f64 * 1e6 / (last - first).max(1) as f64
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                stages.push(LindleyStageTelemetry::try_new(
+                    stage,
+                    rate,
+                    latency_ns as f64 / 1e6,
+                )?);
+            }
+            LindleyTelemetryModel::try_new(BURST as f64, arrival_rate, stages)
+        }
+
+        fn arrival_conforms(rows: &[Observation], rate: f64) -> bool {
+            rows.iter().enumerate().all(|(first, start)| {
+                rows[first..].iter().enumerate().all(|(offset, end)| {
+                    (offset + 1) as f64
+                        <= BURST as f64
+                            + rate * (end.stages_ns[0][0] - start.stages_ns[0][0]) as f64 / 1e6
+                })
+            })
+        }
+
+        // Check D(t) >= (A * beta)(t) immediately before each departure, where
+        // the continuous lower bound is largest before D jumps. Stage arrivals
+        // and completions are counted independently, so async acknowledgment
+        // order is not assumed to be FIFO. This proves only this finite trace.
+        fn service_conforms(
+            rows: &[Observation],
+            stage: usize,
+            model: &LindleyStageTelemetry,
+        ) -> bool {
+            let mut arrivals: Vec<u64> = rows.iter().map(|row| row.stages_ns[stage][0]).collect();
+            let mut departures: Vec<u64> = rows.iter().map(|row| row.stages_ns[stage][1]).collect();
+            arrivals.sort_unstable();
+            departures.sort_unstable();
+            departures.iter().all(|departure| {
+                let time = departure.saturating_sub(1);
+                let completed = departures.partition_point(|value| *value <= time);
+                let lower = arrivals
+                    .iter()
+                    .enumerate()
+                    .take_while(|(_, start)| **start <= time)
+                    .map(|(count, start)| {
+                        count as f64
+                            + model.service_rate_events_per_ms
+                                * (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                // s=t is also a candidate in the min-plus convolution.
+                let arrived = arrivals.partition_point(|value| *value <= time);
+                lower.min(arrived as f64) <= completed as f64 + 1e-9
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn row(sequence: u32, start: u64, end: u64) -> Observation {
+                Observation {
+                    sequence,
+                    stages_ns: [[start, end]; 3],
+                    content_sha256: String::new(),
+                }
+            }
+
+            #[test]
+            fn held_out_service_check_rejects_delayed_departure() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
+                assert!(service_conforms(&[row(0, 0, 1_000_000)], 0, &model));
+                assert!(!service_conforms(&[row(0, 0, 3_000_000)], 0, &model));
+            }
+
+            #[test]
+            fn arrival_check_rejects_excess_burst() {
+                let rows: Vec<_> = (0..11).map(|seq| row(seq, 0, 1)).collect();
+                assert!(arrival_conforms(&rows[..10], 1.0));
+                assert!(!arrival_conforms(&rows, 1.0));
+            }
+
+            #[test]
+            fn calibration_excludes_later_observations() {
+                let mut rows: Vec<_> = (0..10).map(|seq| row(seq, 0, 1_000_000)).collect();
+                let model = calibrate(&rows, 0.1).unwrap();
+                rows.push(row(10, 0, 100_000_000));
+                assert_eq!(model, calibrate(&rows[..10], 0.1).unwrap());
+                assert!(!service_conforms(&rows[10..], 0, &model.stages[0]));
+            }
         }
     }
 }
