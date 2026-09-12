@@ -83,17 +83,23 @@ fn readme_tracks_executable_storage_schema_version() {
     let readme_path = workspace_root().join("README.md");
     let readme = fs::read_to_string(&readme_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", readme_path.display()));
-    let expected_markers = [
-        format!("currently schema v{SCHEMA_VERSION}"),
-        format!("current version is **v{SCHEMA_VERSION}**"),
-        format!("`SCHEMA_VERSION = {SCHEMA_VERSION}` at HEAD"),
-    ];
-
-    for marker in expected_markers {
+    // The README count-stamping gate owns these machine-readable markers;
+    // validate every stamped value against the executable schema authority.
+    let marker = "<!--count:storage_schema_version-->";
+    let values: Vec<_> = readme.split(marker).skip(1).collect();
+    assert_eq!(
+        values.len(),
+        2,
+        "README must retain both schema count slots"
+    );
+    for suffix in values {
+        let (version, _) = suffix
+            .split_once("<!--/count-->")
+            .expect("storage schema count marker must have a closing marker");
         assert_eq!(
-            readme.matches(&marker).count(),
-            1,
-            "README storage-schema marker must appear exactly once: {marker}"
+            version,
+            SCHEMA_VERSION.to_string(),
+            "README storage schema count must match the executable version"
         );
     }
 }

@@ -657,7 +657,7 @@ fn mixed_event_types_full_pipeline() {
 // ===========================================================================
 
 #[test]
-fn schema_version_filtering_skips_unknown() {
+fn schema_version_mismatch_preserves_checkpoint_for_recovery() {
     run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = storage_config(dir.path());
@@ -677,19 +677,27 @@ fn schema_version_filtering_skips_unknown() {
 
         let icfg = indexer_config(dir.path(), "schema-filter");
         let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-        let result = indexer.run(&storage).await.unwrap();
-
-        assert_eq!(result.events_read, 3);
-        assert_eq!(result.events_indexed, 2);
-        assert_eq!(result.events_skipped, 1);
-
-        // Only v1 events should be indexed
-        assert_eq!(indexer.writer().docs.len(), 2);
-        assert_eq!(indexer.writer().docs[0].event_id, "v1-evt");
-        assert_eq!(indexer.writer().docs[1].event_id, "v1-evt-2");
-
-        // Checkpoint should advance past all 3 (including skipped)
-        assert_eq!(result.final_ordinal, Some(2));
+        let error = indexer.run(&storage).await.unwrap_err();
+        assert!(
+            matches!(error, IndexerError::SchemaMismatch { event_id, ordinal: 1, .. } if event_id == "v2-evt")
+        );
+        assert!(
+            storage
+                .read_checkpoint(&CheckpointConsumerId("schema-filter".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A fresh run must encounter the unsupported event again, not silently
+        // advance past it and make the missing document permanent.
+        let mut retry = IncrementalIndexer::new(
+            indexer_config(dir.path(), "schema-filter"),
+            TrackingWriter::new(),
+        );
+        assert!(matches!(
+            retry.run(&storage).await,
+            Err(IndexerError::SchemaMismatch { ordinal: 1, .. })
+        ));
     });
 }
 
@@ -843,11 +851,11 @@ fn idempotent_batch_replay_no_duplicates() {
 }
 
 // ===========================================================================
-// Test: Writer rejection skips event but advances checkpoint
+// Test: Writer rejection preserves the checkpoint for a complete retry
 // ===========================================================================
 
 #[test]
-fn writer_rejection_skips_but_advances() {
+fn writer_rejection_preserves_checkpoint_until_complete_retry() {
     run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = storage_config(dir.path());
@@ -867,18 +875,32 @@ fn writer_rejection_skips_but_advances() {
         let icfg = indexer_config(dir.path(), "reject-test");
         let writer = TrackingWriter::with_rejections(vec!["bad-1".to_string()]);
         let mut indexer = IncrementalIndexer::new(icfg, writer);
-        let result = indexer.run(&storage).await.unwrap();
+        assert!(matches!(
+            indexer.run(&storage).await,
+            Err(IndexerError::IndexWrite(IndexWriteError::Rejected { .. }))
+        ));
+        assert!(
+            storage
+                .read_checkpoint(&CheckpointConsumerId("reject-test".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        assert_eq!(result.events_indexed, 2);
-        assert_eq!(result.events_skipped, 1);
-        assert_eq!(result.final_ordinal, Some(2)); // Checkpoint past all 3
-
-        // On second run, nothing should be re-indexed
+        // With the fault removed, retry the entire uncommitted batch.
         let icfg2 = indexer_config(dir.path(), "reject-test");
         let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
         let r2 = ix2.run(&storage).await.unwrap();
-        assert_eq!(r2.events_indexed, 0);
+        assert_eq!(r2.events_indexed, 3);
+        assert_eq!(r2.events_skipped, 0);
+        assert_eq!(r2.final_ordinal, Some(2));
+        assert!(ix2.writer().docs.iter().any(|doc| doc.event_id == "bad-1"));
         assert!(r2.caught_up);
+        let mut replay = IncrementalIndexer::new(
+            indexer_config(dir.path(), "reject-test"),
+            TrackingWriter::new(),
+        );
+        assert_eq!(replay.run(&storage).await.unwrap().events_indexed, 0);
     });
 }
 
@@ -963,10 +985,11 @@ fn torn_tail_recovery_reader_matches_storage() {
         assert_eq!(records.len(), 5, "reader should recover 5 valid records");
 
         // Reopen storage and verify it also recovers correctly
+        drop(storage);
         let storage2 = AppendLogRecorderStorage::open(scfg).unwrap();
         let health2 = storage2.health().await;
         // After torn-tail truncation on reopen, storage should have same head
-        assert!(health2.latest_offset.is_some());
+        assert_eq!(health2.latest_offset.unwrap().ordinal, 4);
     });
 }
 
@@ -1161,16 +1184,23 @@ async fn run_writer_rejection_scenario() -> ChaosScenarioReport {
         cfg.clone(),
         TrackingWriter::with_rejections(vec!["rej-1".to_string()]),
     );
-    let first = indexer.run(&storage).await.unwrap();
-    assert_eq!(first.events_indexed, 3);
-    assert_eq!(first.events_skipped, 1);
-    assert_eq!(first.final_ordinal, Some(3));
+    assert!(matches!(
+        indexer.run(&storage).await,
+        Err(IndexerError::IndexWrite(IndexWriteError::Rejected { .. }))
+    ));
+    assert!(
+        storage
+            .read_checkpoint(&CheckpointConsumerId(consumer.into()))
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let mut rerun = IncrementalIndexer::new(cfg, TrackingWriter::new());
     let second = rerun.run(&storage).await.unwrap();
     assert_eq!(
-        second.events_indexed, 0,
-        "replay must not silently duplicate"
+        second.events_indexed, 4,
+        "retry must recover all events, including the rejected event"
     );
     assert!(second.caught_up);
 
@@ -1178,13 +1208,13 @@ async fn run_writer_rejection_scenario() -> ChaosScenarioReport {
     assert_eq!(lag.records_behind, 0);
 
     ChaosScenarioReport {
-        name: "writer_rejection_checkpointed",
+        name: "writer_rejection_retried",
         fault: "document_rejected",
-        detected: first.events_skipped > 0,
-        recovered_events: first.events_indexed,
-        skipped_events: first.events_skipped,
-        final_ordinal: first.final_ordinal,
-        recovery_batches: first.batches_committed + second.batches_committed,
+        detected: true,
+        recovered_events: second.events_indexed,
+        skipped_events: second.events_skipped,
+        final_ordinal: second.final_ordinal,
+        recovery_batches: second.batches_committed,
     }
 }
 

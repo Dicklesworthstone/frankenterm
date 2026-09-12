@@ -16,8 +16,8 @@ use frankenterm_core::recorder_migration::{
 };
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointConsumerId,
-    CursorRecord, DurabilityLevel, EventCursorError, RecorderBackendKind, RecorderCheckpoint,
-    RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderStorage,
+    CursorRecord, DurabilityLevel, EventCursorError, FlushMode, RecorderBackendKind,
+    RecorderCheckpoint, RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderStorage,
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
@@ -391,6 +391,11 @@ fn test_m0_rejects_degraded_source() {
             })
             .await;
         assert!(failed_append.is_err());
+        // Invalid caller input does not imply broken storage. Inject an actual
+        // state publication failure before asserting migration health gating.
+        assert!(!storage.storage.health().await.degraded);
+        std::fs::create_dir(storage.config.state_path.with_extension("tmp")).unwrap();
+        assert!(storage.storage.flush(FlushMode::Buffered).await.is_err());
         assert!(storage.storage.health().await.degraded);
         let engine = MigrationEngine::new(MigrationConfig::default());
 
@@ -1090,6 +1095,9 @@ fn test_m5_degraded_preflight_fails_before_marker_io() {
             })
             .await;
         assert!(failed_append.is_err());
+        assert!(!target.storage.health().await.degraded);
+        std::fs::create_dir(target.config.state_path.with_extension("tmp")).unwrap();
+        assert!(target.storage.flush(FlushMode::Buffered).await.is_err());
         assert!(target.storage.health().await.degraded);
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
@@ -1139,9 +1147,12 @@ fn test_m5_marker_batch_uses_fsync_durability() {
             .await
             .unwrap();
 
-        let reopened = AppendLogRecorderStorage::open(target.config.clone()).unwrap();
+        assert_eq!(target.event_count(), 1);
+        let config = target.config.clone();
+        // Reopening as a writer requires releasing the original writer lease.
+        drop(target.storage);
+        let reopened = AppendLogRecorderStorage::open(config).unwrap();
         let latest = reopened.health().await.latest_offset.unwrap();
         assert_eq!(latest.ordinal, 0);
-        assert_eq!(target.event_count(), 1);
     });
 }
