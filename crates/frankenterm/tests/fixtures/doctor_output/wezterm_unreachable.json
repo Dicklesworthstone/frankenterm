@@ -17,7 +17,7 @@
       "status": "error"
     },
     {
-      "detail": "schema v46, wal mode",
+      "detail": "schema v47, wal mode",
       "name": "database",
       "status": "ok"
     }
