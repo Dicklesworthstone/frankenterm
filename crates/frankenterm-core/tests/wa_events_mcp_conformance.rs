@@ -90,9 +90,10 @@ const FIXTURE_RULE_ID: &str = "codex.usage.reached";
 const CLAIM_DELIVERY_TIMEOUT_SECS: u64 = 5;
 
 struct TestHarness {
-    _workspace: tempfile::TempDir,
-    db_path: PathBuf,
     client: FrameworkTestClient,
+    db_path: PathBuf,
+    // Drop the client before releasing the database fixture directory.
+    _workspace: tempfile::TempDir,
 }
 
 #[derive(Serialize)]
@@ -345,13 +346,22 @@ fn assert_boundary_invalid_params_error(error: &str) {
 
 fn capture_tool_contract(
     tool_name: &str,
-    success_setup: impl FnOnce(&mut TestHarness),
+    success_setup: impl FnOnce(&PathBuf),
     success_args: impl FnOnce(&TestHarness) -> Value,
     boundary_invalid_setup: impl FnOnce(&mut TestHarness),
     boundary_invalid_args: impl FnOnce(&TestHarness) -> Value,
 ) -> ToolContractCapture {
-    let mut harness = new_harness();
-    success_setup(&mut harness);
+    let workspace = tempfile::tempdir().expect("create static contract workspace");
+    let db_path = workspace.path().join("mcp.sqlite3");
+    // Static envelope fixtures need no concurrent initializer/writer. Finish
+    // seeding before the server starts; live-insertion tests use new_harness.
+    success_setup(&db_path);
+    let client = spawn_ready_client(db_path.clone());
+    let mut harness = TestHarness {
+        _workspace: workspace,
+        db_path,
+        client,
+    };
     let input_schema = tool_input_schema(&mut harness.client, tool_name);
     assert_schema_matches_manifest(tool_name, &input_schema);
     let success_envelope = parse_tool_envelope(
@@ -423,6 +433,7 @@ fn seed_events_fixture(harness: &TestHarness) {
 }
 
 fn seed_events_fixture_at(db_path: &PathBuf) {
+    let started = std::time::Instant::now();
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
@@ -433,7 +444,12 @@ fn seed_events_fixture_at(db_path: &PathBuf) {
         storage
             .upsert_pane(make_pane(FIXTURE_PANE_ID, FIXTURE_TS))
             .await
-            .expect("upsert pane");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "single-event fixture pane upsert failed after {:?}: {error:?}",
+                    started.elapsed()
+                )
+            });
         let event_id = storage
             .record_event(make_event())
             .await
@@ -454,7 +470,7 @@ fn seed_events_fixture_at(db_path: &PathBuf) {
 fn mcp_conformance_wa_events_contract_matches_expected_envelope() {
     let capture = capture_tool_contract(
         "wa.events",
-        |harness| seed_events_fixture(harness),
+        seed_events_fixture_at,
         |_| {
             json!({
                 "limit": 10,
@@ -509,6 +525,8 @@ fn seed_many_events(harness: &TestHarness, events: Vec<StoredEvent>) {
 }
 
 fn seed_many_events_at(db_path: &PathBuf, events: Vec<StoredEvent>) {
+    let started = std::time::Instant::now();
+    let event_count = events.len();
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
@@ -519,12 +537,16 @@ fn seed_many_events_at(db_path: &PathBuf, events: Vec<StoredEvent>) {
         storage
             .upsert_pane(make_pane(FIXTURE_PANE_ID, FIXTURE_TS))
             .await
-            .expect("upsert pane");
-        for event in events {
+            .unwrap_or_else(|error| {
+                panic!("multi-event fixture pane upsert ({event_count} events) failed after {:?}: {error:?}", started.elapsed())
+            });
+        for (index, event) in events.into_iter().enumerate() {
             storage
                 .record_event(event)
                 .await
-                .expect("record coverage event");
+                .unwrap_or_else(|error| {
+                    panic!("fixture event {index}/{event_count} failed after {:?}: {error:?}", started.elapsed())
+                });
         }
         storage.shutdown().await.expect("shutdown storage");
     });

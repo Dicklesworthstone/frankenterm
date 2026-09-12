@@ -17,10 +17,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 struct TestHarness {
-    _env_lock: MutexGuard<'static, ()>,
+    client: FrameworkTestClient,
     _override_guard: WeztermCliOverrideGuard,
     _fake_wezterm: FakeWezterm,
-    client: FrameworkTestClient,
+    // Release the process-global override lock after the client and fixture.
+    _env_lock: MutexGuard<'static, ()>,
 }
 
 #[derive(Serialize)]
@@ -156,6 +157,13 @@ print(json.dumps(panes))
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
+    let selected = frankenterm_core::wezterm::build_unified_client(&config);
+    assert_eq!(
+        selected.selection().kind,
+        frankenterm_core::wezterm::BackendKind::Cli,
+        "wa.state must use its explicit CLI fixture rather than a live host mux"
+    );
+    assert!(selected.discovered_socket().is_none());
     let server = match db_path {
         Some(db_path) => build_server_with_db(&config, Some(db_path)),
         None => build_server_degraded(&config),
@@ -232,7 +240,10 @@ fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMc
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
-    assert_eq!(envelope["ok"], ok);
+    assert_eq!(
+        envelope["ok"], ok,
+        "unexpected wa.state envelope: {envelope}"
+    );
     assert!(envelope["elapsed_ms"].is_number());
     assert!(envelope["now"].is_number());
     assert_eq!(envelope["mcp_version"], "v1");

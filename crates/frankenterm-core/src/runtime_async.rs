@@ -6592,15 +6592,28 @@ pub mod process {
         #[cfg(unix)]
         #[test]
         fn blocked_stdin_write_observes_cooperative_cancellation() {
+            let fixture = tempfile::tempdir().expect("cancellation start barrier directory");
+            let ready_path = fixture.path().join("ready");
+            let trigger_ready_path = ready_path.clone();
             let cancellation = CommandCancellation::new();
             let cancel_from_thread = cancellation.clone();
             let trigger = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(25));
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !trigger_ready_path.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let child_started = trigger_ready_path.exists();
                 cancel_from_thread.cancel();
+                assert!(child_started, "cancellation must target a running child");
             });
             let mut command = Command::new("sh");
             command
-                .args(["-c", "sleep 5"])
+                .args([
+                    "-c",
+                    "dd bs=1 count=1 of=/dev/null 2>/dev/null && printf ready > \"$1\"; exec sleep 30",
+                    "cancellation-start-barrier",
+                ])
+                .arg(&ready_path)
                 .stdin_bytes(vec![b'x'; 1024 * 1024])
                 .stdin_limit(1024 * 1024);
             let started = Instant::now();
@@ -6608,7 +6621,11 @@ pub mod process {
                 .output_blocking_with_cancellation(Duration::from_secs(5), &cancellation)
                 .expect_err("non-reading child must observe cooperative cancellation");
             trigger.join().expect("cancellation trigger must finish");
-            assert!(CommandCancelled::from_io_error(&error).is_some());
+            assert!(
+                CommandCancelled::from_io_error(&error).is_some(),
+                "running child cancellation must settle cleanly: {error:?}; elapsed: {:?}",
+                started.elapsed()
+            );
             assert!(started.elapsed() < Duration::from_secs(2));
         }
 
@@ -9561,7 +9578,9 @@ mod tests {
         struct ObservedReactor {
             inner: std::sync::Arc<dyn Reactor>,
             armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            long_poll: std::sync::mpsc::SyncSender<()>,
+            long_poll: std::sync::mpsc::SyncSender<u64>,
+            poll_returns: std::sync::atomic::AtomicU64,
+            long_poll_generation: std::sync::atomic::AtomicU64,
         }
         impl Reactor for ObservedReactor {
             fn register(
@@ -9584,11 +9603,21 @@ mod tests {
                 timeout: Option<Duration>,
             ) -> std::io::Result<usize> {
                 if timeout.is_some_and(|wait| wait > Duration::from_secs(2))
-                    && self.armed.swap(false, std::sync::atomic::Ordering::AcqRel)
+                    && self.armed.load(std::sync::atomic::Ordering::Acquire)
                 {
-                    let _ = self.long_poll.try_send(());
+                    // Runtime startup/task publication can leave a native wake
+                    // permit pending. Consume it before announcing the long
+                    // wait; otherwise raw BudgetSleep can appear to notify it.
+                    self.inner.poll(events, Some(Duration::ZERO))?;
+                    let generation = self.poll_returns.load(std::sync::atomic::Ordering::Acquire);
+                    self.long_poll_generation
+                        .store(generation, std::sync::atomic::Ordering::Release);
+                    let _ = self.long_poll.try_send(generation);
                 }
-                self.inner.poll(events, timeout)
+                let result = self.inner.poll(events, timeout);
+                self.poll_returns
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                result
             }
             fn wake(&self) -> std::io::Result<()> {
                 self.inner.wake()
@@ -9607,6 +9636,8 @@ mod tests {
                 inner: asupersync::runtime::reactor::create_reactor().expect("native reactor"),
                 armed: std::sync::Arc::clone(&armed),
                 long_poll: long_poll_tx,
+                poll_returns: std::sync::atomic::AtomicU64::new(0),
+                long_poll_generation: std::sync::atomic::AtomicU64::new(0),
             });
             let runtime = asupersync::runtime::RuntimeBuilder::new()
                 .worker_threads(2)
@@ -9660,9 +9691,34 @@ mod tests {
                 }
                 let _ = driver.cancel(&later);
             });
-            long_poll_rx.recv_timeout(Duration::from_secs(3)).expect(
-                "reactor must select the existing long deadline before short-timer publication",
-            );
+            let observation_started = std::time::Instant::now();
+            loop {
+                let remaining = Duration::from_secs(2)
+                    .checked_sub(observation_started.elapsed())
+                    .expect("reactor must establish its parked long wait within two seconds");
+                let _notification = long_poll_rx
+                    .recv_timeout(remaining)
+                    .expect("reactor must enter the long wait before short-timer publication");
+                // The bounded channel coalesces notifications; its atomic
+                // generation identifies the latest announced long poll.
+                let generation = reactor
+                    .long_poll_generation
+                    .load(std::sync::atomic::Ordering::Acquire);
+                // Confirm that this native poll has not already returned due
+                // to an unrelated startup notification. Re-observe a new poll
+                // if it has, before publishing any short timer at all.
+                std::thread::sleep(Duration::from_millis(20));
+                if reactor
+                    .poll_returns
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == generation
+                {
+                    reactor
+                        .armed
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+            }
             release_tx.send(()).expect("release short-timer publisher");
             let completed = done_rx.recv_timeout(Duration::from_secs(1));
             // Explicitly wake the real reactor to drain the negative control;
@@ -13016,17 +13072,17 @@ mod tests {
 
         #[test]
         fn proptest_timeout_ready_future_returns_value(value in any::<i64>()) {
-            let rt = RuntimeBuilder::current_thread()
-                .build()
-                .expect("runtime should build");
-
-            let observed = rt.block_on(async move {
-                timeout(Duration::from_millis(1), async move { value })
-                    .await
-                    .expect("ready future should not timeout")
-            });
-
-            prop_assert_eq!(observed, value);
+            // Fixed virtual time proves readiness before the deadline without
+            // assuming the host schedules this poll within one wall-clock ms.
+            let (_clock, cx) =
+                virtual_timeout_context(asupersync::Time::ZERO, asupersync::Budget::INFINITE);
+            let _current = crate::cx::Cx::set_current(Some(cx));
+            let mut future = std::pin::pin!(timeout(
+                Duration::from_millis(1),
+                async move { value },
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            prop_assert_eq!(future.as_mut().poll(&mut context), std::task::Poll::Ready(Ok(value)));
         }
 
         #[test]
