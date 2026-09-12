@@ -66,7 +66,7 @@
       "media_type": "application/json",
       "produced_by_bead": "ft-35yac.1.2",
       "proof_categories": [4, 9],
-      "description": "Headless GPU-renderer visual parity contract for the G5 render-parity category. Runtime runs emit target/gpu-regression/<runner>/render-parity-gpu.json beside summary.json; the full ratatui<->ftui byte-level report remains ft-35yac.2."
+      "description": "Headless GPU-renderer parity contract scaffold for G5, not an executed verdict. scripts/test-gpu-harness.sh emits render-parity-gpu.json beside summary.json in GPU_HARNESS_RUN_DIR or its per-run temporary directory. Native release evidence is retained through DSR; the ratatui<->ftui byte-level report remains ft-35yac.2."
     },
     {
       "category": "tui/render-parity",
@@ -102,13 +102,11 @@
     },
     {
       "category": "security/redaction-hygiene",
-      "path": null,
+      "path": "docs/security/redaction-hygiene.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-7h5da.1.5",
-      "deferred_to_bead": "ft-7h5da.1.5",
-      "deferred_reason": "The W0.5 producer is blocked and has not closed the catalog-version stamping and backfill-receipt contract. The retained JSON cannot be promoted to release evidence while that work remains blocked.",
       "proof_categories": [7, 9],
-      "description": "Deferred temporal-redaction hygiene proof for catalog-versioned segment stamping and catalog-aware backfill receipts. The retained artifact remains diagnostic-only until the producer closes."
+      "description": "Scoped remote regression evidence for expression-sensitive catalog identity and atomic redaction maintenance receipts. Does not certify deployment corpus cleanliness or external index rebuilds; final signed release qualification remains separate."
     },
     {
       "category": "security/distributed-threat-model",
@@ -168,13 +166,11 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": null,
+      "path": "docs/attestations/proofs/operating-envelope.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-booek.7",
-      "deferred_to_bead": "ft-booek.7",
-      "deferred_reason": "The operating-envelope convergence producer is blocked and still records target-class capacity as not proven. Its retained no-verdict artifact must not be hashed into a release bundle as completed producer evidence.",
       "proof_categories": [4, 5],
-      "description": "Deferred operating-envelope convergence proof for the ft.operating_envelope.v1 fail-closed admission contract. The retained no-verdict artifact remains diagnostic-only while target-class capacity is unproven."
+      "description": "Scoped remote operating-envelope read-only admission and fixture-calendar contract proof. Target-class production capacity remains skipped and unproven; this artifact does not authorize service mutation or promote capacity claims."
     },
     {
       "category": "proofs/robot-contracts",
@@ -218,13 +214,11 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": null,
+      "path": "docs/attestations/proofs/robot-contract-doctor.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-7h5da.13.7",
-      "deferred_to_bead": "ft-7h5da.13.7",
-      "deferred_reason": "The unified Contract Doctor producer is blocked and has not completed its six-dimension verdict and cross-surface proof contract. The retained artifact is excluded from release evidence until the producer closes.",
       "proof_categories": [4],
-      "description": "Deferred unified Robot/MCP Contract Doctor verdict for the ft.robot_contract_doctor.v1 release contract. The retained artifact remains diagnostic-only until its producer closes."
+      "description": "Unified Robot/MCP Contract Doctor inventory with scoped remote policy and actual CLI/MCP parity evidence. All234 matrix cells are covered; final immutable-source DSR test, snapshot and signed-bundle qualification remain required."
     },
     {
       "category": "proofs/rehearsal-score",
