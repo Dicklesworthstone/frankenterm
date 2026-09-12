@@ -139,6 +139,7 @@ async fn append_events(storage: &AppendLogRecorderStorage, prefix: &str, count: 
 
 #[derive(Debug, Default)]
 struct DrillWriter {
+    generation: Option<String>,
     docs: Vec<IndexDocumentFields>,
     deleted_ids: Vec<String>,
     commits: u64,
@@ -185,7 +186,19 @@ impl IndexWriter for DrillWriter {
 }
 
 impl ReindexableWriter for DrillWriter {
-    fn clear_all(&mut self) -> Result<u64, IndexWriteError> {
+    fn reindex_generation(&self) -> Result<Option<String>, IndexWriteError> {
+        Ok(self.generation.clone())
+    }
+
+    fn begin_reindex_generation(
+        &mut self,
+        consumer: &str,
+        clear: bool,
+    ) -> Result<u64, IndexWriteError> {
+        self.generation = Some(consumer.to_owned());
+        if !clear {
+            return Ok(0);
+        }
         let count = self.docs.len() as u64;
         self.docs.clear();
         self.deleted_ids.clear();
@@ -355,7 +368,7 @@ fn recovery_drill_reindex_resume_integrity_consistent() {
         let recovery_start = Instant::now();
         let mut cfg_resume = reindex_config(dir.path(), consumer, 5, 0);
         cfg_resume.clear_before_start = false;
-        let mut pipeline_resume = ReindexPipeline::new(DrillWriter::new());
+        let mut pipeline_resume = ReindexPipeline::new(writer_first);
         let resume_progress = pipeline_resume
             .full_reindex(&storage, &cfg_resume)
             .await
@@ -367,8 +380,7 @@ fn recovery_drill_reindex_resume_integrity_consistent() {
         assert_eq!(resume_progress.current_ordinal, Some(15));
         assert!(resume_progress.caught_up);
 
-        let mut combined_docs = writer_first.docs;
-        combined_docs.extend(pipeline_resume.writer().docs.iter().cloned());
+        let combined_docs = pipeline_resume.writer().docs.clone();
         assert_eq!(combined_docs.len(), 16);
 
         let lookup = DrillLookup::from_docs(&combined_docs);

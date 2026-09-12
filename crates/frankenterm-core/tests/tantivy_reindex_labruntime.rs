@@ -13,9 +13,9 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::recorder_storage::{
-    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CursorRecord, DurabilityLevel,
-    EventCursorError, RecorderEventCursor, RecorderEventReader, RecorderOffset,
-    RecorderSourceDescriptor, RecorderStorage,
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointConsumerId,
+    CursorRecord, DurabilityLevel, EventCursorError, RecorderEventCursor, RecorderEventReader,
+    RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
 };
 use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
@@ -129,6 +129,7 @@ fn epoch_ms_now() -> u64 {
 // ===========================================================================
 
 struct MockReindexWriter {
+    generation: Option<String>,
     docs: Vec<IndexDocumentFields>,
     deleted_ids: Vec<String>,
     commits: u64,
@@ -142,6 +143,7 @@ struct MockReindexWriter {
 impl MockReindexWriter {
     fn new() -> Self {
         Self {
+            generation: None,
             docs: Vec::new(),
             deleted_ids: Vec::new(),
             commits: 0,
@@ -191,12 +193,24 @@ impl IndexWriter for MockReindexWriter {
 }
 
 impl ReindexableWriter for MockReindexWriter {
-    fn clear_all(&mut self) -> Result<u64, IndexWriteError> {
-        let count = self.docs.len() as u64 + self.clear_count;
+    fn reindex_generation(&self) -> Result<Option<String>, IndexWriteError> {
+        Ok(self.generation.clone())
+    }
+
+    fn begin_reindex_generation(
+        &mut self,
+        consumer: &str,
+        clear: bool,
+    ) -> Result<u64, IndexWriteError> {
+        self.generation = Some(consumer.to_owned());
+        if !clear {
+            return Ok(0);
+        }
+        let count = self.docs.len() as u64;
         self.docs.clear();
         self.deleted_ids.clear();
         self.cleared = true;
-        self.clear_count = count;
+        self.clear_count += count;
         Ok(count)
     }
 }
@@ -445,15 +459,60 @@ fn full_reindex_resumes_from_checkpoint() {
         assert_eq!(p1.events_indexed, 3);
         assert!(!p1.caught_up);
 
-        // Second run: should NOT clear (checkpoint exists), indexes next 3
-        let mut pipeline2 = ReindexPipeline::new(MockReindexWriter::new());
-        let p2 = pipeline2.full_reindex(&storage, &config).await.unwrap();
+        // Resuming is explicit: clearing under an existing checkpoint is
+        // refused, while the original writer retains the resumable generation.
+        let resume_config = ReindexConfig {
+            clear_before_start: false,
+            ..config.clone()
+        };
+        let mut pipeline2 = ReindexPipeline::new(pipeline.into_writer());
+        let p2 = pipeline2
+            .full_reindex(&storage, &resume_config)
+            .await
+            .unwrap();
         assert_eq!(p2.events_indexed, 3);
         assert_eq!(p2.docs_cleared, 0); // no clear because checkpoint exists
-        assert!(!pipeline2.writer().cleared);
+        // The original clear remains recorded, but resume retains its prefix.
+        assert_eq!(pipeline2.writer().docs.len(), 6);
+        assert_eq!(pipeline2.writer().docs[3].event_id, "e3");
 
-        // Verify docs start from ordinal 3
-        assert_eq!(pipeline2.writer().docs[0].event_id, "e3");
+        let consumer = CheckpointConsumerId(config.consumer_id.clone());
+        let checkpoint = storage.read_checkpoint(&consumer).await.unwrap().unwrap();
+        assert_eq!(checkpoint.upto_offset.ordinal, 5);
+        for cx_first in [false, true] {
+            let mut writer = MockReindexWriter::new();
+            writer.docs = pipeline2.writer().docs.clone();
+            let expected_docs = writer.docs.clone();
+            let mut restarted = ReindexPipeline::new(writer);
+            let cx = frankenterm_core::cx::for_request();
+            let result = if cx_first {
+                restarted.full_reindex_with_cx(&cx, &storage, &config).await
+            } else {
+                restarted.full_reindex(&storage, &config).await
+            };
+            assert!(matches!(result, Err(IndexerError::Config(message)) if message.contains("fresh consumer_id")));
+            assert!(!restarted.writer().cleared);
+            assert_eq!(restarted.writer().commits, 0);
+            assert!(restarted.writer().deleted_ids.is_empty());
+            assert_eq!(restarted.writer().docs, expected_docs);
+            assert_eq!(storage.read_checkpoint(&consumer).await.unwrap(), Some(checkpoint.clone()));
+
+            // A new checkpoint generation permits a real restart at zero.
+            let restart_config = ReindexConfig {
+                consumer_id: format!("fresh-rebuild-{cx_first}"),
+                ..config.clone()
+            };
+            let restart = if cx_first {
+                restarted.full_reindex_with_cx(&cx, &storage, &restart_config).await
+            } else {
+                restarted.full_reindex(&storage, &restart_config).await
+            }.unwrap();
+            assert!(restarted.writer().cleared);
+            assert_eq!(restart.docs_cleared, expected_docs.len() as u64);
+            assert_eq!(restart.events_indexed, 3);
+            assert_eq!(restarted.writer().docs[0].event_id, "e0");
+            assert_eq!(storage.read_checkpoint(&consumer).await.unwrap(), Some(checkpoint.clone()));
+        }
     });
 }
 
