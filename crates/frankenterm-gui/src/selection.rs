@@ -118,6 +118,7 @@ pub struct PendingSelectionStart {
     pub frame: SelectionFrameStamp,
     pub coordinate: SelectionCoordinate,
     pub mode: SelectionMode,
+    pub button: window::MousePress,
     pub paint_retries_remaining: u8,
 }
 
@@ -829,6 +830,7 @@ mod tests {
             frame,
             coordinate: anchor,
             mode: SelectionMode::Cell,
+            button: window::MousePress::Left,
             paint_retries_remaining: 3,
         };
         let mut retries = pending;

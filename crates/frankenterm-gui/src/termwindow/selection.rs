@@ -171,13 +171,27 @@ impl super::TermWindow {
         text
     }
 
-    pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
+    pub fn clear_selection_drag(&mut self) {
         self.active_selection_drag_pane = None;
+        self.active_selection_drag_button = None;
+    }
+
+    pub fn begin_selection_drag(&mut self, pane: &Arc<dyn Pane>) {
+        self.active_selection_drag_button = self.current_mouse_event.as_ref().and_then(|event| {
+            super::mouseevent::selection_gesture_button(&event.kind, &self.current_mouse_buttons)
+        });
+        self.active_selection_drag_pane = self.active_selection_drag_button.map(|_| pane.pane_id());
+    }
+
+    pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
+        self.clear_selection_drag();
         self.pane_state(pane.pane_id()).pending_selection_start = None;
         self.update_selection(pane, None, Selection::clear);
     }
 
     pub fn extend_selection_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
+        // Even a deferred first motion is a drag, not a hyperlink click.
+        self.pane_state(pane.pane_id()).suppress_selection_link = true;
         let had_pending_start = self
             .pane_state(pane.pane_id())
             .pending_selection_start
@@ -185,6 +199,17 @@ impl super::TermWindow {
         self.retry_pending_selection_start(pane);
         if had_pending_start {
             // A successful retry already applies the retained motion once.
+            // Real input also restarts presentation after background retries
+            // exhaust; this is one invalidation per motion, not a paint loop.
+            if self
+                .pane_state(pane.pane_id())
+                .pending_selection_start
+                .is_some()
+            {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
             return;
         }
         if self.selection_authority_has_changed(pane) {
@@ -354,14 +379,16 @@ impl super::TermWindow {
                 state
                     .mouse_selection_frame
                     .zip(state.mouse_terminal_coords)
-                    .map(
-                        |(frame, (position, row))| crate::selection::PendingSelectionStart {
+                    .zip(self.active_selection_drag_button)
+                    .map(|((frame, (position, row)), button)| {
+                        crate::selection::PendingSelectionStart {
                             frame,
                             coordinate: SelectionCoordinate::x_y(position.column, row),
                             mode,
+                            button,
                             paint_retries_remaining: 3,
-                        },
-                    )
+                        }
+                    })
             };
             self.selection(pane.pane_id()).clear();
             let mut state = self.pane_state(pane.pane_id());
@@ -383,7 +410,10 @@ impl super::TermWindow {
         let Some(pending) = self.pane_state(pane.pane_id()).pending_selection_start else {
             return;
         };
-        if self.active_selection_drag_pane != Some(pane.pane_id()) {
+        if self.active_selection_drag_pane != Some(pane.pane_id())
+            || self.active_selection_drag_button != Some(pending.button)
+            || !self.current_mouse_buttons.contains(&pending.button)
+        {
             self.pane_state(pane.pane_id()).pending_selection_start = None;
             return;
         }
