@@ -32116,163 +32116,8 @@ fn register_builtin_workflows(
 ///
 /// For `Custom` actions (the default from `steps_to_plans()`), infer the type
 /// from the action_type string which encodes `workflow_step:<step_name>`.
-fn step_action_to_dry_run_type(
-    action: &frankenterm_core::plan::StepAction,
-) -> frankenterm_core::dry_run::ActionType {
-    use frankenterm_core::dry_run::ActionType;
-    use frankenterm_core::plan::StepAction;
-    match action {
-        StepAction::SendText { .. } => ActionType::SendText,
-        StepAction::WaitFor { .. } => ActionType::WaitFor,
-        StepAction::AcquireLock { .. } => ActionType::AcquireLock,
-        StepAction::ReleaseLock { .. } => ActionType::ReleaseLock,
-        StepAction::StoreData { .. } => ActionType::StoreData,
-        StepAction::RunWorkflow { .. } => ActionType::WorkflowStep,
-        StepAction::MarkEventHandled { .. } => ActionType::MarkEventHandled,
-        StepAction::ValidateApproval { .. } => ActionType::ValidateApproval,
-        StepAction::NestedPlan { .. } => ActionType::WorkflowStep,
-        StepAction::Custom { action_type, .. } => infer_action_type_from_name(action_type),
-    }
-}
-
-/// Infer a dry-run `ActionType` from a step/action name string.
-fn infer_action_type_from_name(name: &str) -> frankenterm_core::dry_run::ActionType {
-    use frankenterm_core::dry_run::ActionType;
-    let lower = name.to_lowercase();
-    if lower.contains("send") {
-        ActionType::SendText
-    } else if lower.contains("wait")
-        || lower.contains("stabilize")
-        || lower.contains("verify")
-        || lower.contains("check")
-    {
-        ActionType::WaitFor
-    } else if lower.contains("lock") {
-        ActionType::AcquireLock
-    } else if lower.contains("mark") && lower.contains("handled") {
-        ActionType::MarkEventHandled
-    } else {
-        ActionType::WorkflowStep
-    }
-}
-
-/// Extract metadata from a `StepPlan` for the dry-run report.
-fn step_plan_metadata(step: &frankenterm_core::plan::StepPlan) -> serde_json::Value {
-    use frankenterm_core::plan::StepAction;
-    let mut meta = serde_json::Map::new();
-
-    meta.insert(
-        "step_id".to_string(),
-        serde_json::Value::String(step.step_id.to_string()),
-    );
-    meta.insert(
-        "idempotent".to_string(),
-        serde_json::Value::Bool(step.idempotent),
-    );
-
-    if let Some(timeout_ms) = step.timeout_ms {
-        meta.insert(
-            "timeout_ms".to_string(),
-            serde_json::Value::Number(timeout_ms.into()),
-        );
-    }
-
-    if !step.preconditions.is_empty() {
-        meta.insert(
-            "precondition_count".to_string(),
-            serde_json::Value::Number(step.preconditions.len().into()),
-        );
-    }
-
-    if step.verification.is_some() {
-        meta.insert(
-            "has_verification".to_string(),
-            serde_json::Value::Bool(true),
-        );
-    }
-
-    // Action-specific metadata
-    match &step.action {
-        StepAction::SendText {
-            pane_id,
-            text,
-            paste_mode,
-        } => {
-            meta.insert("policy_gated".to_string(), serde_json::Value::Bool(true));
-            meta.insert(
-                "pane_id".to_string(),
-                serde_json::Value::Number((*pane_id).into()),
-            );
-            meta.insert(
-                "text_len".to_string(),
-                serde_json::Value::Number(text.len().into()),
-            );
-            // Bound and redact the preview before it enters report metadata.
-            let preview = bounded_terminal_preview(text, 60, 512);
-            meta.insert(
-                "text_preview".to_string(),
-                serde_json::Value::String(preview),
-            );
-            if let Some(paste) = paste_mode {
-                meta.insert("paste_mode".to_string(), serde_json::Value::Bool(*paste));
-            }
-        }
-        StepAction::WaitFor {
-            pane_id,
-            condition,
-            timeout_ms,
-        } => {
-            if let Some(pid) = pane_id {
-                meta.insert(
-                    "pane_id".to_string(),
-                    serde_json::Value::Number((*pid).into()),
-                );
-            }
-            meta.insert(
-                "wait_timeout_ms".to_string(),
-                serde_json::Value::Number((*timeout_ms).into()),
-            );
-            meta.insert(
-                "condition".to_string(),
-                serde_json::Value::String(condition.canonical_string()),
-            );
-        }
-        StepAction::AcquireLock {
-            lock_name,
-            timeout_ms,
-        } => {
-            meta.insert(
-                "lock_name".to_string(),
-                serde_json::Value::String(lock_name.clone()),
-            );
-            if let Some(t) = timeout_ms {
-                meta.insert(
-                    "lock_timeout_ms".to_string(),
-                    serde_json::Value::Number((*t).into()),
-                );
-            }
-        }
-        StepAction::ReleaseLock { lock_name } => {
-            meta.insert(
-                "lock_name".to_string(),
-                serde_json::Value::String(lock_name.clone()),
-            );
-        }
-        StepAction::Custom {
-            action_type,
-            payload,
-        } => {
-            meta.insert(
-                "custom_action_type".to_string(),
-                serde_json::Value::String(action_type.clone()),
-            );
-            meta.insert("custom_payload".to_string(), payload.clone());
-        }
-        _ => {}
-    }
-
-    serde_json::Value::Object(meta)
-}
+#[cfg(test)]
+use frankenterm_core::dry_run::{infer_action_type_from_name, step_action_to_dry_run_type};
 
 fn build_workflow_dry_run_report(
     command_ctx: &frankenterm_core::dry_run::CommandContext,
@@ -32281,167 +32126,15 @@ fn build_workflow_dry_run_report(
     pane_info: Option<&frankenterm_core::wezterm::PaneInfo>,
     config: &frankenterm_core::config::Config,
 ) -> frankenterm_core::dry_run::DryRunReport {
-    use frankenterm_core::dry_run::{
-        ActionType, PlannedAction, PolicyCheck, PolicyEvaluation, TargetResolution,
-    };
-
-    let mut ctx = command_ctx.dry_run_context();
-    let policy_input = workflow_run_policy_input(pane, name);
-
-    // Target resolution
-    if let Some(info) = pane_info {
-        let mut target =
-            TargetResolution::new(pane, info.inferred_domain()).with_is_active(info.is_active);
-        if let Some(title) = &info.title {
-            target = target.with_title(title.clone());
-        }
-        if let Some(cwd) = &info.cwd {
-            target = target.with_cwd(cwd.clone());
-        }
-        ctx.set_target(target);
-    } else {
-        ctx.set_target(TargetResolution::new(pane, "unknown"));
-        ctx.add_warning("Pane metadata unavailable; verify pane ID and daemon state.");
-    }
-
-    // Policy evaluation for workflow
-    let mut eval = PolicyEvaluation::new();
     let workflow = resolve_workflow(name, &config.workflows);
-    match workflow.as_ref() {
-        Some(wf) => {
-            eval.add_check(PolicyCheck::passed(
-                "workflow",
-                format!("Workflow '{name}' loaded"),
-            ));
-            if workflow_enabled(wf.name(), &config.workflows) {
-                eval.add_check(PolicyCheck::passed(
-                    "workflow_enabled",
-                    "Workflow is enabled",
-                ));
-            } else {
-                eval.add_check(PolicyCheck::failed(
-                    "workflow_enabled",
-                    "Workflow is disabled",
-                ));
-            }
-
-            if wf.requires_approval() {
-                eval.add_check(PolicyCheck::failed(
-                    "approval",
-                    "Workflow requires approval",
-                ));
-            } else {
-                eval.add_check(PolicyCheck::passed("approval", "No approval required"));
-            }
-
-            if wf.is_destructive() {
-                eval.add_check(PolicyCheck::failed(
-                    "destructive",
-                    "Workflow marked destructive",
-                ));
-            } else {
-                eval.add_check(PolicyCheck::passed(
-                    "destructive",
-                    "Workflow marked non-destructive",
-                ));
-            }
-        }
-        None => {
-            eval.add_check(PolicyCheck::failed(
-                "workflow",
-                format!("Workflow '{name}' not found"),
-            ));
-        }
-    }
-
-    if pane_info.is_some() {
-        eval.add_check(PolicyCheck::passed("pane", "Pane found"));
-    } else {
-        eval.add_check(PolicyCheck::failed(
-            "pane",
-            "Pane not found (dry-run uses best-effort resolution)",
-        ));
-    }
-
-    eval.add_check(
-        PolicyCheck::passed("pane_state", "Pane state not inspected during dry-run")
-            .with_details("Verify prompt/alt-screen state before execution."),
-    );
-    eval.add_check(
-        PolicyCheck::passed(
-            "policy_surface",
-            format!("Policy surface: {}", policy_input.surface.as_str()),
-        )
-        .with_details(format!("action: {}", policy_input.action.as_str())),
-    );
-    eval.add_check(
-        PolicyCheck::passed("policy", "Policy checks deferred to execution")
-            .with_details("Send steps remain policy-gated at runtime."),
-    );
-    ctx.set_policy_evaluation(eval);
-
-    // Expected workflow steps — use structured StepPlans when available
-    if let Some(wf) = workflow.as_ref() {
-        let mut step = 1u32;
-
-        // Step 1: Acquire workflow lock
-        ctx.add_action(PlannedAction::new(
-            step,
-            ActionType::AcquireLock,
-            format!("Acquire workflow lock for pane {pane}"),
-        ));
-        step += 1;
-
-        // Workflow body steps via structured StepPlan
-        let step_plans = wf.steps_to_plans(pane);
-        for sp in &step_plans {
-            let action_type = step_action_to_dry_run_type(&sp.action);
-            let mut description = sp.description.clone();
-            if action_type == ActionType::SendText {
-                description.push_str(" [policy-gated]");
-            }
-            let mut meta = step_plan_metadata(sp);
-            if action_type == ActionType::SendText {
-                if let serde_json::Value::Object(ref mut map) = meta {
-                    map.insert("policy_gated".to_string(), serde_json::Value::Bool(true));
-                }
-            }
-            let action = PlannedAction::new(step, action_type, description).with_metadata(meta);
-            ctx.add_action(action);
-            step += 1;
-        }
-
-        // Mark event handled (if workflow has triggers)
-        let trigger_event_types = wf.trigger_event_types();
-        let trigger_rule_ids = wf.trigger_rule_ids();
-        if !trigger_event_types.is_empty() || !trigger_rule_ids.is_empty() {
-            let mut details = Vec::new();
-            if !trigger_event_types.is_empty() {
-                details.push(format!("event types: {}", trigger_event_types.join(", ")));
-            }
-            if !trigger_rule_ids.is_empty() {
-                details.push(format!("rule ids: {}", trigger_rule_ids.join(", ")));
-            }
-            let suffix = details.join("; ");
-            ctx.add_action(PlannedAction::new(
-                step,
-                ActionType::MarkEventHandled,
-                format!("Mark triggering event handled ({suffix})"),
-            ));
-            step += 1;
-        }
-
-        // Final step: Release lock
-        ctx.add_action(PlannedAction::new(
-            step,
-            ActionType::ReleaseLock,
-            "Release workflow lock".to_string(),
-        ));
-    } else {
-        ctx.add_warning("No workflow steps available; check workflow name.");
-    }
-
-    ctx.take_report()
+    frankenterm_core::dry_run::workflow_preview(
+        command_ctx,
+        name,
+        pane,
+        pane_info,
+        workflow.as_deref(),
+        workflow_enabled(name, &config.workflows),
+    )
 }
 
 fn workflow_enabled(workflow: &str, config: &frankenterm_core::config::WorkflowsConfig) -> bool {
@@ -55945,10 +55638,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let lock_manager = Arc::new(PaneWorkflowLockManager::new());
                                     // [ft-4z7vh] Full policy surface — see the
                                     // sibling fix in RobotCommands::Workflow::Run above.
-                                    // abort_execution_with_cx runs compensation steps
-                                    // through the injector; any send_text in a
-                                    // compensation path must go through the same
-                                    // gates the direct send path does.
+                                    // Explicit abort settles durable workflow state
+                                    // and audit evidence; it does not run terminal
+                                    // compensation. Keep this runner's injector
+                                    // policy-configured for its execution contract.
                                     let policy_engine = PolicyEngine::new(
                                         config.safety.rate_limit_per_pane,
                                         config.safety.rate_limit_global,
@@ -67296,7 +66989,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             }
                             if receipt.tantivy_rebuild_requested {
                                 println!(
-                                    "  note: Tantivy reindex signaled (handled by the search daemon)"
+                                    "  note: Tantivy rebuild required before serving the existing index; no rebuild was queued or performed"
                                 );
                             }
                             if receipt.dry_run {
@@ -108133,36 +107826,43 @@ recorder_backend = "rusqlite"
             "12345678901234567890",
         ]
         .concat();
-        let mut pane_text = BTreeMap::from([
-            (
-                1_u64,
-                RobotPaneTextResult::Ok {
-                    text: format!("terminal output {secret}"),
-                    truncated: false,
-                    truncation_info: None,
-                },
-            ),
-            (
-                2_u64,
-                RobotPaneTextResult::Error {
-                    code: "robot.wezterm_command_failed".to_string(),
-                    message: format!("backend error {secret}"),
-                    hint: Some(format!("retry without {secret}")),
-                },
-            ),
-        ]);
+        for escapes in [false, true] {
+            let split_secret = format!("{}\x1b[31m{}\x1b[0m", &secret[..18], &secret[18..]);
+            let mut pane_text = BTreeMap::from([
+                (
+                    1_u64,
+                    RobotPaneTextResult::Ok {
+                        text: format!("terminal output {split_secret}"),
+                        truncated: false,
+                        truncation_info: None,
+                    },
+                ),
+                (
+                    2_u64,
+                    RobotPaneTextResult::Error {
+                        code: "robot.wezterm_command_failed".to_string(),
+                        message: format!("backend error {secret}"),
+                        hint: Some(format!("retry without {secret}")),
+                    },
+                ),
+            ]);
 
-        redact_pane_text_results_for_output(&mut pane_text, false);
+            redact_pane_text_results_for_output(&mut pane_text, escapes);
 
-        let json = serde_json::to_string(&pane_text).expect("serialize pane text results");
-        assert!(
-            !json.contains(&secret),
-            "raw secret leaked in robot pane text results"
-        );
-        assert!(
-            json.contains("[REDACTED]"),
-            "expected redaction marker in robot pane text results"
-        );
+            let json = serde_json::to_string(&pane_text).expect("serialize pane text results");
+            assert!(
+                !json.contains(&secret),
+                "raw secret leaked in robot pane text results"
+            );
+            assert!(
+                json.contains("[REDACTED]"),
+                "expected redaction marker in robot pane text results"
+            );
+            assert!(
+                !json.contains(&secret[18..]),
+                "ANSI-split secret suffix leaked in batch output with escapes={escapes}"
+            );
+        }
     }
 
     #[test]
@@ -117769,8 +117469,22 @@ cat "$FAKE_FONT_ARCHIVE"
             .find("&& check_installed_version \"$VERSION\"")
             .expect("installed-version refresh boundary");
         assert!(lock_acquired < installed_version_check);
+        // The shared dispatch helper is defined before the executable lock
+        // block; its definition is not an activation. Check the locked call
+        // site and retain the helper's real activation edge independently.
+        let dispatch_start = installer
+            .find("dispatch_process_family_activation() {")
+            .expect("shared activation dispatcher");
+        let dispatch_end = installer[dispatch_start..]
+            .find("\n}\n")
+            .map(|offset| dispatch_start + offset)
+            .expect("shared activation dispatcher end");
+        assert!(
+            installer[dispatch_start..dispatch_end]
+                .contains("if ! activate_process_family_generation \"$ACTIVATE_GENERATION\"; then")
+        );
         let activation_dispatch = installer
-            .rfind("activate_process_family_generation \"$ACTIVATE_GENERATION\"")
+            .rfind("dispatch_process_family_activation || exit 1")
             .expect("top-level activation dispatch");
         assert!(
             lock_acquired < activation_dispatch && activation_dispatch < installed_version_check,

@@ -2731,10 +2731,10 @@ pub struct WorkflowStatusData {
 /// Response data for workflow status list (--pane or --active).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStatusListData {
-    pub executions: Vec<WorkflowStatusData>,
-    #[serde(default)]
+    pub executions: Vec<WorkflowStatusDetailData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_filter: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_only: Option<bool>,
     pub count: usize,
 }

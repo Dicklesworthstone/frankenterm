@@ -56,6 +56,10 @@ impl Drop for TestToolOverrideGuard {
 
 impl TestHarness {
     fn new() -> Self {
+        Self::with_config(Config::default())
+    }
+
+    fn with_config(config: Config) -> Self {
         let lock = tool_override_lock();
         let workspace = tempfile::tempdir().expect("create conformance workspace");
         let fake_bin_dir = workspace.path().join("bin");
@@ -78,7 +82,7 @@ impl TestHarness {
 
         let db_path = workspace.path().join("mcp.sqlite3");
         seed_db(&db_path);
-        let client = spawn_client(Some(db_path));
+        let client = spawn_client(config, Some(db_path));
         let tool_override_guard = TestToolOverrideGuard;
 
         Self {
@@ -194,8 +198,7 @@ EOF
 "#
 }
 
-fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let mut config = Config::default();
+fn spawn_client(mut config: Config, db_path: Option<PathBuf>) -> FrameworkTestClient {
     config.safety.require_prompt_active = false;
     let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
@@ -493,21 +496,25 @@ fn assert_cass_status_success(envelope: &Value) {
 }
 
 fn assert_workflow_run_success(envelope: &Value) {
-    let data = envelope["data"]
-        .as_object()
-        .expect("workflow_run data object");
-    assert_eq!(
-        data.get("workflow_name"),
-        Some(&Value::String("handle_usage_limits".to_string()))
+    let report: frankenterm_core::dry_run::DryRunReport =
+        serde_json::from_value(envelope["data"].clone()).expect("shared workflow preview report");
+    assert_eq!(report.command, "workflow run");
+    assert_eq!(report.target_resolution.as_ref().unwrap().pane_id, 1);
+    let checks = &report.policy_evaluation.as_ref().unwrap().checks;
+    assert!(checks.iter().any(|check| check.name == "workflow"
+        && check.passed
+        && check.message.contains("handle_usage_limits")));
+    assert!(
+        checks.iter().any(|check| check.name == "policy"
+            && check.message == "Policy checks deferred to execution")
     );
-    assert_eq!(data.get("pane_id"), Some(&Value::from(1_u64)));
     assert_eq!(
-        data.get("status"),
-        Some(&Value::String("dry_run".to_string()))
+        report.expected_actions.first().unwrap().action_type,
+        frankenterm_core::dry_run::ActionType::AcquireLock
     );
     assert_eq!(
-        data.get("message"),
-        Some(&Value::String("Dry-run: workflow not executed".to_string()))
+        report.expected_actions.last().unwrap().action_type,
+        frankenterm_core::dry_run::ActionType::ReleaseLock
     );
 }
 
@@ -655,6 +662,72 @@ fn mcp_conformance_wa_cass_view_matches_snapshot() {
     );
 
     assert_json_snapshot!("wa_cass_view_conformance", snapshot_capture(&capture));
+}
+
+#[test]
+fn contract_doctor_workflow_gate_audits_without_starting_execution() {
+    use frankenterm_core::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch};
+    use frankenterm_core::storage::PolicyDeniedAuditRecord;
+
+    for decision in [
+        PolicyRuleDecision::Deny,
+        PolicyRuleDecision::RequireApproval,
+    ] {
+        let mut config = Config::default();
+        config.safety.rules.enabled = true;
+        config.safety.rules.rules.push(PolicyRule {
+            id: "contract-doctor.workflow".to_string(),
+            description: None,
+            priority: 1,
+            match_on: PolicyRuleMatch {
+                actions: vec!["workflow_run".to_string()],
+                actors: vec!["mcp".to_string()],
+                surfaces: vec!["workflow".to_string()],
+                ..Default::default()
+            },
+            decision,
+            message: Some("contract doctor workflow control".to_string()),
+        });
+        let mut harness = TestHarness::with_config(config);
+        let envelope = parse_tool_envelope(
+            &harness
+                .client
+                .call_tool(
+                    "wa.workflow_run",
+                    json!({"name": "handle_usage_limits", "pane_id": 1, "dry_run": false}),
+                )
+                .expect("call actual workflow handler"),
+        );
+        assert_common_envelope_fields(&envelope, false);
+        assert_eq!(envelope["error_code"], "FT-MCP-0006", "{envelope}");
+        let connection =
+            rusqlite::Connection::open(harness._workspace.path().join("mcp.sqlite3")).unwrap();
+        let (count, actual_decision): (i64, String) = connection.query_row(
+            "SELECT COUNT(*), MIN(decision) FROM policy_denied_audit WHERE tool_name = 'wa.workflow_run'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            actual_decision,
+            if decision == PolicyRuleDecision::Deny {
+                PolicyDeniedAuditRecord::DECISION_DENIED
+            } else {
+                PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL
+            }
+        );
+        for table in [
+            "workflow_executions",
+            "workflow_step_logs",
+            "workflow_action_plans",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "denied workflow must not write {table}");
+        }
+    }
 }
 
 #[test]

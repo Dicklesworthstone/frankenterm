@@ -4,11 +4,126 @@ expression: snapshot_capture(&capture)
 ---
 {
   "data": {
-    "elapsed_ms": 0,
-    "message": "Dry-run: workflow not executed",
-    "pane_id": 1,
-    "status": "dry_run",
-    "workflow_name": "handle_usage_limits"
+    "command": "workflow run",
+    "expected_actions": [
+      {
+        "action_type": "acquire_lock",
+        "description": "Acquire workflow lock for pane 1",
+        "step": 1
+      },
+      {
+        "action_type": "wait_for",
+        "description": "Validate pane state allows interaction",
+        "metadata": {
+          "custom_action_type": "workflow_step:check_guards",
+          "custom_payload": {
+            "description": "Validate pane state allows interaction",
+            "pane_id": 1,
+            "step_name": "check_guards",
+            "workflow": "handle_usage_limits"
+          },
+          "idempotent": false,
+          "step_id": "step:8f2909f807146572"
+        },
+        "step": 2
+      },
+      {
+        "action_type": "workflow_step",
+        "description": "Exit Codex and persist session summary",
+        "metadata": {
+          "custom_action_type": "workflow_step:exit_and_persist",
+          "custom_payload": {
+            "description": "Exit Codex and persist session summary",
+            "pane_id": 1,
+            "step_name": "exit_and_persist",
+            "workflow": "handle_usage_limits"
+          },
+          "idempotent": false,
+          "step_id": "step:819fa3e7b248eff9"
+        },
+        "step": 3
+      },
+      {
+        "action_type": "workflow_step",
+        "description": "Select best available account",
+        "metadata": {
+          "custom_action_type": "workflow_step:select_account",
+          "custom_payload": {
+            "description": "Select best available account",
+            "pane_id": 1,
+            "step_name": "select_account",
+            "workflow": "handle_usage_limits"
+          },
+          "idempotent": false,
+          "step_id": "step:50b926a12e3d262e"
+        },
+        "step": 4
+      },
+      {
+        "action_type": "mark_event_handled",
+        "description": "Mark triggering event handled (event types: usage.reached, rate_limit.detected, usage_limit)",
+        "step": 5
+      },
+      {
+        "action_type": "release_lock",
+        "description": "Release workflow lock",
+        "step": 6
+      }
+    ],
+    "policy_evaluation": {
+      "checks": [
+        {
+          "message": "Workflow 'handle_usage_limits' loaded",
+          "name": "workflow",
+          "passed": true
+        },
+        {
+          "message": "Workflow is enabled",
+          "name": "workflow_enabled",
+          "passed": true
+        },
+        {
+          "message": "No approval required",
+          "name": "approval",
+          "passed": true
+        },
+        {
+          "message": "Workflow marked non-destructive",
+          "name": "destructive",
+          "passed": true
+        },
+        {
+          "message": "Pane found",
+          "name": "pane",
+          "passed": true
+        },
+        {
+          "details": "Verify prompt/alt-screen state before execution.",
+          "message": "Pane state not inspected during dry-run",
+          "name": "pane_state",
+          "passed": true
+        },
+        {
+          "details": "action: workflow_run",
+          "message": "Policy surface: workflow",
+          "name": "policy_surface",
+          "passed": true
+        },
+        {
+          "details": "Send steps remain policy-gated at runtime.",
+          "message": "Policy checks deferred to execution",
+          "name": "policy",
+          "passed": true
+        }
+      ]
+    },
+    "target_resolution": {
+      "cwd": "file:///tmp/ft-workflow",
+      "domain": "local",
+      "is_active": false,
+      "pane_id": 1,
+      "title": "workflow-pane"
+    }
   },
   "ok": true,
   "tool": "wa.workflow_run"

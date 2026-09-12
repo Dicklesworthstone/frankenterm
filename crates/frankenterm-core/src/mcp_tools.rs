@@ -89,8 +89,8 @@ use crate::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
 };
 use crate::robot_types::{
-    SubmitGuaranteeLevel, WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData,
-    WorkflowStatusListData, WorkflowStepLog,
+    SubmitGuaranteeLevel, WorkflowActionPlan, WorkflowStatusDetailData, WorkflowStatusListData,
+    WorkflowStepLog,
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::{
@@ -1046,6 +1046,7 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// follow-up; this fix removes the misleading dead end.
 fn mcp_authorize_mcp_mutation(
     config: &Config,
+    audit_db_path: Option<&std::path::Path>,
     policy_rate_limiter: &SharedRateLimiter,
     summary: &str,
     command_text: &str,
@@ -1080,6 +1081,7 @@ fn mcp_authorize_mcp_mutation(
         );
         persist_mcp_policy_denial(
             config,
+            audit_db_path,
             summary,
             command_text,
             &reason,
@@ -1120,6 +1122,7 @@ fn mcp_authorize_mcp_mutation(
         );
         persist_mcp_policy_denial(
             config,
+            audit_db_path,
             summary,
             command_text,
             &reason,
@@ -1142,7 +1145,8 @@ fn mcp_authorize_mcp_mutation(
 }
 
 /// ft-rsqap: best-effort audit-table write for a denied/require-approval
-/// MCP mutation. Resolves the workspace db_path from `config`, builds a
+/// MCP mutation. Uses the tool's explicit database when supplied, otherwise
+/// resolves the workspace db_path from `config`, builds a
 /// `PolicyDeniedAuditRecord`, and calls the sync blocking helper in
 /// `storage.rs`. Every failure (layout resolution, connection open, INSERT)
 /// logs a secondary `tracing::warn!` and returns — the caller's policy-
@@ -1150,6 +1154,7 @@ fn mcp_authorize_mcp_mutation(
 /// failure.
 fn persist_mcp_policy_denial(
     config: &Config,
+    audit_db_path: Option<&std::path::Path>,
     tool_name: &str,
     command_text: &str,
     reason: &str,
@@ -1157,17 +1162,20 @@ fn persist_mcp_policy_denial(
     decision: &str,
     reason_code: &str,
 ) {
-    let layout = match config.workspace_layout(None) {
-        Ok(layout) => layout,
-        Err(_error) => {
-            tracing::warn!(
-                target: "ft::security::policy",
-                tool = %tool_name,
-                error_class = "policy_denial_workspace_layout_unavailable",
-                "workspace_layout unavailable; skipping policy_denied_audit write"
-            );
-            return;
-        }
+    let db_path = match audit_db_path {
+        Some(path) => path.to_path_buf(),
+        None => match config.workspace_layout(None) {
+            Ok(layout) => layout.db_path,
+            Err(_error) => {
+                tracing::warn!(
+                    target: "ft::security::policy",
+                    tool = %tool_name,
+                    error_class = "policy_denial_workspace_layout_unavailable",
+                    "workspace_layout unavailable; skipping policy_denied_audit write"
+                );
+                return;
+            }
+        },
     };
     let record = crate::storage::PolicyDeniedAuditRecord {
         id: 0,
@@ -1181,7 +1189,7 @@ fn persist_mcp_policy_denial(
         decision: decision.to_string(),
     };
     if let Err(_error) =
-        crate::storage::record_policy_denial_audit_blocking(layout.db_path.as_path(), &record)
+        crate::storage::record_policy_denial_audit_blocking(db_path.as_path(), &record)
     {
         tracing::warn!(
             target: "ft::security::policy",
@@ -10021,6 +10029,39 @@ impl ToolHandler for WaWorkflowRunTool {
             }
         };
 
+        if params.dry_run {
+            // A preview is read-only and is not an authorization receipt. Share
+            // the CLI's eligibility report, including unknown/disabled workflow
+            // findings, without opening storage or issuing approval tokens.
+            let runtime = CompatRuntimeBuilder::current_thread()
+                .build()
+                .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
+            let pane_info = runtime.block_on(async {
+                let wezterm = crate::wezterm::wezterm_handle_from_config(self.config.as_ref());
+                wezterm.get_pane(params.pane_id).await.ok()
+            });
+            let workflows = crate::mcp::builtin_workflows(self.config.as_ref());
+            let workflow = workflows
+                .iter()
+                .find(|workflow| workflow.name() == params.name);
+            let enabled = self.config.workflows.enabled.is_empty()
+                || self
+                    .config
+                    .workflows
+                    .enabled
+                    .iter()
+                    .any(|name| name == &params.name);
+            let report = crate::dry_run::workflow_preview(
+                &crate::dry_run::CommandContext::new("workflow run", true),
+                &params.name,
+                params.pane_id,
+                pane_info.as_ref(),
+                workflow.map(|workflow| workflow.as_ref()),
+                enabled,
+            );
+            return envelope_to_content(McpEnvelope::success(report.redacted(), elapsed_ms(start)));
+        }
+
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
@@ -10074,15 +10115,13 @@ impl ToolHandler for WaWorkflowRunTool {
                     input = input.with_pane_cwd(cwd.clone());
                 }
 
-                let decision =
-                    authorize_mcp_policy_call(&mut policy_engine, &input, params.dry_run);
+                let decision = authorize_mcp_policy_call(&mut policy_engine, &input, false);
                 if decision.is_denied() {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Workflow denied by policy")
                         .to_string();
                     // ft-mw1zb: persist to policy_denied_audit alongside tracing.
-                    if !params.dry_run {
-                        persist_mcp_policy_denial_async(
+                    persist_mcp_policy_denial_async(
                             storage.as_ref(),
                             "wa.workflow_run",
                             &summary,
@@ -10092,7 +10131,6 @@ impl ToolHandler for WaWorkflowRunTool {
                             crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                         )
                         .await;
-                    }
                     return Err(McpToolError::new(
                         MCP_ERR_POLICY,
                         reason,
@@ -10100,19 +10138,6 @@ impl ToolHandler for WaWorkflowRunTool {
                     ));
                 }
                 if decision.requires_approval() {
-                    if params.dry_run {
-                        let reason = policy_reason(&decision)
-                            .unwrap_or("Workflow requires approval")
-                            .to_string();
-                        return Err(McpToolError::new(
-                            MCP_ERR_POLICY,
-                            reason,
-                            Some(
-                                "Dry-run preview only: rerun without dry_run to request an allow-once approval token."
-                                    .to_string(),
-                            ),
-                        ));
-                    }
                     let workspace_id =
                         resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
                     let store = ApprovalStore::new(
@@ -10140,20 +10165,6 @@ impl ToolHandler for WaWorkflowRunTool {
                     )
                     .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
-                }
-
-                if params.dry_run {
-                    return Ok(McpWorkflowRunData {
-                        workflow_name: params.name,
-                        pane_id: params.pane_id,
-                        execution_id: None,
-                        status: "dry_run".to_string(),
-                        message: Some("Dry-run: workflow not executed".to_string()),
-                        result: None,
-                        steps_executed: None,
-                        step_index: None,
-                        elapsed_ms: Some(elapsed_ms(start)),
-                    });
                 }
 
                 let runner = workflow_assembly.runner();
@@ -10401,23 +10412,6 @@ fn workflow_status_data(
     }
 }
 
-fn workflow_status_list_item(record: crate::storage::WorkflowRecord) -> WorkflowStatusData {
-    WorkflowStatusData {
-        execution_id: record.id,
-        workflow_name: record.workflow_name,
-        pane_id: Some(record.pane_id),
-        trigger_event_id: record.trigger_event_id,
-        status: record.status,
-        message: record.error,
-        started_at: Some(record.started_at),
-        completed_at: record.completed_at,
-        current_step: Some(record.current_step),
-        total_steps: None,
-        plan: None,
-        created_at: Some(record.started_at),
-    }
-}
-
 impl ToolHandler for WaWorkflowStatusTool {
     fn definition(&self) -> Tool {
         Tool {
@@ -10589,8 +10583,10 @@ impl ToolHandler for WaWorkflowStatusTool {
                     records.truncate(limit);
                 }
 
-                let executions: Vec<WorkflowStatusData> =
-                    records.into_iter().map(workflow_status_list_item).collect();
+                let executions: Vec<WorkflowStatusDetailData> = records
+                    .into_iter()
+                    .map(|record| workflow_status_data(record, None, None, None, false))
+                    .collect();
                 let data = WorkflowStatusListData {
                     count: executions.len(),
                     executions,
@@ -10872,6 +10868,7 @@ impl ToolHandler for WaTxRunTool {
         // ft-x86z2: policy gate before any side effect (contract load, tx execute).
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.tx_run",
             "tx.run",
@@ -11194,6 +11191,7 @@ impl ToolHandler for WaTxRollbackTool {
         // ft-x86z2: policy gate before any side effect (contract load, compensation).
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.tx_rollback",
             "tx.rollback",
@@ -13134,6 +13132,7 @@ impl ToolHandler for WaMissionPauseTool {
         // ft-x86z2: policy gate before mission load + state transition.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.mission_pause",
             "mission.pause",
@@ -13288,6 +13287,7 @@ impl ToolHandler for WaMissionResumeTool {
         // ft-x86z2: policy gate before mission load + state transition.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.mission_resume",
             "mission.resume",
@@ -13452,6 +13452,7 @@ impl ToolHandler for WaMissionAbortTool {
         // ft-x86z2: policy gate before mission load + abort decision.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.mission_abort",
             "mission.abort",
@@ -13648,6 +13649,7 @@ impl ToolHandler for WaEventsAnnotateTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
             "wa.events_annotate",
             "event.annotate",
@@ -13876,6 +13878,7 @@ impl ToolHandler for WaEventsTriageTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
             "wa.events_triage",
             "event.triage",
@@ -14116,6 +14119,7 @@ impl ToolHandler for WaEventsLabelTool {
         if is_mutation {
             if let Some(deny) = mcp_authorize_mcp_mutation(
                 self.config.as_ref(),
+                Some(self.db_path.as_ref().as_path()),
                 &self.policy_rate_limiter,
                 "wa.events_label",
                 "event.label",
@@ -20237,14 +20241,156 @@ mod tests {
         assert!(evidence(&remove_context, "actor_id").is_none());
     }
 
+    fn event_mutation_snapshot(path: &Path, event_id: i64) -> String {
+        rusqlite::Connection::open(path)
+            .expect("open event snapshot database")
+            .query_row(
+                "SELECT json_object('triage', triage_state, 'by', triage_updated_by,
+                    'notes', (SELECT group_concat(note) FROM event_notes WHERE event_id = events.id),
+                    'labels', (SELECT group_concat(label) FROM event_labels WHERE event_id = events.id))
+                 FROM events WHERE id = ?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .expect("snapshot event mutation fields")
+    }
+
+    fn assert_event_denial_audited(path: &Path, tool: &str) {
+        let connection = rusqlite::Connection::open(path).expect("open denial audit database");
+        let (count, decision, reason_code): (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MIN(decision), MIN(reason_code) FROM policy_denied_audit WHERE tool_name = ?1",
+                [tool],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query exact tool denial receipt");
+        assert_eq!(count, 1);
+        assert_eq!(
+            decision,
+            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED
+        );
+        assert_eq!(
+            reason_code,
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED
+        );
+    }
+
+    #[test]
+    fn contract_doctor_reservation_and_refresh_gates_preserve_state_and_audit() {
+        use crate::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch};
+        use crate::storage::PolicyDeniedAuditRecord;
+
+        for decision in [
+            PolicyRuleDecision::Deny,
+            PolicyRuleDecision::RequireApproval,
+        ] {
+            for (tool_name, action, surface) in [
+                ("wa.reserve", "reserve_pane", "swarm"),
+                ("wa.release", "release_pane", "swarm"),
+                ("wa.accounts_refresh", "exec_command", "mcp"),
+            ] {
+                let (_dir, path) = temp_db_path();
+                seed_event(path.as_path());
+                let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+                let reservation = runtime.block_on(async {
+                    let storage = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
+                    let reservation = storage
+                        .create_reservation(7, "agent", "existing-owner", None, 3_600_000)
+                        .await
+                        .unwrap();
+                    storage.shutdown().await.unwrap();
+                    reservation
+                });
+                let mut config = Config::default();
+                config.storage.db_path = path.to_string_lossy().into_owned();
+                config.safety.require_prompt_active = false;
+                config.safety.rules.enabled = true;
+                config.safety.rules.rules.push(PolicyRule {
+                    id: "contract-doctor.mutation-gate".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: PolicyRuleMatch {
+                        actions: vec![action.to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec![surface.to_string()],
+                        ..Default::default()
+                    },
+                    decision,
+                    message: Some("contract doctor policy control".to_string()),
+                });
+                let config = Arc::new(config);
+                let response = match tool_name {
+                    "wa.reserve" => WaReserveTool::new(config, Arc::clone(&path)).call(
+                        &test_mcp_context(),
+                        serde_json::json!({"pane_id": 7, "owner_kind": "agent", "owner_id": "new-owner"}),
+                    ),
+                    "wa.release" => WaReleaseTool::new(config, Arc::clone(&path)).call(
+                        &test_mcp_context(),
+                        serde_json::json!({"reservation_id": reservation.id}),
+                    ),
+                    "wa.accounts_refresh" => WaAccountsRefreshTool::new(config, Arc::clone(&path)).call(
+                        &test_mcp_context(), serde_json::json!({"service": "openai"}),
+                    ),
+                    _ => unreachable!(),
+                };
+                let envelope = parse_json_content(response.expect("actual mutation handler"));
+                assert_eq!(envelope["ok"], false, "{tool_name}: {envelope}");
+                assert_eq!(
+                    envelope["error_code"], MCP_ERR_POLICY,
+                    "{tool_name}: {envelope}"
+                );
+                let conn = rusqlite::Connection::open(path.as_path()).unwrap();
+                let (count, actual_decision, reason): (i64, String, String) = conn.query_row(
+                    "SELECT COUNT(*), MIN(decision), MIN(reason_code) FROM policy_denied_audit WHERE tool_name = ?1",
+                    [tool_name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(count, 1, "{tool_name}");
+                let (expected_decision, expected_reason) = match decision {
+                    PolicyRuleDecision::Deny => (
+                        PolicyDeniedAuditRecord::DECISION_DENIED,
+                        PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    ),
+                    PolicyRuleDecision::RequireApproval => (
+                        PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    ),
+                    PolicyRuleDecision::Allow => unreachable!(),
+                };
+                assert_eq!(actual_decision, expected_decision, "{tool_name}");
+                assert_eq!(reason, expected_reason, "{tool_name}");
+                let (reservation_count, released_at): (i64, Option<i64>) = conn
+                    .query_row(
+                        "SELECT COUNT(*), MAX(released_at) FROM pane_reservations",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reservation_count, 1,
+                    "{tool_name} must not create a reservation"
+                );
+                assert_eq!(
+                    released_at, None,
+                    "{tool_name} must not release the existing owner"
+                );
+                let accounts: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(accounts, 0, "{tool_name} must not refresh accounts");
+            }
+        }
+    }
+
     #[test]
     fn events_annotate_tool_applies_mcp_mutation_policy_gate() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsAnnotateTool::new(
-            deny_mcp_exec_command_config("event\\.annotate", "event note mutations are blocked"),
-            Arc::clone(&db_path),
-        );
+        let before = event_mutation_snapshot(db_path.as_path(), event_id);
+        let wrong_db = db_path.with_file_name("unrelated-config.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.annotate", "event note mutations are blocked");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        let tool = WaEventsAnnotateTool::new(cfg, Arc::clone(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -20261,16 +20407,24 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event note mutations are blocked");
+        assert_eq!(event_mutation_snapshot(db_path.as_path(), event_id), before);
+        assert_event_denial_audited(db_path.as_path(), "wa.events_annotate");
+        assert!(
+            !wrong_db.exists(),
+            "denial must not open an unrelated configured database"
+        );
     }
 
     #[test]
     fn events_triage_tool_applies_mcp_mutation_policy_gate() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsTriageTool::new(
-            deny_mcp_exec_command_config("event\\.triage", "event triage mutations are blocked"),
-            Arc::clone(&db_path),
-        );
+        let before = event_mutation_snapshot(db_path.as_path(), event_id);
+        let wrong_db = db_path.with_file_name("unrelated-config.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.triage", "event triage mutations are blocked");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        let tool = WaEventsTriageTool::new(cfg, Arc::clone(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -20287,16 +20441,24 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event triage mutations are blocked");
+        assert_eq!(event_mutation_snapshot(db_path.as_path(), event_id), before);
+        assert_event_denial_audited(db_path.as_path(), "wa.events_triage");
+        assert!(
+            !wrong_db.exists(),
+            "denial must not open an unrelated configured database"
+        );
     }
 
     #[test]
     fn events_label_tool_applies_mcp_mutation_policy_gate() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsLabelTool::new(
-            deny_mcp_exec_command_config("event\\.label", "event label mutations are blocked"),
-            Arc::clone(&db_path),
-        );
+        let before = event_mutation_snapshot(db_path.as_path(), event_id);
+        let wrong_db = db_path.with_file_name("unrelated-config.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.label", "event label mutations are blocked");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        let tool = WaEventsLabelTool::new(cfg, Arc::clone(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -20313,6 +20475,36 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event label mutations are blocked");
+        assert_eq!(event_mutation_snapshot(db_path.as_path(), event_id), before);
+        assert_event_denial_audited(db_path.as_path(), "wa.events_label");
+        assert!(
+            !wrong_db.exists(),
+            "denial must not open an unrelated configured database"
+        );
+    }
+
+    #[test]
+    fn events_denial_with_unavailable_explicit_audit_db_never_falls_back() {
+        let directory = tempfile::tempdir().expect("unavailable audit fixture");
+        let wrong_db = directory.path().join("must-not-create.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.annotate", "denied with unavailable audit");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        // A directory is deliberately not a usable SQLite database. Denial
+        // remains enforced; no receipt may be invented in another database.
+        let tool = WaEventsAnnotateTool::new(cfg, Arc::new(directory.path().to_path_buf()));
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"event_id": 1, "note": "must not be written"}),
+            )
+            .expect("unavailable audit must preserve denial envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert_eq!(envelope["error"], "denied with unavailable audit");
+        assert!(!wrong_db.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -20672,6 +20864,55 @@ mod tests {
                 "wa.send write-level envelope: {envelope:?}"
             );
             assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+        });
+    }
+
+    #[test]
+    fn contract_doctor_send_policy_denial_preserves_pane_and_audit() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, path) = temp_db_path();
+            let pane_id = 4_207;
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rules.enabled = true;
+            cfg.safety.rules.rules.push(crate::config::PolicyRule {
+                id: "contract-doctor.send-denied".to_string(),
+                description: None,
+                priority: 1,
+                match_on: crate::config::PolicyRuleMatch {
+                    actions: vec!["send_text".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    ..Default::default()
+                },
+                decision: crate::config::PolicyRuleDecision::Deny,
+                message: Some("contract doctor refuses this send".to_string()),
+            });
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let before = mock.pane_state(pane_id).await.unwrap().content;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::new(cfg),
+                Arc::clone(&path),
+                Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+            );
+            let response = parse_json_content(tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"pane_id": pane_id, "text": "contract-doctor-forbidden-input"}),
+            ).unwrap());
+            assert_eq!(
+                response["ok"], true,
+                "injection outcome must be represented: {response}"
+            );
+            assert_eq!(
+                response["data"]["injection"]["status"], "denied",
+                "{response}"
+            );
+            assert_eq!(mock.pane_state(pane_id).await.unwrap().content, before);
+            let audit = latest_audit_action(path.as_path(), "send_text");
+            assert_eq!(audit.result, "denied");
+            assert_eq!(audit.pane_id, Some(pane_id));
         });
     }
 
@@ -22134,6 +22375,103 @@ mod tests {
                 "Tx tool '{}' not found in definitions",
                 expected_name
             );
+        }
+    }
+
+    #[test]
+    fn contract_doctor_tx_and_mission_gates_audit_before_file_effects() {
+        use crate::storage::PolicyDeniedAuditRecord;
+
+        for approval in [false, true] {
+            for (tool_name, command) in [
+                ("wa.tx_run", "tx\\.run"),
+                ("wa.tx_rollback", "tx\\.rollback"),
+                ("wa.mission_pause", "mission\\.pause"),
+                ("wa.mission_resume", "mission\\.resume"),
+                ("wa.mission_abort", "mission\\.abort"),
+            ] {
+                let dir = workspace_tempdir();
+                let contract = if tool_name.starts_with("wa.mission_") {
+                    write_mission_file(
+                        &dir,
+                        if tool_name == "wa.mission_resume" {
+                            MissionLifecycleState::Paused
+                        } else {
+                            MissionLifecycleState::Running
+                        },
+                    )
+                } else {
+                    write_tx_contract(&dir, MissionTxState::Planned)
+                };
+                let original = std::fs::read(&contract).unwrap();
+                let path = dir.path().join("audit.sqlite3");
+                seed_event(&path);
+                let mut config = if approval {
+                    require_approval_mcp_exec_command_config(command, "approval control")
+                } else {
+                    deny_mcp_exec_command_config(command, "deny control")
+                };
+                Arc::make_mut(&mut config).storage.db_path = path.to_string_lossy().into_owned();
+                let args = if tool_name == "wa.mission_resume" {
+                    serde_json::json!({"mission_file": contract.to_string_lossy(), "requested_by": "doctor"})
+                } else if tool_name.starts_with("wa.mission_") {
+                    serde_json::json!({"mission_file": contract.to_string_lossy(), "reason": "doctor control", "requested_by": "doctor"})
+                } else {
+                    serde_json::json!({"contract_file": contract.to_string_lossy()})
+                };
+                let result = match tool_name {
+                    "wa.tx_run" => WaTxRunTool::new(config).call(&test_mcp_context(), args),
+                    "wa.tx_rollback" => {
+                        WaTxRollbackTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    "wa.mission_pause" => {
+                        WaMissionPauseTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    "wa.mission_resume" => {
+                        WaMissionResumeTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    "wa.mission_abort" => {
+                        WaMissionAbortTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    _ => unreachable!(),
+                };
+                let envelope = parse_json_content(result.unwrap());
+                assert_eq!(envelope["ok"], false, "{tool_name}: {envelope}");
+                assert_eq!(
+                    envelope["error_code"], MCP_ERR_POLICY,
+                    "{tool_name}: {envelope}"
+                );
+                assert_eq!(
+                    std::fs::read(&contract).unwrap(),
+                    original,
+                    "{tool_name} altered the contract before authorization"
+                );
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                let (count, decision, reason): (i64, String, String) = conn.query_row(
+                    "SELECT COUNT(*), MIN(decision), MIN(reason_code) FROM policy_denied_audit WHERE tool_name = ?1",
+                    [tool_name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(count, 1);
+                if approval {
+                    assert_eq!(
+                        decision,
+                        PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED
+                    );
+                    assert_eq!(
+                        reason,
+                        PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED
+                    );
+                    assert!(
+                        envelope["hint"]
+                            .as_str()
+                            .unwrap()
+                            .contains("does not support")
+                    );
+                } else {
+                    assert_eq!(decision, PolicyDeniedAuditRecord::DECISION_DENIED);
+                    assert_eq!(reason, PolicyDeniedAuditRecord::REASON_CODE_DENIED);
+                }
+            }
         }
     }
 
@@ -26188,6 +26526,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             cfg.as_ref(),
+            None,
             &rate_limiter,
             "wa.tx_run",
             "tx.run",
@@ -26244,6 +26583,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             cfg.as_ref(),
+            None,
             &rate_limiter,
             "wa.mission_pause",
             "mission.pause",
@@ -26274,6 +26614,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             cfg.as_ref(),
+            None,
             &rate_limiter,
             "wa.tx_run",
             "tx.run",
