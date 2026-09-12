@@ -127,6 +127,13 @@ impl TestHarness {
         let env_lock = wezterm_env_lock();
         let fake_wezterm = FakeWezterm::new();
         let override_guard = fake_wezterm.install();
+        let selected = frankenterm_core::wezterm::build_unified_client(&config);
+        assert_eq!(
+            selected.selection().kind,
+            frankenterm_core::wezterm::BackendKind::Cli,
+            "the explicit CLI fixture must not select a live host mux"
+        );
+        assert!(selected.discovered_socket().is_none());
         let workspace = tempfile::tempdir().expect("create conformance workspace");
         let db_path = workspace.path().join("mcp.sqlite3");
         seed_search_db(&db_path);
@@ -581,7 +588,7 @@ fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMc
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
-    assert_eq!(envelope["ok"], ok);
+    assert_eq!(envelope["ok"], ok, "unexpected MCP envelope: {envelope}");
     assert!(envelope["elapsed_ms"].is_number());
     assert!(envelope["now"].is_number());
     assert_eq!(envelope["mcp_version"], "v1");
