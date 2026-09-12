@@ -1306,12 +1306,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_extra_parts_still_works() {
-        // "1.2.3.4" — has 4 parts, but parse only needs first 3
-        let v = ApiVersion::parse("1.2.3.4").unwrap();
-        assert_eq!(v.major, 1);
-        assert_eq!(v.minor, 2);
-        assert_eq!(v.patch, 3);
+    fn parse_extra_parts_are_rejected() {
+        assert!(ApiVersion::parse("1.2.3.4").is_none());
+        assert!(ApiVersion::parse("1.2.3.4-rc.1").is_none());
+        assert_eq!(
+            ApiVersion::parse("1.2.3-rc.1+build.7"),
+            ApiVersion::parse("1.2.3")
+        );
     }
 
     #[test]

@@ -5722,6 +5722,7 @@ impl Screen {
     ) {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         log::debug!(
+            target: "frankenterm_term::screen::scroll",
             "scroll_up_within_margins region:{:?} margins:{:?} rows={}",
             scroll_region,
             left_and_right_margins,
@@ -5827,6 +5828,7 @@ impl Screen {
         }
 
         debug!(
+            target: "frankenterm_term::screen::scroll",
             "scroll_up {:?} num_rows={} phys_scroll={:?}",
             scroll_region, num_rows, phys_scroll
         );
