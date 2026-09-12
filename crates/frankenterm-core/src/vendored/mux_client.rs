@@ -13032,8 +13032,16 @@ mod tests {
                                     stream.write_all(&out).await.expect("write response");
                                 }
                                 Pdu::ListPanes(_) => {
-                                    // Keep the socket open but silent past client read_timeout.
-                                    sleep(Duration::from_millis(250)).await;
+                                    // Only the client deadline ends this exchange. A competing
+                                    // server sleep/close can turn the expected timeout into EOF
+                                    // when the test process is heavily scheduled.
+                                    let mut byte = [0];
+                                    assert_eq!(
+                                        unix_stream_read(&mut stream, &mut byte)
+                                            .await
+                                            .expect("read client close"),
+                                        0
+                                    );
                                     return;
                                 }
                                 _ => {}
@@ -13046,9 +13054,10 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            // Handshake is setup, not the operation whose deadline we test.
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client.config.read_timeout = Duration::from_millis(40);
 
             let err = client
                 .list_panes()
@@ -13116,8 +13125,14 @@ mod tests {
                                     stream.write_all(&out).await.expect("write response");
                                 }
                                 Pdu::ListPanes(_) => {
-                                    // Keep the socket open but silent past client read_timeout.
-                                    sleep(Duration::from_millis(250)).await;
+                                    // Stay silent until the timed-out client closes the socket.
+                                    let mut byte = [0];
+                                    assert_eq!(
+                                        unix_stream_read(&mut stream, &mut byte)
+                                            .await
+                                            .expect("read client close"),
+                                        0
+                                    );
                                     return;
                                 }
                                 _ => {}
@@ -13130,11 +13145,11 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
+            client.config.read_timeout = Duration::from_millis(40);
 
             let err = client
                 .list_panes_with_cx(&cx)
@@ -13327,6 +13342,8 @@ mod tests {
             let socket_path = temp_dir.path().join("partial-frame.sock");
             let server_socket_path = socket_path.clone();
             let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let (first_chunk_tx, first_chunk_rx) = crate::runtime_async::oneshot::channel();
+            let (continue_tx, continue_rx) = crate::runtime_async::oneshot::channel();
             let server = std::thread::spawn(move || {
                 let runtime = RuntimeBuilder::current_thread()
                     .build()
@@ -13391,7 +13408,10 @@ mod tests {
                                         .write_all(&out[..split])
                                         .await
                                         .expect("write first frame chunk");
-                                    sleep(Duration::from_millis(20)).await;
+                                    first_chunk_tx.send(split).expect("announce first chunk");
+                                    crate::runtime_async::oneshot_recv(continue_rx)
+                                        .await
+                                        .expect("client buffered first chunk");
                                     stream
                                         .write_all(&out[split..])
                                         .await
@@ -13408,14 +13428,45 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
-            let panes = client
-                .list_panes()
+            let cx = crate::cx::for_testing();
+            let serial = client
+                .send_request_only_with_cx(&cx, Pdu::ListPanes(ListPanes {}))
                 .await
-                .expect("list_panes should succeed with split response frame");
+                .expect("send ListPanes");
+            let split = crate::runtime_async::oneshot_recv(first_chunk_rx)
+                .await
+                .expect("first chunk length");
+            let mut first_chunk = vec![0; split];
+            let mut received = 0;
+            while received < split {
+                let read = timeout(
+                    client.config.read_timeout,
+                    unix_stream_read(&mut client.stream, &mut first_chunk[received..]),
+                )
+                .await
+                .expect("first chunk read deadline")
+                .expect("read first chunk");
+                assert!(read > 0, "server must remain open for the second chunk");
+                received += read;
+            }
+            client.read_buf.extend_from_slice(&first_chunk);
+            assert!(
+                Pdu::stream_decode(&mut client.read_buf)
+                    .expect("valid incomplete frame")
+                    .is_none(),
+                "the first chunk alone must not produce a response"
+            );
+            continue_tx.send(()).expect("release remaining frame bytes");
+            let response = client
+                .await_response_with_cx(&cx, serial)
+                .await
+                .expect("ListPanes should succeed with split response frame");
+            let Pdu::ListPanesResponse(panes) = response else {
+                panic!("expected ListPanesResponse, got {response:?}");
+            };
             assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);

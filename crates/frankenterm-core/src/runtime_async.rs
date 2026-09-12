@@ -7154,9 +7154,83 @@ pub async fn sleep(duration: Duration) {
 /// Every cx-first accept/poll loop in this crate that uses `sleep_with_cx`
 /// already follows this pattern (e.g. watchdog.rs, backpressure polling).
 pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(), String> {
-    asupersync::time::budget_sleep(cx, duration, cx_timer_now(cx))
-        .await
-        .map_err(|err| err.to_string())
+    notify_initial_timer_registration(asupersync::time::budget_sleep(
+        cx,
+        duration,
+        cx_timer_now(cx),
+    ))
+    .await
+    .map_err(|err| err.to_string())
+}
+
+async fn notify_initial_timer_registration<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut registration_notified = false;
+    std::future::poll_fn(|task_cx| {
+        let result = future.as_mut().poll(task_cx);
+        if result.is_pending()
+            && !registration_notified
+            && asupersync::runtime::Runtime::current_handle().is_some()
+        {
+            // asupersync 0.3.10 publishes timer-wheel registrations without
+            // waking a reactor leader already parked on a later deadline.
+            // The task's own scheduler waker notifies that reactor after this
+            // first poll has registered the timer. One extra poll is bounded;
+            // subsequent Pending results must not create a polling loop.
+            // LabRuntime has no parked native reactor; the global fallback
+            // timer already wakes its own pump when registering a deadline.
+            registration_notified = true;
+            task_cx.waker().wake_by_ref();
+        }
+        result
+    })
+    .await
+}
+
+/// Wait until the supplied context fails its cancellation/budget checkpoint.
+///
+/// An infinite-budget context registers only a cancellation waker. A finite
+/// deadline adds one deadline timer, never a polling loop. Dropping the future
+/// unregisters both waiters. Poll/cost exhaustion is observed at checkpoints;
+/// the owning runtime remains responsible for publishing budget cancellation.
+///
+/// # Errors
+///
+/// Normal termination returns the structural checkpoint cause, distinguishing
+/// cancellation, deadline expiry, and exhausted poll/cost budgets. This wait
+/// has no successful value and does not mutate an unrelated cancellation token.
+/// The structural error is boxed to keep the future's result compact.
+pub async fn wait_for_cancellation(cx: &crate::cx::Cx) -> Result<(), Box<ContextError>> {
+    fn classify(cx: &crate::cx::Cx, error: ContextError) -> ContextError {
+        use crate::outcome::CancelKind;
+        // Pinned Cx::checkpoint reports every structural termination as
+        // Cancelled. Recover budget distinctions from its retained root cause,
+        // keeping the original checkpoint error as the diagnostic source.
+        let kind = match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => ContextErrorKind::DeadlineExceeded,
+            Some(CancelKind::PollQuota) => ContextErrorKind::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => ContextErrorKind::CostQuotaExhausted,
+            _ => return error,
+        };
+        ContextError::new(kind).with_source(error)
+    }
+
+    cx.checkpoint()
+        .map_err(|error| Box::new(classify(cx, error)))?;
+    let signal = asupersync::sync::OnceCell::<()>::new();
+    let waiter = signal.wait(cx);
+    if let Some(deadline) = cx.budget().deadline {
+        let remaining = Duration::from_nanos(deadline.duration_since(timer_now_with_cx(cx)));
+        let _ = timeout_with_cx_typed(cx, remaining, waiter).await;
+    } else {
+        let _ = waiter.await;
+    }
+    match cx.checkpoint() {
+        Err(error) => Err(Box::new(classify(cx, error))),
+        Ok(()) => Err(Box::new(ContextError::internal(
+            "cancellation waiter completed without context termination",
+        ))),
+    }
 }
 
 /// Maximum number of concurrently admitted interruptible timer registrations.
@@ -7536,10 +7610,8 @@ async fn sleep_with_cx_interruptible_using(
     let effective_deadline = cx.budget().deadline.map_or(requested_deadline, |deadline| {
         deadline.min(requested_deadline)
     });
-    let timer = std::pin::pin!(asupersync::time::budget_sleep(
-        cx,
-        duration,
-        timer_started_at,
+    let timer = std::pin::pin!(notify_initial_timer_registration(
+        asupersync::time::budget_sleep(cx, duration, timer_started_at)
     ));
     // An uninitialized OnceCell is a zero-payload cancellation signal here:
     // `wait` registers directly with the explicit Cx and can only resolve via
@@ -8168,16 +8240,27 @@ pub(crate) async fn timeout_with_cx_typed<F>(
 where
     F: Future,
 {
-    let mut future = Box::pin(future);
-    let initial =
-        std::future::poll_fn(|task_cx| std::task::Poll::Ready(future.as_mut().poll(task_cx))).await;
-    if let std::task::Poll::Ready(output) = initial {
-        return Ok(output);
+    let started_at = cx_timer_now(cx);
+    // budget_timeout clamps an expired budget to zero remaining duration,
+    // which would move an already-past deadline to `started_at` and admit
+    // ready work under its exact-boundary preference. Preserve true expiry;
+    // equality still delegates to the underlying ready-first contract.
+    if cx
+        .budget()
+        .deadline
+        .is_some_and(|deadline| deadline < started_at)
+    {
+        return Err(TimeoutError::Elapsed);
     }
 
-    asupersync::time::budget_timeout(cx, duration, future, cx_timer_now(cx))
-        .await
-        .map_err(|_elapsed| TimeoutError::Elapsed)
+    notify_initial_timer_registration(asupersync::time::budget_timeout(
+        cx,
+        duration,
+        Box::pin(future),
+        started_at,
+    ))
+    .await
+    .map_err(|_elapsed| TimeoutError::Elapsed)
 }
 
 pub(crate) fn timer_now_with_cx(cx: &crate::cx::Cx) -> asupersync::Time {
@@ -9284,6 +9367,329 @@ mod tests {
             let result = sleep_with_cx(&cx, Duration::from_secs(1)).await;
             assert!(result.is_err(), "expired budgets must short-circuit sleep");
         });
+    }
+
+    fn virtual_timeout_context(
+        now: asupersync::Time,
+        budget: asupersync::Budget,
+    ) -> (
+        std::sync::Arc<asupersync::time::VirtualClock>,
+        crate::cx::Cx,
+    ) {
+        let clock = std::sync::Arc::new(asupersync::time::VirtualClock::starting_at(now));
+        let driver = asupersync::time::TimerDriverHandle::with_virtual_clock(clock.clone());
+        let identity = crate::cx::for_testing();
+        let cx = crate::cx::Cx::new_with_drivers(
+            identity.region_id(),
+            identity.task_id(),
+            budget,
+            None,
+            None,
+            None,
+            Some(driver),
+            None,
+        );
+        (clock, cx)
+    }
+
+    #[test]
+    fn timeout_with_cx_rejects_past_budget_but_preserves_exact_ready_boundary() {
+        for deadline_ms in [99, 100, 101] {
+            let (_clock, cx) = virtual_timeout_context(
+                asupersync::Time::from_millis(100),
+                asupersync::Budget::new().with_deadline(asupersync::Time::from_millis(deadline_ms)),
+            );
+            let _current = crate::cx::Cx::set_current(Some(cx.clone()));
+            let polled = std::cell::Cell::new(false);
+            let mut timeout =
+                std::pin::pin!(timeout_with_cx_typed(&cx, Duration::from_secs(1), async {
+                    polled.set(true);
+                    7
+                }));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let result = timeout.as_mut().poll(&mut context);
+            if deadline_ms < 100 {
+                assert!(matches!(
+                    result,
+                    std::task::Poll::Ready(Err(TimeoutError::Elapsed))
+                ));
+                assert!(!polled.get(), "expired budgets must not start caller work");
+            } else {
+                assert!(matches!(result, std::task::Poll::Ready(Ok(7))));
+                assert!(polled.get());
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_with_cx_counts_time_spent_in_first_pending_user_poll() {
+        let (clock, cx) =
+            virtual_timeout_context(asupersync::Time::ZERO, asupersync::Budget::INFINITE);
+        let _current = crate::cx::Cx::set_current(Some(cx.clone()));
+        let mut first_poll = true;
+        let work = std::future::poll_fn(|_| {
+            if first_poll {
+                first_poll = false;
+                clock.advance(100_000_000);
+            }
+            std::task::Poll::<()>::Pending
+        });
+        let mut timeout =
+            std::pin::pin!(timeout_with_cx_typed(&cx, Duration::from_millis(50), work));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            timeout.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(TimeoutError::Elapsed))
+        ));
+        assert_eq!(cx_timer_now(&cx), asupersync::Time::from_millis(100));
+    }
+
+    #[test]
+    fn cancellation_wait_registers_direct_wake_and_unregisters_on_drop() {
+        let cx = crate::cx::for_testing();
+        let (probe, waker) = probe_waker(false);
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiter = Box::pin(wait_for_cancellation(&cx));
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        assert_eq!(probe.count(), 0, "waiting must not self-wake");
+        cx.cancel_with(crate::outcome::CancelKind::User, Some("waiter wake proof"));
+        assert_eq!(
+            probe.count(),
+            1,
+            "cancellation must wake the registered task"
+        );
+        let std::task::Poll::Ready(Err(error)) = waiter.as_mut().poll(&mut context) else {
+            panic!("cancelled context must terminate the wait");
+        };
+        assert_eq!(error.kind(), ContextErrorKind::Cancelled);
+        drop(waiter);
+
+        let dropped_cx = crate::cx::for_testing();
+        let (dropped_probe, dropped_waker) = probe_waker(false);
+        let mut dropped_context = std::task::Context::from_waker(&dropped_waker);
+        let mut dropped_waiter = Box::pin(wait_for_cancellation(&dropped_cx));
+        assert!(
+            dropped_waiter
+                .as_mut()
+                .poll(&mut dropped_context)
+                .is_pending()
+        );
+        drop(dropped_waiter);
+        dropped_cx.cancel_with(crate::outcome::CancelKind::User, Some("waiter drop proof"));
+        assert_eq!(
+            dropped_probe.count(),
+            0,
+            "dropped waiter must be unregistered"
+        );
+    }
+
+    #[test]
+    fn cancellation_wait_preserves_exhausted_budget_error() {
+        let cx =
+            crate::cx::Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0));
+        let (probe, waker) = probe_waker(false);
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiter = std::pin::pin!(wait_for_cancellation(&cx));
+        let std::task::Poll::Ready(Err(error)) = waiter.as_mut().poll(&mut context) else {
+            panic!("exhausted budget must fail before registering a waiter");
+        };
+        assert_eq!(error.kind(), ContextErrorKind::PollQuotaExhausted);
+        assert_eq!(probe.count(), 0);
+    }
+
+    #[test]
+    fn cancellation_wait_observes_deadline_without_external_canceller() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let task_observed = std::sync::Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0xCA11_CE11)
+                .with_auto_advance()
+                .max_steps(10_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let budget = asupersync::Budget::new().with_deadline(asupersync::Time::from_millis(100));
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, budget, async move {
+                let cx = crate::cx::Cx::current().expect("LabRuntime context");
+                let error = wait_for_cancellation(&cx)
+                    .await
+                    .expect_err("deadline must terminate wait");
+                *task_observed.lock().expect("record deadline result") = Some(error.kind());
+            })
+            .expect("deadline waiter task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_with_auto_advance();
+        assert_eq!(
+            *observed.lock().expect("deadline result"),
+            Some(ContextErrorKind::DeadlineExceeded)
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+    }
+
+    #[test]
+    fn sleep_with_cx_notifies_registration_once_without_busy_polling() {
+        run_async_test(async {
+            let cx = crate::cx::Cx::current().expect("native runtime context");
+            let (probe, waker) = probe_waker(false);
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut waiting = std::pin::pin!(sleep_with_cx(&cx, Duration::from_secs(60)));
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+            assert_eq!(probe.count(), 1);
+            for _ in 0..8 {
+                assert!(waiting.as_mut().poll(&mut context).is_pending());
+            }
+            assert_eq!(probe.count(), 1, "Pending must not continually self-wake");
+
+            let mut immediate = std::pin::pin!(sleep_with_cx(&cx, Duration::ZERO));
+            assert!(matches!(
+                immediate.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert_eq!(probe.count(), 1, "ready timers need no registration wake");
+        });
+    }
+
+    #[test]
+    fn sleep_with_cx_wakes_reactor_parked_on_later_deadline() {
+        use asupersync::runtime::reactor::{Events, Interest, Reactor, Source, Token};
+
+        // Observe the real platform reactor without replacing its polling or
+        // wake semantics. The channel only reports the leader's chosen wait.
+        struct ObservedReactor {
+            inner: std::sync::Arc<dyn Reactor>,
+            armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            long_poll: std::sync::mpsc::SyncSender<()>,
+        }
+        impl Reactor for ObservedReactor {
+            fn register(
+                &self,
+                source: &dyn Source,
+                token: Token,
+                interest: Interest,
+            ) -> std::io::Result<()> {
+                self.inner.register(source, token, interest)
+            }
+            fn modify(&self, token: Token, interest: Interest) -> std::io::Result<()> {
+                self.inner.modify(token, interest)
+            }
+            fn deregister(&self, token: Token) -> std::io::Result<()> {
+                self.inner.deregister(token)
+            }
+            fn poll(
+                &self,
+                events: &mut Events,
+                timeout: Option<Duration>,
+            ) -> std::io::Result<usize> {
+                if timeout.is_some_and(|wait| wait > Duration::from_secs(2))
+                    && self.armed.swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    let _ = self.long_poll.try_send(());
+                }
+                self.inner.poll(events, timeout)
+            }
+            fn wake(&self) -> std::io::Result<()> {
+                self.inner.wake()
+            }
+            fn registration_count(&self) -> usize {
+                self.inner.registration_count()
+            }
+        }
+
+        for mode in ["raw", "sleep", "interruptible", "timeout"] {
+            let (long_poll_tx, long_poll_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reactor = std::sync::Arc::new(ObservedReactor {
+                inner: asupersync::runtime::reactor::create_reactor().expect("native reactor"),
+                armed: std::sync::Arc::clone(&armed),
+                long_poll: long_poll_tx,
+            });
+            let runtime = asupersync::runtime::RuntimeBuilder::new()
+                .worker_threads(2)
+                .with_reactor(reactor.clone())
+                .build()
+                .expect("two-worker native runtime");
+            let task = runtime.handle().spawn(async move {
+                let cx = crate::cx::Cx::current().expect("scheduler context");
+                let driver = cx.timer_driver().expect("scheduler timer driver");
+                let later = driver.register(
+                    driver.now() + Duration::from_secs(5),
+                    std::task::Waker::noop().clone(),
+                );
+                armed.store(true, std::sync::atomic::Ordering::Release);
+                // Intentionally hold this worker while its peer selects the
+                // long timer. This channel does not wake the reactor.
+                let released = release_rx.recv_timeout(Duration::from_secs(3));
+                if released.is_ok() {
+                    let started = std::time::Instant::now();
+                    let result = match mode {
+                        "sleep" => sleep_with_cx(&cx, Duration::from_millis(20)).await,
+                        "interruptible" => {
+                            sleep_with_cx_interruptible(&cx, Duration::from_millis(20))
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                        "timeout" => match timeout_with_cx_typed(
+                            &cx,
+                            Duration::from_millis(20),
+                            std::future::pending::<()>(),
+                        )
+                        .await
+                        {
+                            Err(TimeoutError::Elapsed) => Ok(()),
+                            other => Err(format!("unexpected timeout result: {other:?}")),
+                        },
+                        "raw" => {
+                            // This unnotified primitive is only a test negative
+                            // control, never a selectable production behavior.
+                            asupersync::time::budget_sleep(
+                                &cx,
+                                Duration::from_millis(20),
+                                driver.now(),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                        }
+                        _ => unreachable!("fixed test cases"),
+                    };
+                    let _ = done_tx.send((result, started.elapsed()));
+                }
+                let _ = driver.cancel(&later);
+            });
+            long_poll_rx.recv_timeout(Duration::from_secs(3)).expect(
+                "reactor must select the existing long deadline before short-timer publication",
+            );
+            release_tx.send(()).expect("release short-timer publisher");
+            let completed = done_rx.recv_timeout(Duration::from_secs(1));
+            // Explicitly wake the real reactor to drain the negative control;
+            // neither teardown nor a five-second timer is the test watchdog.
+            reactor.wake().expect("wake reactor for bounded cleanup");
+            if completed.is_err() {
+                let (result, _) = done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("forced reactor wake must drain the pending timer");
+                assert!(result.is_ok());
+            }
+            drop(task);
+            drop(runtime);
+            if mode != "raw" {
+                let (result, elapsed) = completed.unwrap_or_else(|error| {
+                    panic!("{mode}: short timer must interrupt the long reactor wait: {error}")
+                });
+                assert!(result.is_ok(), "budget sleep failed: {result:?}");
+                assert!(elapsed >= Duration::from_millis(20));
+                assert!(elapsed < Duration::from_secs(1));
+            } else {
+                assert!(
+                    matches!(completed, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                    "unnotified timer must expose the parked-leader regression"
+                );
+            }
+        }
     }
 
     #[test]
@@ -13963,6 +14369,8 @@ mod tests {
         // Clean up the spawned process
         if let Ok(mut c) = child {
             let _ = c.kill();
+            c.wait()
+                .expect("spawned cat must be reaped after termination");
         }
     }
 
@@ -14145,7 +14553,7 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
             assert!(
                 process::CommandTimedOut::from_io_error(&error).is_some(),
-                "deadline failure must retain its typed content-free receipt"
+                "deadline failure must retain its typed content-free receipt; actual error: {error:?}; display: {error}; elapsed: {elapsed:?}"
             );
             assert!(
                 elapsed < Duration::from_secs(2),
@@ -14913,13 +15321,19 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let mut set = task::JoinSet::new();
-            let (completed_tx, completed_rx) = oneshot::channel();
-            set.spawn(async move {
-                let _ = completed_tx.send(());
-                7_u32
-            });
-            await_test_signal(completed_rx, "completed JoinSet child").await;
-            task::yield_now().await;
+            let handle = task::spawn(async { 7_u32 });
+            // A signal sent inside the child precedes terminal publication.
+            // Observe the handle's actual terminal state before testing the
+            // synchronous fallback; a single scheduler yield is not a fence.
+            let started = std::time::Instant::now();
+            while !handle.is_finished() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "JoinSet child must publish terminal completion within the test bound"
+                );
+                sleep(Duration::from_millis(1)).await;
+            }
+            set.insert_handle(handle);
             set.force_join_registration_failure_for_test();
 
             assert_eq!(

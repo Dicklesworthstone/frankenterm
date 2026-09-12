@@ -1,11 +1,11 @@
-//! Tokio-facing bridge for `frankensearch::TwoTierSearcher`.
+//! Runtime-facing bridge for `frankensearch::TwoTierSearcher`.
 //!
 //! This module exposes an async API that can be called from FrankenTerm's
 //! runtime surface while preserving frankensearch's progressive phase callbacks
 //! and capability-context cancellation semantics.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -92,6 +92,55 @@ impl SearchBridgeRequest {
 struct CancellationState {
     cancelled: AtomicBool,
     notify: Notify,
+    registrations: Mutex<Vec<Weak<SearchCancellationRegistration>>>,
+    #[cfg(test)]
+    deadline_signals: Mutex<Vec<Weak<SearchTimeoutSignal>>>,
+}
+
+#[derive(Debug)]
+struct SearchCancellationRegistration {
+    cx: Mutex<Option<Cx>>,
+}
+
+impl SearchCancellationRegistration {
+    fn cancel(&self) {
+        let cx = self
+            .cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Claim exactly once, then publish without any bridge lock held:
+        // cancellation may synchronously invoke an arbitrary registered waker.
+        if let Some(cx) = cx {
+            cx.set_cancel_requested(true);
+        }
+    }
+}
+
+/// Owns the token-to-search link. Drop revokes unclaimed cancellation; an
+/// already-claimed cancellation can finish publishing its wake without
+/// retaining a search future or phase callback, or blocking Drop on that wake.
+struct SearchCancellationGuard {
+    token: BridgeCancellationToken,
+    registration: Arc<SearchCancellationRegistration>,
+}
+
+impl Drop for SearchCancellationGuard {
+    fn drop(&mut self) {
+        let cx = self
+            .registration
+            .cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(cx);
+        self.token
+            .state
+            .registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| !entry.ptr_eq(&Arc::downgrade(&self.registration)));
+    }
 }
 
 /// Bridge-local cancellation token.
@@ -110,7 +159,43 @@ impl BridgeCancellationToken {
     /// Request cancellation.
     pub fn cancel(&self) {
         if !self.state.cancelled.swap(true, Ordering::AcqRel) {
+            let registrations: Vec<_> = self
+                .state
+                .registrations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for registration in registrations {
+                registration.cancel();
+            }
             self.state.notify.notify_waiters();
+        }
+    }
+
+    fn register_search(&self, cx: Cx) -> SearchCancellationGuard {
+        let registration = Arc::new(SearchCancellationRegistration {
+            cx: Mutex::new(Some(cx)),
+        });
+        let mut registrations = self
+            .state
+            .registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The predicate and insertion share cancel's registry lock: a cancel
+        // before registration is sticky, and a later one sees this entry.
+        let cancelled = self.is_cancelled();
+        if !cancelled {
+            registrations.push(Arc::downgrade(&registration));
+        }
+        drop(registrations);
+        if cancelled {
+            registration.cancel();
+        }
+        SearchCancellationGuard {
+            token: self.clone(),
+            registration,
         }
     }
 
@@ -172,23 +257,12 @@ impl BridgeCancellationToken {
             return BridgeWaitOutcome::CxCancelled;
         }
 
-        // Race the bridge-notify wait against cx-aware polling.
-        // The cx-aware yield branch polls the cx at tick boundaries
-        // so a cancelled cx wakes this future without depending on
-        // the bridge's own notify path.
+        // Both branches register wakes; neither busy-polls nor spawns work.
         let bridge_cancelled = self.cancelled_after_initial_check(|| {});
-        let cx_wait = async {
-            loop {
-                if cx.checkpoint().is_err() {
-                    return;
-                }
-                asupersync::runtime::yield_now().await;
-            }
-        };
 
         crate::runtime_async::select! {
             () = bridge_cancelled => BridgeWaitOutcome::BridgeCancelled,
-            () = cx_wait => BridgeWaitOutcome::CxCancelled,
+            _ = crate::runtime_async::wait_for_cancellation(cx) => BridgeWaitOutcome::CxCancelled,
         }
     }
 }
@@ -306,7 +380,7 @@ impl SearchBridgeRequest {
     }
 }
 
-/// Tokio-facing bridge wrapper around `TwoTierSearcher`.
+/// Runtime-facing bridge wrapper around `TwoTierSearcher`.
 #[derive(Clone)]
 pub struct SearchBridge {
     searcher: Arc<TwoTierSearcher>,
@@ -343,8 +417,9 @@ impl SearchBridge {
 
     /// Run a search using an internally managed capability context.
     ///
-    /// This creates a per-request `Cx::for_request()` capability context and
-    /// forwards progressive phases to `on_phase`.
+    /// This creates a per-request context. When called within a runtime task,
+    /// caller cancellation propagates into the search, while request timeout
+    /// and token cancellation leave the surrounding task's context intact.
     pub async fn search(
         &self,
         request: SearchBridgeRequest,
@@ -354,14 +429,15 @@ impl SearchBridge {
         self.search_with_cx(cx, request, on_phase).await
     }
 
-    /// Run a search with a caller-provided capability context.
+    /// Run a search governed by a caller-provided capability context.
+    /// Request cancellation is isolated from the caller's surrounding scope.
     pub async fn search_with_cx(
         &self,
         cx: Cx,
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        self.search_direct(cx, request, on_phase).await
+        self.search_with_asupersync_cx(&cx, request, on_phase).await
     }
 
     /// Run a search against a caller-provided asupersync capability context
@@ -370,28 +446,23 @@ impl SearchBridge {
     /// The caller's `asupersync::Cx` governs cooperative cancellation for
     /// the outer bridge: if the Cx is already cancelled on entry this
     /// method short-circuits with `SearchBridgeError::Cancelled` without
-    /// invoking the underlying `TwoTierSearcher`. While the search runs,
-    /// a background watcher propagates asupersync Cx cancellation into
-    /// the bridge's [`BridgeCancellationToken`], which in turn drives the
-    /// frankensearch-side cooperative cancel via the existing
-    /// `spawn_cancellation_thread` machinery.
+    /// invoking the underlying `TwoTierSearcher`. The search and the caller's
+    /// cancellation wait are owned by this future; dropping it drops both.
     ///
-    /// The frankensearch side still runs under a fresh `frankensearch::Cx`
-    /// because frankensearch's cooperative-cancel API is defined against
-    /// its own Cx type; the bridge token is the single source of truth
-    /// that ties the two together.
+    /// Both surfaces use the same Cx type. A fresh search context preserves
+    /// caller isolation: a request timeout or bridge token must not cancel
+    /// the caller's surrounding scope.
     pub async fn search_with_asupersync_cx(
         &self,
         cx: &crate::cx::Cx,
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        // Short-circuit: pre-cancelled asupersync Cx must not open a new
-        // searcher call at all — matches the existing contract used by
-        // pool.rs::acquire_with_cx and caut.rs::run_with_cx.
-        if cx.is_cancel_requested() {
+        // Check before the select: an immediately-ready search could otherwise
+        // win before its cancellation branch checks an already-expired budget.
+        if cx.checkpoint().is_err() {
             return Err(SearchBridgeError::Cancelled {
-                reason: "capability context already cancelled".to_owned(),
+                reason: "capability context cancelled or exhausted".to_owned(),
             });
         }
 
@@ -402,27 +473,43 @@ impl SearchBridge {
         let bridge_token = request.cancellation.clone().unwrap_or_default();
         request.cancellation = Some(bridge_token.clone());
 
-        let (watcher_done, watcher_handle) =
-            spawn_asupersync_cancellation_watcher(cx.clone(), bridge_token.clone());
-
-        // `Cx` inside this file is re-exported from frankensearch, which
-        // in turn re-exports asupersync::Cx — so this is literally the
-        // same type family as the caller's `&crate::cx::Cx`. We still
-        // mint a fresh owned Cx here because the existing
-        // `search_with_cx` takes ownership; the caller's Cx is watched
-        // for cancellation via `spawn_asupersync_cancellation_watcher`
-        // above.
+        // Although both APIs use the same Cx type, a clone would share cancel
+        // state and allow a request timeout to cancel the caller's scope.
+        // Preserve the one-way link by owning a fresh search context.
         let search_cx = Cx::for_request();
-        let result = self.search_with_cx(search_cx, request, on_phase).await;
-
-        // Stop the asupersync-Cx watcher thread before returning so we do
-        // not leak it past the call.
-        watcher_done.store(true, Ordering::Release);
-        if let Some(handle) = watcher_handle {
-            let _ = handle.await;
+        let phase_cx = cx.clone();
+        let phase_token = bridge_token.clone();
+        let mut on_phase = on_phase;
+        let forward_phase = move |phase| {
+            // A synchronous provider can occupy the search poll while the
+            // caller is cancelled. Observe caller authority at publication,
+            // rather than waiting for the outer select to regain control.
+            // Cancellation racing an already-started callback remains
+            // cooperative; this check is the publication boundary.
+            if phase_cx.checkpoint().is_err() {
+                phase_token.cancel();
+                return;
+            }
+            on_phase(phase);
+        };
+        crate::runtime_async::select! {
+            result = self.search_direct(search_cx, request, forward_phase) => {
+                if cx.checkpoint().is_err() {
+                    bridge_token.cancel();
+                    Err(SearchBridgeError::Cancelled {
+                        reason: "capability context cancelled or exhausted".to_owned(),
+                    })
+                } else {
+                    result
+                }
+            },
+            _ = crate::runtime_async::wait_for_cancellation(cx) => {
+                bridge_token.cancel();
+                Err(SearchBridgeError::Cancelled {
+                    reason: "capability context cancelled".to_owned(),
+                })
+            },
         }
-
-        result
     }
 
     async fn search_direct(
@@ -433,9 +520,8 @@ impl SearchBridge {
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
         // br-ft-qfklb: pre-flight request validation before any side
         // effect. Catches limit=0/usize::MAX and timeout=ZERO/MAX
-        // misconfigurations at the boundary, returning a structured
-        // ValidationError before reaching the timeout-thread spawn,
-        // cancellation-thread spawn, or the underlying searcher.
+        // misconfigurations before deadline creation, cancellation registration,
+        // or the underlying searcher.
         request.validate()?;
 
         let SearchBridgeRequest {
@@ -446,11 +532,15 @@ impl SearchBridge {
             text_provider,
         } = request;
 
+        // Link tokens with possible writers: the caller publication gate,
+        // explicit cancellation, or a deadline. No timeout needs no OS thread;
+        // the searcher observes linked cancellation through its private Cx.
+        let needs_cancellation_link = cancellation.is_some() || timeout.is_some();
         let cancellation = cancellation.unwrap_or_default();
-        if cx.is_cancel_requested() {
+        if cx.checkpoint().is_err() {
             cancellation.cancel();
             return Err(SearchBridgeError::Cancelled {
-                reason: "capability context already cancelled".to_owned(),
+                reason: "capability context cancelled or exhausted".to_owned(),
             });
         }
         if cancellation.is_cancelled() {
@@ -460,10 +550,9 @@ impl SearchBridge {
             });
         }
 
-        let (timeout_done, timeout_fired, timeout_thread) =
-            spawn_timeout_thread(timeout, cancellation.clone());
-        let (cancel_done, cancel_thread) =
-            spawn_cancellation_thread(cx.clone(), cancellation.clone());
+        let timeout_guard = SearchTimeoutGuard::start(timeout, cancellation.clone())?;
+        let cancellation_link =
+            needs_cancellation_link.then(|| cancellation.register_search(cx.clone()));
 
         let mut best_results = Vec::new();
         let search_result = self
@@ -474,21 +563,30 @@ impl SearchBridge {
                 limit,
                 |doc_id| text_provider(doc_id),
                 |phase| {
+                    if cancellation.is_cancelled() || cx.is_cancel_requested() {
+                        return;
+                    }
                     update_best_results(&mut best_results, &phase);
                     on_phase(phase);
                 },
             )
             .await;
 
-        cancel_done.store(true, Ordering::Release);
-        if let Some(handle) = cancel_thread {
-            handle.thread().unpark();
-            let _ = handle.join();
+        // Stop callbacks before interpreting the result. Drop runs these same
+        // ownership boundaries if the search future is abandoned or unwinds.
+        timeout_guard.stop();
+        drop(cancellation_link);
+
+        if timeout_guard.fired() {
+            return Err(SearchBridgeError::Timeout {
+                timeout_ms: timeout.map_or(0, |value| value.as_millis() as u64),
+            });
         }
-        timeout_done.store(true, Ordering::Release);
-        if let Some(handle) = timeout_thread {
-            handle.thread().unpark();
-            let _ = handle.join();
+        if cancellation.is_cancelled() || cx.is_cancel_requested() {
+            cancellation.cancel();
+            return Err(SearchBridgeError::Cancelled {
+                reason: "search cancellation requested".to_owned(),
+            });
         }
 
         match search_result {
@@ -499,7 +597,7 @@ impl SearchBridge {
             Err(error) => Err(map_search_error(
                 error,
                 &cancellation,
-                timeout_fired.load(Ordering::Acquire),
+                timeout_guard.fired(),
                 timeout,
             )),
         }
@@ -541,138 +639,150 @@ fn update_best_results(best_results: &mut Vec<ScoredResult>, phase: &SearchPhase
     }
 }
 
-const BRIDGE_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-fn spawn_cancellation_thread(
-    cx: Cx,
-    cancellation: BridgeCancellationToken,
-) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
-    let done = Arc::new(AtomicBool::new(false));
-    if cancellation.is_cancelled() {
-        cx.set_cancel_requested(true);
-        return (done, None);
-    }
-
-    let done_for_thread = Arc::clone(&done);
-    let cx_for_spawn_error = cx.clone();
-    let handle = match std::thread::Builder::new()
-        .name("ft-search-bridge-cancel".to_string())
-        .spawn(move || {
-            while !done_for_thread.load(Ordering::Acquire) {
-                if cancellation.is_cancelled() {
-                    cx.set_cancel_requested(true);
-                    break;
-                }
-                // Avoid busy-waiting: this loop is best-effort cancellation plumbing.
-                std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
-            }
-        }) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to spawn search bridge cancellation watcher");
-            cx_for_spawn_error.set_cancel_requested(true);
-            return (done, None);
-        }
-    };
-
-    (done, Some(handle))
+#[derive(Debug, Default)]
+struct SearchTimeoutState {
+    stopped: bool,
+    fired: bool,
+    settled: bool,
 }
 
-/// Propagate asupersync capability-context cancellation into a
-/// [`BridgeCancellationToken`] (ft-xbnl0.2.2 Cx-first plumbing).
-///
-/// Symmetrical companion to [`spawn_cancellation_thread`]: that helper
-/// drives the frankensearch-side Cx from the bridge token, while this
-/// helper drives the bridge token from the caller's asupersync Cx.
-/// Together they give `search_with_asupersync_cx` a single coherent
-/// cancellation signal chain: asupersync::Cx → BridgeCancellationToken →
-/// frankensearch::Cx.
-///
-/// The returned `done` flag is set to `true` by the caller once the
-/// search finishes so the watcher thread exits without doing any more
-/// polling. The watcher is also unparked when the flag is flipped to
-/// shorten the worst-case teardown latency.
-fn spawn_asupersync_cancellation_watcher(
-    cx: crate::cx::Cx,
+#[derive(Debug)]
+struct SearchTimeoutSignal {
+    state: Mutex<SearchTimeoutState>,
+    wake: Condvar,
+    started: Instant,
+    duration: Duration,
     cancellation: BridgeCancellationToken,
-) -> (
-    Arc<AtomicBool>,
-    Option<crate::runtime_async::task::JoinHandle<()>>,
-) {
-    let done = Arc::new(AtomicBool::new(false));
-    // If the asupersync Cx is already cancelled at entry, propagate once
-    // and skip the watcher thread entirely.
-    if cx.is_cancel_requested() {
-        cancellation.cancel();
-        return (done, None);
-    }
-    // If the bridge token is already cancelled, no further plumbing is
-    // required — the frankensearch-side machinery will observe it.
-    if cancellation.is_cancelled() {
-        return (done, None);
-    }
-
-    let done_for_task = Arc::clone(&done);
-    let handle = crate::runtime_async::task::spawn_with_cx(&cx, move |watcher_cx| async move {
-        while !done_for_task.load(Ordering::Acquire) {
-            if watcher_cx.is_cancel_requested() {
-                cancellation.cancel();
-                break;
-            }
-            if cancellation.is_cancelled() {
-                break;
-            }
-            let _ =
-                crate::runtime_async::sleep_with_cx(&watcher_cx, BRIDGE_WATCH_POLL_INTERVAL).await;
-        }
-    });
-
-    (done, Some(handle))
 }
 
-fn spawn_timeout_thread(
-    timeout: Option<Duration>,
-    cancellation: BridgeCancellationToken,
-) -> (
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-    Option<std::thread::JoinHandle<()>>,
-) {
-    let done = Arc::new(AtomicBool::new(false));
-    let fired = Arc::new(AtomicBool::new(false));
+/// A deadline must still run while a synchronous embedder/provider occupies a
+/// poll. Its thread owns only this small signal and token, never the search or
+/// callback. Drop revokes an unclaimed deadline and wakes it; it does not join
+/// an OS thread on the async executor. A deadline already claimed before drop
+/// may finish publishing cancellation, with no bridge locks held. Otherwise
+/// the detached thread needs only one wake to settle, regardless of deadline.
+struct SearchTimeoutGuard {
+    signal: Option<Arc<SearchTimeoutSignal>>,
+}
 
-    let Some(timeout_duration) = timeout else {
-        return (done, fired, None);
-    };
+impl SearchTimeoutGuard {
+    fn start(
+        timeout: Option<Duration>,
+        cancellation: BridgeCancellationToken,
+    ) -> Result<Self, SearchBridgeError> {
+        Self::start_with_spawn(timeout, cancellation, |work| {
+            std::thread::Builder::new()
+                .name("ft-search-bridge-timeout".to_owned())
+                .spawn(work)
+                .map(drop)
+        })
+    }
 
-    let done_for_thread = Arc::clone(&done);
-    let fired_for_thread = Arc::clone(&fired);
-    let cancellation_for_spawn_error = cancellation.clone();
-    let handle = match std::thread::Builder::new()
-        .name("ft-search-bridge-timeout".to_string())
-        .spawn(move || {
-            let started_at = Instant::now();
-            while !done_for_thread.load(Ordering::Acquire) {
-                let elapsed = started_at.elapsed();
-                if elapsed >= timeout_duration {
-                    fired_for_thread.store(true, Ordering::Release);
-                    cancellation.cancel();
+    fn start_with_spawn(
+        timeout: Option<Duration>,
+        cancellation: BridgeCancellationToken,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> Result<Self, SearchBridgeError> {
+        let Some(duration) = timeout else {
+            return Ok(Self { signal: None });
+        };
+        let signal = Arc::new(SearchTimeoutSignal {
+            state: Mutex::new(SearchTimeoutState::default()),
+            wake: Condvar::new(),
+            started: Instant::now(),
+            duration,
+            cancellation,
+        });
+        let thread_signal = Arc::clone(&signal);
+        spawn(Box::new(move || {
+            let mut state = thread_signal
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !state.stopped {
+                let remaining = thread_signal
+                    .duration
+                    .saturating_sub(thread_signal.started.elapsed());
+                if remaining.is_zero() {
+                    state.fired = true;
+                    // Claim expiry under the lock, but never hold it while
+                    // waking tasks: a waker may drop this search reentrantly.
+                    drop(state);
+                    thread_signal.cancellation.cancel();
+                    state = thread_signal
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     break;
                 }
-                let remaining = timeout_duration.saturating_sub(elapsed);
-                std::thread::park_timeout(remaining.min(BRIDGE_WATCH_POLL_INTERVAL));
+                (state, _) = thread_signal
+                    .wake
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-        }) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to spawn search bridge timeout watcher");
-            fired.store(true, Ordering::Release);
-            cancellation_for_spawn_error.cancel();
-            return (done, fired, None);
-        }
-    };
+            state.settled = true;
+            thread_signal.wake.notify_all();
+        }))
+        .map_err(|error| {
+            tracing::warn!(kind = ?error.kind(), "Search deadline worker admission failed");
+            SearchBridgeError::Runtime {
+                message: "deadline worker admission failed".to_owned(),
+            }
+        })?;
+        #[cfg(test)]
+        signal
+            .cancellation
+            .state
+            .deadline_signals
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&signal));
+        Ok(Self {
+            signal: Some(signal),
+        })
+    }
 
-    (done, fired, Some(handle))
+    fn stop(&self) {
+        self.stop_at(Instant::now());
+    }
+
+    fn stop_at(&self, now: Instant) {
+        if let Some(signal) = &self.signal {
+            let mut state = signal
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Completion checks the actual clock as well as the worker's
+            // receipt: an unscheduled deadline thread cannot authorize a late
+            // success. Stop-before-expiry remains final on repeated calls.
+            let claim_expiry = !state.stopped
+                && !state.fired
+                && now.saturating_duration_since(signal.started) >= signal.duration;
+            state.fired |= claim_expiry;
+            state.stopped = true;
+            drop(state);
+            signal.wake.notify_all();
+            if claim_expiry {
+                signal.cancellation.cancel();
+            }
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.signal.as_ref().is_some_and(|signal| {
+            signal
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fired
+        })
+    }
+}
+
+impl Drop for SearchTimeoutGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +855,12 @@ mod tests {
     }
 
     fn build_test_bridge() -> (SearchBridge, TextProvider) {
+        build_test_bridge_with_embedder(None)
+    }
+
+    fn build_test_bridge_with_embedder(
+        search_embedder: Option<Arc<dyn Embedder>>,
+    ) -> (SearchBridge, TextProvider) {
         let now_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -800,8 +916,12 @@ mod tests {
         let index = Arc::new(
             TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open built test index"),
         );
-        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
-            .with_quality_embedder(quality);
+        let searcher = TwoTierSearcher::new(
+            index,
+            search_embedder.unwrap_or(fast),
+            TwoTierConfig::default(),
+        )
+        .with_quality_embedder(quality);
 
         let text_map: Arc<HashMap<String, String>> = Arc::new(documents.into_iter().collect());
         let text_provider: TextProvider = Arc::new(move |doc_id| text_map.get(doc_id).cloned());
@@ -911,6 +1031,51 @@ mod tests {
             token.cancelled_after_initial_check(|| token.cancel()).await;
         });
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_wait_registers_wakes_without_self_polling() {
+        use std::future::Future;
+
+        struct WakeCount(AtomicU64);
+        impl std::task::Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for cancel_bridge in [false, true] {
+            let token = BridgeCancellationToken::new();
+            let cx = Cx::for_testing();
+            let notifications = Arc::new(WakeCount(AtomicU64::new(0)));
+            let waker = std::task::Waker::from(Arc::clone(&notifications));
+            let mut task_cx = std::task::Context::from_waker(&waker);
+            let mut waiter = Box::pin(token.cancelled_with_cx(&cx));
+            assert!(waiter.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(
+                notifications.0.load(Ordering::Relaxed),
+                0,
+                "no busy-loop wake"
+            );
+            if cancel_bridge {
+                token.cancel();
+            } else {
+                cx.set_cancel_requested(true);
+            }
+            assert!(notifications.0.load(Ordering::Relaxed) > 0);
+            assert_eq!(
+                waiter.as_mut().poll(&mut task_cx),
+                Poll::Ready(if cancel_bridge {
+                    BridgeWaitOutcome::BridgeCancelled
+                } else {
+                    BridgeWaitOutcome::CxCancelled
+                })
+            );
+        }
     }
 
     #[test]
@@ -1321,78 +1486,333 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // spawn_cancellation_thread unit tests
+    // Cancellation registration ownership
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_spawn_cancellation_thread_pre_cancelled() {
+    fn search_registration_observes_cancellation_before_registration() {
         let cx = Cx::for_testing();
         let token = BridgeCancellationToken::new();
         token.cancel();
 
-        let (done, handle) = spawn_cancellation_thread(cx.clone(), token);
-        // When pre-cancelled, no thread is spawned
-        assert!(handle.is_none());
-        // The cx should have cancel requested set
+        let _registration = token.register_search(cx.clone());
         assert!(cx.is_cancel_requested());
-        // done flag should still be false (no thread ran)
-        assert!(!done.load(Ordering::Acquire));
     }
 
     #[test]
-    fn test_spawn_cancellation_thread_polls_and_stops() {
+    fn search_registration_observes_cancel_and_revokes_dropped_links() {
         let cx = Cx::for_testing();
+        let dropped_cx = Cx::for_testing();
         let token = BridgeCancellationToken::new();
 
-        let (done, handle) = spawn_cancellation_thread(cx.clone(), token);
-        assert!(handle.is_some());
-        // Signal done so thread exits cleanly
-        done.store(true, Ordering::Release);
-        handle.unwrap().join().expect("thread should join");
-        // cx should NOT have cancel_requested since we didn't cancel the token
-        assert!(!cx.is_cancel_requested());
+        let registration = token.register_search(cx.clone());
+        let dropped_registration = token.register_search(dropped_cx.clone());
+        drop(dropped_registration);
+        token.cancel();
+        assert!(cx.is_cancel_requested());
+        assert!(!dropped_cx.is_cancel_requested());
+        drop(registration);
+        assert!(token.state.registrations.lock().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------
-    // spawn_timeout_thread unit tests
+    // Deadline ownership
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_spawn_timeout_thread_none_timeout() {
+    fn search_timeout_without_deadline_creates_no_signal() {
         let token = BridgeCancellationToken::new();
-        let (done, fired, handle) = spawn_timeout_thread(None, token.clone());
-        assert!(handle.is_none());
-        assert!(!fired.load(Ordering::Acquire));
-        assert!(!done.load(Ordering::Acquire));
+        let guard = SearchTimeoutGuard::start(None, token.clone()).unwrap();
+        assert!(guard.signal.is_none());
+        assert!(!guard.fired());
         assert!(!token.is_cancelled());
     }
 
     #[test]
-    fn test_spawn_timeout_thread_fires_on_expiry() {
+    fn deadline_admission_failure_is_runtime_error_without_cancellation() {
         let token = BridgeCancellationToken::new();
-        let (done, fired, handle) =
-            spawn_timeout_thread(Some(Duration::from_millis(20)), token.clone());
-        assert!(handle.is_some());
-        // Wait for timeout to fire
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(fired.load(Ordering::Acquire));
+        let error = SearchTimeoutGuard::start_with_spawn(
+            Some(Duration::from_secs(60)),
+            token.clone(),
+            |_| Err(std::io::ErrorKind::WouldBlock.into()),
+        )
+        .err()
+        .expect("refused thread admission must fail");
+        assert!(matches!(
+            error,
+            SearchBridgeError::Runtime { message }
+                if message == "deadline worker admission failed"
+        ));
+        assert!(!token.is_cancelled());
+        assert!(token.state.deadline_signals.lock().unwrap().is_empty());
+        SearchTimeoutGuard::start_with_spawn(None, token, |_| {
+            panic!("ordinary search must not attempt worker admission")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn completion_checks_deadline_before_an_unscheduled_worker_runs() {
+        for expired in [false, true] {
+            let token = BridgeCancellationToken::new();
+            let mut pending_work = None;
+            let guard = SearchTimeoutGuard::start_with_spawn(
+                Some(Duration::from_secs(60)),
+                token.clone(),
+                |work| {
+                    pending_work = Some(work);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let signal = Arc::clone(guard.signal.as_ref().unwrap());
+            let deadline = signal.started + signal.duration;
+            guard.stop_at(if expired { deadline } else { signal.started });
+            assert_eq!(guard.fired(), expired);
+            assert_eq!(token.is_cancelled(), expired);
+            // Repeated stop/drop cannot retroactively expire a search that
+            // completed on time, nor unclaim an expired deadline.
+            guard.stop_at(deadline + Duration::from_nanos(1));
+            assert_eq!(guard.fired(), expired);
+            pending_work.take().expect("worker was admitted")();
+            assert!(signal.state.lock().unwrap().settled);
+            assert_eq!(token.is_cancelled(), expired);
+        }
+    }
+
+    fn assert_deadline_thread_settled(signal: &SearchTimeoutSignal) {
+        let state = signal.state.lock().unwrap();
+        let (state, _) = signal
+            .wake
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.settled)
+            .unwrap();
+        assert!(state.settled, "deadline thread must acknowledge shutdown");
+    }
+
+    #[test]
+    fn search_timeout_fires_on_expiry() {
+        let token = BridgeCancellationToken::new();
+        let guard =
+            SearchTimeoutGuard::start(Some(Duration::from_millis(20)), token.clone()).unwrap();
+        assert_deadline_thread_settled(guard.signal.as_ref().unwrap());
+        assert!(guard.fired());
         assert!(token.is_cancelled());
-        // Clean up
-        done.store(true, Ordering::Release);
-        handle.unwrap().join().expect("thread should join");
     }
 
     #[test]
-    fn test_spawn_timeout_thread_does_not_fire_if_done_early() {
+    fn search_timeout_drop_wakes_long_deadline_without_cancelling_token() {
         let token = BridgeCancellationToken::new();
-        let (done, fired, handle) =
-            spawn_timeout_thread(Some(Duration::from_secs(60)), token.clone());
-        assert!(handle.is_some());
-        // Signal done immediately, before timeout
-        done.store(true, Ordering::Release);
-        handle.unwrap().join().expect("thread should join");
-        assert!(!fired.load(Ordering::Acquire));
+        let guard =
+            SearchTimeoutGuard::start(Some(Duration::from_secs(60)), token.clone()).unwrap();
+        let signal = Arc::clone(guard.signal.as_ref().unwrap());
+        drop(guard);
+        assert_deadline_thread_settled(&signal);
+        let state = signal.state.lock().unwrap();
+        assert!(state.stopped);
+        assert!(!state.fired);
         assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_wakers_can_drop_search_owners_reentrantly() {
+        use std::future::Future;
+
+        struct DropOwnersOnWake {
+            owners: Mutex<Option<(SearchCancellationGuard, SearchTimeoutGuard)>>,
+            called: AtomicBool,
+        }
+
+        impl DropOwnersOnWake {
+            fn release(&self) {
+                let owners = self.owners.lock().unwrap().take();
+                drop(owners);
+                self.called.store(true, Ordering::Release);
+            }
+        }
+
+        impl std::task::Wake for DropOwnersOnWake {
+            fn wake(self: Arc<Self>) {
+                self.release();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.release();
+            }
+        }
+
+        for deadline_fires in [false, true] {
+            let token = BridgeCancellationToken::new();
+            let cx = Cx::for_testing();
+            let registration = token.register_search(cx.clone());
+            let owner = Arc::new(DropOwnersOnWake {
+                owners: Mutex::new(None),
+                called: AtomicBool::new(false),
+            });
+            let waker = std::task::Waker::from(Arc::clone(&owner));
+            let mut task_cx = std::task::Context::from_waker(&waker);
+            let mut cancellation = Box::pin(crate::runtime_async::wait_for_cancellation(&cx));
+            assert!(cancellation.as_mut().poll(&mut task_cx).is_pending());
+
+            // Hold the receiver lock while arming: even an immediately-fired
+            // timer's waker must observe the installed owners before dropping.
+            let mut owners = owner.owners.lock().unwrap();
+            let duration = if deadline_fires {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(60)
+            };
+            let deadline = SearchTimeoutGuard::start(Some(duration), token.clone()).unwrap();
+            let signal = Arc::clone(deadline.signal.as_ref().unwrap());
+            *owners = Some((registration, deadline));
+            drop(owners);
+
+            if deadline_fires {
+                assert_deadline_thread_settled(&signal);
+                assert!(signal.state.lock().unwrap().fired);
+            } else {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let publisher = std::thread::spawn(move || {
+                    token.cancel();
+                    done_tx.send(()).unwrap();
+                });
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("reentrant cancellation must not deadlock");
+                publisher.join().unwrap();
+            }
+            assert!(owner.called.load(Ordering::Acquire));
+            assert!(owner.owners.lock().unwrap().is_none());
+            assert_deadline_thread_settled(&signal);
+            assert!(cancellation.as_mut().poll(&mut task_cx).is_ready());
+        }
+    }
+
+    struct PendingSearchEmbedder {
+        inner: HashEmbedder,
+        entered: Arc<Mutex<Option<Cx>>>,
+        dropped: Arc<AtomicBool>,
+        token: BridgeCancellationToken,
+        deadline: Arc<Mutex<Option<Arc<SearchTimeoutSignal>>>>,
+        panic_on_poll: bool,
+    }
+
+    impl Embedder for PendingSearchEmbedder {
+        fn embed<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _text: &'a str,
+        ) -> frankensearch::SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                struct DropReceipt(Arc<AtomicBool>);
+                impl Drop for DropReceipt {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Release);
+                    }
+                }
+                let _receipt = DropReceipt(Arc::clone(&self.dropped));
+                *self.entered.lock().unwrap() = Some(cx.clone());
+                *self.deadline.lock().unwrap() =
+                    self.token.state.deadline_signals.lock().unwrap()[0].upgrade();
+                assert!(!self.panic_on_poll, "injected pending-search panic");
+                std::future::pending().await
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+
+        fn category(&self) -> frankensearch::ModelCategory {
+            // Select frankensearch's genuinely async await path. Hash-category
+            // embedders are deliberately polled once on rayon and reject Pending.
+            frankensearch::ModelCategory::ApiEmbedder
+        }
+    }
+
+    #[test]
+    fn dropped_and_panicking_search_futures_revoke_all_cancellation_owners() {
+        use std::future::Future;
+
+        for entrypoint in 0..3 {
+            for panic_on_poll in [false, true] {
+                let entered = Arc::new(Mutex::new(None));
+                let dropped = Arc::new(AtomicBool::new(false));
+                let token = BridgeCancellationToken::new();
+                let deadline = Arc::new(Mutex::new(None));
+                let embedder = Arc::new(PendingSearchEmbedder {
+                    inner: HashEmbedder::default_256(),
+                    entered: Arc::clone(&entered),
+                    dropped: Arc::clone(&dropped),
+                    token: token.clone(),
+                    deadline: Arc::clone(&deadline),
+                    panic_on_poll,
+                });
+                let (bridge, _) = build_test_bridge_with_embedder(Some(embedder));
+                let caller_cx = Cx::for_testing();
+                let request = SearchBridgeRequest::new("rust ownership", 5)
+                    .with_cancellation(token.clone())
+                    .with_timeout(Duration::from_secs(60));
+                let phases = Arc::new(AtomicU64::new(0));
+                let phase_receipt = Arc::clone(&phases);
+                let callback = move |_| {
+                    phase_receipt.fetch_add(1, Ordering::Relaxed);
+                };
+                let mut search = Box::pin(async {
+                    match entrypoint {
+                        0 => bridge.search(request, callback).await,
+                        1 => {
+                            bridge
+                                .search_with_cx(caller_cx.clone(), request, callback)
+                                .await
+                        }
+                        _ => {
+                            bridge
+                                .search_with_asupersync_cx(&caller_cx, request, callback)
+                                .await
+                        }
+                    }
+                });
+                let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    search.as_mut().poll(&mut task_cx)
+                }));
+                if panic_on_poll {
+                    assert!(polled.is_err(), "the injected embedder must run");
+                } else {
+                    assert!(polled.unwrap().is_pending(), "search must actually suspend");
+                }
+                let search_cx = entered.lock().unwrap().clone().expect("embedder entered");
+                let signal = deadline.lock().unwrap().clone().expect("deadline observed");
+                drop(search);
+                assert!(
+                    dropped.load(Ordering::Acquire),
+                    "pending embedder was dropped"
+                );
+                assert!(token.state.registrations.lock().unwrap().is_empty());
+                assert_deadline_thread_settled(&signal);
+                assert!(!signal.state.lock().unwrap().fired);
+                assert!(!token.is_cancelled());
+                token.cancel();
+                assert!(
+                    !search_cx.is_cancel_requested(),
+                    "dropped search link was revoked"
+                );
+                assert!(!caller_cx.is_cancel_requested());
+                assert_eq!(phases.load(Ordering::Relaxed), 0);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1494,43 +1914,160 @@ mod tests {
 
         let result = run_async(bridge.search_with_cx(cx, request, |_| {}));
         assert!(matches!(result, Err(SearchBridgeError::Cancelled { .. })));
-        assert!(token.is_cancelled());
+        assert!(
+            !token.is_cancelled(),
+            "pre-cancelled caller is rejected before linking the request token"
+        );
 
         log_test_event("test_bridge_cancellation_reverse", "done", started_at, "ok");
+    }
+
+    #[test]
+    fn expired_caller_budgets_fail_before_search_or_deadline_admission() {
+        let (bridge, _) = build_test_bridge();
+        for budget in [
+            crate::cx::Budget::new().with_poll_quota(0),
+            crate::cx::Budget::new().with_deadline(asupersync::types::Time::ZERO),
+        ] {
+            let cx = Cx::for_testing_with_budget(budget);
+            assert!(!cx.is_cancel_requested(), "budget has not been checked yet");
+            let token = BridgeCancellationToken::new();
+            let calls = Arc::new(AtomicU64::new(0));
+            let provider_calls = Arc::clone(&calls);
+            let phase_calls = Arc::clone(&calls);
+            let request = SearchBridgeRequest::new("rust -missing", 5)
+                .with_timeout(Duration::from_secs(60))
+                .with_cancellation(token.clone())
+                .with_text_provider(move |_| {
+                    provider_calls.fetch_add(1, Ordering::Relaxed);
+                    None
+                });
+            let result = run_async(bridge.search_with_asupersync_cx(&cx, request, move |_| {
+                phase_calls.fetch_add(1, Ordering::Relaxed);
+            }));
+            assert!(matches!(result, Err(SearchBridgeError::Cancelled { .. })));
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert!(token.state.registrations.lock().unwrap().is_empty());
+            assert!(token.state.deadline_signals.lock().unwrap().is_empty());
+            assert!(
+                !token.is_cancelled(),
+                "rejected caller never linked the token"
+            );
+        }
     }
 
     #[test]
     fn test_bridge_timeout() {
         let started_at = Instant::now();
         let (bridge, text_provider) = build_test_bridge();
+        let token = BridgeCancellationToken::new();
+        let provider_token = token.clone();
         let slow_provider: TextProvider = Arc::new(move |doc_id| {
-            std::thread::sleep(Duration::from_millis(200));
+            // A synchronous provider occupies the search poll until the real
+            // deadline fires. Async-only timeout plumbing cannot pass this.
+            let signal = provider_token.state.deadline_signals.lock().unwrap()[0]
+                .upgrade()
+                .expect("active deadline");
+            assert_deadline_thread_settled(&signal);
             text_provider(doc_id)
         });
 
         // Use a negation term so frankensearch invokes text_provider for each
-        // result (exclusion filtering).  Each call sleeps 200 ms, making the
-        // overall search far exceed the 100 ms budget and causing a timeout.
+        // result (exclusion filtering), holding the poll across the deadline.
         let request = SearchBridgeRequest::new("vector retrieval -nonexistent", 6)
             .with_text_provider_arc(slow_provider)
+            .with_cancellation(token)
             .with_timeout(Duration::from_millis(100));
 
         let result = run_async(bridge.search(request, |_| {}));
-        // The slow text provider is invoked during the quality refinement phase.
-        // Depending on runtime timing:
-        // - Timeout fires -> Err(Timeout)
-        // - Cancellation propagates -> Err(Cancelled)
-        // - Search completes before timeout -> Ok(results)
-        // All outcomes are acceptable; the key invariant is no panic and no hang.
-        match &result {
-            Ok(_) => {} // Search finished before timeout — acceptable
-            Err(SearchBridgeError::Timeout { .. }) => {}
-            Err(SearchBridgeError::Cancelled { .. }) => {}
-            Err(SearchBridgeError::Search(_)) => {}
-            Err(other) => panic!("unexpected error variant: {other}"),
-        }
+        assert!(
+            matches!(result, Err(SearchBridgeError::Timeout { timeout_ms: 100 })),
+            "deadline must win over late provider completion: {result:?}"
+        );
 
         log_test_event("test_bridge_timeout", "done", started_at, "ok");
+    }
+
+    #[test]
+    fn ambient_search_timeout_and_token_cancellation_preserve_native_task_context() {
+        let (bridge, text_provider) = build_test_bridge();
+        for cancel_token in [false, true] {
+            let bridge = bridge.clone();
+            let text_provider = Arc::clone(&text_provider);
+            run_async(async move {
+                let task = crate::runtime_async::task::spawn(async move {
+                    let caller = Cx::current().expect("native task installs current Cx");
+                    caller.checkpoint().expect("caller starts live");
+                    let token = BridgeCancellationToken::new();
+                    if cancel_token {
+                        token.cancel();
+                    }
+                    let provider_token = token.clone();
+                    let request = SearchBridgeRequest::new("vector retrieval -nonexistent", 6)
+                        .with_cancellation(token)
+                        .with_timeout(Duration::from_millis(100))
+                        .with_text_provider(move |doc_id| {
+                            let signal = provider_token.state.deadline_signals.lock().unwrap()[0]
+                                .upgrade()
+                                .expect("active request deadline");
+                            assert_deadline_thread_settled(&signal);
+                            text_provider(doc_id)
+                        });
+                    let result = bridge.search(request, |_| {}).await;
+                    if cancel_token {
+                        assert!(matches!(result, Err(SearchBridgeError::Cancelled { .. })));
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(SearchBridgeError::Timeout { timeout_ms: 100 })
+                        ));
+                    }
+                    assert!(
+                        !caller.is_cancel_requested(),
+                        "request must not cancel task"
+                    );
+                    caller.checkpoint().expect("surrounding task can continue");
+                    42
+                });
+                assert_eq!(task.await.expect("native task finishes normally"), 42);
+            });
+        }
+    }
+
+    #[test]
+    fn synchronous_provider_caller_cancellation_prevents_later_phase_publication() {
+        let (bridge, text_provider) = build_test_bridge();
+        for cancel_caller in [false, true] {
+            let caller = Cx::for_testing();
+            let provider_caller = caller.clone();
+            let text_provider = Arc::clone(&text_provider);
+            let entered = Arc::new(AtomicBool::new(false));
+            let provider_entered = Arc::clone(&entered);
+            let phases = Arc::new(AtomicU64::new(0));
+            let phase_count = Arc::clone(&phases);
+            let request = SearchBridgeRequest::new("vector retrieval -nonexistent", 6)
+                .with_text_provider(move |doc_id| {
+                    provider_entered.store(true, Ordering::Release);
+                    if cancel_caller {
+                        provider_caller.set_cancel_requested(true);
+                    }
+                    text_provider(doc_id)
+                });
+            let result = run_async(
+                bridge.search_with_asupersync_cx(&caller, request, move |_| {
+                    phase_count.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+            assert!(entered.load(Ordering::Acquire), "synchronous provider ran");
+            if cancel_caller {
+                assert!(matches!(result, Err(SearchBridgeError::Cancelled { .. })));
+                assert_eq!(phases.load(Ordering::Relaxed), 0);
+            } else {
+                assert!(result.is_ok(), "uncancelled control succeeds: {result:?}");
+                assert!(phases.load(Ordering::Relaxed) > 0);
+                assert!(!caller.is_cancel_requested());
+            }
+        }
     }
 
     #[test]
@@ -1657,13 +2194,9 @@ mod tests {
     // LabRuntime deterministic tests for the Cx-first entry point
     // (ft-xbnl0.2.2 / search_bridge slice)
     //
-    // These tests pin the pre-cancellation short-circuit and the
-    // cancellation-watcher plumbing added by
-    // `search_with_asupersync_cx` + `spawn_asupersync_cancellation_watcher`
-    // under deterministic scheduling. They deliberately don't run the
-    // underlying frankensearch searcher — that would require building a
-    // real TwoTierIndex inside LabRuntime which is orthogonal to the
-    // Cx-first cancellation contract this slice owns.
+    // These tests pin pre-cancellation and one-way caller authority under
+    // deterministic scheduling. Suspended real-search ownership is covered
+    // separately by the pending embedder control above.
     // -------------------------------------------------------------------------
 
     mod labruntime_search_bridge {
@@ -1730,39 +2263,37 @@ mod tests {
             });
         }
 
-        /// 2. `spawn_asupersync_cancellation_watcher` propagates an
-        ///    already-cancelled asupersync Cx into the bridge token
-        ///    without ever spawning a watcher thread — the short path.
         #[test]
-        fn watcher_propagates_precancelled_cx_under_labruntime() {
+        fn wait_observes_precancelled_cx_without_mutating_token_under_labruntime() {
             run_lab(4002, || async move {
                 let cx = cancelled_request_cx("pre-cancel watcher");
                 let token = BridgeCancellationToken::new();
                 assert!(!token.is_cancelled());
-                let (done, handle) = spawn_asupersync_cancellation_watcher(cx, token.clone());
-                assert!(token.is_cancelled(), "token must be cancelled immediately");
-                assert!(
-                    handle.is_none(),
-                    "no watcher thread should spawn for an already-cancelled Cx"
+                assert_eq!(
+                    token.cancelled_with_cx(&cx).await,
+                    BridgeWaitOutcome::CxCancelled
                 );
-                assert!(!done.load(Ordering::Acquire));
+                assert!(!token.is_cancelled());
             });
         }
 
-        /// 3. `spawn_asupersync_cancellation_watcher` takes the short
-        ///    path when the bridge token is already cancelled — no new
-        ///    thread spawns and the asupersync Cx is left untouched.
         #[test]
-        fn watcher_short_circuits_when_token_precancelled_under_labruntime() {
+        fn precancelled_request_does_not_cancel_caller_under_labruntime() {
             run_lab(4003, || async move {
                 let cx = crate::cx::Cx::for_testing_with_budget(crate::cx::Budget::new());
                 let token = BridgeCancellationToken::new();
                 token.cancel();
-                let (_done, handle) =
-                    spawn_asupersync_cancellation_watcher(cx.clone(), token.clone());
+                let (bridge, _) = build_test_bridge();
+                let result = bridge
+                    .search_with_asupersync_cx(
+                        &cx,
+                        SearchBridgeRequest::new("rust", 5).with_cancellation(token),
+                        |_| {},
+                    )
+                    .await;
                 assert!(
-                    handle.is_none(),
-                    "no watcher thread should spawn for an already-cancelled token"
+                    matches!(result, Err(SearchBridgeError::Cancelled { .. })),
+                    "pre-cancelled request must not search"
                 );
                 assert!(
                     !cx.is_cancel_requested(),
