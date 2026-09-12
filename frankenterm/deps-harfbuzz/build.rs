@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 fn harfbuzz() {
     use std::fs;
 
-    if !Path::new("harfbuzz/.git").exists() {
-        git_submodule_update();
+    for source in ["harfbuzz/src/harfbuzz.cc", "harfbuzz/src/hb.h"] {
+        assert!(
+            Path::new(source).is_file(),
+            "missing vendored source {}; initialize the vendored sources before building",
+            source
+        );
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -27,7 +31,9 @@ fn harfbuzz() {
     let target = env::var("TARGET").unwrap();
 
     cfg.file("harfbuzz/src/harfbuzz.cc");
-    cfg.define("HB_NO_MT", None);
+    // Independent font instances still share HarfBuzz's lazy function tables.
+    // Keep its atomic reference counts and locks enabled: GUI font work and
+    // parallel tests can create and destroy those instances on different threads.
 
     if !target.contains("windows") {
         cfg.define("HAVE_UNISTD_H", None);
@@ -58,13 +64,8 @@ fn harfbuzz() {
     cfg.compile("harfbuzz");
 }
 
-fn git_submodule_update() {
-    let _ = std::process::Command::new("git")
-        .args(["submodule", "update", "--init"])
-        .status();
-}
-
 fn main() {
+    println!("cargo:rerun-if-changed=harfbuzz/src");
     harfbuzz();
     let out_dir = env::var("OUT_DIR").unwrap();
     println!("cargo:outdir={}", out_dir);

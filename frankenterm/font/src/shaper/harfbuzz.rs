@@ -912,6 +912,48 @@ mod test {
     }
 
     #[test]
+    fn independent_font_lifetimes_preserve_shared_harfbuzz_functions_across_threads() {
+        const THREADS: usize = 8;
+        let barrier = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    // Each thread owns its FreeType library, faces and mutable
+                    // shaper; only HarfBuzz's internal function table is shared.
+                    let handles = fallback_test_handles(1);
+                    let config = config::configuration();
+                    let shape = |shaper: &HarfbuzzShaper| {
+                        shaper
+                            .shape(
+                                "WZ ffi e\u{301}",
+                                10.,
+                                72,
+                                &mut Vec::new(),
+                                None,
+                                Direction::LeftToRight,
+                                None,
+                                None,
+                            )
+                            .unwrap()
+                    };
+                    let expected = {
+                        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+                        shape(&shaper)
+                    };
+                    assert!(!expected.is_empty());
+                    for _ in 0..64 {
+                        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+                        assert_eq!(shape(&shaper), expected);
+                        drop(shaper);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn invalid_font_sizes_return_errors_without_poisoning_cached_faces() {
         let handles = fallback_test_handles(1);
         let config = config::configuration();

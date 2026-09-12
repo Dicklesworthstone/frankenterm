@@ -10,9 +10,7 @@ fn new_build() -> cc::Build {
 }
 
 fn zlib() {
-    if !Path::new("zlib/.git").exists() {
-        git_submodule_update();
-    }
+    require_vendored_sources(&["zlib/adler32.c", "zlib/zlib.h"]);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -47,9 +45,7 @@ fn zlib() {
 }
 
 fn libpng() {
-    if !Path::new("libpng/.git").exists() {
-        git_submodule_update();
-    }
+    require_vendored_sources(&["libpng/png.c", "libpng/png.h"]);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -110,9 +106,10 @@ fn libpng() {
 }
 
 fn freetype() {
-    if !Path::new("freetype2/.git").exists() {
-        git_submodule_update();
-    }
+    require_vendored_sources(&[
+        "freetype2/src/base/ftbase.c",
+        "freetype2/include/ft2build.h",
+    ]);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -124,9 +121,13 @@ fn freetype() {
     cfg.include("libpng");
     cfg.include(out_dir.join("png-build"));
 
-    fs::create_dir_all(build_dir.join("freetype2/include/freetype/config")).unwrap();
-    cfg.include(format!("{}/freetype2/include", build_dir.display()));
-    cfg.include("freetype2/include");
+    // Cargo can reuse these native artifacts after the source checkout moves.
+    // Export a complete header tree owned by OUT_DIR, including the configured
+    // ftoption.h below, rather than a path into a transient source checkout.
+    let include_dir = build_dir.join("freetype2/include");
+    copy_include_tree(Path::new("freetype2/include"), &include_dir)
+        .expect("copy vendored FreeType headers into OUT_DIR");
+    cfg.include(&include_dir);
     cfg.define("FT2_BUILD_LIBRARY", None);
 
     let target = env::var("TARGET").unwrap();
@@ -223,21 +224,47 @@ fn freetype() {
 
     // These cause DEP_FREETYPE_INCLUDE and DEP_FREETYPE_LIB to be
     // defined in the harfbuzz/build.rs
-    println!(
-        "cargo:include={}/include/freetype2;{}/freetype2/include",
-        build_dir.display(),
-        std::env::current_dir().unwrap().display()
-    );
+    println!("cargo:include={}", include_dir.display());
     println!("cargo:lib={}", build_dir.display());
 }
 
-fn git_submodule_update() {
-    let _ = std::process::Command::new("git")
-        .args(["submodule", "update", "--init"])
-        .status();
+fn require_vendored_sources(paths: &[&str]) {
+    for path in paths {
+        assert!(
+            Path::new(path).is_file(),
+            "missing vendored source {}; initialize the vendored sources before building",
+            path
+        );
+    }
+}
+
+fn copy_include_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_include_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported vendored header entry: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn main() {
+    for source in ["zlib", "libpng", "freetype2"] {
+        println!("cargo:rerun-if-changed={}", source);
+    }
     zlib();
     libpng();
     freetype();
