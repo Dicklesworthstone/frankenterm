@@ -8472,7 +8472,7 @@ mod tests {
     use wezterm_term::Line;
     use wezterm_term::config::ScrollbackSpillSink;
 
-    pub(super) fn deferred_test_sink() -> (
+    pub fn deferred_test_sink() -> (
         tempfile::TempDir,
         Arc<LiveScrollbackSpillSink>,
         Arc<deferred_scrollback::DeferredScrollbackSpillSink>,
