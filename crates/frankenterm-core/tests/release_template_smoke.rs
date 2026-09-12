@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 const TEMPLATE_REL_PATH: &str = "docs/release/attestation-bead-closing-template.md";
 const CHECKLIST_REL_PATH: &str = "docs/release/attestation-checklist.md";
-const RELEASE_WORKFLOW_REL_PATH: &str = ".github/workflows/release.yml";
+const RELEASE_GATES_REL_PATH: &str = "scripts/release-gates.sh";
+const RELEASE_VERIFIER_REL_PATH: &str = "scripts/release/verify-release.sh";
 
 const REQUIRED_TEMPLATE_LINES: &[&str] = &[
     "Manifest slot category: `<category>`",
@@ -100,28 +101,94 @@ fn attestation_checklist_points_producing_beads_at_the_template_and_test() {
 }
 
 #[test]
-fn release_workflow_attestation_pipeline_fails_closed() {
-    let workflow = read_workspace_file(RELEASE_WORKFLOW_REL_PATH);
-
-    assert!(
-        !workflow.contains("continue-on-error: true"),
-        "{RELEASE_WORKFLOW_REL_PATH} must not let a failed release gate publish artifacts"
-    );
+fn dsr_attestation_gates_and_authenticated_release_bindings_are_wired() {
+    let gates = read_workspace_file(RELEASE_GATES_REL_PATH);
+    let dev_gate = gates
+        .lines()
+        .find(|line| line.starts_with("gate \"attestation dev bundle build+verify\""))
+        .expect("DSR quality must register the development attestation gate");
+    assert!(dev_gate.contains("scripts/attestation-build.sh"));
+    assert!(dev_gate.contains("&& bash scripts/attestation-verify.sh"));
+    // Development allows explicitly deferred claims. Publication authenticates
+    // a separate operator policy; this wiring test is not release evidence.
+    let verifier = read_workspace_file(RELEASE_VERIFIER_REL_PATH);
     for required in [
-        "scripts/attestation-build.sh",
-        "--sign cosign",
-        "--strict-deferred",
         "scripts/attestation-verify.sh",
-        "--strict-required",
+        "--release-policy",
+        ".publisher_authenticated == true",
+        ".git.commit == $sha",
+        ".build.profile == \"release-interactive\"",
+        "(.build.targets | sort) == $targets",
+        "finish_failed",
     ] {
         assert!(
-            workflow.contains(required),
-            "{RELEASE_WORKFLOW_REL_PATH} is missing mandatory attestation gate: {required}"
+            verifier.contains(required),
+            "{RELEASE_VERIFIER_REL_PATH} is missing release-policy binding: {required}"
         );
     }
-    assert_eq!(
-        workflow.matches("--target multi-platform-release").count(),
-        2,
-        "release build identity must name its target exactly once in derivation and generation"
+}
+
+#[test]
+fn windows_release_inventory_requires_the_complete_application_family() {
+    let verifier = read_workspace_file(RELEASE_VERIFIER_REL_PATH);
+    let marker = "if python3 - \"$ASSETS_DIR/$name\" \"$archive_kind\" \"$manifest_name\" <<'PY'\n";
+    let inventory = verifier
+        .split_once(marker)
+        .expect("production archive inventory validator")
+        .1
+        .split_once("\nPY\n")
+        .expect("inventory validator terminator")
+        .0;
+    let dir = tempfile::tempdir().expect("inventory fixtures");
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import pathlib, stat, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+validator = compile(sys.argv[2], 'production-release-inventory', 'exec')
+manifest = 'ft-windows-amd64.component-manifest.json'
+required = ['ft.exe', 'frankenterm-mux-server.exe', 'frankenterm-pty-guardian.exe',
+            'frankenterm-gui.exe', 'verify-components.sh', manifest]
+cases = [('complete', required, True)]
+cases += [('missing-' + str(i), required[:i] + required[i+1:], False)
+          for i in range(len(required))]
+cases += [('extra', required + ['unexpected.exe'], False),
+          ('duplicate', required + ['ft.exe'], False),
+          ('symlink', required, False), ('fifo', required, False),
+          ('directory', required + ['extra/'], False)]
+for name, names, accepted in cases:
+    path = root / (name + '.zip')
+    with zipfile.ZipFile(path, 'w') as archive:
+        for member in names:
+            info = zipfile.ZipInfo(member)
+            if name in ('symlink', 'fifo') and member == 'ft.exe':
+                info.create_system = 3
+                kind = stat.S_IFLNK if name == 'symlink' else stat.S_IFIFO
+                info.external_attr = (kind | 0o777) << 16
+            archive.writestr(info, b'fixture')
+    sys.argv = ['inventory', str(path), 'process-zip', manifest]
+    try:
+        exec(validator, {})
+    except SystemExit as error:
+        if accepted:
+            raise AssertionError((name, error)) from error
+    else:
+        assert accepted, name + ' unexpectedly accepted'
+print('WINDOWS_INVENTORY_CONTROLS_PASSED', len(cases))
+"#,
+        ])
+        .arg(dir.path())
+        .arg(inventory)
+        .output()
+        .expect("run production Python inventory validator");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("WINDOWS_INVENTORY_CONTROLS_PASSED 12")
     );
 }

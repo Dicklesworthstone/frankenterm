@@ -64,12 +64,13 @@ fn valid_bead_ids() -> BTreeSet<String> {
     manifest_slots_by_category()
         .into_values()
         .flatten()
-        .filter_map(|slot| slot.produced_by_bead)
+        .flat_map(|slot| [slot.produced_by_bead, slot.deferred_to_bead])
+        .flatten()
         .collect()
 }
 
 fn why_use_section(readme: &str) -> &str {
-    let heading = "### Why Use ft?";
+    let heading = "## Why use ft?";
     let start = readme
         .find(heading)
         .unwrap_or_else(|| panic!("README.md is missing {heading:?}"));
@@ -122,31 +123,44 @@ fn manifest_categories_in_text(
         .collect()
 }
 
-fn assert_populated_manifest_category(
+fn assert_manifest_reference(
     category: &str,
+    reference_text: &str,
+    declaration: &str,
     slots_by_category: &BTreeMap<String, Vec<ManifestSlot>>,
 ) {
     let Some(slots) = slots_by_category.get(category) else {
         panic!("README cites non-existent manifest slot category {category}");
     };
-    let deferred: Vec<String> = slots
-        .iter()
-        .filter(|slot| slot.path.is_none())
-        .map(|slot| {
-            slot.deferred_to_bead
-                .clone()
-                .unwrap_or_else(|| "missing deferred_to_bead".to_string())
-        })
+    let links = Regex::new(r"\[`([^`]+)`\]\(([^)]+)\)").expect("manifest link regex");
+    let targets: Vec<String> = links
+        .captures_iter(reference_text)
+        .filter(|cap| &cap[1] == category)
+        .map(|cap| cap[2].to_string())
         .collect();
-    assert!(
-        deferred.is_empty(),
-        "README cites manifest slot category {category}, but at least one matching slot is deferred: {}",
-        deferred.join(", ")
-    );
-    assert!(
-        slots.iter().all(|slot| slot.path.is_some()),
-        "README cites manifest slot category {category}, but it has no populated path"
-    );
+    assert_eq!(targets.len(), 1, "one exact artifact link for {category}");
+    if declaration.starts_with("Deferred:") {
+        assert_eq!(targets[0], "docs/attestations/manifest.json");
+        let owners = bead_ids_in_text(declaration);
+        assert_eq!(owners.len(), 1, "deferred claim must name its owner");
+        assert!(
+            slots.iter().any(|slot| {
+                slot.path.is_none()
+                    && slot
+                        .deferred_to_bead
+                        .as_ref()
+                        .is_some_and(|owner| owners.contains(owner))
+            }),
+            "deferred claim must match a deferred manifest producer"
+        );
+    } else {
+        assert!(
+            slots
+                .iter()
+                .any(|slot| slot.path.as_deref() == Some(targets[0].as_str())),
+            "README artifact link for {category} does not match a populated manifest slot"
+        );
+    }
 }
 
 fn claim_map_rows(readme: &str) -> Vec<ClaimMapRow> {
@@ -219,7 +233,7 @@ fn every_why_use_footnote_anchors_to_resolved_manifest_slot() {
             "footnote {anchor} does not cite a manifest slot category: {def:?}"
         );
         for category in &categories {
-            assert_populated_manifest_category(category, &slots_by_category);
+            assert_manifest_reference(category, def, def, &slots_by_category);
         }
         println!(
             "footnote.resolve.{anchor} categories={}",
@@ -272,21 +286,81 @@ fn trust_attestation_claim_map_matches_manifest() {
             .expect("category was extracted from manifest categories");
         let matching_slots: Vec<&ManifestSlot> = slots
             .iter()
-            .filter(|slot| slot.produced_by_bead.as_deref() == Some(bead.as_str()))
+            .filter(|slot| {
+                slot.produced_by_bead.as_deref() == Some(bead.as_str())
+                    || slot.deferred_to_bead.as_deref() == Some(bead.as_str())
+            })
             .collect();
         assert!(
             !matching_slots.is_empty(),
             "Trust & Attestation row {} claims {category} is produced by {bead}, but manifest.json disagrees",
             row.index
         );
-        assert!(
-            matching_slots.iter().all(|slot| slot.path.is_some()),
-            "Trust & Attestation row {} links to deferred slot {category} produced by {bead}",
-            row.index
+        let producer_slots = BTreeMap::from([(
+            category.clone(),
+            matching_slots.into_iter().cloned().collect(),
+        )]);
+        assert_manifest_reference(
+            category,
+            &row.slot_cell,
+            &format!("{} {}", row.claim, row.bead_cell),
+            &producer_slots,
         );
         println!(
             "trust_attestation_table.row.{} claim={} category={} bead={}",
             row.index, row.claim, category, bead
         );
+    }
+}
+
+#[test]
+fn exact_artifact_and_explicit_deferral_controls() {
+    let slots = BTreeMap::from([(
+        "proofs/example".to_string(),
+        vec![
+            ManifestSlot {
+                category: "proofs/example".to_string(),
+                path: Some("docs/accepted.json".to_string()),
+                produced_by_bead: Some("ft-good.1".to_string()),
+                deferred_to_bead: None,
+            },
+            ManifestSlot {
+                category: "proofs/example".to_string(),
+                path: None,
+                produced_by_bead: None,
+                deferred_to_bead: Some("ft-pending.1".to_string()),
+            },
+        ],
+    )]);
+    for (path, declaration, valid) in [
+        ("docs/accepted.json", "Verified artifact", true),
+        ("docs/other.json", "Verified artifact", false),
+        (
+            "docs/attestations/manifest.json",
+            "Verified artifact",
+            false,
+        ),
+        (
+            "docs/attestations/manifest.json",
+            "Deferred: ft-pending.1",
+            true,
+        ),
+        (
+            "docs/attestations/manifest.json",
+            "Deferred: ft-good.1",
+            false,
+        ),
+        (
+            "docs/attestations/manifest.json",
+            "Deferred: unnamed",
+            false,
+        ),
+        ("docs/accepted.json", "Deferred: ft-pending.1", false),
+    ] {
+        let reference = format!("[`proofs/example`]({path})");
+        let result = std::panic::catch_unwind(|| {
+            assert_manifest_reference("proofs/example", &reference, declaration, &slots);
+        });
+        assert_eq!(result.is_ok(), valid, "{path}: {declaration}");
     }
 }

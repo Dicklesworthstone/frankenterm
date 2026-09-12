@@ -372,7 +372,7 @@ verify_archive_inventory() {
       ;;
     ft-windows-amd64.zip)
       archive_kind="process-zip"
-      manifest_name=""
+      manifest_name="ft-windows-amd64.component-manifest.json"
       ;;
     FrankenTerm-darwin-arm64.app.tar.xz)
       archive_kind="app-tar"
@@ -458,13 +458,16 @@ elif archive_kind == "process-zip":
             "ft.exe",
             "frankenterm-mux-server.exe",
             "frankenterm-pty-guardian.exe",
+            "frankenterm-gui.exe",
+            "verify-components.sh",
+            manifest_name,
         }
         if set(names) != expected or any(info.is_dir() for info in infos):
-            raise SystemExit("Windows process-family archive violates its exact executable contract")
+            raise SystemExit("Windows application-family archive violates its exact six-file contract")
         for info in infos:
             mode = info.external_attr >> 16
-            if mode and stat.S_ISLNK(mode):
-                raise SystemExit("Windows process-family archive contains a symlink")
+            if stat.S_IFMT(mode) not in (0, stat.S_IFREG):
+                raise SystemExit("Windows application-family archive contains a non-regular member")
 else:
     raise SystemExit("unknown release archive kind")
 PY
