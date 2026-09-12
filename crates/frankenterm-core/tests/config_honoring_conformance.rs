@@ -212,7 +212,16 @@ where
         .enable_all()
         .build()
         .expect("failed to build test runtime");
-    runtime.block_on(future);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(future);
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frankenterm_core::runtime_async::clear_runtime_handle();
+    }));
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// retention (ft-rrqhm): `storage.retention_max_mb` is honored behaviorally —
@@ -302,21 +311,17 @@ fn make_session_db() -> (tempfile::NamedTempFile, Connection) {
     (file, conn)
 }
 
-fn insert_closed_session(conn: &Connection, path: &std::path::Path, created_at: i64) {
+async fn insert_closed_session(conn: &Connection, path: &std::path::Path, created_at: i64) {
     use frankenterm_core::config::SnapshotConfig;
-    use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::snapshot_engine::SnapshotEngine;
-    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
-        .enable_all()
-        .build()
-        .expect("snapshot fixture runtime");
     let engine = SnapshotEngine::new(
         std::sync::Arc::new(path.to_str().expect("fixture path").to_string()),
         SnapshotConfig::default(),
     );
-    let receipt = runtime
-        .block_on(engine.shutdown_checkpoint(&[], std::time::Duration::from_secs(10)))
-        .expect("persist verified clean shutdown");
+    let receipt = engine
+        .shutdown_checkpoint(&[], std::time::Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|error| panic!("persist clean session created_at={created_at}: {error:?}"));
     // Model a closed process rather than the still-live test process. Keep the
     // real checkpoint witness and clean authority created by SnapshotEngine.
     conn.execute(
@@ -346,9 +351,12 @@ fn session_retention_max_closed_sessions_drives_cleanup() {
     use frankenterm_core::session_retention::cleanup_sessions;
 
     let (file, conn) = make_session_db();
-    for i in 0..5 {
-        insert_closed_session(&conn, file.path(), 1_000 + i64::from(i));
-    }
+    // All writes belong to one runtime lifecycle, matching the live scheduler.
+    run_async(async {
+        for i in 0..5 {
+            insert_closed_session(&conn, file.path(), 1_000 + i64::from(i)).await;
+        }
+    });
     assert_eq!(
         count_sessions(&conn),
         5,

@@ -101,7 +101,6 @@ struct SharedWorkloadState {
     /// Tracks which tasks completed (bit mask).
     completed_mask: AtomicU64,
     /// Tracks cancellations observed.
-    #[allow(dead_code)]
     cancellations: AtomicU64,
 }
 
@@ -129,7 +128,6 @@ impl SharedWorkloadState {
     }
 
     /// Record a cancellation.
-    #[allow(dead_code)]
     fn record_cancellation(&self) {
         self.cancellations.fetch_add(1, Ordering::SeqCst);
     }
@@ -794,55 +792,87 @@ fn cfm_recovery_after_fault_clearance() {
 /// Verify CFM-7: cancelled tasks don't corrupt shared state.
 #[test]
 fn cfm_cancellation_safety() {
+    assert_cancellation_workload(999, "cfm_cancellation_safety", 4, 2);
+}
+
+fn assert_cancellation_workload(seed: u64, name: &str, task_count: u64, cancel_count: u64) {
     let _scenario = fault_scenario_guard();
-    let injector = FaultInjector::init_global();
-    injector.clear_all();
-
-    // Use delay to simulate slow operations that get cancelled.
-    injector.set_fault(FaultPoint::DbRead, FaultMode::delay(1000));
-
+    assert!(cancel_count > 0 && cancel_count < task_count);
     let state = SharedWorkloadState::new();
-    let st = Arc::clone(&state);
-
-    // Run with tight step limit — tasks won't all complete.
-    let config = LabTestConfig::new(999, "cfm_cancellation_safety")
-        .worker_count(2)
-        .max_steps(50)
-        .panic_on_leak(false); // Expect some tasks won't finish
-
+    let started = Arc::new(AtomicU64::new(0));
+    let config = LabTestConfig::new(seed, name).worker_count(4);
     let mut runtime = LabRuntime::new(config.to_lab_config());
     let region = runtime.state.create_root_region(Budget::INFINITE);
+    let mut tasks = Vec::new();
 
-    // Spawn tasks that will be interrupted
-    for task_id in 0..4u64 {
-        let s = Arc::clone(&st);
-        let (tid, _handle) = runtime
+    for task_id in 0..task_count {
+        let s = Arc::clone(&state);
+        let started = Arc::clone(&started);
+        let (tid, handle) = runtime
             .state
             .create_task(region, Budget::INFINITE, async move {
-                let ok = FaultInjector::check(FaultPoint::DbRead).is_ok();
-                if ok {
-                    let _ = FaultInjector::check(FaultPoint::DbWrite);
+                let cx = frankenterm_core::cx::Cx::current().expect("task context installed");
+                started.fetch_add(1, Ordering::SeqCst);
+                if task_id < cancel_count {
+                    // Park until an actual runtime cancellation reaches this
+                    // task's checkpoint. Blocking fault delays never yield and
+                    // therefore cannot test interruption by a scheduler budget.
+                    std::future::poll_fn(|_| {
+                        if cx.checkpoint().is_err() {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    s.record_cancellation();
+                    s.record_op(task_id, false);
+                } else {
+                    s.record_op(task_id, true);
                 }
-                s.record_op(task_id, ok);
             })
             .expect("create task");
         runtime.scheduler.lock().schedule(tid, 0);
+        tasks.push((tid, handle));
     }
 
-    // Run with limited steps (some tasks may not complete)
-    runtime.run_until_quiescent();
-
-    // CFM-7: Whatever completed must be consistent.
-    let attempted = state.ops_attempted.load(Ordering::SeqCst);
-    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
-    let failed = state.ops_failed.load(Ordering::SeqCst);
+    // Every task gets its first poll: controls finish, cancellation targets
+    // remain parked. No wall-clock sleep or exhausted step budget is involved.
+    for _ in 0..task_count {
+        runtime.step_for_test();
+    }
+    assert_eq!(started.load(Ordering::SeqCst), task_count);
+    assert_eq!(state.cancellations.load(Ordering::SeqCst), 0);
     assert_eq!(
-        attempted,
-        succeeded + failed,
-        "CFM-7: inconsistent counters after cancellation"
+        state.ops_attempted.load(Ordering::SeqCst),
+        task_count - cancel_count
     );
 
-    FaultInjector::reset_global();
+    for (tid, handle) in tasks.iter().take(cancel_count as usize) {
+        assert!(!handle.is_finished(), "cancellation target must be parked");
+        let (changed, wakes) = runtime
+            .state
+            .cancel_task(*tid, &asupersync::types::CancelReason::user(name))
+            .into_parts();
+        assert!(changed, "runtime must publish a new cancellation");
+        runtime.scheduler.lock().schedule_cancel(*tid, 0);
+        wakes.dispatch();
+    }
+    runtime.run_until_quiescent();
+
+    assert!(tasks.iter().all(|(_, handle)| handle.is_finished()));
+    assert_eq!(state.cancellations.load(Ordering::SeqCst), cancel_count);
+    assert_eq!(state.ops_failed.load(Ordering::SeqCst), cancel_count);
+    assert_eq!(
+        state.ops_succeeded.load(Ordering::SeqCst),
+        task_count - cancel_count
+    );
+    assert_eq!(state.ops_attempted.load(Ordering::SeqCst), task_count);
+    state.assert_invariants(name);
+    assert!(
+        runtime.check_invariants().is_empty(),
+        "{name}: runtime invariant violation"
+    );
 }
 
 // =============================================================================
@@ -1353,54 +1383,7 @@ fn cfm_scenario_startup_degraded_io() {
 /// shared state remains consistent when many tasks are abruptly stopped.
 #[test]
 fn cfm_scenario_cancellation_storm() {
-    let _scenario = fault_scenario_guard();
-    let injector = FaultInjector::init_global();
-    injector.clear_all();
-
-    // All operations delayed heavily — most will be "cancelled" by step limit
-    injector.set_fault(FaultPoint::DbRead, FaultMode::delay(5000));
-    injector.set_fault(FaultPoint::DbWrite, FaultMode::delay(5000));
-    injector.set_fault(FaultPoint::WeztermCliCall, FaultMode::delay(5000));
-
-    let state = SharedWorkloadState::new();
-    let st = Arc::clone(&state);
-
-    let config = LabTestConfig::new(1005, "cfm_scenario_cancellation_storm")
-        .worker_count(4)
-        .max_steps(100)
-        .panic_on_leak(false);
-
-    let mut runtime = LabRuntime::new(config.to_lab_config());
-    let region = runtime.state.create_root_region(Budget::INFINITE);
-
-    // Spawn many tasks that will mostly be cancelled
-    for task_id in 0..16u64 {
-        let s = Arc::clone(&st);
-        let (tid, _handle) = runtime
-            .state
-            .create_task(region, Budget::INFINITE, async move {
-                let db_ok = FaultInjector::check(FaultPoint::DbRead).is_ok();
-                let cli_ok = FaultInjector::check(FaultPoint::WeztermCliCall).is_ok();
-                let write_ok = FaultInjector::check(FaultPoint::DbWrite).is_ok();
-                s.record_op(task_id, db_ok && cli_ok && write_ok);
-            })
-            .expect("create task");
-        runtime.scheduler.lock().schedule(tid, 0);
-    }
-
-    runtime.run_until_quiescent();
-
-    // CFM-7: Even with mass cancellation, completed tasks must be consistent
-    let attempted = state.ops_attempted.load(Ordering::SeqCst);
-    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
-    let failed = state.ops_failed.load(Ordering::SeqCst);
-    assert_eq!(
-        attempted,
-        succeeded + failed,
-        "CFM-7 cancellation storm: counter inconsistency"
-    );
-
-    FaultInjector::reset_global();
+    assert_cancellation_workload(1005, "cfm_scenario_cancellation_storm", 16, 12);
 }
 
 // =============================================================================

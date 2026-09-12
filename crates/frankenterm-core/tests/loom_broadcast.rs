@@ -157,12 +157,6 @@ fn loom_broadcast_preserves_total_order_across_receivers() {
     loom::model(|| {
         let bus: Arc<LoomBroadcast<usize>> = Arc::new(LoomBroadcast::new());
 
-        let bus_send = Arc::clone(&bus);
-        let sender = thread::spawn(move || {
-            bus_send.send(10);
-            bus_send.send(20);
-        });
-
         let bus_a = Arc::clone(&bus);
         let receiver_a = thread::spawn(move || {
             let (s0, v0) = bus_a.recv_at(0).unwrap();
@@ -177,7 +171,11 @@ fn loom_broadcast_preserves_total_order_across_receivers() {
             (s0, v0, s1, v1)
         });
 
-        sender.join().unwrap();
+        // The model's main thread is the sender. Both receivers still race
+        // with both sends; a fourth thread that only spawns and joins actors
+        // adds lifecycle schedules without adding broadcast interactions.
+        bus.send(10);
+        bus.send(20);
         let observed_a = receiver_a.join().unwrap();
         let observed_b = receiver_b.join().unwrap();
 

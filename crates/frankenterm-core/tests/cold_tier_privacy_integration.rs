@@ -151,6 +151,18 @@ fn production_storage_redacts_split_secret_in_sqlite_and_mmap_mirror() {
         assert!(second_segment.content.contains(REDACTED_MARKER));
         assert_eq!(second_segment.content_hash, None);
 
+        let expected_text = format!("pane wrote {REDACTED_MARKER} after\n");
+        let live_segments = handle
+            .get_segments(7, 10)
+            .await
+            .expect("read after redaction");
+        let live_text = live_segments
+            .iter()
+            .rev()
+            .map(|segment| segment.content.as_str())
+            .collect::<String>();
+        assert_eq!(live_text, expected_text);
+
         handle.shutdown().await.expect("shutdown storage");
 
         let sqlite_rows = sqlite_segment_rows(&db_path, 7);
@@ -174,9 +186,30 @@ fn production_storage_redacts_split_secret_in_sqlite_and_mmap_mirror() {
             .join("7.log");
         let mmap_text = std::fs::read_to_string(&mmap_log)
             .unwrap_or_else(|error| panic!("read mmap mirror {}: {error}", mmap_log.display()));
-        assert!(mmap_text.contains(REDACTED_MARKER));
+        assert!(mmap_text.is_empty(), "invalidated mirror must be cleared");
         assert!(!mmap_text.contains(secret));
         assert!(!mmap_text.contains("sk-ant-api03-"));
+
+        let reopened = StorageHandle::new(&db_path_text)
+            .await
+            .expect("reopen storage");
+        let reopened_segments = reopened
+            .get_segments(7, 10)
+            .await
+            .expect("read after reopen");
+        assert_eq!(
+            reopened_segments
+                .iter()
+                .rev()
+                .map(|segment| segment.content.as_str())
+                .collect::<String>(),
+            expected_text,
+            "an empty old mirror cannot hide the committed SQLite history"
+        );
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened storage");
     });
 }
 

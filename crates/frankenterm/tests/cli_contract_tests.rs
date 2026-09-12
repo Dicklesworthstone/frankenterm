@@ -2943,7 +2943,7 @@ fn contract_history_json_filters_undoable_and_orders_newest_first() {
     let conn = rusqlite::Connection::open(&db_path).expect("open DB");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_120_000i64, "human", "spawn", "allow", "success", 1i64],
     )
     .expect("insert audit undoable older");
@@ -2963,7 +2963,7 @@ fn contract_history_json_filters_undoable_and_orders_newest_first() {
     .expect("insert undo older");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_130_000i64, "workflow", "workflow_start", "allow", "success", 1i64],
     )
     .expect("insert audit undoable newer");
@@ -2983,7 +2983,7 @@ fn contract_history_json_filters_undoable_and_orders_newest_first() {
     .expect("insert undo newer");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_140_000i64, "human", "send_text", "allow", "success", 1i64],
     )
     .expect("insert audit non-undoable");
@@ -3036,7 +3036,7 @@ fn contract_undo_list_json_returns_only_currently_undoable_actions() {
     let conn = rusqlite::Connection::open(&db_path).expect("open DB");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_100_000i64, "human", "spawn", "allow", "success", 1i64],
     )
     .expect("insert audit undoable");
@@ -3057,7 +3057,7 @@ fn contract_undo_list_json_returns_only_currently_undoable_actions() {
     .expect("insert action_undo undoable");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_101_000i64, "human", "spawn", "allow", "success", 1i64],
     )
     .expect("insert audit undone");
@@ -3078,7 +3078,7 @@ fn contract_undo_list_json_returns_only_currently_undoable_actions() {
     .expect("insert action_undo undone");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_102_000i64, "human", "send_text", "allow", "success", 1i64],
     )
     .expect("insert audit non-undoable");
@@ -3134,7 +3134,7 @@ fn contract_undo_single_json_not_applicable_for_manual_strategy() {
     let conn = rusqlite::Connection::open(&db_path).expect("open DB");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_150_000i64, "human", "send_text", "allow", "success", 1i64],
     )
     .expect("insert audit manual");
@@ -3181,7 +3181,7 @@ fn contract_undo_single_json_already_undone_is_idempotent_noop() {
     let conn = rusqlite::Connection::open(&db_path).expect("open DB");
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id, target_pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         rusqlite::params![1_700_000_170_000i64, "human", "spawn", "allow", "success", 1i64],
     )
     .expect("insert audit already-undone");
