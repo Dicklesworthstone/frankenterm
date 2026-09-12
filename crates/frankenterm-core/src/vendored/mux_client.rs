@@ -12526,9 +12526,17 @@ mod tests {
                         .expect("read");
                     assert!(read > 0, "expected codec handshake request bytes");
 
-                    // Keep the socket open without sending a codec response so
-                    // client-side read timeout handling is exercised.
-                    sleep(Duration::from_millis(150)).await;
+                    // Only the client deadline ends the exchange; a competing
+                    // server close would turn scheduling delay into Disconnected.
+                    timeout(Duration::from_secs(5), async {
+                        while unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read until timed-out client closes")
+                            != 0
+                        {}
+                    })
+                    .await
+                    .expect("timed-out client must close before server watchdog");
                 });
             });
 
@@ -12536,8 +12544,11 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should become ready");
 
-            let config =
+            let mut config =
                 direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            // This fixture accepts one connection and tests that attempt's
+            // read deadline. Auto fallback requires a second server accept.
+            config.compression_mode = wa_config::VendoredCompressionMode::Never;
 
             let err = DirectMuxClient::connect(config)
                 .await
@@ -12574,9 +12585,15 @@ mod tests {
                         .expect("read");
                     assert!(read > 0, "expected codec handshake request bytes");
 
-                    // Keep the socket open without sending a codec response so
-                    // client-side read timeout handling is exercised.
-                    sleep(Duration::from_millis(150)).await;
+                    timeout(Duration::from_secs(5), async {
+                        while unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read until timed-out client closes")
+                            != 0
+                        {}
+                    })
+                    .await
+                    .expect("timed-out client must close before server watchdog");
                 });
             });
 
@@ -12584,8 +12601,9 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should become ready");
 
-            let config =
+            let mut config =
                 direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            config.compression_mode = wa_config::VendoredCompressionMode::Never;
 
             let err = DirectMuxClient::connect_with_cx(&cx, config)
                 .await

@@ -965,20 +965,49 @@ proptest! {
                 .to_string();
             let cx = frankenterm_core::cx::for_testing();
             let cancel_cx = cx.clone();
+            let observer_db = storage.db_path().to_string();
+            let observer_execution = execution_id.clone();
             let cancel_thread = std::thread::spawn(move || {
+                let connection = rusqlite::Connection::open_with_flags(
+                    observer_db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .expect("open independent retry-log observer");
+                let observation_deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let persisted: bool = connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM workflow_step_logs WHERE workflow_id = ?1 AND result_type = 'retry')",
+                            [&observer_execution],
+                            |row| row.get(0),
+                        )
+                        .expect("observe committed retry boundary");
+                    if persisted {
+                        break;
+                    }
+                    if Instant::now() >= observation_deadline {
+                        cancel_cx.cancel_with(
+                            frankenterm_core::outcome::CancelKind::User,
+                            Some("retry boundary observation failed"),
+                        );
+                        panic!("workflow must commit its first retry before cancellation");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let retry_observed_at = Instant::now();
                 std::thread::sleep(Duration::from_millis(cancel_after_ms));
                 cancel_cx.cancel_with(
                     frankenterm_core::outcome::CancelKind::User,
                     Some("workflow handler property cancellation"),
                 );
+                retry_observed_at
             });
 
-            let started_at = Instant::now();
             let result = runner
                 .run_workflow_with_cx(&cx, PANE_ID, workflow, &execution_id, 0)
                 .await;
-            cancel_thread.join().expect("cancel thread should not panic");
-            let elapsed = started_at.elapsed();
+            let retry_observed_at = cancel_thread.join().expect("cancel thread should not panic");
+            let elapsed = retry_observed_at.elapsed();
 
             let cancel_message = match &result {
                 WorkflowExecutionResult::Aborted { reason, .. } => reason.as_str(),
@@ -992,11 +1021,12 @@ proptest! {
                 }
             };
             prop_assert!(
-                cancel_message.contains("cancelled"),
-                "terminal cancellation should explain cancellation; got {result:?}"
+                cancel_message.contains("cancelled")
+                    && cancel_message.contains("workflow retry backoff"),
+                "cancellation must occur in retry backoff; got {result:?}"
             );
             prop_assert!(
-                attempts.load(Ordering::SeqCst) <= 1,
+                attempts.load(Ordering::SeqCst) == 1,
                 "cancellation must not execute another attempt after the first retry boundary"
             );
             prop_assert!(
@@ -1026,17 +1056,7 @@ proptest! {
                 .get_step_logs(&execution_id)
                 .await
                 .expect("load cancelled retry logs");
-            match attempts.load(Ordering::SeqCst) {
-                0 => prop_assert!(
-                    logs.is_empty(),
-                    "cancellation before first handler attempt must not log a step: {logs:?}"
-                ),
-                1 => assert_retry_step_log_contract(&logs, 1, None)?,
-                attempts => prop_assert!(
-                    false,
-                    "retry cancellation must not execute or log multiple attempts: attempts={attempts}, logs={logs:?}"
-                ),
-            }
+            assert_retry_step_log_contract(&logs, 1, None)?;
             prop_assert!(
                 lock_manager.is_locked(PANE_ID).is_none(),
                 "runner must release pane lock after retry cancellation"

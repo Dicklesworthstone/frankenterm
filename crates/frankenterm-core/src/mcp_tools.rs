@@ -17527,6 +17527,7 @@ mod tests {
 
         let mut cancelled_requests = 0_usize;
         let mut rejected_requests = 0_usize;
+        let mut waiter_cancellations = 0_u64;
         for caller in callers {
             let (request_result, request_leases) = caller
                 .join()
@@ -17536,9 +17537,19 @@ mod tests {
             let error =
                 request_result.expect_err("shutdown-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:shutdown-") {
+                assert_eq!(error.code, MCP_ERR_CONFIG);
+                cancelled_requests = cancelled_requests.saturating_add(1);
+            } else if error.code == MCP_ERR_TIMEOUT {
+                // Shutdown cancels the same request Cx observed by both the
+                // task and its synchronous response waiter. If the waiter
+                // checkpoint wins, execute_request returns the canonical
+                // cancellation envelope instead of the fixture task's label.
+                assert_eq!(error.message, "Request timed out or was cancelled");
+                waiter_cancellations = waiter_cancellations.saturating_add(1);
                 cancelled_requests = cancelled_requests.saturating_add(1);
             } else {
-                assert!(error.message.contains("shutting down"));
+                assert_eq!(error.code, MCP_ERR_CONFIG);
+                assert!(error.message.contains("shutting down"), "{error:?}");
                 rejected_requests = rejected_requests.saturating_add(1);
             }
         }
@@ -17556,6 +17567,7 @@ mod tests {
             u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
         );
         assert_eq!(stopped.request_jobs_rejected_for_shutdown, 1);
+        assert_eq!(stopped.request_waiter_cancellations, waiter_cancellations);
         assert_eq!(stopped.request_jobs_cancelled_for_epoch, 0);
         assert_eq!(stopped.request_jobs_rejected_for_epoch, 0);
         assert_eq!(stopped.request_admission_rejections_unready, 1);
