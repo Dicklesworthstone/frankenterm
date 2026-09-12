@@ -279,6 +279,7 @@ duration_suboptimal_units = "allow"
 # Core dependencies
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+semver = "1.0.28"
 tantivy = "0.26.1"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
