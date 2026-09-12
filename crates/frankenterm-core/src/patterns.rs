@@ -3575,7 +3575,10 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "context compacted".to_string(),
                 ],
                 regex: Some(
-                    r"(?:Conversation compacted(?:\s*\([^)]+\))?|Auto-compact:\s*context compacted|context compacted)(?:[:\s]+(?:(?:compacted|summarized)\s+)?(?P<tokens_before>[\d,]+)\s+tokens?\s+to\s+(?P<tokens_after>[\d,]+))?".to_string()
+                    // Token-count notices must contain both counts. The real
+                    // Conversation compacted banner is a separate complete-line
+                    // alternative, not an optional suffix that accepts fragments.
+                    r"(?m)(?:(?:Conversation compacted(?:\s*\([^)]+\))?|Auto-compact:\s*(?:context compacted|summarized)|context compacted)[:\s]+(?:(?:compacted|summarized)\s+)?(?P<tokens_before>\d(?:[\d,]*\d)?)\s+tokens?\s+to\s+(?P<tokens_after>\d(?:[\d,]*\d)?)\b|Conversation compacted(?:[ \t]*\([^\r\n)]+\))?[ \t]*\r?$)".to_string()
                 ),
                 description: "Claude Code context compaction event".to_string(),
                 remediation: Some("Context was reduced - some history may be lost".to_string()),

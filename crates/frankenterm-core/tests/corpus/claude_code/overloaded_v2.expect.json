@@ -17,7 +17,7 @@
     "extracted": {
       "retry_after": "60 seconds"
     },
-    "matched_text": "retry in 60 seconds",
+    "matched_text": "too many requests to API. Will retry in 60 seconds",
     "rule_id": "claude_code.rate_limit.detected",
     "severity": "critical"
   },
@@ -28,7 +28,7 @@
     "extracted": {
       "retry_after": "60 seconds"
     },
-    "matched_text": "retry in 60 seconds",
+    "matched_text": "too many requests to API. Will retry in 60 seconds",
     "rule_id": "codex.rate_limit.detected",
     "severity": "critical"
   },
@@ -39,7 +39,7 @@
     "extracted": {
       "retry_after": "60 seconds"
     },
-    "matched_text": "retry in 60 seconds",
+    "matched_text": "too many requests to API. Will retry in 60 seconds",
     "rule_id": "gemini.rate_limit.detected",
     "severity": "critical"
   }

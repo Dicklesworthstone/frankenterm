@@ -8,6 +8,6 @@
     "extracted": {
       "retry_after": "2 minutes"
     },
-    "matched_text": "wait 2 minutes"
+    "matched_text": "529 throttling response. Please wait 2 minutes"
   }
 ]
