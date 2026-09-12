@@ -60,7 +60,8 @@ pub struct AuditActionRecord {
     pub actor_id: Option<String>,
     /// Optional correlation identifier for prepare/approve/commit chains.
     pub correlation_id: Option<String>,
-    /// Pane ID, if the action targeted a pane.
+    /// Target pane ID, retained even if the pane was never observed or is deleted.
+    /// This identity does not imply that observed pane metadata exists.
     pub pane_id: Option<u64>,
     /// Domain name, if applicable.
     pub domain: Option<String>,
@@ -254,7 +255,7 @@ pub struct ActionHistoryRecord {
     pub actor_id: Option<String>,
     /// Optional correlation identifier.
     pub correlation_id: Option<String>,
-    /// Pane ID, if the action targeted a pane.
+    /// Retained target pane ID; does not imply an observed pane still exists.
     pub pane_id: Option<u64>,
     /// Domain name, if applicable.
     pub domain: Option<String>,
@@ -295,7 +296,7 @@ pub struct ActionHistoryRecord {
 pub struct AuditQuery {
     /// Maximum number of results; default is 100.
     pub limit: Option<usize>,
-    /// Filter by pane ID.
+    /// Filter by retained target pane ID, including unobserved or deleted panes.
     pub pane_id: Option<u64>,
     /// Filter by domain name.
     pub domain: Option<String>,
@@ -328,7 +329,7 @@ pub struct AuditStreamQuery {
     pub limit: Option<usize>,
     /// Optional offset applied after cursor filtering.
     pub offset: Option<usize>,
-    /// Filter by pane ID.
+    /// Filter by retained target pane ID, including unobserved or deleted panes.
     pub pane_id: Option<u64>,
     /// Filter by domain name.
     pub domain: Option<String>,
@@ -368,7 +369,7 @@ pub struct ActionHistoryQuery {
     pub audit_action_id: Option<i64>,
     /// Maximum number of results; default is 100.
     pub limit: Option<usize>,
-    /// Filter by pane ID.
+    /// Filter by retained target pane ID, including unobserved or deleted panes.
     pub pane_id: Option<u64>,
     /// Filter by domain name.
     pub domain: Option<String>,

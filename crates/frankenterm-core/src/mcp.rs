@@ -2199,7 +2199,7 @@ mod tests {
         .ok()?;
         connection
             .query_row(
-                "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain,
+                "SELECT id, ts, actor_kind, actor_id, correlation_id, target_pane_id, domain,
                         action_kind, policy_decision, decision_reason, rule_id,
                         input_summary, verification_summary, decision_context, result
                  FROM audit_actions WHERE action_kind = ?1 ORDER BY ts DESC LIMIT 1",

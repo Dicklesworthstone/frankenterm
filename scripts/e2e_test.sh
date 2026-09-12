@@ -8745,10 +8745,10 @@ INSERT OR REPLACE INTO workflow_executions (
 );
 
 INSERT OR REPLACE INTO audit_actions (
-    id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+    id, ts, actor_kind, actor_id, correlation_id, pane_id, target_pane_id, domain, action_kind,
     policy_decision, decision_reason, rule_id, input_summary, verification_summary, decision_context, result
 ) VALUES (
-    $start_action_id, $start_ts, 'workflow', '$workflow_id', NULL, $pane_id, 'local', 'workflow_start',
+    $start_action_id, $start_ts, 'workflow', '$workflow_id', NULL, $pane_id, $pane_id, 'local', 'workflow_start',
     'allow', 'workflow started', NULL, '{"workflow_name":"e2e_history_undo"}', NULL, NULL, 'success'
 );
 
@@ -8759,10 +8759,10 @@ INSERT OR REPLACE INTO action_undo (
 );
 
 INSERT OR REPLACE INTO audit_actions (
-    id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+    id, ts, actor_kind, actor_id, correlation_id, pane_id, target_pane_id, domain, action_kind,
     policy_decision, decision_reason, rule_id, input_summary, verification_summary, decision_context, result
 ) VALUES (
-    $step_action_id, $step_ts, 'workflow', '$workflow_id', NULL, $pane_id, 'local', 'workflow_step',
+    $step_action_id, $step_ts, 'workflow', '$workflow_id', NULL, $pane_id, $pane_id, 'local', 'workflow_step',
     'allow', 'workflow step emitted', NULL, '{"step_name":"send_probe","parent_action_id":$start_action_id}', NULL, NULL, 'success'
 );
 

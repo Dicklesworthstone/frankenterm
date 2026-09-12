@@ -102,7 +102,8 @@
 /// output segment, so a process loss between the primary commit and recorder
 /// append cannot permanently omit the event.
 /// Bumped 45 -> 46 for serialized connector dispatch ownership and ingress cursors.
-pub const SCHEMA_VERSION: i32 = 46;
+/// Bumped 46 -> 47 to retain audit target identity independently of observed panes.
+pub const SCHEMA_VERSION: i32 = 47;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -855,6 +856,8 @@ CREATE TABLE IF NOT EXISTS audit_actions (
     actor_id TEXT,                     -- optional (workflow execution id, MCP client id)
     correlation_id TEXT,              -- optional chain/correlation identifier
     pane_id INTEGER REFERENCES panes(pane_id) ON DELETE SET NULL,
+    target_pane_id INTEGER CHECK(target_pane_id IS NULL OR
+        (typeof(target_pane_id) = 'integer' AND target_pane_id >= 0)),
     domain TEXT,
     action_kind TEXT NOT NULL,         -- send_text, workflow_run, etc.
     policy_decision TEXT NOT NULL,     -- allow, deny, require_approval
@@ -868,10 +871,17 @@ CREATE TABLE IF NOT EXISTS audit_actions (
 
 CREATE INDEX IF NOT EXISTS idx_audit_actions_ts ON audit_actions(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_pane ON audit_actions(pane_id, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_actions_target_pane ON audit_actions(target_pane_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_actor ON audit_actions(actor_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_action ON audit_actions(action_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_decision ON audit_actions(policy_decision, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_correlation ON audit_actions(correlation_id);
+
+CREATE TRIGGER IF NOT EXISTS audit_actions_target_pane_immutable
+BEFORE UPDATE OF target_pane_id ON audit_actions
+WHEN new.target_pane_id IS NOT old.target_pane_id BEGIN
+    SELECT RAISE(ABORT, 'audit target pane identity is immutable');
+END;
 
 -- Undo metadata for audit actions
 CREATE TABLE IF NOT EXISTS action_undo (

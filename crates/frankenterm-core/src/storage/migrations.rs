@@ -2226,6 +2226,14 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // Rollback would erase dispatch ownership and permit duplicate effects.
         down_sql: None,
     },
+    Migration {
+        version: 47,
+        description: "Retain audit target identity independently of observed panes",
+        // Shared by fresh/v0 repair and versioned upgrades.
+        up_sql: "",
+        // Removing the target would lose identity for unobserved or deleted panes.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -5066,6 +5074,29 @@ fn ensure_audit_actions_correlation_id(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_audit_actions_target_pane(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "audit_actions", "target_pane_id")? {
+        conn.execute_batch(
+            "ALTER TABLE audit_actions ADD COLUMN target_pane_id INTEGER
+                 CHECK(target_pane_id IS NULL OR
+                     (typeof(target_pane_id) = 'integer' AND target_pane_id >= 0));
+             UPDATE audit_actions SET target_pane_id = pane_id;",
+        )
+        .map_err(|e| StorageError::MigrationFailed(format!("audit target migration: {e}")))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_audit_actions_target_pane
+             ON audit_actions(target_pane_id, ts);
+         CREATE TRIGGER IF NOT EXISTS audit_actions_target_pane_immutable
+         BEFORE UPDATE OF target_pane_id ON audit_actions
+         WHEN new.target_pane_id IS NOT old.target_pane_id BEGIN
+             SELECT RAISE(ABORT, 'audit target pane identity is immutable');
+         END;",
+    )
+    .map_err(|e| StorageError::MigrationFailed(format!("audit target authority: {e}")))?;
+    Ok(())
+}
+
 fn ensure_event_triage_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(
         conn,
@@ -6109,6 +6140,7 @@ fn suspend_canonical_session_authority_triggers_for_v0_replay(conn: &Connection)
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
     if table_exists(conn, "audit_actions")? {
         ensure_audit_actions_correlation_id(conn)?;
+        ensure_audit_actions_target_pane(conn)?;
     }
     if table_exists(conn, "workflow_step_logs")? {
         ensure_workflow_step_logs_audit_action_id(conn)?;
@@ -6338,6 +6370,10 @@ fn apply_migration_mutation(
                 }
                 44 => {
                     ensure_session_recovery_usability_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                47 => {
+                    ensure_audit_actions_target_pane(conn)?;
                     apply_raw_up_sql = false;
                 }
                 _ => {}
@@ -6874,6 +6910,87 @@ pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_target_migration_backfills_atomically_and_is_idempotent() {
+        for starting_version in [0, 46] {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            // Reconstruct the pre-v47 shape only inside this owned in-memory fixture.
+            conn.execute_batch(
+                "DROP TRIGGER audit_actions_target_pane_immutable;
+                 DROP INDEX idx_audit_actions_target_pane;
+                 ALTER TABLE audit_actions DROP COLUMN target_pane_id;
+                 INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+                     VALUES (7, 'local', 1, 1, 1);
+                 INSERT INTO audit_actions (id, ts, actor_kind, pane_id, action_kind, policy_decision, result)
+                     VALUES (91, 1, 'robot', 7, 'read_output', 'deny', 'denied');",
+            ).unwrap();
+            conn.execute(
+                "DELETE FROM schema_version WHERE version > ?1",
+                [starting_version],
+            )
+            .unwrap();
+            set_user_version(&conn, starting_version).unwrap();
+            ensure_ft_meta(&conn, 46).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_audit_target_migration_receipt
+                 BEFORE INSERT ON schema_version WHEN new.version = 47 BEGIN
+                     SELECT RAISE(ABORT, 'fixture rejects migration receipt');
+                 END;",
+            )
+            .unwrap();
+
+            assert!(initialize_schema(&conn).is_err());
+            assert_eq!(get_user_version(&conn).unwrap(), starting_version);
+            assert!(!table_has_column(&conn, "audit_actions", "target_pane_id").unwrap());
+            assert!(
+                conn.is_autocommit(),
+                "failed migration must release its transaction"
+            );
+            conn.execute_batch("DROP TRIGGER reject_audit_target_migration_receipt")
+                .unwrap();
+
+            initialize_schema(&conn).unwrap();
+            initialize_schema(&conn).unwrap();
+            assert_eq!(get_user_version(&conn).unwrap(), 47);
+            let target: i64 = conn
+                .query_row(
+                    "SELECT target_pane_id FROM audit_actions WHERE id = 91",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(target, 7);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM schema_version WHERE version = 47",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            conn.execute("DELETE FROM panes WHERE pane_id = 7", [])
+                .unwrap();
+            let identity: (Option<i64>, Option<i64>) = conn
+                .query_row(
+                    "SELECT pane_id, target_pane_id FROM audit_actions WHERE id = 91",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(identity, (None, Some(7)));
+            assert!(
+                conn.execute(
+                    "UPDATE audit_actions SET target_pane_id = NULL WHERE id = 91",
+                    []
+                )
+                .is_err()
+            );
+            ensure_no_foreign_key_violations(&conn, "audit target migration test").unwrap();
+        }
+    }
 
     #[test]
     fn schema_sql_comparison_normalizes_only_non_semantic_syntax() {

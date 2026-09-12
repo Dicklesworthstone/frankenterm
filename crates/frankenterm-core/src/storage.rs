@@ -9088,9 +9088,35 @@ impl StorageHandle {
             .map(|dir| dir.as_ref().clone());
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            // The mirror is not transactional with SQLite. A committed append,
+            // retention, or retroactive redaction can invalidate otherwise valid
+            // JSON, including an empty mirror. Pin the authoritative bounded
+            // window first; never promote an unchecked cache to read authority.
+            let authoritative = pooled_backend(db_path.as_str(), |backend| {
+                query_segments_backend(backend, pane_id, limit)
+            })?;
             if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
                 match query_segments_from_mmap(mmap_dir, pane_id, limit) {
-                    Ok(Some(segments)) => return Ok(segments),
+                    Ok(Some(segments)) => {
+                        let matches = segments.len() == authoritative.len()
+                            && segments.iter().zip(&authoritative).all(|(cached, stored)| {
+                                cached.id == stored.id
+                                    && cached.pane_id == stored.pane_id
+                                    && cached.seq == stored.seq
+                                    && cached.content == stored.content
+                                    && cached.content_len == stored.content_len
+                                    && cached.content_hash == stored.content_hash
+                                    && cached.captured_at == stored.captured_at
+                            });
+                        if matches {
+                            return Ok(segments);
+                        }
+                        tracing::debug!(
+                            pane_id,
+                            limit,
+                            "mmap segment mirror differs from SQLite; using committed storage"
+                        );
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::warn!(
@@ -9104,9 +9130,7 @@ impl StorageHandle {
                 }
             }
 
-            pooled_backend(db_path.as_str(), |backend| {
-                query_segments_backend(backend, pane_id, limit)
-            })
+            Ok(authoritative)
         })
         .await
     }
@@ -19094,7 +19118,17 @@ fn disable_mmap_mirror_after_retained_tail_move(
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     pane_id: u64,
 ) {
-    if mmap_mirror.is_some() {
+    if let Some(store) = mmap_mirror.as_mut() {
+        // Remove the obsolete incomplete credential prefix from the affected
+        // cache before dropping it. SQLite remains the read authority even if
+        // clearing the disposable mirror fails.
+        if let Err(error) = store.clear_pane(pane_id) {
+            tracing::warn!(
+                pane_id,
+                error = %error,
+                "could not clear mmap mirror after cross-append redaction"
+            );
+        }
         tracing::warn!(
             pane_id,
             "disabled mmap segment mirror after retained redaction tail updated a prior segment"
@@ -22387,6 +22421,8 @@ pub fn record_policy_denial_audit_blocking(
 }
 
 /// Record an audit action through the writer-thread backend bridge.
+/// The target survives observation deletion. Resolve the optional observation
+/// foreign key in the INSERT itself, avoiding a check/insert race.
 fn record_audit_action_backend(
     backend: &dyn StorageBackend,
     action: &AuditActionRecord,
@@ -22401,8 +22437,9 @@ fn record_audit_action_backend(
         .query_row_typed(
         "INSERT INTO audit_actions (ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
          policy_decision, decision_reason, rule_id, input_summary, verification_summary,
-         decision_context, result)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         decision_context, result, target_pane_id)
+         VALUES (?1, ?2, ?3, ?4, (SELECT pane_id FROM panes WHERE pane_id = ?5),
+                 ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?5)
          RETURNING id",
         &[
             ToSqlValue::Integer(ts),
@@ -31683,7 +31720,7 @@ fn audit_action_from_backend_cells(row: &[SqlCell]) -> Result<AuditActionRecord>
         .optional_i64(5)
         .and_then(|value| {
             value
-                .map(|pane_id| backend_i64_to_u64(pane_id, "audit_actions.pane_id"))
+                .map(|pane_id| backend_i64_to_u64(pane_id, "audit_actions.target_pane_id"))
                 .transpose()
         })
         .map_err(|err| storage_backend_error("Audit action row pane_id", err))?;
@@ -31740,7 +31777,7 @@ fn query_audit_actions_backend(
     query: &AuditQuery,
 ) -> Result<Vec<AuditActionRecord>> {
     let mut sql = String::from(
-        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, target_pane_id, domain, action_kind,
          policy_decision, decision_reason, rule_id, input_summary, verification_summary,
          decision_context, result
          FROM audit_actions WHERE 1=1",
@@ -31749,7 +31786,7 @@ fn query_audit_actions_backend(
 
     if let Some(pane_id) = query.pane_id {
         let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-        sql.push_str(" AND pane_id = ?");
+        sql.push_str(" AND target_pane_id = ?");
         params.push(ToSqlValue::Integer(pane_id_i64));
     }
     if let Some(domain) = &query.domain {
@@ -31812,7 +31849,7 @@ fn query_audit_actions_stream_backend(
     query: &AuditStreamQuery,
 ) -> Result<AuditStreamPage> {
     let mut sql = String::from(
-        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, target_pane_id, domain, action_kind,
          policy_decision, decision_reason, rule_id, input_summary, verification_summary,
          decision_context, result
          FROM audit_actions WHERE 1=1",
@@ -31825,7 +31862,7 @@ fn query_audit_actions_stream_backend(
     }
     if let Some(pane_id) = query.pane_id {
         let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-        sql.push_str(" AND pane_id = ?");
+        sql.push_str(" AND target_pane_id = ?");
         params.push(ToSqlValue::Integer(pane_id_i64));
     }
     if let Some(domain) = &query.domain {
@@ -31985,7 +32022,7 @@ fn query_action_history_backend(
     query: &ActionHistoryQuery,
 ) -> Result<Vec<ActionHistoryRecord>> {
     let mut sql = String::from(
-        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, target_pane_id, domain, action_kind,
          policy_decision, decision_reason, rule_id, input_summary, verification_summary,
          decision_context, result, undoable, undo_strategy, undo_hint, undone_at, undone_by,
          workflow_id, step_name
@@ -31999,7 +32036,7 @@ fn query_action_history_backend(
     }
     if let Some(pane_id) = query.pane_id {
         let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-        sql.push_str(" AND pane_id = ?");
+        sql.push_str(" AND target_pane_id = ?");
         params.push(ToSqlValue::Integer(pane_id_i64));
     }
     if let Some(domain) = &query.domain {
@@ -32403,25 +32440,24 @@ fn query_segments_from_mmap(
         return Ok(Some(Vec::new()));
     }
 
-    let config = mmap_store::MmapStoreConfig::new(base_dir.to_path_buf());
-    let mut store = mmap_store::MmapScrollbackStore::new(config).map_err(|error| {
-        StorageError::Database(format!("Failed to open mmap segment mirror store: {error}"))
-    })?;
-
-    match store.ensure_pane(pane_id) {
-        Ok(()) => {}
-        Err(mmap_store::MmapStoreError::UnknownPane(_)) => return Ok(None),
-        Err(error) => {
-            return Err(StorageError::Database(format!(
-                "Failed to prepare mmap pane {pane_id} for read: {error}"
-            ))
-            .into());
+    // Opening a writer here could create/repair files and index the entire
+    // history for a small tail query. Use the existing bounded, read-only
+    // snapshot seam. Oversized mirrors simply fall back to indexed SQLite.
+    const MIRROR_READ_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+    let lines = match mmap_store::read_pane_snapshot(
+        base_dir,
+        pane_id,
+        limit,
+        MIRROR_READ_BUDGET_BYTES,
+        MIRROR_READ_BUDGET_BYTES,
+    ) {
+        Ok(snapshot) => snapshot.records,
+        Err(mmap_store::MmapStoreError::PaneSnapshotLimitExceeded { .. }) => return Ok(None),
+        Err(mmap_store::MmapStoreError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
         }
-    }
-
-    let lines = match store.tail_lines(pane_id, limit) {
-        Ok(lines) => lines,
-        Err(mmap_store::MmapStoreError::UnknownPane(_)) => return Ok(None),
         Err(error) => {
             return Err(StorageError::Database(format!(
                 "Failed to read mmap pane {pane_id} lines: {error}"
@@ -32443,7 +32479,7 @@ fn query_segments_from_mmap(
         segments.push(segment);
     }
 
-    // tail_lines() returns oldest->newest within the requested window;
+    // The bounded snapshot returns oldest->newest;
     // query_segments_backend() returns newest->oldest, so align ordering.
     segments.reverse();
     Ok(Some(segments))
@@ -43267,7 +43303,30 @@ fn mmap_segment_line_round_trip_preserves_multiline_content() {
 }
 
 #[test]
-fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
+fn get_segments_mmap_snapshot_is_bounded_and_read_only() {
+    let temp = tempfile::tempdir().expect("mirror fixture");
+    let absent = temp.path().join("absent");
+    assert!(query_segments_from_mmap(&absent, 1, 10).unwrap().is_none());
+    assert!(!absent.exists(), "cache reads must not create a store");
+    assert!(query_segments_from_mmap(temp.path(), 1, 10).unwrap().is_none());
+    assert!(!temp.path().join("1.log").exists(), "cache reads must not create pane files");
+    let log = temp.path().join("1.log");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&log).unwrap();
+    file.set_len(8 * 1024 * 1024 + 1).unwrap();
+    assert!(query_segments_from_mmap(temp.path(), 1, 10).unwrap().is_none());
+    assert_eq!(file.metadata().unwrap().len(), 8 * 1024 * 1024 + 1);
+    assert!(!temp.path().join("1.seq").exists(), "cache reads must not create journals");
+}
+
+#[test]
+fn get_segments_validates_mmap_content_and_falls_back_to_sqlite() {
     run_storage_async_test(async {
         use std::io::Write;
 
@@ -43338,6 +43397,22 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
             assert_eq!(got.content_hash, expected.content_hash);
             assert_eq!(got.captured_at, expected.captured_at);
         }
+
+        mmap_store.clear_pane(1).expect("clear owned mirror fixture");
+        let empty_mirror_read = handle.get_segments(1, 10).await.expect("empty mirror fallback");
+        assert_eq!(empty_mirror_read.len(), sqlite_segments.len());
+        for segment in sqlite_segments.iter().rev() {
+            let mut stale = segment.clone();
+            if stale.content == "beta" {
+                // Same id, length and metadata: a boundary/count witness alone
+                // cannot establish content authority after an in-place edit.
+                stale.content = "BETA".to_string();
+            }
+            mmap_store.append_line(1, &encode_mmap_segment_line(&stale).unwrap()).unwrap();
+        }
+        let stale_read = handle.get_segments(1, 10).await.expect("stale content fallback");
+        assert_eq!(stale_read[0].content, "beta");
+        assert_eq!(stale_read.len(), sqlite_segments.len());
 
         let mut corrupted_log = std::fs::OpenOptions::new()
             .append(true)

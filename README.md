@@ -2578,7 +2578,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v<!--count:storage_schema_version-->46<!--/count-->**. The authoritative source is
+The current version is **v<!--count:storage_schema_version-->47<!--/count-->**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -3945,7 +3945,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->46<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->47<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?

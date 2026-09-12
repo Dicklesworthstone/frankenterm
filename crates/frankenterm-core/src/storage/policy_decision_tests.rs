@@ -1979,6 +1979,104 @@ fn can_insert_and_query_audit_actions() {
 }
 
 #[test]
+fn audit_target_identity_survives_missing_observation_and_pane_deletion() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    let mut action = make_send_audit_record_with_secret("benign");
+    action.pane_id = Some(0);
+    action.action_kind = "read_output".to_string();
+    action.policy_decision = "deny".to_string();
+    action.result = "denied".to_string();
+    let unobserved_id = record_audit_action_for_conn(&mut conn, &action).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM panes", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let identity: (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT pane_id, target_pane_id FROM audit_actions WHERE id = ?1",
+            [unobserved_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(identity, (None, Some(0)));
+
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+                  VALUES (7, 'local', 1, 1, 1)",
+        [],
+    )
+    .unwrap();
+    action.pane_id = Some(7);
+    let observed_id = record_audit_action_for_conn(&mut conn, &action).unwrap();
+    let identity: (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT pane_id, target_pane_id FROM audit_actions WHERE id = ?1",
+            [observed_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(identity, (Some(7), Some(7)));
+    conn.execute("DELETE FROM panes WHERE pane_id = 7", [])
+        .unwrap();
+    let identity: (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT pane_id, target_pane_id FROM audit_actions WHERE id = ?1",
+            [observed_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(identity, (None, Some(7)));
+    assert!(
+        conn.execute(
+            "UPDATE audit_actions SET target_pane_id = 99 WHERE id = ?1",
+            [observed_id]
+        )
+        .is_err()
+    );
+
+    let backend = RusqliteBackend::new(conn).unwrap();
+    for pane_id in [0, 7, 99] {
+        let expected_count = usize::from(pane_id != 99);
+        let rows = query_audit_actions_backend(
+            &backend,
+            &AuditQuery {
+                pane_id: Some(pane_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), expected_count);
+        for row in rows {
+            assert_eq!(row.pane_id, Some(pane_id));
+            assert_eq!(row.policy_decision, "deny");
+            assert_eq!(row.result, "denied");
+        }
+        let page = query_audit_actions_stream_backend(
+            &backend,
+            &AuditStreamQuery {
+                pane_id: Some(pane_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.records.len(), expected_count);
+        assert!(page.records.iter().all(|row| row.pane_id == Some(pane_id)));
+        let history = query_action_history_backend(
+            &backend,
+            &ActionHistoryQuery {
+                pane_id: Some(pane_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(history.len(), expected_count);
+        assert!(history.iter().all(|row| row.pane_id == Some(pane_id)));
+    }
+}
+
+#[test]
 fn action_history_includes_undo_metadata() {
     let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
