@@ -20,7 +20,6 @@
 //! Mazurkiewicz trace catalog for mpsc lives at
 //! [docs/runtime/mazurkiewicz-traces.md](../../../../docs/runtime/mazurkiewicz-traces.md).
 
-use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
 
@@ -71,6 +70,7 @@ struct LoomBoundedMpsc<T> {
 struct LoomBoundedMpscState<T> {
     queue: Vec<T>,
     closed: bool,
+    max_queue_depth: usize,
 }
 
 impl<T> LoomBoundedMpsc<T> {
@@ -79,6 +79,7 @@ impl<T> LoomBoundedMpsc<T> {
             state: Mutex::new(LoomBoundedMpscState {
                 queue: Vec::with_capacity(capacity),
                 closed: false,
+                max_queue_depth: 0,
             }),
             not_full: Condvar::new(),
             not_empty: Condvar::new(),
@@ -95,6 +96,9 @@ impl<T> LoomBoundedMpsc<T> {
             return Err(value);
         }
         state.queue.push(value);
+        // Observe occupancy at the enqueue linearization point, before a
+        // receiver can remove the item or another producer can enqueue.
+        state.max_queue_depth = state.max_queue_depth.max(state.queue.len());
         self.not_empty.notify_one();
         Ok(())
     }
@@ -166,61 +170,32 @@ fn loom_mpsc_cancel_trace_classes_are_declared() {
 fn loom_mpsc_preserves_capacity_and_delivery() {
     loom::model(|| {
         let chan: Arc<LoomBoundedMpsc<usize>> = Arc::new(LoomBoundedMpsc::new(1));
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let max_in_flight = Arc::new(AtomicUsize::new(0));
 
         let chan_a = Arc::clone(&chan);
-        let in_flight_a = Arc::clone(&in_flight);
-        let max_a = Arc::clone(&max_in_flight);
         let producer_a = thread::spawn(move || {
             chan_a.send(1).unwrap();
-            let depth = in_flight_a.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut current_max = max_a.load(Ordering::SeqCst);
-            while depth > current_max {
-                match max_a.compare_exchange(current_max, depth, Ordering::SeqCst, Ordering::SeqCst)
-                {
-                    Ok(_) => break,
-                    Err(observed) => current_max = observed,
-                }
-            }
         });
 
         let chan_b = Arc::clone(&chan);
-        let in_flight_b = Arc::clone(&in_flight);
-        let max_b = Arc::clone(&max_in_flight);
         let producer_b = thread::spawn(move || {
             chan_b.send(2).unwrap();
-            let depth = in_flight_b.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut current_max = max_b.load(Ordering::SeqCst);
-            while depth > current_max {
-                match max_b.compare_exchange(current_max, depth, Ordering::SeqCst, Ordering::SeqCst)
-                {
-                    Ok(_) => break,
-                    Err(observed) => current_max = observed,
-                }
-            }
         });
 
-        let chan_c = Arc::clone(&chan);
-        let in_flight_c = Arc::clone(&in_flight);
-        let consumer = thread::spawn(move || {
-            let first = chan_c.recv().unwrap();
-            in_flight_c.fetch_sub(1, Ordering::SeqCst);
-            let second = chan_c.recv().unwrap();
-            in_flight_c.fetch_sub(1, Ordering::SeqCst);
-            (first, second)
-        });
-
+        // The model thread is the single consumer; both producer threads
+        // remain concurrent with these receives.
+        let first = chan.recv().unwrap();
+        let second = chan.recv().unwrap();
         producer_a.join().unwrap();
         producer_b.join().unwrap();
-        let (first, second) = consumer.join().unwrap();
 
         let mut received = vec![first, second];
         received.sort_unstable();
         assert_eq!(received, vec![1, 2], "lost or duplicated send");
-        assert!(
-            max_in_flight.load(Ordering::SeqCst) <= 2,
-            "in-flight count exceeded sender count"
+        let state = chan.state.lock().unwrap();
+        assert!(state.queue.is_empty(), "all sent values must be drained");
+        assert_eq!(
+            state.max_queue_depth, chan.capacity,
+            "a capacity-one queue must hold exactly one item at its peak"
         );
     });
 }

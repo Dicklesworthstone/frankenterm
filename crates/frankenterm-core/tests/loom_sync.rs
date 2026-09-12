@@ -235,14 +235,11 @@ fn loom_mutex_drop_releases_for_next_acquirer() {
     });
 }
 
-/// ft-e2usk: try_lock returns Some when the mutex is free and is
-/// observable as a clean acquisition. The model uses lock() then
-/// drop to set up the "free" state. Loom's Mutex::try_lock returns
-/// the same Option<MutexGuard> as std, so the proof anchors the
-/// happy-path behaviour. The "try_lock returns None when held"
-/// half is structurally implied by the mutual-exclusion proof at
-/// line 24 — Loom's enumeration covers any try_lock during a
-/// concurrent lock holder.
+/// ft-e2usk: try_lock returns Ok when the mutex is free and is
+/// observable as a clean acquisition. The mutex starts unlocked;
+/// try_lock returns a Result, as std does, and this test checks
+/// its successful branch. Contended try_lock behavior is not
+/// exercised by this test or the blocking-lock tests above.
 #[test]
 fn loom_mutex_try_lock_succeeds_when_free() {
     loom::model(|| {
@@ -351,11 +348,9 @@ fn loom_rwlock_preserves_reader_writer_invariant() {
 // ft-5omg9: RwLock exhaustive proofs
 // ============================================================================
 
-/// ft-5omg9: multiple readers can hold the lock simultaneously and
-/// all observe the same underlying value. Reader-reader is the
-/// non-contended path of the RwLock contract; this proof pins the
-/// "no reader-reader serialization" property — in contrast to a
-/// Mutex where every acquisition serializes.
+/// ft-5omg9: independently scheduled readers observe the same
+/// underlying value. This checks read consistency; it does not
+/// establish simultaneous ownership or absence of serialization.
 #[test]
 fn loom_rwlock_concurrent_readers_observe_consistent_value() {
     loom::model(|| {
@@ -445,6 +440,8 @@ struct LoomTicketSemaphore {
 struct LoomTicketSemaphoreState {
     available: usize,
     serving_ticket: usize,
+    held: usize,
+    max_held: usize,
 }
 
 impl LoomTicketSemaphore {
@@ -453,6 +450,8 @@ impl LoomTicketSemaphore {
             state: Mutex::new(LoomTicketSemaphoreState {
                 available: permits,
                 serving_ticket: 0,
+                held: 0,
+                max_held: 0,
             }),
             cv: Condvar::new(),
         }
@@ -466,12 +465,17 @@ impl LoomTicketSemaphore {
             }
             state.available -= 1;
             state.serving_ticket += 1;
+            // Count actual held permits at acquisition, without introducing
+            // unrelated atomic-counter schedules after the lock is released.
+            state.held += 1;
+            state.max_held = state.max_held.max(state.held);
         }
         LoomSemaphorePermit { semaphore }
     }
 
     fn release(&self) {
         let mut state = self.state.lock().unwrap();
+        state.held -= 1;
         state.available += 1;
         self.cv.notify_all();
     }
@@ -496,51 +500,34 @@ impl Drop for LoomSemaphorePermit {
 fn loom_semaphore_never_exceeds_capacity() {
     loom::model(|| {
         let semaphore = Arc::new(LoomTicketSemaphore::new(2));
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let max_in_flight = Arc::new(AtomicUsize::new(0));
 
         let sem_a = Arc::clone(&semaphore);
-        let active_a = Arc::clone(&in_flight);
-        let max_a = Arc::clone(&max_in_flight);
         let t1 = thread::spawn(move || {
             let _permit = LoomTicketSemaphore::acquire_owned(sem_a, 0);
-            let current = active_a.fetch_add(1, Ordering::SeqCst) + 1;
-            update_max(&max_a, current);
-            assert!(current <= 2, "semaphore exceeded configured capacity");
-            thread::yield_now();
-            active_a.fetch_sub(1, Ordering::SeqCst);
         });
 
         let sem_b = Arc::clone(&semaphore);
-        let active_b = Arc::clone(&in_flight);
-        let max_b = Arc::clone(&max_in_flight);
         let t2 = thread::spawn(move || {
             let _permit = LoomTicketSemaphore::acquire_owned(sem_b, 1);
-            let current = active_b.fetch_add(1, Ordering::SeqCst) + 1;
-            update_max(&max_b, current);
-            assert!(current <= 2, "semaphore exceeded configured capacity");
-            thread::yield_now();
-            active_b.fetch_sub(1, Ordering::SeqCst);
         });
 
-        let sem_c = Arc::clone(&semaphore);
-        let active_c = Arc::clone(&in_flight);
-        let max_c = Arc::clone(&max_in_flight);
-        let t3 = thread::spawn(move || {
-            let _permit = LoomTicketSemaphore::acquire_owned(sem_c, 2);
-            let current = active_c.fetch_add(1, Ordering::SeqCst) + 1;
-            update_max(&max_c, current);
-            assert!(current <= 2, "semaphore exceeded configured capacity");
-            thread::yield_now();
-            active_c.fetch_sub(1, Ordering::SeqCst);
-        });
+        // Keep three concurrent acquirers, with the model thread serving as
+        // the third. Acquisition and Drop still take separate locks, so Loom
+        // explores schedules with overlapping permit lifetimes.
+        let third = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 2);
+        drop(third);
 
         t1.join().unwrap();
         t2.join().unwrap();
-        t3.join().unwrap();
 
-        assert_eq!(semaphore.available_permits(), 2);
-        assert!(max_in_flight.load(Ordering::SeqCst) <= 2);
+        let state = semaphore.state.lock().unwrap();
+        assert_eq!(state.available, 2);
+        assert_eq!(state.held, 0);
+        assert!(state.max_held > 0);
+        assert!(
+            state.max_held <= 2,
+            "semaphore exceeded configured capacity"
+        );
     });
 }
 
