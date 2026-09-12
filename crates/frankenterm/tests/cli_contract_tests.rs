@@ -12,6 +12,283 @@
 //! - Secret-like strings never leak unredacted
 
 use assert_cmd::Command;
+
+#[cfg(all(feature = "mcp", target_os = "linux"))]
+mod mcp_runtime_migration {
+    use asupersync::cx::cap::CapSetRuntimeMask;
+    use frankenterm_core::config::McpClientConfig;
+    use frankenterm_core::cx::Cx;
+    use frankenterm_core::mcp_client::{ExternalServerConfig, FtMcpClient};
+
+    #[test]
+    fn real_stdio_client_restores_caller_and_reaps_server() {
+        for restricted in [false, true] {
+            let workspace = tempfile::Builder::new()
+                .prefix("ft-mcp-runtime-migration-")
+                .tempdir()
+                .expect("create MCP workspace")
+                .keep();
+            eprintln!(
+                "retained MCP migration workspace (restricted={restricted}): {}",
+                workspace.display()
+            );
+            let pid_path = workspace.join("server.pid");
+            let upstream_pid_path = workspace.join("upstream.pid");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let operation = std::thread::spawn(move || {
+                run_real_stdio_client_case(restricted, workspace);
+                done_tx.send(()).expect("completion observer is present");
+            });
+            match done_rx.recv_timeout(std::time::Duration::from_secs(45)) {
+                Ok(()) => operation.join().expect("stdio operation completes"),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    cleanup_recorded_children([&upstream_pid_path, &pid_path]);
+                    operation.join().expect("stdio operation must not panic");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // A protocol regression must fail within a fixed bound.
+                    // Terminate only the actual child recorded by our launcher
+                    // so its pipe closes and the client can unwind and reap it.
+                    cleanup_recorded_children([&upstream_pid_path, &pid_path]);
+                    let cleanup = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+                    panic!("MCP stdio operation exceeded 45 seconds; cleanup={cleanup:?}");
+                }
+            }
+        }
+    }
+
+    fn cleanup_recorded_children(paths: [&std::path::PathBuf; 2]) {
+        for path in paths {
+            if let Ok(pid) = std::fs::read_to_string(path)
+                && let Ok(pid) = pid.trim().parse::<u32>()
+            {
+                let cleanup = std::process::Command::new("kill")
+                    .args(["-TERM", "--", &pid.to_string()])
+                    .status();
+                eprintln!("failed MCP operation child {pid} cleanup: {cleanup:?}");
+            }
+        }
+    }
+
+    fn run_real_stdio_client_case(restricted: bool, workspace: std::path::PathBuf) {
+        let config_path = workspace.join("ft.toml");
+        let upstream_config_path = workspace.join("upstream.json");
+        let upstream_pid_path = workspace.join("upstream.pid");
+        let upstream_calls_path = workspace.join("upstream-calls.jsonl");
+        let upstream_closed_path = workspace.join("upstream-closed");
+        // Controlled protocol peer, not a live external-service proof. Both
+        // FtMcpClient connections and the real ft discovery/mount/audit/format
+        // and RemoteProxyToolHandler paths run unchanged around this fixture.
+        let upstream_program = r#"
+import json, os, pathlib, sys
+pid_path, calls_path, closed_path = map(pathlib.Path, sys.argv[1:])
+pid_path.write_text(str(os.getpid()))
+payloads = {
+    'audio': {'type': 'audio', 'data': 'YXVkaW8=', 'mimeType': 'audio/wav'},
+    'empty': {'type': 'resource', 'resource': {'uri': 'file:///empty'}},
+    'both': {'type': 'resource', 'resource': {'uri': 'file:///both', 'text': 'text', 'blob': 'Ynl0ZXM='}},
+}
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'content-fixture', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'content', 'description': 'Controlled content fixture', 'inputSchema': {'type': 'object', 'properties': {'kind': {'type': 'string', 'enum': list(payloads)}}, 'required': ['kind'], 'additionalProperties': False}, 'annotations': {'readOnlyHint': True, 'destructiveHint': False}}]}
+    elif method == 'tools/call':
+        params = request['params']
+        assert params['name'] == 'content'
+        assert set(params['arguments']) == {'kind'}
+        with calls_path.open('a') as calls:
+            calls.write(json.dumps(params) + '\n')
+        result = {'content': [payloads[params['arguments']['kind']]]}
+    elif method == 'ping':
+        result = {}
+    else:
+        raise AssertionError(method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+closed_path.write_text('stdin closed')
+"#;
+        std::fs::write(
+            &upstream_config_path,
+            serde_json::to_vec_pretty(&serde_json::json!({"mcpServers": {"fixture": {
+                "command": "python3",
+                "args": ["-u", "-c", upstream_program, upstream_pid_path, upstream_calls_path, upstream_closed_path]
+            }}})).expect("upstream discovery configuration"),
+        ).expect("write upstream discovery configuration");
+        let mut server_config = frankenterm_core::config::Config::default();
+        server_config.storage.db_path = workspace.join("mcp-audit.db").display().to_string();
+        server_config.mcp_client = McpClientConfig {
+            enabled: true,
+            include_default_paths: false,
+            discovery_paths: vec![upstream_config_path.display().to_string()],
+            proxy_enabled: true,
+            proxy_mount_all_discovered: false,
+            proxy_servers: vec!["fixture".to_owned()],
+            proxy_strict: true,
+            proxy_fallback_to_local: false,
+            timeout_ms: 10_000,
+            ..Default::default()
+        };
+        server_config.validate().expect("valid proxy configuration");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&server_config).expect("server TOML"),
+        )
+        .expect("write server configuration");
+        let pid_path = workspace.join("server.pid");
+        let server = ExternalServerConfig {
+            name: "real-ft".to_owned(),
+            command: "sh".to_owned(),
+            // The launcher records the process identity, then execs the real
+            // binary. It does not implement or intercept the MCP protocol.
+            args: vec![
+                "-c".to_owned(),
+                "printf '%s\\n' \"$$\" > \"$1\"; shift; exec \"$@\"".to_owned(),
+                "ft-mcp-migration".to_owned(),
+                pid_path.display().to_string(),
+                env!("CARGO_BIN_EXE_ft").to_owned(),
+                "--workspace".to_owned(),
+                workspace.display().to_string(),
+                "--config".to_owned(),
+                config_path.display().to_string(),
+                "mcp".to_owned(),
+                "serve".to_owned(),
+            ],
+            env: Default::default(),
+            cwd: Some(workspace.display().to_string()),
+            disabled: false,
+        };
+        let settings = McpClientConfig {
+            enabled: true,
+            // These application values were accepted before the framework
+            // migration. Immediate startup must still succeed without applying
+            // the newer framework's unrelated default policy caps or waiting
+            // for the configured retry delay.
+            timeout_ms: if restricted { 10_000 } else { 1_000_000 },
+            max_retries: if restricted { 0 } else { u32::MAX },
+            retry_delay_ms: if restricted { 1_000 } else { u64::MAX },
+            ..Default::default()
+        };
+        let mut caller_config = frankenterm_core::config::Config::default();
+        caller_config.mcp_client = settings.clone();
+        caller_config
+            .validate()
+            .expect("accepted application configuration");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("parent runtime");
+        runtime.block_on(async {
+            let original = Cx::current().expect("parent Cx");
+            type NoRemote = asupersync::cx::CapSet<true, true, true, true, false>;
+            type AllCapabilities = asupersync::cx::CapSet<true, true, true, true, true>;
+            let mask = if restricted {
+                <NoRemote as CapSetRuntimeMask>::MASK
+            } else {
+                <AllCapabilities as CapSetRuntimeMask>::MASK
+            };
+            let restriction = Cx::push_restriction(mask);
+            let installed = Cx::set_current(Some(original.clone()));
+            let parent = Cx::current().expect("restricted parent");
+            assert_eq!(parent.capabilities().effective.remote, !restricted);
+            let assert_parent = || {
+                let current = Cx::current().expect("restored caller Cx");
+                assert_eq!(current.region_id(), parent.region_id());
+                assert_eq!(current.task_id(), parent.task_id());
+                assert_eq!(current.capabilities(), parent.capabilities());
+            };
+
+            let mut client = FtMcpClient::connect_external(server, &settings)
+                .expect("connect actual ft stdio server");
+            assert_parent();
+            let pid: u32 = std::fs::read_to_string(&pid_path)
+                .expect("server process receipt")
+                .trim()
+                .parse()
+                .expect("numeric server pid");
+            let process_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+            assert!(process_path.exists(), "server must be alive after connect");
+            let tools = client.list_tools().expect("list actual server tools");
+            assert!(tools.iter().any(|tool| tool.name == "wa.rules_list"));
+            assert!(tools.iter().any(|tool| tool.name == "remote/fixture/content"));
+            let result = client
+                .call_tool("wa.rules_list", serde_json::json!({}))
+                .expect("execute actual rules tool");
+            let text = result
+                .iter()
+                .find_map(|item| item.as_text())
+                .expect("rules tool text");
+            let envelope: serde_json::Value = serde_json::from_str(text).expect("tool envelope");
+            assert_eq!(envelope["ok"], true);
+            for (kind, expected) in [
+                ("audio", serde_json::json!({"type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav"})),
+                ("empty", serde_json::json!({"type": "resource", "resource": {"uri": "file:///empty"}})),
+                ("both", serde_json::json!({"type": "resource", "resource": {"uri": "file:///both", "text": "text", "blob": "Ynl0ZXM="}})),
+            ] {
+                let content = client.call_tool("remote/fixture/content", serde_json::json!({
+                    "kind": kind, "format": "json"
+                })).expect("actual mounted proxy call");
+                assert_eq!(serde_json::to_value(content).unwrap(), serde_json::json!([expected]));
+                assert_parent();
+            }
+            let calls: Vec<serde_json::Value> = std::fs::read_to_string(&upstream_calls_path)
+                .expect("upstream request transcript")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("upstream request JSON"))
+                .collect();
+            assert_eq!(calls, serde_json::json!([
+                {"name": "content", "arguments": {"kind": "audio"}},
+                {"name": "content", "arguments": {"kind": "empty"}},
+                {"name": "content", "arguments": {"kind": "both"}}
+            ]).as_array().unwrap().clone());
+            let audit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let count = rusqlite::Connection::open_with_flags(
+                    &server_config.storage.db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                ).and_then(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'mcp.remote/fixture/content' AND actor_kind = 'mcp' AND policy_decision = 'allow' AND result = 'success'",
+                    [], |row| row.get::<_, i64>(0),
+                ));
+                if matches!(count, Ok(3)) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < audit_deadline, "three successful proxy audits must persist, observed={count:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_parent();
+            client.shutdown();
+            assert!(
+                !process_path.exists(),
+                "shutdown must reap the actual server"
+            );
+            let upstream_pid: u32 = std::fs::read_to_string(&upstream_pid_path)
+                .expect("upstream process receipt").trim().parse().expect("numeric upstream pid");
+            let upstream_process = std::path::PathBuf::from(format!("/proc/{upstream_pid}"));
+            let close_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while upstream_process.exists() || !upstream_closed_path.exists() {
+                assert!(std::time::Instant::now() < close_deadline, "upstream fixture must observe EOF and exit");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_parent();
+
+            let child = asupersync::runtime::Runtime::current_handle()
+                .expect("parent runtime handle restored")
+                .spawn(async {
+                    asupersync::runtime::yield_now().await;
+                    Cx::current().expect("ordinary child context").region_id()
+                });
+            assert_eq!(child.await, parent.region_id());
+            drop(installed);
+            drop(restriction);
+            let restored = Cx::current().expect("original parent restored");
+            assert_eq!(restored.capabilities(), original.capabilities());
+        });
+    }
+}
+
 // Compile the production build metadata resolver directly; its Cargo entry
 // point is intentionally not invoked by this integration harness.
 #[allow(

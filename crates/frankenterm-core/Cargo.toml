@@ -137,9 +137,7 @@ ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = 
 ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
 
 # MCP server (optional, behind feature)
-# FrameworkTestClient is a public integration surface. This feature exposes
-# production-faithful helpers; it does not enable test-internals/testing-lab.
-fastmcp = { workspace = true, optional = true, features = ["testing"] }
+fastmcp = { workspace = true, optional = true }
 fastmcp-server = { workspace = true, optional = true }
 toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)

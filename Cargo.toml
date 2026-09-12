@@ -582,8 +582,8 @@ wasmtime-wasi = { version = "47.0.4", default-features = false, features = ["p1"
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.4.10" }
-asupersync-macros = { version = "0.4.9" }
+asupersync = { version = "=0.5.0" }
+asupersync-macros = { version = "=0.5.0" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3.3"
@@ -601,19 +601,16 @@ trybuild = { version = "1.0.116", default-features = false }
 # defaults (logging, std, tls12) so behavior is otherwise unchanged.
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 rustls-pemfile = "2.2.0"
-# These revisions share the workspace's Asupersync 0.4.10 context and I/O types.
-fastmcp = { version = "0.8.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "ef1e310a22c6f1444ef131ea35af850033b2e335", package = "fastmcp-rust" }
-# The delivery adapter needs catalog inspection and the acknowledgment-aware
-# custom transport lifecycle, which the protocol facade does not expose.
-fastmcp-server = { version = "0.8.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "ef1e310a22c6f1444ef131ea35af850033b2e335", default-features = false, features = ["legacy-2024-11-05"] }
-fastapi = { version = "0.4.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "badcf8ad05c161f9a83c41d7641183f1b1fc7288", package = "fastapi-rust" }
+fastmcp = { version = "=0.9.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "180a7c88890705217bb8e202d19555adabf24187", package = "fastmcp-rust", features = ["legacy-2024-11-05", "testing-lab"] }
+fastmcp-server = { version = "=0.9.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "180a7c88890705217bb8e202d19555adabf24187" }
+fastapi = { version = "=0.4.4", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "fb15fa5025cfdc23ab99344db5e2a4939dbcf38e", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "520164439ff4cbc55573d1c79d2346e313fc778f", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { version = "=0.6.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Narrow registry alias for the audited descriptor-bound ACL presence probe.
 # Keep this isolated from the existing full-stack FrankenSearch git pin above.
-frankensearch-index-acl = { package = "frankensearch-index", version = "=0.2.3", default-features = false }
+frankensearch-index-acl = { package = "frankensearch-index", version = "=0.3.0", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.2.2"
 

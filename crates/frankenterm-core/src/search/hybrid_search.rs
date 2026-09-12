@@ -220,8 +220,6 @@ fn rrf_fuse_with_frankensearch(
             })
             .collect();
 
-        // Keep upstream fusion neutral: weights and numeric-ID tiebreaks are
-        // applied below after retaining every candidate's original lane rank.
         let config = frankensearch::RrfConfig {
             k: f64::from(k),
             lexical_weight: 1.0,
