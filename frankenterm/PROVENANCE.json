@@ -734,15 +734,15 @@
         "other": 4,
         "refactor": 2,
         "runtime-swap": 1,
-        "test": 14
+        "test": 15
       },
-      "fork_side_commit_count": 55,
+      "fork_side_commit_count": 56,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-12T06:11:46-04:00",
-        "sha": "8ccd0ab462acd5f5ede7bd39433e8e8a68c9a1cc",
-        "subject": "test(platform): preserve native socket and PTY contracts across hosts"
+        "committed_at": "2026-09-12T06:26:00-04:00",
+        "sha": "fef77c06307d92a7a823bf89280496727ebc50b0",
+        "subject": "test(pty): make Unix-only fixture import explicit to coupling gate"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -1061,8 +1061,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2496,
-  "generated_at": "2026-09-12T10:13:06.896926Z",
+  "fork_side_commit_total": 2497,
+  "generated_at": "2026-09-12T10:32:30.716885Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
