@@ -1749,13 +1749,17 @@ impl Line {
     /// Return true if the last cell in the line has the wrapped attribute,
     /// indicating that the following line is logically a part of this one.
     pub fn last_cell_was_wrapped(&self) -> bool {
-        if let CellStorage::C(line) = &self.cells {
-            return line.last_cell_was_wrapped();
+        match &self.cells {
+            CellStorage::C(line) => line.last_cell_was_wrapped(),
+            CellStorage::V(cells) => cells.cached_wrap_boundary(|| {
+                // Wide cells can hide spacer cells whose attributes differ.
+                // Cache the existing visible-cell oracle, not the raw tail.
+                self.visible_cells()
+                    .last()
+                    .map(|c| c.attrs().wrapped())
+                    .unwrap_or(false)
+            }),
         }
-        self.visible_cells()
-            .last()
-            .map(|c| c.attrs().wrapped())
-            .unwrap_or(false)
     }
 
     /// Adjust the value of the wrapped attribute on the last cell of this
@@ -4441,7 +4445,9 @@ mod tests {
 
     #[test]
     fn line_double_click_range_inside_wide_non_word_cell_stays_empty() {
-        let line = Line::from_text("❤️a", &CellAttributes::default(), SEQ_ZERO, None);
+        // Use an unconditionally wide non-word character. Emoji presentation
+        // width depends on the configured Unicode/variation-selector policy.
+        let line = Line::from_text("。a", &CellAttributes::default(), SEQ_ZERO, None);
         let first = line.visible_cells().next().expect("wide first cell");
         assert_eq!(first.width(), 2);
 
@@ -4599,9 +4605,24 @@ mod tests {
             let mut line =
                 Line::from_text("abc界e\u{0301}🚀אב", &CellAttributes::default(), 1, None);
             let original_hash = line.compute_shape_hash();
+            let original_boundary = line.last_cell_was_wrapped();
             assert_eq!(original_hash, line.compute_shape_hash_uncached());
             let frozen = line.clone();
             mutate(&mut line);
+            assert_eq!(
+                line.last_cell_was_wrapped(),
+                line.visible_cells()
+                    .last()
+                    .is_some_and(|cell| cell.attrs().wrapped()),
+                "wrap boundary after {}",
+                name
+            );
+            assert_eq!(
+                frozen.last_cell_was_wrapped(),
+                original_boundary,
+                "snapshot wrap boundary after {}",
+                name
+            );
             assert_eq!(line.current_seqno(), 1);
             assert_eq!(
                 line.compute_shape_hash(),

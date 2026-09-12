@@ -4889,6 +4889,12 @@ impl Screen {
         let started = Instant::now();
         let old_cols = self.physical_cols;
         let original_len = self.lines.len();
+        // Profiling-only stage attribution. Enable with
+        // RUST_LOG=frankenterm_term::screen::reflow_profile=debug.
+        // No extra clock reads are performed when this target is disabled.
+        let profile_start =
+            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
+                .then(Instant::now);
         let estimated_capacity = if physical_cols >= self.physical_cols {
             original_len
         } else {
@@ -4899,9 +4905,11 @@ impl Screen {
                 .max(original_len)
         };
         let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
+        let cursor_elapsed = profile_start.map(|start| start.elapsed());
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) = self
             .logical_wraps_for_resize(physical_cols, seqno, &|| false)
             .expect("synchronous reflow cannot be cancelled");
+        let wraps_elapsed = profile_start.map(|start| start.elapsed());
         let cached_layout_signature = match &wrapped {
             WrappedResizeLines::Cached(wrapped) => {
                 self.rebuild_rewrap_row_prefix_scratch(&wrapped.lines);
@@ -4914,6 +4922,7 @@ impl Screen {
         };
         let mut adjusted_cursor = (cursor_x, cursor_y);
         let wrapped_count = self.rewrap_row_prefix_scratch.last().copied().unwrap_or(0);
+        let prefix_elapsed = profile_start.map(|start| start.elapsed());
 
         let required_capacity = estimated_capacity.max(physical_rows);
         let mut pruned_rows = 0usize;
@@ -4978,6 +4987,25 @@ impl Screen {
                 rewrapped
             }
         };
+        if let (Some(start), Some(cursor), Some(wraps), Some(prefix)) =
+            (profile_start, cursor_elapsed, wraps_elapsed, prefix_elapsed)
+        {
+            log::debug!(
+                target: "frankenterm_term::screen::reflow_profile",
+                "reflow_stages seq={} old_cols={} cols={} source_rows={} target_rows={} logical_lines={} cursor_us={} wraps_us={} prefix_us={} materialize_us={} wrap_cache_hit={}",
+                seqno,
+                old_cols,
+                physical_cols,
+                original_len,
+                self.lines.len(),
+                logical_count,
+                cursor.as_micros(),
+                wraps.saturating_sub(cursor).as_micros(),
+                prefix.saturating_sub(wraps).as_micros(),
+                start.elapsed().saturating_sub(prefix).as_micros(),
+                wrap_cache_hit,
+            );
+        }
 
         if logical_cache_hit && reuse_unlinked_scan_state_for_reflow() {
             for line in &mut self.lines {
@@ -5076,6 +5104,9 @@ impl Screen {
         if !self.allow_scrollback || !self.needs_rewrap_for_width_change(size.cols.max(1)) {
             return None;
         }
+        let profile_start =
+            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
+                .then(Instant::now);
         // The empty constructor avoids allocating another full scrollback.
         // Copy only the inputs to wrapping, not recovery state, retained frames,
         // keyboard state, per-line caches or scratch buffers. The logical cache
@@ -5099,6 +5130,16 @@ impl Screen {
         snapshot.stable_row_index_offset = self.stable_row_index_offset;
         snapshot.resize_wrap_policy = self.resize_wrap_policy;
         snapshot.rewrap_cache = self.rewrap_cache.clone();
+        if let Some(start) = profile_start {
+            log::debug!(
+                target: "frankenterm_term::screen::reflow_profile",
+                "reflow_capture seq={} source_rows={} cols={} capture_us={}",
+                cursor.seqno,
+                self.lines.len(),
+                size.cols,
+                start.elapsed().as_micros(),
+            );
+        }
         Some(ScreenReflowPreparation {
             snapshot,
             source_lines: VecDeque::new(),
@@ -5116,7 +5157,10 @@ impl Screen {
         size: TerminalSize,
         cursor: CursorPosition,
     ) -> bool {
-        prepared.ready
+        let profile_start =
+            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
+                .then(Instant::now);
+        let matches = prepared.ready
             && self.allow_scrollback
             && prepared.target == size
             && prepared.source_cursor == cursor
@@ -5130,7 +5174,19 @@ impl Screen {
                 .source_lines
                 .iter()
                 .zip(&self.lines)
-                .all(|(source, live)| source.is_same_reflow_source(live))
+                .all(|(source, live)| source.is_same_reflow_source(live));
+        if let Some(start) = profile_start {
+            log::debug!(
+                target: "frankenterm_term::screen::reflow_profile",
+                "reflow_validate seq={} source_rows={} cols={} matches={} validate_us={}",
+                cursor.seqno,
+                self.lines.len(),
+                size.cols,
+                matches,
+                start.elapsed().as_micros(),
+            );
+        }
+        matches
     }
 
     fn prune_resize_trailing_blanks(&mut self, cursor: CursorPosition) {
