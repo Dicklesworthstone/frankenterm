@@ -502,7 +502,7 @@ The README claim-to-slot map identifies populated artifacts and explicitly defer
 | Bloom prefilter search speedup | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | 200-pane capacity and memory-budget benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | Robot JSON/TOON envelope contract | [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) | `ft-0elb9` |
-| Deferred: operating-envelope read-only admission proof | [`proofs/robot-contracts`](docs/attestations/manifest.json) | `ft-booek.7` |
+| Operating-envelope read-only admission proof | [`proofs/robot-contracts`](docs/attestations/proofs/operating-envelope.json) | `ft-booek.7` |
 | Redactor coverage matrix | [`security/redactor-coverage`](docs/security/redactor-coverage.json) | `ft-x0666.2` |
 | Distributed wire-protocol safety | [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) | `ft-x0666.3` |
 | `runtime_async` Loom model | [`proofs/loom-runtime-async`](docs/attestations/proofs/loom-runtime-async.json) | `ft-e87u6.12` |
@@ -510,10 +510,10 @@ The README claim-to-slot map identifies populated artifacts and explicitly defer
 | Transaction kill-switch proof | [`proofs/tx-killswitch`](docs/attestations/proofs/tx-killswitch.json) | `ft-tf6g3.12` |
 <!-- attestation-claim-map:end -->
 
-The operating-envelope contract (`ft.operating_envelope.v1`) has a deferred slot
+The operating-envelope contract (`ft.operating_envelope.v1`) has a populated slot
 under the `proofs/robot-contracts` manifest category, assigned to `ft-booek.7`.
-Its retained diagnostic artifact is not an accepted manifest proof; a
-`blocked_rch_no_verdict` status is not production proof. The slot also does not
+Its artifact records scoped remote contract tests and development bundle
+verification; final release qualification remains pending. The slot does not
 prove target-class production capacity while the target-class resource-cockpit
 artifact remains `skipped_not_proven`. The
 renderer SLO suite is still tracked under [ft-tf6g3](#engineering-discipline)

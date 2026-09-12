@@ -409,6 +409,8 @@ pub struct RenderableInner {
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
+    /// Local coordinate epoch, independent of ordinary remote content updates.
+    selection_layout_generation: SequenceNo,
 
     /// Exact rules used for the persisted implicit links in `lines`. GUI
     /// windows can supply different rule sets for the same remote pane, so this
@@ -511,6 +513,7 @@ impl RenderableInner {
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
+            selection_layout_generation: SEQ_ZERO,
             implicit_hyperlink_rules: config.hyperlink_rules.clone(),
             predictions: Vec::new(),
             alt_screen_active,
@@ -1095,10 +1098,21 @@ impl RenderableInner {
             return false;
         }
         let alt_screen_changed = self.alt_screen_active != delta.alt_screen_active;
-        if authoritative_snapshot
+        // Legacy render transport advertises a same-geometry cold coordinate
+        // replacement as a dirty range below physical_top. It has no explicit
+        // layout epoch on the wire. Retire selection authority conservatively
+        // for that signal without scanning or hydrating the historical rows.
+        let cold_layout_invalidated = delta
+            .dirty_lines
+            .iter()
+            .any(|range| range.start < range.end && range.start < delta.dimensions.physical_top);
+        let reset_layout = authoritative_snapshot
             || alt_screen_changed
-            || !mux::renderable::same_line_layout_geometry(&self.dimensions, &delta.dimensions)
-        {
+            || !mux::renderable::same_line_layout_geometry(&self.dimensions, &delta.dimensions);
+        if reset_layout || cold_layout_invalidated {
+            self.selection_layout_generation = self.selection_layout_generation.saturating_add(1);
+        }
+        if reset_layout {
             // Stable row coordinates belong to the active screen epoch. Never
             // combine cached main-screen rows with an alternate-screen delta
             // (or vice versa), and never carry a speculative main-screen glyph
@@ -3185,6 +3199,21 @@ pub(crate) async fn hydrate_render_application_lines(
 }
 
 impl RenderableState {
+    pub(crate) fn selection_source_snapshot(
+        &self,
+    ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions, bool)> {
+        let inner = self.inner.try_borrow().ok()?;
+        if inner.selection_layout_generation == SequenceNo::MAX || inner.seqno == SequenceNo::MAX {
+            return None;
+        }
+        Some((
+            inner.selection_layout_generation,
+            inner.seqno,
+            inner.dimensions,
+            inner.alt_screen_active,
+        ))
+    }
+
     pub fn get_cursor_position(&self) -> StableCursorPosition {
         self.inner.borrow().cursor_position
     }
@@ -3635,6 +3664,143 @@ mod tests {
 
     fn test_renderable_state() -> Arc<parking_lot::Mutex<super::RenderableState>> {
         test_renderable_state_with_echo_threshold(None)
+    }
+
+    #[test]
+    fn selection_snapshot_preserves_content_epoch_and_retires_replaced_layouts() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let initial = state.selection_source_snapshot().unwrap();
+        let mut delta = codec::GetPaneRenderChangesResponse {
+            pane_id: 743,
+            mouse_grabbed: false,
+            alt_screen_active: initial.3,
+            cursor_position: mux::renderable::StableCursorPosition::default(),
+            dimensions: initial.2,
+            tiered_scrollback_status: None,
+            dirty_lines: Vec::new(),
+            title: "selection-test".to_string(),
+            working_dir: None,
+            bonus_lines: codec::SerializedLines::from(Vec::new()),
+            input_serial: None,
+            seqno: initial.1 + 1,
+        };
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        let content = state.selection_source_snapshot().unwrap();
+        assert_eq!(content.0, initial.0);
+        assert_eq!(content.1, delta.seqno);
+
+        // A replacement can reuse the exact remote sequence and geometry.
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_render_application_to_surface(
+                delta.clone(),
+                Vec::new(),
+                codec::RenderApplicationKind::Snapshot,
+            ));
+        let replacement = state.selection_source_snapshot().unwrap();
+        assert_eq!(replacement.0, content.0 + 1);
+        assert_eq!(replacement.1, content.1);
+        assert_eq!(replacement.2, content.2);
+
+        delta.alt_screen_active = !delta.alt_screen_active;
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        let alternate = state.selection_source_snapshot().unwrap();
+        assert_eq!(alternate.0, replacement.0 + 1);
+        assert_eq!(alternate.3, delta.alt_screen_active);
+
+        delta.dimensions.cols += 1;
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        let resized = state.selection_source_snapshot().unwrap();
+        assert_eq!(resized.0, alternate.0 + 1);
+        assert_eq!(resized.2, delta.dimensions);
+
+        state.inner.borrow_mut().selection_layout_generation = SequenceNo::MAX - 1;
+        for _ in 0..2 {
+            assert!(state
+                .inner
+                .borrow_mut()
+                .apply_render_application_to_surface(
+                    delta.clone(),
+                    Vec::new(),
+                    codec::RenderApplicationKind::Snapshot,
+                ));
+            assert_eq!(
+                state.inner.borrow().selection_layout_generation,
+                SequenceNo::MAX
+            );
+            assert!(state.selection_source_snapshot().is_none());
+        }
+    }
+
+    #[test]
+    fn selection_snapshot_retires_cold_dirty_layout_but_preserves_hot_output() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let initial = state.selection_source_snapshot().unwrap();
+        let mut delta = codec::GetPaneRenderChangesResponse {
+            pane_id: 743,
+            mouse_grabbed: false,
+            alt_screen_active: initial.3,
+            cursor_position: mux::renderable::StableCursorPosition::default(),
+            dimensions: initial.2,
+            tiered_scrollback_status: None,
+            dirty_lines: std::iter::once(-1_000_000_000..0).collect(),
+            title: "selection-cold-layout-test".to_string(),
+            working_dir: None,
+            bonus_lines: codec::SerializedLines::from(Vec::new()),
+            input_serial: None,
+            seqno: initial.1,
+        };
+        // Matches the legacy producer's cold-map replacement notification:
+        // neither content sequence nor viewport geometry needs to change.
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        let replaced = state.selection_source_snapshot().unwrap();
+        assert_eq!(replaced.0, initial.0 + 1);
+        assert_eq!(replaced.1, initial.1);
+        assert_eq!(replaced.2, initial.2);
+
+        delta.dirty_lines = std::iter::once(0..1).collect();
+        delta.seqno += 1;
+        let lines = vec![(0, Line::with_width(delta.dimensions.cols, delta.seqno))];
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), lines));
+        let content = state.selection_source_snapshot().unwrap();
+        assert_eq!(content.0, replaced.0);
+        assert_eq!(content.1, delta.seqno);
+    }
+
+    #[test]
+    fn selection_snapshot_rejects_busy_and_exhausted_authority() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        {
+            let mut inner = state.inner.borrow_mut();
+            assert!(state.selection_source_snapshot().is_none());
+            inner.seqno = SequenceNo::MAX;
+        }
+        assert!(state.selection_source_snapshot().is_none());
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = SEQ_ZERO;
+            inner.selection_layout_generation = SequenceNo::MAX;
+        }
+        assert!(state.selection_source_snapshot().is_none());
     }
 
     #[test]

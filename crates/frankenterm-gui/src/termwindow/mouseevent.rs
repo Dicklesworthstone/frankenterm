@@ -31,6 +31,22 @@ fn checked_mouse_stable_row(viewport: StableRowIndex, row: i64) -> Option<Stable
     viewport.checked_add(offset)
 }
 
+fn release_ends_selection_drag(press: MousePress, active_button: Option<MousePress>) -> bool {
+    Some(press) == active_button
+}
+
+pub(super) fn selection_gesture_button(
+    event: &WMEK,
+    held_buttons: &[MousePress],
+) -> Option<MousePress> {
+    match event {
+        WMEK::Press(button) => held_buttons.contains(button).then_some(*button),
+        // MouseEventTrigger::Drag is dispatched for this same last-held button.
+        WMEK::Move => held_buttons.last().copied(),
+        _ => None,
+    }
+}
+
 impl super::TermWindow {
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
@@ -141,10 +157,31 @@ impl super::TermWindow {
 
         match event.kind {
             WMEK::Release(ref press) => {
-                self.current_mouse_capture = None;
+                let ends_selection_drag =
+                    release_ends_selection_drag(*press, self.active_selection_drag_button);
+                if ends_selection_drag {
+                    // Resolve the retained press before ending drag protection.
+                    // Doing this in dispatch alone is too late: custom release
+                    // bindings and early returns must also retire pending input.
+                    if let Some(pane_id) = self.active_selection_drag_pane {
+                        if let Some(pos) = self
+                            .get_panes_to_render()
+                            .into_iter()
+                            .find(|pos| pos.pane.pane_id() == pane_id)
+                        {
+                            self.retry_pending_selection_start(&pos.pane);
+                        }
+                        self.pane_state(pane_id).pending_selection_start = None;
+                    }
+                }
+                // An unrelated release must not drop the captured selection
+                // pane while its initiating button remains held.
+                if ends_selection_drag || self.active_selection_drag_button.is_none() {
+                    self.current_mouse_capture = None;
+                }
                 self.current_mouse_buttons.retain(|p| p != press);
-                if press == &MousePress::Left {
-                    self.active_selection_drag_pane = None;
+                if ends_selection_drag {
+                    self.clear_selection_drag();
                 }
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
@@ -159,7 +196,12 @@ impl super::TermWindow {
             WMEK::Press(ref press) => {
                 capture_mouse = true;
                 if press == &MousePress::Left {
-                    self.active_selection_drag_pane = None;
+                    let other_active_button = self
+                        .active_selection_drag_button
+                        .is_some_and(|button| button != *press);
+                    if !other_active_button {
+                        self.clear_selection_drag();
+                    }
                 }
 
                 // Perform click counting
@@ -833,16 +875,32 @@ impl super::TermWindow {
         let viewport = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top);
-        let stable_row = checked_mouse_stable_row(viewport, row);
         let current_selection_frame = selection_position
             .as_ref()
             .and_then(|pos| self.selection_frame_stamp_for_position(&pane, pos));
+        let mouse_selection_frame = {
+            let state = self.pane_state(pane.pane_id());
+            state
+                .selection_frame
+                .for_mouse(current_selection_frame)
+                .or_else(|| {
+                    // Retain only the coordinates actually displayed at the press.
+                    // A busy source can be retried; a known layout mismatch cannot.
+                    if current_selection_frame.is_some() {
+                        return None;
+                    }
+                    let geometry = self.selection_frame_geometry(selection_position.as_ref()?)?;
+                    state.selection_frame.displayed_for_geometry(geometry)
+                })
+        };
+        let stable_row = checked_mouse_stable_row(
+            mouse_selection_frame.map_or(viewport, |frame| frame.viewport),
+            row,
+        );
 
         {
             let mut pane_state = self.pane_state(pane.pane_id());
-            pane_state.mouse_selection_frame = pane_state
-                .selection_frame
-                .for_mouse(current_selection_frame);
+            pane_state.mouse_selection_frame = mouse_selection_frame;
             if let Some(stable_row) = stable_row {
                 pane_state.mouse_terminal_coords.replace((
                     ClickPosition {
@@ -1139,13 +1197,70 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_mouse_stable_row;
+    use super::{checked_mouse_stable_row, release_ends_selection_drag, selection_gesture_button};
+    use crate::termwindow::should_preserve_selection_during_dirty_line_update as preserve_drag;
     use wezterm_term::StableRowIndex;
+    use window::{MouseEventKind, MousePress};
 
     #[test]
     fn mouse_stable_row_conversion_fails_closed_at_domain_boundaries() {
         assert_eq!(checked_mouse_stable_row(10, 3), Some(13));
         assert_eq!(checked_mouse_stable_row(10, -1), None);
         assert_eq!(checked_mouse_stable_row(StableRowIndex::MAX, 1), None);
+    }
+
+    #[test]
+    fn deferred_custom_button_release_retires_only_its_own_gesture() {
+        assert!(!release_ends_selection_drag(
+            MousePress::Left,
+            Some(MousePress::Right)
+        ));
+        assert!(release_ends_selection_drag(
+            MousePress::Right,
+            Some(MousePress::Right)
+        ));
+        assert!(!release_ends_selection_drag(
+            MousePress::Right,
+            Some(MousePress::Middle)
+        ));
+        assert!(release_ends_selection_drag(
+            MousePress::Middle,
+            Some(MousePress::Middle)
+        ));
+        assert!(!release_ends_selection_drag(MousePress::Left, None));
+    }
+
+    #[test]
+    fn initiating_button_survives_pending_resolution_and_matches_chord_dispatch() {
+        let held = [MousePress::Left, MousePress::Right];
+        let active = selection_gesture_button(&MouseEventKind::Press(MousePress::Left), &held);
+        assert_eq!(active, Some(MousePress::Left));
+        // Resolution consumes pending coordinates, not the active button.
+        assert!(!release_ends_selection_drag(MousePress::Right, active));
+        assert!(release_ends_selection_drag(MousePress::Left, active));
+        let active = selection_gesture_button(&MouseEventKind::Move, &held);
+        assert_eq!(active, Some(MousePress::Right));
+        assert!(release_ends_selection_drag(MousePress::Right, active));
+        assert!(
+            selection_gesture_button(&MouseEventKind::Release(MousePress::Right), &held).is_none()
+        );
+        assert!(
+            selection_gesture_button(&MouseEventKind::Press(MousePress::Middle), &held).is_none()
+        );
+        let capture = Some(crate::termwindow::MouseCapture::TerminalPane(42));
+        assert!(preserve_drag(
+            &capture,
+            &[MousePress::Right],
+            Some(42),
+            active,
+            42,
+        ));
+        assert!(!preserve_drag(
+            &capture,
+            &[MousePress::Left],
+            Some(42),
+            active,
+            42,
+        ));
     }
 }

@@ -1231,7 +1231,7 @@ where
 }
 
 /// Ungh: https://github.com/microsoft/WSL/issues/4456
-fn utf16_to_utf8(_: &Lua, text: mlua::String) -> mlua::Result<String> {
+fn utf16_to_utf8(_: &Lua, text: mlua::LuaString) -> mlua::Result<String> {
     let bytes = text.as_bytes();
 
     if bytes.len() % 2 != 0 {
@@ -1240,12 +1240,15 @@ fn utf16_to_utf8(_: &Lua, text: mlua::String) -> mlua::Result<String> {
         )));
     }
 
-    // This is "safe" because we checked that the length seems reasonable,
-    // and our new slice is within those same bounds.
-    let wide: &[u16] =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, bytes.len() / 2) };
-
-    String::from_utf16(wide).map_err(mlua::Error::external)
+    // Lua strings are byte buffers, with no u16 alignment contract. Decode
+    // pairs explicitly while preserving the native-endian input convention.
+    char::decode_utf16(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]])),
+    )
+    .collect::<Result<String, _>>()
+    .map_err(mlua::Error::external)
 }
 
 pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlua::Result<()> {
@@ -1260,6 +1263,23 @@ mod test {
     use super::*;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Instant;
+
+    #[test]
+    fn utf16_decoder_preserves_unicode_and_rejects_malformed_input() {
+        let lua = Lua::new();
+        let expected = "A\0表😀";
+        let bytes: Vec<u8> = expected.encode_utf16().flat_map(u16::to_ne_bytes).collect();
+        assert_eq!(
+            utf16_to_utf8(&lua, lua.create_string(&bytes).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            utf16_to_utf8(&lua, lua.create_string([]).unwrap()).unwrap(),
+            ""
+        );
+        assert!(utf16_to_utf8(&lua, lua.create_string([0u8]).unwrap()).is_err());
+        assert!(utf16_to_utf8(&lua, lua.create_string(0xd800u16.to_ne_bytes()).unwrap()).is_err());
+    }
 
     fn timer_test_executor() -> promise::spawn::SimpleExecutor {
         let limits = promise::spawn::MainThreadAdmissionLimits::new(

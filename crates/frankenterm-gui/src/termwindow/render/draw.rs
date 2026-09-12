@@ -211,12 +211,12 @@ impl crate::TermWindow {
         }
         drop(render_pass);
 
-        // In this wgpu API both `Queue::submit` and `SurfaceTexture::present`
+        // In this wgpu API both `Queue::submit` and `Queue::present`
         // are synchronously infallible. Device-loss errors reported later by
         // wgpu are outside this synchronous seam; a successful return does not
         // prove asynchronous GPU completion or visible scanout.
         let _submission = webgpu.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        webgpu.queue.present(output);
 
         Ok(())
     }

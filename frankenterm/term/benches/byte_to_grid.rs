@@ -379,6 +379,9 @@ fn bench_resize_reflow(c: &mut Criterion) {
 }
 
 fn bench_config() -> Criterion {
+    // Stage attribution is opt-in through RUST_LOG. Keep sampled diagnostic
+    // runs separate from Criterion's uninstrumented latency baseline.
+    let _ = env_logger::try_init();
     measure_payload("ascii_agent_output", ascii_agent_payload());
     measure_payload("wrapped_agent_output", wrapped_agent_payload());
     measure_payload("mixed_control_output", mixed_control_payload());

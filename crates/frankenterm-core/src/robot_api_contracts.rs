@@ -1983,7 +1983,13 @@ mod tests {
         let artifact = read_workspace_json("docs/attestations/proofs/robot-contract-doctor.json");
         assert_eq!(artifact["category"], "proofs/robot-contracts");
         assert_eq!(artifact["produced_by_bead"], "ft-7h5da.13.7");
-        assert_eq!(artifact["overall_status"], "pass_with_tracked_exceptions");
+        assert!(matches!(
+            artifact["overall_status"].as_str(),
+            Some("pending_final_qualification" | "pass_with_tracked_exceptions")
+        ));
+        if artifact["overall_status"] == "pending_final_qualification" {
+            assert_eq!(artifact["contract"]["full_release_qualified"], false);
+        }
 
         let slots = manifest["slots"]
             .as_array()
@@ -1992,14 +1998,15 @@ mod tests {
             .iter()
             .find(|slot| {
                 slot["category"] == "proofs/robot-contracts"
-                    && slot["deferred_to_bead"] == artifact["produced_by_bead"]
+                    && slot["produced_by_bead"] == artifact["produced_by_bead"]
             })
-            .expect("deferred robot-contract-doctor manifest slot exists");
-        assert!(slot["path"].is_null());
-        assert_eq!(slot["deferred_to_bead"], artifact["produced_by_bead"]);
-        assert!(slot["deferred_reason"].as_str().is_some_and(|reason| {
-            reason.contains("producer is blocked") && reason.contains("excluded from release")
-        }));
+            .expect("populated robot-contract-doctor manifest slot exists");
+        assert_eq!(
+            slot["path"],
+            "docs/attestations/proofs/robot-contract-doctor.json"
+        );
+        assert!(slot["deferred_to_bead"].is_null());
+        assert!(slot["deferred_reason"].is_null());
         assert!(
             slot["proof_categories"]
                 .as_array()

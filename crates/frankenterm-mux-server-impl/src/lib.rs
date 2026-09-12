@@ -3244,9 +3244,11 @@ impl LiveScrollbackSpillSink {
             );
             let active_path = Self::append_wal_path(&self.manifest_path)?;
             let stage_path = Self::append_wal_stage_path(&self.manifest_path)?;
-            let parent = active_path
+            let _parent = active_path
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("append WAL path has no parent"))?;
+            #[cfg(unix)]
+            let parent = _parent;
 
             if let Some(active) = Self::read_append_wal(&active_path)? {
                 let manifest = Self::read_manifest(&self.manifest_path)?
@@ -3354,7 +3356,9 @@ impl LiveScrollbackSpillSink {
                     "opened append WAL stage is not a regular file"
                 );
                 if let Some(expected) = expected_stage_metadata {
-                    let observed = file.metadata()?;
+                    let _observed = file.metadata()?;
+                    #[cfg(unix)]
+                    let observed = _observed;
                     anyhow::ensure!(
                         expected.file_type().is_file()
                             && expected.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
@@ -5350,10 +5354,12 @@ impl LiveScrollbackSpillSink {
                     <= LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
                 "scrollback manifest serialization exceeds its byte ceiling"
             );
-            let parent = self
+            let _parent = self
                 .manifest_path
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("scrollback manifest path has no parent"))?;
+            #[cfg(unix)]
+            let parent = _parent;
             // One deterministic stage slot bounds pre-publication failures. A
             // retry reuses the exact authenticated target; a different target
             // fails closed behind the retained diagnostic rather than allocating
@@ -7486,7 +7492,7 @@ fn validate_live_scrollback_manifest_identity(
 
 fn validate_live_scrollback_directory(
     path: &std::path::Path,
-    require_private: bool,
+    _require_private: bool,
 ) -> anyhow::Result<std::fs::Metadata> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspect live scrollback pane directory {}", path.display()))?;
@@ -7500,7 +7506,7 @@ fn validate_live_scrollback_directory(
         use std::os::unix::fs::PermissionsExt as _;
 
         anyhow::ensure!(
-            !require_private || unix_mode_is_private(metadata.permissions().mode()),
+            !_require_private || unix_mode_is_private(metadata.permissions().mode()),
             "live scrollback pane directory is not private: {}",
             path.display()
         );

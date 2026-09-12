@@ -44,6 +44,20 @@ impl super::TermWindow {
             return None;
         }
         let (authority, source_sequence, dims) = SelectionAuthority::capture_source(&**pane)?;
+        let stamp = crate::selection::SelectionFrameStamp {
+            authority,
+            source_sequence,
+            viewport: self
+                .get_viewport(pane.pane_id())
+                .unwrap_or(dims.physical_top),
+            geometry: self.selection_frame_geometry(pos)?,
+        };
+        SelectionAuthority::capture_source(&**pane)
+            .filter(|(after, _, after_dims)| *after == authority && *after_dims == dims)
+            .map(|_| stamp)
+    }
+
+    pub fn selection_frame_geometry(&self, pos: &mux::tab::PositionedPane) -> Option<[usize; 12]> {
         let (padding_left, padding_top) = self.padding_left_top();
         let border = self.get_os_border();
         let top_bar = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
@@ -51,29 +65,20 @@ impl super::TermWindow {
         } else {
             0.0
         };
-        let stamp = crate::selection::SelectionFrameStamp {
-            authority,
-            source_sequence,
-            viewport: self
-                .get_viewport(pane.pane_id())
-                .unwrap_or(dims.physical_top),
-            geometry: [
-                self.render_metrics.cell_size.width as usize,
-                self.render_metrics.cell_size.height as usize,
-                pos.left,
-                pos.top,
-                pos.width,
-                pos.height,
-                self.dimensions.pixel_width,
-                self.dimensions.pixel_height,
-                (padding_left + border.left.get() as f32).to_bits() as usize,
-                (padding_top + top_bar + border.top.get() as f32).to_bits() as usize,
-                self.shape_generation,
-                self.config.generation() as usize,
-            ],
-        };
-        (SelectionAuthority::capture_source(&**pane) == Some((authority, source_sequence, dims)))
-            .then_some(stamp)
+        Some([
+            self.render_metrics.cell_size.width as usize,
+            self.render_metrics.cell_size.height as usize,
+            pos.left,
+            pos.top,
+            pos.width,
+            pos.height,
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height,
+            (padding_left + border.left.get() as f32).to_bits() as usize,
+            (padding_top + top_bar + border.top.get() as f32).to_bits() as usize,
+            self.shape_generation,
+            self.config.generation() as usize,
+        ])
     }
 
     fn mouse_selection_authority(&self, pane: &Arc<dyn Pane>) -> Option<SelectionAuthority> {
@@ -99,7 +104,9 @@ impl super::TermWindow {
             update(&mut selection);
             selection.seqno = current_seqno;
             selection.authority = expected;
-            if expected.is_none() || SelectionAuthority::capture(&**pane) != expected {
+            if expected.is_none()
+                || selection.is_invalidated_by(SelectionAuthority::capture(&**pane))
+            {
                 selection.clear();
             }
         }
@@ -111,6 +118,11 @@ impl super::TermWindow {
     pub fn selection_authority_is_current(&self, pane: &Arc<dyn Pane>) -> bool {
         let current = SelectionAuthority::capture(&**pane);
         self.selection(pane.pane_id()).is_authorized_by(current)
+    }
+
+    pub fn selection_authority_has_changed(&self, pane: &Arc<dyn Pane>) -> bool {
+        let current = SelectionAuthority::capture(&**pane);
+        self.selection(pane.pane_id()).is_invalidated_by(current)
     }
 
     /// Returns the selection region as a series of Line
@@ -159,16 +171,59 @@ impl super::TermWindow {
         text
     }
 
-    pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
+    pub fn clear_selection_drag(&mut self) {
         self.active_selection_drag_pane = None;
+        self.active_selection_drag_button = None;
+    }
+
+    pub fn begin_selection_drag(&mut self, pane: &Arc<dyn Pane>) {
+        self.active_selection_drag_button = self.current_mouse_event.as_ref().and_then(|event| {
+            super::mouseevent::selection_gesture_button(&event.kind, &self.current_mouse_buttons)
+        });
+        self.active_selection_drag_pane = self.active_selection_drag_button.map(|_| pane.pane_id());
+    }
+
+    pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
+        self.clear_selection_drag();
+        self.pane_state(pane.pane_id()).pending_selection_start = None;
         self.update_selection(pane, None, Selection::clear);
     }
 
     pub fn extend_selection_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
-        if !self.selection_authority_is_current(pane)
+        // Even a deferred first motion is a drag, not a hyperlink click.
+        self.pane_state(pane.pane_id()).suppress_selection_link = true;
+        let had_pending_start = self
+            .pane_state(pane.pane_id())
+            .pending_selection_start
+            .is_some();
+        self.retry_pending_selection_start(pane);
+        if had_pending_start {
+            // A successful retry already applies the retained motion once.
+            // Real input also restarts presentation after background retries
+            // exhaust; this is one invalidation per motion, not a paint loop.
+            if self
+                .pane_state(pane.pane_id())
+                .pending_selection_start
+                .is_some()
+            {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            return;
+        }
+        if self.selection_authority_has_changed(pane) {
+            self.clear_selection(pane);
+            return;
+        }
+        if self.selection(pane.pane_id()).authority.is_none()
             || self.mouse_selection_authority(pane).is_none()
         {
-            self.clear_selection(pane);
+            // Output/parser contention or autoscroll can outrun presentation.
+            // Wait for a usable frame without discarding the drag's anchor.
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
             return;
         }
         self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
@@ -290,9 +345,7 @@ impl super::TermWindow {
             }
         }
 
-        if !self.selection_authority_is_current(pane)
-            || self.mouse_selection_authority(pane).is_none()
-        {
+        if self.selection_authority_has_changed(pane) {
             self.clear_selection(pane);
             return;
         }
@@ -314,15 +367,106 @@ impl super::TermWindow {
     }
 
     pub fn select_text_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
+        {
+            let mut state = self.pane_state(pane.pane_id());
+            state.pending_selection_start = None;
+            state.suppress_selection_link = false;
+        }
         let expected = self.mouse_selection_authority(pane);
         if expected.is_none() {
-            self.clear_selection(pane);
+            let pending = {
+                let state = self.pane_state(pane.pane_id());
+                state
+                    .mouse_selection_frame
+                    .zip(state.mouse_terminal_coords)
+                    .zip(self.active_selection_drag_button)
+                    .map(|((frame, (position, row)), button)| {
+                        crate::selection::PendingSelectionStart {
+                            frame,
+                            coordinate: SelectionCoordinate::x_y(position.column, row),
+                            mode,
+                            button,
+                            paint_retries_remaining: 3,
+                        }
+                    })
+            };
+            self.selection(pane.pane_id()).clear();
+            let mut state = self.pane_state(pane.pane_id());
+            state.pending_selection_start = pending;
+            state.suppress_selection_link = true;
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
             return;
         }
         let (x, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
             Some(coords) => (coords.0.column, coords.1),
             None => return,
         };
+        self.select_text_at_coordinate(mode, pane, expected, x, y);
+    }
+
+    pub fn retry_pending_selection_start(&mut self, pane: &Arc<dyn Pane>) {
+        let Some(pending) = self.pane_state(pane.pane_id()).pending_selection_start else {
+            return;
+        };
+        if self.active_selection_drag_pane != Some(pane.pane_id())
+            || self.active_selection_drag_button != Some(pending.button)
+            || !self.current_mouse_buttons.contains(&pending.button)
+        {
+            self.pane_state(pane.pane_id()).pending_selection_start = None;
+            return;
+        }
+        let current = self.selection_frame_stamp(pane);
+        let resolved = pending.resolve(current, &self.pane_state(pane.pane_id()).selection_frame);
+        match resolved {
+            crate::selection::PendingSelectionResolution::Ready => {}
+            crate::selection::PendingSelectionResolution::Wait => return,
+            crate::selection::PendingSelectionResolution::Invalidated => {
+                self.clear_selection(pane);
+                return;
+            }
+        };
+        self.pane_state(pane.pane_id()).pending_selection_start = None;
+        let SelectionX::Cell(x) = pending.coordinate.x else {
+            return;
+        };
+        self.select_text_at_coordinate(
+            pending.mode,
+            pane,
+            Some(pending.frame.authority),
+            x,
+            pending.coordinate.y,
+        );
+        // Motion may have arrived while the press was waiting. Its endpoint
+        // is reusable only if it was measured against the same displayed map.
+        let extend = {
+            let mut state = self.pane_state(pane.pane_id());
+            if state
+                .mouse_selection_frame
+                .is_some_and(|frame| frame.same_coordinates(pending.frame))
+            {
+                state.mouse_selection_frame = state.selection_frame.for_mouse(current);
+                state.mouse_terminal_coords.is_some_and(|(position, row)| {
+                    position.column != x || row != pending.coordinate.y
+                })
+            } else {
+                false
+            }
+        };
+        if extend {
+            self.extend_selection_at_mouse_cursor(pending.mode, pane);
+        }
+    }
+
+    fn select_text_at_coordinate(
+        &mut self,
+        mode: SelectionMode,
+        pane: &Arc<dyn Pane>,
+        expected: Option<SelectionAuthority>,
+        x: usize,
+        y: StableRowIndex,
+    ) {
         match mode {
             SelectionMode::Line => {
                 let start = SelectionCoordinate::x_y(x, y);
@@ -359,9 +503,7 @@ impl super::TermWindow {
 
         self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
         self.selection(pane.pane_id()).authority = expected;
-        if !self.selection_authority_is_current(pane)
-            || self.mouse_selection_authority(pane) != expected
-        {
+        if self.selection_authority_has_changed(pane) {
             self.clear_selection(pane);
             return;
         }

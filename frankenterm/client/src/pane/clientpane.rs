@@ -2856,6 +2856,13 @@ fn validate_render_application_resources(
 }
 
 impl ClientPane {
+    /// Atomically observe cached selection coordinates without blocking the GUI.
+    pub fn selection_source_snapshot(
+        &self,
+    ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions, bool)> {
+        self.renderable.try_lock()?.selection_source_snapshot()
+    }
+
     pub(crate) fn new(
         client: &Arc<ClientInner>,
         local_pane_id: PaneId,
@@ -4764,6 +4771,18 @@ mod tests {
             None,
             false,
         ))
+    }
+
+    #[test]
+    fn selection_source_snapshot_is_nonblocking_while_renderable_is_locked() {
+        let inner = test_client_inner(731);
+        let pane = test_client_pane(&inner, 733, 743);
+        let before = pane.selection_source_snapshot().unwrap();
+        {
+            let _guard = pane.renderable.lock();
+            assert!(pane.selection_source_snapshot().is_none());
+        }
+        assert_eq!(pane.selection_source_snapshot(), Some(before));
     }
 
     fn test_client_inner_with_rpc_peer(

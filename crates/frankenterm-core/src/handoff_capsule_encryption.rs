@@ -48,9 +48,8 @@
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, common::getrandom},
 };
-use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -350,20 +349,16 @@ impl XChaCha20Poly1305Hook {
         let (key_id, _) = body.split_at_checked(XCHACHA20_POLY1305_KEY_ID_LEN)?;
         Some(hex::encode(key_id))
     }
-}
 
-impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
-    fn hook_id(&self) -> &'static str {
-        Self::HOOK_ID
-    }
-
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+    fn seal_with_entropy(
+        &self,
+        plaintext: &[u8],
+        fill_nonce: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> Result<Vec<u8>, EncryptionError> {
         let mut nonce = XNonce::default();
-        SysRng
-            .try_fill_bytes(nonce.as_mut())
-            .map_err(|_| EncryptionError::EncryptionFailed {
-                reason: "XChaCha20Poly1305 nonce entropy unavailable".into(),
-            })?;
+        fill_nonce(nonce.as_mut()).map_err(|_| EncryptionError::EncryptionFailed {
+            reason: "XChaCha20Poly1305 nonce entropy unavailable".into(),
+        })?;
         let encrypted = self.cipher.encrypt(&nonce, plaintext).map_err(|_| {
             EncryptionError::EncryptionFailed {
                 reason: "XChaCha20Poly1305 seal failed".into(),
@@ -382,6 +377,16 @@ impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
         sealed.extend_from_slice(&encrypted);
         Ok(sealed)
     }
+}
+
+impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
+    fn hook_id(&self) -> &'static str {
+        Self::HOOK_ID
+    }
+
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        self.seal_with_entropy(plaintext, getrandom::fill)
+    }
 
     fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         let body = ciphertext
@@ -399,18 +404,16 @@ impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
                 reason: "XChaCha20Poly1305 key id mismatch".into(),
             });
         }
-        let Some((nonce_bytes, encrypted)) = body.split_at_checked(XCHACHA20_POLY1305_NONCE_LEN)
+        let Some((nonce_bytes, encrypted)) =
+            body.split_first_chunk::<XCHACHA20_POLY1305_NONCE_LEN>()
         else {
             return Err(EncryptionError::DecryptionFailed {
                 reason: "truncated XChaCha20Poly1305 nonce".into(),
             });
         };
-        let nonce =
-            <&XNonce>::try_from(nonce_bytes).map_err(|_| EncryptionError::DecryptionFailed {
-                reason: "invalid XChaCha20Poly1305 nonce length".into(),
-            })?;
+        let nonce = XNonce::from(*nonce_bytes);
         self.cipher
-            .decrypt(nonce, encrypted)
+            .decrypt(&nonce, encrypted)
             .map_err(|_| EncryptionError::DecryptionFailed {
                 reason: "XChaCha20Poly1305 authentication failed".into(),
             })
@@ -573,6 +576,24 @@ mod tests {
             .expect("open ok");
         assert_eq!(recovered.sections, capsule.sections);
         recovered.verify_integrity().expect("integrity preserved");
+    }
+
+    #[test]
+    fn xchacha20poly1305_hook_entropy_failure_returns_no_ciphertext() {
+        let hook = XChaCha20Poly1305Hook::try_from_key_slice(&[0x11; 32]).expect("valid key");
+        let error = hook
+            .seal_with_entropy(b"private capsule contents", |nonce| {
+                // A failed OS read may have partially filled its destination.
+                nonce[..4].copy_from_slice(&[1, 2, 3, 4]);
+                Err(getrandom::Error::UNSUPPORTED)
+            })
+            .expect_err("entropy failure must not emit an encrypted envelope");
+        assert_eq!(
+            error,
+            EncryptionError::EncryptionFailed {
+                reason: "XChaCha20Poly1305 nonce entropy unavailable".into(),
+            }
+        );
     }
 
     #[test]

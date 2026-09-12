@@ -19162,7 +19162,7 @@ where
                 backup_created: false,
             })?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let mut reconciled_transactions = Vec::new();
+    let reconciled_transactions = Vec::new();
     let mut current = read_open_agent_config_file(
         &parent,
         &prepared.target_path,
@@ -19415,9 +19415,11 @@ where
         })?;
         Ok(backup_created)
     })();
-    let backup_created = match publication {
+    let _backup_created = match publication {
         Ok(backup_created) => backup_created,
-        Err(mut error) => {
+        Err(error) => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let mut error = error;
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let classified_outcome = classify_unacknowledged_agent_config_transaction(
@@ -19466,7 +19468,7 @@ where
         &claim_sha256,
         AgentConfigTransactionOutcome::Applied,
         true,
-        backup_created,
+        _backup_created,
         true,
     )
     .map_err(|message| AgentConfigApplyError {
@@ -19474,7 +19476,7 @@ where
             "Agent config '{}' was applied but its durable acknowledgement failed: {message}",
             prepared.target_path.display()
         ),
-        backup_created,
+        backup_created: _backup_created,
     })?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let transaction_receipt = unreachable!();
@@ -19485,7 +19487,7 @@ where
             display_name: prepared.display_name.clone(),
             action: agent_config_action_label(actual_action).to_string(),
             filename: prepared.filename.clone(),
-            backup_created,
+            backup_created: _backup_created,
             error: None,
         },
         transactions: {
@@ -85012,7 +85014,7 @@ fn revalidate_artifact_parent_directory(
     parent_path: &Path,
     pinned_parent: &cap_std::fs::Dir,
 ) -> anyhow::Result<()> {
-    use cap_fs_ext::OsMetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
     let pinned_metadata = pinned_parent.dir_metadata().map_err(|err| {
         anyhow::anyhow!(
@@ -85528,7 +85530,7 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
         anyhow::bail!("Mux dump is not a regular file: {}", path.display());
     }
     {
-        use cap_fs_ext::OsMetadataExt as _;
+        use cap_fs_ext::MetadataExt as _;
 
         let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
             anyhow::anyhow!(
@@ -85595,7 +85597,7 @@ fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<
         anyhow::bail!("Mux dump changed during verification: {}", path.display());
     }
     {
-        use cap_fs_ext::OsMetadataExt as _;
+        use cap_fs_ext::MetadataExt as _;
 
         let path_metadata_after = parent.symlink_metadata(&leaf).map_err(|err| {
             anyhow::anyhow!(

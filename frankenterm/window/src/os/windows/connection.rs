@@ -16,20 +16,18 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
-use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use winapi::um::winbase::INFINITE;
-use winapi::um::wingdi::{
-    DEVMODEW, DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE,
-};
+use winapi::um::wingdi::{DEVMODEW, DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY};
 use winapi::um::winnt::HANDLE;
 use winapi::um::winuser::*;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE,
 };
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
@@ -173,7 +171,11 @@ impl Connection {
                         let mut inner = handle.borrow_mut();
                         prom.result(f(&mut inner));
                     } else {
-                        fail_window_op_for_destroyed_window(&mut prom, "Windows", window.0);
+                        fail_window_op_for_destroyed_window(
+                            &mut prom,
+                            "Windows",
+                            format!("{window:?}"),
+                        );
                     }
                 })
                 .detach(),
@@ -375,8 +377,9 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
             GetDisplayConfigBufferSizes(flags, &mut path_count as *mut _, &mut mode_count as *mut _)
         };
 
-        if result != ERROR_SUCCESS as i32 {
-            return Err(std::io::Error::last_os_error()).context("GetDisplayConfigBufferSizes");
+        if result != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(result.0 as i32))
+                .context("GetDisplayConfigBufferSizes");
         }
 
         paths.resize_with(path_count as usize, DISPLAYCONFIG_PATH_INFO::default);
@@ -389,7 +392,7 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
                 paths.as_mut_ptr(),
                 &mut mode_count as &mut _,
                 modes.as_mut_ptr(),
-                std::ptr::null_mut(),
+                None,
             )
         };
 
@@ -398,12 +401,13 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
         paths.resize_with(path_count as usize, DISPLAYCONFIG_PATH_INFO::default);
         modes.resize_with(mode_count as usize, DISPLAYCONFIG_MODE_INFO::default);
 
-        if result == ERROR_INSUFFICIENT_BUFFER as i32 {
+        if result == ERROR_INSUFFICIENT_BUFFER {
             continue;
         }
 
-        if result != ERROR_SUCCESS as i32 {
-            return Err(std::io::Error::last_os_error()).context("QueryDisplayConfig");
+        if result != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(result.0 as i32))
+                .context("QueryDisplayConfig");
         }
 
         break;
