@@ -157,7 +157,10 @@ proptest! {
         let mut tracker = ContextBudgetTracker::new(1, config);
         prop_assert!((tracker.utilization() - 0.0).abs() < f64::EPSILON);
         tracker.update_tokens(tokens);
-        prop_assert_eq!(tracker.utilization(), if tokens == 0 { 0.0 } else { 1.0 });
+        // These clamped endpoints are exact, so retain an exact oracle rather
+        // than introducing tolerance for intermediate floating-point values.
+        let expected = if tokens == 0 { 0.0_f64 } else { 1.0_f64 };
+        prop_assert_eq!(tracker.utilization().to_bits(), expected.to_bits());
     }
 }
 

@@ -143,7 +143,7 @@ fn windows_release_inventory_requires_the_complete_application_family() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            r#"
+            r"
 import pathlib, stat, sys, zipfile
 root = pathlib.Path(sys.argv[1])
 validator = compile(sys.argv[2], 'production-release-inventory', 'exec')
@@ -176,7 +176,7 @@ for name, names, accepted in cases:
     else:
         assert accepted, name + ' unexpectedly accepted'
 print('WINDOWS_INVENTORY_CONTROLS_PASSED', len(cases))
-"#,
+",
         ])
         .arg(dir.path())
         .arg(inventory)

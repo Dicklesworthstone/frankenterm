@@ -38,7 +38,7 @@ fn csi_final_bytes_do_not_open_strings() {
         }
     }
     // The same bytes directly after ESC still introduce string bodies.
-    for intro in [b'P', b'X', b']', b'^', b'_'] {
+    for intro in *b"PX]^_" {
         let bytes = [0x1b, intro, b'x', 0x1b, b'\\', b't'];
         let mut state = OutputScanState::default();
         let metrics = scan_newlines_and_ansi_with_state(&bytes, &mut state);

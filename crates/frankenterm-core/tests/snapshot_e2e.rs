@@ -1,3 +1,8 @@
+// The capture -> shutdown admission -> blocking authority future chain needs
+// more than the default 128 trait-solver steps to prove Send on the pinned
+// nightly. Match the other snapshot integration crates' bounded solver budget.
+#![recursion_limit = "256"]
+
 //! Hermetic snapshot persistence and manual-restore contract tests with
 //! structured reports.
 //!

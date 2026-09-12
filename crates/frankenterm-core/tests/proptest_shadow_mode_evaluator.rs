@@ -665,7 +665,7 @@ proptest! {
         for i in 0..high_count {
             let cycle = (low_count + i) as u64;
             let diff = eval.evaluate_cycle(cycle, (cycle * 1000) as i64, &empty_recs, &good_events);
-            prop_assert_eq!(diff.fidelity_score, 1.0);
+            prop_assert_eq!(diff.fidelity_score.to_bits(), 1.0_f64.to_bits());
         }
 
         // Phase 3: more low-fidelity cycles
