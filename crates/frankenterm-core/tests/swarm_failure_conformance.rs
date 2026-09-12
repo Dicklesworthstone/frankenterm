@@ -99,12 +99,29 @@ fn every_scenario_declares_structured_log_fields_and_typed_receipts() {
             scenario.failure_mode
         );
         assert!(
-            scenario.proof_command.contains("rch exec")
-                && scenario
-                    .proof_command
-                    .contains("cargo test -p frankenterm-core"),
+            scenario.proof_command == SWARM_FAILURE_CONFORMANCE_RCH_COMMAND,
             "{} proof command is not RCH-routed",
             scenario.failure_mode
+        );
+    }
+}
+
+#[test]
+fn proof_command_validation_rejects_unrouted_and_injected_commands() {
+    let report = swarm_failure_conformance_report();
+    let mut scenario = report.scenarios[0].clone();
+    assert!(scenario.validation_errors().is_empty());
+    for command in [
+        "cargo test -p frankenterm-core",
+        "echo 'rch exec cargo test -p frankenterm-core'",
+        "rch exec -- cargo test -p other-crate",
+    ] {
+        scenario.proof_command = command.to_owned();
+        assert!(
+            scenario
+                .validation_errors()
+                .iter()
+                .any(|error| error.contains("proof command"))
         );
     }
 }

@@ -299,6 +299,9 @@ pub fn is_region_output_suppressed(write_region: RowSpan) -> bool {
 /// use tracing_subscriber::prelude::*;
 ///
 /// let layer = fmt::layer().with_writer(TuiAwareWriter);
+/// let subscriber = tracing_subscriber::registry().with(layer);
+/// tracing::subscriber::set_global_default(subscriber)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy)]
 pub struct TuiAwareWriter;

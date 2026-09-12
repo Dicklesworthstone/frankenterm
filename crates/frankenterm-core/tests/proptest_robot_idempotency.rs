@@ -639,6 +639,9 @@ fn evict_expired_cleans_old_records() {
     guard.evict_expired(1150);
     assert_eq!(guard.len(), 2);
 
-    guard.evict_expired(1301);
+    guard.evict_expired(1300);
     assert_eq!(guard.len(), 1);
+    assert!(guard.check(&MutationKey::derive("t", "3"), 1300).is_some());
+    guard.evict_expired(1301);
+    assert!(guard.is_empty());
 }

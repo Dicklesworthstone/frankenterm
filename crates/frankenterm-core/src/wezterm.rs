@@ -1253,6 +1253,10 @@ fn wezterm_cli_override_slot() -> &'static Mutex<Option<String>> {
 
 /// Override the wezterm CLI binary path for tests and in-process harnesses.
 ///
+/// While present, this also selects the CLI backend for config-aware clients:
+/// a live host mux must not intercept requests intended for the fixture.
+/// Clearing the override restores ordinary backend discovery.
+///
 /// This avoids mutating process-global environment variables in Rust 2024
 /// code paths, where `std::env::set_var` is unsafe and forbidden in this
 /// workspace.
@@ -9705,11 +9709,35 @@ fn compatibility_inputs_for_backend_selection(
 
 /// Build a `UnifiedClient` by probing the runtime environment.
 ///
+/// An explicit in-process CLI override selects that fixture before any host
+/// discovery. Without an override, selection follows the ordinary rules:
+///
 /// 1. Check if the `vendored` feature is enabled (compile time).
 /// 2. Run vendored compatibility checks (when feature available).
 /// 3. Attempt mux socket discovery (config → env → canonical defaults).
 /// 4. If all pass, use vendored backend; else fall back to CLI.
 pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
+    let cli_override_active = wezterm_cli_override_slot()
+        .lock()
+        .unwrap_or_else(record_poison_and_recover)
+        .is_some();
+    build_unified_client_with_cli_override(config, cli_override_active)
+}
+
+fn build_unified_client_with_cli_override(
+    config: &crate::config::Config,
+    cli_override_active: bool,
+) -> UnifiedClient {
+    if cli_override_active {
+        return UnifiedClient::from_handle(
+            Arc::new(WeztermClient::new().with_timeout(config.cli.timeout_seconds)),
+            BackendSelection {
+                kind: BackendKind::Cli,
+                reason: "explicit in-process CLI override".to_string(),
+                compatibility: None,
+            },
+        );
+    }
     let vendored_enabled = cfg!(feature = "vendored");
     // Socket discovery: one ranked resolver covers the explicit config path,
     // the environment, the socket a running FrankenTerm GUI publishes, and the
@@ -12772,10 +12800,33 @@ mod unified_tests {
     #[test]
     fn build_unified_client_returns_cli_without_vendored_feature() {
         let config = crate::config::Config::default();
-        let client = build_unified_client(&config);
+        let client = build_unified_client_with_cli_override(&config, false);
         if !cfg!(feature = "vendored") {
             assert_eq!(client.selection().kind, BackendKind::Cli);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cli_override_prevents_live_socket_selection_until_cleared() {
+        let directory = tempfile::tempdir().expect("socket fixture directory");
+        let socket = directory.path().join("mux.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)
+            .expect("bind live mux discovery fixture");
+        let mut config = crate::config::Config::default();
+        config.vendored.mux_socket_path = Some(socket.to_string_lossy().into_owned());
+        // Inject the override snapshot to avoid racing unrelated global-override
+        // users in the parallel unit suite. Both branches use production selection.
+        let overridden = build_unified_client_with_cli_override(&config, true);
+        assert_eq!(overridden.selection().kind, BackendKind::Cli);
+        assert!(overridden.discovered_socket().is_none());
+
+        let restored = build_unified_client_with_cli_override(&config, false);
+        assert_eq!(
+            restored.discovered_socket().map(|selected| &selected.path),
+            Some(&socket),
+            "clearing the override must restore live socket discovery"
+        );
     }
 
     #[test]
@@ -12787,7 +12838,9 @@ mod unified_tests {
             "/tmp/ft-shard-1.sock".to_string(),
         ];
 
-        let client = build_unified_client(&config);
+        // This selection-policy test requires no override; unrelated parallel
+        // fixtures may install the process-wide CLI override while it runs.
+        let client = build_unified_client_with_cli_override(&config, false);
         assert!(
             client
                 .selection()

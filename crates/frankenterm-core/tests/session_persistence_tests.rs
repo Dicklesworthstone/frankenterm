@@ -163,6 +163,11 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             .expect("locate canonical v40 retained-size schema"),
     )
     .expect("install canonical v40 retained-size authority");
+    conn.execute_batch(
+        frankenterm_core::storage::migrations::session_recovery_usability_schema_sql()
+            .expect("locate canonical v44 recovery-usability schema"),
+    )
+    .expect("install canonical v44 recovery-usability authority");
 
     (tmp, db_path)
 }
@@ -271,6 +276,16 @@ fn restore_queries_follow_newest_unclean_checkpoint() {
             .await
             .unwrap();
 
+        assert!(
+            find_unclean_sessions(db_path.as_str()).unwrap().is_empty(),
+            "live owner is not a recovery candidate"
+        );
+        // Model PID reuse: this persisted owner incarnation has ended, even
+        // though the fixture's current process remains alive.
+        Connection::open(db_path.as_str()).unwrap().execute(
+            "UPDATE mux_sessions SET owner_process_start = owner_process_start + 1 WHERE session_id = ?1",
+            [&startup.session_id],
+        ).unwrap();
         let candidates = find_unclean_sessions(db_path.as_str()).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, startup.session_id);
@@ -405,11 +420,14 @@ fn shutdown_marks_session_clean() {
         assert_eq!(bound_witness, r.state_hash);
         drop(conn);
 
-        // Any later checkpoint invalidates the old receipt atomically.
-        engine
-            .capture(&[make_pane_simple(1)], SnapshotTrigger::Manual)
-            .await
-            .unwrap();
+        // Closing is terminal for this engine: refused late captures preserve
+        // the exact clean receipt rather than silently reopening admission.
+        assert!(matches!(
+            engine
+                .capture(&[make_pane_simple(1)], SnapshotTrigger::Manual)
+                .await,
+            Err(SnapshotError::ShuttingDown)
+        ));
         let conn = Connection::open(db_path.as_str()).unwrap();
         let (clean, clean_checkpoint_id): (i64, Option<i64>) = conn
             .query_row(
@@ -419,8 +437,8 @@ fn shutdown_marks_session_clean() {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(clean, 0);
-        assert_eq!(clean_checkpoint_id, None);
+        assert_eq!(clean, 1);
+        assert_eq!(clean_checkpoint_id, Some(r.checkpoint_id));
     });
 }
 

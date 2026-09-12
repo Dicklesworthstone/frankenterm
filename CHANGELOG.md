@@ -45,6 +45,16 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Onboarding refuses high-risk eligibility when any required check is missing or skipped, and reports which check lacks passing evidence.
 - Schema 47 preserves an audit action's target pane identity even when the pane has not been observed or is later removed. Native read and search audits no longer fail the observation foreign key. The migration is forward-only; retain a database backup with the previous application for rollback.
 - Optional mmap capture mirrors cannot override committed SQLite text with stale or empty cache contents after redaction. Mirror reads are bounded and read-only, and fall back to SQLite when the cached records differ.
+- Once an mmap pane log is the primary history, truncated or malformed committed tails return an error instead of silently switching to an older SQLite fallback.
+- Incremental terminal parsing bounds retained actions and bytes across incomplete input chunks, reuses its pending buffer, and reports overflow without dropping the final action batch. ANSI scanning distinguishes CSI final bytes from string-control introducers.
+- Text-only builds expose the shape cache's image-attachment predicate and return false when image support is disabled.
+- GUI update notifications compare semantic versions rather than build-description strings, so older releases are not advertised as upgrades.
+- MCP proxy discovery rejects empty or malformed safety annotations. Its default read-only surface requires an explicit read-only hint, and transaction risk classification preserves critical tags regardless of tag order.
+- Claude compaction detection rejects incomplete token-count messages while retaining complete banners. Corpus diagnostics preserve UTF-8 boundaries.
+- Explicit workflow abort commits its state, trigger settlement, audit and undo retirement in one transaction. Writer-owned cleanup releases pane ownership even if the requesting task disappears after admission; stale progress cannot revive an aborted execution.
+- CLI and MCP workflow previews share the same read-only report, including policy-gate metadata and nested text redaction. Workflow status lists retain context, result and timing fields, and event-denial audits use the tool's selected database.
+- Redaction backfill and purge commit catalog adoption, content changes, derived-store maintenance and receipts atomically. Failed receipt writes roll back the operation; dry runs preserve database bytes.
+- Concurrent initialization of the submit-idempotency database validates its header and schema objects from one read snapshot, avoiding a false schema-mismatch error when another connection initializes the database between reads.
 
 These changes are under release qualification. Native profiling of earlier candidates found synchronous scrollback persistence holding the terminal lock during output. Deferred persistence and bounded off-UI reads now address that lock path; complete cold/resident seam reflow and large-history layout coverage remain in progress. Native resize/font latency, streaming-output behavior and memory qualification remain pending. This entry does not announce a release or an instant-resize result.
 

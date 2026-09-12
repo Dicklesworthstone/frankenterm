@@ -123,7 +123,7 @@ fn assert_common_envelope_fields(envelope: &Value, ok: bool, label: &str) {
         "{label} missing now: {envelope}"
     );
     assert_eq!(envelope["mcp_version"], "v1");
-    assert!(envelope["version"].is_string());
+    assert_eq!(envelope["version"], env!("CARGO_PKG_VERSION"));
 }
 
 fn assert_success_envelope_shape(envelope: &Value, label: &str) {
@@ -223,6 +223,11 @@ fn assert_matches_golden(name: &str, captures: &[ToolContractCapture]) {
     let actual_text = pretty_canonical(&actual_value);
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse golden");
+    for capture in expected_value.as_array_mut().expect("golden captures") {
+        capture["success_envelope"]["version"] = Value::from(env!("CARGO_PKG_VERSION"));
+    }
+    let expected = pretty_canonical(&expected_value);
 
     if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
         let actual_path = path.with_extension("actual.json");

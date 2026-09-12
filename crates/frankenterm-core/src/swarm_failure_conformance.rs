@@ -241,11 +241,7 @@ impl SwarmFailureConformanceScenario {
                 self.failure_mode
             ));
         }
-        if !self.proof_command.contains("rch exec")
-            || !self
-                .proof_command
-                .contains("cargo test -p frankenterm-core")
-        {
+        if self.proof_command != SWARM_FAILURE_CONFORMANCE_RCH_COMMAND {
             errors.push(format!(
                 "{} proof command must route through RCH cargo execution",
                 self.failure_mode

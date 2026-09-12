@@ -120,7 +120,57 @@ fn snippet(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len])
+        format!("{}...", &text[..text.floor_char_boundary(max_len)])
+    }
+}
+
+#[test]
+fn snippet_preserves_utf8_at_byte_limit() {
+    assert_eq!(snippet("aé日", 2), "a...");
+    assert_eq!(snippet("aé日", 3), "aé...");
+    assert_eq!(snippet("aé日", 6), "aé日");
+}
+
+#[test]
+fn summarized_compaction_requires_agent_marker() {
+    let engine = PatternEngine::new();
+    for input in [
+        "summarized 8,000 token to 2,100",
+        "A report says it compacted 8,000 tokens to 2,100",
+        "context compacted tokens to",
+        "context compacted 8,000 tokens to",
+        "context compacted ,,, tokens to 2,100",
+        "Auto-compact: summarized 8,000 tokens to",
+        "Conversation compacted tokens to",
+        "Conversation compacted 8,000 tokens to",
+    ] {
+        assert!(
+            engine
+                .detect(input)
+                .iter()
+                .all(|d| d.rule_id != "claude_code.compaction")
+        );
+    }
+    let detections = engine.detect("Auto-compact: summarized 8,000 token to 2,100");
+    let compaction = detections
+        .iter()
+        .find(|d| d.rule_id == "claude_code.compaction")
+        .expect("explicit agent marker must match");
+    assert_eq!(compaction.extracted["tokens_before"], "8,000");
+    assert_eq!(compaction.extracted["tokens_after"], "2,100");
+    for input in [
+        "Conversation compacted",
+        "Conversation compacted (ctrl+o for history)",
+        "before\nConversation compacted (ctrl+o for history)\r\nafter",
+        "context compacted: summarized 100,000 tokens to 15,000 tokens",
+    ] {
+        assert!(
+            engine
+                .detect(input)
+                .iter()
+                .any(|d| d.rule_id == "claude_code.compaction"),
+            "complete compaction notice must match: {input}"
+        );
     }
 }
 

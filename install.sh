@@ -6170,6 +6170,22 @@ build_from_source() {
     "$proof_root/verify-components.sh"
 }
 
+# Called by the executable dispatcher only after acquiring the installer lock.
+# Keep failure receipt publication in this shared path so isolated tests exercise
+# the same receipt and exit-status contract without depending on live host state.
+dispatch_process_family_activation() {
+  if ! activate_process_family_generation "$ACTIVATE_GENERATION"; then
+    if [ "$PROCESS_FAMILY_FAILURE_RECEIPT_SAFE" -eq 1 ] && \
+       [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ] && \
+       [ -n "$PUBLISHED_PROCESS_FAMILY_ROOT" ] && \
+       [ -n "$PUBLISHED_PROCESS_FAMILY_VERSION" ]; then
+      emit_process_family_receipt || true
+    fi
+    return 1
+  fi
+  emit_process_family_receipt || return 1
+}
+
 # Test subprocesses source the exact production functions so failpoint tests
 # execute the installer state machine rather than a structural reimplementation.
 # The seam is source-only: executing install.sh with this variable is rejected.
@@ -6429,16 +6445,7 @@ fi
 # activation. It intentionally runs only after the permanent installer lock is
 # held, but before any network or release-resolution work.
 if [ -n "$ACTIVATE_GENERATION" ]; then
-  if ! activate_process_family_generation "$ACTIVATE_GENERATION"; then
-    if [ "$PROCESS_FAMILY_FAILURE_RECEIPT_SAFE" -eq 1 ] && \
-       [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ] && \
-       [ -n "$PUBLISHED_PROCESS_FAMILY_ROOT" ] && \
-       [ -n "$PUBLISHED_PROCESS_FAMILY_VERSION" ]; then
-      emit_process_family_receipt || true
-    fi
-    exit 1
-  fi
-  emit_process_family_receipt || exit 1
+  dispatch_process_family_activation || exit 1
   exit 0
 fi
 

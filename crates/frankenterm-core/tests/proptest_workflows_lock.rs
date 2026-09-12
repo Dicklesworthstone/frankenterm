@@ -173,7 +173,7 @@ proptest! {
     }
 
     #[test]
-    fn proptest_workflow_lock_zero_limit_behaves_as_unbounded(
+    fn proptest_workflow_lock_zero_limit_denies_all(
         pane_ids in prop::collection::btree_set(1u64..10_000, 1..8),
         workflow_prefix in arb_label(),
         execution_prefix in arb_label(),
@@ -184,11 +184,17 @@ proptest! {
             let workflow = format!("{workflow_prefix}-{idx}");
             let execution = format!("{execution_prefix}-{idx}");
             let result = manager.try_acquire_with_limit(*pane_id, &workflow, &execution, 0);
-            prop_assert_eq!(result.unwrap(), LockAcquisitionResult::Acquired);
+            let denied = result.expect_err("zero limit must deny admission");
+            prop_assert_eq!(denied.active, 0);
+            prop_assert_eq!(denied.limit, 0);
         }
 
-        prop_assert_eq!(manager.active_count(), pane_ids.len());
-        prop_assert_eq!(manager.health().concurrency_limit_blocks_total, 0);
+        prop_assert_eq!(manager.active_count(), 0);
+        prop_assert_eq!(manager.health().concurrency_limit_blocks_total, pane_ids.len() as u64);
+        prop_assert_eq!(
+            manager.try_acquire_with_limit(*pane_ids.first().unwrap(), &workflow_prefix, &execution_prefix, 1).unwrap(),
+            LockAcquisitionResult::Acquired
+        );
     }
 
     #[test]

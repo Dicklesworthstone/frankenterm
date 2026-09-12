@@ -6,8 +6,8 @@
 #![cfg(feature = "subprocess-bridge")]
 
 use frankenterm_core::plan::{
-    MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction, TxId,
-    TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId,
+    MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
+    TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId,
 };
 use frankenterm_core::tx_execution::*;
 use frankenterm_core::tx_observability::TxObservabilityConfig;
@@ -43,7 +43,16 @@ fn make_contract(num_steps: usize) -> MissionTxContract {
             tx_id: TxId("tx-prop".to_string()),
             steps,
             preconditions: Vec::new(),
-            compensations: Vec::new(),
+            compensations: (0..num_steps)
+                .map(|i| TxCompensation {
+                    for_step_id: TxStepId(format!("step-{i}")),
+                    action: StepAction::SendText {
+                        pane_id: i as u64,
+                        text: format!("undo-{i}"),
+                        paste_mode: None,
+                    },
+                })
+                .collect(),
         },
         lifecycle_state: MissionTxState::Planned,
         outcome: TxOutcome::Pending,
@@ -325,6 +334,17 @@ proptest! {
         };
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, config);
         let mut contract = make_contract(num_steps);
+        if fail_idx > 0 {
+            let mut missing_undo = contract.clone();
+            missing_undo.plan.compensations.clear();
+            let err = engine.execute(&mut missing_undo, 5000).unwrap_err();
+            match err {
+                TxExecutionError::InvalidContract(reason) => {
+                    prop_assert!(reason.contains("no compensation action for committed step"));
+                }
+                other => prop_assert!(false, "expected missing compensation rejection, got {other:?}"),
+            }
+        }
         let result = engine.execute(&mut contract, 5000).unwrap();
 
         // Compensation should exist since we injected a failure

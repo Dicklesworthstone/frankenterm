@@ -534,11 +534,15 @@ pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option
 /// from the true mean by `epsilon`, given observations bounded in
 /// `[0, range]`:
 ///
-///     P(|X̄ - μ| ≥ ε) ≤ 2 · exp(-2 · n · ε² / range²)
+/// ```text
+/// P(|X̄ - μ| ≥ ε) ≤ 2 · exp(-2 · n · ε² / range²)
+/// ```
 ///
 /// Solving for `n` at the target failure probability `α`:
 ///
-///     n ≥ range² · ln(2 / α) / (2 · ε²)
+/// ```text
+/// n ≥ range² · ln(2 / α) / (2 · ε²)
+/// ```
 ///
 /// Inputs:
 /// - `threshold` — minimum effect size to detect (same units as
@@ -574,11 +578,15 @@ pub fn min_sample_size_hoeffding(threshold: f64, alpha: f64, range: f64) -> Opti
 ///
 /// Bernstein's inequality:
 ///
-///     P(|X̄ - μ| ≥ ε) ≤ 2 · exp(-n · ε² / (2 · var_bound + (2/3) · range · ε))
+/// ```text
+/// P(|X̄ - μ| ≥ ε) ≤ 2 · exp(-n · ε² / (2 · var_bound + (2/3) · range · ε))
+/// ```
 ///
 /// Solving for `n` at failure probability `α`:
 ///
-///     n ≥ (2 · var_bound + (2/3) · range · ε) · ln(2/α) / ε²
+/// ```text
+/// n ≥ (2 · var_bound + (2/3) · range · ε) · ln(2/α) / ε²
+/// ```
 ///
 /// Returns `None` for invalid inputs (same convention as
 /// [`min_sample_size_hoeffding`]). When `var_bound` exceeds

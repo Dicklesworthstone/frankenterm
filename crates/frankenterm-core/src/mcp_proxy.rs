@@ -623,6 +623,20 @@ fn proxy_tool_safety_block_reason(
         return Some(ProxyToolSafetyBlockReason::UnknownAnnotationShape);
     };
 
+    // A present object is not evidence of safety: typed MCP clients discard
+    // unknown fields, so legacy or misspelled hints can arrive here as `{}`.
+    // Reject malformed safety fields before considering the mutating opt-in.
+    if ["destructive", "destructiveHint", "readOnly", "readOnlyHint"]
+        .iter()
+        .any(|key| {
+            annotations
+                .get(*key)
+                .is_some_and(|value| !value.is_boolean())
+        })
+    {
+        return Some(ProxyToolSafetyBlockReason::UnknownAnnotationShape);
+    }
+
     if annotation_bool(annotations, "destructive")
         || annotation_bool(annotations, "destructiveHint")
     {
@@ -640,7 +654,13 @@ fn proxy_tool_safety_block_reason(
         return Some(ProxyToolSafetyBlockReason::MutatingToolBlocked);
     }
 
-    None
+    // Non-destructive operations can still mutate state. Only an explicit
+    // read-only assertion authorizes the default read-only proxy surface.
+    if annotation_bool(annotations, "readOnly") || annotation_bool(annotations, "readOnlyHint") {
+        None
+    } else {
+        Some(ProxyToolSafetyBlockReason::MissingAnnotations)
+    }
 }
 
 /// br-ft-gmt1c: a block reason is "explicit" iff the tool's
@@ -1338,7 +1358,7 @@ mod tests {
             icon: None,
             version: None,
             tags: vec![],
-            annotations: Some(serde_json::json!({"destructive": false})),
+            annotations: Some(serde_json::json!({"destructiveHint": false, "readOnlyHint": true})),
         };
         let destructive = McpClientToolDefinition {
             name: "drop_db".to_string(),
@@ -1525,7 +1545,7 @@ mod tests {
             icon: None,
             version: None,
             tags: vec![],
-            annotations: Some(serde_json::json!({"destructive": false})),
+            annotations: Some(serde_json::json!({"destructiveHint": false, "readOnlyHint": true})),
         };
 
         let mixed = vec![
@@ -1783,6 +1803,39 @@ mod tests {
     }
 
     #[test]
+    fn filter_remote_tools_requires_explicit_well_formed_safety_metadata() {
+        for allow_mutating in [false, true] {
+            let settings = McpClientConfig {
+                proxy_allow_mutating_tools: allow_mutating,
+                ..Default::default()
+            };
+            for annotations in [
+                serde_json::json!({}),
+                serde_json::json!({"title": "read only"}),
+                serde_json::json!({"destructiveHint": false}),
+                serde_json::json!({"readOnlyHint": "true"}),
+                serde_json::json!({"readOnlyHint": true, "destructiveHint": null}),
+                serde_json::json!({"destructiveHint": true, "readOnlyHint": "false"}),
+            ] {
+                let tool = McpClientToolDefinition {
+                    name: "unknown_safety".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: Some(annotations.clone()),
+                };
+                assert!(
+                    locked_filter_remote_tools(&settings, vec![tool]).is_empty(),
+                    "unsafe metadata admitted: {annotations}, opt-in={allow_mutating}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn filter_remote_tools_empty_input() {
         let settings = McpClientConfig::default();
         let filtered = locked_filter_remote_tools(&settings, Vec::new());
@@ -1935,7 +1988,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: Vec::new(),
-                annotations: Some(serde_json::json!({"destructive": false})),
+                annotations: Some(serde_json::json!({"destructiveHint": false, "readOnlyHint": true})),
             };
             let destructive = McpClientToolDefinition {
                 name: destructive_name.clone(),

@@ -152,6 +152,7 @@ async fn append_events(storage: &AppendLogRecorderStorage, events: Vec<RecorderE
 
 /// Mock IndexWriter that accumulates documents for use with InMemorySearchService.
 struct CollectingWriter {
+    generation: Option<String>,
     docs: Vec<IndexDocumentFields>,
     deleted_ids: Vec<String>,
     commits: u64,
@@ -160,6 +161,7 @@ struct CollectingWriter {
 impl CollectingWriter {
     fn new() -> Self {
         Self {
+            generation: None,
             docs: Vec::new(),
             deleted_ids: Vec::new(),
             commits: 0,
@@ -194,7 +196,19 @@ impl IndexWriter for CollectingWriter {
 }
 
 impl ReindexableWriter for CollectingWriter {
-    fn clear_all(&mut self) -> Result<u64, IndexWriteError> {
+    fn reindex_generation(&self) -> Result<Option<String>, IndexWriteError> {
+        Ok(self.generation.clone())
+    }
+
+    fn begin_reindex_generation(
+        &mut self,
+        consumer: &str,
+        clear: bool,
+    ) -> Result<u64, IndexWriteError> {
+        self.generation = Some(consumer.to_owned());
+        if !clear {
+            return Ok(0);
+        }
         let count = self.docs.len() as u64;
         self.docs.clear();
         self.deleted_ids.clear();

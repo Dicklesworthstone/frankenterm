@@ -1,6 +1,7 @@
 use crate::ICON_DATA;
 use anyhow::anyhow;
 use config::{configuration, wezterm_version};
+use frankenterm_gui::update_version::release_tag_is_newer;
 use frankenterm_toast_notification::*;
 use http_req::request::{HttpVersion, Request};
 use http_req::uri::Uri;
@@ -86,9 +87,8 @@ pub fn load_last_release_info_and_set_banner() {
             Err(_) => return,
         };
 
-        let current = wezterm_version();
         let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
-        if latest.tag_name.as_str() <= current && !force_ui {
+        if !release_tag_is_newer(&latest.tag_name) && !force_ui {
             return;
         }
 
@@ -141,8 +141,8 @@ fn set_banner_from_release_info(latest: &Release) {
 }
 
 fn schedule_set_banner_from_release_info(latest: &Release) {
-    let current = wezterm_version();
-    if latest.tag_name.as_str() <= current {
+    let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
+    if !release_tag_is_newer(&latest.tag_name) && !force_ui {
         return;
     }
     match promise::spawn::try_reserve_main_thread(
@@ -181,7 +181,7 @@ fn release_browser_url(latest: &Release) -> String {
     }
 }
 
-/// Returns true if the provided socket path is dead.
+/// Poll release metadata and notify one running GUI about newer releases.
 fn update_checker() {
     // Compute how long we should sleep for;
     // if we've never checked, give it a few seconds after the first
@@ -205,8 +205,7 @@ fn update_checker() {
 
     std::thread::sleep(if force_ui { initial_interval } else { delay });
 
-    let my_sock =
-        frankenterm_client::discovery::gui_socket_path_for_pid(std::process::id());
+    let my_sock = frankenterm_client::discovery::gui_socket_path_for_pid(std::process::id());
 
     loop {
         // Figure out which other FrankenTerm GUIs are running.
@@ -221,11 +220,12 @@ fn update_checker() {
             if let Ok(latest) = get_latest_release_info() {
                 schedule_set_banner_from_release_info(&latest);
                 let current = wezterm_version();
-                if latest.tag_name.as_str() > current || force_ui {
+                if release_tag_is_newer(&latest.tag_name) || force_ui {
                     log::info!(
-                        "latest release {} is newer than current build {}",
+                        "showing release {} information for current build {} (forced: {})",
                         latest.tag_name,
-                        current
+                        current,
+                        force_ui
                     );
 
                     let url = release_browser_url(&latest);

@@ -157,7 +157,7 @@ proptest! {
         let mut p1 = Parser::new();
         let mut p2 = Parser::new();
         let first = p1.parse_first(&bytes);
-        let first_vec = p2.parse_first_as_vec(&bytes);
+        let first_vec = p2.parse_first_as_vec(&bytes).expect("small structured corpus stays within sequence bounds");
 
         match (&first, &first_vec) {
             (Some((_, n_first)), Some((actions, n_vec))) => {

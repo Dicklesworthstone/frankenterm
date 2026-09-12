@@ -17,8 +17,9 @@
         "type": "string"
       },
       "idempotency_key": {
-        "description": "Caller replay key; repeated non-dry-run sends with the same pane/text/key return the stored submitted or queued receipt without re-sending",
+        "description": "Caller replay key; a completed identical non-dry-run send returns its stored receipt without re-sending, while an interrupted/indeterminate prior send refuses automatic replay",
         "maxLength": 256,
+        "minLength": 1,
         "type": "string"
       },
       "pane_id": {

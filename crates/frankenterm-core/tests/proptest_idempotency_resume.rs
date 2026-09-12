@@ -253,7 +253,7 @@ proptest! {
     }
 
     #[test]
-    fn resume_state_terminal_no_pending(
+    fn resume_state_requires_step_evidence_not_a_terminal_label(
         num_steps in 1usize..6,
         terminal_state in prop_oneof![
             Just(MissionTxState::Committed),
@@ -276,8 +276,30 @@ proptest! {
             decision_path: "resume_state_terminal_no_pending".to_string(),
         }).unwrap());
         let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
+        prop_assert!(!resume.is_fully_resolved());
+        prop_assert!(!resume.commit_phase_completed);
+        prop_assert_eq!(resume.pending_step_ids.len(), num_steps);
+
+        // A terminal label without per-step evidence must not erase pending
+        // effects. A complete real commit receipt chain does resolve them.
+        contract.receipts.clear();
+        let inputs: Vec<TxCommitStepInput> = (1..=num_steps)
+            .map(|i| TxCommitStepInput {
+                step_id: TxStepId(format!("s{i}")),
+                success: true,
+                reason_code: "ok".into(),
+                error_code: None,
+                completed_at_ms: 6000 + i as i64,
+            })
+            .collect();
+        let committed = execute_commit_phase(
+            &contract, &inputs, MissionKillSwitchLevel::Off, false, 9000,
+        ).unwrap();
+        contract.receipts = committed.receipts;
+        let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
         prop_assert!(resume.is_fully_resolved());
         prop_assert!(resume.pending_step_ids.is_empty());
+        prop_assert_eq!(resume.committed_step_ids.len(), num_steps);
     }
 
     #[test]

@@ -107,20 +107,20 @@
         "cosmetic": 2,
         "docs": 1,
         "feat": 5,
-        "fix": 14,
+        "fix": 15,
         "other": 3,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 34,
+      "fork_side_commit_count": 35,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-10T20:52:11-04:00",
-        "sha": "f9a5d41c4522b40fefaaa8941bb5ae604b8a38f8",
-        "subject": "perf(render): hydrate cold scrollback outside native UI locks"
+        "classification": "fix",
+        "committed_at": "2026-09-12T03:21:41-04:00",
+        "sha": "66f315e08a34c10f4c5a4d956aac99e959254654",
+        "subject": "fix(cell): support attachment queries in text-only builds"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -399,20 +399,20 @@
         "cosmetic": 5,
         "docs": 1,
         "feat": 7,
-        "fix": 18,
+        "fix": 19,
         "other": 6,
         "refactor": 1,
         "rename": 1,
         "security-fix": 49,
         "test": 6
       },
-      "fork_side_commit_count": 96,
+      "fork_side_commit_count": 97,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "chore",
-        "committed_at": "2026-09-02T15:16:08-04:00",
-        "sha": "e856ee829d32ae8a8f8b43e238f5d6522fade9cd",
-        "subject": "chore(deps): apply the safe half of the rust-deps group bump (Refs PR #86)"
+        "classification": "fix",
+        "committed_at": "2026-09-12T02:34:49-04:00",
+        "sha": "39063de24071df1aa7e84af09f9f4c4102f0951a",
+        "subject": "fix(parser): retain bounded first-sequence actions across chunks"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -553,15 +553,15 @@
         "fix": 12,
         "other": 5,
         "refactor": 3,
-        "test": 1
+        "test": 2
       },
-      "fork_side_commit_count": 32,
+      "fork_side_commit_count": 33,
       "last_modified": {
-        "author": "Dicklesworthstone",
-        "classification": "feat",
-        "committed_at": "2026-08-27T01:01:15-04:00",
-        "sha": "4b6f8ff633fbb8943799fe456b8f0ae054922526",
-        "subject": "feat(guardian,mux,replay): expand guardian proxy forwarding, tantivy schema ingestion, and replay verification"
+        "author": "Jeff Emanuel",
+        "classification": "test",
+        "committed_at": "2026-09-12T06:11:46-04:00",
+        "sha": "8ccd0ab462acd5f5ede7bd39433e8e8a68c9a1cc",
+        "subject": "test(platform): preserve native socket and PTY contracts across hosts"
       },
       "name": "mux-lua",
       "path": "frankenterm/lua-api-crates/mux-lua",
@@ -734,15 +734,15 @@
         "other": 4,
         "refactor": 2,
         "runtime-swap": 1,
-        "test": 13
+        "test": 15
       },
-      "fork_side_commit_count": 54,
+      "fork_side_commit_count": 56,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-31T07:58:50-04:00",
-        "sha": "046b29845f2be48e98fdfc05f537574e94fb9b3f",
-        "subject": "style(rustfmt): format imports and assertions across crates, mux, surface, and client"
+        "classification": "test",
+        "committed_at": "2026-09-12T06:26:00-04:00",
+        "sha": "fef77c06307d92a7a823bf89280496727ebc50b0",
+        "subject": "test(pty): make Unix-only fixture import explicit to coupling gate"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -820,7 +820,7 @@
         "chore": 1,
         "cosmetic": 5,
         "feat": 7,
-        "fix": 21,
+        "fix": 22,
         "other": 4,
         "refactor": 3,
         "rename": 1,
@@ -828,13 +828,13 @@
         "security-fix": 1,
         "test": 8
       },
-      "fork_side_commit_count": 58,
+      "fork_side_commit_count": 59,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-09-12T06:11:15-04:00",
+        "sha": "ce304e44f5278c64798bff60c48a41761aadd001",
+        "subject": "fix(ssh): preserve symlink payload and destination ordering in libssh"
       },
       "name": "frankenterm-ssh",
       "path": "frankenterm/ssh",
@@ -970,15 +970,15 @@
         "other": 3,
         "rename": 1,
         "runtime-swap": 3,
-        "test": 5
+        "test": 6
       },
-      "fork_side_commit_count": 22,
+      "fork_side_commit_count": 23,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-08-20T20:37:55-04:00",
-        "sha": "c18ba6b60e253cc6716bbf312ea6dcdd7cef6790",
-        "subject": "fix(uds): compile combined readiness helper only on unix"
+        "classification": "test",
+        "committed_at": "2026-09-12T06:11:46-04:00",
+        "sha": "8ccd0ab462acd5f5ede7bd39433e8e8a68c9a1cc",
+        "subject": "test(platform): preserve native socket and PTY contracts across hosts"
       },
       "name": "frankenterm-uds",
       "path": "frankenterm/uds",
@@ -1061,8 +1061,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2490,
-  "generated_at": "2026-09-12T00:55:54.468153Z",
+  "fork_side_commit_total": 2497,
+  "generated_at": "2026-09-12T10:32:30.716885Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

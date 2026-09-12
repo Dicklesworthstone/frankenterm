@@ -8,6 +8,6 @@
     "extracted": {
       "retry_after": "30 seconds"
     },
-    "matched_text": "wait 30 seconds"
+    "matched_text": "429: Too Many Requests from upstream provider. Please wait 30 seconds"
   }
 ]

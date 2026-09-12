@@ -14,13 +14,14 @@ use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use async_channel::TryRecvError;
 use codec::{CompressionMode, DecodedPdu, Pdu, Ping, StreamingPduBuffer};
 use frankenterm_mux_server_impl::dispatch::{
-    self, DispatchIoPreference, DispatchRuntimeConfig, DispatchStream, DispatchStreamKind,
+    self, DispatchIoPreference, DispatchReadySide, DispatchRuntimeConfig, DispatchStream,
+    DispatchStreamKind,
 };
 use mux::Mux;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 
@@ -55,6 +56,10 @@ struct ScriptState {
     flush_count: AtomicUsize,
     writable_waits: AtomicUsize,
     readable_waits: AtomicUsize,
+    backpressure: bool,
+    write_pending: AtomicBool,
+    flush_pending: AtomicBool,
+    pending_polls: AtomicUsize,
     stream_kind: DispatchStreamKind,
 }
 
@@ -85,7 +90,12 @@ struct ScriptedDispatchStream {
 }
 
 impl ScriptedDispatchStream {
-    fn new(script: Vec<u8>, stream_kind: DispatchStreamKind, chunk: usize) -> (Self, ScriptHandle) {
+    fn new(
+        script: Vec<u8>,
+        stream_kind: DispatchStreamKind,
+        chunk: usize,
+        backpressure: bool,
+    ) -> (Self, ScriptHandle) {
         let state = Arc::new(ScriptState {
             script,
             cursor: AtomicUsize::new(0),
@@ -94,6 +104,10 @@ impl ScriptedDispatchStream {
             flush_count: AtomicUsize::new(0),
             writable_waits: AtomicUsize::new(0),
             readable_waits: AtomicUsize::new(0),
+            backpressure,
+            write_pending: AtomicBool::new(true),
+            flush_pending: AtomicBool::new(true),
+            pending_polls: AtomicUsize::new(0),
             stream_kind,
         });
         let stream = Self {
@@ -114,8 +128,21 @@ impl DispatchStream for ScriptedDispatchStream {
     }
 
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
-        self.state.writable_waits.fetch_add(1, Ordering::Relaxed);
-        Box::pin(async { Ok(()) })
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    fn wait_for_readable_or_writable(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = io::Result<DispatchReadySide>> + Send + '_>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Ok(DispatchReadySide::Writable)
+        })
     }
 }
 
@@ -149,9 +176,25 @@ impl AsyncRead for ScriptedDispatchStream {
 impl AsyncWrite for ScriptedDispatchStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let buf = if self.state.backpressure {
+            if self.state.write_pending.swap(false, Ordering::Relaxed) {
+                self.state.pending_polls.fetch_add(1, Ordering::Relaxed);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            assert_eq!(
+                self.state.writable_waits.load(Ordering::Relaxed),
+                self.state.pending_polls.load(Ordering::Relaxed),
+                "pending write must await readiness before retry"
+            );
+            self.state.write_pending.store(true, Ordering::Relaxed);
+            &buf[..buf.len().min(2)]
+        } else {
+            buf
+        };
         self.state
             .writes
             .lock()
@@ -160,7 +203,20 @@ impl AsyncWrite for ScriptedDispatchStream {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.backpressure {
+            if self.state.flush_pending.swap(false, Ordering::Relaxed) {
+                self.state.pending_polls.fetch_add(1, Ordering::Relaxed);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            assert_eq!(
+                self.state.writable_waits.load(Ordering::Relaxed),
+                self.state.pending_polls.load(Ordering::Relaxed),
+                "pending flush must await readiness before retry"
+            );
+            self.state.flush_pending.store(true, Ordering::Relaxed);
+        }
         self.state.flush_count.fetch_add(1, Ordering::Relaxed);
         Poll::Ready(Ok(()))
     }
@@ -243,13 +299,24 @@ fn run_once(
     script: Vec<u8>,
     read_chunk: usize,
 ) -> ScriptHandle {
+    run_with_backpressure(preference, stream_kind, script, read_chunk, false)
+}
+
+fn run_with_backpressure(
+    preference: DispatchIoPreference,
+    stream_kind: DispatchStreamKind,
+    script: Vec<u8>,
+    read_chunk: usize,
+    backpressure: bool,
+) -> ScriptHandle {
     let _lock = GLOBAL_STATE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let mux = Arc::new(Mux::new(None));
     let _scoped = ScopedMux::install(&mux);
 
-    let (stream, handle) = ScriptedDispatchStream::new(script, stream_kind, read_chunk);
+    let (stream, handle) =
+        ScriptedDispatchStream::new(script, stream_kind, read_chunk, backpressure);
 
     let result = promise::spawn::block_on(dispatch::process_with_config(
         stream,
@@ -349,8 +416,8 @@ fn ping_stream_produces_identical_wire_output_across_backends() {
             );
             assert_eq!(
                 handle.writable_waits(),
-                baseline_flushes,
-                "writable_waits should equal flush count for pref={pref:?} stream={stream_kind:?}"
+                0,
+                "ready writes must not await writability for pref={pref:?} stream={stream_kind:?}"
             );
         }
     }
@@ -384,8 +451,8 @@ fn chunked_reads_preserve_wire_output_across_backends() {
                 );
                 assert_eq!(
                     handle.writable_waits(),
-                    baseline_flushes,
-                    "writable waits diverged for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                    0,
+                    "ready writes must not await writability for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
                 );
                 assert!(
                     handle.readable_waits() >= 1,
@@ -423,10 +490,34 @@ fn mixed_compression_ping_stream_preserves_dispatch_order_across_backends() {
                 );
                 assert_eq!(
                     handle.writable_waits(),
-                    handle.flush_count(),
-                    "writable waits should track flushes for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                    0,
+                    "ready writes must not await writability for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn pending_short_writes_and_flushes_preserve_exact_wire_output() {
+    let script = encoded_ping_series(3);
+    let baseline = run_once(
+        DispatchIoPreference::Poll,
+        DispatchStreamKind::Unix,
+        script.clone(),
+        0,
+    );
+    for preference in ALL_PREFERENCES {
+        for stream_kind in ALL_STREAM_KINDS {
+            let blocked = run_with_backpressure(*preference, *stream_kind, script.clone(), 2, true);
+            assert_eq!(blocked.writes(), baseline.writes());
+            assert_eq!(blocked.flush_count(), baseline.flush_count());
+            let pending = blocked.0.pending_polls.load(Ordering::Relaxed);
+            assert!(
+                pending > blocked.flush_count(),
+                "write and flush must both block"
+            );
+            assert_eq!(blocked.writable_waits(), pending);
         }
     }
 }

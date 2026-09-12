@@ -540,7 +540,8 @@ fn sim_agent_failure_item_remains_in_progress() {
 fn sim_heartbeat_timeout_reclaims_stale_items() {
     let scenario = "sim.heartbeat_reclaim";
     let config = WorkQueueConfig {
-        heartbeat_timeout_ms: 5_000, // 5s timeout
+        heartbeat_timeout_ms: 10,
+        max_concurrent_per_agent: 5,
         ..sim_queue_config()
     };
     let mut queue = SwarmWorkQueue::new(config);
@@ -554,22 +555,25 @@ fn sim_heartbeat_timeout_reclaims_stale_items() {
             .unwrap();
     }
 
-    // Simulate time passing beyond heartbeat timeout
-    // reclaim_timed_out uses internal Assignment.last_heartbeat vs config threshold
+    // Refresh actual heartbeat timestamps before waiting past the timeout.
+    for i in 0..5 {
+        queue
+            .heartbeat(&format!("stale-{i}"), &s("slow-agent"))
+            .unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
     let reclaimed = queue.reclaim_timed_out();
+    assert_eq!(reclaimed.len(), 5);
+    assert_eq!(queue.stats().in_progress, 0);
+    assert_eq!(queue.stats().ready, 5);
 
-    // Items assigned without heartbeat updates should be reclaimed
-    // (depends on implementation — the mock may use creation time as heartbeat)
+    // Every expired assignment must become ready for reassignment.
     emit_sim_log(
         scenario,
         "reclaim-001",
         "reclaimed_count",
         &reclaimed.len().to_string(),
-        if reclaimed.is_empty() {
-            "info_no_reclaim_yet"
-        } else {
-            "pass"
-        },
+        "pass",
     );
 }
 
@@ -577,7 +581,10 @@ fn sim_heartbeat_timeout_reclaims_stale_items() {
 #[test]
 fn sim_multi_agent_failure_queue_consistency() {
     let scenario = "sim.multi_agent_failure";
-    let mut queue = SwarmWorkQueue::new(sim_queue_config());
+    let mut queue = SwarmWorkQueue::new(WorkQueueConfig {
+        max_concurrent_per_agent: 5,
+        ..sim_queue_config()
+    });
 
     // 15 items assigned across 3 agents
     for i in 0..15 {
@@ -597,6 +604,22 @@ fn sim_multi_agent_failure_queue_consistency() {
                 &format!("agent-{}", i % 3),
                 Some("agent crash".to_string()),
             )
+            .unwrap();
+    }
+
+    let retry_stats = queue.stats();
+    assert_eq!(
+        retry_stats.ready, 10,
+        "first failures must remain retryable"
+    );
+    assert_eq!(retry_stats.failed, 0);
+    assert_eq!(retry_stats.in_progress, 5);
+    for i in (0..15).filter(|i| i % 3 != 2) {
+        let id = format!("multi-{i}");
+        let agent = format!("agent-{}", i % 3);
+        queue.assign(&id, &agent).unwrap();
+        queue
+            .fail(&id, &agent, Some("retry crash".to_owned()))
             .unwrap();
     }
 
@@ -907,7 +930,7 @@ fn sim_beads_import_sync_round_trip() {
 
     let scenario = "sim.beads_import_sync";
     let jsonl = r#"{"id":"bead-1","title":"First bead","status":"open","priority":1,"dependencies":[],"labels":["test"]}
-{"id":"bead-2","title":"Second bead","status":"open","priority":2,"dependencies":[{"depends_on_id":"bead-1","type":"blocks"}],"labels":["test"]}
+{"id":"bead-2","title":"Second bead","status":"open","priority":2,"dependencies":[{"issue_id":"bead-2","depends_on_id":"bead-1","type":"blocks"}],"labels":["test"]}
 {"id":"bead-3","title":"Closed bead","status":"closed","priority":0,"dependencies":[],"labels":["done"]}"#;
 
     let importer = BeadsImporter::from_jsonl(jsonl).expect("parse JSONL");
@@ -920,7 +943,12 @@ fn sim_beads_import_sync_round_trip() {
     let mut queue = SwarmWorkQueue::new(sim_queue_config());
     let report = importer.sync_to_queue(&mut queue);
 
-    assert!(report.imported > 0, "should import actionable beads");
+    assert_eq!(report.imported, 2, "import both actionable beads");
+    assert_eq!(queue.item_status(&s("bead-1")), Some(WorkItemStatus::Ready));
+    assert_eq!(
+        queue.item_status(&s("bead-2")),
+        Some(WorkItemStatus::Blocked)
+    );
 
     emit_sim_log(
         scenario,
@@ -1172,10 +1200,13 @@ fn sim_queue_pressure_accuracy() {
 #[test]
 fn regression_queue_stats_sum_equals_total() {
     let scenario = "regression.stats_sum";
-    let mut queue = SwarmWorkQueue::new(sim_queue_config());
+    let mut queue = SwarmWorkQueue::new(WorkQueueConfig {
+        max_concurrent_per_agent: 5,
+        ..sim_queue_config()
+    });
 
-    for i in 0..20 {
-        let dep_str = format!("reg-{}", i - 1);
+    for i in 0u32..20 {
+        let dep_str = format!("reg-{}", i.saturating_sub(1));
         let deps: Vec<&str> = if i > 0 && i % 5 == 0 {
             vec![dep_str.as_str()]
         } else {
@@ -1511,10 +1542,18 @@ fn sim_pipeline_hook_abort_halts_early() {
     let mut executor = PipelineExecutor::with_hooks(hooks);
     let execution = executor.execute(&pipeline, 10_000).expect("execute");
 
-    // The setup step should succeed (no precondition on it directly),
-    // guarded-step behavior depends on hook implementation
-    let setup_outcome = execution.step_outcomes.get(&0);
-    assert!(setup_outcome.is_some(), "setup step should have an outcome");
+    // PreStep hooks apply to every step, so missing metadata aborts before setup.
+    assert!(
+        matches!(&execution.status, PipelineStatus::Aborted { reason } if reason.contains("abort-hook") && reason.contains("setup"))
+    );
+    assert!(execution.step_outcomes.is_empty());
+    let mut admitted = pipeline;
+    admitted
+        .metadata
+        .insert("abort_gate".to_string(), "present".to_string());
+    let completed = executor.execute(&admitted, 20_000).expect("gate satisfied");
+    assert!(matches!(completed.status, PipelineStatus::Succeeded));
+    assert_eq!(completed.step_outcomes.len(), 2);
 
     emit_sim_log(
         scenario,

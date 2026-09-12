@@ -17,3 +17,4 @@ data:
 elapsed_ms: 14
 version: 0.1.0
 now: 1777000000005
+schema_version: 1

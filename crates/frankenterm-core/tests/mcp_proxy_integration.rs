@@ -48,6 +48,11 @@ for raw in sys.stdin:
     method = request.get("method")
     req_id = request.get("id")
 
+    # JSON-RPC notifications, including notifications/initialized, must
+    # not emit a response that the next request could consume.
+    if "id" not in request:
+        continue
+
     if method == "initialize":
         send({
             "jsonrpc": "2.0",
@@ -58,8 +63,6 @@ for raw in sys.stdin:
                 "serverInfo": {"name": "mock-proxy", "version": "1.0.0"}
             }
         })
-    elif method == "initialized":
-        continue
     elif method == "tools/list":
         send({
             "jsonrpc": "2.0",
@@ -74,7 +77,7 @@ for raw in sys.stdin:
                             "properties": {"text": {"type": "string"}},
                             "required": ["text"]
                         },
-                        "annotations": {"destructive": False}
+                        "annotations": {"destructiveHint": False, "readOnlyHint": True}
                     },
                     {
                         "name": "drop_db",
@@ -83,6 +86,12 @@ for raw in sys.stdin:
                             "type": "object",
                             "properties": {}
                         },
+                        "annotations": {"destructiveHint": True, "readOnlyHint": False}
+                    },
+                    {
+                        "name": "unknown_legacy",
+                        "description": "Legacy annotations must not authorize admission",
+                        "inputSchema": {"type": "object", "properties": {}},
                         "annotations": {"destructive": True}
                     }
                 ]
@@ -251,6 +260,10 @@ fn proxy_mounts_remote_tools_with_prefixed_routes() {
     assert!(
         !tool_names.contains("remote/mock/drop_db"),
         "destructive remote tool should be filtered by default"
+    );
+    assert!(
+        !tool_names.contains("remote/mock/unknown_legacy"),
+        "annotations stripped by typed transport must remain fail-closed"
     );
 }
 

@@ -961,9 +961,15 @@ impl CellAttributes {
     /// This intentionally does not clone the image descriptors.  Persistence
     /// preflights use it to reject unsupported graphics before allocating a
     /// terminal checkpoint projection.
-    #[cfg(feature = "use_image")]
     pub fn has_image_attachments(&self) -> bool {
-        self.fat.as_ref().is_some_and(|fat| !fat.image.is_empty())
+        #[cfg(feature = "use_image")]
+        {
+            self.fat.as_ref().is_some_and(|fat| !fat.image.is_empty())
+        }
+        #[cfg(not(feature = "use_image"))]
+        {
+            false
+        }
     }
 
     /// Returns the list of attached images in z-index order.

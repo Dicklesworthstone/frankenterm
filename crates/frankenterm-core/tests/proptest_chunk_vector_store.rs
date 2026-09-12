@@ -9,8 +9,8 @@ use proptest::prelude::*;
 use tempfile::tempdir;
 
 use frankenterm_core::search::{
-    ChunkDirection, ChunkEmbeddingUpsert, ChunkSourceOffset, ChunkVectorStore, SemanticChunk,
-    SemanticGenerationStatus,
+    ChunkDirection, ChunkEmbeddingUpsert, ChunkSourceOffset, ChunkVectorStore,
+    ChunkVectorStoreError, SemanticChunk, SemanticGenerationStatus,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -355,10 +355,9 @@ proptest! {
         prop_assert!(hits.len() <= limit, "got {} > limit {}", hits.len(), limit);
     }
 
-    /// Search with empty query vector returns nothing.
+    /// A broken empty query is distinguishable from a valid no-hit search.
     #[test]
-    fn search_empty_query_returns_nothing(dummy in 0u8..1) {
-        let _ = dummy;
+    fn search_empty_query_is_rejected(limit in 0usize..20) {
         let (mut store, _dir) = open_store();
         store
             .register_generation("p1", "g1", "ft.recorder.chunking.v1", "lex-v1")
@@ -367,8 +366,11 @@ proptest! {
         let upsert = make_upsert("p1", "g1", "chunk-1", 0, 10, 4);
         store.upsert_chunk_embedding(upsert).expect("upsert");
 
-        let hits = store.semantic_search("p1", "g1", &[], 10).expect("search");
-        prop_assert_eq!(hits.len(), 0);
+        let result = store.semantic_search("p1", "g1", &[], limit);
+        prop_assert!(matches!(result, Err(ChunkVectorStoreError::InvalidVector(_))));
+        let hits = store.semantic_search("p1", "g1", &make_normalized_vec(4), 1)
+            .expect("valid query remains searchable");
+        prop_assert_eq!(hits.len(), 1);
     }
 
     /// Search results are ordered by descending score.

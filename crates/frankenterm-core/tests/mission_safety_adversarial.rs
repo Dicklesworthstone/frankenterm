@@ -219,6 +219,11 @@ fn adv_03_risky_label_case_insensitive() {
 #[test]
 fn adv_04_retry_storm_backoff_then_recovery() {
     let mut ml = loop_with_config(MissionLoopConfig {
+        // Otherwise the solver cooldown rejects before the retry gate can run.
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
         safety_envelope: MissionSafetyEnvelopeConfig {
             max_assignments_per_cycle: 10,
             max_risky_assignments_per_cycle: 10,

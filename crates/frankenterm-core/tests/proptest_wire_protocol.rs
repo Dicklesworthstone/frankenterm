@@ -770,7 +770,7 @@ fn aggregator_stale_session_pruning_uses_local_receive_clock_conformance() {
     let mut duplicate_refresh = gap_envelope(1, "agent-a");
     duplicate_refresh.sent_at_ms = 0;
     assert!(matches!(
-        agg.ingest_envelope_at(duplicate_refresh, 160).unwrap(),
+        agg.ingest_envelope_at(duplicate_refresh, 149).unwrap(),
         IngestResult::Duplicate { .. }
     ));
     assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
@@ -778,7 +778,7 @@ fn aggregator_stale_session_pruning_uses_local_receive_clock_conformance() {
     let mut late_new_sender = gap_envelope(1, "agent-c");
     late_new_sender.sent_at_ms = 0;
     assert!(matches!(
-        agg.ingest_envelope_at(late_new_sender, 190).unwrap(),
+        agg.ingest_envelope_at(late_new_sender, 170).unwrap(),
         IngestResult::Accepted(_)
     ));
 
@@ -806,7 +806,7 @@ fn distributed_pruning_dedup_conformance() {
     ));
 
     let duplicate = agg
-        .ingest_envelope_at(gap_envelope(4, "agent-a"), 160)
+        .ingest_envelope_at(gap_envelope(4, "agent-a"), 149)
         .unwrap();
     assert!(matches!(
         duplicate,
@@ -822,7 +822,7 @@ fn distributed_pruning_dedup_conformance() {
     assert!(matches!(blocked, WireProtocolError::TooManyAgents { .. }));
 
     assert!(matches!(
-        agg.ingest_envelope_at(gap_envelope(1, "agent-c"), 190)
+        agg.ingest_envelope_at(gap_envelope(1, "agent-c"), 170)
             .unwrap(),
         IngestResult::Accepted(_)
     ));
@@ -832,6 +832,36 @@ fn distributed_pruning_dedup_conformance() {
     assert_eq!(agg.agent_last_seq("agent-c"), Some(1));
     assert_eq!(agg.total_accepted(), 3);
     assert_eq!(agg.total_rejected(), 1);
+}
+
+#[test]
+fn expired_sender_sequence_reset_is_accepted_at_exact_local_deadline() {
+    let mut agg = Aggregator::with_stale_after(1, 50);
+    let mut first = gap_envelope(5, "agent-a");
+    first.sent_at_ms = i64::MAX;
+    assert!(matches!(
+        agg.ingest_envelope_at(first, 100).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    // Equality expires the old sender session even when its remote clock is
+    // far in the future, allowing a restarted sender to reset its sequence.
+    let mut restarted = gap_envelope(1, "agent-a");
+    restarted.sent_at_ms = 0;
+    assert!(matches!(
+        agg.ingest_envelope_at(restarted, 150).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+    assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+    assert_eq!(agg.total_accepted(), 2);
+
+    assert!(matches!(
+        agg.ingest_envelope_at(gap_envelope(1, "agent-a"), 151)
+            .unwrap(),
+        IngestResult::Duplicate { .. }
+    ));
+    assert_eq!(agg.total_accepted(), 2);
+    assert_eq!(agg.total_rejected(), 0);
 }
 
 // ============================================================================

@@ -681,6 +681,10 @@ fn established_mmap_authority_never_falls_back_to_a_stale_sqlite_history() {
     store.append_line(pane, "alpha").expect("append alpha");
     store.append_line(pane, "beta").expect("append beta");
     store.append_line(pane, "gamma").expect("append gamma");
+    assert_eq!(
+        store.tail_lines(pane, 2).expect("valid primary tail"),
+        ["beta", "gamma"]
+    );
 
     let log_path = temp.path().join(format!("{pane}.log"));
     std::fs::OpenOptions::new()
@@ -704,4 +708,29 @@ fn established_mmap_authority_never_falls_back_to_a_stale_sqlite_history() {
         Some(PaneStorageMode::Mmap),
         "a later primary error must not silently fork to an uncommitted fallback history"
     );
+}
+
+#[test]
+fn committed_tail_missing_delimiter_is_an_error_without_length_change() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pane = 617;
+    let config = MmapStoreConfig::new(temp.path().to_path_buf())
+        .with_sqlite_fallback(temp.path().join("fallback.sqlite3"));
+    let mut store = MmapScrollbackStore::new(config).expect("create store");
+    store.append_line(pane, "alpha").expect("append alpha");
+    assert_eq!(store.tail_lines(pane, 1).expect("valid tail"), ["alpha"]);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(temp.path().join(format!("{pane}.log")))
+        .expect("open log");
+    let original_len = file.metadata().expect("metadata").len();
+    file.seek(SeekFrom::End(-1)).expect("seek delimiter");
+    file.write_all(b"!").expect("replace delimiter");
+    file.sync_data().expect("sync corruption");
+    assert_eq!(file.metadata().expect("metadata").len(), original_len);
+    assert!(store.tail_lines(pane, 1).is_err());
+    assert_eq!(store.pane_storage_mode(pane), Some(PaneStorageMode::Mmap));
 }

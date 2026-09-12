@@ -13,16 +13,7 @@ use proptest::prelude::*;
 // ── Strategies ──────────────────────────────────────────────────────────────
 
 fn arb_view() -> impl Strategy<Value = View> {
-    prop_oneof![
-        Just(View::Home),
-        Just(View::Panes),
-        Just(View::Events),
-        Just(View::Triage),
-        Just(View::History),
-        Just(View::Search),
-        Just(View::Help),
-        Just(View::Timeline),
-    ]
+    prop::sample::select(View::all().to_vec())
 }
 
 // ── View circular navigation ────────────────────────────────────────────────
@@ -170,7 +161,23 @@ proptest! {
 #[test]
 fn view_all_covers_every_variant() {
     let views = View::all();
-    assert_eq!(views.len(), 8);
+    let expected = vec![
+        View::Home,
+        View::Panes,
+        View::Events,
+        View::Triage,
+        View::History,
+        View::Search,
+        View::Help,
+        View::Timeline,
+    ];
+    #[cfg(feature = "ftui")]
+    let expected = {
+        let mut expected = expected;
+        expected.push(View::Deck);
+        expected
+    };
+    assert_eq!(views, expected);
     let mut seen = std::collections::HashSet::new();
     for v in views {
         assert!(seen.insert(v.name()), "duplicate view: {}", v.name());

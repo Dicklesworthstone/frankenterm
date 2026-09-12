@@ -509,9 +509,16 @@ fn symlink_should_create_symlink_pointing_to_file(#[future] session: SessionWith
             "Symlink is not a symlink!"
         );
 
-        // TODO: This fails even though the type is a symlink:
-        //       https://github.com/assert-rs/assert_fs/issues/70
-        // link.assert(predicate::path::is_symlink());
+        assert_eq!(std::fs::read_link(link.path()).unwrap(), file.path());
+        assert_eq!(
+            session
+                .sftp()
+                .read_link(link.path().to_path_buf())
+                .await
+                .unwrap(),
+            file.path()
+        );
+        assert!(std::fs::symlink_metadata(file.path()).unwrap().is_file());
     })
 }
 
@@ -537,6 +544,16 @@ fn symlink_should_create_symlink_pointing_to_directory(#[future] session: Sessio
             .expect("Failed to create symlink");
 
         link.assert(predicate::path::is_symlink());
+        assert_eq!(std::fs::read_link(link.path()).unwrap(), dir.path());
+        assert_eq!(
+            session
+                .sftp()
+                .read_link(link.path().to_path_buf())
+                .await
+                .unwrap(),
+            dir.path()
+        );
+        assert!(std::fs::symlink_metadata(dir.path()).unwrap().is_dir());
     })
 }
 
@@ -561,6 +578,19 @@ fn symlink_should_succeed_even_if_path_missing(#[future] session: SessionWithSsh
             .expect("Failed to create symlink");
 
         link.assert(predicate::path::is_symlink());
+        assert_eq!(std::fs::read_link(link.path()).unwrap(), file.path());
+        assert_eq!(
+            session
+                .sftp()
+                .read_link(link.path().to_path_buf())
+                .await
+                .unwrap(),
+            file.path()
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(file.path()).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     })
 }
 

@@ -286,6 +286,9 @@ const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
 pub struct Parser {
     state_machine: VTParser,
     state: RefCell<ParseState>,
+    /// Actions emitted before parse_first_as_vec reaches a ground boundary.
+    pending_actions: alloc::collections::VecDeque<Action>,
+    pending_sequence_bytes: usize,
     /// Total raw bytes accepted by this parser's streaming API. `None` means
     /// the position overflowed and can no longer authorize a durable recovery
     /// boundary.  The parser remains usable for ordinary terminal rendering in
@@ -300,6 +303,40 @@ pub struct Parser {
     /// [`Parser::set_print_batching`] overrides the resolved default.
     print_batching: bool,
 }
+
+/// Bounded partial sequence; no emitted actions are discarded. The parser
+/// remains at the reported byte boundary and callers may resume or recover.
+pub struct FirstSequenceLimitExceeded {
+    /// Actions already emitted, in input order; caller owns their delivery.
+    pub actions: Vec<Action>,
+    /// Bytes consumed from this call only; retry from this offset to resume.
+    pub consumed: usize,
+}
+
+impl core::fmt::Debug for FirstSequenceLimitExceeded {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FirstSequenceLimitExceeded")
+            .field("action_count", &self.actions.len())
+            .field("consumed", &self.consumed)
+            .finish()
+    }
+}
+
+impl core::fmt::Display for FirstSequenceLimitExceeded {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("first sequence collection limit exceeded")
+    }
+}
+
+impl core::error::Error for FirstSequenceLimitExceeded {}
+
+/// Maximum emitted actions retained while waiting for a ground boundary.
+/// A single byte can emit several actions; an over-limit atomic dispatch is
+/// handed back in full through `FirstSequenceLimitExceeded`, never retained.
+pub const MAX_FIRST_SEQUENCE_ACTIONS: usize = 1024;
+/// Maximum raw sequence bytes consumed across chunks before explicit handoff.
+pub const MAX_FIRST_SEQUENCE_BYTES: usize = 1_048_576;
 
 /// Non-constructible witness that one exact parser was recovery-ground after
 /// consuming [`Self::stream_bytes`] raw bytes.
@@ -368,6 +405,8 @@ impl Parser {
         Self {
             state_machine: VTParser::new_with_max_string_sequence_bytes(max_string_sequence_bytes),
             state: RefCell::new(state),
+            pending_actions: alloc::collections::VecDeque::new(),
+            pending_sequence_bytes: 0,
             recovery_stream_bytes: Some(0),
             print_batching: default_print_batching(),
         }
@@ -405,7 +444,7 @@ impl Parser {
     /// the exact byte watermark is carried into the transaction.
     #[must_use]
     pub fn is_recovery_ground(&self) -> bool {
-        if !self.state_machine.is_ground() {
+        if !self.pending_actions.is_empty() || !self.state_machine.is_ground() {
             return false;
         }
 
@@ -515,6 +554,10 @@ impl Parser {
         // of this slice, the position remains `None` and this parser can never
         // mint an ambiguously old recovery watermark after the panic is caught.
         let prior_stream_bytes = self.recovery_stream_bytes.take();
+        self.pending_sequence_bytes = 0;
+        for action in core::mem::take(&mut self.pending_actions) {
+            callback(action);
+        }
         #[cfg(feature = "tmux_cc")]
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
         #[cfg(feature = "tmux_cc")]
@@ -621,7 +664,13 @@ impl Parser {
     /// first action from the stream of bytes.  The return value is the action
     /// that was recognized and the length of the byte stream that was fed in
     /// to the parser to yield it.
+    /// An action retained by `parse_first_as_vec` is returned with zero new
+    /// bytes consumed. OSC dispatch occurs at ESC, before an ST's backslash.
     pub fn parse_first(&mut self, bytes: &[u8]) -> Option<(Action, usize)> {
+        self.pending_sequence_bytes = 0;
+        if let Some(action) = self.pending_actions.pop_front() {
+            return Some((action, 0));
+        }
         let prior_stream_bytes = self.recovery_stream_bytes.take();
         // holds the first action.  We need to use RefCell to deal with
         // the Performer holding a reference to this via the closure we set up.
@@ -672,30 +721,62 @@ impl Parser {
     /// Similar to `parse_first` but collects all actions from the first sequence,
     /// and guarantees the state machine is in the ground state at the end of this
     /// sequence.
-    pub fn parse_first_as_vec(&mut self, bytes: &[u8]) -> Option<(Vec<Action>, usize)> {
+    /// Actions emitted before that boundary are retained across chunk calls
+    /// and delivered exactly once, including when switching to another API.
+    /// Exceeding either `MAX_FIRST_SEQUENCE_*` bound returns the emitted
+    /// partial batch and this call's consumed byte count as an explicit error.
+    pub fn parse_first_as_vec(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<(Vec<Action>, usize)>, FirstSequenceLimitExceeded> {
         let prior_stream_bytes = self.recovery_stream_bytes.take();
-        let mut actions = Vec::new();
+        let mut actions = core::mem::take(&mut self.pending_actions);
         let mut first_idx = None;
         for (idx, b) in bytes.iter().enumerate() {
+            if actions.len() >= MAX_FIRST_SEQUENCE_ACTIONS
+                || self.pending_sequence_bytes >= MAX_FIRST_SEQUENCE_BYTES
+            {
+                self.pending_sequence_bytes = 0;
+                self.finish_recovery_stream_advance(prior_stream_bytes, idx);
+                return Err(FirstSequenceLimitExceeded {
+                    actions: actions.into_iter().collect(),
+                    consumed: idx,
+                });
+            }
+            self.pending_sequence_bytes += 1;
             self.state_machine.parse_byte(
                 *b,
                 &mut Performer {
-                    callback: &mut |action| actions.push(action),
+                    callback: &mut |action| actions.push_back(action),
                     state: &mut self.state.borrow_mut(),
                 },
             );
+            if actions.len() > MAX_FIRST_SEQUENCE_ACTIONS {
+                self.pending_sequence_bytes = 0;
+                self.finish_recovery_stream_advance(prior_stream_bytes, idx + 1);
+                return Err(FirstSequenceLimitExceeded {
+                    actions: actions.into_iter().collect(),
+                    consumed: idx + 1,
+                });
+            }
             if !actions.is_empty() && self.state_machine.is_ground() {
                 // if we recognized any actions, record the iterator index
                 first_idx = Some(idx);
                 break;
             }
         }
-        let result = first_idx.map(|idx| (actions, idx + 1));
+        let result = if let Some(idx) = first_idx {
+            self.pending_sequence_bytes = 0;
+            Some((actions.into_iter().collect(), idx + 1))
+        } else {
+            self.pending_actions = actions;
+            None
+        };
         let consumed = result
             .as_ref()
             .map_or(bytes.len(), |(_, consumed)| *consumed);
         self.finish_recovery_stream_advance(prior_stream_bytes, consumed);
-        result
+        Ok(result)
     }
 }
 
@@ -1173,6 +1254,7 @@ mod test {
         let mut parser = Parser::new();
         let (actions, consumed) = parser
             .parse_first_as_vec(b"a\x1b[partial")
+            .expect("bounded sequence")
             .expect("first ground action batch");
 
         assert_eq!(actions, vec![Action::Print('a')]);
@@ -1352,7 +1434,7 @@ mod test {
 
         let mut offset = 0;
         let mut actions = vec![];
-        while let Some((mut act, off)) = p.parse_first_as_vec(&data[offset..]) {
+        while let Some((mut act, off)) = p.parse_first_as_vec(&data[offset..]).unwrap() {
             actions.append(&mut act);
             offset += off;
         }
@@ -1365,9 +1447,10 @@ mod test {
         SetHyperlink(
             Some(
                 Hyperlink {
-                    params: {},
-                    uri: "http://example.com",
+                    param_count: 0,
+                    uri_bytes: 18,
                     implicit: false,
+                    semantic_text: "[REDACTED]",
                 },
             ),
         ),
@@ -1414,7 +1497,7 @@ mod test {
         let mut offset = 0;
         let mut actions = vec![];
         let mut slices = vec![];
-        while let Some((act, off)) = p.parse_first_as_vec(&data[offset..]) {
+        while let Some((act, off)) = p.parse_first_as_vec(&data[offset..]).unwrap() {
             // Store each vec of actions so we can confirm that the ST sequence is bundled with the
             // OSC SetHyperlink command.
             actions.push(act);
@@ -1444,9 +1527,10 @@ mod test {
             SetHyperlink(
                 Some(
                     Hyperlink {
-                        params: {},
-                        uri: "http://example.com",
+                        param_count: 0,
+                        uri_bytes: 18,
                         implicit: false,
+                        semantic_text: "[REDACTED]",
                     },
                 ),
             ),
@@ -1816,20 +1900,20 @@ mod test {
     fn parse_first_streaming_st_terminator_split_across_chunks() {
         let mut p = Parser::new();
 
-        assert_eq!(None, p.parse_first(b"\x1b]0;hello\x1b"));
-
-        let chunk = b"\\X";
         let (action, consumed) = p
-            .parse_first(chunk)
-            .expect("expected OSC action once ST terminator is completed");
+            .parse_first(b"\x1b]0;hello\x1b")
+            .expect("first-action API dispatches OSC on ESC");
         assert_eq!(
             Action::OperatingSystemCommand(Box::new(
                 OperatingSystemCommand::SetIconNameAndWindowTitle("hello".to_owned()),
             )),
             action
         );
+        assert_eq!(10, consumed);
+        let chunk = b"\\X";
+        let (action, consumed) = p.parse_first(chunk).expect("ST completes separately");
+        assert_eq!(Action::Esc(Esc::Code(EscCode::StringTerminator)), action);
         assert_eq!(1, consumed);
-
         assert_eq!(
             Some((Action::Print('X'), 1)),
             p.parse_first(&chunk[consumed..])
@@ -1842,6 +1926,7 @@ mod test {
         let data = b"\x1b[1mB";
         let (actions, consumed) = p
             .parse_first_as_vec(data)
+            .expect("bounded sequence")
             .expect("expected first completed sequence");
 
         assert_eq!(
@@ -1851,7 +1936,7 @@ mod test {
         assert_eq!(4, consumed);
         assert_eq!(
             Some((vec![Action::Print('B')], 1)),
-            p.parse_first_as_vec(&data[consumed..])
+            p.parse_first_as_vec(&data[consumed..]).unwrap()
         );
     }
 
@@ -1859,11 +1944,12 @@ mod test {
     fn parse_first_as_vec_streaming_st_terminator_split_across_chunks() {
         let mut p = Parser::new();
 
-        assert_eq!(None, p.parse_first_as_vec(b"\x1b]0;hello\x1b"));
+        assert_eq!(None, p.parse_first_as_vec(b"\x1b]0;hello\x1b").unwrap());
 
         let chunk = b"\\X";
         let (actions, consumed) = p
             .parse_first_as_vec(chunk)
+            .expect("bounded sequence")
             .expect("expected completed OSC+ST sequence");
 
         assert_eq!(
@@ -1878,8 +1964,221 @@ mod test {
         assert_eq!(1, consumed);
         assert_eq!(
             Some((vec![Action::Print('X')], 1)),
-            p.parse_first_as_vec(&chunk[consumed..])
+            p.parse_first_as_vec(&chunk[consumed..]).unwrap()
         );
+    }
+
+    #[test]
+    fn first_sequence_actions_survive_every_chunk_split() {
+        let input = b"\x1b]8;id=fixture;https://example.com\x1b\\X";
+        let mut reference = Parser::new();
+        reference.set_print_batching(false);
+        let expected = reference.parse_as_vec(input);
+        for split in 0..=input.len() {
+            let mut parser = Parser::new();
+            let mut actual = Vec::new();
+            for chunk in [&input[..split], &input[split..]] {
+                let mut offset = 0;
+                while let Some((actions, consumed)) =
+                    parser.parse_first_as_vec(&chunk[offset..]).unwrap()
+                {
+                    actual.extend(actions);
+                    offset += consumed;
+                }
+            }
+            assert_eq!(actual, expected, "split {split}");
+            assert!(parser.recovery_ground_boundary().is_some());
+            assert!(parser.parse_first_as_vec(b"").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn retained_sequence_actions_survive_api_switch_exactly_once() {
+        let mut parser = Parser::new();
+        assert!(
+            parser
+                .parse_first_as_vec(b"\x1b]0;hello\x1b")
+                .unwrap()
+                .is_none()
+        );
+        assert!(parser.recovery_ground_boundary().is_none());
+        assert_eq!(
+            parser.parse_first(b""),
+            Some((
+                Action::OperatingSystemCommand(Box::new(
+                    OperatingSystemCommand::SetIconNameAndWindowTitle("hello".to_owned())
+                )),
+                0
+            ))
+        );
+        assert_eq!(
+            parser.parse_as_vec(b"\\"),
+            vec![Action::Esc(Esc::Code(EscCode::StringTerminator))]
+        );
+        assert!(parser.recovery_ground_boundary().is_some());
+
+        let mut parser = Parser::new();
+        assert!(
+            parser
+                .parse_first_as_vec(b"\x1b]0;hello\x1b")
+                .unwrap()
+                .is_none()
+        );
+        let actions = parser.parse_as_vec(b"\\");
+        assert_eq!(actions.len(), 2);
+        assert!(
+            matches!(&actions[0], Action::OperatingSystemCommand(command)
+            if **command == OperatingSystemCommand::SetIconNameAndWindowTitle("hello".to_owned()))
+        );
+        assert_eq!(
+            actions[1],
+            Action::Esc(Esc::Code(EscCode::StringTerminator))
+        );
+        assert!(parser.parse_as_vec(b"").is_empty());
+    }
+
+    #[test]
+    fn first_sequence_action_limit_checks_multi_action_final_byte() {
+        for exceeds_limit in [false, true] {
+            let osc_count = MAX_FIRST_SEQUENCE_ACTIONS - 2 + usize::from(exceeds_limit);
+            let mut input = vec![0x1b];
+            for _ in 0..osc_count {
+                input.extend_from_slice(b"]0;x\x1b");
+            }
+            input.extend_from_slice(b"[1;3m");
+            let mut oracle = Parser::new();
+            let expected = oracle.parse_as_vec(&input);
+            assert_eq!(expected.len(), osc_count + 2);
+
+            let mut parser = Parser::new();
+            let final_byte = input.pop().unwrap();
+            assert!(parser.parse_first_as_vec(&input).unwrap().is_none());
+            let result = parser.parse_first_as_vec(&[final_byte, b'X']);
+            let (actions, consumed) = if exceeds_limit {
+                let error = result.unwrap_err();
+                (error.actions, error.consumed)
+            } else {
+                result.unwrap().unwrap()
+            };
+            assert_eq!(actions, expected);
+            assert_eq!(consumed, 1);
+            assert!(parser.pending_actions.is_empty());
+            assert!(parser.recovery_ground_boundary().is_some());
+            assert_eq!(parser.parse_as_vec(b"X"), vec![Action::Print('X')]);
+            assert!(parser.parse_as_vec(b"").is_empty());
+        }
+    }
+
+    #[test]
+    fn first_sequence_action_limit_returns_lossless_partial_batch() {
+        let mut parser = Parser::new();
+        let mut input = vec![0x1b];
+        for _ in 0..MAX_FIRST_SEQUENCE_ACTIONS {
+            input.extend_from_slice(b"]0;x\x1b");
+        }
+        let mut single_call = Parser::new();
+        let mut terminated = input.clone();
+        terminated.push(b'\\');
+        let single_limit = single_call.parse_first_as_vec(&terminated).unwrap_err();
+        assert_eq!(single_limit.consumed, input.len());
+        assert_eq!(single_limit.actions.len(), MAX_FIRST_SEQUENCE_ACTIONS);
+        assert!(parser.parse_first_as_vec(&input).unwrap().is_none());
+        let limited = parser.parse_first_as_vec(b"\\").unwrap_err();
+        assert_eq!(limited.consumed, 0);
+        assert_eq!(limited.actions.len(), MAX_FIRST_SEQUENCE_ACTIONS);
+        assert!(
+            limited.actions.iter().all(|action| matches!(action,
+            Action::OperatingSystemCommand(command)
+                if **command == OperatingSystemCommand::SetIconNameAndWindowTitle("x".to_owned())))
+        );
+        assert!(parser.pending_actions.is_empty());
+        assert!(parser.recovery_ground_boundary().is_none());
+        let (rest, consumed) = parser.parse_first_as_vec(b"\\").unwrap().unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            rest,
+            vec![Action::Esc(Esc::Code(EscCode::StringTerminator))]
+        );
+        assert!(parser.recovery_ground_boundary().is_some());
+    }
+
+    #[test]
+    fn pending_action_queue_survives_single_byte_chunks_without_repacking() {
+        let mut parser = Parser::new();
+        let mut prefix = vec![0x1b];
+        for _ in 0..512 {
+            prefix.extend_from_slice(b"]0;x\x1b");
+        }
+        prefix.extend_from_slice(b"]0;");
+        assert!(parser.parse_first_as_vec(&prefix).unwrap().is_none());
+        let capacity = parser.pending_actions.capacity();
+        let first_action = parser.pending_actions.front().unwrap() as *const Action;
+        for _ in 0..256 {
+            assert!(parser.parse_first_as_vec(b"y").unwrap().is_none());
+            assert_eq!(parser.pending_actions.len(), 512);
+            assert_eq!(parser.pending_actions.capacity(), capacity);
+            assert_eq!(
+                parser.pending_actions.front().unwrap() as *const Action,
+                first_action
+            );
+        }
+        let (actions, consumed) = parser.parse_first_as_vec(b"\x07").unwrap().unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(actions.len(), 513);
+        assert!(
+            matches!(&actions[512], Action::OperatingSystemCommand(command)
+            if **command == OperatingSystemCommand::SetIconNameAndWindowTitle("y".repeat(256)))
+        );
+        assert!(parser.parse_as_vec(b"").is_empty());
+        assert!(parser.recovery_ground_boundary().is_some());
+    }
+
+    #[test]
+    fn first_sequence_byte_limit_applies_across_chunks() {
+        let mut parser = Parser::new();
+        let mut input = b"\x1b]0;".to_vec();
+        input.resize(MAX_FIRST_SEQUENCE_BYTES, b'x');
+        let split = input.len() / 2;
+        assert!(
+            parser
+                .parse_first_as_vec(&input[..split])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parser
+                .parse_first_as_vec(&input[split..])
+                .unwrap()
+                .is_none()
+        );
+        let limited = parser.parse_first_as_vec(b"\x07").unwrap_err();
+        assert_eq!(limited.consumed, 0);
+        assert!(limited.actions.is_empty());
+        assert!(parser.recovery_ground_boundary().is_none());
+        let (rest, consumed) = parser.parse_first_as_vec(b"\x07").unwrap().unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(rest.len(), 1);
+        assert!(matches!(&rest[0], Action::OperatingSystemCommand(command)
+            if matches!(&**command, OperatingSystemCommand::SetIconNameAndWindowTitle(title)
+                if title.len() == MAX_FIRST_SEQUENCE_BYTES - 4)));
+        assert!(parser.recovery_ground_boundary().is_some());
+    }
+
+    #[test]
+    fn first_sequence_limit_error_does_not_format_semantic_payload() {
+        let error = FirstSequenceLimitExceeded {
+            actions: vec![Action::PrintString("private-parser-marker".to_string())],
+            consumed: 7,
+        };
+        assert_eq!(
+            format!("{error:?}"),
+            "FirstSequenceLimitExceeded { action_count: 1, consumed: 7 }"
+        );
+        assert_eq!(
+            error.to_string(),
+            "first sequence collection limit exceeded"
+        );
+        assert!(!format!("{error:?} {error}").contains("private-parser-marker"));
     }
 
     fn round_trip_parse(s: &str) -> Vec<Action> {

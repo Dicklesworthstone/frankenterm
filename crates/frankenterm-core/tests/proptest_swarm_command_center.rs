@@ -381,16 +381,21 @@ proptest! {
         now in 0..10000u64,
     ) {
         let mut throttle = UpdateThrottle::new(interval);
-        // First update should always go through
+        // The throttle's initial last-update epoch is zero; a synthetic
+        // timestamp earlier than its interval is not yet due.
         let first = throttle.should_update(now);
-        prop_assert!(first, "first update should always proceed");
+        prop_assert_eq!(first, now >= interval);
 
         // Immediate retry should be throttled
         let retry = throttle.should_update(now);
         prop_assert!(!retry, "immediate retry should be throttled");
 
-        // After interval, should proceed
-        let later = throttle.should_update(now + interval + 1);
+        let last_update = throttle.last_update_ms;
+        prop_assert!(!throttle.should_update(last_update.saturating_sub(1)),
+            "clock regression must not trigger a premature update");
+        prop_assert!(!throttle.should_update(last_update + interval - 1));
+        // The exact interval boundary is admitted.
+        let later = throttle.should_update(last_update + interval);
         prop_assert!(later, "update after interval should proceed");
     }
 }
@@ -423,9 +428,18 @@ fn action_category_all_has_8() {
 
 #[test]
 fn command_center_snapshot_serializes() {
-    let center = SwarmCommandCenter::new(LatencyBudget::strict());
-    let snap = center.snapshot();
-    let json = serde_json::to_string(&snap).unwrap();
-    let back: CommandCenterSnapshot = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.operator_level, OperatorLevel::Observer);
+    let mut center = SwarmCommandCenter::new(LatencyBudget::strict());
+    assert_eq!(center.snapshot().operator_level, OperatorLevel::Operator);
+    for level in [
+        OperatorLevel::Observer,
+        OperatorLevel::Operator,
+        OperatorLevel::SeniorOperator,
+        OperatorLevel::Admin,
+    ] {
+        center.set_operator_level(level);
+        let snap = center.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CommandCenterSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.operator_level, level);
+    }
 }

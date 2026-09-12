@@ -76,19 +76,42 @@ fn should_resume_full_reindex(clear_before_start: bool, checkpoint_present: bool
     checkpoint_present && !clear_before_start
 }
 
+fn validate_full_reindex_generation(
+    clear_before_start: bool,
+    checkpoint_present: bool,
+) -> Result<(), IndexerError> {
+    if clear_before_start && checkpoint_present {
+        return Err(IndexerError::Config(
+            "clear_before_start requires a fresh consumer_id with no checkpoint; use clear_before_start=false to resume the existing generation"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Extended writer trait for reindex operations
 // ---------------------------------------------------------------------------
 
 /// Extended capabilities required for reindex (beyond base `IndexWriter`).
 ///
-/// The `clear_all` method is needed for full rebuilds. Implementations should
-/// delete every document and commit the deletion before returning.
+/// Generation metadata belongs to the index, not the process or pipeline.
+/// Implementations must reload it on reopen and preserve it across commits.
+/// Exclusive writer ownership must cover generation validation through writes.
 pub trait ReindexableWriter: IndexWriter {
-    /// Delete all documents from the index.
-    ///
-    /// Returns the number of documents deleted.
-    fn clear_all(&mut self) -> Result<u64, IndexWriteError>;
+    fn reindex_generation(&self) -> Result<Option<String>, IndexWriteError>;
+
+    /// Durably commit generation ownership and, when requested, deletion of
+    /// every document as one atomic index transaction. Return deleted count.
+    /// A crash must expose either the entire previous state or the new owner
+    /// with the cleared index, never old ownership over cleared data. On an
+    /// indeterminate commit error the writer must refuse further use until
+    /// reopened; callers must not infer rollback from an error.
+    fn begin_reindex_generation(
+        &mut self,
+        consumer: &str,
+        clear: bool,
+    ) -> Result<u64, IndexWriteError>;
 }
 
 /// Trait for looking up documents in the index (used by integrity checker).
@@ -161,8 +184,9 @@ pub struct ReindexConfig {
     pub expected_event_schema: String,
     /// Whether to clear the entire index and rebuild from ordinal 0 before starting.
     ///
-    /// Existing full-reindex checkpoints are ignored when this is true. Set this
-    /// to false to resume from a previous full-reindex checkpoint.
+    /// This requires a fresh consumer_id with no checkpoint: clearing under an
+    /// existing checkpoint could make resume skip data no longer in the index.
+    /// Set this to false to resume from a previous full-reindex checkpoint.
     pub clear_before_start: bool,
     /// Stop after this many batches (0 = unlimited).
     pub max_batches: usize,
@@ -355,8 +379,8 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
     /// Perform a full reindex from ordinal 0.
     ///
     /// If `config.clear_before_start` is true, all existing documents are
-    /// deleted before indexing begins and any existing full-reindex checkpoint
-    /// is ignored so the rebuild starts from ordinal 0. Set
+    /// deleted before indexing begins, but only for a fresh consumer_id without
+    /// a checkpoint. An existing checkpoint fails closed before clearing. Set
     /// `clear_before_start=false` for resumable continuation from the last
     /// checkpoint.
     pub async fn full_reindex<S: RecorderStorage>(
@@ -373,16 +397,21 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
-        let checkpoint = if config.clear_before_start {
-            None
-        } else {
-            let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        validate_full_reindex_generation(config.clear_before_start, checkpoint.is_some())?;
+        if checkpoint.is_some()
+            && self.writer.reindex_generation()?.as_deref() != Some(config.consumer_id.as_str())
+        {
+            return Err(IndexerError::Config(
+                "full reindex checkpoint does not own the index generation".to_string(),
+            ));
+        }
+        let checkpoint =
             if should_resume_full_reindex(config.clear_before_start, checkpoint.is_some()) {
                 checkpoint
             } else {
                 None
-            }
-        };
+            };
 
         let mut cursor = match &checkpoint {
             Some(cp) => {
@@ -397,8 +426,11 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             None => event_reader.open_cursor_from_start().map_err(cursor_err)?,
         };
 
-        if config.clear_before_start {
-            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+        if checkpoint.is_none() {
+            let cleared = self
+                .writer
+                .begin_reindex_generation(&config.consumer_id, config.clear_before_start)
+                .map_err(IndexerError::IndexWrite)?;
             progress.docs_cleared = cleared;
         }
 
@@ -424,7 +456,7 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
     /// [`Self::index_loop_with_cx`] (per-iteration cancellation).
     ///
     /// Cancellation-safety contract: source identity and cursor readability are
-    /// proven before `writer.clear_all()`. A cancellation checkpoint immediately
+    /// proven before `writer.begin_reindex_generation()`. A cancellation checkpoint immediately
     /// before the clear prevents destructive mutation if cancellation arrived
     /// during source discovery; a post-clear checkpoint reports the cleared count.
     pub async fn full_reindex_with_cx<S: RecorderStorage>(
@@ -447,24 +479,28 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
-        let checkpoint = if config.clear_before_start {
-            None
-        } else {
-            cx.checkpoint().map_err(|err| {
-                IndexerError::Config(format!(
-                    "full_reindex cancelled before checkpoint read (docs_cleared={}): {err}",
-                    progress.docs_cleared
-                ))
-            })?;
+        cx.checkpoint().map_err(|err| {
+            IndexerError::Config(format!(
+                "full_reindex cancelled before checkpoint read (docs_cleared={}): {err}",
+                progress.docs_cleared
+            ))
+        })?;
 
-            // Tick 75/76 refactor: Cx-first trait sibling.
-            let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
+        let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
+        validate_full_reindex_generation(config.clear_before_start, checkpoint.is_some())?;
+        if checkpoint.is_some()
+            && self.writer.reindex_generation()?.as_deref() != Some(config.consumer_id.as_str())
+        {
+            return Err(IndexerError::Config(
+                "full reindex checkpoint does not own the index generation".to_string(),
+            ));
+        }
+        let checkpoint =
             if should_resume_full_reindex(config.clear_before_start, checkpoint.is_some()) {
                 checkpoint
             } else {
                 None
-            }
-        };
+            };
 
         let mut cursor = match &checkpoint {
             Some(cp) => {
@@ -478,14 +514,17 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             None => event_reader.open_cursor_from_start().map_err(cursor_err)?,
         };
 
-        if config.clear_before_start {
+        if checkpoint.is_none() {
             cx.checkpoint().map_err(|err| {
                 IndexerError::Config(format!(
                     "full_reindex cancelled after source proof and before clear_all: {err}"
                 ))
             })?;
 
-            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+            let cleared = self
+                .writer
+                .begin_reindex_generation(&config.consumer_id, config.clear_before_start)
+                .map_err(IndexerError::IndexWrite)?;
             progress.docs_cleared = cleared;
 
             cx.checkpoint().map_err(|err| {
@@ -2093,9 +2132,10 @@ mod tests {
         }
     }
 
-    // -- Mock ReindexableWriter --
+    // -- Mock ReindexableWriter: models atomic ownership, not disk durability --
 
     struct MockReindexWriter {
+        generation: Option<String>,
         docs: Vec<IndexDocumentFields>,
         deleted_ids: Vec<String>,
         commits: u64,
@@ -2109,6 +2149,7 @@ mod tests {
     impl MockReindexWriter {
         fn new() -> Self {
             Self {
+                generation: None,
                 docs: Vec::new(),
                 deleted_ids: Vec::new(),
                 commits: 0,
@@ -2158,12 +2199,24 @@ mod tests {
     }
 
     impl ReindexableWriter for MockReindexWriter {
-        fn clear_all(&mut self) -> Result<u64, IndexWriteError> {
-            let count = self.docs.len() as u64 + self.clear_count;
+        fn reindex_generation(&self) -> Result<Option<String>, IndexWriteError> {
+            Ok(self.generation.clone())
+        }
+
+        fn begin_reindex_generation(
+            &mut self,
+            consumer: &str,
+            clear: bool,
+        ) -> Result<u64, IndexWriteError> {
+            self.generation = Some(consumer.to_owned());
+            if !clear {
+                return Ok(0);
+            }
+            let count = self.docs.len() as u64;
             self.docs.clear();
             self.deleted_ids.clear();
             self.cleared = true;
-            self.clear_count = count;
+            self.clear_count += count;
             Ok(count)
         }
     }
@@ -2365,14 +2418,15 @@ mod tests {
             assert!(!p1.caught_up);
 
             // Second run: with clear disabled, resume from the existing checkpoint.
-            let mut pipeline2 = ReindexPipeline::new(MockReindexWriter::new());
+            let mut pipeline2 = ReindexPipeline::new(pipeline.into_writer());
             let p2 = pipeline2.full_reindex(&storage, &config).await.unwrap();
             assert_eq!(p2.events_indexed, 3);
             assert_eq!(p2.docs_cleared, 0);
             assert!(!pipeline2.writer().cleared);
 
-            // Verify docs start from ordinal 3
-            assert_eq!(pipeline2.writer().docs[0].event_id, "e3");
+            // Retained prefix plus newly indexed suffix form the same index.
+            assert_eq!(pipeline2.writer().docs.len(), 6);
+            assert_eq!(pipeline2.writer().docs[3].event_id, "e3");
         });
     }
 
@@ -2524,7 +2578,7 @@ mod tests {
                 max_batches: 0,
                 ..first_config
             };
-            let mut resumed = ReindexPipeline::new(MockReindexWriter::new());
+            let mut resumed = ReindexPipeline::new(first.into_writer());
             let resumed_progress = resumed
                 .full_reindex(&storage, &resume_config)
                 .await
@@ -2538,13 +2592,13 @@ mod tests {
                     .iter()
                     .map(|doc| doc.event_id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["sql-e2", "sql-e3", "sql-e4"]
+                vec!["sql-e0", "sql-e1", "sql-e2", "sql-e3", "sql-e4"]
             );
         });
     }
 
     #[test]
-    fn full_reindex_clear_before_start_ignores_existing_checkpoint_ft_d58zy() {
+    fn full_reindex_clear_before_start_requires_fresh_checkpoint_generation() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
@@ -2578,11 +2632,32 @@ mod tests {
                 99,
             ));
             let mut pipeline2 = ReindexPipeline::new(writer);
-            let p2 = pipeline2.full_reindex(&storage, &config).await.unwrap();
+            let consumer = CheckpointConsumerId(config.consumer_id.clone());
+            let checkpoint = storage.read_checkpoint(&consumer).await.unwrap();
+            let before = pipeline2.writer().docs.clone();
+            let error = pipeline2.full_reindex(&storage, &config).await.unwrap_err();
+            assert!(
+                matches!(error, IndexerError::Config(message) if message.contains("fresh consumer_id"))
+            );
+            assert!(!pipeline2.writer().cleared);
+            assert_eq!(pipeline2.writer().docs, before);
+            assert_eq!(
+                storage.read_checkpoint(&consumer).await.unwrap(),
+                checkpoint
+            );
+
+            let fresh_config = ReindexConfig {
+                consumer_id: "fresh-reindex-generation".to_string(),
+                ..config
+            };
+            let p2 = pipeline2
+                .full_reindex(&storage, &fresh_config)
+                .await
+                .unwrap();
 
             assert!(
                 pipeline2.writer().cleared,
-                "clear_before_start=true must clear even when a checkpoint exists"
+                "clear_before_start=true must clear for a fresh checkpoint generation"
             );
             assert_eq!(p2.docs_cleared, 1);
             assert_eq!(p2.events_indexed, 3);
@@ -2599,6 +2674,87 @@ mod tests {
                 !ids.contains(&"stale"),
                 "stale pre-clear document must not survive a clean full reindex"
             );
+        });
+    }
+
+    #[test]
+    fn full_reindex_rejects_checkpoint_from_replaced_or_missing_writer_generation() {
+        run_async_test(async {
+            for cx_first in [false, true] {
+                let dir = tempdir().unwrap();
+                let storage =
+                    AppendLogRecorderStorage::open(test_storage_config(dir.path())).unwrap();
+                let events = (0..6)
+                    .map(|i| sample_event(&format!("e{i}"), 1, i, "text"))
+                    .collect();
+                populate_log(&storage, events).await;
+                let config_a = ReindexConfig {
+                    source: RecorderSourceDescriptor::AppendLog {
+                        data_path: dir.path().join("events.log"),
+                    },
+                    consumer_id: "generation-a".to_owned(),
+                    batch_size: 2,
+                    clear_before_start: true,
+                    ..ReindexConfig::default()
+                };
+                let mut pipeline = ReindexPipeline::new(MockReindexWriter::new());
+                let initial = pipeline.full_reindex(&storage, &config_a).await.unwrap();
+                assert_eq!(initial.events_indexed, 6);
+                let config_b = ReindexConfig {
+                    consumer_id: "generation-b".to_owned(),
+                    max_batches: 1,
+                    ..config_a.clone()
+                };
+                let progress = pipeline.full_reindex(&storage, &config_b).await.unwrap();
+                assert_eq!(progress.docs_cleared, 6);
+                assert_eq!(pipeline.writer().docs.len(), 2);
+                let before = pipeline.writer().docs.clone();
+                let consumer_a = CheckpointConsumerId(config_a.consumer_id.clone());
+                let checkpoint_a = storage.read_checkpoint(&consumer_a).await.unwrap();
+                let resume_a = ReindexConfig {
+                    clear_before_start: false,
+                    ..config_a
+                };
+                let cx = frankenterm_core::cx::for_request();
+                let error = if cx_first {
+                    pipeline
+                        .full_reindex_with_cx(&cx, &storage, &resume_a)
+                        .await
+                } else {
+                    pipeline.full_reindex(&storage, &resume_a).await
+                }
+                .unwrap_err();
+                assert!(
+                    matches!(error, IndexerError::Config(message) if message.contains("does not own the index generation"))
+                );
+                assert_eq!(pipeline.writer().docs, before);
+                assert_eq!(
+                    pipeline.writer().generation.as_deref(),
+                    Some("generation-b")
+                );
+                assert_eq!(
+                    storage.read_checkpoint(&consumer_a).await.unwrap(),
+                    checkpoint_a
+                );
+
+                // Lost metadata cannot authorize replay even if documents exist.
+                let mut missing = MockReindexWriter::new();
+                missing.docs = before;
+                let mut missing = ReindexPipeline::new(missing);
+                assert!(missing.full_reindex(&storage, &resume_a).await.is_err());
+                assert!(missing.writer().generation.is_none());
+                assert_eq!(missing.writer().docs.len(), 2);
+
+                // The current generation can still resume without losing its prefix.
+                let resume_b = ReindexConfig {
+                    clear_before_start: false,
+                    max_batches: 0,
+                    ..config_b
+                };
+                let resumed = pipeline.full_reindex(&storage, &resume_b).await.unwrap();
+                assert_eq!(resumed.events_indexed, 4);
+                assert_eq!(pipeline.writer().docs.len(), 6);
+            }
         });
     }
 

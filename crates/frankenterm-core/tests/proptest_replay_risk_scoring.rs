@@ -227,10 +227,10 @@ proptest! {
         prop_assert_eq!(agg.recommendation, Recommendation::Review);
     }
 
-    // ── RS-11: Info/Low only → Pass ────────────────────────────────────
+    // ── RS-11: Small risks accumulate into the review threshold ─────────
 
     #[test]
-    fn rs11_info_low_pass(n_info in 0usize..5, n_low in 0usize..5) {
+    fn rs11_info_low_aggregate_review_threshold(n_info in 0usize..5, n_low in 0usize..5) {
         let total = n_info + n_low;
         prop_assume!(total > 0);
         let mut scores = Vec::new();
@@ -241,7 +241,12 @@ proptest! {
             scores.push(RiskScore { severity: DivergenceSeverity::Low, impact_radius: 0, confidence: 1.0, explanation: String::new() });
         }
         let agg = AggregateRisk::from_scores(&scores);
-        prop_assert_eq!(agg.recommendation, Recommendation::Pass);
+        // Confidence is one and radius zero: Info=1, Low=2. Even without
+        // any Medium divergence, a cumulative score of 10 requires review.
+        let total_risk = n_info + 2 * n_low;
+        prop_assert_eq!(agg.total_risk_score, total_risk as u64);
+        let expected = if total_risk >= 10 { Recommendation::Review } else { Recommendation::Pass };
+        prop_assert_eq!(agg.recommendation, expected);
     }
 
     // ── RS-12: max_severity is max of individuals ──────────────────────

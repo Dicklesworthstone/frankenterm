@@ -655,11 +655,14 @@ fn heavy_subcommand() -> impl Strategy<Value = &'static str> {
         Just("nextest"),
         Just("bench"),
         Just("clippy"),
+        Just("run"),
+        Just("r"),
+        Just("install"),
     ]
 }
 
 fn non_heavy_subcommand() -> impl Strategy<Value = &'static str> {
-    prop_oneof![Just("run"), Just("r"), Just("doc"),]
+    prop_oneof![Just("doc"), Just("d"),]
 }
 
 fn flag_strategy() -> impl Strategy<Value = String> {

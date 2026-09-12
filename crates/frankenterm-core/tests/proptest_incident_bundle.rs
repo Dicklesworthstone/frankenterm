@@ -400,7 +400,7 @@ proptest! {
     #[test]
     fn prop_truncate_excerpt_char_bound(
         text in arb_utf8_content(),
-        limit in 1usize..=100,
+        limit in 0usize..=100,
     ) {
         let budget = PrivacyBudget {
             max_output_excerpt_len: limit,
@@ -411,8 +411,15 @@ proptest! {
         if input_chars <= limit {
             prop_assert_eq!(result.chars().count(), input_chars);
         } else {
-            // limit chars + "..." (3 chars)
-            prop_assert_eq!(result.chars().count(), limit + 3);
+            // The suffix consumes budget too, including at limits below 3.
+            prop_assert_eq!(result.chars().count(), limit);
+            if limit >= 3 {
+                prop_assert!(result.ends_with("..."));
+                let prefix: String = text.chars().take(limit - 3).collect();
+                prop_assert!(result.starts_with(&prefix));
+            } else {
+                prop_assert_eq!(result, ".".repeat(limit));
+            }
         }
     }
 }
@@ -702,6 +709,8 @@ proptest! {
     fn prop_readme_contains_safety(manifest in arb_manifest()) {
         let readme = generate_bundle_readme(&manifest);
         prop_assert!(readme.contains("Safety"));
+        prop_assert!(readme.contains("Review the bundle contents"));
+        prop_assert!(readme.contains("redaction_report.json"));
     }
 
     /// README mentions redaction (either "No secrets" or "redacted").

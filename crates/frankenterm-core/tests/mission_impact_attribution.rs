@@ -297,7 +297,7 @@ fn impact_churn_decreases_with_stable_assignments() {
 }
 
 #[test]
-fn impact_deny_rate_bounded_below_half() {
+fn impact_deny_rate_reflects_default_reassignment_cooldown() {
     let agents = vec![agent("a1"), agent("a2")];
     let issues = vec![issue("b1", 1)];
     let ml = run_cycles(&agents, &issues, 5);
@@ -306,12 +306,14 @@ fn impact_deny_rate_bounded_below_half() {
     let samples: Vec<&MissionCycleMetricsSample> = history.iter().collect();
     let stats = compute_baseline(&samples);
 
-    // Default safety envelope may deny some assignments; verify bounded
+    // Reusing the same bead is intentionally throttled: cycles 1 and 4
+    // assign, while cycles 2, 3, and 5 are denied by the 3-cycle cooldown.
     assert!(
-        stats.mean_deny_rate <= 0.5,
-        "Deny rate should stay below critical threshold: {}",
+        (stats.mean_deny_rate - 0.6).abs() < f64::EPSILON,
+        "Deny rate must reflect three cooldown denials in five cycles: {}",
         stats.mean_deny_rate
     );
+    assert_eq!(ml.state().total_assignments_made, 2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

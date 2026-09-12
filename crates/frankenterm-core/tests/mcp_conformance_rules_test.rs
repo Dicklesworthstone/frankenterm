@@ -241,13 +241,14 @@ fn canonicalize(value: &mut Value) {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
-                    "now" | "elapsed_ms" => *child = Value::from(0_u64),
+                    "input_schema" => {}
+                    "now" | "elapsed_ms" if child.is_number() => *child = Value::from(0_u64),
                     "confidence" if child.is_number() => {
                         // Confidence varies with internal PatternEngine scoring heuristics
                         // — freeze to 0.0 to keep the golden insensitive to tuning.
                         *child = Value::from(0.0_f64);
                     }
-                    _ if key.ends_with("_ms") => *child = Value::from(0_i64),
+                    _ if key.ends_with("_ms") && child.is_number() => *child = Value::from(0_i64),
                     _ => canonicalize(child),
                 }
             }
@@ -267,12 +268,12 @@ fn canonicalize(value: &mut Value) {
             }
         }
         Value::Number(number) => {
-            if number.as_i64().is_none()
+            if number.is_f64()
                 && let Some(float) = number.as_f64()
                 && float.is_finite()
                 && float.fract() == 0.0
                 && float >= i64::MIN as f64
-                && float <= i64::MAX as f64
+                && float < i64::MAX as f64
             {
                 *value = Value::from(float as i64);
             }
@@ -285,6 +286,32 @@ fn canonical_value(value: &Value) -> Value {
     let mut cloned = value.clone();
     canonicalize(&mut cloned);
     cloned
+}
+
+#[test]
+fn canonicalization_preserves_schema_versions_and_large_numbers() {
+    let schema = json!({"properties": {"timeout_ms": {"type": "number", "minimum": 1.0}}});
+    let original = json!({
+        "input_schema": schema,
+        "version": "malformed-version",
+        "unsigned": u64::MAX,
+        "upper_boundary": 9223372036854775808.0_f64,
+        "integral_float": 1.0,
+    });
+    let actual = canonical_value(&original);
+    for field in ["input_schema", "version", "unsigned", "upper_boundary"] {
+        assert_eq!(
+            actual[field], original[field],
+            "changed authoritative {field}"
+        );
+    }
+    assert_eq!(actual["integral_float"], json!(1));
+    let mut expected = actual.clone();
+    expected["version"] = json!(env!("CARGO_PKG_VERSION"));
+    assert_ne!(
+        actual, expected,
+        "malformed actual versions must not compare equal"
+    );
 }
 
 fn pretty_canonical(value: &Value) -> String {
@@ -326,7 +353,21 @@ fn assert_matches_golden(name: &str, capture: &RulesTestGoldenCapture) {
     let actual_text = pretty_canonical(&actual_value);
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
-    if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    for field in [
+        "anchor_success_envelope",
+        "anchor_success_envelope_with_trace",
+        "empty_text_success_envelope",
+    ] {
+        let version = expected_value[field]
+            .get_mut("version")
+            .expect("golden envelope must contain a version");
+        assert!(version.is_string(), "golden version must remain a string");
+        *version = Value::String(env!("CARGO_PKG_VERSION").to_string());
+    }
+    // Preserve schema constraints and response types; object member ordering
+    // is not part of the JSON contract. Version must match this exact package.
+    if canonical_value(&expected_value) != canonical_value(&actual_value) {
         let actual_path = path.with_extension("actual.json");
         let _ = fs::write(&actual_path, &actual_text);
         panic!(

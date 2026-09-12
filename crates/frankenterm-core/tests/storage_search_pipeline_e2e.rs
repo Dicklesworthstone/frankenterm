@@ -227,11 +227,21 @@ fn retention_size_eviction_honors_config_and_cascades_embeddings_e2e() {
         assert_eq!(disabled.deleted_segments, 0, "cap=0 must be a no-op");
         assert_eq!(total_segments(&storage).await, 256);
 
-        // Enforce a 1 MiB cap: evicts the oldest segments and shrinks live size.
-        let outcome = storage.enforce_size_limit(1).await.expect("enforce 1");
+        // Leave room for the actual schema/index footprint. A fixed 1 MiB
+        // cap can be smaller than non-segment data and evict the whole corpus.
+        // Choose the greatest whole-MiB cap strictly below the measured size,
+        // so the overage is at most 1 MiB of this 4 MiB corpus.
+        assert!(disabled.used_bytes_before > 2 * 1024 * 1024);
+        let cap_mb = u32::try_from((disabled.used_bytes_before - 1) / (1024 * 1024))
+            .expect("fixture size fits configured cap");
+        assert!(cap_mb > 0);
+        let outcome = storage
+            .enforce_size_limit(cap_mb)
+            .await
+            .expect("enforce cap");
         assert!(
             outcome.deleted_segments > 0,
-            "a 1 MiB cap must evict over-cap segments: {outcome:?}"
+            "a below-size cap must evict over-cap segments: {outcome:?}"
         );
         assert!(
             outcome.used_bytes_after < outcome.used_bytes_before,
@@ -243,6 +253,19 @@ fn retention_size_eviction_honors_config_and_cascades_embeddings_e2e() {
         assert!(
             remaining > 0 && remaining < 256,
             "expected partial oldest-first eviction, {remaining} segments remain"
+        );
+        let mut surviving_sequences: Vec<_> = storage
+            .get_segments(7, 256)
+            .await
+            .expect("read retained segments")
+            .into_iter()
+            .map(|segment| segment.seq)
+            .collect();
+        surviving_sequences.sort_unstable();
+        assert_eq!(
+            surviving_sequences,
+            ((256 - remaining) as u64..256).collect::<Vec<_>>(),
+            "retention must keep exactly the newest contiguous suffix"
         );
 
         // FK cascade: each evicted segment's embedding is gone too (no orphans),

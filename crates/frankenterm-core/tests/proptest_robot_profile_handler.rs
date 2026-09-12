@@ -201,11 +201,27 @@ proptest! {
     #[test]
     fn proptest_robot_profile_handler_apply_paths_are_count_and_dry_run_exact(
         name in valid_word(),
-        requested_count in any::<u64>(),
+        requested_count in prop_oneof![1u64..=256, Just(0), Just(257), any::<u64>()],
     ) {
         let backend = fresh_backend();
         insert_agent_profile(&backend, &profile(&name, "worker", Vec::new()))
             .expect("insert profile");
+
+        if !(1..=256).contains(&requested_count) {
+            // Dry-run validates the same bounded spawn request as live apply.
+            for dry_run in [true, false] {
+                let err = handle_profile_command(
+                    "apply",
+                    &json!({"name": name.clone(), "count": requested_count, "dry_run": dry_run}),
+                    &backend,
+                ).unwrap_err();
+                match err {
+                    ProfileHandlerError::BadParams(reason) => prop_assert!(reason.contains("count")),
+                    other => prop_assert!(false, "expected count validation failure, got {other:?}"),
+                }
+            }
+            return Ok(());
+        }
 
         let dry_run = handle_profile_command(
             "apply",
@@ -228,7 +244,7 @@ proptest! {
         .unwrap_err();
         match err {
             ProfileHandlerError::SpawnFailed { reason } => {
-                let expected_count = format!("count={}", u32::try_from(requested_count).unwrap_or(1));
+                let expected_count = format!("count={requested_count}");
                 prop_assert!(reason.contains(&name));
                 prop_assert!(reason.contains(&expected_count));
                 prop_assert!(reason.contains("daemon-mediated pane spawning"));

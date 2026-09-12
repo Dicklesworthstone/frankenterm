@@ -705,6 +705,7 @@ fn all_explanation_suggestions_start_with_verb() {
         "Reduce",
         "Increase",
         "Consider",
+        "Prefer",
         "Ensure",
         "Investigate",
         "If",

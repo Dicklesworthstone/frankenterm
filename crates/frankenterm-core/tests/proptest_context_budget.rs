@@ -118,7 +118,12 @@ proptest! {
         tracker.update_tokens(current_tokens);
 
         let util = tracker.utilization();
-        let expected = current_tokens as f64 / max_tokens as f64;
+        let expected = if current_tokens >= max_tokens {
+            1.0
+        } else {
+            current_tokens as f64 / max_tokens as f64
+        };
+        prop_assert!((0.0..=1.0).contains(&util));
         prop_assert!((util - expected).abs() < 1e-10,
             "utilization {} != expected {}", util, expected);
     }
@@ -144,13 +149,18 @@ proptest! {
     }
 
     #[test]
-    fn zero_max_tokens_safe(_dummy in 0..1u32) {
+    fn zero_max_tokens_safe(tokens in any::<u64>()) {
         let config = ContextBudgetConfig {
             max_tokens: 0,
             max_compaction_history: 10,
         };
-        let tracker = ContextBudgetTracker::new(1, config);
+        let mut tracker = ContextBudgetTracker::new(1, config);
         prop_assert!((tracker.utilization() - 0.0).abs() < f64::EPSILON);
+        tracker.update_tokens(tokens);
+        // These clamped endpoints are exact, so retain an exact oracle rather
+        // than introducing tolerance for intermediate floating-point values.
+        let expected = if tokens == 0 { 0.0_f64 } else { 1.0_f64 };
+        prop_assert_eq!(tracker.utilization().to_bits(), expected.to_bits());
     }
 }
 

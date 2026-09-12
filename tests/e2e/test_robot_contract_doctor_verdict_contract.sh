@@ -34,6 +34,12 @@ LIVE_MANIFEST = "docs/attestations/manifest.json"
 WORKFLOW = "scripts/release-gates.sh"
 MATRIX = "docs/robot-contracts/contract-doctor-matrix.md"
 ORACLE = "scripts/check-contract-doctor-coverage.sh"
+REGISTRY = "crates/frankenterm-core/src/robot_api_contracts.rs"
+registry_source = StaticAttestation.read_text!(REGISTRY, check: "robot_contract_doctor.registry")
+registry_all = registry_source.match(/pub const ALL:\s*&'static \[ApiSurface\]\s*=\s*&\[(.*?)\];/m)
+raise "cannot locate ApiSurface::ALL" unless registry_all
+LIVE_SURFACE_COUNT = registry_all[1].scan(/Self::[A-Za-z0-9_]+/).length
+raise "ApiSurface::ALL must not be empty" if LIVE_SURFACE_COUNT.zero?
 
 EXPECTED_DIMENSIONS = %w[ENV PAR POL RED TOON ERR].freeze
 EXPECTED_GAPS = {
@@ -107,7 +113,8 @@ def validation_errors(verdict, input_path)
   errors << "kind" unless verdict["kind"] == "robot-contract-doctor-attestation"
   errors << "category" unless verdict["category"] == "proofs/robot-contracts"
   errors << "produced_by_bead" unless verdict["produced_by_bead"] == "ft-7h5da.13.7"
-  errors << "overall_status" unless verdict["overall_status"] == "pass_with_tracked_exceptions"
+  expected_status = input_path == LIVE_ARTIFACT ? "pending_final_qualification" : "pass_with_tracked_exceptions"
+  errors << "overall_status" unless verdict["overall_status"] == expected_status
 
   proof_categories = verdict["proof_categories"]
   errors << "proof_categories" unless proof_categories.is_a?(Array) && proof_categories.include?(4)
@@ -118,12 +125,19 @@ def validation_errors(verdict, input_path)
     return errors
   end
   errors << "contract_id" unless contract["contract_id"] == "ft.robot_contract_doctor.v1"
-  errors << "api_surface_count" unless contract["api_surface_count"] == 38
-  errors << "matrix_surface_count" unless contract["matrix_surface_count"] == 38
+  # Historical golden/invalid documents retain their original registry size;
+  # the live producer must track the current typed registry, not that snapshot.
+  expected_surface_count = input_path == LIVE_ARTIFACT ? LIVE_SURFACE_COUNT : 38
+  errors << "api_surface_count" unless contract["api_surface_count"] == expected_surface_count
+  errors << "matrix_surface_count" unless contract["matrix_surface_count"] == expected_surface_count
   errors << "dimensions" unless contract["dimensions"] == EXPECTED_DIMENSIONS
   errors << "unified_ci_verdict" unless contract["unified_ci_verdict"] == true
   errors << "local_cargo_counts_as_proof" unless contract["local_cargo_counts_as_proof"] == false
   errors << "tracked_exceptions_are_not_green_claims" unless contract["tracked_exceptions_are_not_green_claims"] == true
+  if input_path == LIVE_ARTIFACT
+    errors << "partial_cell_count" unless contract["partial_cell_count"] == 0
+    errors << "full_release_qualified" unless contract["full_release_qualified"] == false
+  end
 
   boundaries = verdict["claim_boundaries"]
   if boundaries.is_a?(Hash)
@@ -137,15 +151,22 @@ def validation_errors(verdict, input_path)
   ci = verdict["ci_verdict"]
   if ci.is_a?(Hash)
     errors << "ci_verdict.workflow" unless ci["workflow"] == WORKFLOW
-    errors << "ci_verdict.job" unless ci["job"] == "matrix"
+    expected_job = input_path == LIVE_ARTIFACT ? "dsr-repository-gates" : "matrix"
+    errors << "ci_verdict.job" unless ci["job"] == expected_job
     steps = ci["fail_closed_steps"]
     if steps.is_a?(Array)
       names = steps.map { |step| step["name"] }
       errors << "fail_closed_steps" unless names == EXPECTED_STEPS
       command_text = steps.map { |step| step["command"].to_s }.join("\n")
       errors << "fail_closed_steps.static_oracle" unless command_text.include?(ORACLE)
-      errors << "fail_closed_steps.jq" unless command_text.include?("jq -e")
-      errors << "fail_closed_steps.cargo_filter" unless command_text.include?("cargo test -p frankenterm-core --lib robot_api_contracts")
+      expected_slot_command = input_path == LIVE_ARTIFACT ? "bash scripts/release-gates.sh --only 'Robot/MCP Contract Doctor attestation slot'" : "jq -e"
+      errors << "fail_closed_steps.slot" unless command_text.include?(expected_slot_command)
+      expected_cargo_command = if input_path == LIVE_ARTIFACT
+        "bash scripts/release-gates.sh --cargo --only 'Robot/MCP Contract Doctor cargo verdict'"
+      else
+        "cargo test -p frankenterm-core --lib robot_api_contracts"
+      end
+      errors << "fail_closed_steps.cargo_filter" unless command_text.include?(expected_cargo_command)
     else
       errors << "fail_closed_steps"
     end
@@ -158,7 +179,8 @@ def validation_errors(verdict, input_path)
     actual = tracked.to_h { |gap| [gap["gap_id"], gap["tracking_bead"]] }
     errors << "tracked_exceptions" unless actual == EXPECTED_GAPS
     tracked.each do |gap|
-      errors << "tracked_exceptions.status" unless gap["status"] == "tracked_exception"
+      expected_gap_status = input_path == LIVE_ARTIFACT ? "scope_boundary" : "tracked_exception"
+      errors << "tracked_exceptions.status" unless gap["status"] == expected_gap_status
     end
   else
     errors << "tracked_exceptions"
@@ -248,7 +270,26 @@ end
 if repo_file?(LIVE_ARTIFACT)
   live = read_json(LIVE_ARTIFACT)
   assert_valid_verdict(live, LIVE_ARTIFACT)
-  expect_equal(projection_for(live), expected_projection, "live verdict projection drifted from golden", check: "robot_contract_doctor.live_projection", input_path: LIVE_ARTIFACT)
+  live_projection = expected_projection.merge(
+    "overall_status" => "pending_final_qualification",
+    "api_surface_count" => LIVE_SURFACE_COUNT,
+    "matrix_surface_count" => LIVE_SURFACE_COUNT,
+  )
+  expect_equal(projection_for(live), live_projection, "live verdict projection drifted from current contract", check: "robot_contract_doctor.live_projection", input_path: LIVE_ARTIFACT)
+  stale_live = Marshal.load(Marshal.dump(live))
+  stale_live["contract"]["api_surface_count"] = LIVE_SURFACE_COUNT - 1
+  stale_live["contract"]["matrix_surface_count"] = LIVE_SURFACE_COUNT - 1
+  assert_ok(
+    validation_errors(stale_live, LIVE_ARTIFACT).include?("api_surface_count") &&
+      validation_errors(stale_live, LIVE_ARTIFACT).include?("matrix_surface_count"),
+    "live verdict must reject a stale registry count",
+    check: "robot_contract_doctor.live_stale_count_negative",
+  )
+  premature_green = Marshal.load(Marshal.dump(live))
+  premature_green["contract"]["full_release_qualified"] = true
+  assert_ok(validation_errors(premature_green, LIVE_ARTIFACT).include?("full_release_qualified"),
+    "focused receipts must not claim completed release qualification",
+    check: "robot_contract_doctor.live_premature_release_negative")
 
   # The manifest slot is either populated (producer closed) or explicitly
   # deferred to the producer bead (attestation: defer blocked producer slots).
@@ -278,6 +319,27 @@ if repo_file?(LIVE_ARTIFACT)
     present = workflow.include?(step)
     assert_ok(present, "workflow missing #{step}", check: "robot_contract_doctor.workflow_step", input_path: WORKFLOW, expected: step, actual: present ? "present" : "missing")
   end
+  cargo_gate = workflow.lines.find { |line| line.start_with?('cargo_gate "Robot/MCP Contract Doctor cargo verdict"') }
+  static_gate = workflow.lines.find { |line| line.start_with?('gate "Robot/MCP Contract Doctor static verdict"') }
+  assert_ok(static_gate && static_gate.include?("bash scripts/check-contract-doctor-coverage.sh --strict"),
+    "Doctor release static gate must reject partial cells",
+    check: "robot_contract_doctor.static_release_gate_strict", input_path: WORKFLOW)
+  required_cargo_terms = [
+    "bash scripts/check-contract-doctor-coverage.sh --strict && cargo test",
+    "--features mcp", "--lib", "--test conformance_robot_api_surface_coverage",
+    "--test conformance_robot_envelope_schema", "--test mcp_conformance_core_tools",
+    "--test mcp_conformance_additional_tools", "--test wa_event_mutations_mcp_conformance",
+    "--test proptest_toon_roundtrip", "--test toon_golden",
+    "--no-fail-fast", "--test cli_contract_tests", "--bin ft",
+    "doctor_cargo_test contract_doctor_cli_mcp_read_and_refresh_parity 1",
+    "doctor_cargo_test tests::workflow_dry_run_report_includes_steps positive",
+    "doctor_cargo_test tests::redact_pane_text_results_for_output_scrubs_ok_and_error_payloads 1",
+    "--exact --nocapture --color never",
+  ]
+  required_cargo_terms.each do |term|
+    assert_ok(cargo_gate && cargo_gate.include?(term), "Doctor cargo gate missing #{term}",
+      check: "robot_contract_doctor.cargo_gate_dimensions", input_path: WORKFLOW)
+  end
 else
   StaticAttestation.log_check(
     "robot_contract_doctor.live_artifact_optional",
@@ -290,3 +352,34 @@ end
 
 puts "robot contract doctor verdict contract: passed (golden projection, #{invalid_cases.length} invalid fragments, live=#{repo_file?(LIVE_ARTIFACT)})"
 RUBY
+
+# Exercise transcript acceptance without invoking Cargo. These are gate-parser
+# controls, not runtime receipts for the product tests named by the gate.
+doctor_helper=$(sed -n '/^doctor_cargo_test() {/,/^}/p' scripts/release-gates.sh)
+[[ -n "$doctor_helper" ]] || { echo 'Doctor Cargo proof helper missing' >&2; exit 1; }
+(
+  eval "$doctor_helper"
+  cargo() { printf '%s\n' "$doctor_fixture"; return "$doctor_status"; }
+  doctor_status=0
+  doctor_fixture=$'test oracle ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 9 filtered out; finished in 0.01s'
+  doctor_cargo_test oracle 1 >/dev/null
+  doctor_cargo_test oracle positive >/dev/null
+  doctor_fixture='test result: ok. 0 passed; 0 failed; 0 ignored; 10 filtered out; finished in 0.01s'
+  if doctor_cargo_test oracle 1 >/dev/null; then
+    echo 'Doctor gate accepted zero tests' >&2; exit 1
+  fi
+  doctor_fixture=$'test different ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 9 filtered out; finished in 0.01s'
+  if doctor_cargo_test oracle 1 >/dev/null; then
+    echo 'Doctor gate accepted wrong oracle' >&2; exit 1
+  fi
+  doctor_fixture=$'test oracle ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 8 filtered out; finished in 0.01s'
+  if doctor_cargo_test oracle 1 >/dev/null; then
+    echo 'Doctor gate accepted non-exact test count' >&2; exit 1
+  fi
+  doctor_cargo_test oracle positive >/dev/null
+  doctor_status=1
+  if doctor_cargo_test oracle positive >/dev/null; then
+    echo 'Doctor gate accepted unsuccessful Cargo exit' >&2; exit 1
+  fi
+)
+echo 'Doctor filtered-test transcript controls: passed (no Cargo executed)'

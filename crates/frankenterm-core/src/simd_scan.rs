@@ -43,7 +43,7 @@ impl OutputScanMetrics {
     }
 }
 
-/// Phase of an in-flight string-introducer C1 sequence.
+/// Phase of an in-flight escape sequence.
 ///
 /// [ft-nk6u9] The C1 controls `]` (OSC), `P` (DCS), `X` (SOS), `^` (PM),
 /// and `_` (APC) open a *string* sequence whose body continues until
@@ -62,10 +62,12 @@ pub enum StringPhase {
     /// is the `\` of an ST (end of string) or the start of another
     /// embedded sequence.
     SawEsc,
+    /// Inside CSI parameters; the next final byte ends the control.
+    Csi,
 }
 
 #[cfg(feature = "ansi-dfa-table")]
-const ANSI_DFA_STATE_COUNT: usize = 6;
+const ANSI_DFA_STATE_COUNT: usize = 8;
 #[cfg(feature = "ansi-dfa-table")]
 const ANSI_DFA_BYTE_COUNT: usize = 256;
 #[cfg(feature = "ansi-dfa-table")]
@@ -79,7 +81,7 @@ include!(concat!(env!("OUT_DIR"), "/ansi_dfa_table.rs"));
 pub struct OutputScanState {
     /// True if previous chunk ended inside an ANSI escape sequence.
     pub in_escape: bool,
-    /// Phase of an in-flight C1 string sequence (OSC/DCS/SOS/PM/APC).
+    /// Phase of an in-flight CSI or C1 string sequence (OSC/DCS/SOS/PM/APC).
     ///
     /// [ft-nk6u9] Defaults to `None`; [`OutputScanState::default()`] is
     /// unchanged in observable behaviour relative to the pre-fix state.
@@ -130,6 +132,8 @@ pub(crate) fn is_string_intro_byte(b: u8) -> bool {
 ///     in escape (CSI parameters).
 ///   * Any byte above `0x7E` (non-ASCII in the middle of an escape)
 ///     → count, exit escape (best-effort; avoids runaway state).
+/// * Inside CSI, bytes at or above `0x40` end the control, including
+///   string introducers and non-ASCII bytes (best-effort recovery).
 /// * While in a string body:
 ///   * `BEL` (0x07) terminates the string; count, exit escape fully.
 ///   * `ESC` enters the "saw ESC inside string" phase; count, stay in
@@ -147,6 +151,8 @@ pub(crate) fn ansi_state_step(b: u8, in_escape: &mut bool, string_phase: &mut St
         // potential ST — do not reset the Body-phase to None here.
         if *in_escape && matches!(string_phase, StringPhase::Body | StringPhase::SawEsc) {
             *string_phase = StringPhase::SawEsc;
+        } else {
+            *string_phase = StringPhase::None;
         }
         *in_escape = true;
         return true;
@@ -163,7 +169,7 @@ pub(crate) fn ansi_state_step(b: u8, in_escape: &mut bool, string_phase: &mut St
             if is_string_intro_byte(b) {
                 *string_phase = StringPhase::Body;
             } else if b == b'[' {
-                // CSI intro; stay in escape.
+                *string_phase = StringPhase::Csi;
             } else if (0x40..=0x7E).contains(&b) {
                 // Single-char C1 final byte.
                 *in_escape = false;
@@ -174,6 +180,12 @@ pub(crate) fn ansi_state_step(b: u8, in_escape: &mut bool, string_phase: &mut St
             }
             // else: parameter / intermediate byte (0x20..=0x3F) — stay
             // in escape, already counted.
+        }
+        StringPhase::Csi => {
+            if b >= 0x40 {
+                *string_phase = StringPhase::None;
+                *in_escape = false;
+            }
         }
         StringPhase::Body => {
             if b == 0x07 {
@@ -205,6 +217,7 @@ fn ansi_dfa_encode_state(in_escape: bool, string_phase: StringPhase) -> usize {
         StringPhase::None => 0,
         StringPhase::Body => 1,
         StringPhase::SawEsc => 2,
+        StringPhase::Csi => 3,
     };
     (phase << 1) | usize::from(in_escape)
 }
@@ -217,7 +230,8 @@ fn ansi_dfa_decode_state(state: usize) -> (bool, StringPhase) {
         0 => StringPhase::None,
         1 => StringPhase::Body,
         2 => StringPhase::SawEsc,
-        _ => unreachable!("ANSI DFA table encodes only six states"),
+        3 => StringPhase::Csi,
+        _ => unreachable!("ANSI DFA table encodes only eight states"),
     };
     (in_escape, string_phase)
 }
@@ -487,6 +501,8 @@ mod tests {
             (true, StringPhase::Body),
             (false, StringPhase::SawEsc),
             (true, StringPhase::SawEsc),
+            (false, StringPhase::Csi),
+            (true, StringPhase::Csi),
         ]
     }
 

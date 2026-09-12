@@ -7,11 +7,12 @@
   },
   "required_debug_fragments": [
     "SetHyperlink",
-    "ft-link",
-    "https://example.com/ft"
+    "param_count: 1",
+    "semantic_text: \"[REDACTED]\""
   ],
   "required_display_utf8": [
-    "link text"
+    "link text",
+    "https://example.com/ft"
   ],
   "required_display_hex": [
     "1b5d383b69643d66742d6c696e6b3b",

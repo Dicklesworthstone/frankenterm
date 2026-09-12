@@ -346,7 +346,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// Capture depth within 5 of capacity → Black (capacity > 0).
+    /// Absolute capture headroom escalates to Black only at >=95% fill.
     #[test]
     fn prop_classify_black_capture_saturated(
         cap in 6usize..10_000,
@@ -358,10 +358,11 @@ proptest! {
             write_depth: 0,
             write_capacity: 10_000,
         };
-        prop_assert_eq!(m.classify(&d), BackpressureTier::Black);
+        prop_assert_eq!(m.classify(&d) == BackpressureTier::Black,
+            d.capture_depth * 20 >= cap * 19);
     }
 
-    /// Write depth within 100 of capacity → Black (capacity > 0).
+    /// Absolute write headroom escalates to Black only at >=95% fill.
     #[test]
     fn prop_classify_black_write_saturated(
         cap in 101usize..10_000,
@@ -373,7 +374,8 @@ proptest! {
             write_depth: cap.saturating_sub(99), // within 100 of cap
             write_capacity: cap,
         };
-        prop_assert_eq!(m.classify(&d), BackpressureTier::Black);
+        prop_assert_eq!(m.classify(&d) == BackpressureTier::Black,
+            d.write_depth * 20 >= cap * 19);
     }
 }
 

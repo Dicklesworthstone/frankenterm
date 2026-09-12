@@ -17,10 +17,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 struct TestHarness {
-    _env_lock: MutexGuard<'static, ()>,
+    client: FrameworkTestClient,
     _override_guard: WeztermCliOverrideGuard,
     _fake_wezterm: FakeWezterm,
-    client: FrameworkTestClient,
+    // Release the process-global override lock after the client and fixture.
+    _env_lock: MutexGuard<'static, ()>,
 }
 
 #[derive(Serialize)]
@@ -134,6 +135,8 @@ state_dir = Path({state_dir_literal})
 panes = json.loads((state_dir / "panes.json").read_text())
 
 args = sys.argv[1:]
+if args[:2] == ["cli", "--no-auto-start"]:
+    args = [args[0], *args[2:]]
 if len(args) < 2 or args[0] != "cli":
     print(f"unsupported args: {{args}}", file=sys.stderr)
     sys.exit(2)
@@ -154,6 +157,13 @@ print(json.dumps(panes))
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
+    let selected = frankenterm_core::wezterm::build_unified_client(&config);
+    assert_eq!(
+        selected.selection().kind,
+        frankenterm_core::wezterm::BackendKind::Cli,
+        "wa.state must use its explicit CLI fixture rather than a live host mux"
+    );
+    assert!(selected.discovered_socket().is_none());
     let server = match db_path {
         Some(db_path) => build_server_with_db(&config, Some(db_path)),
         None => build_server_degraded(&config),
@@ -230,11 +240,14 @@ fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMc
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
-    assert_eq!(envelope["ok"], ok);
+    assert_eq!(
+        envelope["ok"], ok,
+        "unexpected wa.state envelope: {envelope}"
+    );
     assert!(envelope["elapsed_ms"].is_number());
     assert!(envelope["now"].is_number());
     assert_eq!(envelope["mcp_version"], "v1");
-    assert!(envelope["version"].is_string());
+    assert_eq!(envelope["version"], env!("CARGO_PKG_VERSION"));
 }
 
 fn assert_success_envelope_shape(envelope: &Value) {
@@ -361,6 +374,9 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
     let actual_text = pretty_canonical(&actual_value);
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse golden");
+    expected_value["success_envelope"]["version"] = Value::from(env!("CARGO_PKG_VERSION"));
+    let expected = pretty_canonical(&expected_value);
 
     if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
         let actual_path = path.with_extension("actual.json");

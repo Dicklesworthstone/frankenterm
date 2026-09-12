@@ -5,7 +5,7 @@
   "generated_at_utc": "2026-03-12T00:27:00Z",
   "required_capability_ids": [
     "ft.runtime.observation",
-    "ft.runtime.compatibility_seam",
+    "ft.runtime.canonical_async_surface",
     "ft.robot.api.envelope",
     "ft.patterns.detection",
     "ft.events.bounded_fanout",
@@ -42,8 +42,8 @@
       "evidence_notes": "Watcher bootstraps ObservationRuntime and enforces periodic discovery/capture loops."
     },
     {
-      "capability_id": "ft.runtime.compatibility_seam",
-      "capability_name": "Runtime compatibility seam for shared tokio/asupersync-adjacent primitives",
+      "capability_id": "ft.runtime.canonical_async_surface",
+      "capability_name": "Canonical asupersync runtime API for project sync, channel, task and time operations",
       "source_domain": "frankenterm",
       "status": "partial",
       "gap_severity": "low",
@@ -58,10 +58,10 @@
         "robot/distributed IPC helper paths"
       ],
       "implementation_anchors": [
-        "crates/frankenterm-core/src/runtime_compat.rs",
+        "crates/frankenterm-core/src/runtime_async.rs",
         "crates/frankenterm/src/main.rs"
       ],
-      "evidence_notes": "runtime_compat already centralizes sync/channel/task/time seams and ships SURFACE_CONTRACT_V1 keep/replace/retire policy metadata; the seam is real and active, but still intentionally transitional."
+      "evidence_notes": "runtime_async is the canonical project-owned asupersync API. The runtime_compat alias and SURFACE_CONTRACT_V1 migration inventory were retired. These anchors establish the API and its CLI integration; they do not independently qualify every runtime consumer."
     },
     {
       "capability_id": "ft.runtime.single_writer_lock",
@@ -305,7 +305,7 @@
       "implementation_anchors": [
         "crates/frankenterm-core/src/runtime_telemetry.rs",
         "crates/frankenterm-core/src/runtime_health.rs",
-        "crates/frankenterm-core/src/policy_metrics.rs"
+        "crates/frankenterm-core-policy-types/src/policy_metrics.rs"
       ],
       "evidence_notes": "UnifiedTelemetryRecord and the runtime-health enrichment path are live, but full convergence coverage across every downstream subsystem is still being normalized under ft-3681t.7.x."
     },

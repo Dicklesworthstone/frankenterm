@@ -36,7 +36,6 @@ use std::sync::OnceLock;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::redactor::{Redactor, secret_pattern_names};
 use crate::{Error, Result};
@@ -56,7 +55,7 @@ const EMBEDDING_DELETE_CHUNK: usize = 500;
 /// Configuration for a single redaction-backfill pass.
 #[derive(Debug, Clone)]
 pub struct RedactBackfillConfig {
-    /// Segments read per batch. Clamped to at least 1.
+    /// Segments read per batch. Clamped to 1..=DEFAULT_BACKFILL_BATCH_SIZE.
     pub batch_size: u32,
     /// Scan and count, but never mutate the database.
     pub dry_run: bool,
@@ -89,10 +88,12 @@ pub struct RedactBackfillReceipt {
     pub schema_version: String,
     /// Whether this was a dry run (no mutations).
     pub dry_run: bool,
-    /// Fingerprint of the active pattern catalog (sha256 over ordered family names).
+    /// Fingerprint of the active detection expressions and replacement policy.
     pub catalog_version: String,
     /// Number of pattern families evaluated.
     pub patterns_checked: usize,
+    /// Exclusive starting cursor; a resumed receipt does not cover earlier rows.
+    pub resume_after_id: i64,
     /// Total segments scanned.
     pub segments_scanned: u64,
     /// Segments that contained at least one secret (rewritten unless `dry_run`).
@@ -105,8 +106,7 @@ pub struct RedactBackfillReceipt {
     pub embeddings_invalidated: u64,
     /// Whether the FTS5 index was rebuilt.
     pub fts_rebuilt: bool,
-    /// Tantivy lexical index rebuild is signaled (performed out-of-process by the
-    /// search daemon); recorded for honesty rather than performed inline.
+    /// A Tantivy rebuild is required, but is not queued or performed here.
     pub tantivy_rebuild_requested: bool,
 }
 
@@ -117,6 +117,7 @@ impl RedactBackfillReceipt {
             dry_run,
             catalog_version: catalog_version(),
             patterns_checked: secret_pattern_names().count(),
+            resume_after_id,
             segments_scanned: 0,
             segments_rewritten: 0,
             family_counts: BTreeMap::new(),
@@ -143,23 +144,17 @@ impl RedactBackfillReceipt {
     }
 }
 
-/// Fingerprint of the active secret-pattern catalog: sha256 over the ordered
-/// family names. Mirrors `backup.rs`'s catalog-version scheme so a backfill
-/// receipt and a backup manifest produced from the same catalog agree.
+/// Canonical detection-expression and replacement-policy fingerprint shared
+/// with ingest stamping and backup manifests.
 #[must_use]
 pub fn catalog_version() -> String {
-    let names: Vec<&'static str> = secret_pattern_names().collect();
-    let mut hasher = Sha256::new();
-    hasher.update(names.join("\n").as_bytes());
-    format!(
-        "live-secret-patterns-sha256:{}",
-        hex::encode(hasher.finalize())
-    )
+    crate::redactor::secret_catalog_version()
 }
 
 /// The active catalog fingerprint, computed once and cached. Hot paths — most
 /// importantly segment-append stamping (ft-7h5da.1.5) — call this instead of
-/// recomputing the sha256 over the pattern names on every row.
+/// recomputing the SHA-256 over the detection expressions and replacement policy
+/// on every row.
 #[must_use]
 pub fn current_catalog_version() -> &'static str {
     static CACHED: OnceLock<String> = OnceLock::new();
@@ -179,8 +174,28 @@ pub fn run_redact_backfill(
     conn: &Connection,
     config: &RedactBackfillConfig,
 ) -> Result<RedactBackfillReceipt> {
+    let transaction = rusqlite::Transaction::new_unchecked(
+        conn,
+        if config.dry_run {
+            rusqlite::TransactionBehavior::Deferred
+        } else {
+            rusqlite::TransactionBehavior::Immediate
+        },
+    )
+    .map_err(|error| db_err("beginning atomic redaction backfill", &error))?;
+    let receipt = run_redact_backfill_transaction(&transaction, config)?;
+    transaction
+        .commit()
+        .map_err(|error| db_err("committing redaction backfill and receipt", &error))?;
+    Ok(receipt)
+}
+
+fn run_redact_backfill_transaction(
+    conn: &Connection,
+    config: &RedactBackfillConfig,
+) -> Result<RedactBackfillReceipt> {
     let redactor = Redactor::new();
-    let batch = i64::from(config.batch_size.max(1));
+    let batch = i64::from(config.batch_size.clamp(1, DEFAULT_BACKFILL_BATCH_SIZE));
     let mut cursor = config.resume_after_id;
     let mut receipt = RedactBackfillReceipt::new(config.dry_run, config.resume_after_id);
     let mut rewritten_ids: Vec<i64> = Vec::new();
@@ -197,10 +212,19 @@ pub fn run_redact_backfill(
         if rows.is_empty() {
             break;
         }
+        rewritten_ids.clear();
         for (id, content) in &rows {
             receipt.segments_scanned += 1;
             cursor = *id;
             receipt.last_segment_id = *id;
+
+            if !config.dry_run {
+                conn.execute(
+                    "UPDATE output_segments SET redaction_catalog_version = ?1 WHERE id = ?2",
+                    rusqlite::params![receipt.catalog_version, id],
+                )
+                .map_err(|error| db_err("stamping backfill catalog version", &error))?;
+            }
 
             let detections = redactor.detect(content);
             if detections.is_empty() {
@@ -231,12 +255,16 @@ pub fn run_redact_backfill(
                 rewritten_ids.push(*id);
             }
         }
+        if !config.dry_run
+            && config.invalidate_embeddings
+            && !rewritten_ids.is_empty()
+            && table_exists(conn, "segment_embeddings")?
+        {
+            receipt.embeddings_invalidated += invalidate_embeddings(conn, &rewritten_ids)?;
+        }
     }
 
-    if !config.dry_run && !rewritten_ids.is_empty() {
-        if config.invalidate_embeddings && table_exists(conn, "segment_embeddings")? {
-            receipt.embeddings_invalidated = invalidate_embeddings(conn, &rewritten_ids)?;
-        }
+    if !config.dry_run && receipt.segments_rewritten > 0 {
         if config.rebuild_fts && table_exists(conn, "output_segments_fts")? {
             conn.execute_batch(
                 "INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')",
@@ -244,11 +272,11 @@ pub fn run_redact_backfill(
             .map_err(|e| db_err("rebuilding output_segments_fts", &e))?;
             receipt.fts_rebuilt = true;
         }
-        // The Tantivy index lives on disk and is owned by the search daemon; it
-        // re-derives from output_segments out-of-process. We signal rather than
-        // reindex inline so the heavy rebuild stays under the daemon's budget.
+        // This receipt records a required external rebuild; it neither queues
+        // that work nor proves a Tantivy reader stopped serving old documents.
         receipt.tantivy_rebuild_requested = true;
-
+    }
+    if !config.dry_run {
         persist_receipt(conn, &receipt)?;
     }
 
@@ -264,9 +292,17 @@ pub fn run_redact_backfill_on_path(
     db_path: &str,
     config: &RedactBackfillConfig,
 ) -> Result<RedactBackfillReceipt> {
-    let conn = Connection::open(db_path)
+    let conn = Connection::open_with_flags(db_path, maintenance_open_flags(config.dry_run))
         .map_err(|e| db_err(&format!("opening database {db_path}"), &e))?;
     run_redact_backfill(&conn, config)
+}
+
+fn maintenance_open_flags(dry_run: bool) -> rusqlite::OpenFlags {
+    if dry_run {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    }
 }
 
 // ── Targeted purge (ft-7h5da.1.4) ──────────────────────────────────────────
@@ -298,6 +334,10 @@ pub struct RedactPurgeReceipt {
     pub schema_version: String,
     /// Whether this was a dry run (no mutations).
     pub dry_run: bool,
+    /// Catalog used to identify eligible secret matches.
+    pub catalog_version: String,
+    /// Exclusive starting cursor; earlier rows are outside this receipt.
+    pub resume_after_id: i64,
     /// SHA-256 hex of the targeted secret — **never** the plaintext.
     pub secret_hash: String,
     /// Total segments scanned.
@@ -315,7 +355,7 @@ pub struct RedactPurgeReceipt {
     pub embeddings_invalidated: u64,
     /// Whether the FTS5 index was rebuilt.
     pub fts_rebuilt: bool,
-    /// Tantivy lexical index rebuild is signaled (performed out-of-process).
+    /// A Tantivy rebuild is required, but is not queued or performed here.
     pub tantivy_rebuild_requested: bool,
     /// True when occurrences were found: backup archives predating this purge may
     /// still contain the secret and must be reviewed / re-created. The offline DB
@@ -329,6 +369,8 @@ impl RedactPurgeReceipt {
         Self {
             schema_version: REDACT_PURGE_SCHEMA_VERSION.to_string(),
             dry_run,
+            catalog_version: catalog_version(),
+            resume_after_id,
             secret_hash: secret_hash.to_string(),
             segments_scanned: 0,
             segments_purged: 0,
@@ -384,6 +426,27 @@ pub fn run_redact_purge(
     secret_hash: &str,
     config: &RedactBackfillConfig,
 ) -> Result<RedactPurgeReceipt> {
+    let transaction = rusqlite::Transaction::new_unchecked(
+        conn,
+        if config.dry_run {
+            rusqlite::TransactionBehavior::Deferred
+        } else {
+            rusqlite::TransactionBehavior::Immediate
+        },
+    )
+    .map_err(|error| db_err("beginning atomic redaction purge", &error))?;
+    let receipt = run_redact_purge_transaction(&transaction, secret_hash, config)?;
+    transaction
+        .commit()
+        .map_err(|error| db_err("committing redaction purge and receipt", &error))?;
+    Ok(receipt)
+}
+
+fn run_redact_purge_transaction(
+    conn: &Connection,
+    secret_hash: &str,
+    config: &RedactBackfillConfig,
+) -> Result<RedactPurgeReceipt> {
     // Fail closed on a malformed key so we never scan the corpus with a garbage
     // hash (which would silently match nothing and read as "clean").
     let secret_hash = secret_hash.trim().to_ascii_lowercase();
@@ -395,10 +458,11 @@ pub fn run_redact_purge(
     }
 
     let redactor = Redactor::new();
-    let batch = i64::from(config.batch_size.max(1));
+    let batch = i64::from(config.batch_size.clamp(1, DEFAULT_BACKFILL_BATCH_SIZE));
     let mut cursor = config.resume_after_id;
     let mut receipt = RedactPurgeReceipt::new(config.dry_run, &secret_hash, config.resume_after_id);
     let mut rewritten_ids: Vec<i64> = Vec::new();
+    let catalog_version = current_catalog_version();
 
     if !config.dry_run {
         conn.execute_batch("PRAGMA secure_delete=ON")
@@ -410,6 +474,7 @@ pub fn run_redact_purge(
         if rows.is_empty() {
             break;
         }
+        rewritten_ids.clear();
         for (id, content) in &rows {
             receipt.segments_scanned += 1;
             cursor = *id;
@@ -448,8 +513,20 @@ pub fn run_redact_purge(
                     rusqlite::params![redacted, content_len, id],
                 )
                 .map_err(|e| db_err(&format!("purging output_segments id {id}"), &e))?;
+                conn.execute(
+                    "UPDATE output_segments SET redaction_catalog_version = ?1 WHERE id = ?2",
+                    rusqlite::params![catalog_version, id],
+                )
+                .map_err(|error| db_err("stamping purge catalog version", &error))?;
                 rewritten_ids.push(*id);
             }
+        }
+        if !config.dry_run
+            && config.invalidate_embeddings
+            && !rewritten_ids.is_empty()
+            && table_exists(conn, "segment_embeddings")?
+        {
+            receipt.embeddings_invalidated += invalidate_embeddings(conn, &rewritten_ids)?;
         }
     }
 
@@ -457,10 +534,7 @@ pub fn run_redact_purge(
     // may still carry it — flag for operator review regardless of dry-run.
     receipt.backups_review_required = receipt.segments_purged > 0;
 
-    if !config.dry_run && !rewritten_ids.is_empty() {
-        if config.invalidate_embeddings && table_exists(conn, "segment_embeddings")? {
-            receipt.embeddings_invalidated = invalidate_embeddings(conn, &rewritten_ids)?;
-        }
+    if !config.dry_run && receipt.segments_purged > 0 {
         if config.rebuild_fts && table_exists(conn, "output_segments_fts")? {
             conn.execute_batch(
                 "INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')",
@@ -469,6 +543,8 @@ pub fn run_redact_purge(
             receipt.fts_rebuilt = true;
         }
         receipt.tantivy_rebuild_requested = true;
+    }
+    if !config.dry_run {
         persist_purge_receipt(conn, &receipt)?;
     }
 
@@ -487,15 +563,20 @@ pub fn run_redact_purge_on_path(
     secret_hash: &str,
     config: &RedactBackfillConfig,
 ) -> Result<RedactPurgeReceipt> {
-    let conn = Connection::open(db_path)
+    // Reject malformed requests before touching the filesystem. Maintenance
+    // must never create a database, including for a dry-run.
+    if !is_valid_secret_hash(secret_hash.trim()) {
+        return Err(Error::Storage(crate::StorageError::Database(format!(
+            "redact purge: --secret-hash must be a 64-char SHA-256 hex digest (got {} chars)",
+            secret_hash.trim().len()
+        ))));
+    }
+    let conn = Connection::open_with_flags(db_path, maintenance_open_flags(config.dry_run))
         .map_err(|e| db_err(&format!("opening database {db_path}"), &e))?;
     run_redact_purge(&conn, secret_hash, config)
 }
 
 fn persist_purge_receipt(conn: &Connection, receipt: &RedactPurgeReceipt) -> Result<()> {
-    if !table_exists(conn, "maintenance_log")? {
-        return Ok(());
-    }
     let metadata = serde_json::to_string(receipt).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
             "serializing redact-purge receipt: {e}"
@@ -560,9 +641,6 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 fn persist_receipt(conn: &Connection, receipt: &RedactBackfillReceipt) -> Result<()> {
-    if !table_exists(conn, "maintenance_log")? {
-        return Ok(());
-    }
     let metadata = serde_json::to_string(receipt).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
             "serializing redact-backfill receipt: {e}"
@@ -599,6 +677,7 @@ mod tests {
                 content_len INTEGER NOT NULL,
                 content_hash TEXT,
                 captured_at INTEGER NOT NULL,
+                redaction_catalog_version TEXT,
                 UNIQUE(pane_id, seq)
             );
             CREATE VIRTUAL TABLE output_segments_fts USING fts5(
@@ -649,6 +728,59 @@ mod tests {
     const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
 
     #[test]
+    fn path_maintenance_never_creates_missing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.sqlite3");
+        let path_string = path.to_str().unwrap();
+        let hash = crate::secrets::hash_secret(SECRET);
+        for dry_run in [true, false] {
+            let config = RedactBackfillConfig {
+                dry_run,
+                ..Default::default()
+            };
+            assert!(run_redact_backfill_on_path(path_string, &config).is_err());
+            assert!(!path.exists());
+            assert!(run_redact_purge_on_path(path_string, &hash, &config).is_err());
+            assert!(!path.exists());
+            let error = run_redact_purge_on_path(path_string, "invalid", &config).unwrap_err();
+            assert!(error.to_string().contains("must be a 64-char SHA-256"));
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn path_dry_runs_use_read_only_connections_and_preserve_database_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE output_segments (id INTEGER PRIMARY KEY, content TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO output_segments VALUES (1, ?1)", [SECRET])
+            .unwrap();
+        conn.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let read_only = Connection::open_with_flags(&path, maintenance_open_flags(true)).unwrap();
+        assert!(read_only.is_readonly(rusqlite::MAIN_DB).unwrap());
+        read_only.close().unwrap();
+        let config = RedactBackfillConfig {
+            dry_run: true,
+            ..Default::default()
+        };
+        let backfill = run_redact_backfill_on_path(path.to_str().unwrap(), &config).unwrap();
+        assert_eq!(backfill.segments_rewritten, 1);
+        let purge = run_redact_purge_on_path(
+            path.to_str().unwrap(),
+            &crate::secrets::hash_secret(SECRET),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(purge.segments_purged, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn secret_fixture_is_detected_by_live_catalog() {
         let r = Redactor::new();
         assert!(
@@ -667,6 +799,10 @@ mod tests {
         let receipt = run_redact_backfill(&conn, &RedactBackfillConfig::default()).unwrap();
 
         assert_eq!(receipt.segments_scanned, 2);
+        println!(
+            "REDACTION_BACKFILL_FIXTURE_RECEIPT={}",
+            serde_json::to_string(&receipt).unwrap()
+        );
         assert_eq!(receipt.segments_rewritten, 1);
         assert!(!receipt.family_counts.is_empty());
         assert_eq!(receipt.last_segment_id, 2);
@@ -729,7 +865,7 @@ mod tests {
         assert_eq!(second.embeddings_invalidated, 0);
         assert!(!second.fts_rebuilt, "no rewrites => no FTS rebuild");
 
-        // Only the first pass wrote a receipt.
+        // A zero-rewrite sweep still certifies which catalog inspected the rows.
         let logged: i64 = conn
             .query_row(
                 "SELECT count(*) FROM maintenance_log WHERE event_type = ?1",
@@ -737,7 +873,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(logged, 1);
+        assert_eq!(logged, 2);
     }
 
     #[test]
@@ -771,6 +907,14 @@ mod tests {
             .query_row("SELECT count(*) FROM maintenance_log", [], |r| r.get(0))
             .unwrap();
         assert_eq!(logged, 0, "dry-run must not write a receipt");
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments WHERE redaction_catalog_version IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 0, "dry-run must not adopt the active catalog");
     }
 
     #[test]
@@ -814,6 +958,7 @@ mod tests {
         let receipt = run_redact_backfill(&conn, &cfg).unwrap();
         assert_eq!(receipt.segments_scanned, 5);
         assert_eq!(receipt.segments_rewritten, 5);
+        assert_eq!(receipt.embeddings_invalidated, 5);
         assert_eq!(receipt.last_segment_id, 5);
     }
 
@@ -821,10 +966,76 @@ mod tests {
     fn catalog_version_is_stable_and_namespaced() {
         let v = catalog_version();
         assert_eq!(v, catalog_version());
-        assert!(v.starts_with("live-secret-patterns-sha256:"));
+        assert!(v.starts_with("live-secret-patterns-v2-sha256:"));
     }
 
     // ── Targeted purge (ft-7h5da.1.4) ──────────────────────────────────────
+
+    #[test]
+    fn backfill_clean_sweep_stamps_catalog_and_records_receipt() {
+        let conn = setup_db();
+        insert_segment(&conn, 1, 0, 0, "ordinary output");
+        let receipt = run_redact_backfill(&conn, &RedactBackfillConfig::default()).unwrap();
+        assert_eq!(receipt.segments_rewritten, 0);
+        let version: String = conn
+            .query_row(
+                "SELECT redaction_catalog_version FROM output_segments",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, catalog_version());
+        let metadata: String = conn
+            .query_row("SELECT metadata FROM maintenance_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RedactBackfillReceipt>(&metadata).unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn backfill_receipt_failure_rolls_back_content_stamp_and_derived_changes() {
+        for (missing_table, purge) in [(false, false), (true, false), (false, true), (true, true)] {
+            let conn = setup_db();
+            insert_segment(&conn, 1, 0, 0, SECRET);
+            if missing_table {
+                conn.execute_batch("ALTER TABLE maintenance_log RENAME TO unavailable_receipts")
+                    .unwrap();
+            } else {
+                conn.execute_batch("CREATE TRIGGER reject_receipt BEFORE INSERT ON maintenance_log BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;").unwrap();
+            }
+            if purge {
+                assert!(
+                    run_redact_purge(
+                        &conn,
+                        &crate::secrets::hash_secret(SECRET),
+                        &RedactBackfillConfig::default()
+                    )
+                    .is_err()
+                );
+            } else {
+                assert!(run_redact_backfill(&conn, &RedactBackfillConfig::default()).is_err());
+            }
+            let (content, version): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT content, redaction_catalog_version FROM output_segments",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(content, SECRET);
+            assert!(version.is_none());
+            let embeddings: i64 = conn
+                .query_row("SELECT COUNT(*) FROM segment_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(embeddings, 1);
+            let hits: i64 = conn.query_row("SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'AKIAIOSFODNN7EXAMPLE'", [], |row| row.get(0)).unwrap();
+            assert_eq!(hits, 1);
+        }
+    }
 
     #[test]
     fn purge_excises_secret_by_hash_and_emits_receipt() {
@@ -834,6 +1045,10 @@ mod tests {
         let hash = crate::secrets::hash_secret(SECRET);
 
         let receipt = run_redact_purge(&conn, &hash, &RedactBackfillConfig::default()).unwrap();
+        println!(
+            "REDACTION_PURGE_FIXTURE_RECEIPT={}",
+            serde_json::to_string(&receipt).unwrap()
+        );
 
         // Acceptance: all occurrences removed; receipt names the surfaces touched.
         assert_eq!(receipt.secret_hash, hash);
@@ -931,7 +1146,7 @@ mod tests {
             )
             .unwrap();
         assert!(content.contains(SECRET));
-        // No tombstone for a no-op.
+        // Retain the completed targeted scan, even when it found no match.
         let logged: i64 = conn
             .query_row(
                 "SELECT count(*) FROM maintenance_log WHERE event_type = ?1",
@@ -939,7 +1154,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(logged, 0);
+        assert_eq!(logged, 1);
     }
 
     #[test]

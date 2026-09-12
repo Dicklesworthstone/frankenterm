@@ -660,13 +660,14 @@ proptest! {
     }
 
     #[test]
-    fn compatibility_report_compatible_matches_missing_fields(
+    fn compatibility_report_requires_version_and_field_compatibility(
         src in arb_schema_version(),
         tgt in arb_schema_version(),
     ) {
         let registry = SchemaEvolutionRegistry::new();
         let report = check_compatibility(&registry, &src, &tgt);
-        prop_assert_eq!(report.compatible, report.missing_fields.is_empty());
+        let version_compatible = src.major == tgt.major && src.minor >= tgt.minor;
+        prop_assert_eq!(report.compatible, version_compatible && report.missing_fields.is_empty());
     }
 }
 

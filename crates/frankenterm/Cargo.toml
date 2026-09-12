@@ -24,6 +24,10 @@ workspace = true
 
 [build-dependencies]
 frankenterm-build-identity.workspace = true
+hex = { workspace = true, features = ["alloc"] }
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
 
 [dependencies]
 frankenterm-build-identity.workspace = true

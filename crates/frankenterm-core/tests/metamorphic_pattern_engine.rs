@@ -34,9 +34,7 @@ fn arb_agent_output() -> impl Strategy<Value = String> {
         prop_oneof![
             // Weighted: 80% printable ASCII, 20% newline — roughly the
             // shape of real pane scrollback (long lines + periodic breaks).
-            8 => any::<u8>().prop_filter("printable ASCII",
-                |b| (0x20..=0x7e).contains(b))
-                .prop_map(|b| b as char),
+            8 => (0x20_u8..=0x7e).prop_map(char::from),
             2 => Just('\n'),
         ],
         0..512,

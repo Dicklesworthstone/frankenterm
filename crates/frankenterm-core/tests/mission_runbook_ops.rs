@@ -180,7 +180,14 @@ fn launch_tick_returns_none_before_cadence() {
 
 #[test]
 fn failure_inject_all_agents_offline_then_recover() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // Isolate fleet recovery from the independent reassignment cooldown.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let issues = vec![issue("b1", 1), issue("b2", 2)];
     let c = ctx();
 
@@ -254,7 +261,14 @@ fn failure_inject_all_closed_beads_graceful() {
 
 #[test]
 fn failure_partial_agent_fleet_maintains_throughput() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // Isolate fleet availability from the independent reassignment cooldown.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let issues = vec![issue("b1", 1), issue("b2", 2)];
     let c = ctx();
 

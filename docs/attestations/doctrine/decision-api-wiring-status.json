@@ -11,10 +11,8 @@
     {
       "symbol": "run_connector_lifecycle_intent",
       "defining_path": "crates/frankenterm-core/src/policy.rs",
-      "status": "dormant",
-      "dormant_bead": "ft-pohny",
-      "dormant_expires_on": "2026-10-01",
-      "note": "gated production boundary landed + unit-proven (ft-7h5da.5.11); operator surface pending"
+      "status": "wired",
+      "note": "production-called from robot_connector_handler.rs lifecycle intent dispatch; the gate remains a source wiring check, not runtime acceptance"
     },
     {
       "symbol": "route_connector_operation_through_mesh",
@@ -29,10 +27,10 @@
       "note": "called from the runtime event loop"
     },
     {
-      "symbol": "check_dedup",
+      "symbol": "acquire_durable_reservation",
       "defining_path": "crates/frankenterm-core/src/tx_idempotency.rs",
       "status": "wired",
-      "note": "consulted pre-dispatch by tx_execution commit/compensation paths (ft-b0pw6)"
+      "note": "tx_execution commit/compensation paths acquire durable reservation and inspect observed_outcome before dispatch; replaces retired check_dedup advisory lookup (37fb43d0e)"
     },
     {
       "symbol": "execute_with_store",

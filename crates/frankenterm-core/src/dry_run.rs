@@ -10,6 +10,259 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::{PolicyDecision, Redactor};
 
+/// Build the shared Robot/MCP workflow preview without executing its steps.
+/// Runtime pane-state and policy authorization are explicitly deferred; the
+/// preview reports workflow eligibility and never grants permission to run.
+#[must_use]
+pub fn workflow_preview(
+    command: &CommandContext,
+    name: &str,
+    pane: u64,
+    pane_info: Option<&crate::wezterm::PaneInfo>,
+    workflow: Option<&dyn crate::workflows::Workflow>,
+    enabled: bool,
+) -> DryRunReport {
+    let mut ctx = command.dry_run_context();
+    if let Some(info) = pane_info {
+        let mut target =
+            TargetResolution::new(pane, info.inferred_domain()).with_is_active(info.is_active);
+        if let Some(title) = &info.title {
+            target = target.with_title(title.clone());
+        }
+        if let Some(cwd) = &info.cwd {
+            target = target.with_cwd(cwd.clone());
+        }
+        ctx.set_target(target);
+    } else {
+        ctx.set_target(TargetResolution::new(pane, "unknown"));
+        ctx.add_warning("Pane metadata unavailable; verify pane ID and daemon state.");
+    }
+    let mut eval = PolicyEvaluation::new();
+    if let Some(wf) = workflow {
+        eval.add_check(PolicyCheck::passed(
+            "workflow",
+            format!("Workflow '{name}' loaded"),
+        ));
+        eval.add_check(if enabled {
+            PolicyCheck::passed("workflow_enabled", "Workflow is enabled")
+        } else {
+            PolicyCheck::failed("workflow_enabled", "Workflow is disabled")
+        });
+        eval.add_check(if wf.requires_approval() {
+            PolicyCheck::failed("approval", "Workflow requires approval")
+        } else {
+            PolicyCheck::passed("approval", "No approval required")
+        });
+        eval.add_check(if wf.is_destructive() {
+            PolicyCheck::failed("destructive", "Workflow marked destructive")
+        } else {
+            PolicyCheck::passed("destructive", "Workflow marked non-destructive")
+        });
+    } else {
+        eval.add_check(PolicyCheck::failed(
+            "workflow",
+            format!("Workflow '{name}' not found"),
+        ));
+    }
+    eval.add_check(if pane_info.is_some() {
+        PolicyCheck::passed("pane", "Pane found")
+    } else {
+        PolicyCheck::failed(
+            "pane",
+            "Pane not found (dry-run uses best-effort resolution)",
+        )
+    });
+    eval.add_check(
+        PolicyCheck::passed("pane_state", "Pane state not inspected during dry-run")
+            .with_details("Verify prompt/alt-screen state before execution."),
+    );
+    eval.add_check(
+        PolicyCheck::passed("policy_surface", "Policy surface: workflow")
+            .with_details("action: workflow_run"),
+    );
+    eval.add_check(
+        PolicyCheck::passed("policy", "Policy checks deferred to execution")
+            .with_details("Send steps remain policy-gated at runtime."),
+    );
+    ctx.set_policy_evaluation(eval);
+    if let Some(wf) = workflow {
+        let mut step = 1;
+        ctx.add_action(PlannedAction::new(
+            step,
+            ActionType::AcquireLock,
+            format!("Acquire workflow lock for pane {pane}"),
+        ));
+        step += 1;
+        for plan in wf.steps_to_plans(pane) {
+            let action_type = step_action_to_dry_run_type(&plan.action);
+            let mut description = plan.description.clone();
+            if action_type == ActionType::SendText {
+                description.push_str(" [policy-gated]");
+            }
+            ctx.add_action(
+                PlannedAction::new(step, action_type, description)
+                    .with_metadata(workflow_step_metadata(&plan)),
+            );
+            step += 1;
+        }
+        let event_types = wf.trigger_event_types();
+        let rule_ids = wf.trigger_rule_ids();
+        if !event_types.is_empty() || !rule_ids.is_empty() {
+            let mut details = Vec::new();
+            if !event_types.is_empty() {
+                details.push(format!("event types: {}", event_types.join(", ")));
+            }
+            if !rule_ids.is_empty() {
+                details.push(format!("rule ids: {}", rule_ids.join(", ")));
+            }
+            ctx.add_action(PlannedAction::new(
+                step,
+                ActionType::MarkEventHandled,
+                format!("Mark triggering event handled ({})", details.join("; ")),
+            ));
+            step += 1;
+        }
+        ctx.add_action(PlannedAction::new(
+            step,
+            ActionType::ReleaseLock,
+            "Release workflow lock".to_string(),
+        ));
+    } else {
+        ctx.add_warning("No workflow steps available; check workflow name.");
+    }
+    ctx.take_report()
+}
+
+/// Map a structured workflow step to its preview action category.
+#[must_use]
+pub fn step_action_to_dry_run_type(action: &crate::plan::StepAction) -> ActionType {
+    use crate::plan::StepAction;
+    match action {
+        StepAction::SendText { .. } => ActionType::SendText,
+        StepAction::WaitFor { .. } => ActionType::WaitFor,
+        StepAction::AcquireLock { .. } => ActionType::AcquireLock,
+        StepAction::ReleaseLock { .. } => ActionType::ReleaseLock,
+        StepAction::StoreData { .. } => ActionType::StoreData,
+        StepAction::RunWorkflow { .. } | StepAction::NestedPlan { .. } => ActionType::WorkflowStep,
+        StepAction::MarkEventHandled { .. } => ActionType::MarkEventHandled,
+        StepAction::ValidateApproval { .. } => ActionType::ValidateApproval,
+        StepAction::Custom { action_type, .. } => infer_action_type_from_name(action_type),
+    }
+}
+
+/// Infer the category of an extension workflow's named action.
+#[must_use]
+pub fn infer_action_type_from_name(name: &str) -> ActionType {
+    let lower = name.to_lowercase();
+    if lower.contains("send") {
+        ActionType::SendText
+    } else if lower.contains("wait")
+        || lower.contains("stabilize")
+        || lower.contains("verify")
+        || lower.contains("check")
+    {
+        ActionType::WaitFor
+    } else if lower.contains("unlock") || (lower.contains("release") && lower.contains("lock")) {
+        ActionType::ReleaseLock
+    } else if lower.contains("lock") {
+        ActionType::AcquireLock
+    } else if lower.contains("mark") && lower.contains("handled") {
+        ActionType::MarkEventHandled
+    } else {
+        ActionType::WorkflowStep
+    }
+}
+
+fn workflow_step_metadata(step: &crate::plan::StepPlan) -> serde_json::Value {
+    use crate::plan::StepAction;
+    let mut meta = serde_json::Map::new();
+    // Custom workflow plans can describe sends too; use the same category as
+    // the displayed action so structured and human preview policy agree.
+    if step_action_to_dry_run_type(&step.action) == ActionType::SendText {
+        meta.insert("policy_gated".to_string(), serde_json::json!(true));
+    }
+    meta.insert(
+        "step_id".to_string(),
+        serde_json::json!(step.step_id.to_string()),
+    );
+    meta.insert("idempotent".to_string(), serde_json::json!(step.idempotent));
+    if let Some(timeout) = step.timeout_ms {
+        meta.insert("timeout_ms".to_string(), serde_json::json!(timeout));
+    }
+    if !step.preconditions.is_empty() {
+        meta.insert(
+            "precondition_count".to_string(),
+            serde_json::json!(step.preconditions.len()),
+        );
+    }
+    if step.verification.is_some() {
+        meta.insert("has_verification".to_string(), serde_json::json!(true));
+    }
+    match &step.action {
+        StepAction::SendText {
+            pane_id,
+            text,
+            paste_mode,
+        } => {
+            meta.insert("pane_id".to_string(), serde_json::json!(pane_id));
+            meta.insert("text_len".to_string(), serde_json::json!(text.len()));
+            let preview = if text.len() > 64 * 1024 {
+                crate::output::truncate_bounded(
+                    "preview omitted: input exceeds safety limit",
+                    60,
+                    512,
+                )
+            } else {
+                crate::output::sanitize_redact_truncate_bounded(text, 60, 512, |sanitized| {
+                    Redactor::new().redact(sanitized)
+                })
+            };
+            meta.insert("text_preview".to_string(), serde_json::json!(preview));
+            if let Some(paste) = paste_mode {
+                meta.insert("paste_mode".to_string(), serde_json::json!(paste));
+            }
+        }
+        StepAction::WaitFor {
+            pane_id,
+            condition,
+            timeout_ms,
+        } => {
+            if let Some(pane) = pane_id {
+                meta.insert("pane_id".to_string(), serde_json::json!(pane));
+            }
+            meta.insert("wait_timeout_ms".to_string(), serde_json::json!(timeout_ms));
+            meta.insert(
+                "condition".to_string(),
+                serde_json::json!(condition.canonical_string()),
+            );
+        }
+        StepAction::AcquireLock {
+            lock_name,
+            timeout_ms,
+        } => {
+            meta.insert("lock_name".to_string(), serde_json::json!(lock_name));
+            if let Some(timeout) = timeout_ms {
+                meta.insert("lock_timeout_ms".to_string(), serde_json::json!(timeout));
+            }
+        }
+        StepAction::ReleaseLock { lock_name } => {
+            meta.insert("lock_name".to_string(), serde_json::json!(lock_name));
+        }
+        StepAction::Custom {
+            action_type,
+            payload,
+        } => {
+            meta.insert(
+                "custom_action_type".to_string(),
+                serde_json::json!(action_type),
+            );
+            meta.insert("custom_payload".to_string(), payload.clone());
+        }
+        _ => {}
+    }
+    serde_json::Value::Object(meta)
+}
+
 // ============================================================================
 // Core Types
 // ============================================================================
@@ -147,7 +400,7 @@ pub struct DryRunReport {
     pub expected_actions: Vec<PlannedAction>,
 
     /// Warnings encountered during dry-run
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 
@@ -193,40 +446,40 @@ impl DryRunReport {
         let redactor = Redactor::new();
         let mut report = self.clone();
 
-        report.command = redactor.redact(&report.command);
+        report.command = redact_report_text(&report.command, &redactor);
 
         if let Some(target) = &mut report.target_resolution {
-            target.domain = redactor.redact(&target.domain);
+            target.domain = redact_report_text(&target.domain, &redactor);
             if let Some(title) = &mut target.title {
-                *title = redactor.redact(title);
+                *title = redact_report_text(title, &redactor);
             }
             if let Some(cwd) = &mut target.cwd {
-                *cwd = redactor.redact(cwd);
+                *cwd = redact_report_text(cwd, &redactor);
             }
             if let Some(agent) = &mut target.agent_type {
-                *agent = redactor.redact(agent);
+                *agent = redact_report_text(agent, &redactor);
             }
         }
 
         if let Some(policy) = &mut report.policy_evaluation {
             for check in &mut policy.checks {
-                check.name = redactor.redact(&check.name);
-                check.message = redactor.redact(&check.message);
+                check.name = redact_report_text(&check.name, &redactor);
+                check.message = redact_report_text(&check.message, &redactor);
                 if let Some(details) = &mut check.details {
-                    *details = redactor.redact(details);
+                    *details = redact_report_text(details, &redactor);
                 }
             }
         }
 
         for action in &mut report.expected_actions {
-            action.description = redactor.redact(&action.description);
+            action.description = redact_report_text(&action.description, &redactor);
             if let Some(metadata) = &mut action.metadata {
                 redact_json_value(metadata, &redactor);
             }
         }
 
         for warning in &mut report.warnings {
-            *warning = redactor.redact(warning);
+            *warning = redact_report_text(warning, &redactor);
         }
 
         report
@@ -494,10 +747,14 @@ impl fmt::Display for ActionType {
 // Output Formatting
 // ============================================================================
 
+fn redact_report_text(text: &str, redactor: &Redactor) -> String {
+    redactor.redact(&crate::output::normalize_terminal_text_for_redaction(text))
+}
+
 fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
     match value {
         serde_json::Value::String(text) => {
-            *text = redactor.redact(text);
+            *text = redact_report_text(text, redactor);
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -505,6 +762,15 @@ fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
             }
         }
         serde_json::Value::Object(map) => {
+            if map.keys().any(|key| {
+                let normalized = crate::output::normalize_terminal_text_for_redaction(key);
+                redactor.redact(&normalized) != normalized
+            }) {
+                // Renaming arbitrary payload keys could collide and silently
+                // replace a sibling. Explicitly omit this sensitive object.
+                *value = serde_json::json!("[REDACTED: metadata object contains sensitive keys]");
+                return;
+            }
             for value in map.values_mut() {
                 redact_json_value(value, redactor);
             }
@@ -692,6 +958,102 @@ pub fn create_wait_for_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_custom_send_metadata_retains_policy_gate_without_gating_waits() {
+        for (name, gated) in [("send_prompt", true), ("wait_for_prompt", false)] {
+            let step = crate::plan::StepPlan::new(
+                1,
+                crate::plan::StepAction::Custom {
+                    action_type: name.to_string(),
+                    payload: serde_json::json!({"pane_id": 42}),
+                },
+                "preview custom workflow step",
+            );
+            let metadata = workflow_step_metadata(&step);
+            assert_eq!(
+                metadata.get("policy_gated"),
+                gated.then_some(&serde_json::Value::Bool(true))
+            );
+            assert_eq!(metadata["custom_action_type"], name);
+            assert_eq!(metadata["custom_payload"]["pane_id"], 42);
+        }
+    }
+
+    #[test]
+    fn report_without_warnings_roundtrips_but_malformed_warnings_are_rejected() {
+        let report = DryRunReport::with_command("workflow run");
+        let mut wire = serde_json::to_value(&report).unwrap();
+        assert!(wire.get("warnings").is_none());
+        let decoded: DryRunReport = serde_json::from_value(wire.clone()).unwrap();
+        assert!(decoded.warnings.is_empty());
+        assert_eq!(decoded.command, report.command);
+        wire["warnings"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<DryRunReport>(wire).is_err());
+    }
+
+    #[test]
+    fn workflow_custom_lock_preview_distinguishes_acquire_and_release() {
+        for name in [
+            "release_lock",
+            "unlock",
+            "unlock_pane",
+            "release_workflow_lock",
+        ] {
+            assert_eq!(
+                infer_action_type_from_name(name),
+                ActionType::ReleaseLock,
+                "{name}"
+            );
+        }
+        for name in ["acquire_lock", "lock_pane"] {
+            assert_eq!(
+                infer_action_type_from_name(name),
+                ActionType::AcquireLock,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_preview_redacts_nested_values_wait_conditions_and_object_keys() {
+        let secret = format!("sk-ant-api03-{}", "a".repeat(48));
+        let split = format!("{}\x1b[31m{}\x1b[0m", &secret[..18], &secret[18..]);
+        let mut report = DryRunReport::with_command("workflow run");
+        report.expected_actions.push(
+            PlannedAction::new(1, ActionType::WorkflowStep, "custom step").with_metadata(
+                serde_json::json!({
+                    "custom_payload": {"nested": [{"value": split}], "plain": "keep me"},
+                    "condition": split,
+                "sensitive_keys": {(split.clone()): "payload"},
+                }),
+            ),
+        );
+        let output = report.redacted();
+        let metadata = output.expected_actions[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata["custom_payload"]["plain"], "keep me");
+        assert_eq!(
+            metadata["sensitive_keys"],
+            "[REDACTED: metadata object contains sensitive keys]"
+        );
+        let encoded = serde_json::to_string(&output).unwrap();
+        assert!(
+            !encoded.contains(&secret[18..]),
+            "split secret suffix escaped final preview boundary"
+        );
+        assert!(
+            metadata["condition"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+        assert!(
+            metadata["custom_payload"]["nested"][0]["value"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+    }
 
     #[test]
     fn dry_run_context_creation() {
