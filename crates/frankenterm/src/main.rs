@@ -120237,18 +120237,50 @@ printf x > "$MINISIGN_MARKER"
             .write_all(b"component-corruption")
             .expect("corrupt explicit activation candidate");
 
+        let script = format!(
+            "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nsource {}\nDEST={}\nQUIET=1\nHAS_GUM=0\nACTIVATE_GENERATION={}\nIDLE_HOST_CONFIRMED=1\ndispatch_process_family_activation\n",
+            shell_single_quote(&installer.to_string_lossy()),
+            shell_single_quote(&destination.to_string_lossy()),
+            shell_single_quote(&family.generation_id),
+        );
+        // An active host must refuse before inspecting the corrupt candidate;
+        // this must neither emit nor replace the existing publication receipt.
+        let receipt_path = destination.join(".frankenterm-process-family/install-receipt.json");
+        let before = std::fs::read(&receipt_path).expect("read publication receipt");
+        let active = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .env("FT_INSTALL_TEST_MUX_OWNERSHIP_STATE", "active")
+            .output()
+            .expect("execute active-host activation refusal");
+        assert!(!active.status.success());
+        assert!(String::from_utf8_lossy(&active.stderr).contains("refusing activation"));
+        assert!(
+            !String::from_utf8_lossy(&active.stdout)
+                .contains("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1=")
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), before);
+        assert_initial_family_is_uniformly_unavailable(&destination);
+
         let output = std::process::Command::new("bash")
-            .arg(&installer)
-            .arg("--quiet")
-            .arg("--no-gum")
-            .arg("--dest")
-            .arg(&destination)
-            .arg("--activate")
-            .arg(&family.generation_id)
-            .arg("--idle-host-confirmed")
+            .args(["-c", &script])
+            .env("FT_INSTALL_TEST_MUX_OWNERSHIP_STATE", "inactive")
             .output()
             .expect("execute production explicit activation dispatch");
         assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("FT_INSTALL_PROCESS_FAMILY_RECEIPT_V1="),
+            "activation dispatch must publish its failure receipt: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let source = std::fs::read_to_string(&installer).expect("read installer dispatch wiring");
+        let lock_refusal = source
+            .find("if [ \"$LOCKED\" -ne 1 ]; then")
+            .expect("permanent lock refusal");
+        let dispatch = source
+            .find("  dispatch_process_family_activation || exit 1")
+            .expect("executable activation dispatch");
+        assert!(lock_refusal < dispatch);
         let receipt = parse_installer_process_family_receipt(&output.stdout);
         assert_eq!(
             receipt["pending_reason"],
