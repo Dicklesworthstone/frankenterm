@@ -306,8 +306,8 @@ regex = "1.12.4"
 bloomfilter = "3.0.1"
 
 # Crypto / randomness
-chacha20poly1305 = "0.10.1"
-ed25519-dalek = { version = "2.2.0", default-features = false }
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = { version = "3.0.0", default-features = false }
 hmac = "0.13.0"
 rand = "0.10.1"
 sha2 = "0.11.0"
@@ -422,7 +422,7 @@ maplit = "1.0.2"
 memmem = "0.1.1"
 metrics = "0.24.6"
 miniz_oxide = "0.9.1"
-mlua = "0.11.6"
+mlua = "0.12.1"
 names = { version = "0.14.0", default-features = false }
 nix = "0.31.3"
 ntapi = "0.4.3"
@@ -441,7 +441,7 @@ predicates = "3.1.4"
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 roaring = "0.11.4"
-rstest = "0.26.1"
+rstest = "0.27.0"
 serial2 = "0.2.37"
 shared_library = "0.1.9"
 shell-words = "1.1.1"
@@ -502,7 +502,7 @@ cc = { version = "1.2.64", features = ["parallel"] }
 pkg-config = "0.3"
 # macOS GUI deps
 cgl = "0.3"
-cocoa = "=0.26.1"
+cocoa = "=0.27.0"
 core-foundation = "=0.10.1"
 core-graphics = "=0.25.0"
 core-text = "=22.0.0"
@@ -523,7 +523,7 @@ xcb-imdkit = { version = "0.3", git = "https://github.com/wezterm/xcb-imdkit-rs.
 xkbcommon = "0.9.0"
 zbus = "5.16.0"
 zvariant = "5.12.0"
-smithay-client-toolkit = { version = "0.20.0", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false }
 wayland-backend = "0.3.15"
 wayland-protocols = "0.32.12"
 wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
@@ -544,7 +544,7 @@ hdrhistogram = "7.5.4"
 http_req = "0.14.6"
 nucleo-matcher = "0.3"
 rayon = "1.12.0"
-wgpu = "29.0.3"
+wgpu = "30.0.1"
 # Additional GUI-layer workspace aliases
 wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
 wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
@@ -575,15 +575,15 @@ ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankent
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
-wasmtime = { version = "45.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "45.0.1", default-features = false, features = ["p1"] }
+wasmtime = { version = "48.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "47.0.4", default-features = false, features = ["p1"] }
 
 # Benchmarking
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.3.10" }
-asupersync-macros = { version = "0.3.10" }
+asupersync = { version = "0.4.10" }
+asupersync-macros = { version = "0.4.9" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3.3"

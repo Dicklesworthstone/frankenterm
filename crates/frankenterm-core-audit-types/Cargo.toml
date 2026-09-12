@@ -27,6 +27,6 @@ tracing.workspace = true
 frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }
 
 [dev-dependencies]
-jsonschema = { version = "0.53.0", default-features = false }
+jsonschema = { version = "0.55.1", default-features = false }
 proptest = "1.8.0"
 toon_rust.workspace = true
