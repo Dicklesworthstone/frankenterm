@@ -1282,17 +1282,19 @@ impl Pane for LocalPane {
         // Never substitute resident row zero for a requested persisted row.
         // A missing cold snapshot is a loading frame, followed by a targeted
         // repaint after exact-registration publication of the worker result.
-        let Some(term) = self.terminal.try_lock() else {
+        let Some(mut term) = self.terminal.try_lock() else {
             if let Some(registration) = self.mux_registration.load() {
                 retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
             }
             with_lines.with_lines_mut(lines.start, &mut []);
             return;
         };
+        #[cfg(feature = "disruptor-pane-io")]
+        self.drain_action_ring_locked(&mut term);
         let cold = lines.start < term.screen().phys_to_stable_row_index(0);
-        let logical_context = term.screen().expand_cold_logical_range(lines.clone());
-        drop(term);
         if cold {
+            let logical_context = term.screen().expand_cold_logical_range(lines.clone());
+            drop(term);
             let (first, mut snapshot) = self.cold_viewport_lines(logical_context);
             let mut start = 0;
             for end in 0..snapshot.len() {
@@ -1317,13 +1319,6 @@ impl Pane for LocalPane {
             );
             return;
         }
-        if let Some(pending) = self
-            .cold_viewport_pending
-            .try_lock()
-            .and_then(|mut pending| pending.take())
-        {
-            pending.cancelled.store(true, Ordering::Release);
-        }
         struct Snapshot {
             first: StableRowIndex,
             lines: Vec<Line>,
@@ -1339,11 +1334,19 @@ impl Pane for LocalPane {
             first: lines.start,
             lines: Vec::new(),
         };
-        let coordinate_witness = {
-            let mut term = self.locked_terminal();
-            terminal_with_lines_mut_and_apply_hyperlinks(&mut term, lines, rules, &mut snapshot);
-            term.screen().capture_coordinate_witness()
-        };
+        // Keep the successful nonblocking acquisition through classification
+        // and capture. Dropping it and calling locked_terminal here lets a
+        // resize win the gap and turn this paint path into a blocking wait.
+        terminal_with_lines_mut_and_apply_hyperlinks(&mut term, lines, rules, &mut snapshot);
+        let coordinate_witness = term.screen().capture_coordinate_witness();
+        drop(term);
+        if let Some(pending) = self
+            .cold_viewport_pending
+            .try_lock()
+            .and_then(|mut pending| pending.take())
+        {
+            pending.cancelled.store(true, Ordering::Release);
+        }
         // Shaping, glyph uploads and overlay callbacks must not exclude parser
         // progress or re-enter pane APIs under the terminal mutex. Hyperlinks
         // were applied to the authoritative logical lines before cloning.
@@ -4582,7 +4585,19 @@ mod tests {
                 [0x70; 16],
                 "native-render-snapshot-test".to_string(),
             );
+            #[cfg(not(feature = "disruptor-pane-io"))]
             pane.terminal.lock().advance_bytes(b"original");
+            #[cfg(feature = "disruptor-pane-io")]
+            {
+                let mut parser = termwiz::escape::parser::Parser::new();
+                let mut staged = Vec::new();
+                parser.parse(b"original", |action| action.append_to(&mut staged));
+                // Force the producer to stage output. Snapshot capture must
+                // apply it before cloning, without reacquiring the mutex.
+                let _terminal = pane.terminal.lock();
+                pane.perform_actions(staged);
+                assert!(!pane.action_ring.is_empty());
+            }
             let mut render = Render {
                 pane: &pane,
                 metadata: Arc::new(42),
@@ -4593,6 +4608,8 @@ mod tests {
             };
             pane.with_lines_mut_and_apply_hyperlinks(0..1, &[], &mut render);
             assert!(render.called);
+            #[cfg(feature = "disruptor-pane-io")]
+            assert!(pane.action_ring.is_empty());
             let (_, lines) = pane.get_lines(0..1);
             assert_eq!(lines.len(), 1);
             assert_eq!(

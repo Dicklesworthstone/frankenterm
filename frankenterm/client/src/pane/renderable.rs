@@ -2182,7 +2182,7 @@ impl ImageHydrationBytePermit {
             bytes,
             MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES,
         )
-        .then_some(Self { bytes })
+        .then(|| Self { bytes })
     }
 }
 
@@ -2194,18 +2194,25 @@ impl Drop for ImageHydrationBytePermit {
     }
 }
 
-struct ImageValidationJobPermit;
+struct ImageValidationJobPermit<'a> {
+    jobs: &'a AtomicUsize,
+}
 
-impl ImageValidationJobPermit {
+impl ImageValidationJobPermit<'static> {
     fn try_acquire() -> Option<Self> {
-        try_reserve_bounded_atomic(&IMAGE_VALIDATION_JOBS, 1, MAX_PENDING_IMAGE_VALIDATIONS)
-            .then_some(Self)
+        Self::try_acquire_from(&IMAGE_VALIDATION_JOBS, MAX_PENDING_IMAGE_VALIDATIONS)
     }
 }
 
-impl Drop for ImageValidationJobPermit {
+impl<'a> ImageValidationJobPermit<'a> {
+    fn try_acquire_from(jobs: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        try_reserve_bounded_atomic(jobs, 1, limit).then(|| Self { jobs })
+    }
+}
+
+impl Drop for ImageValidationJobPermit<'_> {
     fn drop(&mut self) {
-        let released = try_release_atomic(&IMAGE_VALIDATION_JOBS, 1);
+        let released = try_release_atomic(self.jobs, 1);
         debug_assert!(released);
     }
 }
@@ -3597,6 +3604,23 @@ mod tests {
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
     use wezterm_term::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn rejected_image_permits_preserve_existing_reservations() {
+        let jobs = AtomicUsize::new(0);
+        let permit = super::ImageValidationJobPermit::try_acquire_from(&jobs, 1)
+            .expect("first validation fits");
+        assert!(super::ImageValidationJobPermit::try_acquire_from(&jobs, 1).is_none());
+        assert_eq!(jobs.load(Ordering::Acquire), 1);
+        drop(permit);
+        assert_eq!(jobs.load(Ordering::Acquire), 0);
+
+        // This cannot reserve capacity, regardless of concurrent hydration.
+        assert!(super::ImageHydrationBytePermit::try_acquire(
+            MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES + 1
+        )
+        .is_none());
+    }
 
     #[test]
     fn bounded_atomic_reservation_preserves_limit_overflow_and_release_boundaries() {
