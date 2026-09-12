@@ -815,7 +815,8 @@ pub fn secret_pattern_names() -> impl Iterator<Item = &'static str> {
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::redactor::Redactor;
+// This source is compiled by both the core and standalone redactor crates.
+#[doc = concat!("use ", env!("CARGO_CRATE_NAME"), "::redactor::Redactor;")]
 ///
 /// let redactor = Redactor::new();
 /// let input = "My API key is sk-abc123456789012345678901234567890123456789012345678901";

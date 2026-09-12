@@ -37,6 +37,13 @@
 //!
 //! // Evaluate and advance
 //! playbook.pass_gate("G-01", "all 47 blocking scenarios pass");
+//! playbook.record_approval(ApprovalRecord {
+//!     approver: "PinkForge".to_string(),
+//!     role: ApproverRole::MigrationLead,
+//!     stage: CutoverStage::Preflight,
+//!     approved_at_ms: 999,
+//!     notes: "Preflight evidence reviewed".to_string(),
+//! });
 //! let result = playbook.try_advance(1000, "PinkForge");
 //! assert!(result.advanced);
 //! ```
