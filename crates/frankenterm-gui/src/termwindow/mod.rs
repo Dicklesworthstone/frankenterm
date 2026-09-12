@@ -450,6 +450,8 @@ pub struct PaneState {
     selection: Selection,
     selection_frame: crate::selection::SelectionFrameState,
     mouse_selection_frame: Option<crate::selection::SelectionFrameStamp>,
+    pending_selection_start: Option<crate::selection::PendingSelectionStart>,
+    suppress_selection_link: bool,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
@@ -5028,7 +5030,7 @@ impl TermWindow {
                 let selection = self.selection(pane_id);
                 selection.origin.is_some() || selection.range.is_some()
             };
-            if has_selection_anchor && !self.selection_authority_is_current(pane) {
+            if has_selection_anchor && self.selection_authority_has_changed(pane) {
                 self.selection(pane_id).clear();
                 if self.active_selection_drag_pane == Some(pane_id) {
                     self.active_selection_drag_pane = None;
@@ -6886,10 +6888,18 @@ impl TermWindow {
                 self.emit_window_event(name, None);
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
+                self.retry_pending_selection_start(pane);
                 self.active_selection_drag_pane = None;
+                let suppress_link = {
+                    let mut state = self.pane_state(pane.pane_id());
+                    state.pending_selection_start = None;
+                    std::mem::take(&mut state.suppress_selection_link)
+                };
                 let had_selection = self.selection(pane.pane_id()).range.is_some();
                 if had_selection && !self.selection_authority_is_current(pane) {
-                    self.clear_selection(pane);
+                    if self.selection_authority_has_changed(pane) {
+                        self.clear_selection(pane);
+                    }
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let text = self.selection_text(pane);
@@ -6898,12 +6908,20 @@ impl TermWindow {
                     if let Some(window) = self.window.as_ref() {
                         window.invalidate();
                     }
-                } else if !had_selection || self.selection_authority_is_current(pane) {
+                } else if !suppress_link
+                    && (!had_selection || self.selection_authority_is_current(pane))
+                {
                     self.do_open_link_at_mouse_cursor(pane);
                 }
             }
             CompleteSelection(dest) => {
+                self.retry_pending_selection_start(pane);
                 self.active_selection_drag_pane = None;
+                {
+                    let mut state = self.pane_state(pane.pane_id());
+                    state.pending_selection_start = None;
+                    state.suppress_selection_link = false;
+                }
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);

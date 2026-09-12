@@ -141,6 +141,21 @@ impl super::TermWindow {
 
         match event.kind {
             WMEK::Release(ref press) => {
+                if press == &MousePress::Left {
+                    // Resolve the retained press before ending drag protection.
+                    // Doing this in dispatch alone is too late: custom release
+                    // bindings and early returns must also retire pending input.
+                    if let Some(pane_id) = self.active_selection_drag_pane {
+                        if let Some(pos) = self
+                            .get_panes_to_render()
+                            .into_iter()
+                            .find(|pos| pos.pane.pane_id() == pane_id)
+                        {
+                            self.retry_pending_selection_start(&pos.pane);
+                        }
+                        self.pane_state(pane_id).pending_selection_start = None;
+                    }
+                }
                 self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
                 if press == &MousePress::Left {
@@ -833,16 +848,32 @@ impl super::TermWindow {
         let viewport = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top);
-        let stable_row = checked_mouse_stable_row(viewport, row);
         let current_selection_frame = selection_position
             .as_ref()
             .and_then(|pos| self.selection_frame_stamp_for_position(&pane, pos));
+        let mouse_selection_frame = {
+            let state = self.pane_state(pane.pane_id());
+            state
+                .selection_frame
+                .for_mouse(current_selection_frame)
+                .or_else(|| {
+                    // Retain only the coordinates actually displayed at the press.
+                    // A busy source can be retried; a known layout mismatch cannot.
+                    if current_selection_frame.is_some() {
+                        return None;
+                    }
+                    let geometry = self.selection_frame_geometry(selection_position.as_ref()?)?;
+                    state.selection_frame.displayed_for_geometry(geometry)
+                })
+        };
+        let stable_row = checked_mouse_stable_row(
+            mouse_selection_frame.map_or(viewport, |frame| frame.viewport),
+            row,
+        );
 
         {
             let mut pane_state = self.pane_state(pane.pane_id());
-            pane_state.mouse_selection_frame = pane_state
-                .selection_frame
-                .for_mouse(current_selection_frame);
+            pane_state.mouse_selection_frame = mouse_selection_frame;
             if let Some(stable_row) = stable_row {
                 pane_state.mouse_terminal_coords.replace((
                     ClickPosition {
