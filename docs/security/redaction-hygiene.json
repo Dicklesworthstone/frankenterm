@@ -2,7 +2,7 @@
   "schema_version": "ft.security.redaction_hygiene.v1",
   "category": "security/redaction-hygiene",
   "produced_by_bead": "ft-7h5da.1.5",
-  "generated_at": "2026-06-09T00:00:00Z",
+  "generated_at": "2026-09-11T21:27:46Z",
   "summary": "Redaction-hygiene attestation: the at-rest output corpus is catalog-versioned and sweepable. Each captured segment records the secret-pattern catalog fingerprint in effect at capture (output_segments.redaction_catalog_version, schema v29), and a catalog-aware backfill rewrites stale-catalog secrets with a per-family receipt. Together these make 'is this corpus clean as of catalog vN?' a queryable fact rather than a guess.",
   "attestation_manifest_slot": {
     "category": "security/redaction-hygiene",
@@ -11,11 +11,11 @@
     "produced_by_bead": "ft-7h5da.1.5"
   },
   "catalog": {
-    "fingerprint": "live-secret-patterns-sha256:d3a987729a34e2903e1b130de9aa698301d5339efdabfd2d2e98c8e5ec5583b1",
+    "fingerprint": "live-secret-patterns-sha256:fe61f64fc31f111b575f119d7694a59fe9531213602939bd35c734a6367db25a",
     "fingerprint_algorithm": "sha256 over the ordered secret-pattern family names joined by \"\\n\" (no trailing newline)",
     "computed_at_runtime_by": "frankenterm_core::redact_backfill::catalog_version()",
     "reproducible": "sha256 of the `families` list below, joined by newline, must equal `fingerprint`'s hex suffix.",
-    "family_count": 32,
+    "family_count": 33,
     "families": [
       "anthropic_key",
       "openai_key",
@@ -34,9 +34,9 @@
       "aws_access_key_id",
       "aws_secret_key",
       "bearer_token",
+      "http_basic_auth",
       "slack_token",
       "stripe_key",
-      "twilio_account_sid",
       "sendgrid_key",
       "datadog_api_key",
       "database_url",
@@ -48,7 +48,8 @@
       "generic_api_key",
       "generic_token",
       "generic_password",
-      "generic_secret"
+      "generic_secret",
+      "twilio_account_sid"
     ]
   },
   "temporal_redaction": {

@@ -311,6 +311,7 @@
         "proofs/robot-contracts",
         "proofs/rehearsal-score",
         "proofs/tx-killswitch",
+        "proofs/killswitch-tier-enforcement",
         "doctrine/agents-md-counts",
         "doctrine/vendored-provenance",
         "doctrine/cx-propagation",

@@ -387,12 +387,14 @@ fn checked_in_manifest_validates_against_deferred_slot_schema() {
 }
 
 #[test]
-fn checked_in_dev_bundle_validates_against_schema() {
+fn generated_dev_bundle_fixture_validates_against_schema() {
     let validator = bundle_validator();
-    let path = workspace_root()
-        .join("docs")
-        .join("attestations")
-        .join("0.0.0-dev.json");
+    // The producer's default docs/attestations/0.0.0-dev.json is ignored,
+    // mutable local output and does not exist in a clean source archive.
+    // Keep its generated schema example as a tracked fixture instead. Actual
+    // build/verify round trips remain covered by tests/attestation/smoke-test.sh.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/attestation-dev-bundle.json");
     let bundle = fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
     let bundle: Value = serde_json::from_str(&bundle)
@@ -400,7 +402,7 @@ fn checked_in_dev_bundle_validates_against_schema() {
     let errors = validate(&validator, &bundle);
     assert!(
         errors.is_empty(),
-        "checked-in dev bundle failed validation:\n{}",
+        "generated dev bundle fixture failed validation:\n{}",
         errors.join("\n")
     );
 }

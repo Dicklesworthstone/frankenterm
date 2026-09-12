@@ -769,7 +769,7 @@ case "$SIGN_METHOD" in
       echo "error: --sign unsigned only permitted on --channel dev (got: $CHANNEL). Production releases must use --sign cosign or --sign ed25519." >&2
       exit 1
     fi
-    reason_text="dev channel bundle — production releases must use --sign cosign or --sign ed25519"
+    reason_text="dev channel bundle tracked by ft-e87u6.2 — production releases must use --sign cosign or --sign ed25519"
     sig_obj="$(jq -n \
       --arg method "unsigned" \
       --arg canonical_sha256 "$canonical_sha" \
