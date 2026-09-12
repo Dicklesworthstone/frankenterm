@@ -1094,6 +1094,7 @@ impl WindowOps for Window {
         Future::result(
             clipboard_win::get_clipboard_string()
                 .map(|s| s.replace("\r\n", "\n"))
+                .map_err(|err| std::io::Error::from_raw_os_error(err.raw_code()))
                 .context("Error getting clipboard"),
         )
     }

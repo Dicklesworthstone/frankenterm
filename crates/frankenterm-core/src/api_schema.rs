@@ -74,7 +74,7 @@ impl ApiVersion {
         let core = s.split_once('-').map(|(c, _)| c).unwrap_or(s);
         let core = core.split_once('+').map(|(c, _)| c).unwrap_or(core);
         let parts: Vec<&str> = core.split('.').collect();
-        if parts.len() < 3 {
+        if parts.len() != 3 {
             return None;
         }
         Some(Self {

@@ -287,8 +287,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(40))]
 
     // Property 1: Generated status-transition sequences persist exactly one
-    // durable final state, classify incomplete workflows consistently, and only
-    // resume running/waiting executions.
+    // durable final state, reject every transition out of an immutable aborted
+    // record, and resume only the final accepted running/waiting state.
     #[test]
     fn engine_state_machine_persists_resume_contract(
         pane_id in 1u64..10_000,
@@ -320,12 +320,16 @@ proptest! {
                 .await
                 .expect("start workflow engine property execution");
 
+            let mut final_transition: Option<&EngineTransition> = None;
             for transition in &transitions {
+                let previous = storage.get_workflow_with_cx(&cx, &execution_id)
+                    .await.expect("load pre-transition durable record")
+                    .expect("started record exists");
                 let wait_condition = transition
                     .wait_rule
                     .as_ref()
                     .map(|rule_id| WaitCondition::pattern(rule_id.clone()));
-                engine
+                let updated = engine
                     .update_status_cx(
                         &cx,
                         &storage,
@@ -337,14 +341,25 @@ proptest! {
                             error: transition.error.as_deref(),
                         },
                     )
-                    .await
-                    .expect("apply generated workflow engine transition");
+                    .await;
 
                 let record = storage
                     .get_workflow_with_cx(&cx, &execution_id)
                     .await
                     .expect("load workflow after generated transition")
                     .expect("workflow record remains durable");
+                if final_transition.is_some_and(|accepted| accepted.status == ExecutionStatus::Aborted) {
+                    let error = updated.expect_err("aborted executions must reject every later update");
+                    prop_assert!(error.to_string().contains("workflow is aborted"));
+                    prop_assert_eq!(
+                        serde_json::to_value(&record).expect("serialize retained record"),
+                        serde_json::to_value(&previous).expect("serialize original record"),
+                        "rejected transitions must preserve all durable abort authority"
+                    );
+                    continue;
+                }
+                updated.expect("apply generated transition before abort");
+                final_transition = Some(transition);
                 prop_assert_eq!(record.status.as_str(), status_storage_name(transition.status));
                 prop_assert_eq!(record.current_step, transition.current_step);
                 prop_assert_eq!(record.wait_condition, wait_condition.map(|condition| {
@@ -358,9 +373,8 @@ proptest! {
                 );
             }
 
-            let final_transition = transitions
-                .last()
-                .expect("proptest generated at least one transition");
+            let final_transition = final_transition
+                .expect("the initial running state accepts the first transition");
             let incomplete_ids = engine
                 .find_incomplete_cx(&cx, &storage)
                 .await
