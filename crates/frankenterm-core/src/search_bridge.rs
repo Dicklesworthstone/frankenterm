@@ -831,7 +831,7 @@ mod tests {
     /// Helper to construct a `ScoredResult` for unit tests.
     fn make_scored_result(doc_id: &str, score: f32) -> ScoredResult {
         ScoredResult {
-            doc_id: doc_id.to_string(),
+            doc_id: doc_id.into(),
             score,
             source: ScoreSource::Hybrid,
             index: None,
@@ -851,6 +851,8 @@ mod tests {
             vectors_searched: 10,
             lexical_candidates: 5,
             fused_count: 8,
+            skip_reason: None,
+            hash_control_candidates: 0,
         }
     }
 
@@ -1697,6 +1699,15 @@ mod tests {
     }
 
     impl Embedder for PendingSearchEmbedder {
+        fn identity(
+            &self,
+        ) -> frankensearch::SearchResult<&frankensearch::core::EmbeddingIdentityBundleV1> {
+            // This test wrapper delays or panics before yielding any vector.
+            // Retain the underlying producer identity so the existing index
+            // admission succeeds and the cancellation path is actually polled.
+            self.inner.identity()
+        }
+
         fn embed<'a>(
             &'a self,
             cx: &'a Cx,
