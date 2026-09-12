@@ -600,20 +600,9 @@ mod deferred_scrollback {
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
-            {
-                let state = self.state.lock().ok()?;
-                if stable_row < state.oldest? || stable_row >= state.newest_exclusive? {
-                    return None;
-                }
-                if let Some(row) = state
-                    .pending
-                    .iter()
-                    .find(|row| row.stable_row == stable_row)
-                {
-                    return Some(row.line.as_ref().clone());
-                }
-            }
-            self.backing.load_scrollback_line(stable_row)
+            self.load_scrollback_lines(stable_row..stable_row.checked_add(1)?)
+                .into_iter()
+                .next()
         }
 
         fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
@@ -621,48 +610,29 @@ mod deferred_scrollback {
         }
 
         fn load_scrollback_lines(&self, rows: std::ops::Range<StableRowIndex>) -> Vec<Line> {
-            if rows.start >= rows.end {
+            if rows.start >= rows.end || self.operation.is_poisoned() {
                 return Vec::new();
             }
-            // Pending rows are already owned and immutable. Keep them readable
-            // even while a flush is blocked on a backing filesystem lease.
-            {
-                let Ok(state) = self.state.lock() else {
-                    return Vec::new();
-                };
-                if state.oldest.is_some_and(|oldest| rows.start < oldest) {
-                    return Vec::new();
-                }
-                if let Some(first) = state
-                    .pending
-                    .iter()
-                    .position(|row| row.stable_row == rows.start)
-                {
-                    return state
-                        .pending
-                        .iter()
-                        .skip(first)
-                        .take(32)
-                        .take_while(|row| row.stable_row < rows.end)
-                        .map(|row| row.line.as_ref().clone())
-                        .collect();
-                }
-            }
-            // Freeze pending/durable transitions without holding state across
-            // storage IO. Parser admission uses try_lock and retains its rows.
-            let Ok(_operation) = self.operation.lock() else {
-                return Vec::new();
-            };
-            let (end, pending) = {
+            // Capture an immutable pending suffix and its append-only lineage.
+            // Taking operation here would wait for the entire durable flush,
+            // even when the requested durable prefix is already available.
+            // The backing read serializes its own IO; validate the lineage
+            // afterwards so clear, replacement and retention cannot mix rows.
+            let (end, pending, interval) = {
                 let Ok(state) = self.state.lock() else {
                     return Vec::new();
                 };
                 let (Some(oldest), Some(newest)) = (state.oldest, state.newest_exclusive) else {
                     return Vec::new();
                 };
-                if rows.start < oldest || rows.start >= newest {
+                if state.publication_uncertain || rows.start < oldest || rows.start >= newest {
                     return Vec::new();
                 }
+                let ScrollbackIntervalCapture::Ready(interval) =
+                    state.interval_identity.capture(Some(oldest..newest))
+                else {
+                    return Vec::new();
+                };
                 let end = rows.end.min(newest).min(rows.start.saturating_add(32));
                 let pending = state
                     .pending
@@ -670,7 +640,7 @@ mod deferred_scrollback {
                     .filter(|row| row.stable_row >= rows.start && row.stable_row < end)
                     .map(|row| (row.stable_row, Arc::clone(&row.line)))
                     .collect::<Vec<_>>();
-                (end, pending)
+                (end, pending, interval)
             };
             let durable_end = pending.first().map_or(end, |(row, _)| *row);
             let mut result = if durable_end > rows.start {
@@ -678,16 +648,36 @@ mod deferred_scrollback {
             } else {
                 Vec::new()
             };
-            if result.len() != (durable_end - rows.start) as usize {
-                return result;
-            }
-            for (row, line) in pending {
-                if row != rows.start + result.len() as StableRowIndex {
-                    break;
+            if result.len() == (durable_end - rows.start) as usize {
+                for (row, line) in pending {
+                    if row != rows.start + result.len() as StableRowIndex {
+                        break;
+                    }
+                    result.push(line.as_ref().clone());
                 }
-                result.push(line.as_ref().clone());
             }
-            result
+            let Ok(state) = self.state.lock() else {
+                return Vec::new();
+            };
+            let (Some(oldest), Some(newest)) = (state.oldest, state.newest_exclusive) else {
+                return Vec::new();
+            };
+            let ScrollbackIntervalCapture::Ready(current) =
+                state.interval_identity.capture(Some(oldest..newest))
+            else {
+                return Vec::new();
+            };
+            if !state.publication_uncertain
+                && !self.operation.is_poisoned()
+                && current.retains(
+                    &interval,
+                    rows.start..rows.start + result.len() as StableRowIndex,
+                )
+            {
+                result
+            } else {
+                Vec::new()
+            }
         }
 
         fn retained_scrollback_rows(&self) -> usize {
@@ -821,6 +811,52 @@ mod deferred_scrollback {
             };
             Ok(receipt)
         }
+    }
+    #[test]
+    fn durable_pending_read_does_not_acquire_whole_flush_operation() {
+        use wezterm_term::CellAttributes;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let durable = Line::from_text("durable prefix", &CellAttributes::blank(), 0, None);
+        let pending = Line::from_text("pending suffix", &CellAttributes::blank(), 0, None);
+        assert!(deferred.store_scrollback_line(0, &durable, 8));
+        deferred.flush_scrollback().unwrap();
+        assert!(deferred.store_scrollback_line(1, &pending, 8));
+        assert_eq!(backing.retained_scrollback_rows(), 1);
+
+        // Hold the exact transaction lock that a parser flush owns. The real
+        // backing prefix is readable; a read must not wait for the whole drain.
+        let operation = deferred.operation.lock().unwrap();
+        assert!(deferred.operation.try_lock().is_err());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reading = Arc::clone(&deferred);
+        let reader = std::thread::spawn(move || {
+            tx.send(reading.load_scrollback_lines(0..2)).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(operation);
+        reader.join().unwrap();
+        assert_eq!(result.unwrap(), vec![durable, pending]);
+        assert_eq!(backing.retained_scrollback_rows(), 1);
+
+        deferred.state.lock().unwrap().publication_uncertain = true;
+        assert!(deferred.load_scrollback_lines(0..2).is_empty());
+        assert!(deferred.load_scrollback_lines(1..2).is_empty());
+        assert!(deferred.load_scrollback_line(0).is_none());
+        assert!(deferred.load_scrollback_line(1).is_none());
+
+        deferred.state.lock().unwrap().publication_uncertain = false;
+        let poisoning = Arc::clone(&deferred);
+        assert!(
+            std::thread::spawn(move || {
+                let _operation = poisoning.operation.lock().unwrap();
+                panic!("owned operation-poison negative control");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(deferred.load_scrollback_lines(0..2).is_empty());
+        assert!(deferred.load_scrollback_lines(1..2).is_empty());
     }
 }
 
@@ -8436,7 +8472,7 @@ mod tests {
     use wezterm_term::Line;
     use wezterm_term::config::ScrollbackSpillSink;
 
-    fn deferred_test_sink() -> (
+    pub(super) fn deferred_test_sink() -> (
         tempfile::TempDir,
         Arc<LiveScrollbackSpillSink>,
         Arc<deferred_scrollback::DeferredScrollbackSpillSink>,
