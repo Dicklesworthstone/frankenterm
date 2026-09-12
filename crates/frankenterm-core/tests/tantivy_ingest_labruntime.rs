@@ -519,7 +519,7 @@ fn indexer_already_caught_up() {
 }
 
 #[test]
-fn indexer_skips_wrong_schema_version() {
+fn indexer_wrong_schema_fails_before_advancing_checkpoint() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
@@ -533,13 +533,13 @@ fn indexer_skips_wrong_schema_version() {
         populate_log(&storage, vec![bad_event, good_event]).await;
 
         let icfg = test_indexer_config(dir.path());
+        let consumer = CheckpointConsumerId(icfg.consumer_id.clone());
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
-        let result = indexer.run(&storage).await.unwrap();
-
-        assert_eq!(result.events_read, 2);
-        assert_eq!(result.events_indexed, 1);
-        assert_eq!(result.events_skipped, 1);
-        assert_eq!(indexer.writer().docs[0].event_id, "good-1");
+        let error = indexer.run(&storage).await.unwrap_err();
+        assert!(matches!(error, IndexerError::SchemaMismatch { event_id, ordinal: 0, .. } if event_id == "bad-1"));
+        assert!(indexer.writer().docs.is_empty());
+        assert_eq!(indexer.writer().commits, 0);
+        assert!(storage.read_checkpoint(&consumer).await.unwrap().is_none());
     });
 }
 
@@ -596,7 +596,7 @@ fn indexer_no_dedup_when_disabled() {
 }
 
 #[test]
-fn indexer_rejected_docs_are_skipped() {
+fn indexer_rejected_docs_preserve_checkpoint_for_retry() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
@@ -616,13 +616,27 @@ fn indexer_rejected_docs_are_skipped() {
         let icfg = test_indexer_config(dir.path());
         let mut writer = MockIndexWriter::new();
         writer.reject_event_ids = vec!["reject-me".to_string()];
-        let mut indexer = IncrementalIndexer::new(icfg, writer);
+        let consumer = CheckpointConsumerId(icfg.consumer_id.clone());
+        let mut indexer = IncrementalIndexer::new(icfg.clone(), writer);
 
-        let result = indexer.run(&storage).await.unwrap();
-        assert_eq!(result.events_indexed, 2);
-        assert_eq!(result.events_skipped, 1);
-        // Checkpoint still advances past the rejected event
+        let error = indexer.run(&storage).await.unwrap_err();
+        assert!(matches!(
+            error,
+            IndexerError::IndexWrite(IndexWriteError::Rejected { .. })
+        ));
+        assert_eq!(indexer.writer().commits, 0);
+        assert!(storage.read_checkpoint(&consumer).await.unwrap().is_none());
+        assert_eq!(indexer.writer().docs.len(), 1);
+        assert_eq!(indexer.writer().docs[0].event_id, "ok-1");
+
+        // Recovering the writer must replay the entire uncheckpointed batch,
+        // including the rejected document, instead of silently losing it.
+        let mut retry = IncrementalIndexer::new(icfg, MockIndexWriter::new());
+        let result = retry.run(&storage).await.unwrap();
+        assert_eq!(result.events_indexed, 3);
+        assert_eq!(result.events_skipped, 0);
         assert_eq!(result.final_ordinal, Some(2));
+        assert_eq!(retry.writer().docs[1].event_id, "reject-me");
     });
 }
 
@@ -1093,11 +1107,11 @@ fn indexer_transient_write_error_propagates() {
 }
 
 // ===========================================================================
-// All-skipped batch still advances checkpoint
+// Unsupported schemas never become checkpointed data loss
 // ===========================================================================
 
 #[test]
-fn indexer_all_events_wrong_schema_still_commits_checkpoint() {
+fn indexer_all_events_wrong_schema_leaves_checkpoint_absent() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
@@ -1115,16 +1129,16 @@ fn indexer_all_events_wrong_schema_still_commits_checkpoint() {
             consumer_id: "all-skip-test".to_string(),
             ..test_indexer_config(dir.path())
         };
+        let consumer = CheckpointConsumerId(icfg.consumer_id.clone());
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
-        let result = indexer.run(&storage).await.unwrap();
-
-        assert_eq!(result.events_read, 2);
-        assert_eq!(result.events_indexed, 0);
-        assert_eq!(result.events_skipped, 2);
-        assert_eq!(result.batches_committed, 1);
-        assert!(result.caught_up);
-        // Checkpoint should still advance
-        assert!(result.final_ordinal.is_some());
+        let error = indexer.run(&storage).await.unwrap_err();
+        assert!(matches!(
+            error,
+            IndexerError::SchemaMismatch { ordinal: 0, .. }
+        ));
+        assert!(indexer.writer().docs.is_empty());
+        assert_eq!(indexer.writer().commits, 0);
+        assert!(storage.read_checkpoint(&consumer).await.unwrap().is_none());
     });
 }
 
@@ -1405,11 +1419,19 @@ fn run_with_reader_resumes_from_checkpoint() {
 
         // Second run: should pick up remaining 3
         let writer2 = MockIndexWriter::new();
-        let mut indexer2 = IncrementalIndexer::new(icfg, writer2);
+        let mut indexer2 = IncrementalIndexer::new(icfg.clone(), writer2);
         let r2 = indexer2.run_with_reader(&storage, &source).await.unwrap();
         assert_eq!(r2.events_read, 3);
-        assert!(r2.caught_up);
+        // Hitting the exact batch budget does not establish EOF; the next
+        // bounded poll proves caught_up without reindexing checkpointed rows.
+        assert!(!r2.caught_up);
         assert_eq!(r2.final_ordinal, Some(5));
+        let mut final_poll = IncrementalIndexer::new(icfg, MockIndexWriter::new());
+        let done = final_poll.run_with_reader(&storage, &source).await.unwrap();
+        assert_eq!(done.events_read, 0);
+        assert_eq!(done.events_indexed, 0);
+        assert!(done.caught_up);
+        assert_eq!(done.final_ordinal, Some(5));
     });
 }
 
@@ -1602,7 +1624,7 @@ fn parity_with_mixed_pane_ids() {
 }
 
 #[test]
-fn parity_dedup_skips_identical_schema_mismatch() {
+fn parity_schema_mismatch_preserves_last_committed_batch() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
@@ -1623,15 +1645,26 @@ fn parity_dedup_skips_identical_schema_mismatch() {
         populate_log(&storage, events).await;
 
         let source = AppendLogEventSource::from_storage(&storage);
-        let icfg = test_indexer_config(dir.path());
-        let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
-
-        assert_eq!(r1.events_read, 4);
-        assert_eq!(r1.events_indexed, 3); // e3 skipped
-        assert_eq!(r1.events_skipped, 1);
-        assert_eq!(r1.events_read, r2.events_read);
-        assert_eq!(r1.events_indexed, r2.events_indexed);
-        assert_eq!(r1.events_skipped, r2.events_skipped);
+        for use_reader in [false, true] {
+            let consumer = CheckpointConsumerId(format!("schema-parity-{use_reader}"));
+            let config = IndexerConfig {
+                consumer_id: consumer.0.clone(),
+                batch_size: 2,
+                ..test_indexer_config(dir.path())
+            };
+            let mut indexer = IncrementalIndexer::new(config, MockIndexWriter::new());
+            let error = if use_reader {
+                indexer.run_with_reader(&storage, &source).await.unwrap_err()
+            } else {
+                indexer.run(&storage).await.unwrap_err()
+            };
+            assert!(matches!(error, IndexerError::SchemaMismatch { event_id, ordinal: 2, .. } if event_id == "e3"));
+            assert_eq!(indexer.writer().docs.len(), 2);
+            assert_eq!(indexer.writer().commits, 1);
+            assert_eq!(indexer.writer().deleted_ids, vec!["e1", "e2"]);
+            let checkpoint = storage.read_checkpoint(&consumer).await.unwrap().unwrap();
+            assert_eq!(checkpoint.upto_offset.ordinal, 1);
+        }
     });
 }
 
