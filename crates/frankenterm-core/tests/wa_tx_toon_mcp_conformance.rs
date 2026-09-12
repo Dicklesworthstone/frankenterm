@@ -25,17 +25,17 @@ impl Drop for CwdGuard {
 }
 
 struct TestHarness {
-    workspace: tempfile::TempDir,
-    client: FrameworkTestClient,
     _cwd_guard: CwdGuard,
+    client: FrameworkTestClient,
+    workspace: tempfile::TempDir,
 }
 
 #[derive(Serialize)]
 struct ToolContractCapture {
     tool: String,
     input_schema: Value,
-    json_success_envelope: Value,
-    toon_success_envelope: Value,
+    json_envelope: Value,
+    toon_envelope: Value,
     boundary_invalid_params_error: String,
 }
 
@@ -112,8 +112,7 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
-        pretty_canonical(actual_schema),
-        pretty_canonical(&expected_schema),
+        actual_schema, &expected_schema,
         "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
 }
@@ -165,9 +164,10 @@ fn assert_common_envelope_fields(envelope: &Value, ok: bool, label: &str) {
         envelope["mcp_version"], "v1",
         "{label} unexpected mcp_version: {envelope}"
     );
-    assert!(
-        envelope["version"].is_string(),
-        "{label} missing version: {envelope}"
+    assert_eq!(
+        envelope["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{label} unexpected package version: {envelope}"
     );
 }
 
@@ -207,9 +207,15 @@ fn canonicalize(value: &mut Value) {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
-                    "now" | "elapsed_ms" => *child = Value::from(0_u64),
-                    "contract_file" => *child = Value::String("<contract_file>".to_string()),
-                    _ if key.ends_with("_ms") => *child = Value::from(0_i64),
+                    "input_schema" => {}
+                    "now" | "elapsed_ms" if child.is_number() => *child = Value::from(0_u64),
+                    "contract_file" if child.is_string() => {
+                        *child = Value::String("<contract_file>".to_string());
+                    }
+                    "workspace_id" if child.is_string() => {
+                        *child = Value::String("<workspace_id>".to_string());
+                    }
+                    _ if key.ends_with("_ms") && child.is_number() => *child = Value::from(0_i64),
                     _ => canonicalize(child),
                 }
             }
@@ -229,17 +235,12 @@ fn canonicalize(value: &mut Value) {
                 canonicalize(item);
             }
         }
-        Value::Number(number) => {
-            if let Some(float_value) = number.as_f64() {
-                if float_value.fract() == 0.0 {
-                    if let Ok(int_value) = i64::try_from(float_value as i128) {
-                        *value = Value::from(int_value);
-                    } else if float_value >= 0.0 {
-                        if let Ok(uint_value) = u64::try_from(float_value as u128) {
-                            *value = Value::from(uint_value);
-                        }
-                    }
-                }
+        Value::Number(number) if number.is_f64() => {
+            let float_value = number.as_f64().unwrap();
+            // TOON counters decode as f64. Do not round integer authorities
+            // through f64 or coerce floats outside its exact-integer range.
+            if float_value.fract() == 0.0 && float_value.abs() <= 9_007_199_254_740_991.0 {
+                *number = serde_json::Number::from(float_value as i64);
             }
         }
         _ => {}
@@ -250,6 +251,39 @@ fn canonical_value(value: &Value) -> Value {
     let mut cloned = value.clone();
     canonicalize(&mut cloned);
     cloned
+}
+
+#[test]
+fn canonicalization_preserves_schemas_types_and_large_integer_identity() {
+    let schema = json!({"properties": {
+        "contract_file": {"type": "string"},
+        "elapsed_ms": {"type": "number", "default": 23},
+        "workspace_id": {"type": "string"}
+    }});
+    let value = json!({
+        "input_schema": schema,
+        "contract_file": {"type": "string"},
+        "elapsed_ms": "invalid-number-type",
+        "workspace_id": false,
+        "small_counter": 7.0,
+        "large_id": 9_007_199_254_740_993_u64,
+        "max_id": u64::MAX,
+        "large_float": 9_007_199_254_740_992.0
+    });
+    let canonical = canonical_value(&value);
+    assert_eq!(canonical["input_schema"], value["input_schema"]);
+    for key in [
+        "contract_file",
+        "elapsed_ms",
+        "workspace_id",
+        "large_id",
+        "max_id",
+        "large_float",
+    ] {
+        assert_eq!(canonical[key], value[key], "must preserve {key}");
+    }
+    assert_eq!(canonical["small_counter"], json!(7));
+    assert_ne!(canonical["large_id"], json!(9_007_199_254_740_992_u64));
 }
 
 fn pretty_canonical(value: &Value) -> String {
@@ -290,6 +324,24 @@ fn assert_matches_golden(name: &str, captures: &[ToolContractCapture]) {
     let actual_text = pretty_canonical(&actual_value);
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse tx golden");
+    // Only these expected envelope leaves vary with a release. Live success
+    // and rejection envelopes already assert the exact current package version.
+    // Never normalize versions inside schemas, contracts, or response data.
+    for capture in expected_value
+        .as_array_mut()
+        .expect("golden captures array")
+    {
+        for field in ["json_envelope", "toon_envelope"] {
+            let version = capture
+                .get_mut(field)
+                .and_then(|envelope| envelope.get_mut("version"))
+                .expect("golden envelope version leaf");
+            assert!(version.is_string(), "golden version must remain a string");
+            *version = Value::from(env!("CARGO_PKG_VERSION"));
+        }
+    }
+    let expected = pretty_canonical(&expected_value);
 
     if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
         let actual_path = path.with_extension("actual.json");
@@ -372,9 +424,91 @@ fn seed_planned_tx(harness: &mut TestHarness) {
     write_json(&tx_file_path(harness.workspace.path()), &make_tx_contract());
 }
 
-fn seed_committed_tx(harness: &mut TestHarness) {
+fn assert_persisted_prepare_denial(harness: &TestHarness) {
+    let contract: MissionTxContract = serde_json::from_slice(
+        &fs::read(tx_file_path(harness.workspace.path())).expect("read persisted transaction"),
+    )
+    .expect("parse persisted transaction");
+    assert_eq!(contract.lifecycle_state, MissionTxState::Failed);
+    assert_eq!(contract.outcome, TxOutcome::Failed);
+    assert!(
+        contract
+            .receipts
+            .iter()
+            .all(|receipt| { receipt["phase"] != "commit" && receipt["phase"] != "compensate" }),
+        "prepare denial must not produce commit or compensation receipts"
+    );
+}
+
+fn assert_workspace_ids(value: &Value, expected: &str) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "workspace_id" {
+                    assert_eq!(child.as_str(), Some(expected), "wrong workspace authority");
+                } else {
+                    assert_workspace_ids(child, expected);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_workspace_ids(item, expected);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_response_outcome(harness: &TestHarness, tool_name: &str, envelope: &Value) {
+    let workspace = Config::default()
+        .workspace_layout(None)
+        .expect("workspace layout");
+    assert_eq!(
+        workspace.root.canonicalize().unwrap(),
+        harness.workspace.path().canonicalize().unwrap(),
+        "response must be scoped to this harness workspace"
+    );
+    assert_workspace_ids(envelope, &workspace.root.to_string_lossy());
+    if tool_name == "wa.tx_rollback" {
+        assert_common_envelope_fields(envelope, false, tool_name);
+        assert_eq!(envelope["error_code"], "FT-MCP-0001");
+        assert_eq!(
+            envelope["error"],
+            "rollback requires commit receipts, got none for tx state failed"
+        );
+        assert!(
+            envelope["hint"]
+                .as_str()
+                .unwrap()
+                .contains("do not fabricate receipts")
+        );
+        assert!(envelope.get("data").is_none());
+        assert_persisted_prepare_denial(harness);
+    } else {
+        assert_success_envelope_shape(envelope, tool_name);
+        if tool_name == "wa.tx_run" {
+            // Transport success is a valid execution report, not a committed
+            // transaction. Missing panes must stop this fixture at prepare.
+            assert_eq!(envelope["data"]["final_state"], "failed");
+            assert_eq!(envelope["data"]["prepare_report"]["outcome"], "denied");
+            let gates = envelope["data"]["prepare_report"]["gate_inputs"]
+                .as_array()
+                .unwrap();
+            assert_eq!(gates.len(), 2);
+            for gate in gates {
+                assert_eq!(gate["target_liveness"], false);
+                assert_eq!(gate["preconditions_satisfied"], false);
+            }
+            assert!(envelope["data"].get("commit_report").is_none());
+            assert_persisted_prepare_denial(harness);
+        }
+    }
+}
+
+fn seed_prepare_denied_tx(harness: &mut TestHarness) {
     seed_planned_tx(harness);
-    let _ = harness
+    let contents = harness
         .client
         .call_tool(
             "wa.tx_run",
@@ -383,50 +517,67 @@ fn seed_committed_tx(harness: &mut TestHarness) {
                 "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
             }),
         )
-        .expect("seed tx_run success");
+        .expect("execute transaction prepare");
+    let envelope = parse_tool_envelope(&contents, "json");
+    assert_response_outcome(harness, "wa.tx_run", &envelope);
 }
 
 fn capture_tool_contract(
     tool_name: &str,
-    success_setup: impl Fn(&mut TestHarness),
-    success_args: impl Fn(&TestHarness, &str) -> Value,
+    setup: impl Fn(&mut TestHarness),
+    args: impl Fn(&TestHarness, &str) -> Value,
     boundary_setup: impl Fn(&mut TestHarness),
     boundary_args: impl Fn(&TestHarness) -> Value,
     boundary_hint: &str,
 ) -> ToolContractCapture {
-    let (input_schema, json_success_envelope) = {
+    let (input_schema, json_envelope) = {
         let mut json_harness = new_harness();
-        success_setup(&mut json_harness);
+        setup(&mut json_harness);
         let input_schema = tool_input_schema(&mut json_harness.client, tool_name);
         assert_schema_matches_manifest(tool_name, &input_schema);
-        let json_success_envelope = parse_tool_envelope(
+        let before = fs::read(tx_file_path(json_harness.workspace.path())).unwrap();
+        let json_envelope = parse_tool_envelope(
             &json_harness
                 .client
-                .call_tool(tool_name, success_args(&json_harness, "json"))
-                .unwrap_or_else(|err| panic!("call {tool_name} json success case: {err}")),
+                .call_tool(tool_name, args(&json_harness, "json"))
+                .unwrap_or_else(|err| panic!("call {tool_name} json case: {err}")),
             "json",
         );
-        (input_schema, json_success_envelope)
+        assert_response_outcome(&json_harness, tool_name, &json_envelope);
+        if tool_name == "wa.tx_rollback" {
+            assert_eq!(
+                fs::read(tx_file_path(json_harness.workspace.path())).unwrap(),
+                before
+            );
+        }
+        (input_schema, json_envelope)
     };
 
-    let toon_success_envelope = {
+    let toon_envelope = {
         let mut toon_harness = new_harness();
-        success_setup(&mut toon_harness);
-        parse_tool_envelope(
+        setup(&mut toon_harness);
+        let before = fs::read(tx_file_path(toon_harness.workspace.path())).unwrap();
+        let envelope = parse_tool_envelope(
             &toon_harness
                 .client
-                .call_tool(tool_name, success_args(&toon_harness, "toon"))
-                .unwrap_or_else(|err| panic!("call {tool_name} toon success case: {err}")),
+                .call_tool(tool_name, args(&toon_harness, "toon"))
+                .unwrap_or_else(|err| panic!("call {tool_name} toon case: {err}")),
             "toon",
-        )
+        );
+        assert_response_outcome(&toon_harness, tool_name, &envelope);
+        if tool_name == "wa.tx_rollback" {
+            assert_eq!(
+                fs::read(tx_file_path(toon_harness.workspace.path())).unwrap(),
+                before
+            );
+        }
+        envelope
     };
 
-    assert_success_envelope_shape(&json_success_envelope, &format!("{tool_name} json"));
-    assert_success_envelope_shape(&toon_success_envelope, &format!("{tool_name} toon"));
     assert_eq!(
-        canonical_value(&json_success_envelope),
-        canonical_value(&toon_success_envelope),
-        "{tool_name} TOON envelope drifted from JSON success semantics"
+        canonical_value(&json_envelope),
+        canonical_value(&toon_envelope),
+        "{tool_name} TOON envelope drifted from JSON outcome semantics"
     );
 
     let boundary_invalid_params_error = {
@@ -444,8 +595,8 @@ fn capture_tool_contract(
     ToolContractCapture {
         tool: tool_name.to_string(),
         input_schema,
-        json_success_envelope,
-        toon_success_envelope,
+        json_envelope,
+        toon_envelope,
         boundary_invalid_params_error,
     }
 }
@@ -496,8 +647,7 @@ fn mcp_conformance_wa_tx_toon_and_boundary_contract_matches_golden() {
             |harness, format| {
                 json!({
                     "format": format,
-                    "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
-                    "fail_step": "tx-step:2"
+                    "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
                 })
             },
             seed_planned_tx,
@@ -512,14 +662,14 @@ fn mcp_conformance_wa_tx_toon_and_boundary_contract_matches_golden() {
         ),
         capture_tool_contract(
             "wa.tx_rollback",
-            seed_committed_tx,
+            seed_prepare_denied_tx,
             |harness, format| {
                 json!({
                     "format": format,
                     "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
                 })
             },
-            seed_committed_tx,
+            seed_prepare_denied_tx,
             |harness| {
                 json!({
                     "format": "json",

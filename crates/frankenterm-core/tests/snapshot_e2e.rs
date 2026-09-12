@@ -512,7 +512,50 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             .expect("locate canonical v40 retained-size schema"),
     )
     .expect("install canonical v40 retained-size authority");
+    conn.execute_batch(
+        frankenterm_core::storage::migrations::session_recovery_usability_schema_sql()
+            .expect("locate canonical v44 recovery-usability schema"),
+    )
+    .expect("install canonical v44 recovery-usability authority");
     (tmp, db_path)
+}
+
+/// Model a prior boot while preserving the real local machine identity.
+/// Dropping an engine handle alone never proves its process owner died.
+async fn model_prior_boot_owner(db_path: &Arc<String>) {
+    let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
+    assert!(
+        restorer
+            .detect()
+            .expect("live or unknown owner detection")
+            .is_none()
+    );
+    let (_probe_file, probe_path) = setup_test_db();
+    let probe = SnapshotEngine::new(probe_path.clone(), SnapshotConfig::default());
+    probe
+        .capture(
+            &[make_pane(1, 0, 0, 24, 80, "owner probe", "/tmp")],
+            SnapshotTrigger::Manual,
+        )
+        .await
+        .expect("capture genuine host ownership");
+    let host: String = Connection::open(probe_path.as_str())
+        .unwrap()
+        .query_row("SELECT host_id FROM mux_sessions", [], |row| row.get(0))
+        .expect("capture installs host identity");
+    let mut host: serde_json::Value = serde_json::from_str(&host).unwrap();
+    let prior_boot = "33333333-3333-4333-8333-333333333333";
+    assert_ne!(host["boot_id"], prior_boot);
+    host["boot_id"] = json!(prior_boot);
+    let changed = Connection::open(db_path.as_str())
+        .unwrap()
+        .execute(
+            "UPDATE mux_sessions SET host_id = ?1, owner_pid = 1,
+         owner_process_start = 1, owner_heartbeat_at = created_at",
+            [host.to_string()],
+        )
+        .expect("model prior boot owner");
+    assert!(changed > 0);
 }
 
 fn insert_output_segment(
@@ -1067,7 +1110,7 @@ fn e2e_snapshot_dedup_retention_and_detect_cycle() {
 
         let success = deleted >= 1
             && remaining <= 2
-            && detected_before_shutdown.is_some()
+            && detected_before_shutdown.is_none()
             && detected_after_shutdown.is_none();
         report.total_duration_ms = run_start.elapsed().as_millis() as u64;
         report.passed = success;
@@ -1120,6 +1163,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
         );
 
         let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
+        model_prior_boot_owner(&db_path).await;
         let detect_start = Instant::now();
         let session = restorer
             .detect()
@@ -1421,6 +1465,7 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
             .expect("insert fixture checkpoint");
             let checkpoint_id = conn.last_insert_rowid();
 
+            let mut payload_bytes = 0usize;
             for pane in &fixture_panes {
                 let terminal_json = json!({
                     "rows": 24,
@@ -1431,6 +1476,7 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
                     "title": format!("fixture-pane-{}", pane.pane_id),
                 })
                 .to_string();
+                payload_bytes += terminal_json.len();
                 conn.execute(
                     "INSERT INTO mux_pane_state
                      (checkpoint_id, pane_id, cwd, command, terminal_state_json)
@@ -1444,6 +1490,11 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
                 )
                 .expect("insert fixture pane state");
             }
+            conn.execute(
+                "UPDATE session_checkpoints SET total_bytes = ?1 WHERE id = ?2",
+                params![i64::try_from(payload_bytes).unwrap(), checkpoint_id],
+            )
+            .expect("bind exact persisted fixture payload size");
 
             add_phase(
                 &mut report,
@@ -1461,6 +1512,7 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
         }
 
         let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
+        model_prior_boot_owner(&db_path).await;
         let load_start = Instant::now();
         let session = restorer
             .detect()
@@ -1537,7 +1589,14 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
                     true
                 }
             };
-            let active_matches = new_state.is_active == (pane.pane_id == active_old_pane_id);
+            let source_tab = topology
+                .windows
+                .iter()
+                .flat_map(|window| &window.tabs)
+                .find(|tab| tab.tab_id == pane.tab_id)
+                .expect("fixture pane must belong to a source tab");
+            let active_matches =
+                new_state.is_active == (Some(pane.pane_id) == source_tab.active_pane_id);
             let cwd_matches = pane.cwd.as_deref().map(normalize_cwd_str).as_deref()
                 == Some(new_state.cwd.as_str());
 
@@ -1683,6 +1742,7 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
                 ..SessionRestoreConfig::default()
             },
         );
+        model_prior_boot_owner(&db_path).await;
         let session = restorer
             .detect()
             .expect("detect scrollback restore candidate")
@@ -1879,6 +1939,7 @@ fn e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_rest
         );
 
         // ── Phase 3: detect — must rediscover the captured session.
+        model_prior_boot_owner(&db_path).await;
         let detect_start = Instant::now();
         let candidate = restorer
             .detect()
@@ -2131,6 +2192,7 @@ fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected(
             json!({ "restore_scrollback": true }),
         );
 
+        model_prior_boot_owner(&db_path).await;
         let candidate = restorer
             .detect()
             .expect("detect after handle rebuild")
@@ -2464,6 +2526,7 @@ fn e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes() {
         );
 
         // ── manual layout restore + confirm every source pane is mapped.
+        model_prior_boot_owner(&db_path).await;
         let candidate = restorer
             .detect()
             .expect("detect after handle rebuild")

@@ -3,6 +3,7 @@
     "additionalProperties": false,
     "properties": {
       "agent": {
+        "maxLength": 256,
         "type": "string"
       },
       "domain": {
@@ -14,6 +15,7 @@
           "json",
           "toon"
         ],
+        "maxLength": 16,
         "type": "string"
       },
       "pane_id": {
