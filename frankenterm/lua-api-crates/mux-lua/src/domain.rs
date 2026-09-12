@@ -805,7 +805,22 @@ mod tests {
             "the helper definition and all four implicit attach sites must remain wired"
         );
         assert!(mux_source.contains("domain_spawn_lifecycle: OnceLock"));
-        assert!(mux_source.contains("lifecycle.prepare(Arc::clone(self), prepared"));
+        let preparation = mux_source
+            .split_once("async fn prepare_domain_for_spawn(")
+            .expect("spawn preparation helper remains present")
+            .1
+            .split_once("pub fn resolve_spawn_tab_domain(")
+            .expect("spawn preparation helper remains independently bounded")
+            .0;
+        // Rustfmt may wrap the receiver and method onto separate lines.
+        // Preserve the exact receiver, arguments, and awaited error propagation.
+        let compact_preparation: String = preparation
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(compact_preparation.contains(
+            "lifecycle.prepare(Arc::clone(self),prepared,owner_client_id,window_id).await?"
+        ));
 
         let install = source
             .split_once("pub fn install_domain_lifecycle_recorder(")

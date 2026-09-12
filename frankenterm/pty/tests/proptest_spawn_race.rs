@@ -3,6 +3,7 @@
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use proptest::prelude::*;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -118,10 +119,6 @@ fn recv_output(
     }
 }
 
-fn normalize_pty_eof_echo(output: &str) -> String {
-    output.replace("\r\n^D\u{8}\u{8}", "")
-}
-
 fn run_spawn_race_case(case: &SpawnRaceCase) -> anyhow::Result<(String, portable_pty::ExitStatus)> {
     let pty_system = NativePtySystem::default();
     let pair = pty_system.openpty(PtySize {
@@ -132,6 +129,25 @@ fn run_spawn_race_case(case: &SpawnRaceCase) -> anyhow::Result<(String, portable
     })?;
     let master = pair.master;
     let mut slave = Some(pair.slave);
+
+    // Writer drop injects newline + VEOF. Disable input echo before any
+    // interleaving so the oracle measures child output rather than the kernel's
+    // platform-dependent rendering of those control bytes. Keep canonical
+    // input and output newline processing intact.
+    let tty_path = master
+        .tty_name()
+        .ok_or_else(|| anyhow::anyhow!("native PTY must expose its slave path"))?;
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty_path)?;
+    let mut termios = nix::sys::termios::tcgetattr(&tty)?;
+    termios
+        .local_flags
+        .remove(nix::sys::termios::LocalFlags::ECHO | nix::sys::termios::LocalFlags::ECHONL);
+    nix::sys::termios::tcsetattr(&tty, nix::sys::termios::SetArg::TCSANOW, &termios)?;
+    drop(tty);
 
     let mut reader = if case.clone_reader_before_spawn {
         Some(master.try_clone_reader()?)
@@ -241,9 +257,8 @@ proptest! {
             case,
             status
         );
-        let normalized_output = normalize_pty_eof_echo(&output);
         prop_assert_eq!(
-            normalized_output,
+            output,
             expected_line,
             "pty spawn/read/write/drop interleaving changed subprocess output for {:?}",
             case
