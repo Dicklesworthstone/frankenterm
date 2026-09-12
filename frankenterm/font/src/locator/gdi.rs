@@ -182,10 +182,17 @@ fn handle_from_descriptor(
     descriptor: &FontDescriptor,
     pixel_size: u16,
 ) -> Option<ParsedFont> {
-    let font = collection.get_font_from_descriptor(&descriptor)?;
+    let font = collection
+        .font_from_descriptor(descriptor)
+        .inspect_err(|err| log::warn!("DirectWrite descriptor lookup failed: {err:#x}"))
+        .ok()??;
     let face = font.create_font_face();
-    for file in face.get_files() {
-        if let Some(path) = file.get_font_file_path() {
+    let files = face
+        .files()
+        .inspect_err(|err| log::warn!("DirectWrite font file lookup failed: {err:#x}"))
+        .ok()?;
+    for file in files {
+        if let Ok(path) = file.font_file_path() {
             let family_name = font.family_name();
 
             log::debug!("{} -> {}", family_name, path.display());
@@ -367,10 +374,15 @@ impl FontLocator for GdiFontLocator {
         for family in collection.families_iter() {
             let count = family.get_font_count();
             for idx in 0..count {
-                let font = family.get_font(idx);
+                let font = family.font(idx).map_err(|err| {
+                    anyhow::anyhow!("DirectWrite font {idx} lookup failed: {err:#x}")
+                })?;
                 let face = font.create_font_face();
-                for file in face.get_files() {
-                    if let Some(path) = file.get_font_file_path() {
+                let font_files = face.files().map_err(|err| {
+                    anyhow::anyhow!("DirectWrite font file enumeration failed: {err:#x}")
+                })?;
+                for file in font_files {
+                    if let Ok(path) = file.font_file_path() {
                         if files.contains(&path) {
                             continue;
                         }

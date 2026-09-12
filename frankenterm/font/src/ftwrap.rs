@@ -1427,6 +1427,9 @@ impl FreeTypeStream {
                 0
             }
             StreamBacking::File(file) => {
+                // C unsigned long remains 32-bit on 64-bit Windows (LLP64).
+                #[cfg(any(windows, target_pointer_width = "32"))]
+                let offset = u64::from(offset);
                 if let Err(err) = file.seek(SeekFrom::Start(offset)) {
                     log::error!(
                         "failed to seek {} to offset {}: {:#}",
