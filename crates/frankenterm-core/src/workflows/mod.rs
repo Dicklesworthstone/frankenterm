@@ -6833,6 +6833,352 @@ steps:
         });
     }
 
+    #[test]
+    fn explicit_abort_rejects_trigger_ownership_mismatches_atomically() {
+        run_async_test(async {
+            for fault in ["missing", "owner", "lease"] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("abort-trigger.db");
+                let (runner, storage, locks) = create_test_runner(&path.to_string_lossy()).await;
+                create_test_pane(&storage, 62).await;
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch("INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at) VALUES (1, 62, 'abort.trigger', 'unknown', 'test', 'info', 1.0, 1);").unwrap();
+                runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+                let detection = make_test_detection("multi_step.explicit.abort.trigger");
+                let started = runner.handle_detection(62, &detection, Some(1)).await;
+                let execution = started.execution_id().unwrap();
+                let start_action = super::engine::record_workflow_start_action_with_cx(
+                    &crate::cx::for_testing(),
+                    &storage,
+                    "multi_step",
+                    execution,
+                    62,
+                    3,
+                    0,
+                )
+                .await
+                .unwrap();
+                match fault {
+                    "missing" => {
+                        // Model an externally damaged association without deleting data.
+                        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+                        conn.execute(
+                            "UPDATE workflow_executions SET trigger_event_id=999 WHERE id=?1",
+                            [execution],
+                        )
+                        .unwrap();
+                    }
+                    "owner" => {
+                        conn.execute_batch("UPDATE events SET handled_by_workflow_id='another-execution' WHERE id=1").unwrap();
+                    }
+                    _ => {
+                        conn.execute_batch("UPDATE events SET delivery_lease_token='another-owner', delivery_lease_acquired_at=1, delivery_lease_expires_at=9223372036854775807 WHERE id=1").unwrap();
+                    }
+                }
+                let error = runner
+                    .abort_execution(execution, None, false)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("no abort committed"), "{error}");
+                assert_eq!(
+                    storage
+                        .get_workflow(execution)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "running"
+                );
+                assert!(locks.is_locked(62).is_some());
+                let undoable: bool = conn
+                    .query_row(
+                        "SELECT undoable FROM action_undo WHERE audit_action_id=?1",
+                        [start_action],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(undoable);
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_actions WHERE actor_id=?1 AND action_kind='workflow_aborted'", [execution], |row| row.get(0)).unwrap();
+                assert_eq!(count, 0);
+                let handled: Option<i64> = conn
+                    .query_row("SELECT handled_at FROM events WHERE id=1", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert!(handled.is_none());
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_abort_owner_cleanup_survives_dropped_response() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dropped-abort.db");
+            let (runner, storage, locks) = create_test_runner(&path.to_string_lossy()).await;
+            create_test_pane(&storage, 62).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+            let detection = make_test_detection("multi_step.explicit.abort.drop");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at) VALUES (1, 62, 'abort.drop', 'unknown', 'test', 'info', 1.0, 1);").unwrap();
+            let started = runner.handle_detection(62, &detection, Some(1)).await;
+            let execution = started.execution_id().unwrap().to_string();
+            let expected = storage.get_workflow(&execution).await.unwrap().unwrap();
+            let action = super::engine::build_explicit_abort_action(&expected, None).unwrap();
+            let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let owned_locks = Arc::clone(&locks);
+            let owned_execution = execution.clone();
+            let cx = crate::cx::for_testing();
+            let operation =
+                Box::pin(
+                    storage.abort_workflow_with_cx(&cx, expected, action, None, move || {
+                        let _ = ready_tx.send(());
+                        release_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        owned_locks.release(62, &owned_execution);
+                    }),
+                );
+            let raced = crate::runtime_async::timeout_with_cx(
+                &cx,
+                std::time::Duration::from_secs(5),
+                futures::future::select(operation, ready_rx),
+            )
+            .await
+            .unwrap();
+            match raced {
+                futures::future::Either::Right((ready, pending_response)) => {
+                    ready.unwrap();
+                    assert!(locks.is_locked(62).is_some());
+                    drop(pending_response);
+                    release_tx.send(()).unwrap();
+                }
+                futures::future::Either::Left(_) => {
+                    panic!("response escaped committed cleanup barrier")
+                }
+            }
+            // A subsequent writer command is a barrier behind commit cleanup.
+            create_test_pane(&storage, 63).await;
+            assert!(locks.is_locked(62).is_none());
+            let handled: (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT handled_by_workflow_id, handled_status FROM events WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(handled, (Some(execution.clone()), Some("aborted".into())));
+            assert_eq!(
+                storage
+                    .get_workflow(&execution)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "aborted"
+            );
+            let mut panic_case = storage.get_workflow(&execution).await.unwrap().unwrap();
+            panic_case.id = "abort-cleanup-panic".into();
+            panic_case.status = "running".into();
+            panic_case.trigger_event_id = None;
+            storage.upsert_workflow(panic_case.clone()).await.unwrap();
+            let action = super::engine::build_explicit_abort_action(&panic_case, None).unwrap();
+            let error = storage
+                .abort_workflow_with_cx(&cx, panic_case.clone(), action, None, || {
+                    panic!("injected abort owner cleanup panic");
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("abort committed"));
+            // The canonical panic boundary must leave the writer available.
+            create_test_pane(&storage, 64).await;
+            assert_eq!(
+                storage
+                    .get_workflow(&panic_case.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "aborted"
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn explicit_abort_concurrent_requests_commit_one_transition() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("concurrent-abort.db");
+            let (runner, storage, locks) = create_test_runner(&path.to_string_lossy()).await;
+            create_test_pane(&storage, 62).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+            let detection = make_test_detection("multi_step.explicit.abort.concurrent");
+            let started = runner.handle_detection(62, &detection, None).await;
+            let execution = started.execution_id().unwrap();
+            let active = storage.get_workflow(execution).await.unwrap().unwrap();
+            let (first, second) = futures::join!(
+                runner.abort_execution(execution, Some("first"), false),
+                runner.abort_execution(execution, Some("second"), false),
+            );
+            assert_ne!(first.unwrap().aborted, second.unwrap().aborted);
+            assert!(locks.is_locked(62).is_none());
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'workflow_aborted' AND actor_id = ?1",
+                [execution], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 1);
+            for status in ["running", "completed", "failed", "aborted"] {
+                let mut stale = active.clone();
+                stale.status = status.into();
+                assert!(storage.upsert_workflow(stale).await.is_err());
+                assert_eq!(
+                    storage
+                        .get_workflow(execution)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "aborted"
+                );
+            }
+            // A completion committed before the abort CAS must remain intact,
+            // even if the abort caller read the earlier active snapshot.
+            let mut other = active;
+            other.id = "completed-before-abort-cas".into();
+            storage.upsert_workflow(other.clone()).await.unwrap();
+            let mut completed = other.clone();
+            completed.status = "completed".into();
+            storage.upsert_workflow(completed).await.unwrap();
+            let action = super::engine::build_explicit_abort_action(&other, None).unwrap();
+            assert!(
+                !storage
+                    .abort_workflow_with_cx(
+                        &crate::cx::for_testing(),
+                        other.clone(),
+                        action,
+                        None,
+                        || {}
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                storage
+                    .get_workflow(&other.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "completed"
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: workflow abort updates undo metadata and records abort action.
+    #[test]
+    fn contract_doctor_explicit_abort_is_atomic_with_audit_and_undo() {
+        run_async_test(async {
+            for failure in [None, Some("audit"), Some("undo"), Some("state")] {
+                let fail_audit = failure.is_some();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("explicit-abort.db");
+                let (runner, storage, locks) = create_test_runner(&path.to_string_lossy()).await;
+                create_test_pane(&storage, 62).await;
+                runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+                let detection = make_test_detection("multi_step.explicit.abort.audit");
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch("INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at) VALUES (1, 62, 'abort.audit', 'unknown', 'test', 'info', 1.0, 1);").unwrap();
+                let started = runner.handle_detection(62, &detection, Some(1)).await;
+                let execution = started.execution_id().expect("start workflow");
+                let cx = crate::cx::for_testing();
+                let start_action = super::engine::record_workflow_start_action_with_cx(
+                    &cx,
+                    &storage,
+                    "multi_step",
+                    execution,
+                    62,
+                    3,
+                    0,
+                )
+                .await
+                .unwrap();
+                assert!(locks.is_locked(62).is_some());
+                if let Some(failure) = failure {
+                    let sql = match failure {
+                        "audit" => {
+                            "CREATE TRIGGER reject_abort BEFORE INSERT ON audit_actions WHEN NEW.action_kind = 'workflow_aborted' BEGIN SELECT RAISE(FAIL, 'injected abort failure'); END;"
+                        }
+                        "undo" => {
+                            "CREATE TRIGGER reject_abort BEFORE UPDATE ON action_undo WHEN NEW.undoable = 0 BEGIN SELECT RAISE(FAIL, 'injected abort failure'); END;"
+                        }
+                        _ => {
+                            "CREATE TRIGGER reject_abort BEFORE UPDATE ON workflow_executions WHEN NEW.status = 'aborted' BEGIN SELECT RAISE(FAIL, 'injected abort failure'); END;"
+                        }
+                    };
+                    conn.execute_batch(sql).unwrap();
+                }
+                let result = runner
+                    .abort_execution(execution, Some("operator stop"), false)
+                    .await;
+                if fail_audit {
+                    let error = result
+                        .expect_err("audit failure cannot be reported as complete")
+                        .to_string();
+                    assert!(error.contains("injected abort failure"), "{error}");
+                } else {
+                    assert!(result.unwrap().aborted);
+                }
+                let record = storage.get_workflow(execution).await.unwrap().unwrap();
+                assert_eq!(
+                    record.status,
+                    if fail_audit { "running" } else { "aborted" },
+                    "audit failure must roll back the state transition"
+                );
+                assert_eq!(locks.is_locked(62).is_some(), fail_audit);
+                let undoable: bool = conn
+                    .query_row(
+                        "SELECT undoable FROM action_undo WHERE audit_action_id = ?1",
+                        [start_action],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(undoable, fail_audit);
+                let handled: Option<i64> = conn
+                    .query_row("SELECT handled_at FROM events WHERE id=1", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(handled.is_none(), fail_audit);
+                assert!(
+                    storage.get_step_logs(execution).await.unwrap().is_empty(),
+                    "explicit abort must not execute workflow steps"
+                );
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'workflow_aborted' AND actor_id = ?1", [execution], |row| row.get(0)).unwrap();
+                assert_eq!(count, if fail_audit { 0 } else { 1 });
+                let repeated = runner.abort_execution(execution, None, false).await;
+                if fail_audit {
+                    assert!(repeated.is_err());
+                } else {
+                    assert!(
+                        !repeated.unwrap().aborted,
+                        "repeat abort is a terminal-state no-op"
+                    );
+                }
+                let repeated_count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'workflow_aborted' AND actor_id = ?1", [execution], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    repeated_count, count,
+                    "repeat abort must not invent another transition"
+                );
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
     /// Test: workflow abort updates undo metadata and records abort action.
     #[test]
     fn workflow_abort_updates_undo_metadata() {

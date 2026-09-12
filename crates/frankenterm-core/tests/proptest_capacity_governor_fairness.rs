@@ -8,19 +8,17 @@
 //!
 //! ## Invariants pinned
 //!
-//! 1. **Throttle-gate fairness** — for any
-//!    `(config, signals)`, if Heavy is *Allowed* then Medium
-//!    and Light must also be Allowed. Heavy is the most
-//!    resource-intensive workload; if pressure is low enough
-//!    to admit Heavy, the lighter categories cannot have a
-//!    stricter gate. (Inversely, Light being Blocked implies
-//!    Medium and Heavy are also Blocked under the same
-//!    `(config, signals)`.)
+//! 1. **Pressure-gate fairness** — if Heavy is *Allowed*, Light
+//!    is also Allowed, and Medium is Allowed unless its independent
+//!    concurrency quota is full. A free Heavy slot does not authorize
+//!    exceeding the Medium quota. With quota headroom, the lighter
+//!    categories cannot face a stricter pressure gate.
 //!
 //! 2. **Throttle-gate ordering under pressure** — at any
 //!    pressure that triggers a Block on Light, Heavy and Medium
 //!    are likewise non-Allow. Pinning the ordered fairness:
-//!    Heavy ⊆ Medium ⊆ Light in admission set.
+//!    Heavy ⊆ Medium ⊆ Light for pressure admission, with independent
+//!    concurrency quotas checked separately.
 //!
 //! 3. **Tier transition monotonicity** — for any two pressure
 //!    signals with `s1.max ≤ s2.max`, `s1.health_tier() ≤
@@ -138,13 +136,11 @@ fn is_block(d: &GovernorDecision) -> bool {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
-    /// **Property 1 — throttle-gate fairness (Allow direction)**:
-    /// if Heavy is Allowed under `(config, signals)`, then Medium
-    /// and Light must also be Allowed under the same. Heavy is
-    /// the resource-heaviest category; if it gets through, the
-    /// lighter categories cannot face a stricter gate.
+    /// **Property 1 — pressure fairness with independent quotas**:
+    /// Heavy admission implies Light admission; Medium admission additionally
+    /// requires headroom in its own concurrency quota.
     #[test]
-    fn proptest_capacity_governor_heavy_allowed_implies_medium_and_light_allowed(
+    fn proptest_capacity_governor_heavy_allowed_preserves_lighter_pressure_and_quota_gates(
         signals in arb_pressure_signals(),
     ) {
         init_test_tracing_json();
@@ -167,8 +163,13 @@ proptest! {
         );
 
         if is_allow(&d_heavy) {
-            prop_assert!(is_allow(&d_medium),
-                "Heavy Allow must imply Medium Allow under the same signals");
+            if signals.active_medium_workloads < standard_config().max_concurrent_medium {
+                prop_assert!(is_allow(&d_medium),
+                    "Heavy Allow must imply Medium Allow with quota headroom");
+            } else {
+                prop_assert!(matches!(d_medium, GovernorDecision::Throttle { .. }),
+                    "Medium must still throttle when its independent quota is full");
+            }
             prop_assert!(is_allow(&d_light),
                 "Heavy Allow must imply Light Allow under the same signals");
         }
@@ -358,5 +359,30 @@ proptest! {
         let observed = signals.rch_can_offload();
         let expected = signals.rch_available && signals.rch_workers_available > 0;
         prop_assert_eq!(observed, expected);
+    }
+}
+
+#[test]
+fn medium_quota_boundary_does_not_consume_free_heavy_capacity() {
+    let config = standard_config();
+    for active_medium_workloads in [
+        config.max_concurrent_medium - 1,
+        config.max_concurrent_medium,
+    ] {
+        let signals = PressureSignals {
+            active_medium_workloads,
+            ..PressureSignals::default()
+        };
+        for category in [WorkloadCategory::Heavy, WorkloadCategory::Light] {
+            let decision = CapacityGovernor::new(config.clone()).evaluate(category, &signals);
+            assert!(is_allow(&decision), "{category:?}: {decision:?}");
+        }
+        let decision =
+            CapacityGovernor::new(config.clone()).evaluate(WorkloadCategory::Medium, &signals);
+        if active_medium_workloads < config.max_concurrent_medium {
+            assert!(is_allow(&decision));
+        } else {
+            assert!(matches!(decision, GovernorDecision::Throttle { .. }));
+        }
     }
 }

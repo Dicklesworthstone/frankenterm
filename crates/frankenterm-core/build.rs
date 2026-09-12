@@ -65,10 +65,11 @@ enum BuildStringPhase {
     None,
     Body,
     SawEsc,
+    Csi,
 }
 
 fn write_ansi_dfa_table(out_dir: &Path) {
-    const STATE_COUNT: u8 = 6;
+    const STATE_COUNT: u8 = 8;
     const BYTE_COUNT: u16 = 256;
 
     let mut generated = String::new();
@@ -104,7 +105,8 @@ fn decode_build_ansi_state(state: u8) -> (bool, BuildStringPhase) {
         0 => BuildStringPhase::None,
         1 => BuildStringPhase::Body,
         2 => BuildStringPhase::SawEsc,
-        _ => unreachable!("ANSI DFA state is generated within 0..6"),
+        3 => BuildStringPhase::Csi,
+        _ => unreachable!("ANSI DFA state is generated within 0..8"),
     };
     (in_escape, phase)
 }
@@ -114,6 +116,7 @@ fn encode_build_ansi_state(in_escape: bool, phase: BuildStringPhase) -> u8 {
         BuildStringPhase::None => 0,
         BuildStringPhase::Body => 1,
         BuildStringPhase::SawEsc => 2,
+        BuildStringPhase::Csi => 3,
     };
     (phase << 1) | u8::from(in_escape)
 }
@@ -126,6 +129,8 @@ fn build_ansi_state_step(byte: u8, in_escape: &mut bool, phase: &mut BuildString
     if byte == 0x1b {
         if *in_escape && matches!(*phase, BuildStringPhase::Body | BuildStringPhase::SawEsc) {
             *phase = BuildStringPhase::SawEsc;
+        } else {
+            *phase = BuildStringPhase::None;
         }
         *in_escape = true;
         return true;
@@ -139,7 +144,15 @@ fn build_ansi_state_step(byte: u8, in_escape: &mut bool, phase: &mut BuildString
         BuildStringPhase::None => {
             if build_is_string_intro_byte(byte) {
                 *phase = BuildStringPhase::Body;
-            } else if byte != b'[' && ((0x40..=0x7E).contains(&byte) || byte >= 0x7F) {
+            } else if byte == b'[' {
+                *phase = BuildStringPhase::Csi;
+            } else if byte >= 0x40 {
+                *in_escape = false;
+            }
+        }
+        BuildStringPhase::Csi => {
+            if byte >= 0x40 {
+                *phase = BuildStringPhase::None;
                 *in_escape = false;
             }
         }

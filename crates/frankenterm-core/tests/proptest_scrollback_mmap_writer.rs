@@ -30,7 +30,9 @@ fn record_strategy(max_payload_len: usize) -> impl Strategy<Value = (RecordKind,
 }
 
 fn config_for(dir: &tempfile::TempDir, pane_uuid: &str, cap_bytes: u64) -> MmapScrollbackConfig {
-    MmapScrollbackConfig::new(dir.path(), pane_uuid)
+    // Let the writer create its private leaf rather than inheriting the
+    // caller's tempfile mode (which can include group access under CI umasks).
+    MmapScrollbackConfig::new(dir.path().join("scrollback"), pane_uuid)
         .with_cap_bytes(cap_bytes)
         .with_sync_every_appends(0)
         .with_sync_interval(Duration::from_secs(3600))
@@ -201,21 +203,38 @@ proptest! {
     #[test]
     fn proptest_scrollback_mmap_writer_oversized_payload_is_tail_truncated_to_capacity(
         cap_bytes in (V2_RECORD_HEADER_SIZE as u64 + 1)..=128_u64,
-        payload in prop::collection::vec(Just(b'z'), 129..=256),
+        payload in prop::collection::vec(prop::sample::select(vec![b'z', b'Z']), 129..=256),
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut writer = MmapScrollback::open(config_for(&dir, "pane-truncate", cap_bytes))
             .expect("open writer");
+        let path = writer.path().to_path_buf();
+        let mut payload = payload;
+        // No secret anchors, and a distinct final byte makes head truncation
+        // observably wrong even at the one-byte minimum payload capacity.
+        payload.push(b'!');
         let max_payload = cap_bytes as usize - V2_RECORD_HEADER_SIZE;
-        prop_assume!(payload.len() > max_payload);
+        prop_assert!(payload.len() > max_payload);
 
+        // Streaming retention protects secret-like suffixes; ordinary safe
+        // bytes emit immediately even when shorter than the maximum tail window.
         let report = writer.append(RecordKind::Text, &payload).expect("append oversized payload");
+        prop_assert!(writer.flush_pending_redaction().expect("finish stream").is_none());
 
         prop_assert_eq!(report.payload_bytes, max_payload);
+        prop_assert_eq!(report.redaction.replacement_count, 0);
         prop_assert_eq!(report.write_cursor_bytes, 0);
         prop_assert_eq!(writer.header().write_cursor_bytes, 0);
         prop_assert_eq!(writer.header().total_bytes_written, cap_bytes);
         prop_assert_eq!(writer.header().capacity_bytes, cap_bytes);
+        writer.sync().expect("sync truncated record");
+        drop(writer);
+        let persisted = read_linear_records(&path, read_limits(&path)).expect("read truncated record");
+        prop_assert_eq!(
+            persisted.records,
+            vec![(RecordKind::Text, payload[payload.len() - max_payload..].to_vec())],
+            "full ring must retain exactly the newest payload suffix"
+        );
     }
 
     #[test]
@@ -271,4 +290,35 @@ proptest! {
             .collect();
         prop_assert_eq!(actual_bytes, expected_bytes);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn mmap_writer_refuses_group_accessible_directory_without_creating_leaves() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_for(&dir, "unsafe-directory", 4096);
+    let base_dir = config.bin_path().parent().expect("parent").to_path_buf();
+    std::fs::create_dir(&base_dir).expect("create unsafe directory");
+    std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o770))
+        .expect("set explicit unsafe mode");
+    assert!(matches!(
+        MmapScrollback::open(config),
+        Err(frankenterm_core::scrollback_mmap_writer::MmapScrollbackError::UnsafeReadSource { .. })
+    ));
+    assert_eq!(
+        std::fs::read_dir(&base_dir)
+            .expect("read directory")
+            .count(),
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(&base_dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o770
+    );
 }

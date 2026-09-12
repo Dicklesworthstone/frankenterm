@@ -296,6 +296,7 @@ proptest! {
         metrics in prop::collection::vec(arb_metrics(), 2..=30),
     ) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             max_change_per_tick: max_change,
             ..AutoTuneConfig::default()
@@ -375,6 +376,7 @@ proptest! {
         high_rss in 0.7..=0.95_f64,
     ) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: hysteresis,
             ..AutoTuneConfig::default()
         };
@@ -412,6 +414,7 @@ proptest! {
         metrics in prop::collection::vec(arb_deadband_metrics(), 1..=30),
     ) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -459,6 +462,7 @@ proptest! {
         metrics in prop::collection::vec(arb_metrics(), 1..=40),
     ) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -542,6 +546,7 @@ proptest! {
     #[test]
     fn prop_memory_pressure_reduces_scrollback(rss in 0.65..=0.95_f64) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -559,7 +564,7 @@ proptest! {
         }
 
         prop_assert!(
-            tuner.params().scrollback_lines <= initial_scrollback,
+            tuner.params().scrollback_lines < initial_scrollback,
             "high memory ({}) should reduce scrollback: initial={}, current={}",
             rss, initial_scrollback, tuner.params().scrollback_lines
         );
@@ -569,6 +574,7 @@ proptest! {
     #[test]
     fn prop_memory_pressure_increases_snapshot(rss in 0.65..=0.95_f64) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -586,7 +592,7 @@ proptest! {
         }
 
         prop_assert!(
-            tuner.params().snapshot_interval_secs >= initial_snap,
+            tuner.params().snapshot_interval_secs > initial_snap,
             "high memory ({}) should increase snapshot interval",
             rss
         );
@@ -596,6 +602,7 @@ proptest! {
     #[test]
     fn prop_latency_pressure_increases_poll(latency in 15.0..=80.0_f64) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -613,7 +620,7 @@ proptest! {
         }
 
         prop_assert!(
-            tuner.params().poll_interval_ms >= initial_poll,
+            tuner.params().poll_interval_ms > initial_poll,
             "high latency ({}) should increase poll interval",
             latency
         );
@@ -623,6 +630,7 @@ proptest! {
     #[test]
     fn prop_cpu_pressure_reduces_pool(cpu in 0.45..=0.95_f64) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -640,7 +648,7 @@ proptest! {
         }
 
         prop_assert!(
-            tuner.params().pool_size <= initial_pool,
+            tuner.params().pool_size < initial_pool,
             "high CPU ({}) should reduce pool: initial={}, current={}",
             cpu, initial_pool, tuner.params().pool_size
         );
@@ -658,6 +666,7 @@ proptest! {
     #[test]
     fn prop_convergence_constant_input(metrics in arb_metrics()) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -740,6 +749,7 @@ proptest! {
     #[test]
     fn prop_adjustments_logged_under_pressure(rss in 0.7..=0.95_f64) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -768,6 +778,7 @@ proptest! {
         metrics in prop::collection::vec(arb_metrics(), 5..=20),
     ) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             ..AutoTuneConfig::default()
         };
@@ -796,6 +807,7 @@ proptest! {
     #[test]
     fn prop_monotonic_memory_scrollback_decrease(base_rss in 0.55..=0.75_f64) {
         let config = AutoTuneConfig {
+            enabled: true,
             hysteresis_ticks: 1,
             max_change_per_tick: 0.1,
             ..AutoTuneConfig::default()
@@ -904,10 +916,16 @@ proptest! {
         prop_assert_eq!(tuner.tick_count(), 0);
     }
 
-    /// Default AutoTuneConfig has enabled=true.
+    /// Tuning requires opt-in; default ticks must not adjust parameters.
     #[test]
-    fn prop_default_config_enabled(_dummy in 0..1_u8) {
+    fn prop_default_config_disabled(metrics in prop::collection::vec(arb_metrics(), 1..=20)) {
         let config = AutoTuneConfig::default();
-        prop_assert!(config.enabled, "default config should be enabled");
+        prop_assert!(!config.enabled, "default config should be disabled");
+        let mut tuner = AutoTuner::new(config);
+        let initial = tuner.params().clone();
+        for metric in metrics {
+            prop_assert_eq!(tuner.tick(&metric), initial.clone());
+        }
+        prop_assert!(tuner.adjustments().is_empty());
     }
 }

@@ -798,6 +798,37 @@ pub fn secret_pattern_names() -> impl Iterator<Item = &'static str> {
     SECRET_PATTERNS.iter().map(|pattern| pattern.name)
 }
 
+/// Fingerprint the ordered detection expressions and replacement policy.
+/// Family names alone cannot identify a catalog after a regex correction.
+#[must_use]
+pub fn secret_catalog_version() -> String {
+    catalog_fingerprint(
+        SECRET_PATTERNS
+            .iter()
+            .map(|pattern| (pattern.name, pattern.regex.as_str())),
+    )
+}
+
+fn catalog_fingerprint<'a>(patterns: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"frankenterm-secret-catalog-v2\0sequential-regex-replace-all\0");
+    for field in [REDACTED_MARKER, "[REDACTED:{family}]"] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    for pattern in patterns {
+        for field in <[&str; 2]>::from(pattern) {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+    }
+    format!(
+        "live-secret-patterns-v2-sha256:{}",
+        hex::encode(hash.finalize())
+    )
+}
+
 /// Secret redactor for removing sensitive information from text.
 ///
 /// This redactor uses a conservative set of regex patterns to identify and
@@ -815,7 +846,8 @@ pub fn secret_pattern_names() -> impl Iterator<Item = &'static str> {
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::redactor::Redactor;
+// This source is compiled by both the core and standalone redactor crates.
+#[doc = concat!("use ", env!("CARGO_CRATE_NAME"), "::redactor::Redactor;")]
 ///
 /// let redactor = Redactor::new();
 /// let input = "My API key is sk-abc123456789012345678901234567890123456789012345678901";
@@ -1929,6 +1961,31 @@ impl RedactionResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_identity_changes_with_expression_order_and_family() {
+        let original = super::catalog_fingerprint([("key", "a+"), ("token", "b+")]);
+        assert_ne!(
+            original,
+            super::catalog_fingerprint([("key", "a{2,}"), ("token", "b+")])
+        );
+        assert_ne!(
+            original,
+            super::catalog_fingerprint([("token", "b+"), ("key", "a+")])
+        );
+        assert_ne!(
+            original,
+            super::catalog_fingerprint([("renamed", "a+"), ("token", "b+")])
+        );
+        assert_eq!(
+            original,
+            super::catalog_fingerprint([("key", "a+"), ("token", "b+")])
+        );
+        println!(
+            "REDACTION_CATALOG_VERSION={}",
+            super::secret_catalog_version()
+        );
+    }
+
     use super::*;
     use proptest::prelude::*;
 

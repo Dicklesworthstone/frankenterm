@@ -3,6 +3,7 @@ name = "frankenterm-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+autobins = false
 
 [package.metadata]
 cargo-fuzz = true
@@ -51,31 +52,39 @@ tempfile = "3.27.0"
 # ft-ul4vi: jsonschema fuzz target. Same version pinned in
 # crates/frankenterm-core dev-deps so the harness exercises the
 # crate the conformance gates use.
-jsonschema = { version = "0.53.0", default-features = false }
+jsonschema = { version = "0.55.0", default-features = false }
 # ft-s96ej: ft argv fuzz target. Same version pinned in the workspace
 # so the parser surface matches what `ft` itself uses at runtime.
 clap = { version = "4.6.1", features = ["derive", "env"] }
 
 [[bin]]
 name = "fts_query"
+test = false
+bench = false
 path = "fuzz_targets/fts_query.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "osc_marker_parser"
+test = false
+bench = false
 path = "fuzz_targets/osc_marker_parser.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_pack_parser"
+test = false
+bench = false
 path = "fuzz_targets/pattern_pack_parser.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_pack_toml"
+test = false
+bench = false
 path = "fuzz_targets/pattern_pack_toml.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
@@ -87,42 +96,56 @@ required-features = ["core-fuzz-targets"]
 # gate as the production loader, minus the filesystem read.
 [[bin]]
 name = "pattern_pack_loader"
+test = false
+bench = false
 path = "fuzz_targets/pattern_pack_loader.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_template_interpolation"
+test = false
+bench = false
 path = "fuzz_targets/pattern_template_interpolation.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_detect_with_context_streaming"
+test = false
+bench = false
 path = "fuzz_targets/pattern_detect_with_context_streaming.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_regex_match"
+test = false
+bench = false
 path = "fuzz_targets/pattern_regex_match.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_matcher_fuzz"
+test = false
+bench = false
 path = "fuzz_targets/pattern_matcher_fuzz.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "resize_scheduler_lifecycle"
+test = false
+bench = false
 path = "fuzz_targets/resize_scheduler_lifecycle.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "config_toml_parser"
+test = false
+bench = false
 path = "fuzz_targets/config_toml_parser.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
@@ -132,84 +155,112 @@ required-features = ["core-fuzz-targets"]
 # harnesses can compile without enabling Lua/WASM engines.
 [[bin]]
 name = "extension_manifest"
+test = false
+bench = false
 path = "fuzz_targets/extension_manifest.rs"
 doc = false
 required-features = ["scripting-fuzz-targets"]
 
 [[bin]]
 name = "ftx_package"
+test = false
+bench = false
 path = "fuzz_targets/ftx_package.rs"
 doc = false
 required-features = ["scripting-fuzz-targets"]
 
 [[bin]]
 name = "ntm_importer_json"
+test = false
+bench = false
 path = "fuzz_targets/ntm_importer_json.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "recorder_event_json"
+test = false
+bench = false
 path = "fuzz_targets/recorder_event_json.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "redactor_no_leak"
+test = false
+bench = false
 path = "fuzz_targets/redactor_no_leak.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "native_events_wire"
+test = false
+bench = false
 path = "fuzz_targets/native_events_wire.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "simd_scan"
+test = false
+bench = false
 path = "fuzz_targets/simd_scan.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "tuning_config_toml"
+test = false
+bench = false
 path = "fuzz_targets/tuning_config_toml.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "workflow_yaml_descriptor"
+test = false
+bench = false
 path = "fuzz_targets/workflow_yaml_descriptor.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "robot_envelope_json"
+test = false
+bench = false
 path = "fuzz_targets/robot_envelope_json.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "string_parsers"
+test = false
+bench = false
 path = "fuzz_targets/string_parsers.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "tmux_control_protocol"
+test = false
+bench = false
 path = "fuzz_targets/tmux_control_protocol.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "rch_admission_cargo"
+test = false
+bench = false
 path = "fuzz_targets/rch_admission_cargo.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "snapshot_deserialize"
+test = false
+bench = false
 path = "fuzz_targets/snapshot_deserialize.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
@@ -219,84 +270,114 @@ required-features = ["core-fuzz-targets"]
 # frames plus structured compressed payloads and corrupted batch headers.
 [[bin]]
 name = "byte_compression_frames"
+test = false
+bench = false
 path = "fuzz_targets/byte_compression_frames.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pdu_stream_decode"
+test = false
+bench = false
 path = "fuzz_targets/pdu_stream_decode.rs"
 doc = false
 required-features = ["codec-fuzz-targets"]
 
 [[bin]]
 name = "pdu_try_read_chunked"
+test = false
+bench = false
 path = "fuzz_targets/pdu_try_read_chunked.rs"
 doc = false
 required-features = ["codec-fuzz-targets"]
 
 [[bin]]
 name = "bounded_varbincode"
+test = false
+bench = false
 path = "fuzz_targets/bounded_varbincode.rs"
 doc = false
 required-features = ["codec-fuzz-targets"]
 
 [[bin]]
 name = "pdu_roundtrip"
+test = false
+bench = false
 path = "fuzz_targets/pdu_roundtrip.rs"
 doc = false
 required-features = ["codec-fuzz-targets"]
 
 [[bin]]
 name = "mux_sessionhandler_process_one"
+test = false
+bench = false
 path = "fuzz_targets/mux_sessionhandler_process_one.rs"
 doc = false
 required-features = ["mux-server-fuzz-targets"]
 
 [[bin]]
 name = "termwiz_csi_parser"
+test = false
+bench = false
 path = "fuzz_targets/termwiz_csi_parser.rs"
 doc = false
 
 [[bin]]
 name = "toon_decode"
+test = false
+bench = false
 path = "fuzz_targets/toon_decode.rs"
 doc = false
 
 [[bin]]
 name = "toon_parse"
+test = false
+bench = false
 path = "fuzz_targets/toon_parse.rs"
 doc = false
 
 [[bin]]
 name = "toon_encode_decode"
+test = false
+bench = false
 path = "fuzz_targets/toon_encode_decode.rs"
 doc = false
 
 [[bin]]
 name = "workflow_roundtrip"
+test = false
+bench = false
 path = "fuzz_targets/workflow_roundtrip.rs"
 doc = false
 
 [[bin]]
 name = "pattern_pack_roundtrip"
+test = false
+bench = false
 path = "fuzz_targets/pattern_pack_roundtrip.rs"
 doc = false
 
 [[bin]]
 name = "protocol_recovery_state"
+test = false
+bench = false
 path = "fuzz_targets/protocol_recovery_state.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "ipc_auth_envelope"
+test = false
+bench = false
 path = "fuzz_targets/ipc_auth_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "wire_envelope"
+test = false
+bench = false
 path = "fuzz_targets/wire_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
@@ -313,6 +394,8 @@ required-features = ["core-fuzz-targets"]
 # conformance-gate boundary).
 [[bin]]
 name = "jsonschema_validator"
+test = false
+bench = false
 path = "fuzz_targets/jsonschema_validator.rs"
 doc = false
 
@@ -321,86 +404,116 @@ doc = false
 # harness doesn't depend on the binary crate's private Cli enum.
 [[bin]]
 name = "ft_argv"
+test = false
+bench = false
 path = "fuzz_targets/ft_argv.rs"
 doc = false
 
 [[bin]]
 name = "escape_parser_raw"
+test = false
+bench = false
 path = "fuzz_targets/escape_parser_raw.rs"
 doc = false
 
 [[bin]]
 name = "termwiz_input_parser"
+test = false
+bench = false
 path = "fuzz_targets/termwiz_input_parser.rs"
 doc = false
 
 [[bin]]
 name = "replay_recording_from_bytes"
+test = false
+bench = false
 path = "fuzz_targets/replay_recording_from_bytes.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "replay_recording_structured"
+test = false
+bench = false
 path = "fuzz_targets/replay_recording_structured.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "replay_frame_decode"
+test = false
+bench = false
 path = "fuzz_targets/replay_frame_decode.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "replay_control_toml"
+test = false
+bench = false
 path = "fuzz_targets/replay_control_toml.rs"
 doc = false
 required-features = ["core-replay-fuzz-targets"]
 
 [[bin]]
 name = "ftvi_index_from_bytes"
+test = false
+bench = false
 path = "fuzz_targets/ftvi_index_from_bytes.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "term_advance_bytes"
+test = false
+bench = false
 path = "fuzz_targets/term_advance_bytes.rs"
 doc = false
 
 [[bin]]
 name = "mcp_request_params"
+test = false
+bench = false
 path = "fuzz_targets/mcp_request_params.rs"
 doc = false
 required-features = ["mcp-fuzz-targets"]
 
 [[bin]]
 name = "contract_context_horizon"
+test = false
+bench = false
 path = "contract_context_horizon/fuzz_target.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "contract_capture_fairness"
+test = false
+bench = false
 path = "contract_capture_fairness/fuzz_target.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "contract_herd_wave"
+test = false
+bench = false
 path = "contract_herd_wave/fuzz_target.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "contract_blocker_radar"
+test = false
+bench = false
 path = "contract_blocker_radar/fuzz_target.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "contract_resource_cockpit"
+test = false
+bench = false
 path = "contract_resource_cockpit/fuzz_target.rs"
 doc = false
 required-features = ["core-fuzz-targets"]

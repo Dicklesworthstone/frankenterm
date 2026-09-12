@@ -89,8 +89,8 @@ use crate::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
 };
 use crate::robot_types::{
-    SubmitGuaranteeLevel, WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData,
-    WorkflowStatusListData, WorkflowStepLog,
+    SubmitGuaranteeLevel, WorkflowActionPlan, WorkflowStatusDetailData, WorkflowStatusListData,
+    WorkflowStepLog,
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::{
@@ -1046,6 +1046,7 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// follow-up; this fix removes the misleading dead end.
 fn mcp_authorize_mcp_mutation(
     config: &Config,
+    audit_db_path: Option<&std::path::Path>,
     policy_rate_limiter: &SharedRateLimiter,
     summary: &str,
     command_text: &str,
@@ -1080,6 +1081,7 @@ fn mcp_authorize_mcp_mutation(
         );
         persist_mcp_policy_denial(
             config,
+            audit_db_path,
             summary,
             command_text,
             &reason,
@@ -1120,6 +1122,7 @@ fn mcp_authorize_mcp_mutation(
         );
         persist_mcp_policy_denial(
             config,
+            audit_db_path,
             summary,
             command_text,
             &reason,
@@ -1142,7 +1145,8 @@ fn mcp_authorize_mcp_mutation(
 }
 
 /// ft-rsqap: best-effort audit-table write for a denied/require-approval
-/// MCP mutation. Resolves the workspace db_path from `config`, builds a
+/// MCP mutation. Uses the tool's explicit database when supplied, otherwise
+/// resolves the workspace db_path from `config`, builds a
 /// `PolicyDeniedAuditRecord`, and calls the sync blocking helper in
 /// `storage.rs`. Every failure (layout resolution, connection open, INSERT)
 /// logs a secondary `tracing::warn!` and returns — the caller's policy-
@@ -1150,6 +1154,7 @@ fn mcp_authorize_mcp_mutation(
 /// failure.
 fn persist_mcp_policy_denial(
     config: &Config,
+    audit_db_path: Option<&std::path::Path>,
     tool_name: &str,
     command_text: &str,
     reason: &str,
@@ -1157,17 +1162,20 @@ fn persist_mcp_policy_denial(
     decision: &str,
     reason_code: &str,
 ) {
-    let layout = match config.workspace_layout(None) {
-        Ok(layout) => layout,
-        Err(_error) => {
-            tracing::warn!(
-                target: "ft::security::policy",
-                tool = %tool_name,
-                error_class = "policy_denial_workspace_layout_unavailable",
-                "workspace_layout unavailable; skipping policy_denied_audit write"
-            );
-            return;
-        }
+    let db_path = match audit_db_path {
+        Some(path) => path.to_path_buf(),
+        None => match config.workspace_layout(None) {
+            Ok(layout) => layout.db_path,
+            Err(_error) => {
+                tracing::warn!(
+                    target: "ft::security::policy",
+                    tool = %tool_name,
+                    error_class = "policy_denial_workspace_layout_unavailable",
+                    "workspace_layout unavailable; skipping policy_denied_audit write"
+                );
+                return;
+            }
+        },
     };
     let record = crate::storage::PolicyDeniedAuditRecord {
         id: 0,
@@ -1181,7 +1189,7 @@ fn persist_mcp_policy_denial(
         decision: decision.to_string(),
     };
     if let Err(_error) =
-        crate::storage::record_policy_denial_audit_blocking(layout.db_path.as_path(), &record)
+        crate::storage::record_policy_denial_audit_blocking(db_path.as_path(), &record)
     {
         tracing::warn!(
             target: "ft::security::policy",
@@ -4320,6 +4328,7 @@ struct McpAwaitEventDeliveryCompletionJob {
 
 fn try_enqueue_mcp_await_event_delivery_completion(
     sender: &crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
+    stats: &McpAwaitEventDeliveryCompletionStats,
     leases: Vec<EventDeliveryLease>,
     outcome: FrameworkResponseDeliveryOutcome,
 ) -> bool {
@@ -4331,9 +4340,19 @@ fn try_enqueue_mcp_await_event_delivery_completion(
         outcome,
         enqueued_at: Instant::now(),
     };
+    // Publish before enqueue: a fast worker may finish before try_send returns.
+    if !try_increment_atomic_below(&stats.completion_jobs_enqueued, u64::MAX) {
+        tracing::error!(
+            "MCP completion accounting exhausted; rejecting admission and retaining lease expiry authority"
+        );
+        return false;
+    }
     match sender.try_send(job) {
         Ok(()) => true,
         Err(crossbeam::channel::TrySendError::Full(job)) => {
+            stats
+                .completion_jobs_enqueued
+                .fetch_sub(1, Ordering::Release);
             tracing::error!(
                 delivery_count = job.leases.len(),
                 ?job.outcome,
@@ -4343,6 +4362,9 @@ fn try_enqueue_mcp_await_event_delivery_completion(
             false
         }
         Err(crossbeam::channel::TrySendError::Disconnected(job)) => {
+            stats
+                .completion_jobs_enqueued
+                .fetch_sub(1, Ordering::Release);
             tracing::error!(
                 delivery_count = job.leases.len(),
                 ?job.outcome,
@@ -4575,6 +4597,8 @@ type McpAwaitEventDeliveryCompletionHandler =
 
 #[derive(Default)]
 struct McpAwaitEventDeliveryCompletionStats {
+    completion_jobs_enqueued: AtomicU64,
+    completion_jobs_settled: AtomicU64,
     worker_starts: AtomicU64,
     worker_stops: AtomicU64,
     worker_handoffs: AtomicU64,
@@ -4638,6 +4662,22 @@ struct McpAwaitEventDeliveryCompletionStats {
 }
 
 impl McpAwaitEventDeliveryCompletionStats {
+    fn record_settled_jobs(&self, count: u64) {
+        if self
+            .completion_jobs_settled
+            .try_update(Ordering::Release, Ordering::Relaxed, |current| {
+                current.checked_add(count)
+            })
+            .is_err()
+        {
+            // Keep the old value so teardown still observes pending work;
+            // wrapping or saturating would manufacture a drained obligation.
+            tracing::error!(
+                "MCP completion settlement accounting exhausted; retaining bounded shutdown fallback"
+            );
+        }
+    }
+
     fn record_completion_batch(&self, job_count: usize, lease_count: usize) {
         self.completion_batches.fetch_add(1, Ordering::Relaxed);
         self.completion_jobs.fetch_add(
@@ -4721,6 +4761,8 @@ impl McpAwaitEventDeliveryCompletionStats {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct McpAwaitEventDeliveryCompletionStatsSnapshot {
+    completion_jobs_enqueued: u64,
+    completion_jobs_settled: u64,
     worker_starts: u64,
     worker_stops: u64,
     worker_handoffs: u64,
@@ -4785,6 +4827,8 @@ struct McpAwaitEventDeliveryCompletionStatsSnapshot {
 impl McpAwaitEventDeliveryCompletionStats {
     fn snapshot(&self) -> McpAwaitEventDeliveryCompletionStatsSnapshot {
         McpAwaitEventDeliveryCompletionStatsSnapshot {
+            completion_jobs_enqueued: self.completion_jobs_enqueued.load(Ordering::Acquire),
+            completion_jobs_settled: self.completion_jobs_settled.load(Ordering::Acquire),
             worker_starts: self.worker_starts.load(Ordering::Relaxed),
             worker_stops: self.worker_stops.load(Ordering::Acquire),
             worker_handoffs: self.worker_handoffs.load(Ordering::Relaxed),
@@ -5173,6 +5217,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                                         "MCP event-delivery completion handler panicked; lease expiry remains authoritative"
                                     );
                                 }
+                                worker_stats.record_settled_jobs(1);
                                 McpAwaitEventCompletionWorkerPhase::ReadyIdle
                                     .store(&worker_phase);
                             }
@@ -5398,7 +5443,12 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             );
             return false;
         }
-        let queued = try_enqueue_mcp_await_event_delivery_completion(&self.sender, leases, outcome);
+        let queued = try_enqueue_mcp_await_event_delivery_completion(
+            &self.sender,
+            &self.stats,
+            leases,
+            outcome,
+        );
         drop(lifecycle_guard);
         if queued {
             self.wake_workers();
@@ -5592,6 +5642,7 @@ fn reclaim_mcp_await_event_request_reply(
     }
     if try_enqueue_mcp_await_event_delivery_completion(
         completion_sender,
+        stats,
         delivery_leases,
         FrameworkResponseDeliveryOutcome::Failed,
     ) {
@@ -6208,6 +6259,9 @@ fn run_mcp_await_event_delivery_completion_worker(
                     completion_stats
                         .completion_attempts_finished
                         .fetch_add(1, Ordering::Release);
+                    completion_stats.record_settled_jobs(
+                        u64::try_from(job_count).unwrap_or(u64::MAX),
+                    );
                     let _ = completion_finished_tx.send(
                         McpAwaitEventServiceTaskFinished::Completion {
                             storage_epoch: completion_epoch,
@@ -6273,9 +6327,27 @@ fn run_mcp_await_event_delivery_completion_worker(
 /// observable and regression-testable.
 impl Drop for McpAwaitEventDeliveryCompletionExecutor {
     fn drop(&mut self) {
+        let shutdown_started = Instant::now();
+        // A failed transport write enqueues lease release immediately before
+        // server teardown. Give already-admitted completion obligations half
+        // the existing bounded grace before cancellation; otherwise teardown
+        // races the worker and unnecessarily leaves healthy leases until TTL.
+        // Settlement counts span queue pop, batching, and the actual storage
+        // attempt, unlike queue emptiness or a transient worker phase.
+        let completion_grace = MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE / 2;
+        self.wake_workers();
+        while self.stats.completion_jobs_settled.load(Ordering::Acquire)
+            < self.stats.completion_jobs_enqueued.load(Ordering::Acquire)
+            && shutdown_started.elapsed() < completion_grace
+        {
+            std::thread::park_timeout(
+                completion_grace
+                    .saturating_sub(shutdown_started.elapsed())
+                    .min(MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL),
+            );
+        }
         self.begin_shutdown();
         let queued_requests_at_shutdown = self.request_sender.len();
-        let shutdown_started = Instant::now();
         for worker in self.workers.drain(..) {
             while !worker.is_finished() {
                 let remaining = MCP_AWAIT_EVENT_COMPLETION_EXECUTOR_DROP_GRACE
@@ -8657,7 +8729,14 @@ impl ToolHandler for WaAwaitEventTool {
                 // the request-start cursor can replay those rules on resume.
                 let pending_finalize = satisfied && !delivery_leases.is_empty();
                 let candidate_cursor = if pending_finalize {
-                    mcp_await_event_safe_cursor(scan_after_id, &blocked_events)
+                    // A retried early hole may complete the conditions after
+                    // a later event was already leased. Pending delivery
+                    // authority comes from owned leases, not the transient
+                    // scanner's exact completing-event position.
+                    mcp_await_event_safe_cursor(
+                        delivery_leases.iter().map(EventDeliveryLease::event_id).max(),
+                        &blocked_events,
+                    )
                 } else {
                     None
                 };
@@ -9950,6 +10029,39 @@ impl ToolHandler for WaWorkflowRunTool {
             }
         };
 
+        if params.dry_run {
+            // A preview is read-only and is not an authorization receipt. Share
+            // the CLI's eligibility report, including unknown/disabled workflow
+            // findings, without opening storage or issuing approval tokens.
+            let runtime = CompatRuntimeBuilder::current_thread()
+                .build()
+                .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
+            let pane_info = runtime.block_on(async {
+                let wezterm = crate::wezterm::wezterm_handle_from_config(self.config.as_ref());
+                wezterm.get_pane(params.pane_id).await.ok()
+            });
+            let workflows = crate::mcp::builtin_workflows(self.config.as_ref());
+            let workflow = workflows
+                .iter()
+                .find(|workflow| workflow.name() == params.name);
+            let enabled = self.config.workflows.enabled.is_empty()
+                || self
+                    .config
+                    .workflows
+                    .enabled
+                    .iter()
+                    .any(|name| name == &params.name);
+            let report = crate::dry_run::workflow_preview(
+                &crate::dry_run::CommandContext::new("workflow run", true),
+                &params.name,
+                params.pane_id,
+                pane_info.as_ref(),
+                workflow.map(|workflow| workflow.as_ref()),
+                enabled,
+            );
+            return envelope_to_content(McpEnvelope::success(report.redacted(), elapsed_ms(start)));
+        }
+
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
@@ -10003,15 +10115,13 @@ impl ToolHandler for WaWorkflowRunTool {
                     input = input.with_pane_cwd(cwd.clone());
                 }
 
-                let decision =
-                    authorize_mcp_policy_call(&mut policy_engine, &input, params.dry_run);
+                let decision = authorize_mcp_policy_call(&mut policy_engine, &input, false);
                 if decision.is_denied() {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Workflow denied by policy")
                         .to_string();
                     // ft-mw1zb: persist to policy_denied_audit alongside tracing.
-                    if !params.dry_run {
-                        persist_mcp_policy_denial_async(
+                    persist_mcp_policy_denial_async(
                             storage.as_ref(),
                             "wa.workflow_run",
                             &summary,
@@ -10021,7 +10131,6 @@ impl ToolHandler for WaWorkflowRunTool {
                             crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                         )
                         .await;
-                    }
                     return Err(McpToolError::new(
                         MCP_ERR_POLICY,
                         reason,
@@ -10029,19 +10138,6 @@ impl ToolHandler for WaWorkflowRunTool {
                     ));
                 }
                 if decision.requires_approval() {
-                    if params.dry_run {
-                        let reason = policy_reason(&decision)
-                            .unwrap_or("Workflow requires approval")
-                            .to_string();
-                        return Err(McpToolError::new(
-                            MCP_ERR_POLICY,
-                            reason,
-                            Some(
-                                "Dry-run preview only: rerun without dry_run to request an allow-once approval token."
-                                    .to_string(),
-                            ),
-                        ));
-                    }
                     let workspace_id =
                         resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
                     let store = ApprovalStore::new(
@@ -10069,20 +10165,6 @@ impl ToolHandler for WaWorkflowRunTool {
                     )
                     .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
-                }
-
-                if params.dry_run {
-                    return Ok(McpWorkflowRunData {
-                        workflow_name: params.name,
-                        pane_id: params.pane_id,
-                        execution_id: None,
-                        status: "dry_run".to_string(),
-                        message: Some("Dry-run: workflow not executed".to_string()),
-                        result: None,
-                        steps_executed: None,
-                        step_index: None,
-                        elapsed_ms: Some(elapsed_ms(start)),
-                    });
                 }
 
                 let runner = workflow_assembly.runner();
@@ -10330,23 +10412,6 @@ fn workflow_status_data(
     }
 }
 
-fn workflow_status_list_item(record: crate::storage::WorkflowRecord) -> WorkflowStatusData {
-    WorkflowStatusData {
-        execution_id: record.id,
-        workflow_name: record.workflow_name,
-        pane_id: Some(record.pane_id),
-        trigger_event_id: record.trigger_event_id,
-        status: record.status,
-        message: record.error,
-        started_at: Some(record.started_at),
-        completed_at: record.completed_at,
-        current_step: Some(record.current_step),
-        total_steps: None,
-        plan: None,
-        created_at: Some(record.started_at),
-    }
-}
-
 impl ToolHandler for WaWorkflowStatusTool {
     fn definition(&self) -> Tool {
         Tool {
@@ -10518,8 +10583,10 @@ impl ToolHandler for WaWorkflowStatusTool {
                     records.truncate(limit);
                 }
 
-                let executions: Vec<WorkflowStatusData> =
-                    records.into_iter().map(workflow_status_list_item).collect();
+                let executions: Vec<WorkflowStatusDetailData> = records
+                    .into_iter()
+                    .map(|record| workflow_status_data(record, None, None, None, false))
+                    .collect();
                 let data = WorkflowStatusListData {
                     count: executions.len(),
                     executions,
@@ -10801,6 +10868,7 @@ impl ToolHandler for WaTxRunTool {
         // ft-x86z2: policy gate before any side effect (contract load, tx execute).
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.tx_run",
             "tx.run",
@@ -11123,6 +11191,7 @@ impl ToolHandler for WaTxRollbackTool {
         // ft-x86z2: policy gate before any side effect (contract load, compensation).
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.tx_rollback",
             "tx.rollback",
@@ -13063,6 +13132,7 @@ impl ToolHandler for WaMissionPauseTool {
         // ft-x86z2: policy gate before mission load + state transition.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.mission_pause",
             "mission.pause",
@@ -13217,6 +13287,7 @@ impl ToolHandler for WaMissionResumeTool {
         // ft-x86z2: policy gate before mission load + state transition.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.mission_resume",
             "mission.resume",
@@ -13381,6 +13452,7 @@ impl ToolHandler for WaMissionAbortTool {
         // ft-x86z2: policy gate before mission load + abort decision.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            None,
             &self.policy_rate_limiter,
             "wa.mission_abort",
             "mission.abort",
@@ -13577,6 +13649,7 @@ impl ToolHandler for WaEventsAnnotateTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
             "wa.events_annotate",
             "event.annotate",
@@ -13805,6 +13878,7 @@ impl ToolHandler for WaEventsTriageTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
             "wa.events_triage",
             "event.triage",
@@ -14045,6 +14119,7 @@ impl ToolHandler for WaEventsLabelTool {
         if is_mutation {
             if let Some(deny) = mcp_authorize_mcp_mutation(
                 self.config.as_ref(),
+                Some(self.db_path.as_ref().as_path()),
                 &self.policy_rate_limiter,
                 "wa.events_label",
                 "event.label",
@@ -16439,7 +16514,7 @@ mod tests {
             .expect("production await service must exist")
             .stats_for_test();
 
-        for _ in 0..4 {
+        for completed in 1..=4 {
             let envelope = parse_json_content(
                 tool.call(
                     &test_mcp_context(),
@@ -16455,6 +16530,12 @@ mod tests {
                 envelope["data"]["bootstrap_state"],
                 "storage_tail_checkpoint"
             );
+            // Replies precede terminal bookkeeping by design. Wait for the
+            // coordinator to settle this request before asserting strictly
+            // sequential lifecycle reuse and a high-water mark of one.
+            wait_for_completion_stats(&stats, "sequential request settlement", |snapshot| {
+                snapshot.request_jobs_finished == completed && snapshot.active_requests == 0
+            });
         }
 
         let running = wait_for_completion_stats(
@@ -16589,6 +16670,92 @@ mod tests {
             shared_p95_us < baseline_p95_us,
             "shared p95 must beat per-request lifecycle baseline: shared={shared_p95_us}us baseline={baseline_p95_us}us"
         );
+    }
+
+    #[test]
+    fn await_event_completion_accounting_refuses_wraparound() {
+        let stats = super::McpAwaitEventDeliveryCompletionStats::default();
+        let (sender, receiver) = crossbeam::channel::bounded(1);
+        stats
+            .completion_jobs_enqueued
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .completion_jobs_settled
+            .store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        assert!(!super::try_enqueue_mcp_await_event_delivery_completion(
+            &sender,
+            &stats,
+            vec![crate::storage::EventDeliveryLease::new(
+                1,
+                "max-lease".into(),
+                0,
+                i64::MAX
+            )],
+            super::FrameworkResponseDeliveryOutcome::Failed,
+        ));
+        assert!(receiver.is_empty());
+        stats.record_settled_jobs(2);
+        assert_eq!(stats.snapshot().completion_jobs_enqueued, u64::MAX);
+        assert_eq!(stats.snapshot().completion_jobs_settled, u64::MAX - 1);
+        stats.record_settled_jobs(1);
+        assert_eq!(stats.snapshot().completion_jobs_settled, u64::MAX);
+    }
+
+    #[test]
+    fn await_event_completion_drop_drains_already_queued_obligations() {
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker_release = Arc::clone(&release);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_observed = Arc::clone(&observed);
+        let handler: super::McpAwaitEventDeliveryCompletionHandler = Arc::new(move |job| {
+            if job.leases[0].event_id() == 1 {
+                started_tx.send(()).unwrap();
+                worker_release.wait();
+            }
+            worker_observed
+                .lock()
+                .unwrap()
+                .push((job.leases[0].event_id(), job.outcome));
+        });
+        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
+            .expect("completion service");
+        let stats = executor.stats_for_test();
+        for (event_id, outcome) in [
+            (
+                1,
+                super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
+            ),
+            (2, super::FrameworkResponseDeliveryOutcome::Failed),
+        ] {
+            assert!(executor.try_submit(
+                vec![crate::storage::EventDeliveryLease::new(
+                    event_id,
+                    format!("drop-lease-{event_id}"),
+                    0,
+                    i64::MAX,
+                )],
+                outcome
+            ));
+            if event_id == 1 {
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            release.wait();
+        });
+        drop(executor);
+        releaser.join().unwrap();
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            2,
+            "queued failed delivery must reach cleanup before shutdown"
+        );
+        assert_eq!(stats.snapshot().completion_jobs_enqueued, 2);
+        assert_eq!(stats.snapshot().completion_jobs_settled, 2);
     }
 
     #[test]
@@ -16811,6 +16978,7 @@ mod tests {
         });
         assert!(super::try_enqueue_mcp_await_event_delivery_completion(
             &sender,
+            &stats,
             vec![
                 crate::storage::EventDeliveryLease::new(
                     55,
@@ -17363,6 +17531,7 @@ mod tests {
 
         let mut cancelled_requests = 0_usize;
         let mut rejected_requests = 0_usize;
+        let mut waiter_cancellations = 0_u64;
         for caller in callers {
             let (request_result, request_leases) = caller
                 .join()
@@ -17372,9 +17541,19 @@ mod tests {
             let error =
                 request_result.expect_err("shutdown-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:shutdown-") {
+                assert_eq!(error.code, MCP_ERR_CONFIG);
+                cancelled_requests = cancelled_requests.saturating_add(1);
+            } else if error.code == MCP_ERR_TIMEOUT {
+                // Shutdown cancels the same request Cx observed by both the
+                // task and its synchronous response waiter. If the waiter
+                // checkpoint wins, execute_request returns the canonical
+                // cancellation envelope instead of the fixture task's label.
+                assert_eq!(error.message, "Request timed out or was cancelled");
+                waiter_cancellations = waiter_cancellations.saturating_add(1);
                 cancelled_requests = cancelled_requests.saturating_add(1);
             } else {
-                assert!(error.message.contains("shutting down"));
+                assert_eq!(error.code, MCP_ERR_CONFIG);
+                assert!(error.message.contains("shutting down"), "{error:?}");
                 rejected_requests = rejected_requests.saturating_add(1);
             }
         }
@@ -17392,6 +17571,7 @@ mod tests {
             u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
         );
         assert_eq!(stopped.request_jobs_rejected_for_shutdown, 1);
+        assert_eq!(stopped.request_waiter_cancellations, waiter_cancellations);
         assert_eq!(stopped.request_jobs_cancelled_for_epoch, 0);
         assert_eq!(stopped.request_jobs_rejected_for_epoch, 0);
         assert_eq!(stopped.request_admission_rejections_unready, 1);
@@ -18482,6 +18662,76 @@ mod tests {
             assert!(storage.release_event_delivery(&lease).await.unwrap());
             storage.shutdown().await.unwrap();
         });
+    }
+
+    #[test]
+    fn await_event_page_deadline_preserves_unclaimed_row_for_original_cursor() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let mut tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::clone(&response_delivery),
+        );
+        tool.wait_for_delivery_completion_ready_for_test();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_in_hook = Arc::clone(&observed);
+        tool = tool.with_iteration_observer(Arc::new(move |phase, id| {
+            if phase == super::McpAwaitEventIterationPhase::PageScan && id == event_id {
+                observed_in_hook.store(true, std::sync::atomic::Ordering::Release);
+                // A completed read does not authorize a claim after the request
+                // deadline. Force that boundary independently of worker load.
+                std::thread::sleep(std::time::Duration::from_millis(1_100));
+            }
+        }));
+        let mut arguments = serde_json::json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "cursor_epoch": event_cursor_epoch(db_path.as_ref().as_path()),
+            "cursor_scope": await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true),
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        });
+        let expired = parse_json_content(
+            tool.call(&test_mcp_context(), arguments.clone())
+                .expect("deadline result"),
+        );
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(expired["ok"], true, "{expired}");
+        assert_eq!(expired["data"]["satisfied"], false);
+        assert_eq!(expired["data"]["timed_out"], true);
+        assert_eq!(expired["data"]["events"], serde_json::json!([]));
+        assert_eq!(expired["data"]["final_cursor"], 0);
+        assert_eq!(expired["data"]["pending_finalize"], false);
+        assert!(expired["data"]["candidate_cursor"].is_null());
+        let connection = rusqlite::Connection::open(db_path.as_ref()).unwrap();
+        let untouched: bool = connection.query_row(
+            "SELECT handled_at IS NULL AND delivery_lease_token IS NULL FROM events WHERE id = ?1",
+            [event_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(
+            untouched,
+            "deadline-expired page must not reserve or handle its row"
+        );
+
+        tool.iteration_observer = None;
+        // The positive control tests retained discoverability, not latency.
+        arguments["timeout_secs"] = serde_json::json!(5);
+        let retried = parse_json_content(
+            tool.call(&test_mcp_context(), arguments)
+                .expect("retry original cursor"),
+        );
+        assert_eq!(retried["ok"], true, "{retried}");
+        assert_eq!(retried["data"]["satisfied"], true, "{retried}");
+        assert_eq!(retried["data"]["timed_out"], false);
+        assert_eq!(retried["data"]["events"].as_array().unwrap().len(), 1);
+        assert_eq!(retried["data"]["events"][0]["id"], event_id);
+        assert_eq!(retried["data"]["final_cursor"], 0);
+        assert_eq!(retried["data"]["candidate_cursor"], event_id);
+        assert_eq!(retried["data"]["pending_finalize"], true);
+        response_delivery.fail_all();
     }
 
     #[test]
@@ -19991,14 +20241,156 @@ mod tests {
         assert!(evidence(&remove_context, "actor_id").is_none());
     }
 
+    fn event_mutation_snapshot(path: &Path, event_id: i64) -> String {
+        rusqlite::Connection::open(path)
+            .expect("open event snapshot database")
+            .query_row(
+                "SELECT json_object('triage', triage_state, 'by', triage_updated_by,
+                    'notes', (SELECT group_concat(note) FROM event_notes WHERE event_id = events.id),
+                    'labels', (SELECT group_concat(label) FROM event_labels WHERE event_id = events.id))
+                 FROM events WHERE id = ?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .expect("snapshot event mutation fields")
+    }
+
+    fn assert_event_denial_audited(path: &Path, tool: &str) {
+        let connection = rusqlite::Connection::open(path).expect("open denial audit database");
+        let (count, decision, reason_code): (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MIN(decision), MIN(reason_code) FROM policy_denied_audit WHERE tool_name = ?1",
+                [tool],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query exact tool denial receipt");
+        assert_eq!(count, 1);
+        assert_eq!(
+            decision,
+            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED
+        );
+        assert_eq!(
+            reason_code,
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED
+        );
+    }
+
+    #[test]
+    fn contract_doctor_reservation_and_refresh_gates_preserve_state_and_audit() {
+        use crate::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch};
+        use crate::storage::PolicyDeniedAuditRecord;
+
+        for decision in [
+            PolicyRuleDecision::Deny,
+            PolicyRuleDecision::RequireApproval,
+        ] {
+            for (tool_name, action, surface) in [
+                ("wa.reserve", "reserve_pane", "swarm"),
+                ("wa.release", "release_pane", "swarm"),
+                ("wa.accounts_refresh", "exec_command", "mcp"),
+            ] {
+                let (_dir, path) = temp_db_path();
+                seed_event(path.as_path());
+                let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+                let reservation = runtime.block_on(async {
+                    let storage = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
+                    let reservation = storage
+                        .create_reservation(7, "agent", "existing-owner", None, 3_600_000)
+                        .await
+                        .unwrap();
+                    storage.shutdown().await.unwrap();
+                    reservation
+                });
+                let mut config = Config::default();
+                config.storage.db_path = path.to_string_lossy().into_owned();
+                config.safety.require_prompt_active = false;
+                config.safety.rules.enabled = true;
+                config.safety.rules.rules.push(PolicyRule {
+                    id: "contract-doctor.mutation-gate".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: PolicyRuleMatch {
+                        actions: vec![action.to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec![surface.to_string()],
+                        ..Default::default()
+                    },
+                    decision,
+                    message: Some("contract doctor policy control".to_string()),
+                });
+                let config = Arc::new(config);
+                let response = match tool_name {
+                    "wa.reserve" => WaReserveTool::new(config, Arc::clone(&path)).call(
+                        &test_mcp_context(),
+                        serde_json::json!({"pane_id": 7, "owner_kind": "agent", "owner_id": "new-owner"}),
+                    ),
+                    "wa.release" => WaReleaseTool::new(config, Arc::clone(&path)).call(
+                        &test_mcp_context(),
+                        serde_json::json!({"reservation_id": reservation.id}),
+                    ),
+                    "wa.accounts_refresh" => WaAccountsRefreshTool::new(config, Arc::clone(&path)).call(
+                        &test_mcp_context(), serde_json::json!({"service": "openai"}),
+                    ),
+                    _ => unreachable!(),
+                };
+                let envelope = parse_json_content(response.expect("actual mutation handler"));
+                assert_eq!(envelope["ok"], false, "{tool_name}: {envelope}");
+                assert_eq!(
+                    envelope["error_code"], MCP_ERR_POLICY,
+                    "{tool_name}: {envelope}"
+                );
+                let conn = rusqlite::Connection::open(path.as_path()).unwrap();
+                let (count, actual_decision, reason): (i64, String, String) = conn.query_row(
+                    "SELECT COUNT(*), MIN(decision), MIN(reason_code) FROM policy_denied_audit WHERE tool_name = ?1",
+                    [tool_name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(count, 1, "{tool_name}");
+                let (expected_decision, expected_reason) = match decision {
+                    PolicyRuleDecision::Deny => (
+                        PolicyDeniedAuditRecord::DECISION_DENIED,
+                        PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    ),
+                    PolicyRuleDecision::RequireApproval => (
+                        PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    ),
+                    PolicyRuleDecision::Allow => unreachable!(),
+                };
+                assert_eq!(actual_decision, expected_decision, "{tool_name}");
+                assert_eq!(reason, expected_reason, "{tool_name}");
+                let (reservation_count, released_at): (i64, Option<i64>) = conn
+                    .query_row(
+                        "SELECT COUNT(*), MAX(released_at) FROM pane_reservations",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reservation_count, 1,
+                    "{tool_name} must not create a reservation"
+                );
+                assert_eq!(
+                    released_at, None,
+                    "{tool_name} must not release the existing owner"
+                );
+                let accounts: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(accounts, 0, "{tool_name} must not refresh accounts");
+            }
+        }
+    }
+
     #[test]
     fn events_annotate_tool_applies_mcp_mutation_policy_gate() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsAnnotateTool::new(
-            deny_mcp_exec_command_config("event\\.annotate", "event note mutations are blocked"),
-            Arc::clone(&db_path),
-        );
+        let before = event_mutation_snapshot(db_path.as_path(), event_id);
+        let wrong_db = db_path.with_file_name("unrelated-config.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.annotate", "event note mutations are blocked");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        let tool = WaEventsAnnotateTool::new(cfg, Arc::clone(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -20015,16 +20407,24 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event note mutations are blocked");
+        assert_eq!(event_mutation_snapshot(db_path.as_path(), event_id), before);
+        assert_event_denial_audited(db_path.as_path(), "wa.events_annotate");
+        assert!(
+            !wrong_db.exists(),
+            "denial must not open an unrelated configured database"
+        );
     }
 
     #[test]
     fn events_triage_tool_applies_mcp_mutation_policy_gate() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsTriageTool::new(
-            deny_mcp_exec_command_config("event\\.triage", "event triage mutations are blocked"),
-            Arc::clone(&db_path),
-        );
+        let before = event_mutation_snapshot(db_path.as_path(), event_id);
+        let wrong_db = db_path.with_file_name("unrelated-config.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.triage", "event triage mutations are blocked");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        let tool = WaEventsTriageTool::new(cfg, Arc::clone(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -20041,16 +20441,24 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event triage mutations are blocked");
+        assert_eq!(event_mutation_snapshot(db_path.as_path(), event_id), before);
+        assert_event_denial_audited(db_path.as_path(), "wa.events_triage");
+        assert!(
+            !wrong_db.exists(),
+            "denial must not open an unrelated configured database"
+        );
     }
 
     #[test]
     fn events_label_tool_applies_mcp_mutation_policy_gate() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsLabelTool::new(
-            deny_mcp_exec_command_config("event\\.label", "event label mutations are blocked"),
-            Arc::clone(&db_path),
-        );
+        let before = event_mutation_snapshot(db_path.as_path(), event_id);
+        let wrong_db = db_path.with_file_name("unrelated-config.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.label", "event label mutations are blocked");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        let tool = WaEventsLabelTool::new(cfg, Arc::clone(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -20067,6 +20475,36 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event label mutations are blocked");
+        assert_eq!(event_mutation_snapshot(db_path.as_path(), event_id), before);
+        assert_event_denial_audited(db_path.as_path(), "wa.events_label");
+        assert!(
+            !wrong_db.exists(),
+            "denial must not open an unrelated configured database"
+        );
+    }
+
+    #[test]
+    fn events_denial_with_unavailable_explicit_audit_db_never_falls_back() {
+        let directory = tempfile::tempdir().expect("unavailable audit fixture");
+        let wrong_db = directory.path().join("must-not-create.sqlite3");
+        let mut cfg =
+            deny_mcp_exec_command_config("event\\.annotate", "denied with unavailable audit");
+        Arc::make_mut(&mut cfg).storage.db_path = wrong_db.to_string_lossy().into_owned();
+        // A directory is deliberately not a usable SQLite database. Denial
+        // remains enforced; no receipt may be invented in another database.
+        let tool = WaEventsAnnotateTool::new(cfg, Arc::new(directory.path().to_path_buf()));
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"event_id": 1, "note": "must not be written"}),
+            )
+            .expect("unavailable audit must preserve denial envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert_eq!(envelope["error"], "denied with unavailable audit");
+        assert!(!wrong_db.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -20426,6 +20864,55 @@ mod tests {
                 "wa.send write-level envelope: {envelope:?}"
             );
             assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+        });
+    }
+
+    #[test]
+    fn contract_doctor_send_policy_denial_preserves_pane_and_audit() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, path) = temp_db_path();
+            let pane_id = 4_207;
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rules.enabled = true;
+            cfg.safety.rules.rules.push(crate::config::PolicyRule {
+                id: "contract-doctor.send-denied".to_string(),
+                description: None,
+                priority: 1,
+                match_on: crate::config::PolicyRuleMatch {
+                    actions: vec!["send_text".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    ..Default::default()
+                },
+                decision: crate::config::PolicyRuleDecision::Deny,
+                message: Some("contract doctor refuses this send".to_string()),
+            });
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let before = mock.pane_state(pane_id).await.unwrap().content;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::new(cfg),
+                Arc::clone(&path),
+                Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+            );
+            let response = parse_json_content(tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"pane_id": pane_id, "text": "contract-doctor-forbidden-input"}),
+            ).unwrap());
+            assert_eq!(
+                response["ok"], true,
+                "injection outcome must be represented: {response}"
+            );
+            assert_eq!(
+                response["data"]["injection"]["status"], "denied",
+                "{response}"
+            );
+            assert_eq!(mock.pane_state(pane_id).await.unwrap().content, before);
+            let audit = latest_audit_action(path.as_path(), "send_text");
+            assert_eq!(audit.result, "denied");
+            assert_eq!(audit.pane_id, Some(pane_id));
         });
     }
 
@@ -20871,7 +21358,7 @@ mod tests {
                 Arc::clone(&db),
                 backend as crate::wezterm::WeztermHandle,
             );
-        let request_cx = crate::mcp_framework::FrameworkCx::for_testing();
+            let request_cx = crate::mcp_framework::FrameworkCx::for_testing();
             let context = McpContext::new(request_cx, 1);
 
             let envelope = parse_json_content(
@@ -21888,6 +22375,103 @@ mod tests {
                 "Tx tool '{}' not found in definitions",
                 expected_name
             );
+        }
+    }
+
+    #[test]
+    fn contract_doctor_tx_and_mission_gates_audit_before_file_effects() {
+        use crate::storage::PolicyDeniedAuditRecord;
+
+        for approval in [false, true] {
+            for (tool_name, command) in [
+                ("wa.tx_run", "tx\\.run"),
+                ("wa.tx_rollback", "tx\\.rollback"),
+                ("wa.mission_pause", "mission\\.pause"),
+                ("wa.mission_resume", "mission\\.resume"),
+                ("wa.mission_abort", "mission\\.abort"),
+            ] {
+                let dir = workspace_tempdir();
+                let contract = if tool_name.starts_with("wa.mission_") {
+                    write_mission_file(
+                        &dir,
+                        if tool_name == "wa.mission_resume" {
+                            MissionLifecycleState::Paused
+                        } else {
+                            MissionLifecycleState::Running
+                        },
+                    )
+                } else {
+                    write_tx_contract(&dir, MissionTxState::Planned)
+                };
+                let original = std::fs::read(&contract).unwrap();
+                let path = dir.path().join("audit.sqlite3");
+                seed_event(&path);
+                let mut config = if approval {
+                    require_approval_mcp_exec_command_config(command, "approval control")
+                } else {
+                    deny_mcp_exec_command_config(command, "deny control")
+                };
+                Arc::make_mut(&mut config).storage.db_path = path.to_string_lossy().into_owned();
+                let args = if tool_name == "wa.mission_resume" {
+                    serde_json::json!({"mission_file": contract.to_string_lossy(), "requested_by": "doctor"})
+                } else if tool_name.starts_with("wa.mission_") {
+                    serde_json::json!({"mission_file": contract.to_string_lossy(), "reason": "doctor control", "requested_by": "doctor"})
+                } else {
+                    serde_json::json!({"contract_file": contract.to_string_lossy()})
+                };
+                let result = match tool_name {
+                    "wa.tx_run" => WaTxRunTool::new(config).call(&test_mcp_context(), args),
+                    "wa.tx_rollback" => {
+                        WaTxRollbackTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    "wa.mission_pause" => {
+                        WaMissionPauseTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    "wa.mission_resume" => {
+                        WaMissionResumeTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    "wa.mission_abort" => {
+                        WaMissionAbortTool::new(config).call(&test_mcp_context(), args)
+                    }
+                    _ => unreachable!(),
+                };
+                let envelope = parse_json_content(result.unwrap());
+                assert_eq!(envelope["ok"], false, "{tool_name}: {envelope}");
+                assert_eq!(
+                    envelope["error_code"], MCP_ERR_POLICY,
+                    "{tool_name}: {envelope}"
+                );
+                assert_eq!(
+                    std::fs::read(&contract).unwrap(),
+                    original,
+                    "{tool_name} altered the contract before authorization"
+                );
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                let (count, decision, reason): (i64, String, String) = conn.query_row(
+                    "SELECT COUNT(*), MIN(decision), MIN(reason_code) FROM policy_denied_audit WHERE tool_name = ?1",
+                    [tool_name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(count, 1);
+                if approval {
+                    assert_eq!(
+                        decision,
+                        PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED
+                    );
+                    assert_eq!(
+                        reason,
+                        PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED
+                    );
+                    assert!(
+                        envelope["hint"]
+                            .as_str()
+                            .unwrap()
+                            .contains("does not support")
+                    );
+                } else {
+                    assert_eq!(decision, PolicyDeniedAuditRecord::DECISION_DENIED);
+                    assert_eq!(reason, PolicyDeniedAuditRecord::REASON_CODE_DENIED);
+                }
+            }
         }
     }
 
@@ -25942,6 +26526,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             cfg.as_ref(),
+            None,
             &rate_limiter,
             "wa.tx_run",
             "tx.run",
@@ -25998,6 +26583,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             cfg.as_ref(),
+            None,
             &rate_limiter,
             "wa.mission_pause",
             "mission.pause",
@@ -26028,6 +26614,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             cfg.as_ref(),
+            None,
             &rate_limiter,
             "wa.tx_run",
             "tx.run",

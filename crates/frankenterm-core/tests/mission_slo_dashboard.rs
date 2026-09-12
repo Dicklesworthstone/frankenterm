@@ -77,6 +77,23 @@ fn elog() -> MissionEventLog {
     })
 }
 
+/// These reporting fixtures reuse identical work every cycle. Disable only
+/// the repeat-assignment limiters so a "clean" sample has no intended denials;
+/// the default-governor and retry-envelope tests cover those safety policies.
+fn clean_reporting_config() -> MissionLoopConfig {
+    MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        safety_envelope: MissionSafetyEnvelopeConfig {
+            max_consecutive_retries_per_bead: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// Run N evaluation cycles, returning the final report.
 fn run_cycles(
     ml: &mut MissionLoop,
@@ -115,7 +132,7 @@ fn slo_idle_when_no_cycles() {
 #[test]
 fn slo_healthy_after_clean_cycles() {
     // Use more agents than beads to ensure clean assignment without rejections
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    let mut ml = MissionLoop::new(clean_reporting_config());
     let agents = vec![agent("a1"), agent("a2"), agent("a3")];
     let issues = vec![issue("b1", 1), issue("b2", 2)];
 
@@ -175,7 +192,7 @@ fn slo_health_threshold_contract_documented() {
     // These thresholds are documented constants in the mission_loop module.
 
     // Clean scenario: no churn, no conflicts
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    let mut ml = MissionLoop::new(clean_reporting_config());
     let agents = vec![agent("a1"), agent("a2"), agent("a3")];
     let issues = vec![
         issue("b1", 1),
@@ -473,7 +490,7 @@ fn shadow_config_defaults_are_sensible() {
 
 #[test]
 fn compliance_sustained_healthy_over_20_cycles() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    let mut ml = MissionLoop::new(clean_reporting_config());
     let agents = vec![agent("a1"), agent("a2"), agent("a3")];
     // Use varied beads with different priorities to reduce churn
     let issues = vec![

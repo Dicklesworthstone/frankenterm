@@ -27,6 +27,10 @@
 //! If a future change un-wires a behavioral fix, or drops a fail-closed
 //! validate-reject, the corresponding assertion here fails.
 
+// The real checkpoint future nests runtime timeout and storage operations.
+// Match the snapshot integration tests so Clippy can prove its Send bound.
+#![recursion_limit = "256"]
+
 use rusqlite::Connection;
 
 use frankenterm_core::config::{Config, SessionRetentionConfig};

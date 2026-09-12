@@ -171,6 +171,17 @@ proptest! {
 //       sort is applied selectively, never globally.
 // ---------------------------------------------------------------------------
 
+#[test]
+fn mr4_rounding_collisions_preserve_distinguishable_element_order() {
+    let mut envelope = json!({ "a": [2, 1, 0.0, 8.801147106204754e-148] });
+    canonicalize_json(&mut envelope, None);
+    assert_eq!(canon_text(&envelope), r#"{"a":[2,1,0.0,0.0]}"#);
+
+    envelope["a"].as_array_mut().unwrap().reverse();
+    canonicalize_json(&mut envelope, None);
+    assert_eq!(canon_text(&envelope), r#"{"a":[0.0,0.0,1,2]}"#);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
@@ -183,23 +194,29 @@ proptest! {
                 |k: &String| !matches!(k.as_str(), "agents" | "tags" | "pane_ids"),
             ),
     ) {
-        prop_assume!(items.len() >= 2);
-        // Build an array that has a distinguishable ordering: append a
-        // sentinel that is strictly less-than any item already in the
-        // list so the "sorted" form and the "reversed" form differ.
+        // Compare the ordered, individually normalized elements. Distinct raw
+        // floats (or timestamps) can legitimately collapse to identical
+        // canonical values, so raw inequality does not imply output inequality.
+        let expected: Vec<_> = items.iter().map(canon_text).collect();
         let mut reversed = items.clone();
         reversed.reverse();
-        prop_assume!(items != reversed);
 
-        let original = json!({ &non_magic: items });
-        let flipped = json!({ &non_magic: reversed });
+        for (input, ordered) in [
+            (items, expected.clone()),
+            (reversed, expected.into_iter().rev().collect()),
+        ] {
+            let mut envelope = json!({ &non_magic: input });
+            canonicalize_json(&mut envelope, None);
+            let actual: Vec<_> = envelope[&non_magic]
+                .as_array()
+                .expect("canonicalization preserves array type")
+                .iter()
+                .map(|item| serde_json::to_string(item).expect("canonical item"))
+                .collect();
 
-        prop_assert_ne!(
-            canon_text(&original),
-            canon_text(&flipped),
-            "non-magic key {} must NOT sort; reversing should change canonical output",
-            non_magic
-        );
+            prop_assert_eq!(actual, ordered,
+                "non-magic key {} must preserve normalized element order", non_magic);
+        }
     }
 }
 

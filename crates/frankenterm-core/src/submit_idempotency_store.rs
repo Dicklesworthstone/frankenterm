@@ -799,9 +799,30 @@ fn preflight_store_schema(
     conn: &Connection,
     allow_uninitialized: bool,
 ) -> Result<(), SubmitIdempotencyError> {
-    match schema_header(conn)? {
-        (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) => validate_initialized_schema_locked(conn),
-        (0, 0) if allow_uninitialized => validate_blank_schema(conn),
+    preflight_store_schema_observing_header(conn, allow_uninitialized, || {})
+}
+
+fn preflight_store_schema_observing_header(
+    conn: &Connection,
+    allow_uninitialized: bool,
+    after_header: impl FnOnce(),
+) -> Result<(), SubmitIdempotencyError> {
+    // Header PRAGMAs and object validation must observe the same committed
+    // generation. An initializer can otherwise commit between these reads,
+    // making a valid blank database appear to have an incompatible schema.
+    // A deferred transaction preserves the read-only preflight before WAL
+    // configuration; initialization is still revalidated under IMMEDIATE.
+    let snapshot = map_sqlite(
+        conn.unchecked_transaction(),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    let header = schema_header(&snapshot)?;
+    after_header();
+    match header {
+        (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) => {
+            validate_initialized_schema_locked(&snapshot)
+        }
+        (0, 0) if allow_uninitialized => validate_blank_schema(&snapshot),
         _ => Err(SubmitIdempotencyError::SchemaMismatch),
     }
 }
@@ -3143,6 +3164,49 @@ mod tests {
         )
         .expect("backward-clock completion");
         assert_eq!(persisted_updated_at(dir.path(), &binding), 1_100);
+    }
+
+    #[test]
+    fn preflight_keeps_blank_header_and_schema_in_one_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = dir.path().join("snapshot.sqlite3");
+        let reader = Connection::open(&database).expect("reader");
+        reader
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL permits a concurrent initialization commit");
+        let mut writer = Connection::open(&database).expect("writer");
+
+        preflight_store_schema_observing_header(&reader, true, || {
+            let initialization = writer
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("initializer transaction");
+            initialize_or_validate_schema_locked(&initialization, true)
+                .expect("initialize exact schema");
+            initialization.commit().expect("commit during preflight");
+        })
+        .expect("preflight must validate the blank snapshot it observed");
+
+        assert!(reader.is_autocommit(), "preflight releases its snapshot");
+        assert_eq!(
+            schema_header(&reader).expect("committed header"),
+            (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION)
+        );
+        // This is precisely the incompatible object read the old autocommit
+        // preflight performed after observing the earlier blank header.
+        assert!(matches!(
+            validate_blank_schema(&reader),
+            Err(SubmitIdempotencyError::SchemaMismatch)
+        ));
+        preflight_store_schema(&reader, false).expect("fresh initialized snapshot");
+
+        writer
+            .execute_batch("CREATE TABLE unexpected_object(value TEXT)")
+            .expect("incompatible schema control");
+        assert!(matches!(
+            preflight_store_schema(&reader, true),
+            Err(SubmitIdempotencyError::SchemaMismatch)
+        ));
+        assert!(reader.is_autocommit(), "failure releases its snapshot");
     }
 
     #[test]

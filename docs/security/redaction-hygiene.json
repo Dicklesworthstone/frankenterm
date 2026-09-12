@@ -2,8 +2,9 @@
   "schema_version": "ft.security.redaction_hygiene.v1",
   "category": "security/redaction-hygiene",
   "produced_by_bead": "ft-7h5da.1.5",
-  "generated_at": "2026-09-11T21:27:46Z",
-  "summary": "Redaction-hygiene attestation: the at-rest output corpus is catalog-versioned and sweepable. Each captured segment records the secret-pattern catalog fingerprint in effect at capture (output_segments.redaction_catalog_version, schema v29), and a catalog-aware backfill rewrites stale-catalog secrets with a per-family receipt. Together these make 'is this corpus clean as of catalog vN?' a queryable fact rather than a guess.",
+  "generated_at": "2026-09-12T11:13:10Z",
+  "status": "scoped_remote_tests_passed_release_qualification_pending",
+  "summary": "Catalog-versioned ingest and atomic offline redaction maintenance passed retained remote regression tests. Final release source, signed bundle and native qualification remain pending. This file does not certify deployment corpus cleanliness.",
   "attestation_manifest_slot": {
     "category": "security/redaction-hygiene",
     "path": "docs/security/redaction-hygiene.json",
@@ -11,10 +12,10 @@
     "produced_by_bead": "ft-7h5da.1.5"
   },
   "catalog": {
-    "fingerprint": "live-secret-patterns-sha256:fe61f64fc31f111b575f119d7694a59fe9531213602939bd35c734a6367db25a",
-    "fingerprint_algorithm": "sha256 over the ordered secret-pattern family names joined by \"\\n\" (no trailing newline)",
+    "fingerprint": "live-secret-patterns-v2-sha256:1b2cd2692bc04ff839dc0750f554d414aefcc4ebde07e5e1c7d1285b6fdc0186",
+    "fingerprint_algorithm": "SHA-256 of domain frankenterm-secret-catalog-v2 NUL sequential-regex-replace-all NUL, then UTF-8 fields framed by u64 big-endian byte lengths: default marker, named marker template, and each ordered family name plus actual regex expression",
     "computed_at_runtime_by": "frankenterm_core::redact_backfill::catalog_version()",
-    "reproducible": "sha256 of the `families` list below, joined by newline, must equal `fingerprint`'s hex suffix.",
+    "reproducible": "redactor::secret_catalog_version is canonical; the names below alone cannot reconstruct expression-sensitive identity. The retained remote catalog-identity and manifest-schema tests verified this fingerprint against the live implementation.",
     "family_count": 33,
     "families": [
       "anthropic_key",
@@ -57,7 +58,7 @@
       "since_schema_version": 29,
       "column": "output_segments.redaction_catalog_version",
       "stamped_by": "frankenterm_core::redact_backfill::current_catalog_version()",
-      "pre_v29_rows": "NULL = catalog unknown at capture (honest; eligible for backfill)",
+      "pre_v29_rows": "NULL = catalog unknown; a successful non-dry-run sweep stamps the applied catalog on every scanned row atomically with its receipt. This column identifies the last applied catalog, not immutable capture provenance.",
       "produced_by_bead": "ft-7h5da.1.5"
     },
     "backfill": {
@@ -68,6 +69,7 @@
       "receipt_fields": [
         "catalog_version",
         "patterns_checked",
+        "resume_after_id",
         "segments_scanned",
         "segments_rewritten",
         "family_counts",
@@ -76,22 +78,46 @@
         "fts_rebuilt"
       ],
       "properties": [
-        "idempotent (re-run rewrites zero rows)",
+        "idempotent content rewrites; every completed real sweep records a receipt including zero-rewrite scans",
         "resumable (segment-id cursor)",
+        "one SQLite transaction covers row rewrites, catalog adoption, configured SQLite derived-store maintenance, and mandatory receipt; failure rolls back",
         "derived-store rebuild: output_segments_fts FTS5 + segment_embeddings invalidation"
       ],
       "produced_by_bead": "ft-7h5da.1.3"
     },
     "purge": {
       "tool": "ft redact purge --secret-hash",
-      "status": "pending",
+      "status": "remote_transaction_and_receipt_controls_passed",
       "tracking_bead": "ft-7h5da.1.4",
-      "note": "Targeted secret-hash purge + tombstones not yet implemented; backfill is the catalog-wide sweep half."
+      "note": "run_redact_purge transaction, receipt and dry-run controls passed remotely. Only active-catalog matches are eligible. Sealed backups require separate review."
     }
   },
   "coverage_map_reference": "docs/security/redaction-coverage-map.md",
   "verification": {
-    "claim": "Corpus cleanliness is catalog-versioned and queryable: each new segment carries the catalog version in effect at capture, and each backfill sweep emits a durable receipt recording the catalog fingerprint and per-family rewrite counts.",
-    "not_claimed": "This slot does NOT assert the corpus is currently free of all secrets. It attests that the catalog-version stamping and catalog-aware backfill machinery exist, are wired, and produce catalog-versioned receipts; the as-of-vN cleanliness of a given deployment is answered by querying that deployment's segments and maintenance_log."
+    "claim": "Scoped remote maintenance, catalog and backup regression proof; release manifest remains deferred until producing-bead bundle qualification completes.",
+    "not_claimed": "No whole-corpus cleanliness claim: scans are per-segment, resumed scans exclude earlier rows, and catalog coverage is finite. Tantivy rebuild_requested records required external work; no rebuild is queued or performed. mmap mirrors, archived backups and external indexes are not certified by a SQLite maintenance receipt.",
+    "required_proofs": ["redact_backfill::tests", "redactor::tests::catalog_identity_changes_with_expression_order_and_family", "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip", "attestation_manifest_schema::redaction_hygiene_attestation_matches_live_catalog"],
+    "retained_current_source_receipts": [
+      {
+        "transcript": "rch-ts1-atomic-producers-1115.log",
+        "transcript_sha256": "44484d8cb0cb55d861a10c44e9cf6e2ac0d7193e8dd54b9b24f6b225bfaac45f",
+        "source_hash_inventory": "atomic-producers-1115-remote.sha256",
+        "worker": "ts1",
+        "source_snapshot": "/home/ubuntu/rch/frankenterm/af0a3623dafdf604",
+        "base_commit": "f2b406a46474e29e5ade7a35c26a19d94dd32d08",
+        "implementation_commit": "8ae0a83ddd0286207b66633cbeef980b8321284f",
+        "source_scope": "Thirteen explicit overlays; redactor.rs, backup.rs and redactor/Cargo.toml match the implementation commit. redact_backfill.rs differs only by a corrected catalog-identity comment.",
+        "completed_at": "2026-09-12T10:50:14Z",
+        "passed_tests": {
+          "redact_backfill": 17,
+          "core_redactor": 99,
+          "backup": 91,
+          "standalone_redactor_total": 123,
+          "attestation_manifest_schema_total": 31
+        },
+        "aggregate_exit_code": 101,
+        "aggregate_limit": "Four unrelated core failures prevented an aggregate pass. The named redaction, backup and manifest-schema tests passed; this receipt does not upgrade the whole batch."
+      }
+    ]
   }
 }

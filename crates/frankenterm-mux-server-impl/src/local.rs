@@ -583,6 +583,20 @@ mod tests {
         let session_thread = std::sync::Arc::new(std::sync::Mutex::new(None));
         let session_thread_in_task = std::sync::Arc::clone(&session_thread);
 
+        // The executor also services other admitted and legacy callbacks.
+        // Put unrelated work ahead of this connection so completion cannot
+        // accidentally depend on the bootstrap and session being ticks 1/2.
+        let unrelated = promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            1024,
+        );
+        match unrelated {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation.spawn(async {}).detach();
+            }
+            other => panic!("expected unrelated admission, got {other:?}"),
+        }
+
         std::thread::spawn(move || {
             assert_ne!(std::thread::current().id(), main_thread);
             admit_connection(
@@ -599,14 +613,18 @@ mod tests {
         .join()
         .expect("listener-side admission must not panic");
 
-        assert!(
-            exec.try_tick().expect("bootstrap must be queued"),
-            "the handoff bootstrap must be queued for the main thread"
-        );
-        assert!(
-            exec.try_tick().expect("session future must be queued"),
-            "the local session future must be queued after the bootstrap"
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session_thread.lock().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connection did not complete its main-thread handoff: {:?}",
+                exec.queue_snapshot()
+            );
+            assert!(
+                exec.try_tick().expect("main-thread callback must be valid"),
+                "admitted connection disappeared before its session ran"
+            );
+        }
         assert_eq!(
             *session_thread.lock().unwrap(),
             Some(main_thread),

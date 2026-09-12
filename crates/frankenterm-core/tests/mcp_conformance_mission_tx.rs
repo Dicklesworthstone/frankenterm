@@ -576,7 +576,16 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
 
     // Preserve schema constraints and response types; JSON object member order
     // is not part of either contract. Array order remains significant.
-    let expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    // The envelope reports this build's package identity. Keep checking its
+    // exact value while allowing a version bump without rewriting every golden.
+    for field in ["success_envelope", "invalid_args_envelope"] {
+        let version = expected_value[field]
+            .get_mut("version")
+            .expect("golden envelope must contain a version");
+        assert!(version.is_string(), "golden version must remain a string");
+        *version = Value::String(env!("CARGO_PKG_VERSION").to_string());
+    }
     let canonical_value: Value = serde_json::from_str(&actual_text).expect("parse actual capture");
     if expected_value != canonical_value {
         let capture_dir = tempfile::Builder::new()

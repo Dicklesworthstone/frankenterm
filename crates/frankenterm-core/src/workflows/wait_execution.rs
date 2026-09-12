@@ -2789,7 +2789,11 @@ mod tests {
     fn external_wait_timeout_uses_same_cx_virtual_clock() {
         let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_task = std::sync::Arc::clone(&observed);
-        let wall_start = Instant::now();
+        // Pattern compilation and runtime construction are fixture setup, not
+        // part of the virtual wait's wall-clock bound.
+        let source = MockPaneSource::new(Vec::new());
+        let engine = PatternEngine::new();
+        let signals = ExternalSignalRegistry::new();
         let mut runtime = asupersync::LabRuntime::new(
             asupersync::LabConfig::new(7302)
                 .with_auto_advance()
@@ -2803,9 +2807,6 @@ mod tests {
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
                 let cx = crate::cx::Cx::current().expect("LabRuntime task should expose Cx");
-                let source = MockPaneSource::new(Vec::new());
-                let engine = PatternEngine::new();
-                let signals = ExternalSignalRegistry::new();
                 let executor =
                     WaitConditionExecutor::new(&source, &engine).with_external_signals(&signals);
                 let result = executor
@@ -2824,7 +2825,9 @@ mod tests {
             .expect("spawn virtual-time external wait task");
         runtime.scheduler.lock().schedule(task_id, 0);
 
+        let wall_start = Instant::now();
         let report = runtime.run_with_auto_advance();
+        let wall_elapsed = wall_start.elapsed();
         let result = observed
             .lock()
             .expect("result lock")
@@ -2833,6 +2836,15 @@ mod tests {
 
         assert!(result.is_timed_out(), "unexpected result: {result:?}");
         assert_eq!(result.elapsed_ms(), Some(5_000));
+        assert_eq!(report.virtual_elapsed_ms(), 5_000);
+        assert!(
+            report.auto_advances > 0,
+            "wait must use virtual timer deadlines"
+        );
+        assert!(
+            report.total_wakeups > 0,
+            "virtual timers must wake the wait"
+        );
         assert!(
             !matches!(
                 report.termination,
@@ -2842,8 +2854,8 @@ mod tests {
             report.termination
         );
         assert!(
-            wall_start.elapsed() < Duration::from_secs(1),
-            "virtual-time timeout must not consume five wall-clock seconds"
+            wall_elapsed < Duration::from_secs(1),
+            "five virtual seconds must finish within one wall-clock second: {wall_elapsed:?}"
         );
     }
 

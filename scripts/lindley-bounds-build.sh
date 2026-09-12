@@ -19,6 +19,11 @@
 #   scripts/lindley-bounds-build.sh                       # historical diagnostic
 #   scripts/lindley-bounds-build.sh --stage-telemetry-json /tmp/stages.json \
 #       --empirical-p99-ms 42.0 --no-write
+#   scripts/lindley-bounds-build.sh --measure-live-executable /path/to/lindley_bounds_build
+#     Runs an already-built native producer against the explicitly owned mux/pane.
+#     No build occurs in this mode. Logs and watchdog receipt are retained in
+#     ARTIFACT_DIR; FT_LINDLEY_LIVE_WATCHDOG_SECS defaults to 2400 (range 1..2400).
+#     The parent DSR lane owns executable/source/profile and mux provenance.
 #
 # Exit codes:
 #   0  diagnostic comparison is within tolerance; not release proof
@@ -29,6 +34,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NO_WRITE=0
+LIVE_EXECUTABLE=""
 RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
 ARTIFACT_DIR="${FT_LINDLEY_BOUNDS_ARTIFACT_DIR:-target/lindley-bounds-build/${RUN_ID}}"
 CARGO_JOBS="${FT_LINDLEY_BOUNDS_CARGO_JOBS:-1}"
@@ -51,6 +57,11 @@ RCH_JSON_END_MARKER="__FT_LINDLEY_BOUNDS_JSON_END__"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-write) NO_WRITE=1; shift ;;
+    --measure-live-executable)
+      [[ $# -ge 2 ]] || { echo "--measure-live-executable requires a path" >&2; exit 2; }
+      LIVE_EXECUTABLE="$2"
+      shift 2
+      ;;
     --stage-telemetry-json)
       [[ $# -ge 2 ]] || { echo "--stage-telemetry-json requires a path" >&2; exit 2; }
       FT_LINDLEY_STAGE_TELEMETRY_PATH="$2"
@@ -73,6 +84,108 @@ cd "$REPO_ROOT"
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$REPO_ROOT/tests/e2e/lib_rch_guards.sh"
 mkdir -p "$ARTIFACT_DIR"
+
+if [[ -n "$LIVE_EXECUTABLE" ]]; then
+  # A separate process enforces wall time even while initialization or a
+  # synchronous stdout write occupies the Rust executor. Files are opened
+  # exclusively; reruns cannot overwrite prior diagnostic evidence.
+  exec python3 - "$LIVE_EXECUTABLE" "$ARTIFACT_DIR" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+executable = pathlib.Path(sys.argv[1]).resolve(strict=True)
+directory = pathlib.Path(sys.argv[2])
+seconds = int(os.environ.get("FT_LINDLEY_LIVE_WATCHDOG_SECS", "2400"))
+if not 1 <= seconds <= 2400 or not executable.is_file() or not os.access(executable, os.X_OK):
+    raise SystemExit("invalid executable or watchdog (expected 1..2400 seconds)")
+environment = os.environ.copy()
+environment["FT_LINDLEY_EXTERNAL_WATCHDOG_SECS"] = str(seconds)
+with executable.open("rb") as binary:
+    digest = hashlib.file_digest(binary, "sha256").hexdigest()
+receipt = {"schema": "frankenterm.lindley-process-watchdog.v1",
+           "executable": str(executable), "executable_sha256": digest,
+           "command": [str(executable), "--measure-live"],
+           "watchdog_seconds": seconds, "timed_out": False,
+           "settled": False, "release_ready": False}
+
+def interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, interrupt)
+started = time.monotonic()
+process = None
+with (directory / "live.stdout.log").open("xb") as output, \
+     (directory / "live.stderr.log").open("xb") as errors, \
+     (directory / "live.watchdog.json").open("x") as retained:
+    try:
+        process = subprocess.Popen(receipt["command"], env=environment,
+                                   stdin=subprocess.DEVNULL, stdout=output,
+                                   stderr=errors, start_new_session=True)
+        receipt["pid"] = process.pid
+        receipt["exit_code"] = process.wait(timeout=seconds)
+        receipt["settled"] = True
+    except subprocess.TimeoutExpired:
+        receipt["timed_out"] = True
+    except (OSError, KeyboardInterrupt) as error:
+        receipt["failure_class"] = type(error).__name__
+    finally:
+        if process is not None and not receipt["settled"]:
+            for termination_signal in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(process.pid, termination_signal)
+                except ProcessLookupError:
+                    pass
+                try:
+                    receipt["exit_code"] = process.wait(timeout=5)
+                    receipt["settled"] = True
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        receipt["elapsed_seconds"] = time.monotonic() - started
+        json.dump(receipt, retained, indent=2)
+        retained.write("\n")
+        retained.flush()
+
+if receipt["timed_out"] or not receipt["settled"] or "failure_class" in receipt:
+    print(f"live producer did not complete normally; receipt: {directory / 'live.watchdog.json'}", file=sys.stderr)
+    raise SystemExit(2)
+code = receipt["exit_code"]
+if code not in (0, 1):
+    raise SystemExit(2)
+try:
+    with (directory / "live.stdout.log").open("rb") as captured:
+        data = captured.read(16 * 1024 * 1024 + 1)
+    if len(data) > 16 * 1024 * 1024:
+        raise ValueError("live producer output exceeds 16MiB")
+    body = data.decode("utf-8")
+    begin = "__FT_LINDLEY_BOUNDS_JSON_BEGIN__\n"
+    end = "__FT_LINDLEY_BOUNDS_JSON_END__\n"
+    if body.count(begin) != 1 or body.count(end) != 1 or body.index(end) < body.index(begin):
+        raise ValueError("live producer lacks exactly one ordered final JSON block")
+    payload = body.split(begin, 1)[1].split(end, 1)[0]
+    row = json.loads(payload)
+    measurement = row["measurement"]
+    checks = [row["within_tolerance"], measurement["observed_delay_bound_holds"],
+              measurement["arrival_envelope_holds"], *measurement["held_out_service_curves_hold"]]
+    if len(checks) != 6 or any(type(check) is not bool for check in checks):
+        raise ValueError("live producer checks must be six explicit booleans")
+    if all(checks) != (code == 0) or measurement["release_ready"] is not False:
+        raise ValueError("live producer exit/JSON contract mismatch")
+    with (directory / "lindley-bounds.json").open("x") as artifact:
+        artifact.write(payload)
+except (OSError, ValueError, KeyError, TypeError) as error:
+    print(f"live producer invalid output: {error}", file=sys.stderr)
+    raise SystemExit(2) from None
+print(directory / "lindley-bounds.json")
+raise SystemExit(code)
+PY
+fi
 
 read_bounded_telemetry() {
   python3 - "$1" "$2" <<'PY'

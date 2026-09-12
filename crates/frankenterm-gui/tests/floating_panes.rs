@@ -124,11 +124,25 @@ fn robot_commands_set_and_pin_floating_state() {
 fn a11y_messages_emit_focus_rect_z_and_pin_changes() {
     let mut controller = GuiFloatingPaneController::new();
     controller.set_floating(3, r(1, 1, 10, 4));
+    controller.set_floating(4, r(20, 1, 10, 4));
     controller.drain_a11y_messages();
 
-    controller.focus(3);
+    assert!(controller.focus(3));
+    assert!(
+        !controller.focus(3),
+        "unchanged focus must not announce again"
+    );
     controller.apply_keyboard_command(KeyboardCommand::MoveDown, 80, 24);
-    controller.apply_keyboard_command(KeyboardCommand::RaiseToTop, 80, 24);
+    assert!(
+        controller
+            .apply_keyboard_command(KeyboardCommand::RaiseToTop, 80, 24)
+            .is_some()
+    );
+    assert!(
+        controller
+            .apply_keyboard_command(KeyboardCommand::RaiseToTop, 80, 24)
+            .is_none()
+    );
     controller.apply_keyboard_command(KeyboardCommand::TogglePin, 80, 24);
 
     let kinds: Vec<_> = controller

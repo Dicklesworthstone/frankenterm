@@ -244,7 +244,13 @@ proptest! {
     ) {
         let contract = make_contract_with_compensations(num_steps);
         let commit_report = get_partial_commit_report(num_steps, 1);
-        let comp_inputs = all_success_comp_inputs(num_steps);
+        // No successful commits means no compensation inputs are authorized.
+        let comp_inputs = vec![];
+
+        let invalid = execute_compensation_phase(
+            &contract, &commit_report, &all_success_comp_inputs(num_steps), 20_000,
+        ).unwrap_err();
+        prop_assert!(invalid.contains("uncommitted step_id s1"));
 
         let report = execute_compensation_phase(
             &contract,
@@ -363,9 +369,13 @@ proptest! {
         if fail_at <= 1 { return Ok(()); }
         let contract = make_contract_with_compensations(num_steps);
         let commit_report = get_partial_commit_report(num_steps, fail_at);
-        let comp_inputs = all_success_comp_inputs(num_steps);
-
         let expected_committed = fail_at - 1;
+        let comp_inputs = all_success_comp_inputs(expected_committed);
+
+        let invalid = execute_compensation_phase(
+            &contract, &commit_report, &all_success_comp_inputs(num_steps), 20_000,
+        ).unwrap_err();
+        prop_assert!(invalid.contains(&format!("uncommitted step_id s{fail_at}")), "unexpected rejection: {}", invalid);
 
         let report = execute_compensation_phase(
             &contract,

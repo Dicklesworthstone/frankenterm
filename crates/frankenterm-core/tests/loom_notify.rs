@@ -63,12 +63,14 @@ fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
 struct LoomNotify {
     state: Mutex<LoomNotifyState>,
     cv: Condvar,
+    waiters_registered: Condvar,
 }
 
 #[derive(Debug)]
 struct LoomNotifyState {
     permits: usize,
     epoch: u64,
+    waiters: usize,
 }
 
 impl LoomNotify {
@@ -77,8 +79,10 @@ impl LoomNotify {
             state: Mutex::new(LoomNotifyState {
                 permits: 0,
                 epoch: 0,
+                waiters: 0,
             }),
             cv: Condvar::new(),
+            waiters_registered: Condvar::new(),
         }
     }
 
@@ -97,15 +101,34 @@ impl LoomNotify {
     fn wait(&self) {
         let mut state = self.state.lock().unwrap();
         let baseline_epoch = state.epoch;
+        let mut registered = false;
         loop {
             if state.permits > 0 {
                 state.permits -= 1;
+                if registered {
+                    state.waiters -= 1;
+                }
                 return;
             }
             if state.epoch != baseline_epoch {
+                if registered {
+                    state.waiters -= 1;
+                }
                 return;
             }
+            if !registered {
+                state.waiters += 1;
+                registered = true;
+                self.waiters_registered.notify_all();
+            }
             state = self.cv.wait(state).unwrap();
+        }
+    }
+
+    fn wait_for_waiters(&self, count: usize) {
+        let mut state = self.state.lock().unwrap();
+        while state.waiters < count {
+            state = self.waiters_registered.wait(state).unwrap();
         }
     }
 }
@@ -182,42 +205,29 @@ fn loom_notify_one_wakes_one_waiter() {
 fn loom_notify_waiters_wakes_currently_parked() {
     loom::model(|| {
         let notify = Arc::new(LoomNotify::new());
-        let woken = Arc::new(AtomicUsize::new(0));
 
         let notify_a = Arc::clone(&notify);
-        let woken_a = Arc::clone(&woken);
         let waiter_a = thread::spawn(move || {
             notify_a.wait();
-            woken_a.fetch_add(1, Ordering::SeqCst);
         });
 
         let notify_b = Arc::clone(&notify);
-        let woken_b = Arc::clone(&woken);
         let waiter_b = thread::spawn(move || {
             notify_b.wait();
-            woken_b.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Two notify_waiters calls, since under loom's interleaving a
-        // single broadcast can race with the wait() entry — issuing
-        // two ensures both waiters complete (the second is a no-op
-        // for already-woken waiters but a real wake for any still
-        // parked).
-        let notify_x = Arc::clone(&notify);
-        let notify_y = Arc::clone(&notify);
-        let notifier = thread::spawn(move || {
-            notify_x.notify_waiters();
-            notify_y.notify_waiters();
-        });
-
-        notifier.join().unwrap();
+        // Registration and Condvar::wait release the same state lock.
+        // Observing both registrations therefore establishes that a single
+        // broadcast occurs after both waiters can receive it.
+        notify.wait_for_waiters(2);
+        notify.notify_waiters();
         waiter_a.join().unwrap();
         waiter_b.join().unwrap();
 
         assert_eq!(
-            woken.load(Ordering::SeqCst),
-            2,
-            "notify_waiters must wake every parked waiter",
+            notify.state.lock().unwrap().waiters,
+            0,
+            "one broadcast must release every registered waiter",
         );
     });
 }
@@ -259,11 +269,9 @@ fn loom_notify_one_permit_caps_at_one() {
         notify.wait();
         woken.fetch_add(1, Ordering::SeqCst);
 
-        // Second wait must block until a fresh notify fires. Spawn
-        // a thread that delivers it after a yield; if the cap were
-        // not 1 (i.e. permits had accumulated to 3), the second
-        // wait would return without the explicit notify and Loom
-        // would not be able to model the linearization point.
+        // Require the second wait to park before issuing a fresh permit.
+        // Extra accumulated permits would make it return early, leaving
+        // wait_for_waiters unable to observe the required registration.
         let notify_late = Arc::clone(&notify);
         let woken_late = Arc::clone(&woken);
         let waiter = thread::spawn(move || {
@@ -271,12 +279,8 @@ fn loom_notify_one_permit_caps_at_one() {
             woken_late.fetch_add(1, Ordering::SeqCst);
         });
 
-        let notify_n = Arc::clone(&notify);
-        let notifier = thread::spawn(move || {
-            notify_n.notify_one();
-        });
-
-        notifier.join().unwrap();
+        notify.wait_for_waiters(1);
+        notify.notify_one();
         waiter.join().unwrap();
 
         assert_eq!(
@@ -313,13 +317,10 @@ fn loom_notify_waiters_does_not_accumulate() {
             woken_w.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Deliver a fresh notify_one to release the waiter.
-        let notify_n = Arc::clone(&notify);
-        let notifier = thread::spawn(move || {
-            notify_n.notify_one();
-        });
-
-        notifier.join().unwrap();
+        // Establish that the earlier broadcast did not let this waiter
+        // return before delivering the fresh notification.
+        notify.wait_for_waiters(1);
+        notify.notify_one();
         waiter.join().unwrap();
 
         assert_eq!(

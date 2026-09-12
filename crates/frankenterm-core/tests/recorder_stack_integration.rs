@@ -24,7 +24,7 @@ use frankenterm_core::recorder_retention::{
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointCommitOutcome,
     CheckpointConsumerId, DurabilityLevel, FlushMode, RecorderCheckpoint, RecorderStorage,
-    RecorderStorageError, RecorderStorageErrorClass,
+    RecorderStorageError, RecorderStorageErrorClass, StatePublicationPhase,
 };
 use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
@@ -391,7 +391,11 @@ fn append_log_path_admission_rejects_substituted_staging_links() {
             }
             assert!(matches!(
                 storage.flush(FlushMode::Buffered).await,
-                Err(RecorderStorageError::Io(_))
+                Err(RecorderStorageError::StatePublication {
+                    phase: StatePublicationPhase::Prepare,
+                    may_be_published: false,
+                    ..
+                })
             ));
             assert_eq!(std::fs::read(&config.data_path).unwrap(), original);
             assert!(storage.health().await.degraded);
@@ -693,9 +697,16 @@ fn assert_append_retry_after_state_failure_is_idempotent(
             required_durability: durability,
             producer_ts_ms: 0,
         };
+        let expected_phase = if fail_rename {
+            StatePublicationPhase::Rename
+        } else {
+            StatePublicationPhase::Prepare
+        };
         assert!(matches!(
             storage.append_batch(request.clone()).await,
-            Err(RecorderStorageError::Io(_))
+            Err(RecorderStorageError::StatePublication {
+                phase, may_be_published: false, ..
+            }) if phase == expected_phase
         ));
         let accepted_bytes = std::fs::read(&config.data_path).unwrap();
         assert!(!accepted_bytes.is_empty());
@@ -706,7 +717,9 @@ fn assert_append_retry_after_state_failure_is_idempotent(
         // The retry must attempt persistence again, but not append again.
         assert!(matches!(
             storage.append_batch(request.clone()).await,
-            Err(RecorderStorageError::Io(_))
+            Err(RecorderStorageError::StatePublication {
+                phase, may_be_published: false, ..
+            }) if phase == expected_phase
         ));
         let retry_health = storage.health().await;
         eprintln!(
@@ -839,7 +852,14 @@ fn assert_checkpoint_persistence_failure_is_atomic(has_prior_checkpoint: bool) {
         // as root. Move the obstruction aside for retry; do not delete it.
         std::fs::create_dir(&temporary_path).unwrap();
         let error = storage.commit_checkpoint(next.clone()).await.unwrap_err();
-        assert!(matches!(error, RecorderStorageError::Io(_)));
+        assert!(matches!(
+            error,
+            RecorderStorageError::StatePublication {
+                phase: StatePublicationPhase::Prepare,
+                may_be_published: false,
+                ..
+            }
+        ));
         let observed = storage.read_checkpoint(&consumer).await.unwrap();
         eprintln!(
             "recorder checkpoint save: prior={has_prior_checkpoint}, phase=write_failed, observed_ordinal={:?}, expected_ordinal={:?}",

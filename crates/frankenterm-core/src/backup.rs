@@ -1165,9 +1165,7 @@ struct BackupRedactionInfo {
 }
 
 fn backup_redaction_catalog_version() -> String {
-    let names: Vec<&'static str> = crate::redactor::secret_pattern_names().collect();
-    let fingerprint = sha256_bytes(names.join("\n").as_bytes());
-    format!("live-secret-patterns-sha256:{fingerprint}")
+    crate::redactor::secret_catalog_version()
 }
 
 fn redact_backup_database(db_path: &Path) -> Result<BackupRedactionInfo> {
@@ -2518,7 +2516,7 @@ mod tests {
             result
                 .manifest
                 .redaction_catalog_version
-                .starts_with("live-secret-patterns-sha256:")
+                .starts_with("live-secret-patterns-v2-sha256:")
         );
         assert_eq!(
             result.manifest.redaction_patterns_checked,

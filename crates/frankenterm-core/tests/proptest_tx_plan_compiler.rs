@@ -322,6 +322,17 @@ proptest! {
         }];
         let plan = compile_tx_plan("p", &assignments, &CompilerConfig::default());
         prop_assert_eq!(plan.steps[0].risk, StepRisk::Critical);
+
+        // Explicit mixed-risk control, independent of random tag selection.
+        for tags in [vec!["risky", "critical"], vec!["critical", "risky"], vec!["risky"]] {
+            let expected = if tags.contains(&"critical") { StepRisk::Critical } else { StepRisk::High };
+            let mixed = vec![PlannerAssignment {
+                tags: tags.into_iter().map(str::to_string).collect(),
+                ..assignments[0].clone()
+            }];
+            let compiled = compile_tx_plan("p", &mixed, &CompilerConfig::default());
+            prop_assert_eq!(compiled.steps[0].risk, expected);
+        }
     }
 
     #[test]

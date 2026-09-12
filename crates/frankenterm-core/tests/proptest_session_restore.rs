@@ -128,6 +128,11 @@ fn setup_test_db() -> (tempfile::TempDir, String, Connection) {
     )
     .unwrap();
 
+    conn.execute_batch(
+        frankenterm_core::storage::migrations::session_retained_size_schema_sql().unwrap(),
+    )
+    .expect("session mutations require canonical retained-size authority");
+
     (dir, db_path, conn)
 }
 
@@ -1243,6 +1248,12 @@ proptest! {
             .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
             .unwrap();
         prop_assert_eq!(ps_count, 0i64, "pane states should be deleted");
+
+        let retained_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_retained_size", [], |row| row.get(0))
+            .unwrap();
+        prop_assert_eq!(retained_count, 0i64, "retained-size authority must be deleted too");
+        prop_assert!(!frankenterm_core::session_restore::delete_session(&db_path, "sess-del").unwrap());
     }
 
     // ================================================================

@@ -5,7 +5,7 @@ expression: workflow_execute_snapshot(&capture)
 ---
 {
   "data": null,
-  "error": "Failed to exit Codex: Ctrl-C requires approval: Destructive action 'send_ctrl_c' requires approval",
+  "error": "handle_usage_limits aborted (stage=codex_exit, error_class=codex_exit_failed)",
   "error_code": "FT-MCP-0008",
   "hint": null,
   "ok": false,

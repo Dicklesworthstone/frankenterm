@@ -851,6 +851,8 @@ mod tests {
     #[test]
     fn authenticated_connect_enforces_private_endpoint_metadata_and_peer_uid() {
         let root = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure native bridge parent directory");
         let socket_path = root.path().join("native-bridge.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path)
             .expect("bind native bridge test listener");
@@ -868,6 +870,18 @@ mod tests {
         assert!(!SOCKET_CONNECT_TIMEOUT.is_zero());
         drop(stream);
 
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o775))
+            .expect("make native bridge parent deliberately shared");
+        assert!(matches!(
+            connect_authenticated_native_event_socket(&socket_path),
+            Err(NativeEventError::Security(
+                frankenterm_core::native_events::NativeEventSecurityError::ParentModeMismatch {
+                    actual_mode: 0o775
+                }
+            ))
+        ));
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore private native bridge parent");
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
             .expect("make native bridge test socket deliberately open");
         assert!(matches!(

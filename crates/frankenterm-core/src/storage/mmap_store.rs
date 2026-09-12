@@ -1249,6 +1249,12 @@ impl PaneFile {
             return Ok(Vec::new());
         }
 
+        if self.file.metadata()?.len() < self.file_len {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "committed pane log length changed during tail read".to_string(),
+            ));
+        }
+
         let line_count = self.line_offsets.len();
         let start_index = line_count.saturating_sub(n);
         let mut lines = Vec::with_capacity(line_count - start_index);
@@ -1260,9 +1266,12 @@ impl PaneFile {
                         .map_err(|_| MmapStoreError::NumericOverflow("line_index"))?,
                 )
                 .ok_or(MmapStoreError::NumericOverflow("seq"))?;
-            if let Some(line) = self.line_at(seq)? {
-                lines.push(line);
-            }
+            let line = self.line_at(seq)?.ok_or_else(|| {
+                MmapStoreError::InvalidPaneLogHeader(
+                    "committed pane log record changed during tail read".to_string(),
+                )
+            })?;
+            lines.push(line);
         }
         Ok(lines)
     }
@@ -2755,19 +2764,9 @@ impl MmapScrollbackStore {
                 return Err(MmapStoreError::UnknownPane(pane_id));
             }
         };
-        match pane.tail_lines(n) {
-            Ok(lines) => Ok(lines),
-            Err(err) => {
-                if self.sqlite_fallback.is_some() {
-                    match self.tail_lines_sqlite(pane_id, n) {
-                        Ok(lines) => Ok(lines),
-                        Err(_) => Err(err),
-                    }
-                } else {
-                    Err(err)
-                }
-            }
-        }
+        // An established primary and its fallback are not one atomic history.
+        // Preserve primary failures instead of returning stale fallback rows.
+        pane.tail_lines(n)
     }
 
     pub fn line_at(&self, pane_id: PaneId, seq: u64) -> Result<Option<String>, MmapStoreError> {

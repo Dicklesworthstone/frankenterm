@@ -2343,16 +2343,64 @@ impl DirectMuxClient {
         cx: &Cx,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
-        let serial = self
-            .send_request_only_with_cx(
-                cx,
-                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                    pane_id: pane_id as usize,
-                }),
-            )
-            .await?;
-        let response = self.await_response_with_cx(cx, serial).await;
-        self.settle_single_render_response(pane_id, response, true)
+        // PTY output may invalidate a render snapshot while it is being
+        // prepared. Only an authoritative, replay-safe rejection permits
+        // another read. All attempts share the original operation's budget.
+        let budget = self
+            .config
+            .write_timeout
+            .saturating_add(self.config.read_timeout);
+        // Runtime Time addition saturates at Time::MAX, unlike std::Instant;
+        // even Duration::MAX remains representable without panicking. The
+        // caller's earlier capability deadline still bounds timeout_with_cx.
+        let deadline = crate::runtime_async::timer_now_with_cx(cx) + budget;
+        let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
+            for attempt in 0..3 {
+                checkpoint_mux_cx(cx, self.connection_id, "render_read_retry")?;
+                if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
+                    return Err(DirectMuxError::ReadTimeout);
+                }
+                let serial = self
+                    .send_request_only_with_cx(
+                        cx,
+                        Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                            pane_id: pane_id as usize,
+                        }),
+                    )
+                    .await?;
+                let response = self.await_response_with_cx(cx, serial).await;
+                let settled = self.settle_single_render_response(pane_id, response, true);
+                if attempt < 2
+                    && matches!(&settled, Err(DirectMuxError::RemoteRejection(error))
+                        if error.validate().is_ok()
+                            && error.request_ident == <GetPaneRenderChanges as codec::PduWireIdent>::IDENT
+                            && error.code == codec::MuxErrorCode::BACKEND_FAILURE
+                            && error.effect == codec::MuxErrorEffect::NOT_APPLIED
+                            && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF)
+                {
+                    checkpoint_mux_cx(cx, self.connection_id, "render_read_backoff")?;
+                    if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
+                        return Err(DirectMuxError::ReadTimeout);
+                    }
+                    crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                        .await
+                        .map_err(|error| cancelled_mux_error("render_read_backoff", error))?;
+                    continue;
+                }
+                return settled;
+            }
+            unreachable!("the final render read attempt returns its result")
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(timeout) => {
+                let error =
+                    classify_cx_timeout(cx, "render_read", timeout, DirectMuxError::ReadTimeout);
+                self.poison_connection("render read budget expired", true);
+                Err(error)
+            }
+        }
     }
 
     /// Fetch specific lines from a pane's scrollback.
@@ -4558,6 +4606,16 @@ impl DirectMuxClient {
                     return Err(error);
                 }
             };
+            // Readiness can deliver bytes or EOF in the same poll in which
+            // cancellation becomes observable. Successful I/O does not erase
+            // the caller's cancellation authority (the error arm checks it
+            // too). Settle cancellation before accepting either outcome.
+            let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "response_read_completed");
+            self.settle_transport_result(
+                checkpoint,
+                "response read completion cancellation",
+                true,
+            )?;
             if read == 0 {
                 tracing::debug!(
                     connection_id = self.connection_id,
@@ -8976,6 +9034,151 @@ mod tests {
     }
 
     #[test]
+    fn render_read_retries_only_authoritative_safe_rejections() {
+        run_async_test(async {
+            for (case, expected_requests) in [
+                ("recover", 2),
+                ("never", 1),
+                ("effect", 1),
+                ("wrong-request", 1),
+                ("persistent", 3),
+                ("cancel", 1),
+                ("deadline", 1),
+                ("extreme", 3),
+                ("extreme-cancel", 1),
+                ("eof", 1),
+            ] {
+                let cx = crate::cx::for_testing();
+                let server_cx = cx.clone();
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir.path().join("render-retry.sock");
+                let listener = compat_unix::bind(&socket_path).await.expect("bind");
+                let server = task::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut buffer = StreamingPduBuffer::new();
+                    let mut requests = 0;
+                    loop {
+                        let mut bytes = [0u8; 4096];
+                        let count = unix_stream_read(&mut stream, &mut bytes)
+                            .await
+                            .expect("read");
+                        if count == 0 {
+                            break;
+                        }
+                        buffer.extend_from_slice(&bytes[..count]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut buffer) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "render-retry".into(),
+                                        executable_path: PathBuf::from("/bin/frankenterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::GetPaneRenderChanges(request) => {
+                                    requests += 1;
+                                    assert_eq!(request.pane_id, 27, "retry preserves request");
+                                    assert!(
+                                        requests <= expected_requests,
+                                        "unexpected retry for {case}"
+                                    );
+                                    if case == "recover" && requests == 2 {
+                                        Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            27,
+                                            42,
+                                            "fresh-after-retry",
+                                        ))
+                                    } else {
+                                        let mut rejection = codec::ErrorResponse::backend_failure(
+                                            <GetPaneRenderChanges as PduWireIdent>::IDENT,
+                                        );
+                                        match case {
+                                            "never" => {
+                                                rejection.code =
+                                                    codec::MuxErrorCode::INVALID_REQUEST;
+                                                rejection.retry = codec::MuxErrorRetry::NEVER;
+                                            }
+                                            "effect" => {
+                                                rejection.code =
+                                                    codec::MuxErrorCode::INDETERMINATE_MUTATION;
+                                                rejection.effect =
+                                                    codec::MuxErrorEffect::INDETERMINATE;
+                                                rejection.retry =
+                                                    codec::MuxErrorRetry::RECONCILE_BEFORE_RETRY;
+                                            }
+                                            "wrong-request" => {
+                                                rejection.request_ident =
+                                                    <ListPanes as PduWireIdent>::IDENT
+                                            }
+                                            "eof" => return requests,
+                                            "cancel" | "extreme-cancel" => {
+                                                server_cx.cancel_with(
+                                                    crate::outcome::CancelKind::User,
+                                                    Some("render retry control"),
+                                                );
+                                                return requests;
+                                            }
+                                            _ => {}
+                                        }
+                                        Pdu::ErrorResponse(rejection)
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            write_response_pdu(&mut stream, &response, decoded.serial)
+                                .await
+                                .expect("response");
+                        }
+                    }
+                    requests
+                });
+                let mut client = DirectMuxClient::connect(direct_mux_client_config(socket_path))
+                    .await
+                    .expect("connect");
+                if matches!(case, "extreme" | "extreme-cancel") {
+                    client.config.write_timeout = Duration::MAX;
+                    client.config.read_timeout = Duration::MAX;
+                }
+                let cx = if case == "deadline" {
+                    Cx::for_testing_with_budget(crate::cx::Budget::new().with_deadline(
+                        crate::runtime_async::timer_now_with_cx(&cx) + Duration::from_millis(5),
+                    ))
+                } else {
+                    cx
+                };
+                let result = client.get_pane_render_changes_with_cx(&cx, 27).await;
+                if case == "recover" {
+                    assert_eq!(
+                        result.expect("safe retry succeeds").title,
+                        "fresh-after-retry"
+                    );
+                } else if matches!(case, "cancel" | "extreme-cancel") {
+                    let error = result.expect_err("cancelled");
+                    assert!(error.is_cancelled(), "{case}: {error:?}");
+                } else if case == "eof" {
+                    let error = result.expect_err("uncancelled EOF is a transport failure");
+                    assert!(matches!(error, DirectMuxError::Disconnected), "{error:?}");
+                } else if case == "deadline" {
+                    let error = result.expect_err("caller deadline cuts retry backoff");
+                    assert!(error.is_cancelled() || matches!(error, DirectMuxError::ReadTimeout));
+                } else {
+                    assert!(result.is_err(), "rejection must not become a frame: {case}");
+                }
+                drop(client);
+                let requests = server.await.expect("server");
+                if case == "deadline" {
+                    assert!(requests <= 1, "expired deadline must prevent a retry");
+                } else {
+                    assert_eq!(requests, expected_requests, "{case}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn single_render_error_response_clears_stale_state_and_preserves_reuse() {
         run_async_test(async {
             let cx = crate::cx::for_testing();
@@ -9013,7 +9216,7 @@ mod tests {
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                             Pdu::GetPaneRenderChanges(request) => {
                                 render_request_count += 1;
-                                if matches!(render_request_count, 1 | 3) {
+                                if matches!(render_request_count, 1..=3 | 5..=7) {
                                     Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
                                         <GetPaneRenderChanges as PduWireIdent>::IDENT,
                                     ))
@@ -9030,7 +9233,7 @@ mod tests {
                         write_response_pdu(&mut stream, &response, decoded.serial)
                             .await
                             .expect("write response");
-                        if render_request_count == 4 {
+                        if render_request_count == 8 {
                             return;
                         }
                     }
@@ -12526,9 +12729,17 @@ mod tests {
                         .expect("read");
                     assert!(read > 0, "expected codec handshake request bytes");
 
-                    // Keep the socket open without sending a codec response so
-                    // client-side read timeout handling is exercised.
-                    sleep(Duration::from_millis(150)).await;
+                    // Only the client deadline ends the exchange; a competing
+                    // server close would turn scheduling delay into Disconnected.
+                    timeout(Duration::from_secs(5), async {
+                        while unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read until timed-out client closes")
+                            != 0
+                        {}
+                    })
+                    .await
+                    .expect("timed-out client must close before server watchdog");
                 });
             });
 
@@ -12536,8 +12747,11 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should become ready");
 
-            let config =
+            let mut config =
                 direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            // This fixture accepts one connection and tests that attempt's
+            // read deadline. Auto fallback requires a second server accept.
+            config.compression_mode = wa_config::VendoredCompressionMode::Never;
 
             let err = DirectMuxClient::connect(config)
                 .await
@@ -12574,9 +12788,15 @@ mod tests {
                         .expect("read");
                     assert!(read > 0, "expected codec handshake request bytes");
 
-                    // Keep the socket open without sending a codec response so
-                    // client-side read timeout handling is exercised.
-                    sleep(Duration::from_millis(150)).await;
+                    timeout(Duration::from_secs(5), async {
+                        while unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read until timed-out client closes")
+                            != 0
+                        {}
+                    })
+                    .await
+                    .expect("timed-out client must close before server watchdog");
                 });
             });
 
@@ -12584,8 +12804,9 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should become ready");
 
-            let config =
+            let mut config =
                 direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            config.compression_mode = wa_config::VendoredCompressionMode::Never;
 
             let err = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
@@ -13032,8 +13253,16 @@ mod tests {
                                     stream.write_all(&out).await.expect("write response");
                                 }
                                 Pdu::ListPanes(_) => {
-                                    // Keep the socket open but silent past client read_timeout.
-                                    sleep(Duration::from_millis(250)).await;
+                                    // Only the client deadline ends this exchange. A competing
+                                    // server sleep/close can turn the expected timeout into EOF
+                                    // when the test process is heavily scheduled.
+                                    let mut byte = [0];
+                                    assert_eq!(
+                                        unix_stream_read(&mut stream, &mut byte)
+                                            .await
+                                            .expect("read client close"),
+                                        0
+                                    );
                                     return;
                                 }
                                 _ => {}
@@ -13046,9 +13275,10 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            // Handshake is setup, not the operation whose deadline we test.
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            client.config.read_timeout = Duration::from_millis(40);
 
             let err = client
                 .list_panes()
@@ -13116,8 +13346,14 @@ mod tests {
                                     stream.write_all(&out).await.expect("write response");
                                 }
                                 Pdu::ListPanes(_) => {
-                                    // Keep the socket open but silent past client read_timeout.
-                                    sleep(Duration::from_millis(250)).await;
+                                    // Stay silent until the timed-out client closes the socket.
+                                    let mut byte = [0];
+                                    assert_eq!(
+                                        unix_stream_read(&mut stream, &mut byte)
+                                            .await
+                                            .expect("read client close"),
+                                        0
+                                    );
                                     return;
                                 }
                                 _ => {}
@@ -13130,11 +13366,11 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
+            client.config.read_timeout = Duration::from_millis(40);
 
             let err = client
                 .list_panes_with_cx(&cx)
@@ -13327,6 +13563,8 @@ mod tests {
             let socket_path = temp_dir.path().join("partial-frame.sock");
             let server_socket_path = socket_path.clone();
             let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let (first_chunk_tx, first_chunk_rx) = crate::runtime_async::oneshot::channel();
+            let (continue_tx, continue_rx) = crate::runtime_async::oneshot::channel();
             let server = std::thread::spawn(move || {
                 let runtime = RuntimeBuilder::current_thread()
                     .build()
@@ -13391,7 +13629,10 @@ mod tests {
                                         .write_all(&out[..split])
                                         .await
                                         .expect("write first frame chunk");
-                                    sleep(Duration::from_millis(20)).await;
+                                    first_chunk_tx.send(split).expect("announce first chunk");
+                                    crate::runtime_async::oneshot_recv(continue_rx)
+                                        .await
+                                        .expect("client buffered first chunk");
                                     stream
                                         .write_all(&out[split..])
                                         .await
@@ -13408,14 +13649,45 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
-            let panes = client
-                .list_panes()
+            let cx = crate::cx::for_testing();
+            let serial = client
+                .send_request_only_with_cx(&cx, Pdu::ListPanes(ListPanes {}))
                 .await
-                .expect("list_panes should succeed with split response frame");
+                .expect("send ListPanes");
+            let split = crate::runtime_async::oneshot_recv(first_chunk_rx)
+                .await
+                .expect("first chunk length");
+            let mut first_chunk = vec![0; split];
+            let mut received = 0;
+            while received < split {
+                let read = timeout(
+                    client.config.read_timeout,
+                    unix_stream_read(&mut client.stream, &mut first_chunk[received..]),
+                )
+                .await
+                .expect("first chunk read deadline")
+                .expect("read first chunk");
+                assert!(read > 0, "server must remain open for the second chunk");
+                received += read;
+            }
+            client.read_buf.extend_from_slice(&first_chunk);
+            assert!(
+                Pdu::stream_decode(&mut client.read_buf)
+                    .expect("valid incomplete frame")
+                    .is_none(),
+                "the first chunk alone must not produce a response"
+            );
+            continue_tx.send(()).expect("release remaining frame bytes");
+            let response = client
+                .await_response_with_cx(&cx, serial)
+                .await
+                .expect("ListPanes should succeed with split response frame");
+            let Pdu::ListPanesResponse(panes) = response else {
+                panic!("expected ListPanesResponse, got {response:?}");
+            };
             assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);

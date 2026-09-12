@@ -76,6 +76,32 @@ fn register_pane(server: &mut HeadlessMuxServer, id: u64) {
         .expect("register pane");
 }
 
+#[test]
+fn peer_health_requires_suspicion_strictly_above_threshold() {
+    let mut server = HeadlessMuxServer::new(ServerConfig {
+        suspicion_threshold: 0.0,
+        ..ServerConfig::default()
+    });
+    server.handle_request(RemoteRequest::JoinFederation {
+        peer: ServerNodeId::new("host", 9876, "boundary-peer"),
+    });
+    let RemoteResponse::Peers { peers } = server.handle_request(RemoteRequest::ListPeers) else {
+        panic!("expected Peers response");
+    };
+    assert_eq!(peers.len(), 1);
+    let heartbeat_micros = peers[0].last_heartbeat_at.saturating_mul(1_000);
+
+    // At the heartbeat timestamp phi equals zero, exactly the configured
+    // threshold. Equality must not mark the peer unreachable.
+    server.check_peer_health_at(heartbeat_micros);
+    assert!(server.prune_unreachable_peers().is_empty());
+    assert_eq!(server.peer_count(), 1);
+
+    server.check_peer_health_at(heartbeat_micros.saturating_add(1));
+    assert_eq!(server.prune_unreachable_peers(), vec!["boundary-peer"]);
+    assert_eq!(server.peer_count(), 0);
+}
+
 proptest! {
     #[test]
     fn peer_status_serde_roundtrip(status in arb_peer_status()) {
@@ -262,9 +288,10 @@ proptest! {
     fn prune_after_health_check_removes_timed_out_peers(
         n_peers in 1usize..5usize,
     ) {
-        // Use a very short peer_timeout so check_peer_health marks old heartbeats
+        // The legacy fixed timeout no longer determines liveness. Drive the
+        // real phi-accrual health sweep using explicit heartbeat timestamps.
         let config = ServerConfig {
-            peer_timeout_ms: 1, // 1ms timeout — all peers stale immediately
+            peer_timeout_ms: 1,
             ..ServerConfig::default()
         };
         let mut server = HeadlessMuxServer::new(config);
@@ -272,12 +299,32 @@ proptest! {
             let node = ServerNodeId::new("host", 9876, format!("peer-{i}"));
             server.handle_request(RemoteRequest::JoinFederation { peer: node });
         }
-        // All peers were just joined (heartbeat = now), but with 1ms timeout
-        // the health check should detect them as stale after a brief moment
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        server.check_peer_health();
+        let RemoteResponse::Peers { peers } =
+            server.handle_request(RemoteRequest::ListPeers)
+        else {
+            prop_assert!(false, "expected Peers response");
+            return Ok(());
+        };
+        prop_assert_eq!(peers.len(), n_peers);
+        let first_heartbeat = peers.iter().map(|p| p.last_heartbeat_at).min().unwrap();
+        let last_heartbeat = peers.iter().map(|p| p.last_heartbeat_at).max().unwrap();
+
+        // Fresh heartbeats must survive the same sweep/prune path.
+        server.check_peer_health_at(first_heartbeat.saturating_mul(1_000));
+        prop_assert!(server.prune_unreachable_peers().is_empty());
+        prop_assert_eq!(server.peer_count(), n_peers);
+
+        // Thirty seconds of silence exceeds the default warmup distribution;
+        // no wall-clock sleep or scheduler timing is part of the assertion.
+        server.check_peer_health_at(
+            last_heartbeat.saturating_mul(1_000).saturating_add(30_000_000),
+        );
         let pruned = server.prune_unreachable_peers();
         prop_assert_eq!(pruned.len(), n_peers);
+        for i in 0..n_peers {
+            let peer_id = format!("peer-{i}");
+            prop_assert!(pruned.contains(&peer_id));
+        }
         prop_assert_eq!(server.peer_count(), 0);
     }
 

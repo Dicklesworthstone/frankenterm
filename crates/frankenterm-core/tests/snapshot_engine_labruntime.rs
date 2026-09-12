@@ -734,21 +734,23 @@ fn snapshot_error_display_messages() {
         SnapshotError::NoChanges.to_string(),
         "no changes since last snapshot"
     );
-    assert!(
-        SnapshotError::PaneList("timeout".into())
-            .to_string()
-            .contains("timeout")
-    );
-    assert!(
-        SnapshotError::Database("disk full".into())
-            .to_string()
-            .contains("disk full")
-    );
-    assert!(
-        SnapshotError::Serialization("bad json".into())
-            .to_string()
-            .contains("bad json")
-    );
+    for (error, public_message) in [
+        (
+            SnapshotError::PaneList("private-pane-detail".into()),
+            "pane listing failed",
+        ),
+        (
+            SnapshotError::Database("private-database-detail".into()),
+            "snapshot database operation failed",
+        ),
+        (
+            SnapshotError::Serialization("private-json-detail".into()),
+            "snapshot serialization failed",
+        ),
+    ] {
+        assert_eq!(error.to_string(), public_message);
+        assert!(!format!("{error:?}").contains("private-"));
+    }
 }
 
 #[test]

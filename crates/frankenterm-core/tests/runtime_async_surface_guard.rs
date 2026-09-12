@@ -245,7 +245,7 @@ fn web_and_cli_async_surfaces_route_through_runtime_async() {
         "web/server.rs must route server lifecycle selection and signals through runtime_async"
     );
     assert!(
-        ["mpsc", "select", "sleep", "task"]
+        ["mpsc", "sleep", "task"]
             .iter()
             .all(|item| imports_runtime_async_item(&web_sse, item)),
         "web/sse.rs must import the runtime_async stream primitives it uses"

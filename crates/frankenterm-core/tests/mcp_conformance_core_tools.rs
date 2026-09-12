@@ -127,6 +127,13 @@ impl TestHarness {
         let env_lock = wezterm_env_lock();
         let fake_wezterm = FakeWezterm::new();
         let override_guard = fake_wezterm.install();
+        let selected = frankenterm_core::wezterm::build_unified_client(&config);
+        assert_eq!(
+            selected.selection().kind,
+            frankenterm_core::wezterm::BackendKind::Cli,
+            "the explicit CLI fixture must not select a live host mux"
+        );
+        assert!(selected.discovered_socket().is_none());
         let workspace = tempfile::tempdir().expect("create conformance workspace");
         let db_path = workspace.path().join("mcp.sqlite3");
         seed_search_db(&db_path);
@@ -217,6 +224,10 @@ panes = json.loads((state_dir / "panes.json").read_text())
 texts = state_dir / "texts"
 
 args = sys.argv[1:]
+if args[:2] != ["cli", "--no-auto-start"]:
+    print(f"missing required CLI no-auto-start guard: {{args}}", file=sys.stderr)
+    sys.exit(2)
+args = [args[0], *args[2:]]
 if len(args) < 2 or args[0] != "cli":
     print(f"unsupported args: {{args}}", file=sys.stderr)
     sys.exit(2)
@@ -577,7 +588,7 @@ fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMc
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
-    assert_eq!(envelope["ok"], ok);
+    assert_eq!(envelope["ok"], ok, "unexpected MCP envelope: {envelope}");
     assert!(envelope["elapsed_ms"].is_number());
     assert!(envelope["now"].is_number());
     assert_eq!(envelope["mcp_version"], "v1");
@@ -701,6 +712,11 @@ fn assert_search_success_data(envelope: &Value) {
     );
     assert!(metrics.get("fallback_reason").is_some());
     assert!(metrics.get("semantic_latency_ms").is_some());
+    assert_eq!(
+        metrics.get("semantic_backoff_until_ms"),
+        Some(&Value::Null),
+        "the healthy semantic lane has no backoff deadline"
+    );
     let results = data
         .get("results")
         .and_then(Value::as_array)
@@ -1018,13 +1034,16 @@ fn canonicalize(value: &mut Value) {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
-                    "now" | "elapsed_ms" | "captured_at" => *child = Value::from(0_u64),
+                    "input_schema" => {}
+                    "now" | "elapsed_ms" | "captured_at" if child.is_number() => {
+                        *child = Value::from(0_u64);
+                    }
                     // `polls` is an observed count that varies with scheduler timing under
                     // load (the fake-wezterm subprocess can be slow to come up, forcing a
                     // second poll). The semantic invariant `polls >= 1` is asserted in
                     // assert_wait_for_success_data; the golden only freezes structural
                     // presence, so canonicalize to 0 here.
-                    "polls" => *child = Value::from(0_u64),
+                    "polls" if child.is_number() => *child = Value::from(0_u64),
                     "score" | "semantic_score" if child.is_number() => {
                         *child = Value::from(0.0_f64);
                     }
@@ -1043,7 +1062,7 @@ fn canonicalize(value: &mut Value) {
                             }
                         }
                     }
-                    _ if key.ends_with("_ms") => *child = Value::from(0_i64),
+                    _ if key.ends_with("_ms") && child.is_number() => *child = Value::from(0_i64),
                     _ => canonicalize(child),
                 }
             }
@@ -1064,12 +1083,12 @@ fn canonicalize(value: &mut Value) {
             }
         }
         Value::Number(number) => {
-            if number.as_i64().is_none()
+            if number.is_f64()
                 && let Some(float) = number.as_f64()
                 && float.is_finite()
                 && float.fract() == 0.0
                 && float >= i64::MIN as f64
-                && float <= i64::MAX as f64
+                && float < i64::MAX as f64
             {
                 *value = Value::from(float as i64);
             }
@@ -1085,6 +1104,32 @@ fn pretty_canonical(value: &Value) -> String {
         "{}\n",
         serde_json::to_string_pretty(&cloned).expect("serialize canonical JSON")
     )
+}
+
+#[test]
+fn canonicalization_preserves_schema_versions_and_large_numbers() {
+    let schema = json!({"properties": {"timeout_ms": {"type": "number", "minimum": 1.0}}});
+    let original = json!({
+        "input_schema": schema,
+        "version": "malformed-version",
+        "unsigned": u64::MAX,
+        "upper_boundary": 9223372036854775808.0_f64,
+        "integral_float": 1.0,
+    });
+    let actual = canonical_value(&original);
+    for field in ["input_schema", "version", "unsigned", "upper_boundary"] {
+        assert_eq!(
+            actual[field], original[field],
+            "changed authoritative {field}"
+        );
+    }
+    assert_eq!(actual["integral_float"], json!(1));
+    let mut expected = actual.clone();
+    expected["version"] = json!(env!("CARGO_PKG_VERSION"));
+    assert_ne!(
+        actual, expected,
+        "malformed actual versions must not compare equal"
+    );
 }
 
 fn canonical_value(value: &Value) -> Value {
@@ -1134,7 +1179,15 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
     let path = golden_path(name);
     let expected = read_or_update_golden(&path, &actual_text);
 
-    if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
+    let mut expected_value: Value = serde_json::from_str(&expected).expect("parse expected golden");
+    let version = expected_value["success_envelope"]
+        .get_mut("version")
+        .expect("golden success envelope must contain a version");
+    assert!(version.is_string(), "golden version must remain a string");
+    *version = Value::String(env!("CARGO_PKG_VERSION").to_string());
+    canonicalize(&mut expected_value);
+    let canonical_value: Value = serde_json::from_str(&actual_text).expect("parse actual capture");
+    if expected_value != canonical_value {
         let actual_path = path.with_extension("actual.json");
         let _ = fs::write(&actual_path, &actual_text);
         panic!(

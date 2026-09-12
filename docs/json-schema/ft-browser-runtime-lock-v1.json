@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://frankenterm.dev/schemas/ft-browser-runtime-lock/v1.json",
   "title": "FrankenTerm browser runtime lock v1",
+  "description": "Pinned Node, Playwright, Chromium, protocol, and platform artifact identities with installation and free-space budgets for the browser runtime.",
   "type": "object",
   "additionalProperties": false,
   "required": [

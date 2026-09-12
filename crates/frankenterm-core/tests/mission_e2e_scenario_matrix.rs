@@ -161,7 +161,19 @@ fn nominal_multi_agent_multi_bead() {
 
 #[test]
 fn nominal_multi_cycle_steady_state() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // This synthetic steady workload reuses the same beads; isolate reporting
+    // from the independently tested repeat-assignment safety limiters.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        safety_envelope: MissionSafetyEnvelopeConfig {
+            max_consecutive_retries_per_bead: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let agents = vec![ready_agent("a1"), ready_agent("a2")];
     let issues = vec![
         bead("b1", BeadStatus::Open, 1),
@@ -632,7 +644,14 @@ fn emergency_manual_trigger_bypass_cadence() {
 
 #[test]
 fn emergency_recovery_full_lifecycle() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // Exercise fleet recovery independently of reassignment cooldown.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let issues = vec![
         bead("b1", BeadStatus::Open, 1),
         bead("b2", BeadStatus::Open, 2),

@@ -63,7 +63,7 @@ fn engine_retries_transient() {
                     async move {
                         let n = cc.fetch_add(1, Ordering::Relaxed);
                         if n < 2 {
-                            Err("read from mux socket timed out".into())
+                            Err("connect to mux socket timed out".into())
                         } else {
                             Ok(99)
                         }
@@ -75,6 +75,7 @@ fn engine_retries_transient() {
         assert_eq!(o.result.unwrap(), 99);
         assert_eq!(o.attempts, 3);
         assert_eq!(e.stats().transient_failures, 2);
+        assert_eq!(e.stats().recoverable_failures, 0);
     });
 }
 

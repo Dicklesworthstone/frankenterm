@@ -78,11 +78,15 @@ fn assert_event_delivery_lease_columns(conn: &Connection) {
     }
 }
 
-/// Insert one `output_segments` row (FK enforcement off so we don't have to
-/// seed the whole panes→output_segments chain) and return its id.
+/// Insert a real pane and its output segment, preserving foreign-key and
+/// scrollback-summary enforcement throughout the migration fixture.
 fn seed_output_segment(conn: &Connection, seq: i64) -> i64 {
-    conn.execute_batch("PRAGMA foreign_keys = OFF;")
-        .expect("disable FK for seeding");
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         INSERT INTO panes (pane_id, first_seen_at, last_seen_at)
+         VALUES (1, 1000, 1000);",
+    )
+    .expect("seed persisted pane and trigger-maintained scrollback summary");
     conn.execute(
         "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
          VALUES (1, ?1, 'x', 1, 1000)",
@@ -177,40 +181,61 @@ fn re_running_initialize_schema_is_idempotent_noop() {
 #[test]
 fn upgrade_from_seconds_default_at_v31_repairs_to_ms_preserving_rows() {
     let conn = Connection::open_in_memory().expect("in-memory sqlite");
-    initialize_schema(&conn).expect("fresh init");
+    conn.execute_batch(include_str!("fixtures/storage_schema_v31.sql"))
+        .expect("initialize historical v31 schema");
 
-    // Simulate a DB upgraded through v22/v23: an output segment, then
-    // segment_embeddings reverted to the LEGACY seconds default carrying a
-    // v30-normalized (ms) value, with user_version stamped back to 31 (pre-v32).
+    // The historical fixture includes the old migration tail, not future
+    // tables/triggers hidden behind a downgraded current-head version stamp.
+    assert_eq!(get_user_version(&conn).expect("legacy user_version"), 31);
+    for query in [
+        "SELECT schema_version FROM ft_meta WHERE id = 1",
+        "SELECT version FROM schema_version ORDER BY applied_at DESC, rowid DESC LIMIT 1",
+    ] {
+        assert_eq!(
+            conn.query_row(query, [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            31
+        );
+    }
+    assert!(!table_has_column(&conn, "events", "delivery_lease_token"));
+    assert!(!table_has_column(
+        &conn,
+        "session_checkpoints",
+        "checkpoint_role"
+    ));
+    for table in [
+        "policy_denied_audit",
+        "agent_profiles",
+        "profiles_applied_log",
+        "fleet_mutation_receipts",
+    ] {
+        assert!(table_exists(&conn, table), "v31 must include {table}");
+    }
+
+    // A real pane/segment carries the v30-normalized ms embedding value under
+    // the older seconds default that v32 must repair.
     let seg_id = seed_output_segment(&conn, 9);
-    conn.execute_batch(
-        "DROP TABLE segment_embeddings;
-         CREATE TABLE segment_embeddings (
-             segment_id INTEGER NOT NULL REFERENCES output_segments(id) ON DELETE CASCADE,
-             embedder_id TEXT NOT NULL,
-             dimension INTEGER NOT NULL,
-             vector BLOB NOT NULL,
-             embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-             PRIMARY KEY (segment_id, embedder_id)
-         );
-         CREATE INDEX IF NOT EXISTS idx_segment_embeddings_embedder
-             ON segment_embeddings(embedder_id);",
-    )
-    .expect("revert to legacy seconds-default table");
     conn.execute(
         "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
          VALUES (?1, 'e', 4, X'00', 1700000000000)",
         [seg_id],
     )
     .expect("seed ms-valued row under the seconds default");
-    conn.execute_batch("PRAGMA user_version = 31;")
-        .expect("stamp pre-v32 version");
+    assert!(
+        conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector)
+             VALUES (-1, 'orphan-negative-control', 4, X'00')",
+            [],
+        )
+        .is_err(),
+        "historical fixture must reject embeddings without a real output segment"
+    );
     assert!(
         !embedded_at_default(&conn).unwrap().contains("1000"),
         "fixture must start on the legacy seconds default"
     );
 
-    // Re-init applies the v32 repair and then the reversible v33 lease tail.
+    // Apply every real migration from v32 through the current head.
     initialize_schema(&conn).expect("upgrade 31 -> current head");
 
     assert_eq!(
@@ -237,6 +262,55 @@ fn upgrade_from_seconds_default_at_v31_repairs_to_ms_preserving_rows() {
         "v32 rebuild must leave no orphan legacy table"
     );
     assert_event_delivery_lease_columns(&conn);
+    assert_eq!(
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "migration must leave foreign-key enforcement enabled"
+    );
+    let preserved: (i64, String, i64, String, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT p.pane_id, p.domain, s.seq, s.content, e.dimension, e.vector
+             FROM panes p JOIN output_segments s ON s.pane_id = p.pane_id
+             JOIN segment_embeddings e ON e.segment_id = s.id
+             WHERE s.id = ?1 AND e.embedder_id = 'e'",
+            [seg_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("pane, segment, and full embedding survive upgrade");
+    assert_eq!(preserved, (1, "local".into(), 9, "x".into(), 4, vec![0]));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0,
+        "upgrade must preserve all foreign-key relationships"
+    );
+    conn.execute(
+        "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector)
+         VALUES (?1, 'after-upgrade', 4, X'00')",
+        [seg_id],
+    )
+    .expect("insert using repaired default");
+    let defaulted: i64 = conn.query_row(
+        "SELECT embedded_at FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = 'after-upgrade'",
+        [seg_id], |row| row.get(0),
+    ).unwrap();
+    assert!(
+        defaulted >= 100_000_000_000,
+        "repaired default must write epoch ms"
+    );
+    initialize_schema(&conn).expect("upgraded database reopens with current guards");
 }
 
 #[test]

@@ -9,9 +9,10 @@
 //!
 //! # Architecture
 //!
-//! Vendored crates use exclusively `smol` (68 references across 11 files)
-//! with zero tokio references. Three crates already have optional
-//! `async-asupersync` feature gates. The migration path is:
+//! The catalog starts from a historical source inventory and incorporates
+//! recorded migration updates, including codec's asupersync I/O path. Its
+//! reference counts are not a fresh source scan or evidence of which runtime
+//! executes in a selected feature set. The migration path is:
 //!
 //! ```text
 //! smol::block_on / smol::io  →  asupersync adapter  →  native asupersync

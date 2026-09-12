@@ -3,9 +3,9 @@
   "kind": "operating-envelope-convergence-attestation",
   "category": "proofs/robot-contracts",
   "release_version": "0.0.0-substrate",
-  "generated_at": "2026-06-14T15:58:06Z",
+  "generated_at": "2026-09-12T11:17:36Z",
   "produced_by_bead": "ft-booek.7",
-  "status": "blocked_rch_no_verdict",
+  "status": "passed_scoped_remote_pending_bundle_verification",
   "proof_categories": [4, 5],
   "scope": "Release-bundle attestation for the ft.operating_envelope.v1 read-only fail-closed admission contract, retained fixture/proof-calendar corpus, no-mock retained-run contract, operator runbook, and release-attestation wiring.",
   "contract": {
@@ -106,7 +106,7 @@
     {
       "claim_id": "operating_envelope.release_attestation_wiring",
       "bead_id": "ft-booek.7",
-      "readiness_state": "blocked_rch_no_verdict",
+      "readiness_state": "pending_bundle_verification",
       "evidence": [
         "docs/attestations/manifest.json",
         "docs/attestations/proofs/operating-envelope.json",
@@ -143,12 +143,55 @@
     "local_cargo_counted": false
   },
   "rch_proof": {
-    "status": "blocked_no_verdict",
+    "status": "passed_operating_envelope_scope",
     "remote_required": true,
     "local_cargo_counted": false,
     "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-booek7-cod10-target cargo test -p frankenterm-core --lib operating_envelope",
     "requested_target_dir": "/tmp/ft-booek7-cod10-target",
-    "blocking_reason": "No current RCH proof reached a passing cargo test summary. The first remote attempt failed during frankenterm-core compilation from shared dirty mcp_tools.rs state; the retry ran remotely but RCH history records it as cancelled before a cargo test summary.",
+    "blocking_reason": null,
+    "current_evidence": {
+      "worker": "ts1",
+      "worker_host": "ubuntu@100.74.254.33",
+      "platform": "Linux x86_64",
+      "base_sha": "f2b406a46474e29e5ade7a35c26a19d94dd32d08",
+      "remote_target_dir": "/home/ubuntu/rch/frankenterm/.rch-target-ts1-pool-976f2216c532a80ff79f16d1140be4c1",
+      "scope_hash_receipt": "/tmp/ft-8r43i.5kXohF/operating-envelope-1115-remote.sha256",
+      "scope_hash_receipt_sha256": "2e989482760cad2075858d5bd8e43dd5172a48b05ccab8e9d5c4cdd2b0eb020c",
+      "scope_hashes_match_current_source": true,
+      "runs": [
+        {
+          "source_snapshot": "af0a3623dafdf604",
+          "log": "/tmp/ft-8r43i.5kXohF/rch-ts1-atomic-producers-1115.log",
+          "log_sha256": "44484d8cb0cb55d861a10c44e9cf6e2ac0d7193e8dd54b9b24f6b225bfaac45f",
+          "command": "env CARGO_HOME=/home/ubuntu/rch/cargo-cache-frankenterm-ts1 TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j8 -p frankenterm-core -p frankenterm-redactor --lib --example lindley_bounds_build --test attestation_manifest_schema --test operating_envelope_schema --test mcp_conformance_additional_tools --features vendored --locked --no-fail-fast -- --test-threads=4 --nocapture",
+          "cargo_reached_remote": true,
+          "tests_reached": true,
+          "operating_envelope_library_passed": 41,
+          "operating_envelope_schema_passed": 3,
+          "operating_envelope_failed": 0,
+          "remote_command_exit_code": 101,
+          "aggregate_verdict": "failed_unrelated_tests_not_counted_as_aggregate_pass"
+        },
+        {
+          "source_snapshot": "c51394b816ffb44c",
+          "log": "/tmp/ft-8r43i.5kXohF/rch-ts1-doctor-abort-final-1208.log",
+          "log_sha256": "f27204c7bc81ece2626cd2a25a12e3ed007fe1cc835fd543850fb6ac525af62d",
+          "command": "env CARGO_HOME=/home/ubuntu/rch/cargo-cache-frankenterm-ts1 TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j8 -p frankenterm-core -p frankenterm --lib --bin ft --test cli_contract_tests --test mcp_conformance_additional_tools --test typed_client_integration --test proptest_robot_types --features mcp --locked --no-fail-fast -- --test-threads=4 --nocapture",
+          "cargo_reached_remote": true,
+          "tests_reached": true,
+          "operating_envelope_library_passed": 41,
+          "core_library_passed": 31554,
+          "core_library_failed": 0,
+          "core_library_ignored": 5,
+          "remote_command_exit_code": 101,
+          "aggregate_verdict": "core_library_passed_command_failed_separate_cli_unit_cli_parity_and_mcp_fixture_tests",
+          "source_hash_boundary": "The seven-file operating-envelope scope was hashed on the 1115 worker. This later full-core run is supplementary execution evidence; its transient source directory was no longer available for an independent post-run hash read."
+        }
+      ],
+      "release_ready": false,
+      "remaining_closeout": "Root must retain these log bytes in the release evidence bundle, verify manifest completeness and unsigned development bundle round-trip, and bind final release source/profile/targets through DSR. Neither aggregate RCH command exited zero. No target-class capacity claim is promoted."
+    },
+    "historical_attempts_note": "The following June attempts are retained as history and superseded for scoped runtime execution by the September receipts above.",
     "attempts": [
       {
         "status": "compile_failed",
@@ -228,8 +271,14 @@
     {
       "path": "crates/frankenterm-core/src/operating_envelope.rs",
       "media_type": "text/plain",
-      "sha256": "c7e2c1217cec9570e67087bcdbcee1ea042abb9a3fdc52cfd80ce56b7d3ea47e",
-      "size_bytes": 165155
+      "sha256": "b5227a9e9d49d976bef9a2f4a1bfe1a9def3816b8d2f083c8414b6673346e61c",
+      "size_bytes": 179666
+    },
+    {
+      "path": "crates/frankenterm-core/tests/operating_envelope_schema.rs",
+      "media_type": "text/plain",
+      "sha256": "cb8b0478cfd60ed71919912ee4531549beea5b0e0d3df1ce2bdbf6029c2f11e3",
+      "size_bytes": 8345
     },
     {
       "path": "docs/robot-contracts/operating-envelope.md",
@@ -252,26 +301,26 @@
     {
       "path": "docs/attestations/manifest.json",
       "media_type": "application/json",
-      "sha256": "f903e0875ede7ca87aab1070ebcfd6d5451d86b6ec96a2529f91d145b92c704d",
-      "size_bytes": 15999
+      "sha256": "f98ae570dc007a7e05924b7fdbc93b69fb2a13a6f2246b2881998d0ea78c5313",
+      "size_bytes": 17070
     },
     {
       "path": "crates/frankenterm-core/tests/attestation_manifest_completeness.rs",
       "media_type": "text/plain",
-      "sha256": "162f66e87aca3471bbacbbeca2a72c84514940ebf2b0c5d75bf921b7db42771b",
-      "size_bytes": 37097
+      "sha256": "bb4cf8d84b99345efe1da5927add8cfdb2a18a181c5ba9c1296db910b1ccb265",
+      "size_bytes": 37728
     },
     {
       "path": "README.md",
       "media_type": "text/markdown",
-      "sha256": "a61a1854ac42ed4e3a994fe74432a81b36227f032ab0010c439617ccd8adeb52",
-      "size_bytes": 254092
+      "sha256": "bbcd1a0dd354975a5c888f738eab195577fa13cb825151979e3d21fb9cee1ee7",
+      "size_bytes": 285300
     },
     {
       "path": "docs/release/attestation-checklist.md",
       "media_type": "text/markdown",
-      "sha256": "5b16ca31c390a4afd471015c1d0854d0939ca4f9f8713f967229e4b95c494f98",
-      "size_bytes": 11972
+      "sha256": "a883e741f92b81b4fffd9e7cec5aecef0ea557591c5c9e6068fb02b7fa958a96",
+      "size_bytes": 16473
     }
   ],
   "release_bundle": {
@@ -279,6 +328,22 @@
     "manifest_category": "proofs/robot-contracts",
     "manifest_slot_path": "docs/attestations/proofs/operating-envelope.json",
     "required_category": true,
-    "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into dev and release bundles."
+    "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into dev and release bundles.",
+    "development_verification": {
+      "status": "passed_for_prior_artifact_bytes",
+      "build_exit_code": 0,
+      "verify_exit_code": 0,
+      "artifact_count": 30,
+      "deferred_slot_count": 2,
+      "bundle": "/tmp/ft-8r43i.5kXohF/attestation-producers-1250/0.0.0-dev.json",
+      "build_log": "/tmp/ft-8r43i.5kXohF/attestation-producers-1250-build.log",
+      "build_log_sha256": "a7a92c510045b55fde481ba2b23e6d477213913d96c62e0523c43d23d137c3b1",
+      "verify_log": "/tmp/ft-8r43i.5kXohF/attestation-producers-1250-verify.log",
+      "verify_log_sha256": "29faa68bee3c66a968389cc2d59e41c22c2f370823ead91c83b8d5e97e78271a",
+      "verification_mode": "development_integrity",
+      "publisher_authenticated": false,
+      "release_ready": false,
+      "boundary": "This retained unsigned round-trip predates the present evidence update and verifies the artifact bytes then bundled, not this edited file. Rebuild and reverify after final artifact/manifest freeze. Refresh the nested manifest digest when the Doctor slot or any other manifest entry changes; two deferred slots still prevent release qualification."
+    }
   }
 }

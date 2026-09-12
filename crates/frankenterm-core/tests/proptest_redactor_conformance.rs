@@ -83,6 +83,7 @@ const JWT_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXN1YmplY3QifQ.abc
 // so the sample embeds that name (the match span covers name + value).
 const AWS_SECRET_KEY: &str = "aws_secret_access_key=aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd"; // value = exactly 40
 const BEARER_TOKEN: &str = "Bearer aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"; // bearer + 36 body
+const HTTP_BASIC_AUTH: &str = "Authorization: Basic dXNlcjpleGFtcGxl"; // synthetic user:example
 const DATADOG_API_KEY: &str = "DATADOG_API_KEY=0123456789abcdef0123456789abcdef"; // 32 hex
 // Keyed / generic / URL patterns. The match span covers the secret
 // value (database_url redacts the password segment up to `@`); each
@@ -157,6 +158,7 @@ const ALL_KNOWN_FORMATS: &[(&str, &str)] = &[
     ("sendgrid_key", SENDGRID_KEY),
     ("datadog_api_key", DATADOG_API_KEY),
     ("bearer_token", BEARER_TOKEN),
+    ("http_basic_auth", HTTP_BASIC_AUTH),
     ("jwt_token", JWT_TOKEN),
     ("ai_provider_keyed_value", AI_PROVIDER_KEYED_VALUE),
     ("generic_api_key", GENERIC_API_KEY),
@@ -316,7 +318,7 @@ fn catalog_pattern_names_match_ordered_golden() {
     // ft-llko1 GOLDEN-ARTIFACT pin: the exact ordered SECRET_PATTERNS catalog.
     //
     // Priority order is load-bearing — `detect()`/`redact()` resolve overlaps
-    // by THIS order, so every specific provider pattern MUST precede the generic
+    // by THIS order. Provider patterns generally precede the generic
     // fallbacks (the invariant ft-uu4b8 / ft-b1p6x depend on: e.g. `anthropic_key`
     // / `google_api_key` ahead of `generic_api_key`). The set-based
     // `every_catalog_pattern_has_smoke_coverage` drift guard catches ADDITIONS
@@ -340,9 +342,9 @@ fn catalog_pattern_names_match_ordered_golden() {
         "aws_access_key_id",
         "aws_secret_key",
         "bearer_token",
+        "http_basic_auth",
         "slack_token",
         "stripe_key",
-        "twilio_account_sid",
         "sendgrid_key",
         "datadog_api_key",
         "database_url",
@@ -355,6 +357,7 @@ fn catalog_pattern_names_match_ordered_golden() {
         "generic_token",
         "generic_password",
         "generic_secret",
+        "twilio_account_sid",
     ];
     let live: Vec<&'static str> = frankenterm_core::redactor::secret_pattern_names().collect();
     assert_eq!(
@@ -369,18 +372,40 @@ fn catalog_pattern_names_match_ordered_golden() {
         GOLDEN,
         "ft-llko1: catalog name/order drift (add/remove/reorder) — update GOLDEN deliberately in the same commit"
     );
-    // Concrete priority invariant the order encodes: the generic fallbacks form a
-    // contiguous lowest-priority tail, so no generic can pre-empt a specific
-    // provider pattern in detect()/redact() overlap resolution.
+    // Twilio is the deliberate exception: its fixed-length bare SID match must
+    // follow keyed-value redaction or it can leave a longer keyed secret's tail.
     let first_generic = live
         .iter()
         .position(|name| name.starts_with("generic_"))
         .expect("ft-llko1: at least one generic_* fallback must exist");
-    assert!(
-        live[first_generic..]
-            .iter()
-            .all(|name| name.starts_with("generic_")),
-        "ft-llko1: generic_* fallbacks must be a contiguous lowest-priority tail: {live:?}"
+    assert_eq!(
+        &live[first_generic..],
+        &[
+            "generic_api_key",
+            "generic_token",
+            "generic_password",
+            "generic_secret",
+            "twilio_account_sid"
+        ],
+        "generic fallbacks must precede only the deliberate fixed-length Twilio exception"
+    );
+}
+
+#[test]
+fn keyed_twilio_prefix_cannot_expose_a_longer_secret_suffix() {
+    let redactor = Redactor::new();
+    // A premature SID replacement consumes AC + 32 hex digits and leaves the
+    // remaining 16 hex digits outside the keyed pattern's replacement.
+    let hex = "0123456789abcdef".repeat(3);
+    for key in ["api_key", "token", "password", "secret"] {
+        let input = format!("{key}=AC{hex}");
+        assert_eq!(redactor.redact(&input), "[REDACTED]");
+    }
+    let sid = format!("AC{}", "0123456789abcdef".repeat(2));
+    assert_eq!(redactor.redact(&sid), "[REDACTED]");
+    assert_eq!(
+        redactor.redact("ordinary public text"),
+        "ordinary public text"
     );
 }
 

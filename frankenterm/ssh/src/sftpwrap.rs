@@ -78,7 +78,10 @@ impl SftpWrap {
             Self::Ssh2(sftp) => Ok(sftp.symlink(path.as_std_path(), target.as_std_path())?),
 
             #[cfg(feature = "libssh-rs")]
-            Self::LibSsh(sftp) => Ok(sftp.symlink(target.as_str(), path.as_str())?),
+            // libssh's C API takes the link payload first, then the new link's
+            // name. The libssh-rs 0.3.8 parameter documentation reverses these
+            // meanings, but its implementation forwards directly to that API.
+            Self::LibSsh(sftp) => Ok(sftp.symlink(path.as_str(), target.as_str())?),
         }
     }
 

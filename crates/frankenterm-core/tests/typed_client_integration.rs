@@ -950,15 +950,72 @@ fn compatible_schemas_have_no_field_drift() {
         }
 
         let schema = load_schema(file);
-        let props = schema_property_names(&schema);
-        let required = schema_required_fields(&schema);
-
-        // Schemas not in drift set should have their required fields documented
+        // Supplemental bundles express their field surfaces through local refs
+        // in oneOf. Validate each branch instead of requiring root properties.
         assert!(
-            !required.is_empty() || !props.is_empty(),
+            has_documented_field_surface(&schema, &schema, 16),
             "{}: Schema has no properties or required fields — check if it needs typing",
             file
         );
+    }
+}
+
+fn has_documented_field_surface(schema: &Value, root: &Value, remaining: usize) -> bool {
+    fields_are_documented(schema, root, remaining, &HashSet::new())
+}
+
+fn fields_are_documented(
+    schema: &Value,
+    root: &Value,
+    remaining: usize,
+    inherited: &HashSet<String>,
+) -> bool {
+    if remaining == 0 {
+        return false;
+    }
+    // oneOf variants refine their enclosing object's fields; a branch's
+    // `required` list need not repeat declarations from the parent schema.
+    let mut props = inherited.clone();
+    props.extend(schema_property_names(schema));
+    if !schema_required_fields(schema).is_subset(&props) {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref") {
+        return reference
+            .as_str()
+            .and_then(|value| value.strip_prefix('#'))
+            .and_then(|pointer| root.pointer(pointer))
+            .is_some_and(|target| fields_are_documented(target, root, remaining - 1, &props));
+    }
+    if let Some(branches) = schema.get("oneOf") {
+        return branches.as_array().is_some_and(|branches| {
+            !branches.is_empty()
+                && branches
+                    .iter()
+                    .all(|branch| fields_are_documented(branch, root, remaining - 1, &props))
+        });
+    }
+    !props.is_empty()
+}
+
+#[test]
+fn field_surface_validation_rejects_broken_or_empty_union_branches() {
+    let valid = json!({"oneOf": [{"$ref": "#/$defs/item"}], "$defs": {
+        "item": {"properties": {"id": {"type": "string"}}, "required": ["id"]}
+    }});
+    assert!(has_documented_field_surface(&valid, &valid, 16));
+    let refinement = json!({"properties": {"id": {"type": "string"}},
+        "oneOf": [{"required": ["id"]}]});
+    assert!(has_documented_field_surface(&refinement, &refinement, 16));
+    for invalid in [
+        json!({"oneOf": []}),
+        json!({"oneOf": [{}]}),
+        json!({"$ref": "#/$defs/missing"}),
+        json!({"$ref": "#"}),
+        json!({"properties": {"id": {}}, "required": ["missing"]}),
+        json!({"properties": {"id": {}}, "oneOf": [{"required": ["missing"]}]}),
+    ] {
+        assert!(!has_documented_field_surface(&invalid, &invalid, 16));
     }
 }
 
@@ -1013,11 +1070,11 @@ fn representative_public_error_codes_parse_correctly() {
         ("robot.mission_error", ErrorCategory::Workflow, false),
         ("robot.tx_error", ErrorCategory::Workflow, false),
         ("robot.timeout", ErrorCategory::Network, true),
-        ("robot.cass_timeout", ErrorCategory::Network, false),
+        ("robot.cass_timeout", ErrorCategory::Network, true),
         ("robot.config_error", ErrorCategory::Config, false),
         ("robot.feature_not_available", ErrorCategory::Config, false),
         ("robot.internal_error", ErrorCategory::Internal, false),
-        ("robot.code_not_found", ErrorCategory::Internal, false),
+        ("robot.code_not_found", ErrorCategory::Config, false),
     ];
 
     for (code_str, expected_category, retryable) in codes {

@@ -51,7 +51,7 @@ fn declarations() -> Vec<DecisionApiDeclaration> {
             "crates/frankenterm-core/src/runtime.rs",
         ),
         (
-            "check_dedup",
+            "acquire_durable_reservation",
             "crates/frankenterm-core/src/tx_idempotency.rs",
         ),
         (

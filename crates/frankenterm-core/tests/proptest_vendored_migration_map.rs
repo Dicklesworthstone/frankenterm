@@ -272,9 +272,14 @@ fn ssh_depends_on_wave0_crates() {
 }
 
 #[test]
-fn total_refs_match_inventory() {
+fn total_refs_include_codec_migration_since_baseline_inventory() {
     let map = build_canonical_map();
-    // From asupersync-runtime-inventory.json: vendored smol = 68, asupersync = 7
-    assert_eq!(map.global_smol_refs, 68);
-    assert_eq!(map.global_asupersync_refs, 7);
+    // The February inventory predates codec's migration from 12 smol / 1
+    // asupersync references to 6 / 3. This catalog is a migration snapshot,
+    // not a fresh text scan or proof of active runtime paths.
+    let codec = map.get("codec").unwrap();
+    assert_eq!(codec.total_smol_refs, 6);
+    assert_eq!(codec.total_asupersync_refs, 3);
+    assert_eq!(map.global_smol_refs, 68 - 12 + 6);
+    assert_eq!(map.global_asupersync_refs, 7 - 1 + 3);
 }

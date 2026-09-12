@@ -16,7 +16,7 @@ use frankenterm_core::storage::{
     ActionUndoRecord, AuditActionRecord, PaneRecord, StorageHandle, WorkflowRecord, now_ms,
 };
 use frankenterm_core::undo::{UndoExecutor, UndoOutcome, UndoRequest};
-use frankenterm_core::wezterm::MockWezterm;
+use frankenterm_core::wezterm::{MockWezterm, MuxInterface};
 use std::sync::Arc;
 
 // ===========================================================================
@@ -548,7 +548,7 @@ fn undo_pane_close_nonexistent_pane_returns_not_applicable() {
 }
 
 #[test]
-fn undo_pane_close_no_pane_id_returns_not_applicable() {
+fn undo_pane_close_present_payload_without_target_fails_closed() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -574,15 +574,24 @@ fn undo_pane_close_no_pane_id_returns_not_applicable() {
             .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
-        // No pane added to mock — and action has pane_id=1 but no default pane in mock
-        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        mock.add_default_pane(1).await;
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
         let result = executor
             .execute(UndoRequest::new(action_id))
             .await
             .expect("result");
 
-        // Falls back to action's pane_id, but mock has no pane 1 → not applicable
-        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        // Present payloads are authoritative: a missing target must never
+        // redirect the operation to an otherwise valid legacy action target.
+        assert_eq!(result.outcome, UndoOutcome::Failed);
+        assert!(result.message.contains("missing `pane_id`"));
+        assert!(
+            mock.get_pane(1).await.is_ok(),
+            "must not close fallback pane"
+        );
+        let undo = storage.get_action_undo(action_id).await.unwrap().unwrap();
+        assert!(undo.undone_at.is_none());
+        assert!(undo.undone_by.is_none());
 
         storage.shutdown().await.expect("shutdown");
     });
@@ -604,13 +613,7 @@ fn undo_workflow_abort_no_execution_id_returns_not_applicable() {
         let action_id = seed_action(storage.as_ref(), 1, "workflow", None, "workflow_start").await;
 
         storage
-            .upsert_action_undo(make_undo(
-                action_id,
-                "workflow_abort",
-                true,
-                None,
-                Some(r#"{"no_exec_id": true}"#),
-            ))
+            .upsert_action_undo(make_undo(action_id, "workflow_abort", true, None, None))
             .await
             .expect("undo metadata");
 
@@ -622,6 +625,25 @@ fn undo_workflow_abort_no_execution_id_returns_not_applicable() {
             .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+
+        // A present but incomplete payload is invalid, unlike NULL legacy
+        // metadata. It must not silently become a no-target success/no-op.
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                None,
+                Some(r#"{"no_exec_id": true}"#),
+            ))
+            .await
+            .expect("invalid target metadata");
+        let invalid = executor.execute(UndoRequest::new(action_id)).await.unwrap();
+        assert_eq!(invalid.outcome, UndoOutcome::Failed);
+        assert!(invalid.message.contains("missing `execution_id`"));
+        let undo = storage.get_action_undo(action_id).await.unwrap().unwrap();
+        assert!(undo.undone_at.is_none());
+        assert!(undo.undone_by.is_none());
 
         storage.shutdown().await.expect("shutdown");
     });
@@ -744,15 +766,9 @@ fn undo_pane_close_falls_back_to_action_pane_id() {
         seed_pane(storage.as_ref(), pane_id).await;
         let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
-        // Payload has no pane_id key
+        // Only absent legacy payloads may fall back to action metadata.
         storage
-            .upsert_action_undo(make_undo(
-                action_id,
-                "pane_close",
-                true,
-                None,
-                Some(r#"{"reason": "test"}"#),
-            ))
+            .upsert_action_undo(make_undo(action_id, "pane_close", true, None, None))
             .await
             .expect("undo metadata");
 
@@ -766,6 +782,14 @@ fn undo_pane_close_falls_back_to_action_pane_id() {
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert_eq!(result.target_pane_id, Some(pane_id));
+
+        assert!(
+            mock.get_pane(pane_id).await.is_err(),
+            "fallback target must close"
+        );
+        let undo = storage.get_action_undo(action_id).await.unwrap().unwrap();
+        assert!(undo.undone_at.is_some());
+        assert_eq!(undo.undone_by.as_deref(), Some("fallback-test"));
 
         storage.shutdown().await.expect("shutdown");
     });

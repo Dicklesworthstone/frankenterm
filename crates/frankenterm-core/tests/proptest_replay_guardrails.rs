@@ -15,7 +15,7 @@
 //! - GR-12: GuardrailReport serde roundtrip
 //! - GR-13: Report is_safe when no violations
 //! - GR-14: Report not is_safe when halted
-//! - GR-15: Disabled limits (0) never trigger
+//! - GR-15: Invalid zero limits fall back to enforced safe defaults
 //! - GR-16: Event count matches number of record_event calls
 //! - GR-17: Violations list grows on limit breach
 
@@ -24,6 +24,18 @@ use proptest::prelude::*;
 use frankenterm_core_replay::replay_guardrails::{
     CheckResult, ConcurrencyGate, GuardrailReport, LimitViolation, ResourceLimits, ResourceTracker,
 };
+
+/// Isolate one guardrail without invalid zero values, which intentionally
+/// cause the constructor to replace the entire configuration with defaults.
+fn isolated_limits() -> ResourceLimits {
+    ResourceLimits {
+        max_events: u64::MAX,
+        max_wall_clock_ms: u64::MAX,
+        memory_warning_events: u64::MAX,
+        watchdog_timeout_ms: u64::MAX,
+        ..Default::default()
+    }
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -34,10 +46,7 @@ proptest! {
     fn gr1_halt_at_limit(limit in 1u64..100) {
         let limits = ResourceLimits {
             max_events: limit,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         // Events 1..limit should be Ok.
@@ -58,10 +67,7 @@ proptest! {
     fn gr2_ok_within_limit(n in 1u64..50) {
         let limits = ResourceLimits {
             max_events: n + 10, // Well above n.
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..n {
@@ -75,11 +81,8 @@ proptest! {
     #[test]
     fn gr3_wall_clock_halt(limit_ms in 100u64..10000, overshoot in 1u64..5000) {
         let limits = ResourceLimits {
-            max_events: 0,
             max_wall_clock_ms: limit_ms,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         // Within limit.
@@ -95,11 +98,8 @@ proptest! {
     #[test]
     fn gr4_memory_warning_once(threshold in 3u64..30) {
         let limits = ResourceLimits {
-            max_events: 0,
-            max_wall_clock_ms: 0,
             memory_warning_events: threshold,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         let mut warnings = 0;
@@ -132,10 +132,7 @@ proptest! {
     fn gr6_watchdog_stall(timeout_ms in 100u64..5000, overshoot in 1u64..1000) {
         let limits = ResourceLimits {
             watchdog_timeout_ms: timeout_ms,
-            max_events: 0,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         tracker.record_event(100); // Last progress at 100ms.
@@ -244,13 +241,7 @@ proptest! {
 
     #[test]
     fn gr13_report_safe(n in 1u64..30) {
-        let limits = ResourceLimits {
-            max_events: 0,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
-        };
+        let limits = isolated_limits();
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..n {
             tracker.record_event(i);
@@ -265,10 +256,7 @@ proptest! {
     fn gr14_report_not_safe(limit in 1u64..20) {
         let limits = ResourceLimits {
             max_events: limit,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..(limit + 5) {
@@ -278,10 +266,10 @@ proptest! {
         prop_assert!(report.halted_by_guardrail);
     }
 
-    // ── GR-15: Disabled limits never trigger ────────────────────────────
+    // ── GR-15: Invalid zero limits retain safe default enforcement ───────
 
     #[test]
-    fn gr15_disabled_limits(n in 1u64..200) {
+    fn gr15_zero_limits_enforce_defaults(n in 1u64..200) {
         let limits = ResourceLimits {
             max_events: 0,
             max_wall_clock_ms: 0,
@@ -295,19 +283,21 @@ proptest! {
             prop_assert_eq!(result, CheckResult::Ok);
         }
         prop_assert!(!tracker.is_halted());
+        let defaults = ResourceLimits::default();
+        let result = tracker.record_event(defaults.max_wall_clock_ms + 1);
+        let expected = CheckResult::Halt(LimitViolation::MaxWallClock {
+            limit_ms: defaults.max_wall_clock_ms,
+            elapsed_ms: defaults.max_wall_clock_ms + 1,
+        });
+        prop_assert_eq!(result, expected);
+        prop_assert!(tracker.is_halted());
     }
 
     // ── GR-16: Event count matches ──────────────────────────────────────
 
     #[test]
     fn gr16_event_count(n in 1u64..100) {
-        let limits = ResourceLimits {
-            max_events: 0,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
-        };
+        let limits = isolated_limits();
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..n {
             tracker.record_event(i);
@@ -321,10 +311,7 @@ proptest! {
     fn gr17_violations_grow(limit in 1u64..10) {
         let limits = ResourceLimits {
             max_events: limit,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            watchdog_timeout_ms: 0,
-            ..Default::default()
+            ..isolated_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..(limit + 3) {

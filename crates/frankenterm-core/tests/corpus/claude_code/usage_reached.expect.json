@@ -6,7 +6,7 @@
     "extracted": {
       "retry_after": "15 minutes"
     },
-    "matched_text": "try again in 15 minutes",
+    "matched_text": "rate limit reached; try again in 15 minutes",
     "rule_id": "claude_code.rate_limit.detected",
     "severity": "critical"
   },
@@ -28,7 +28,7 @@
     "extracted": {
       "retry_after": "15 minutes"
     },
-    "matched_text": "try again in 15 minutes",
+    "matched_text": "rate limit reached; try again in 15 minutes",
     "rule_id": "codex.rate_limit.detected",
     "severity": "critical"
   },
@@ -39,7 +39,7 @@
     "extracted": {
       "retry_after": "15 minutes"
     },
-    "matched_text": "try again in 15 minutes",
+    "matched_text": "rate limit reached; try again in 15 minutes",
     "rule_id": "gemini.rate_limit.detected",
     "severity": "critical"
   }

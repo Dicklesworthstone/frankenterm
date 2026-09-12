@@ -53,6 +53,26 @@ declare -a GATE_NAMES=() GATE_CMDS=() GATE_KINDS=()
 gate() { GATE_NAMES+=("$1"); GATE_CMDS+=("$2"); GATE_KINDS+=("static"); }
 cargo_gate() { GATE_NAMES+=("$1"); GATE_CMDS+=("$2"); GATE_KINDS+=("cargo"); }
 
+# Filtered Cargo success can mean zero tests. Retain the transcript and require
+# both the named oracle and its successful, nonempty libtest summary.
+doctor_cargo_test() {
+  local required_test="$1" expected_count="$2" transcript status
+  shift 2
+  transcript=$(mktemp "${TMPDIR:-/tmp}/ft-doctor-cargo.XXXXXXXX") || return 1
+  printf 'Retained Doctor Cargo transcript: %s\n' "$transcript"
+  cargo test "$@" >"$transcript" 2>&1
+  status=$?
+  cat "$transcript"
+  [[ $status -eq 0 ]] || return "$status"
+  grep -Fqx "test $required_test ... ok" "$transcript" || return 1
+  if [[ "$expected_count" == 1 ]]; then
+    grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$transcript"
+  else
+    grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$transcript"
+  fi
+}
+export -f doctor_cargo_test
+
 # --- Source doctrine -------------------------------------------------------
 gate "asupersync test-only doctrine"            "scripts/check_asupersync_test_only.sh"
 gate "runtime_compat residuals"                  "scripts/check_runtime_compat_residuals.sh"
@@ -92,13 +112,13 @@ gate "deferred proof queue surface contract"     "tests/e2e/test_deferred_proof_
 gate "deferred proof receipt contract"           "tests/e2e/test_deferred_proof_receipt_contract.sh"
 gate "deferred proof replay harness contract"    "tests/e2e/test_deferred_proof_replay_harness_contract.sh"
 gate "adversarial contract-fuzz manifest"        "tests/e2e/test_adversarial_contract_fuzz_manifest.sh"
-gate "Robot/MCP Contract Doctor static verdict"  "bash scripts/check-contract-doctor-coverage.sh"
+gate "Robot/MCP Contract Doctor static verdict"  "bash scripts/check-contract-doctor-coverage.sh --strict"
 # The doctor slot may be populated (producer closed) or explicitly deferred to
 # its producer bead; either is an honest manifest state. A silently missing
 # slot is the failure.
 gate "Robot/MCP Contract Doctor attestation slot" "jq -e '.slots[] | select(.category == \"proofs/robot-contracts\") | select((.path == \"docs/attestations/proofs/robot-contract-doctor.json\" and .produced_by_bead == \"ft-7h5da.13.7\") or (.path == null and .deferred_to_bead == \"ft-7h5da.13.7\")) | select(.proof_categories | index(4))' docs/attestations/manifest.json"
 gate "Robot/MCP Contract Doctor verdict contract" "tests/e2e/test_robot_contract_doctor_verdict_contract.sh"
-cargo_gate "Robot/MCP Contract Doctor cargo verdict" "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
+cargo_gate "Robot/MCP Contract Doctor cargo verdict" "bash scripts/check-contract-doctor-coverage.sh --strict && cargo test -p frankenterm-core --features mcp --locked --no-fail-fast --lib --test conformance_robot_api_surface_coverage --test conformance_robot_envelope_schema --test mcp_conformance --test mcp_conformance_core_tools --test mcp_conformance_additional_tools --test mcp_conformance_mission_tx --test mcp_conformance_rules_test --test wa_state_mcp_conformance --test wa_events_mcp_conformance --test wa_event_mutations_mcp_conformance --test wa_reservations_mcp_conformance --test wa_mission_toon_mcp_conformance --test wa_tx_toon_mcp_conformance --test metamorphic_robot_envelope_canon --test proptest_toon_roundtrip --test toon_golden -- --nocapture && doctor_cargo_test contract_doctor_cli_mcp_read_and_refresh_parity 1 -p frankenterm --features mcp --locked --no-fail-fast --test cli_contract_tests contract_doctor_cli_mcp_read_and_refresh_parity -- --exact --nocapture --color never && doctor_cargo_test tests::workflow_dry_run_report_includes_steps positive -p frankenterm --features mcp --locked --no-fail-fast --bin ft workflow_dry_run_report -- --nocapture --color never && doctor_cargo_test tests::redact_pane_text_results_for_output_scrubs_ok_and_error_payloads 1 -p frankenterm --features mcp --locked --no-fail-fast --bin ft tests::redact_pane_text_results_for_output_scrubs_ok_and_error_payloads -- --exact --nocapture --color never"
 # --- Web API liveness ------------------------------------------------------
 # v0.15.1 shipped an `ft web` that bound its port and never answered a single
 # request (ft-xxfwy.38 / plan G80): fastapi-http's accept timeout was judged

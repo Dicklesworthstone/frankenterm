@@ -1,29 +1,27 @@
 {
   "artifacts": {
-    "ci_upload_roots": [
-      "target/gpu-regression/macos-15/",
-      "target/gpu-regression/macos-15-self-test/",
-      "target/gpu-regression/linux-llvmpipe-goldens/",
-      "target/gpu-regression/linux-llvmpipe-self-test/",
-      "target/gpu-regression/linux-golden-capture/",
-      "target/gpu-regression/linux-namespace-validate/",
-      "target/gpu-regression/linux-vs-macos/"
-    ],
+    "run_directory": "GPU_HARNESS_RUN_DIR or /tmp/gpu-harness-<timestamp>-<pid>",
     "failure_globs": [
       "diffs/*.actual.png",
       "diffs/*.diff.png",
       "diffs/*.report.json"
     ],
-    "runtime_report": "target/gpu-regression/<runner>/render-parity-gpu.json",
-    "summary": "target/gpu-regression/<runner>/summary.json"
+    "runtime_report": "<run_directory>/render-parity-gpu.json",
+    "summary": "<run_directory>/summary.json",
+    "events": "<run_directory>/events.jsonl",
+    "log": "<run_directory>/run.log"
   },
   "category": "tui/render-parity",
-  "ci_contract": {
-    "hard_gate_job": "gpu-regression-macos",
-    "hard_gate_runner": "macos-15",
-    "nightly_trigger": ".github/workflows/ci.yml schedule",
-    "soft_pilot_job": "gpu-linux-llvmpipe-pilot",
-    "stable_required_check": "GPU Regression Required"
+  "verification_contract": {
+    "development_entrypoint": "scripts/test-gpu-harness.sh",
+    "development_execution": "strict remote RCH with headless-render enabled",
+    "release_orchestrator": "dsr",
+    "release_evidence": "Retain native DSR receipts bound to the candidate source and actual adapter. A software-adapter or renderer-free fixture pass does not establish native GPU parity or resize latency."
+  },
+  "current_status": {
+    "state": "contract_scaffold",
+    "production_evidence_required": true,
+    "reason": "This file describes thresholds and evidence paths. It contains no executed fixture verdict or native rendering measurement."
   },
   "default_thresholds": {
     "max_changed_pixel_fraction": 0.001,

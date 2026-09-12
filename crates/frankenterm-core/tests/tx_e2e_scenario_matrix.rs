@@ -454,7 +454,11 @@ fn sc6_auto_rollback_success() {
     let mut comp_contract = contract.clone();
     comp_contract.lifecycle_state = MissionTxState::Compensating;
 
-    let comp_inputs = success_comp_inputs(NUM_STEPS);
+    let invalid_inputs = success_comp_inputs(NUM_STEPS);
+    let error = execute_compensation_phase(&comp_contract, &commit_report, &invalid_inputs, 20_000)
+        .expect_err("failed and skipped steps cannot authorize rollback work");
+    assert!(error.contains("uncommitted step_id s3"));
+    let comp_inputs = success_comp_inputs(2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
@@ -511,7 +515,7 @@ fn sc7_partial_rollback_failure() {
     comp_contract.lifecycle_state = MissionTxState::Compensating;
 
     // Compensation for step 2 fails.
-    let comp_inputs = partial_comp_inputs(NUM_STEPS, 2);
+    let comp_inputs = partial_comp_inputs(2, 2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
@@ -711,7 +715,7 @@ fn resume_after_full_pipeline() {
     .unwrap();
 
     let comp_contract = build_contract("resume4", NUM_STEPS, MissionTxState::Compensating);
-    let comp_inputs = success_comp_inputs(NUM_STEPS);
+    let comp_inputs = success_comp_inputs(2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
@@ -759,23 +763,27 @@ fn receipt_chain_continuity_across_phases() {
     // Pass commit receipts via the contract for continuity.
     comp_contract.receipts = commit_report.receipts.clone();
 
-    let comp_inputs = success_comp_inputs(NUM_STEPS);
+    let comp_inputs = success_comp_inputs(2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
     assert_receipts_monotonic(&comp_report.receipts, "chain1:comp");
 
     // Compensation receipts start after commit receipts.
-    if let (Some(last_commit), Some(first_comp)) =
-        (commit_report.receipts.last(), comp_report.receipts.first())
-    {
-        assert!(
-            receipt_seq(first_comp) > receipt_seq(last_commit),
-            "[chain1] comp receipts should continue from commit: {} -> {}",
-            receipt_seq(last_commit),
-            receipt_seq(first_comp)
-        );
-    }
+    let last_commit = commit_report
+        .receipts
+        .last()
+        .expect("commit emits receipts");
+    let first_comp = comp_report
+        .receipts
+        .first()
+        .expect("compensation emits receipts");
+    assert!(
+        receipt_seq(first_comp) > receipt_seq(last_commit),
+        "[chain1] comp receipts should continue from commit: {} -> {}",
+        receipt_seq(last_commit),
+        receipt_seq(first_comp)
+    );
 }
 
 // ── Cross-scenario: Deterministic count invariants ───────────────────────

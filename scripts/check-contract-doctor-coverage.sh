@@ -6,13 +6,21 @@
 # registries, if a surfaced GAP loses its tracking bead, or if the known
 # registry-completeness gap (G4) regresses.
 #
-# ZERO RCH / ZERO cargo: pure static analysis (grep/awk over source + docs).
-# Run it directly; a clean exit 0 IS the proof. Intended to be wired into CI by
-# ft-7h5da.13.7 (the unified Contract-Doctor verdict).
+# No Cargo: static inventory analysis over source, docs, and the MCP manifest.
+# Exit zero proves inventory consistency only. --strict additionally rejects
+# tracked partial dimensions; the DSR release gate must also execute the
+# corresponding runtime tests under its retained source identity.
 #
 # Exit codes: 0 = all invariants hold; 1 = a contract-coverage invariant failed;
 # 2 = a required input file is missing (treated as failure).
 set -uo pipefail
+STRICT=0
+case "${1:-}" in
+  "") ;;
+  --strict) STRICT=1; shift ;;
+  *) echo "unsupported Contract Doctor argument: $1" >&2; exit 2 ;;
+esac
+[[ $# -eq 0 ]] || { echo "unexpected Contract Doctor arguments" >&2; exit 2; }
 
 # The script lives in <repo>/scripts/, so its parent dir is the repo root.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -87,7 +95,7 @@ for tool in wa.mission_pause wa.mission_resume wa.mission_abort; do
     fi
   fi
 done
-note "mission_pause/resume/abort dispatched in $MCP_DISPATCH and flagged as G4 in the matrix."
+note "G4 tracking checked; exact manifest-to-matrix dispatch union is verified below."
 
 # --- Check 4: every surfaced GAP keeps a tracking reference ---
 echo "[4] gap tracking: surfaced gaps still cite their tracking beads"
@@ -96,9 +104,96 @@ for bead in ft-6mmyp ft-5puf0; do
 done
 note "G1 -> ft-6mmyp, G3 -> ft-5puf0 referenced."
 
+echo "[5] six-dimension cells and registered MCP twins"
+if ! python3 - "$MATRIX" crates/frankenterm-core/tests/fixtures/mcp_manifest.json "$STRICT" <<'PY'
+import json
+import re
+import sys
+
+matrix_path, manifest_path, strict = sys.argv[1:]
+text = open(matrix_path, encoding="utf-8").read()
+tools = {tool["name"] for tool in json.load(open(manifest_path, encoding="utf-8"))["tools"]}
+dimensions = ("ENV", "PAR", "POL", "RED", "TOON", "ERR")
+partials = {}
+rows = []
+for line in text.splitlines():
+    if re.match(r"^\| `[a-z0-9-]+` \|", line):
+        rows.append([cell.strip().strip("`") for cell in line.split("|")[1:-1]])
+mcp_inventory = re.findall(r"^\| `(wa\.[a-z_]+)` \|", text, re.MULTILINE)
+
+def errors_for(candidate_rows, supplemental=mcp_inventory):
+    errors = []
+    seen = set()
+    mapped_tools = []
+    for row in candidate_rows:
+        if len(row) != 10:
+            errors.append("dimension_count")
+            continue
+        surface, _, _, twin, *cells = row
+        if surface in seen:
+            errors.append("duplicate_surface")
+        seen.add(surface)
+        if twin != "none":
+            twins = twin.split("/")
+            prefix = twins[0].rsplit("_", 1)[0] + "_"
+            names = [name if name.startswith("wa.") else prefix + name for name in twins]
+            mapped_tools.extend(names)
+            if any(name not in tools for name in names):
+                errors.append(f"unregistered_mcp_twin:{surface}")
+        for dimension, cell in zip(dimensions, cells):
+            if cell not in ("✓", "~", "n/a"):
+                errors.append(f"uncovered_cell:{surface}:{dimension}")
+            if cell == "~" and (
+                (surface, dimension) not in partials or partials[(surface, dimension)] not in text
+            ):
+                errors.append(f"untracked_partial:{surface}:{dimension}")
+    inventory = mapped_tools + supplemental
+    if len(inventory) != len(set(inventory)):
+        errors.append("duplicate_mcp_registry_tool")
+    if set(inventory) - tools:
+        errors.append("unregistered_mcp_registry_tool")
+    if tools - set(inventory):
+        errors.append("missing_mcp_registry_tool:" + ",".join(sorted(tools - set(inventory))))
+    return errors
+
+errors = errors_for(rows)
+if not rows:
+    errors.append("empty_matrix")
+if errors:
+    raise SystemExit("FAIL: " + ", ".join(errors))
+# Causal negatives exercise the exact live validator, without rewriting files.
+for column, mutation, expected in (
+    (4, "GAP", "uncovered_cell"),
+    (4, "~", "untracked_partial"),
+    (3, "wa.nonexistent_contract_doctor_tool", "unregistered_mcp_twin"),
+):
+    mutated = [row.copy() for row in rows]
+    mutated[0][column] = mutation
+    if not any(error.startswith(expected) for error in errors_for(mutated)):
+        raise SystemExit("FAIL: matrix negative control did not reject " + expected)
+if not mcp_inventory or not any(error.startswith("missing_mcp_registry_tool")
+                              for error in errors_for(rows, mcp_inventory[1:])):
+    raise SystemExit("FAIL: supplemental MCP omission negative control did not reject missing tool")
+if "duplicate_mcp_registry_tool" not in errors_for(rows, mcp_inventory + mcp_inventory[:1]):
+    raise SystemExit("FAIL: supplemental MCP duplicate negative control did not reject duplicate tool")
+print(json.dumps({"surfaces": len(rows), "dimensions": list(dimensions),
+                  "registered_mcp_tools": len(tools), "supplemental_mcp_tools": len(mcp_inventory),
+                  "cells": len(rows) * len(dimensions),
+                  "tracked_partial_cells": sum(row[4:].count("~") for row in rows),
+                  "runtime_tests_executed": False}, sort_keys=True))
+if strict == "1":
+    unresolved = [f"{row[0]}:{dimension}" for row in rows
+                  for dimension, cell in zip(dimensions, row[4:]) if cell == "~"]
+    if unresolved:
+        raise SystemExit("FAIL: stable Contract Doctor has incomplete dimensions: " + ", ".join(unresolved))
+PY
+then
+  err "six-dimension coverage or MCP support declaration drifted"
+fi
+
 echo "=================================================="
 if [[ "$fail" -eq 0 ]]; then
-  echo "OK: Robot/MCP contract coverage is complete and gaps are tracked ($REG_COUNT surfaces)."
+  echo "OK: Robot/MCP coverage inventory is consistent ($REG_COUNT surfaces); this static result is not a runtime or stable-release verdict."
   exit 0
 fi
 echo "DRIFT DETECTED: fix $MATRIX (or file/track the new gap) and re-run."

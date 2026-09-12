@@ -322,7 +322,7 @@ fn conformance_prepare_commit_compensate_idempotent_replay_matrix() {
 
         let compensation = if let Some(expected_compensation) = &case.expected_compensation {
             let comp_contract = build_contract(case.num_steps, MissionTxState::Compensating);
-            let comp_inputs = success_comp_inputs(case.num_steps);
+            let comp_inputs = success_comp_inputs(case.expected_committed);
             let comp =
                 execute_compensation_phase(&comp_contract, &commit, &comp_inputs, 20_000).unwrap();
             let comp_replay =
@@ -578,7 +578,7 @@ fn pipeline_partial_commit_then_partial_rollback() {
 
     // 2. Compensate the 2 committed steps
     let comp_contract = build_contract(5, MissionTxState::Compensating);
-    let comp_inputs = success_comp_inputs(5);
+    let comp_inputs = success_comp_inputs(2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
     assert!(comp_report.is_fully_rolled_back());
@@ -606,7 +606,7 @@ fn pipeline_first_step_failure_nothing_to_compensate() {
 
     // 2. Compensation → NothingToCompensate
     let comp_contract = build_contract(3, MissionTxState::Compensating);
-    let comp_inputs = success_comp_inputs(3);
+    let comp_inputs = success_comp_inputs(0);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
     let is_nothing = matches!(
@@ -1041,6 +1041,13 @@ fn resume_from_partial_commit_receipts_requires_compensation() {
     receipt_contract.receipts = commit_report.receipts.clone();
 
     let resume = reconstruct_tx_resume_state(&receipt_contract, None, None, 15_000);
+    assert!(!resume.commit_phase_completed);
+    assert!(resume.committed_step_ids.is_empty());
+    assert_eq!(resume.pending_step_ids.len(), 5);
+    assert!(!resume.is_fully_resolved());
+    // Executor receipts alone lack the durable rollback reconstruction chain.
+    // Supplying the actual report proves precisely which effects need undo.
+    let resume = reconstruct_tx_resume_state(&receipt_contract, Some(&commit_report), None, 15_000);
     assert!(resume.commit_phase_completed);
     assert_eq!(resume.committed_step_ids.len(), 2);
     assert!(resume.needs_compensation);
@@ -1063,7 +1070,7 @@ fn resume_after_compensation_failure_keeps_residual_work() {
     assert_eq!(commit_report.committed_count, 3);
 
     let comp_contract = build_contract(5, MissionTxState::Compensating);
-    let mut comp_inputs = success_comp_inputs(5);
+    let mut comp_inputs = success_comp_inputs(3);
     comp_inputs
         .iter_mut()
         .find(|input| input.for_step_id.0.as_str() == "s2")
@@ -1312,7 +1319,7 @@ fn serde_roundtrip_full_pipeline() {
 
     // Compensation
     let comp_contract = build_contract(4, MissionTxState::Compensating);
-    let comp_inputs = success_comp_inputs(4);
+    let comp_inputs = success_comp_inputs(2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
     let comp_json = serde_json::to_string(&comp_report).unwrap();
@@ -1545,7 +1552,7 @@ fn concurrent_compensation_determinism() {
             let cr = commit_report.clone();
             std::thread::spawn(move || {
                 let comp_contract = build_contract(5, MissionTxState::Compensating);
-                let comp_inputs = success_comp_inputs(5);
+                let comp_inputs = success_comp_inputs(2);
                 execute_compensation_phase(&comp_contract, &cr, &comp_inputs, 20_000).unwrap()
             })
         })

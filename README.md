@@ -328,10 +328,10 @@ Now that you've seen it run, here's the full capability surface:
 | **Incident Bundles** | Crash and swarm-incident bundles wire to live collectors (process tree, GPU state, mux state, render state, beads coordination snapshot) |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, versioned wire protocol, and stale-session pruning[^ft-attest-distributed-threat] |
-| **Reality-check + Attestation** | Every headline claim links to a signed artifact slot in `docs/attestations/manifest.json`. Verify offline with `ft attestation verify` |
+| **Reality-check + Attestation** | Maps claims to artifacts or explicit deferred slots in `docs/attestations/manifest.json`. Inspect bundle integrity with `ft attestation verify`; publisher authentication requires a trusted release policy |
 
 [^ft-attest-perf-headline]: Verified via the populated [`perf/headline-claims`](docs/perf/headline-claims.json) attestation slot in [`docs/attestations/manifest.json`](docs/attestations/manifest.json); this covers benchmark-lane capture latency, Bloom prefilter speedup, and pane/memory capacity rows. Target-class caveats remain governed by their linked artifacts and the fail-closed [`swarm-capacity-envelope`](docs/attestations/perf/swarm-capacity-envelope.json) adjunct.
-[^ft-attest-lindley]: Verified via the populated [`perf/lindley-bounds`](docs/attestations/perf/lindley-bounds.json) attestation slot for the capture-path Lindley / min-plus latency model.
+[^ft-attest-lindley]: Deferred: the [`perf/lindley-bounds`](docs/attestations/manifest.json) capture-path latency proof is assigned to `ft-7h5da.10.2`; the manifest currently contains no accepted artifact for this slot.
 [^ft-attest-robot-contracts]: Verified via the populated [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) attestation slot for JSON/TOON control-plane envelope contracts.
 [^ft-attest-distributed-threat]: Verified via the populated [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) attestation slot for distributed wire-protocol safety review and diff-fuzz coverage.
 
@@ -482,7 +482,7 @@ Terminology used throughout this document and the codebase. Reading these once s
 - **Workflow trigger-policy allowlists** (ft-j0ufc): high-trust workflows declare allowlisted source panes to prevent low-trust panes from triggering them via output injection.
 - **Public-field bypass class eliminated**: ~6 audit findings closed where `pub` struct fields let callers bypass clamping or validation. Constructors/builders now own the invariants for `ErasureShard`, `CircuitBreaker::Config`, `QuantileBudgetMs`, `ArrivalCurve`, `ServiceCurve`, `ApprovalScope`/`AuditContext`, `ScaleFactor`, and `AxisValue`.
 - **Rubber-stamp `is_safe()` class eliminated**: ~17 audit findings closed where `is_safe()` returned `true` on cold start or before measurements were recorded. Every release-gate `is_safe` now requires evidence before reporting safe.
-- **Release attestation bundles**: every reality-check claim is published through a content-addressed, Sigstore-signed JSON bundle in [`docs/attestations/`](docs/attestations/). Verify any release offline with `ft attestation verify docs/attestations/<version>.json`.
+- **Attestation bundles**: [`docs/attestations/`](docs/attestations/) records artifact hashes and deferred claims. Bundle integrity, publisher authentication under a trusted policy, and the DSR release artifact signatures are separate checks; a development bundle is not proof of a published release.
 
 ### Trust & Attestation
 
@@ -492,17 +492,17 @@ _Latest reality-check drumbeat: [`docs/reports/reality-check-2026-09-01.md`](doc
 
 The canonical manifest is [`docs/attestations/manifest.json`](docs/attestations/manifest.json); each slot maps a claim category to its producing-bead artifact, and the per-release bundle signs those slot hashes.
 
-The README claim-to-slot map is intentionally limited to populated manifest slots:
+The README claim-to-slot map identifies populated artifacts and explicitly deferred proofs:
 
 <!-- attestation-claim-map:start -->
 | README claim | Manifest slot | Producing bead |
 |---|---|---|
 | Capture latency benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
-| Capture-path Lindley / min-plus bound | [`perf/lindley-bounds`](docs/attestations/perf/lindley-bounds.json) | `ft-43x69` |
+| Deferred: capture-path Lindley / min-plus bound | [`perf/lindley-bounds`](docs/attestations/manifest.json) | `ft-7h5da.10.2` |
 | Bloom prefilter search speedup | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | 200-pane capacity and memory-budget benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | Robot JSON/TOON envelope contract | [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) | `ft-0elb9` |
-| Operating-envelope read-only admission contract no-verdict artifact | [`proofs/robot-contracts`](docs/attestations/proofs/operating-envelope.json) | `ft-booek.7` |
+| Deferred: operating-envelope read-only admission proof | [`proofs/robot-contracts`](docs/attestations/manifest.json) | `ft-booek.7` |
 | Redactor coverage matrix | [`security/redactor-coverage`](docs/security/redactor-coverage.json) | `ft-x0666.2` |
 | Distributed wire-protocol safety | [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) | `ft-x0666.3` |
 | `runtime_async` Loom model | [`proofs/loom-runtime-async`](docs/attestations/proofs/loom-runtime-async.json) | `ft-e87u6.12` |
@@ -510,9 +510,9 @@ The README claim-to-slot map is intentionally limited to populated manifest slot
 | Transaction kill-switch proof | [`proofs/tx-killswitch`](docs/attestations/proofs/tx-killswitch.json) | `ft-tf6g3.12` |
 <!-- attestation-claim-map:end -->
 
-The operating-envelope contract (`ft.operating_envelope.v1`) is wired under the
-`proofs/robot-contracts` manifest category as a retained read-only fail-closed
-admission artifact. Its current artifact status is the source of truth; a
+The operating-envelope contract (`ft.operating_envelope.v1`) has a deferred slot
+under the `proofs/robot-contracts` manifest category, assigned to `ft-booek.7`.
+Its retained diagnostic artifact is not an accepted manifest proof; a
 `blocked_rch_no_verdict` status is not production proof. The slot also does not
 prove target-class production capacity while the target-class resource-cockpit
 artifact remains `skipped_not_proven`. The

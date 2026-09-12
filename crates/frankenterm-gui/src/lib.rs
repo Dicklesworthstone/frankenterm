@@ -16,6 +16,87 @@ pub mod renderer_slo;
 pub mod rollout_env;
 pub mod window_state_persist;
 
+/// Release ordering shared with the GUI's banner and notification paths.
+pub mod update_version {
+    /// Compare against the machine version, never the branded display string.
+    pub fn release_tag_is_newer(tag: &str) -> bool {
+        release_version_is_newer(tag, env!("CARGO_PKG_VERSION"))
+    }
+
+    fn release_version_is_newer(tag: &str, current: &str) -> bool {
+        let tag = tag.strip_prefix('v').unwrap_or(tag);
+        let (Ok(latest), Ok(current)) =
+            (semver::Version::parse(tag), semver::Version::parse(current))
+        else {
+            // Nightly names, historical date tags, and malformed values have
+            // no ordering against this package's semantic release version.
+            return false;
+        };
+        latest.cmp_precedence(&current).is_gt()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{release_tag_is_newer, release_version_is_newer};
+
+        #[test]
+        fn numeric_versions_reject_downgrades_and_equal_releases() {
+            for (tag, current, newer) in [
+                ("v0.15.1", "0.15.2", false),
+                ("v0.15.2", "0.15.2", false),
+                ("0.15.3", "0.15.2", true),
+                ("v0.15.10", "0.15.9", true),
+                ("v0.15.9", "0.15.10", false),
+                ("v0.16.0", "0.15.99", true),
+                ("v1.0.0", "0.99.99", true),
+            ] {
+                assert_eq!(
+                    release_version_is_newer(tag, current),
+                    newer,
+                    "{tag} vs {current}"
+                );
+            }
+            assert!(!release_tag_is_newer(concat!(
+                "v",
+                env!("CARGO_PKG_VERSION")
+            )));
+        }
+
+        #[test]
+        fn prerelease_precedence_ignores_build_metadata() {
+            for (tag, current, newer) in [
+                ("v0.15.6", "0.15.6-rc.18", true),
+                ("v0.15.6-rc.18", "0.15.6", false),
+                ("v0.15.6-rc.10", "0.15.6-rc.9", true),
+                ("v0.15.6+zzz", "0.15.6+aaa", false),
+                ("v0.15.6", "0.15.6+dirty", false),
+            ] {
+                assert_eq!(
+                    release_version_is_newer(tag, current),
+                    newer,
+                    "{tag} vs {current}"
+                );
+            }
+        }
+
+        #[test]
+        fn unorderable_tags_do_not_advertise_updates() {
+            for tag in [
+                "nightly",
+                "20240203-110809-5046fc22",
+                "v0.15",
+                "vv0.15.7",
+                "FrankenTerm 0.15.7",
+                "v0.15.7 junk",
+                "",
+            ] {
+                assert!(!release_version_is_newer(tag, "0.15.6"), "{tag}");
+            }
+            assert!(!release_version_is_newer("v0.15.7", "unknown"));
+        }
+    }
+}
+
 /// Bounded, generation-aware coordination for GUI workspace reconciliation.
 ///
 /// The GUI binary owns the actual mux/window work. These pure state machines

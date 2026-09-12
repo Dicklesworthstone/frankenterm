@@ -169,10 +169,12 @@ fn g04_removed_decision() {
 
 #[test]
 fn g05_timing_shift() {
-    let base = DecisionGraph::from_decisions(&[pm("rule_a", 100, 1, "def1", "out1")]);
-    let cand = DecisionGraph::from_decisions(&[
-        pm("rule_a", 150, 1, "def1", "out1"), // shifted by 50ms (within 100ms tolerance)
-    ]);
+    let event = pm("rule_a", 100, 1, "def1", "out1");
+    let mut shifted_event = event.clone();
+    // A timing-only shift preserves input identity as well as output identity.
+    shifted_event.timestamp_ms = 150;
+    let base = DecisionGraph::from_decisions(&[event]);
+    let cand = DecisionGraph::from_decisions(&[shifted_event.clone()]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
 
     assert_eq!(diff.summary.shifted, 1);
@@ -184,6 +186,12 @@ fn g05_timing_shift() {
     let risk = scorer.aggregate(&diff.divergences);
     assert_eq!(risk.info_count, 1);
     assert_eq!(risk.recommendation, Recommendation::Pass);
+
+    shifted_event.input_hash = "different_input".into();
+    let changed = DecisionGraph::from_decisions(&[shifted_event]);
+    let changed_diff = DecisionDiff::diff(&base, &changed, &DiffConfig::default());
+    assert_eq!(changed_diff.summary.shifted, 0);
+    assert!(!changed_diff.is_equivalent(EquivalenceLevel::L1));
 }
 
 // ── G-6: Rule definition change on policy rule → Critical ─────────────────

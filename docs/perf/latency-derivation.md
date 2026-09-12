@@ -1,7 +1,7 @@
 # Pipeline-latency derivation via network calculus
 
-Operator-facing derivation showing how the pipeline's analytical
-`p99_ms` bound is computed from per-stage rate/latency measurements.
+Operator-facing derivation showing how the pipeline's model delay
+bound is computed from supplied per-stage rate/latency parameters.
 Pairs with the substrate at
 `crates/frankenterm-core/src/network_calculus_bound.rs` and the
 attestation artifact published per release at
@@ -9,11 +9,12 @@ attestation artifact published per release at
 
 ## TL;DR
 
-For the currently published headline benchmark pipeline
+For the historical model of the headline benchmark pipeline
 `capture -> delta-extract -> storage write`:
 
 - **Analytical bound**: 8.067ms (Lindley `h(alpha, beta) = T + b/R`).
-- **Empirical p99**: 8.5ms (measured on the bench corpus).
+- **Historical empirical reference**: 8.5ms. This is not a measurement of
+  the current source or release candidate.
 - **Verdict**: the empirical value exceeds the analytical bound by about
   5.37%. It meets a 20% model-agreement tolerance but does **not** satisfy
   the asserted upper bound.
@@ -65,10 +66,11 @@ implements this composition; it does not itself prove the headline 50ms SLO.
 
 ## Coverage status
 
-`LatencyStage` contains eight leaf stages. The current release artifact
-only covers the three stages that make up the published 4KB overlap
-capture benchmark. That is the only Lindley slice that is both modeled
-and backed by the checked-in `lindley-bounds.json` artifact today.
+`LatencyStage` contains eight leaf stages. The retained historical artifact
+models the three stages of the 4KB overlap capture benchmark. Its manifest
+slot is deferred to `ft-7h5da.10.2`; the file is not bundled as current
+release proof. A diagnostic calculation or passing algebra test cannot
+replace measured service curves and a held-out capture trace.
 
 | Claim surface | `LatencyStage` leaves involved | Current status |
 |---------------|--------------------------------|----------------|
@@ -80,8 +82,9 @@ and backed by the checked-in `lindley-bounds.json` artifact today.
 
 The unresolved evidence gaps above are tracked in `ft-tf6g3.51` rather
 than being folded into this artifact with invented numbers. The release
-bundle can retain the current artifact as historical model evidence for the 4KB overlap benchmark, and
-it can cite the end-to-end capture chain only as `modeled_pending_empirical`
+bundle currently defers this slot. The retained file is historical model
+evidence for the 4KB overlap benchmark, and the end-to-end capture chain is
+only `modeled_pending_empirical`
 until a real PTY-to-event empirical row lands. It can cite renderer
 input-to-photon only as `proxy_only_stage_telemetry_physical_path_unproven`.
 It must not cite this artifact as proof for renderer, Robot Mode, or FTS5
@@ -92,17 +95,18 @@ read-path SLOs.
 This is the manifest target for `capture_latency_p99` in
 `docs/perf/headline-claims.json`.
 
-### Per-stage measurements
+### Historical model inputs
 
-Source: `latency_stages.rs` telemetry (live observed rates) +
-worst-case scenario (operator-supplied burst). These are the three rows
-included in the current attestation artifact.
+Source: documentation-derived defaults in `latency_stages/lindley.rs`,
+including a modeled statement-count improvement and a carried-forward
+latency. These are not live observed rates. They are the three rows in
+the historical artifact, not current-release measurements.
 
 | Stage             | Rate (R, events/ms) | Latency (T, ms) | Source |
 |-------------------|----------------------|-----------------|--------|
-| capture (PTY read)| 200                  | 1.0             | `latency_stages.rs` p99 |
-| delta-extract     | 150                  | 2.0             | `latency_stages.rs` p99 |
-| storage write     | 150                  | 5.0             | W9.1 group-commit service curve; p99 carried forward |
+| capture (PTY read)| 200                  | 1.0             | Historical documented input |
+| delta-extract     | 150                  | 2.0             | Historical documented input |
+| storage write     | 150                  | 5.0             | W9.1 statement-count extrapolation; latency carried forward |
 
 Arrival: burst `b = 10 events`, rate `r = 90 events/ms`. The original
 operator sketch used 100 events/ms, but the substrate requires strict
@@ -124,9 +128,9 @@ Composed pipeline: `β = min(200, 150, 150) · (t - 1 - 2 - 5)⁺ = 150·(t - 8)
 
 Lindley bound: `h = 8 + 10/150 = 8.0666666667ms` per arrival.
 
-The README's `<50ms` figure remains the user-facing budget ceiling for
-the benchmark lane. The Lindley artifact is a tighter analytical
-cross-check for the modeled stage slice.
+The README's `<50ms` figure is a budget ceiling for the benchmark lane.
+The historical Lindley calculation does not establish that the current
+implementation meets it.
 
 ### End-to-end capture model
 
@@ -138,7 +142,7 @@ capture -> delta-extract -> storage write -> pattern detect -> event emit
 
 `LindleyTelemetryModel::documented_end_to_end_capture_default()` binds
 all five `LatencyStage::CAPTURE_PATH` leaves. The first three rows reuse
-the benchmark's measured service curves. The final two rows use the
+the historical model inputs above. The final two rows use the
 checked-in p99 budget ceilings for the missing leaves:
 
 | Stage | Rate (R, events/ms) | Latency (T, ms) | Source |
@@ -189,12 +193,12 @@ penalty.
 
 ## Empirical-vs-analytical cross-check
 
-Per release, the bench harness produces:
+The historical example comparison is:
 
 ```rust
 EmpiricalComparison {
     analytical_bound_ms: 8.0666666667, // from pipeline_delay_bound
-    empirical_p99_ms: 8.5,         // from headline-claim bench
+    empirical_p99_ms: 8.5,         // historical reference, not a fresh observation
 }
 ```
 
@@ -213,12 +217,12 @@ and reject an exceeded bound before making that claim.
 
 ## Attestation artifact
 
-Per release, the substrate's
-`LindleyBoundsArtifact::render_attestation_json()` produces:
+The legacy artifact had this shape. It is shown for interpreting old
+evidence, not as output from the current measured producer:
 
 ```json
 {
-  "release_version": "0.1.0",
+  "release_version": "0.0.0-substrate",
   "arrival": { "burst": 10, "rate": 90 },
   "stages": [
     { "name": "capture",  "service_rate": 200, "service_latency": 1.0 },
@@ -246,31 +250,134 @@ Per release, the substrate's
 
 The example reproduces the legacy artifact's fields; `covered` and
 `within_tolerance` are not proof of the exceeded bound. The artifact is
-written to `docs/attestations/perf/lindley-bounds.json`, with one
+retained at `docs/attestations/perf/lindley-bounds.json`, with one
 content hash for each published stage row and explicit coverage status
 for adjacent latency surfaces. Signing and trusted release validation
 require the actual DSR bundle path and `ft-xxfwy.15`/`.49`; this document
 does not establish that the checked-in file is signed.
 
-Required release integration (not a claim of a completed script):
+Required release closeout:
 1. Runs `pipeline_delay_bound(arrival, &stages)` to get
    `analytical_bound_ms`.
-2. Runs the headline-claim bench corpus to get `empirical_p99_ms`.
+2. Retains current-source capture measurements and an independent held-out
+   trace to get `empirical_p99_ms`; historical defaults are prohibited.
 3. Composes a `LindleyBoundsArtifact`.
 4. Calls `render_attestation_json` and writes the file.
-5. Sigstore-signs.
+5. Signs through the DSR release attestation path and verifies with the
+   operator-owned release policy.
 6. Validates finite/nonnegative measurements and admitted envelope
    assumptions, then requires `!comparison().exceeds_bound()` for any
    upper-bound claim. Record tolerance agreement separately.
 
 ---
 
+## Current-source measurement procedure
+
+The opt-in `lindley_bounds_build --measure-live` producer reads an explicitly
+owned mux pane through `WeztermClient::get_text_with_cx`, extracts deltas with
+`PaneCursor::capture_snapshot` and a 4096-byte overlap window, and submits
+ten concurrent `StorageHandle::append_segment_with_cx` requests per burst.
+The storage duration includes waiting for the other captures in the burst.
+It exercises the production grouped writer; it does not observe or certify
+the number of requests in each physical SQLite transaction.
+
+The producer freezes its model after 1,000 calibration requests, then records
+1,000 held-out requests. Service rates are minimum observed burst throughput;
+stage latencies are calibration maximums, despite the legacy telemetry field
+being named `p99_latency_ms`. The held-out p99 is computed independently.
+Arrival-envelope, per-stage min-plus service, maximum-delay and 20% agreement
+checks are separate. An exceeded bound or failed agreement remains a failed
+measurement; do not refit the model using the held-out trace to make it pass.
+This is a finite-workload model check, not a deterministic future guarantee.
+It excludes production watch scheduling, pattern/event dispatch, native
+renderer latency and power-loss durability.
+
+Use three binaries built from the same retained candidate source with
+`release-interactive`: `ft`, `frankenterm-mux-server`, and the
+`lindley_bounds_build` example with feature `vendored`. The release parent
+orchestrates their RCH/DSR builds; a Cargo test executable is not the example
+producer. Do not use a system-installed mux as candidate proof.
+
+Create a new, private evidence directory with a short socket path, isolated
+HOME/XDG directories, and the following native `frankenterm.toml` (substitute
+the absolute owned socket path):
+
+```toml
+initial_cols = 80
+initial_rows = 24
+scrollback_lines = 64
+
+[[unix_domains]]
+name = "lindley-owned"
+socket_path = "/absolute/private-run/mux.sock"
+no_serve_automatically = true
+```
+
+The 64-line scrollback plus 24 visible rows retains a full frame while keeping
+the common snapshot overlap below 4KiB. Larger scrollback changes that workload
+and can correctly fail the overlap check. The initial producer fills the
+screen before publishing its ready marker so trailing blank screen rows do
+not masquerade as an append.
+
+Start only the owned server, in the foreground under the release driver's
+bounded lifecycle supervision. Pass the example path as a positional shell
+argument; do not interpolate it into shell code:
+
+```bash
+"$MUX_BIN" --config-file "$RUN/frankenterm.toml" --daemonize=false \
+  --cwd "$RUN" -- /bin/sh -c 'stty -echo; exec "$1" --pane-producer' \
+  lindley-owned "$LINDLEY_BIN"
+```
+
+The driver supplies `WEZTERM_UNIX_SOCKET`, `FRANKENTERM_UNIX_SOCKET` and
+`FRANKENTERM_CONFIG_FILE` for this private server, and isolated configuration
+directories. Retain its PID and logs. Require the socket lease file to name
+that PID before connecting. Create a private `ft.toml` with
+`[vendored] mux_socket_path = "/absolute/private-run/mux.sock"`; run candidate
+`ft -c "$RUN/ft.toml" list --json` under a 30-second process timeout and require
+exactly one pane. Use only that returned pane ID. The producer independently
+requires its ready marker before sending input.
+
+Run the already-built example through the external watchdog wrapper, using
+an empty artifact directory and a database path that does not exist:
+
+```bash
+FT_LINDLEY_MUX_SOCKET="$RUN/mux.sock" \
+FT_LINDLEY_PANE_ID="$OWNED_PANE_ID" \
+FT_LINDLEY_DB_PATH="$RUN/capture.sqlite3" \
+FT_RELEASE_VERSION="$RELEASE_VERSION" \
+FT_LINDLEY_SOURCE_SHA="$SOURCE_SHA" \
+FT_LINDLEY_ARRIVAL_RATE_EVENTS_PER_MS=0.1 \
+FT_WEZTERM_CLI="$FT_BIN" \
+FT_LINDLEY_BOUNDS_ARTIFACT_DIR="$RUN/measurement" \
+bash scripts/lindley-bounds-build.sh --measure-live-executable "$LINDLEY_BIN"
+```
+
+Declare the arrival rate before calibration. The default external watchdog is
+2,400 seconds, with bounded TERM/KILL settlement; it also covers synchronous
+initialization and output stalls. The wrapper retains regular-file stdout,
+stderr, an executable-hash/process receipt, per-burst traces and final JSON.
+Exit 1 means an observed model check failed; exit 2 means invalid inputs,
+execution/integrity failure or watchdog expiry. Preserve the database and
+logs on every outcome, then stop and settle only the owned server/processes.
+
+Before promoting any result, retain and verify the exact commit/tree,
+profile, target, executable hashes, native host, socket/pane ownership,
+wall-clock interval, filesystem/mount placement, configuration, complete raw
+traces and corpus checks. A tmpfs run is not disk-durability evidence. The
+producer's supplied source SHA and profile claims remain unverified until
+joined to external build receipts. Its `release_ready` stays false; the
+producing bead's attestation checklist and manifest wiring are a separate
+reviewed closeout. No current measurement is recorded in this document yet.
+
 ## Cross-references
 
 - `crates/frankenterm-core/src/network_calculus_bound.rs` — substrate
   (35 tests, including the 50ms-headline-claim scenario).
-- `crates/frankenterm-core/src/latency_stages.rs` — source of the
-  live per-stage rate/latency measurements.
+- `crates/frankenterm-core/src/latency_stages/lindley.rs` — telemetry schema
+  and historical documentation-derived defaults.
+- `crates/frankenterm-core/examples/lindley_bounds_build.rs` — diagnostic
+  calculation and opt-in dedicated-mux measurement producer.
 - `crates/frankenterm-core/src/bench_stats.rs` — bench harness +
   concentration-of-measure sample sizing
   (`min_sample_size_for_regression`).

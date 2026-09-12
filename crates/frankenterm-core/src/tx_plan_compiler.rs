@@ -521,6 +521,7 @@ fn validate_assignment_bead_id(bead_id: &str) -> Result<(), RejectionKind> {
 
 /// Classify risk based on tags and score.
 fn classify_risk(tags: &[String], score: f64) -> StepRisk {
+    let mut has_high_risk_tag = false;
     for tag in tags {
         let normalized = normalize_risk_tag(tag);
         match normalized.as_str() {
@@ -542,11 +543,11 @@ fn classify_risk(tags: &[String], score: f64) -> StepRisk {
             | "needs-approval"
             | "operator-approval"
             | "requires-approval"
-            | "requires-operator-approval" => return StepRisk::High,
+            | "requires-operator-approval" => has_high_risk_tag = true,
             _ => {}
         }
     }
-    if score < 0.3 {
+    if has_high_risk_tag || score < 0.3 {
         return StepRisk::High;
     }
     if score < 0.6 {

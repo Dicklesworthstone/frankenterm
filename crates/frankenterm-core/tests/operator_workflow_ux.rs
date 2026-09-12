@@ -286,7 +286,14 @@ fn incident_agent_goes_offline_reflected_in_evaluation() {
 
 #[test]
 fn override_full_lifecycle_activate_evaluate_clear() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // Isolate override lifecycle from the independent reassignment cooldown.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let agents = vec![ready_agent("agent-a"), ready_agent("agent-b")];
     let issues = vec![open_bead("b-1", 1)];
     let c = ctx();

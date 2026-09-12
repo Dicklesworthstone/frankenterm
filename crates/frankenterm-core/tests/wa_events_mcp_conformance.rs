@@ -19,17 +19,12 @@ use std::path::PathBuf;
 
 struct FailResponseTransport<T> {
     inner: T,
-    response_count: usize,
-    fail_on_response: usize,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<T> FailResponseTransport<T> {
-    fn new(inner: T, fail_on_response: usize) -> Self {
-        Self {
-            inner,
-            response_count: 0,
-            fail_on_response,
-        }
+    fn new(inner: T, armed: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { inner, armed }
     }
 }
 
@@ -40,8 +35,7 @@ impl<T: FrameworkTransport> FrameworkTransport for FailResponseTransport<T> {
         message: &FrameworkJsonRpcMessage,
     ) -> Result<(), FrameworkTransportError> {
         if matches!(message, FrameworkJsonRpcMessage::Response(_)) {
-            self.response_count += 1;
-            if self.response_count == self.fail_on_response {
+            if self.armed.load(std::sync::atomic::Ordering::Acquire) {
                 // Closing the memory endpoint makes the peer observe a terminal
                 // disconnect instead of waiting forever for the injected-lost
                 // response.
@@ -75,8 +69,7 @@ impl<T: FrameworkDeliveryAcknowledgingTransport> FrameworkDeliveryAcknowledgingT
         message: &FrameworkJsonRpcMessage,
     ) -> Result<(), FrameworkTransportError> {
         if matches!(message, FrameworkJsonRpcMessage::Response(_)) {
-            self.response_count += 1;
-            if self.response_count == self.fail_on_response {
+            if self.armed.load(std::sync::atomic::Ordering::Acquire) {
                 let _ = self.inner.close();
                 return Err(FrameworkTransportError::Io(std::io::Error::other(
                     "injected MCP response write failure",
@@ -90,11 +83,17 @@ impl<T: FrameworkDeliveryAcknowledgingTransport> FrameworkDeliveryAcknowledgingT
 const FIXTURE_TS: i64 = 1_700_000_000_123;
 const FIXTURE_PANE_ID: u64 = 7;
 const FIXTURE_RULE_ID: &str = "codex.usage.reached";
+// These two claim-delivery checks prove serialization and durable post-send
+// completion, not a one-second latency bound under competing test runtimes.
+// Page processing correctly stops at its deadline even for an already-read
+// row; dedicated deadline and early-release tests retain their short budgets.
+const CLAIM_DELIVERY_TIMEOUT_SECS: u64 = 5;
 
 struct TestHarness {
-    _workspace: tempfile::TempDir,
-    db_path: PathBuf,
     client: FrameworkTestClient,
+    db_path: PathBuf,
+    // Drop the client before releasing the database fixture directory.
+    _workspace: tempfile::TempDir,
 }
 
 #[derive(Serialize)]
@@ -122,12 +121,49 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
 fn new_harness() -> TestHarness {
     let workspace = tempfile::tempdir().expect("create temp workspace");
     let db_path = workspace.path().join("mcp.sqlite3");
-    let client = spawn_client(Some(db_path.clone()));
+    let client = spawn_ready_client(db_path.clone());
     TestHarness {
         _workspace: workspace,
         db_path,
         client,
     }
+}
+
+fn wait_for_await_service_ready(client: &mut FrameworkTestClient) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let contents = client
+            .call_tool(
+                "wa.await_event",
+                json!({
+                    "any": ["rule:fixture.readiness.never"],
+                    "timeout_secs": 1, "poll_interval_ms": 10
+                }),
+            )
+            .expect("probe await service readiness");
+        let response = parse_tool_envelope(&contents);
+        if response["ok"] == true {
+            return;
+        }
+        assert_eq!(response["error_code"], "FT-MCP-0003");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("shared storage service")
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "await service never became ready: {response}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn spawn_ready_client(db_path: PathBuf) -> FrameworkTestClient {
+    let mut client = spawn_client(Some(db_path));
+    wait_for_await_service_ready(&mut client);
+    client
 }
 
 fn tool_input_schema(client: &mut FrameworkTestClient, tool_name: &str) -> Value {
@@ -177,7 +213,28 @@ fn parse_toon_tool_envelope(contents: &[FrameworkContent]) -> Value {
     let decoded =
         toon_rust::try_decode(first_text_content(contents), None).expect("decode TOON envelope");
     let json_text = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
-    serde_json::from_str(&json_text).expect("TOON envelope should stringify back to JSON")
+    let mut envelope: Value =
+        serde_json::from_str(&json_text).expect("TOON envelope should stringify back to JSON");
+    normalize_toon_integral_numbers(&mut envelope);
+    envelope
+}
+
+fn normalize_toon_integral_numbers(value: &mut Value) {
+    match value {
+        Value::Object(map) => map.values_mut().for_each(normalize_toon_integral_numbers),
+        Value::Array(items) => items.iter_mut().for_each(normalize_toon_integral_numbers),
+        Value::Number(number) if number.is_f64() => {
+            if let Some(float) = number.as_f64()
+                && float.is_finite()
+                && float.fract() == 0.0
+                && float >= i64::MIN as f64
+                && float < i64::MAX as f64
+            {
+                *value = Value::from(float as i64);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
@@ -289,13 +346,22 @@ fn assert_boundary_invalid_params_error(error: &str) {
 
 fn capture_tool_contract(
     tool_name: &str,
-    success_setup: impl FnOnce(&mut TestHarness),
+    success_setup: impl FnOnce(&PathBuf),
     success_args: impl FnOnce(&TestHarness) -> Value,
     boundary_invalid_setup: impl FnOnce(&mut TestHarness),
     boundary_invalid_args: impl FnOnce(&TestHarness) -> Value,
 ) -> ToolContractCapture {
-    let mut harness = new_harness();
-    success_setup(&mut harness);
+    let workspace = tempfile::tempdir().expect("create static contract workspace");
+    let db_path = workspace.path().join("mcp.sqlite3");
+    // Static envelope fixtures need no concurrent initializer/writer. Finish
+    // seeding before the server starts; live-insertion tests use new_harness.
+    success_setup(&db_path);
+    let client = spawn_ready_client(db_path.clone());
+    let mut harness = TestHarness {
+        _workspace: workspace,
+        db_path,
+        client,
+    };
     let input_schema = tool_input_schema(&mut harness.client, tool_name);
     assert_schema_matches_manifest(tool_name, &input_schema);
     let success_envelope = parse_tool_envelope(
@@ -367,6 +433,7 @@ fn seed_events_fixture(harness: &TestHarness) {
 }
 
 fn seed_events_fixture_at(db_path: &PathBuf) {
+    let started = std::time::Instant::now();
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
@@ -377,7 +444,12 @@ fn seed_events_fixture_at(db_path: &PathBuf) {
         storage
             .upsert_pane(make_pane(FIXTURE_PANE_ID, FIXTURE_TS))
             .await
-            .expect("upsert pane");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "single-event fixture pane upsert failed after {:?}: {error:?}",
+                    started.elapsed()
+                )
+            });
         let event_id = storage
             .record_event(make_event())
             .await
@@ -398,7 +470,7 @@ fn seed_events_fixture_at(db_path: &PathBuf) {
 fn mcp_conformance_wa_events_contract_matches_expected_envelope() {
     let capture = capture_tool_contract(
         "wa.events",
-        |harness| seed_events_fixture(harness),
+        seed_events_fixture_at,
         |_| {
             json!({
                 "limit": 10,
@@ -453,6 +525,8 @@ fn seed_many_events(harness: &TestHarness, events: Vec<StoredEvent>) {
 }
 
 fn seed_many_events_at(db_path: &PathBuf, events: Vec<StoredEvent>) {
+    let started = std::time::Instant::now();
+    let event_count = events.len();
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime");
@@ -463,12 +537,16 @@ fn seed_many_events_at(db_path: &PathBuf, events: Vec<StoredEvent>) {
         storage
             .upsert_pane(make_pane(FIXTURE_PANE_ID, FIXTURE_TS))
             .await
-            .expect("upsert pane");
-        for event in events {
+            .unwrap_or_else(|error| {
+                panic!("multi-event fixture pane upsert ({event_count} events) failed after {:?}: {error:?}", started.elapsed())
+            });
+        for (index, event) in events.into_iter().enumerate() {
             storage
                 .record_event(event)
                 .await
-                .expect("record coverage event");
+                .unwrap_or_else(|error| {
+                    panic!("fixture event {index}/{event_count} failed after {:?}: {error:?}", started.elapsed())
+                });
         }
         storage.shutdown().await.expect("shutdown storage");
     });
@@ -626,6 +704,55 @@ fn wait_for_event_delivery_lease(db_path: &PathBuf, event_id: i64, watchdog: std
             "event {event_id} was not leased within {watchdog:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn diagnose_unsatisfied_seeded_claim(db_path: &PathBuf, envelope: &Value) {
+    if envelope["data"]["satisfied"] == Value::Bool(true) {
+        return;
+    }
+    let connection = rusqlite::Connection::open(db_path).expect("open failed claim observer");
+    connection
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .expect("configure failed claim observer");
+    let state: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(handled_at IS NOT NULL), 0), COALESCE(SUM(delivery_lease_token IS NOT NULL), 0) FROM events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query failed claim durable state");
+    eprintln!(
+        "MCP_CLAIM_FIXTURE_STATE rows={} handled={} leased={} envelope={envelope}",
+        state.0, state.1, state.2
+    );
+}
+
+fn wait_for_event_finalization(db_path: &PathBuf, event_ids: &[i64]) {
+    let connection = rusqlite::Connection::open(db_path).expect("open finalization observer");
+    connection
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .expect("configure finalization observer busy timeout");
+    let started = std::time::Instant::now();
+    let watchdog = std::time::Duration::from_secs(5);
+    for event_id in event_ids {
+        loop {
+            let finalized: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE id = ?1 AND handled_at IS NOT NULL",
+                    [event_id],
+                    |row| row.get(0),
+                )
+                .expect("query durable event finalization state");
+            if finalized == 1 {
+                break;
+            }
+            assert!(
+                started.elapsed() < watchdog,
+                "event {event_id} did not finalize within {watchdog:?} after transport delivery"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
@@ -808,7 +935,11 @@ fn assert_await_event_success_data(envelope: &Value, claim: bool) {
         .as_object()
         .expect("wa.await_event data object");
     assert_eq!(data["type"], Value::String("await_result".to_string()));
-    assert_eq!(data["satisfied"], Value::Bool(true));
+    assert_eq!(
+        data["satisfied"],
+        Value::Bool(true),
+        "await result did not satisfy the seeded fixture: {envelope}"
+    );
     assert_eq!(data["timed_out"], Value::Bool(false));
     assert_eq!(data["final_cursor"], Value::from(i32::from(!claim)));
     assert_canonical_cursor_epoch(&data["final_cursor_epoch"]);
@@ -997,14 +1128,16 @@ fn mcp_conformance_wa_await_event_claim_marks_event_handled() {
             "any": ["rule:codex.*"],
             "cursor": 0,
             "pane": FIXTURE_PANE_ID,
-            "timeout_secs": 1,
+            "timeout_secs": CLAIM_DELIVERY_TIMEOUT_SECS,
             "poll_interval_ms": 10,
             "claim": true
         }),
     );
     assert_success_envelope_shape(&envelope);
+    diagnose_unsatisfied_seeded_claim(&harness.db_path, &envelope);
     assert_await_event_success_data(&envelope, true);
 
+    wait_for_event_finalization(&harness.db_path, &[1]);
     let after_claim = call_events(
         &mut harness,
         json!({
@@ -1034,7 +1167,7 @@ fn mcp_conformance_wa_await_event_claim_toon_finalizes_after_transport() {
             "any": ["rule:codex.*"],
             "cursor": 0,
             "pane": FIXTURE_PANE_ID,
-            "timeout_secs": 1,
+            "timeout_secs": CLAIM_DELIVERY_TIMEOUT_SECS,
             "poll_interval_ms": 10,
             "claim": true,
             "format": "toon"
@@ -1047,14 +1180,14 @@ fn mcp_conformance_wa_await_event_claim_toon_finalizes_after_transport() {
     let envelope = parse_toon_tool_envelope(&contents);
     assert_success_envelope_shape(&envelope);
     assert_await_event_cursor_contract(&envelope, &arguments);
+    diagnose_unsatisfied_seeded_claim(&harness.db_path, &envelope);
     assert_await_event_success_data(&envelope, true);
 
     // A memory-transport peer can receive the response after its channel send
     // succeeds but while the server-side post-send finalizer is still running.
-    // The server loop is sequential, so a subsequent request is a deterministic
-    // barrier proving that finalization completed without weakening the
-    // at-least-once delivery contract.
-    let _barrier = call_events(&mut harness, json!({"limit": 1}));
+    // Completion runs asynchronously; another request is not a commit barrier.
+    // Observe the durable transition without extending the await request budget.
+    wait_for_event_finalization(&harness.db_path, &[1]);
     let events = load_fixture_events(&harness.db_path);
     assert_eq!(events.len(), 1);
     assert!(events[0].handled_at.is_some());
@@ -1147,13 +1280,17 @@ fn assert_await_event_claim_send_failure_releases_lease(
     let server =
         build_server_with_db(&Config::default(), Some(db_path.clone())).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
+    let failure_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_failure_armed = std::sync::Arc::clone(&failure_armed);
     let server_thread = std::thread::spawn(move || {
-        // Response 1 is initialize. Response 2 is wa.await_event and is the
-        // injected transport failure whose staged lease must be released.
-        server.run_transport_returning(FailResponseTransport::new(server_transport, 2));
+        server.run_transport_returning(FailResponseTransport::new(
+            server_transport,
+            server_failure_armed,
+        ));
     });
     let mut client = FrameworkTestClient::new(client_transport);
     client.initialize().expect("initialize MCP client");
+    wait_for_await_service_ready(&mut client);
     seed_events_fixture_at(&db_path);
 
     let mut arguments = with_current_event_cursor_token(
@@ -1170,6 +1307,9 @@ fn assert_await_event_claim_send_failure_releases_lease(
     if let Some(format) = requested_format {
         arguments["format"] = Value::String(format.to_string());
     }
+    // Initialization/readiness traffic is complete; only the claimed response
+    // should encounter the injected write failure.
+    failure_armed.store(true, std::sync::atomic::Ordering::Release);
     let error = client
         .call_tool("wa.await_event", arguments)
         .expect_err("injected response failure must disconnect the client");
@@ -1249,7 +1389,7 @@ fn mcp_conformance_wa_await_event_live_lease_retains_cursor_until_retry() {
     );
     assert_success_envelope_shape(&retried);
     assert_await_event_success_data(&retried, true);
-    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    wait_for_event_finalization(&harness.db_path, &[1]);
 }
 
 #[test]
@@ -1259,9 +1399,11 @@ fn mcp_conformance_wa_await_event_observes_early_lease_release_before_timeout() 
     let competing_lease =
         reserve_fixture_event(&harness.db_path, std::time::Duration::from_secs(5));
     let release_db_path = harness.db_path.clone();
+    let request_started = std::time::Instant::now();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(150));
         release_fixture_event(&release_db_path, &competing_lease);
+        request_started.elapsed()
     });
 
     let acquired = call_await_event(
@@ -1275,10 +1417,14 @@ fn mcp_conformance_wa_await_event_observes_early_lease_release_before_timeout() 
             "claim": true
         }),
     );
-    releaser.join().expect("join early lease releaser");
+    let release_elapsed = releaser.join().expect("join early lease releaser");
+    assert!(
+        release_elapsed < std::time::Duration::from_secs(2),
+        "fixture release/setup outlived the request's two-second deadline: {release_elapsed:?}; response: {acquired}"
+    );
     assert_success_envelope_shape(&acquired);
     assert_await_event_success_data(&acquired, true);
-    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    wait_for_event_finalization(&harness.db_path, &[1]);
 }
 
 #[test]
@@ -1339,7 +1485,7 @@ fn mcp_conformance_retried_hole_across_large_backlog_preserves_order_and_cursor(
             .all(|condition| condition["met"] == Value::Bool(true))
     );
 
-    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    wait_for_event_finalization(&harness.db_path, &[1, 502]);
     let events = load_fixture_events(&harness.db_path);
     assert_eq!(events.len(), 502);
     assert!(events[0].handled_at.is_some());
@@ -1366,7 +1512,7 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
         reserve_fixture_event_id(&harness.db_path, 1, std::time::Duration::from_secs(10));
 
     let db_path = harness.db_path.clone();
-    let mut await_client = spawn_client(Some(db_path.clone()));
+    let mut await_client = spawn_ready_client(db_path.clone());
     let await_arguments = with_current_event_cursor_token(
         &db_path,
         json!({
@@ -1381,15 +1527,11 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
     let expected_cursor_epoch = await_arguments["cursor_epoch"].clone();
     let expected_cursor_scope = await_arguments["cursor_scope"].clone();
     let waiter = std::thread::spawn(move || {
-        let envelope = parse_tool_envelope(
+        parse_tool_envelope(
             &await_client
                 .call_tool("wa.await_event", await_arguments)
                 .expect("call delayed-B A/A/B await"),
-        );
-        await_client
-            .call_tool("wa.events", json!({"limit": 1}))
-            .expect("delayed-B delivery barrier");
-        envelope
+        )
     });
 
     // Synchronize on id=2 being leased by the waiter. At that point the A
@@ -1424,11 +1566,12 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
         "the id=1 hole must survive after id=2 satisfies the same A mask"
     );
 
+    wait_for_event_finalization(&db_path, &[1, 2, 3]);
     let events = load_fixture_events(&db_path);
     assert_eq!(events.len(), 3);
     assert!(
         events.iter().all(|event| event.handled_at.is_some()),
-        "every emitted A/A/B event must finalize after the delivery barrier"
+        "every emitted A/A/B event must have durable finalization"
     );
 }
 
@@ -1446,7 +1589,7 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
         reserve_fixture_event_id(&harness.db_path, 1, std::time::Duration::from_secs(10));
 
     let db_path = harness.db_path.clone();
-    let mut await_client = spawn_client(Some(db_path.clone()));
+    let mut await_client = spawn_ready_client(db_path.clone());
     let await_arguments = with_current_event_cursor_token(
         &db_path,
         json!({
@@ -1461,15 +1604,11 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
     let expected_cursor_epoch = await_arguments["cursor_epoch"].clone();
     let expected_cursor_scope = await_arguments["cursor_scope"].clone();
     let waiter = std::thread::spawn(move || {
-        let envelope = parse_tool_envelope(
+        parse_tool_envelope(
             &await_client
                 .call_tool("wa.await_event", await_arguments)
                 .expect("call exact-refetch await"),
-        );
-        await_client
-            .call_tool("wa.events", json!({"limit": 1}))
-            .expect("exact-refetch delivery barrier");
-        envelope
+        )
     });
 
     wait_for_event_delivery_lease(&db_path, 2, std::time::Duration::from_secs(5));
@@ -1502,6 +1641,7 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
         vec![2, 3],
         "handled id=1 must be dropped without substituting id=2 as its refetch"
     );
+    wait_for_event_finalization(&db_path, &[2, 3]);
     let events = load_fixture_events(&db_path);
     assert_eq!(events.len(), 3);
     assert_eq!(
@@ -1572,7 +1712,7 @@ fn mcp_conformance_blocked_hole_cap_fails_closed_across_pages() {
     assert_eq!(retried["data"]["final_cursor"], Value::from(0));
     assert_eq!(retried["data"]["candidate_cursor"], Value::from(1));
     assert_eq!(retried["data"]["pending_finalize"], Value::Bool(true));
-    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    wait_for_event_finalization(&harness.db_path, &[1]);
     release_fixture_events(&harness.db_path, &competing_leases[1..]);
 }
 
@@ -1603,8 +1743,16 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
                 .unwrap_or_else(|error| panic!("call {tool} redaction case: {error}")),
         );
         assert_common_envelope_fields(&envelope, false);
-        assert_eq!(envelope["error_code"], "FT-MCP-0005");
-        assert_eq!(envelope["error"], "Storage unavailable");
+        if tool == "wa.events" {
+            assert_eq!(envelope["error_code"], "FT-MCP-0005");
+            assert_eq!(envelope["error"], "Storage unavailable");
+        } else {
+            assert_eq!(envelope["error_code"], "FT-MCP-0003");
+            assert_eq!(
+                envelope["error"],
+                "wa.await_event shared storage service is initializing, reconnecting, or shutting down"
+            );
+        }
         let serialized = envelope.to_string();
         let invalid_db_path_text = invalid_db_path.to_string_lossy();
         assert!(!serialized.contains(secret_marker));
@@ -1613,11 +1761,11 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
 }
 
 #[test]
-fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
+fn mcp_conformance_delayed_storage_initialization_rejects_then_recovers() {
     let harness = new_harness();
-    // Initialize schema and pane metadata before taking the deliberate writer
-    // lock. The awaited event itself is inserted while the handler is blocked
-    // opening storage.
+    // The shared service opens storage before admitting requests. While that
+    // initialization is blocked, admission must fail closed rather than start
+    // a no-cursor observation window that it cannot service.
     seed_many_events(&harness, Vec::new());
     let lock_connection =
         rusqlite::Connection::open(&harness.db_path).expect("open delayed-open lock connection");
@@ -1647,20 +1795,19 @@ fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
             .map(|contents| parse_tool_envelope(&contents))
             .map_err(|error| error.to_string());
         let _ = result_tx.send(result);
+        await_client
     });
     started_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("delayed-open request thread started");
-    // Give the in-memory server a generous scheduling window to enter the
-    // storage-open path held by the transaction above.
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    assert!(
-        matches!(
-            result_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ),
-        "delayed-open fixture must hold the request before it can respond"
-    );
+    let rejected = result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("unready admission must not wait for storage initialization")
+        .expect("unready admission returns a typed envelope");
+    assert_common_envelope_fields(&rejected, false);
+    assert_eq!(rejected["error_code"], "FT-MCP-0003");
+    assert!(rejected["data"].is_null());
+    let mut await_client = waiter.join().expect("join rejected waiter");
 
     let detected_during_open_ms = epoch_ms_i64();
     lock_connection
@@ -1684,11 +1831,19 @@ fn mcp_conformance_no_cursor_boundary_precedes_delayed_storage_open() {
         .execute_batch("COMMIT")
         .expect("release delayed-open writer lock");
 
-    let envelope = result_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("delayed-open request completed after lock release")
-        .expect("delayed-open MCP call succeeded");
-    waiter.join().expect("join delayed-open waiter");
+    wait_for_await_service_ready(&mut await_client);
+    let arguments = with_current_event_cursor_token(
+        &harness.db_path,
+        json!({
+            "any": ["rule:rule.open_window"], "pane": FIXTURE_PANE_ID,
+            "cursor": 0, "timeout_secs": 2, "poll_interval_ms": 10
+        }),
+    );
+    let envelope = parse_tool_envelope(
+        &await_client
+            .call_tool("wa.await_event", arguments)
+            .expect("retry after shared storage readiness"),
+    );
     assert_success_envelope_shape(&envelope);
     assert_eq!(envelope["data"]["satisfied"], Value::Bool(true));
     assert_eq!(envelope["data"]["timed_out"], Value::Bool(false));
@@ -1735,7 +1890,7 @@ fn mcp_conformance_live_lease_does_not_block_a_later_matching_event() {
     assert_eq!(claimed["data"]["candidate_cursor"], Value::from(0));
     assert_eq!(claimed["data"]["pending_finalize"], Value::Bool(true));
 
-    let _delivery_barrier = call_events(&mut harness, json!({"limit": 1}));
+    wait_for_event_finalization(&harness.db_path, &[2]);
     let events = load_fixture_events(&harness.db_path);
     assert!(events[0].handled_at.is_none());
     assert!(events[1].handled_at.is_some());
@@ -1746,8 +1901,8 @@ fn mcp_conformance_live_lease_does_not_block_a_later_matching_event() {
 fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
     let workspace = tempfile::tempdir().expect("create temp workspace");
     let db_path = workspace.path().join("mcp-concurrent-claims.sqlite3");
-    let mut client_a = spawn_client(Some(db_path.clone()));
-    let mut client_b = spawn_client(Some(db_path.clone()));
+    let mut client_a = spawn_ready_client(db_path.clone());
+    let mut client_b = spawn_ready_client(db_path.clone());
     seed_events_fixture_at(&db_path);
     let args = with_current_event_cursor_token(
         &db_path,
@@ -1765,26 +1920,18 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
     let args_b = args.clone();
 
     let claim_a = std::thread::spawn(move || {
-        let envelope = parse_tool_envelope(
+        parse_tool_envelope(
             &client_a
                 .call_tool("wa.await_event", args)
                 .expect("call concurrent claimant A"),
-        );
-        client_a
-            .call_tool("wa.events", json!({"limit": 1}))
-            .expect("claimant A delivery barrier");
-        envelope
+        )
     });
     let claim_b = std::thread::spawn(move || {
-        let envelope = parse_tool_envelope(
+        parse_tool_envelope(
             &client_b
                 .call_tool("wa.await_event", args_b)
                 .expect("call concurrent claimant B"),
-        );
-        client_b
-            .call_tool("wa.events", json!({"limit": 1}))
-            .expect("claimant B delivery barrier");
-        envelope
+        )
     });
     let envelope_a = claim_a.join().expect("join claimant A");
     let envelope_b = claim_b.join().expect("join claimant B");
@@ -1847,6 +1994,7 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
         }
     }
 
+    wait_for_event_finalization(&db_path, &[1]);
     let events = load_fixture_events(&db_path);
     assert_eq!(events.len(), 1);
     assert!(events[0].handled_at.is_some());

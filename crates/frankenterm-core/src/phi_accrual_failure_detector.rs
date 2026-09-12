@@ -10,7 +10,9 @@
 //! distribution may have ranged from 1 ms to 5 s. φ-accrual instead
 //! reports a continuous suspicion value
 //!
-//!     φ(t) = -log10(P(arrival_at_or_after(t)))
+//! ```text
+//! φ(t) = -log10(P(arrival_at_or_after(t)))
+//! ```
 //!
 //! and the operator threshold (commonly 8.0 - 12.0) maps to a calibrated
 //! false-positive rate against the observed distribution.

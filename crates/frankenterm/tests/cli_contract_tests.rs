@@ -12,6 +12,218 @@
 //! - Secret-like strings never leak unredacted
 
 use assert_cmd::Command;
+// Compile the production build metadata resolver directly; its Cargo entry
+// point is intentionally not invoked by this integration harness.
+#[allow(
+    dead_code,
+    reason = "build-script entry point is not run inside integration tests"
+)]
+#[path = "../build.rs"]
+mod build_metadata;
+
+mod dsr_source_metadata_contract {
+    use super::build_metadata::{DsrSourceIdentity, resolve_source_identity, tracked_source_paths};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+        let mut command = Command::new("git");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            command.env_remove(name);
+        }
+        let output = command
+            .current_dir(root)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .arg("-c")
+            .arg(format!(
+                "core.hooksPath={}",
+                root.join("no-fixture-hooks").display()
+            ))
+            .args(args)
+            .output()
+            .expect("Git fixture command");
+        assert!(
+            output.status.success(),
+            "Git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn identity(revision: String) -> DsrSourceIdentity {
+        let version = "0.15.5";
+        let target = "aarch64-apple-darwin";
+        let profile = "release-interactive";
+        // The canonical existing producer is the independent oracle for the
+        // Rust resolver's source/version/target/profile identity binding.
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/atomic-component-manifest.sh");
+        let output = Command::new("bash")
+            .arg(script)
+            .args([
+                "derive-build-id",
+                "--source-revision",
+                &revision,
+                "--version",
+                version,
+                "--target",
+                target,
+                "--profile",
+                profile,
+                "--feature-contract",
+                "application-family-gui-ft-mux-server-pty-guardian-default-features-v1",
+            ])
+            .output()
+            .expect("canonical atomic identity producer");
+        assert!(
+            output.status.success(),
+            "canonical identity producer failed"
+        );
+        DsrSourceIdentity {
+            revision,
+            reference: format!("v{version}"),
+            version: version.to_owned(),
+            target: target.to_owned(),
+            profile: profile.to_owned(),
+            atomic_identity: String::from_utf8(output.stdout).unwrap().trim().to_owned(),
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, DsrSourceIdentity) {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(repository.join("src/input.txt"), b"original source\n").unwrap();
+        git(&repository, &["add", "src/input.txt"]);
+        git(&repository, &["commit", "-m", "source fixture"]);
+        let revision = String::from_utf8(git(&repository, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let archive = git(&repository, &["archive", "--format=tar", "HEAD"]);
+        fs::write(owner.path().join(".source.tar"), &archive).unwrap();
+        let source = owner.path().join("source");
+        fs::create_dir(&source).unwrap();
+        tar::Archive::new(archive.as_slice())
+            .unpack(&source)
+            .unwrap();
+        let identity = identity(revision);
+        (owner, repository, source, identity)
+    }
+
+    #[test]
+    fn gitless_dsr_archive_supplies_exact_clean_metadata() {
+        let (_owner, _repository, source, identity) = fixture();
+        let metadata = resolve_source_identity(&source, Some(&identity)).unwrap();
+        assert_eq!(metadata.revision, identity.revision);
+        assert!(!metadata.dirty);
+    }
+
+    #[test]
+    fn gitless_metadata_rejects_tampered_or_extra_source() {
+        let (_owner, _repository, source, identity) = fixture();
+        fs::write(source.join("src/input.txt"), b"modified source\n").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+        fs::write(source.join("src/input.txt"), b"original source\n").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_ok());
+        fs::write(source.join("src/injected.rs"), b"extra source").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+
+    #[test]
+    fn gitless_metadata_rejects_environment_only_or_mismatched_authority() {
+        let (owner, _repository, source, good) = fixture();
+        let absent = owner.path().join("no-archive/source");
+        fs::create_dir_all(&absent).unwrap();
+        assert!(resolve_source_identity(&absent, Some(&good)).is_err());
+        let development = resolve_source_identity(&source, None).unwrap();
+        assert_eq!(development.revision, "unknown");
+        assert!(development.dirty);
+
+        let mut wrong_atomic = good.clone();
+        wrong_atomic.target = "x86_64-pc-windows-msvc".to_owned();
+        assert!(resolve_source_identity(&source, Some(&wrong_atomic)).is_err());
+        let mut wrong_version = good.clone();
+        wrong_version.reference = "v0.0.0".to_owned();
+        assert!(resolve_source_identity(&source, Some(&wrong_version)).is_err());
+        // A self-consistent identity for another commit still cannot authorize
+        // this archive. Merely supplying a plausible sealed hash is not enough.
+        let wrong_commit = identity("1".repeat(40));
+        assert!(resolve_source_identity(&source, Some(&wrong_commit)).is_err());
+    }
+
+    #[test]
+    fn git_tracked_dirt_cannot_be_erased_by_valid_dsr_metadata() {
+        let (_owner, repository, _source, identity) = fixture();
+        let clean = resolve_source_identity(&repository, Some(&identity)).unwrap();
+        assert!(!clean.dirty);
+        fs::write(repository.join("src/input.txt"), b"tracked dirty source\n").unwrap();
+        let dirty = resolve_source_identity(&repository, Some(&identity)).unwrap();
+        assert_eq!(dirty.revision, identity.revision);
+        assert!(dirty.dirty);
+    }
+
+    #[test]
+    fn metadata_rerun_inputs_track_unstaged_source_but_exclude_build_caches() {
+        let (_owner, repository, _source, identity) = fixture();
+        let tracked = repository.join("src/input.txt");
+        let expected = vec![tracked.clone()];
+        assert_eq!(tracked_source_paths(&repository).unwrap(), expected);
+        fs::create_dir(repository.join("target")).unwrap();
+        fs::write(repository.join("target/generated.txt"), b"build cache").unwrap();
+        fs::write(repository.join("src/untracked.rs"), b"untracked source").unwrap();
+        assert_eq!(tracked_source_paths(&repository).unwrap(), expected);
+        assert!(
+            !resolve_source_identity(&repository, Some(&identity))
+                .unwrap()
+                .dirty
+        );
+        fs::write(&tracked, b"unstaged source edit").unwrap();
+        assert_eq!(tracked_source_paths(&repository).unwrap(), expected);
+        assert!(
+            resolve_source_identity(&repository, Some(&identity))
+                .unwrap()
+                .dirty
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitless_metadata_rejects_symlinks_and_executable_mode_drift() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (_owner, _repository, source, identity) = fixture();
+        fs::set_permissions(
+            source.join("src/input.txt"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+        fs::set_permissions(
+            source.join("src/input.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink("input.txt", source.join("src/linked.txt")).unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+}
 #[cfg(unix)]
 #[path = "../../frankenterm-core/tests/common/wezterm_subprocess.rs"]
 mod wezterm_subprocess;
@@ -1474,6 +1686,240 @@ fn setup_populated_workspace() -> (TempDir, String) {
 
     drop(conn);
     (dir, ws)
+}
+
+/// Build a wa command configured for the given workspace.
+#[cfg(all(unix, feature = "mcp"))]
+#[test]
+fn contract_doctor_cli_mcp_read_and_refresh_parity() {
+    use frankenterm_core::mcp::build_server_with_db;
+    use frankenterm_core::mcp_framework::{
+        FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Overrides;
+    impl Drop for Overrides {
+        fn drop(&mut self) {
+            frankenterm_core::wezterm::set_wezterm_cli_override(None);
+            frankenterm_core::caut::set_caut_cli_override(None);
+        }
+    }
+    let (dir, workspace) = setup_populated_workspace();
+    // Independent, identically seeded stores prevent the first refresh from
+    // imposing its legitimate cooldown on the other transport's request.
+    let (mcp_dir, _) = setup_populated_workspace();
+    for root in [dir.path(), mcp_dir.path()] {
+        let connection = rusqlite::Connection::open(root.join(".ft/ft.db")).unwrap();
+        connection.execute_batch(
+            "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, context, result, started_at, updated_at, completed_at) VALUES
+             ('doctor-visible', 'handle_usage_limits', 1, 2, 'completed', '{\"source\":\"doctor\"}', '{\"handled\":true}', 1700000000000, 1700000000025, 1700000000025),
+             ('doctor-other-pane', 'handle_usage_limits', 2, 1, 'completed', NULL, NULL, 1700000000000, 1700000000050, 1700000000050);",
+        ).unwrap();
+    }
+    let bin = dir.path().join("doctor-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let mux = bin.join("wezterm");
+    std::fs::write(&mux, r#"#!/bin/sh
+set -eu
+if [ "$*" = 'cli --no-auto-start list --format json' ]; then
+  printf '%s\n' '[{"pane_id":1,"tab_id":1,"window_id":1,"domain_name":"local","title":"doctor-pane","cwd":"file:///tmp/doctor"}]'
+else
+  echo 'unsupported fixture operation' >&2
+  exit 64
+fi
+"#).unwrap();
+    let caut = bin.join("caut");
+    std::fs::write(&caut, r#"#!/bin/sh
+set -eu
+[ "${1:-}" = usage ] || exit 64
+printf '%s\n' '{"schemaVersion":"caut.v1","generatedAt":"2026-02-27T21:05:00Z","command":"usage","data":[{"provider":"codex","account":"doctor-refresh","usage":{"primary":{"percentRemaining":50.0,"tokensUsed":5000,"tokensRemaining":5000,"tokensLimit":10000,"resetAt":"2026-03-01T00:00:00Z"},"updatedAt":"2026-02-27T21:04:59Z","identity":{"accountEmail":"doctor@example.invalid","accountOrganization":"Doctor"}}}],"errors":[]}'
+"#).unwrap();
+    for path in [&mux, &caut] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    frankenterm_core::wezterm::set_wezterm_cli_override(Some(mux.to_string_lossy().into_owned()));
+    frankenterm_core::caut::set_caut_cli_override(Some(caut.to_string_lossy().into_owned()));
+    let _overrides = Overrides;
+    let mut config = frankenterm_core::config::Config::default();
+    config.safety.require_prompt_active = false;
+    let db = mcp_dir.path().join(".ft/ft.db");
+    let server = build_server_with_db(&config, Some(db)).unwrap();
+    let (client_transport, server_transport) = framework_create_memory_transport_pair();
+    let server_thread =
+        std::thread::spawn(move || server.run_transport_returning(server_transport));
+    let mut client = FrameworkTestClient::new(client_transport);
+    client.initialize().unwrap();
+
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path_env = std::env::join_paths(paths).unwrap();
+    for (tool, arguments, cli_args) in [
+        (
+            "wa.accounts",
+            serde_json::json!({"service":"openai"}),
+            vec!["accounts", "list", "--service", "openai"],
+        ),
+        (
+            "wa.workflow_status",
+            serde_json::json!({"pane_id":1}),
+            vec!["workflow", "status", "--pane", "1"],
+        ),
+        (
+            "wa.workflow_run",
+            serde_json::json!({"name":"handle_usage_limits","pane_id":1,"dry_run":true}),
+            vec!["workflow", "run", "handle_usage_limits", "1", "--dry-run"],
+        ),
+        (
+            "wa.workflow_run",
+            serde_json::json!({"name":"doctor_unknown_workflow","pane_id":1,"dry_run":true}),
+            vec![
+                "workflow",
+                "run",
+                "doctor_unknown_workflow",
+                "1",
+                "--dry-run",
+            ],
+        ),
+        (
+            "wa.dom",
+            serde_json::json!({"pane_id":1,"query":"zones"}),
+            vec!["dom", "zones", "1"],
+        ),
+        (
+            "wa.accounts_refresh",
+            serde_json::json!({"service":"openai"}),
+            vec!["accounts", "refresh", "--service", "openai"],
+        ),
+    ] {
+        let unknown_workflow = arguments["name"] == "doctor_unknown_workflow";
+        let started_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let contents = client
+            .call_tool(tool, arguments)
+            .expect("actual MCP dispatch");
+        let text = contents
+            .iter()
+            .find_map(|item| match item {
+                FrameworkContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("MCP text envelope");
+        let mut mcp: serde_json::Value = serde_json::from_str(text).unwrap();
+        let output = wa_cmd_for(&workspace)
+            .current_dir(dir.path())
+            .env("FT_WEZTERM_CLI", &mux)
+            .env("PATH", &path_env)
+            .env("HOME", dir.path())
+            .env("XDG_DATA_HOME", dir.path().join("data-home"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config-home"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("runtime"))
+            .timeout(std::time::Duration::from_secs(30))
+            .args(["robot", "--format", "json"])
+            .args(cli_args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{tool} CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut cli: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("actual CLI envelope");
+        assert_eq!(mcp["ok"], true, "{tool}: {mcp}");
+        assert_eq!(cli["ok"], true, "{tool}: {cli}");
+        if tool == "wa.accounts_refresh" {
+            let finished_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            for envelope in [&mut cli, &mut mcp] {
+                let accounts = envelope["data"]["accounts"]
+                    .as_array_mut()
+                    .expect("refresh accounts");
+                assert_eq!(
+                    accounts.len(),
+                    1,
+                    "fixture must cause a real refreshed account"
+                );
+                for account in accounts {
+                    let timestamp = account["last_refreshed_at"]
+                        .as_i64()
+                        .expect("integer refresh observation time");
+                    assert!(
+                        (started_ms..=finished_ms).contains(&timestamp),
+                        "refresh must record this invocation's real observation time"
+                    );
+                    // This is an independently observed wall-clock field, not
+                    // account content. Check its contract before canonicalizing.
+                    account["last_refreshed_at"] = serde_json::json!(0);
+                }
+            }
+        }
+        assert_eq!(
+            cli["data"], mcp["data"],
+            "actual CLI/MCP payload mismatch for {tool}"
+        );
+        if tool == "wa.accounts" {
+            assert_eq!(cli["data"]["total"], 2, "nonempty seeded account control");
+        }
+        if tool == "wa.workflow_status" {
+            assert_eq!(
+                cli["data"]["count"], 1,
+                "pane filter must exclude the other stored workflow"
+            );
+            assert_eq!(
+                cli["data"]["executions"][0]["execution_id"],
+                "doctor-visible"
+            );
+            assert_eq!(
+                cli["data"]["executions"][0]["elapsed_ms"], 25,
+                "completed execution duration is deterministic"
+            );
+        }
+        if tool == "wa.workflow_run" {
+            let report: frankenterm_core::dry_run::DryRunReport =
+                serde_json::from_value(cli["data"].clone()).unwrap();
+            assert_eq!(report.command, "workflow run");
+            let workflow_check = report
+                .policy_evaluation
+                .as_ref()
+                .unwrap()
+                .checks
+                .iter()
+                .find(|check| check.name == "workflow")
+                .unwrap();
+            assert_eq!(workflow_check.passed, !unknown_workflow);
+            assert_eq!(report.expected_actions.is_empty(), unknown_workflow);
+            for root in [dir.path(), mcp_dir.path()] {
+                let connection = rusqlite::Connection::open(root.join(".ft/ft.db")).unwrap();
+                let count: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM workflow_executions", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 2, "preview must not create a workflow execution");
+                let steps: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM workflow_step_logs", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(steps, 0, "preview must not execute a workflow step");
+            }
+        }
+        if tool == "wa.dom" {
+            assert_eq!(
+                cli["data"]["semantic_data_unavailable"], true,
+                "CLI backend cannot fabricate semantic zones"
+            );
+        }
+    }
+    drop(client);
+    server_thread.join().expect("MCP server thread");
 }
 
 /// Build a wa command configured for the given workspace.

@@ -127,7 +127,9 @@ proptest! {
 
         prop_assert_eq!(view.pane_id, pane_id);
         prop_assert_eq!(view.title, title.unwrap_or_default());
-        prop_assert_eq!(view.domain, domain_name.unwrap_or_else(|| "local".to_string()));
+        let expected_domain = domain_name.as_deref().map(str::trim)
+            .filter(|domain| !domain.is_empty()).unwrap_or("local");
+        prop_assert_eq!(view.domain, expected_domain);
         prop_assert_eq!(view.cwd, cwd);
         prop_assert!(!view.is_excluded);
         prop_assert_eq!(view.last_activity_ts, None);

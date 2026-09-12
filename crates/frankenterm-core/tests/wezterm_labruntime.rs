@@ -442,25 +442,45 @@ fn mock_spawn_multiple_gets_unique_ids() {
 }
 
 #[test]
-fn mock_kill_nonexistent_pane_is_noop() {
+fn mock_kill_nonexistent_pane_fails_without_changing_live_panes() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = MockWezterm::new();
-        assert!(mock.kill_pane(99).await.is_ok());
+        mock.add_default_pane(0).await;
+        assert!(matches!(
+            mock.kill_pane(99).await,
+            Err(frankenterm_core::Error::Wezterm(
+                WeztermError::PaneNotFound(99)
+            ))
+        ));
+        assert!(mock.get_pane(0).await.is_ok());
+        assert_eq!(mock.pane_count().await, 1);
+        mock.kill_pane(0).await.expect("kill existing pane");
+        assert_eq!(mock.pane_count().await, 0);
     });
 }
 
 #[test]
-fn mock_split_ignores_parent_creates_new() {
+fn mock_split_requires_parent_before_creating_child() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = MockWezterm::new();
+        assert!(matches!(
+            mock.split_pane(99, SplitDirection::Right, None, None).await,
+            Err(frankenterm_core::Error::Wezterm(
+                WeztermError::PaneNotFound(99)
+            ))
+        ));
+        assert_eq!(mock.pane_count().await, 0);
+        mock.add_default_pane(99).await;
         let new_id = mock
             .split_pane(99, SplitDirection::Right, None, None)
             .await
             .unwrap();
-        assert_eq!(mock.pane_count().await, 1);
-        assert_eq!(new_id, 0);
+        assert_eq!(mock.pane_count().await, 2);
+        assert_ne!(new_id, 99);
+        assert!(mock.get_pane(99).await.is_ok());
+        assert!(mock.get_pane(new_id).await.is_ok());
     });
 }
 

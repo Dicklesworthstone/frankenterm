@@ -548,8 +548,8 @@ fn loom_2_readers_1_writer_no_torn_read() {
 
 /// **1R/2W** — one reader + two writers. The bead's "no
 /// lost write" claim. Both writers' publishes must increment
-/// `publishes_total`, and the reader sees a value from at
-/// least one of them.
+/// `publishes_total`. The reader sees either the initial
+/// value or one of the published values, depending on scheduling.
 #[test]
 fn loom_1_reader_2_writers_no_lost_write() {
     loom::model(|| {
@@ -590,10 +590,9 @@ fn loom_1_reader_2_writers_no_lost_write() {
         // caught up.
         let overruns = tb.overruns_total.load(Ordering::Relaxed);
         let acquires = tb.acquires_total.load(Ordering::Relaxed);
-        // Either: reader caught the first publish then second
-        // overran (overruns=0, acquires=1) — or — reader was
-        // late, second publish overran first (overruns=1,
-        // acquires=1). Both legal.
+        // If the reader consumes the first publish before the second,
+        // neither publish overruns. Otherwise the second can replace the
+        // unconsumed first publish. Both outcomes have one acquire call.
         assert!(
             overruns <= 1 && acquires == 1,
             "overruns={overruns}, acquires={acquires} not in {{(0,1),(1,1)}}"
@@ -612,11 +611,10 @@ fn loom_1_reader_2_writers_no_lost_write() {
 // ops). On this host, 1R/2W already runs in 2.6 min;
 // 2R/2W and 2R/2-sequential-publishes timed out at 10 min.
 //
-// The 2R/1W and 1R/2W tests above cover the same
-// invariant SET — concurrent publish/acquire CAS
-// orderings, slot-mutex independence, no-torn-read,
-// counter monotonicity. Adding more concurrent threads
-// re-explores the same Mazurkiewicz equivalence classes.
+// The 2R/1W and 1R/2W tests above check concurrent publish/acquire
+// orderings, slot-mutex independence, read consistency, and final
+// counter accounting for these bounded scenarios. They do not prove
+// that larger thread counts introduce no new equivalence classes.
 // Operators who want the full N×M sweep can opt in via
 // `LOOM_MAX_PREEMPTIONS=8 cargo test --release …` at the
 // cost of the 30-min budget.

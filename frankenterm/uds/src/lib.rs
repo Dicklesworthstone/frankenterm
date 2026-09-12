@@ -2934,9 +2934,48 @@ mod tests {
     }
 
     #[test]
-    fn empty_socket_name_fails() {
-        let result = UnixListener::bind("");
-        assert!(result.is_err());
+    fn empty_socket_name_preserves_native_binding_semantics() {
+        // Linux can autobind an empty address into the abstract namespace.
+        // The wrapper deliberately delegates address policy to the native API.
+        match (ListenerImpl::bind(""), UnixListener::bind("")) {
+            (Ok(native), Ok(wrapped)) => {
+                let native_addr = native.local_addr().unwrap();
+                let wrapped_addr = wrapped.local_addr().unwrap();
+                assert_eq!(native_addr.as_pathname(), wrapped_addr.as_pathname());
+                assert_eq!(native_addr.is_unnamed(), wrapped_addr.is_unnamed());
+            }
+            (Err(native), Err(wrapped)) => {
+                assert_eq!(native.kind(), wrapped.kind());
+                assert_eq!(native.raw_os_error(), wrapped.raw_os_error());
+            }
+            (Ok(_), Err(error)) => panic!("native bind succeeded but wrapper failed: {error}"),
+            (Err(error), Ok(_)) => panic!("native bind failed but wrapper succeeded: {error}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn empty_socket_name_autobinds_a_connectable_abstract_address() {
+        let listener = UnixListener::bind("").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(address.as_pathname().is_none());
+        assert!(!address.is_unnamed());
+
+        let mut client = StreamImpl::connect_addr(&address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let timeout = Some(std::time::Duration::from_secs(5));
+        client.set_read_timeout(timeout).unwrap();
+        client.set_write_timeout(timeout).unwrap();
+        server.set_read_timeout(timeout).unwrap();
+        server.set_write_timeout(timeout).unwrap();
+
+        client.write_all(b"ping").unwrap();
+        let mut payload = [0; 4];
+        server.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"ping");
+        server.write_all(b"pong").unwrap();
+        client.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"pong");
     }
 
     #[cfg(unix)]

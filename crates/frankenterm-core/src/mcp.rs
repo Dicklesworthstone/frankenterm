@@ -752,7 +752,7 @@ fn register_builtin_workflows(runner: &WorkflowRunner, config: &Config) {
     }
 }
 
-fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
+pub(crate) fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
     vec![
         Arc::new(
             HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),

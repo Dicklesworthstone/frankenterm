@@ -20,7 +20,7 @@ use frankenterm_core::patterns::{PatternEngine, PatternPack, PatternTelemetrySna
 fn minimal_engine() -> PatternEngine {
     let rule = RuleDef {
         id: "wezterm.test_telemetry".to_string(),
-        agent_type: frankenterm_core::patterns::AgentType::Unknown,
+        agent_type: frankenterm_core::patterns::AgentType::Wezterm,
         event_type: "test_event".to_string(),
         severity: frankenterm_core::patterns::Severity::Info,
         anchors: vec!["ERROR".to_string(), "WARN".to_string()],

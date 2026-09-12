@@ -1045,6 +1045,13 @@ impl HeadlessMuxServer {
     /// no longer false-positive on a single late arrival.
     pub fn check_peer_health(&mut self) {
         let now_micros = epoch_ms().saturating_mul(1_000);
+        self.check_peer_health_at(now_micros);
+    }
+
+    /// Check peer health at an explicit timestamp in microseconds since the
+    /// Unix epoch, using the same clock domain as recorded peer heartbeats.
+    /// This permits deterministic health sweeps and replay without sleeping.
+    pub fn check_peer_health_at(&mut self, now_micros: u64) {
         let threshold = self.config.suspicion_threshold;
 
         for peer in self.peers.values_mut() {

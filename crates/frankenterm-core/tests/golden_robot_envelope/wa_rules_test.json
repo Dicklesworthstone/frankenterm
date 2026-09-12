@@ -62,6 +62,7 @@
     "properties": {
       "format": {
         "description": "Optional output format override for this call",
+        "maxLength": 16,
         "enum": [
           "json",
           "toon"
@@ -70,6 +71,7 @@
       },
       "text": {
         "description": "Text to test pattern detection against",
+        "maxLength": 262144,
         "type": "string"
       },
       "trace": {
