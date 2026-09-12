@@ -64,6 +64,8 @@ struct Args {
     comparison_wezterm_frames: Option<PathBuf>,
     fuzz: FuzzCliFlags,
     fixture_filters: Vec<String>,
+    skip_filters: Vec<String>,
+    ignored_only: bool,
 }
 
 #[derive(Debug)]
@@ -311,6 +313,12 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from(
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args {
         self_test: false,
         headless_render_self_test: false,
@@ -326,19 +334,34 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         comparison_wezterm_frames: None,
         fuzz: FuzzCliFlags::default(),
         fixture_filters: Vec::new(),
+        skip_filters: Vec::new(),
+        ignored_only: false,
     };
 
-    for arg in env::args().skip(1) {
+    let mut arguments = arguments.into_iter();
+    while let Some(arg) = arguments.next() {
         match arg.as_str() {
             "--self-test" => args.self_test = true,
             "--headless-render-self-test" => args.headless_render_self_test = true,
             "--update-goldens" => args.update_goldens = true,
             "--perf-self-test" => args.perf_self_test = true,
             "--update-perf-baseline" => args.update_perf_baseline = true,
-            "--nocapture" | "--ignored" | "--include-ignored" => {}
-            other if other.starts_with("--test-threads") => {}
+            "--nocapture" | "--show-output" | "--include-ignored" => {}
+            "--ignored" => args.ignored_only = true,
+            "--skip" => args
+                .skip_filters
+                .push(arguments.next().ok_or("--skip requires a filter")?),
+            "--test-threads" => {
+                let value = arguments.next().ok_or("--test-threads requires a count")?;
+                parse_positive_u32_arg("--test-threads", &value)?;
+            }
+            other if other.starts_with("--test-threads=") => {
+                parse_positive_u32_arg("--test-threads", &other[15..])?;
+            }
             other => {
-                if let Some(value) = other.strip_prefix("--perf-report=") {
+                if let Some(value) = other.strip_prefix("--skip=") {
+                    args.skip_filters.push(value.to_string());
+                } else if let Some(value) = other.strip_prefix("--perf-report=") {
                     args.perf_report = Some(PathBuf::from(value));
                 } else if let Some(value) = other.strip_prefix("--perf-baseline=") {
                     args.perf_baseline = Some(PathBuf::from(value));
@@ -648,6 +671,24 @@ fn run_fuzz(_flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_args_from([
+        "--skip".to_string(),
+        "scoped_formatting_is_clean_under_rch_source_contract".to_string(),
+        "--skip=workspace_formatting_is_clean_under_rch_source_contract".to_string(),
+        "--test-threads".to_string(),
+        "8".to_string(),
+    ])?;
+    assert!(parsed.fixture_filters.is_empty());
+    assert!(!fixture_is_skipped("_smoketest", &parsed.skip_filters));
+    assert!(fixture_is_skipped(
+        "group/_smoketest",
+        &["smoke".to_string()]
+    ));
+    assert!(fixture_is_skipped("_smoketest", &[String::new()]));
+    assert!(parse_args_from(["--skip".to_string()]).is_err());
+    assert!(parse_args_from(["--test-threads-invalid".to_string()]).is_err());
+    assert!(parse_args_from(["--ignored".to_string()])?.ignored_only);
+    assert!(!parse_args_from(["--include-ignored".to_string()])?.ignored_only);
     let started = Instant::now();
     emit_json(json!({
         "phase": "self-test",
@@ -698,13 +739,42 @@ fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
 fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let root = fixtures_root();
     let artifact_root = artifact_root();
-    let fixtures = discover_fixtures(&root, &args.fixture_filters)?;
+    let mut fixtures = discover_fixtures(&root, &args.fixture_filters)?;
+    let discovered_count = fixtures.len();
+    fixtures.retain(|fixture| !fixture_is_skipped(&fixture.name, &args.skip_filters));
+    if args.ignored_only {
+        // This corpus has no ignored fixtures. Do not silently execute regular
+        // fixtures when Cargo explicitly asks for ignored tests only.
+        fixtures.clear();
+    }
+    let before_feature_filter = fixtures.len();
+    // Ordinary workspace tests include this custom harness without a renderer.
+    // Only an unfiltered default run selects the renderer-free fixtures; an
+    // explicit request for a GPU fixture must still fail if the feature is absent.
+    if !cfg!(feature = "headless-render")
+        && args.fixture_filters.is_empty()
+        && !env_fixture_filter_present()
+    {
+        fixtures.retain(|fixture| fixture.input.kind == InputKind::StaticPngRoundtrip);
+    }
+    let unavailable_without_renderer = before_feature_filter - fixtures.len();
+    let filtered_out = discovered_count - fixtures.len();
 
     emit_json(json!({
         "phase": "discover",
         "root": root,
         "count": fixtures.len(),
+        "filtered_out": filtered_out,
+        "unavailable_without_renderer": unavailable_without_renderer,
+        "headless_render_enabled": cfg!(feature = "headless-render"),
     }));
+    if fixtures.is_empty() {
+        emit_json(
+            json!({"phase": "summary", "status": "no_fixtures_selected", "total": 0,
+            "passed": 0, "failed": 0, "filtered_out": filtered_out}),
+        );
+        return Ok(());
+    }
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -769,6 +839,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         "total": passed + failed,
         "passed": passed,
         "failed": failed,
+        "filtered_out": filtered_out,
     }));
 
     let perf_report = build_perf_report(perf_entries);
@@ -985,6 +1056,10 @@ fn failed_metrics(thresholds: Thresholds) -> serde_json::Value {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn fixture_is_skipped(name: &str, skip_filters: &[String]) -> bool {
+    skip_filters.iter().any(|filter| name.contains(filter))
 }
 
 fn discover_fixtures(
