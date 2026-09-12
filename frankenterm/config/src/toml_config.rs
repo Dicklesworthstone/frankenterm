@@ -557,6 +557,59 @@ agent_auto_layout = "by_activity"
         );
     }
 
+    #[cfg(feature = "lua")]
+    #[test]
+    fn explicit_lua_override_loads_without_implicit_lua_opt_in() {
+        let _env_lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.lua");
+        std::fs::write(
+            &path,
+            "return { scrollback_lines = 4242, enable_tab_bar = false }",
+        )
+        .unwrap();
+        let _override_guard = ConfigFileOverrideGuard::set(Some(&path));
+        let _env_config = EnvVarGuard::set(
+            "FRANKENTERM_CONFIG_FILE",
+            dir.path().join("must-not-load.toml"),
+        );
+        let _wezterm_file = EnvVarGuard::unset("WEZTERM_CONFIG_FILE");
+        let _wezterm_dir = EnvVarGuard::unset("WEZTERM_CONFIG_DIR");
+        let _lua_opt_in = EnvVarGuard::unset("FRANKENTERM_LUA_CONFIG");
+
+        let loaded = Config::load();
+        assert_eq!(loaded.file_name.as_ref(), Some(&path));
+        assert!(loaded.lua.is_some());
+        let config = loaded.config.expect("explicit Lua path must load");
+        assert_eq!(config.scrollback_lines, 4242);
+        assert!(!config.enable_tab_bar);
+
+        let _disabled = EnvVarGuard::set("FRANKENTERM_LUA_CONFIG", "0");
+        let loaded = Config::load();
+        assert_eq!(loaded.file_name.as_ref(), Some(&path));
+        assert!(
+            loaded.config.is_ok(),
+            "explicit path takes precedence over discovery opt-out"
+        );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn explicit_missing_lua_override_reports_error_without_lua_opt_in() {
+        let _env_lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.lua");
+        let _override_guard = ConfigFileOverrideGuard::set(Some(&missing));
+        let _lua_opt_in = EnvVarGuard::unset("FRANKENTERM_LUA_CONFIG");
+
+        let loaded = Config::load();
+        assert_eq!(loaded.file_name.as_ref(), Some(&missing));
+        assert!(
+            loaded.config.is_err(),
+            "explicit paths must not silently become defaults"
+        );
+    }
+
     #[test]
     fn full_config_loads_all_fields() {
         let toml_str = r#"

@@ -1354,13 +1354,14 @@ impl Config {
             return loaded;
         }
 
-        // Skip Lua config unless explicitly enabled. TOML is the default
-        // configuration format for FrankenTerm. Set FRANKENTERM_LUA_CONFIG=1
-        // to enable Lua config fallback.
-        let lua_enabled = std::env::var("FRANKENTERM_LUA_CONFIG")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // An explicit --config-file already selects its configuration format;
+        // non-TOML paths above deliberately fall through to this loader.
+        // Implicit Lua discovery still requires FRANKENTERM_LUA_CONFIG=1.
+        let lua_enabled = config_file_override_snapshot().is_some()
+            || std::env::var("FRANKENTERM_LUA_CONFIG")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
         if !lua_enabled {
             log::info!(
                 "No frankenterm.toml found; Lua config disabled (set FRANKENTERM_LUA_CONFIG=1 to enable)"
