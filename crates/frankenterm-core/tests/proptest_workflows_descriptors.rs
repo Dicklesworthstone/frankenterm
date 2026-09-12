@@ -18,7 +18,7 @@ use frankenterm_core::workflows::{
 
 fn arb_descriptor_trigger() -> impl Strategy<Value = DescriptorTrigger> {
     (
-        prop::collection::vec("[a-z_.]{3,15}", 0..4),
+        prop::collection::vec(r"[a-z_]{1,5}(\.[a-z_]{1,5}){0,2}", 0..4),
         prop::collection::vec(
             prop_oneof![
                 Just("codex".to_string()),
@@ -27,7 +27,7 @@ fn arb_descriptor_trigger() -> impl Strategy<Value = DescriptorTrigger> {
             ],
             0..3,
         ),
-        prop::collection::vec("[a-z_.]{3,15}", 0..4),
+        prop::collection::vec(r"[a-z_]{1,5}(\.[a-z_]{1,5}){0,2}", 0..4),
     )
         .prop_map(|(event_types, agent_types, rule_ids)| DescriptorTrigger {
             event_types,
@@ -1152,7 +1152,7 @@ proptest! {
                 then_steps: vec![DescriptorStep::Log {
                     id: "t".to_string(),
                     description: None,
-                    message: "matched".to_string(),
+                    message: "x".to_string(),
                 }],
                 else_steps: Vec::new(),
             }],
@@ -1178,7 +1178,7 @@ proptest! {
                 then_steps: vec![DescriptorStep::Log {
                     id: "t".to_string(),
                     description: None,
-                    message: "matched".to_string(),
+                    message: "x".to_string(),
                 }],
                 else_steps: Vec::new(),
             }],

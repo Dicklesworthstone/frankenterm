@@ -329,7 +329,7 @@ fn default_config_has_expected_port() {
 #[test]
 fn default_config_has_subject_prefix() {
     let config = EmailNotifyConfig::default();
-    assert_eq!(config.subject_prefix, "[wa]");
+    assert_eq!(config.subject_prefix, "[ft]");
 }
 
 #[test]

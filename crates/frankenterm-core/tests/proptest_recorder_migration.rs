@@ -514,30 +514,24 @@ fn stage_index(s: MigrationStage) -> usize {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    // 29. Earlier stages can always roll back; later stages cannot
+    // 29. Every implemented stage remains rollbackable; M4 is reserved.
     #[test]
-    fn rollback_monotonic_boundary(stage in arb_stage()) {
-        let idx = stage_index(stage);
-        // M0..M3 (indices 0..3) can rollback; M4, M5 (indices 4,5) cannot
-        if idx <= 3 {
-            prop_assert!(stage.can_rollback());
-        } else {
-            prop_assert!(!stage.can_rollback());
-        }
+    fn rollback_available_until_external_selector_activation(stage in arb_stage()) {
+        prop_assert_eq!(stage.can_rollback(), stage != MigrationStage::M4Reserved);
     }
 
-    // 30. Stage pipeline has exactly one complete stage
+    // 30. Target readiness does not prove external live-selector activation.
     #[test]
-    fn exactly_one_complete(_dummy in 0..1i32) {
+    fn no_stage_claims_external_activation_complete(_dummy in 0..1i32) {
         let complete_count = ALL_STAGES.iter().filter(|s| s.is_complete()).count();
-        prop_assert_eq!(complete_count, 1);
+        prop_assert_eq!(complete_count, 0);
     }
 
-    // 31. Stage pipeline has exactly 4 rollbackable stages
+    // 31. The five implemented stages remain rollbackable.
     #[test]
-    fn exactly_four_rollbackable(_dummy in 0..1i32) {
+    fn exactly_five_rollbackable(_dummy in 0..1i32) {
         let rollback_count = ALL_STAGES.iter().filter(|s| s.can_rollback()).count();
-        prop_assert_eq!(rollback_count, 4);
+        prop_assert_eq!(rollback_count, 5);
     }
 
     // 32. Manifest with matching export/import digest means successful migration

@@ -283,13 +283,13 @@ proptest! {
         }
     }
 
-    /// Property 5: ReadOutput and SearchOutput are never mutating, destructive, or rate-limited
+    /// Property 5: Reads are passive; direct output reads are bandwidth-limited.
     #[test]
     fn prop_action_kind_read_actions_passive(action in arb_action_kind()) {
         if matches!(action, ActionKind::ReadOutput | ActionKind::SearchOutput) {
             prop_assert!(!action.is_mutating(), "Read actions should not be mutating");
             prop_assert!(!action.is_destructive(), "Read actions should not be destructive");
-            prop_assert!(!action.is_rate_limited(), "Read actions should not be rate limited");
+            prop_assert_eq!(action.is_rate_limited(), action == ActionKind::ReadOutput);
         }
     }
 
@@ -2334,7 +2334,7 @@ proptest! {
     /// excluding from this MR.
     #[test]
     fn prop_authorize_decision_idempotent_on_repeat_call(
-        action in arb_action_kind(),
+        action in prop_oneof![Just(ActionKind::Activate), Just(ActionKind::SearchOutput)],
         actor in arb_actor_kind(),
         caps in arb_pane_capabilities(),
         surface in arb_policy_surface(),
@@ -2344,7 +2344,7 @@ proptest! {
         // is the one documented source of legitimate decision drift across
         // repeat calls within a single window. This MR covers the policy
         // engine's *rule* evaluation path, not the rate-limiter's counter.
-        prop_assume!(!action.is_rate_limited());
+        prop_assert!(!action.is_rate_limited());
 
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(action, actor)

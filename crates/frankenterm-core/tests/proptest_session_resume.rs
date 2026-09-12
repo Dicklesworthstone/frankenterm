@@ -506,16 +506,33 @@ proptest! {
         prop_assert!(!config.dry_run);
     }
 
-    // 7. SessionResumer with missing binary always fails discover
+    // 7. Missing CASR yields a partial inventory, never authoritative absence.
     #[test]
-    fn resumer_missing_binary_fails(suffix in "[a-z]{5,15}") {
-        let binary = format!("/nonexistent-{}", suffix);
+    fn resumer_missing_binary_marks_discovery_incomplete(suffix in "[a-z]{5,15}") {
+        let home = tempfile::tempdir().expect("isolated discovery home");
+        let binary = home.path().join(format!("nonexistent-{suffix}"));
         let r = SessionResumer::new(SessionResumeConfig {
-            casr_binary: binary,
+            casr_binary: binary.to_string_lossy().into_owned(),
             ..Default::default()
         });
-        let result = r.discover_sessions();
-        prop_assert!(result.is_err());
+        let report = r.discover_sessions_in_home(home.path())
+            .expect("native discovery remains available without CASR");
+        prop_assert!(report.entries.is_empty());
+        prop_assert!(!report.is_complete());
+        prop_assert_eq!(&report.incomplete, &vec![SessionDiscoveryIncomplete {
+            source: SessionDiscoverySource::Casr,
+            reason: SessionDiscoveryIncompleteReason::Unavailable,
+        }]);
+        prop_assert!(
+            matches!(
+                report.require_complete_for_absence_claim(),
+                Err(SessionResumeError::DiscoveryIncomplete {
+                    source: SessionDiscoverySource::Casr,
+                    reason: SessionDiscoveryIncompleteReason::Unavailable,
+                })
+            ),
+            "partial discovery must reject absence claims"
+        );
     }
 
     // 8. SessionResumer with missing binary: is_casr_available is false

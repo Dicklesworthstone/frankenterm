@@ -347,10 +347,16 @@ fn standard_feature_alignments_has_7() {
 }
 
 #[test]
-fn standard_feature_alignments_none_aligned() {
-    // All standard alignments should be not-yet-aligned (migration incomplete)
+fn standard_feature_alignments_track_completed_default_flips() {
+    // These three manifests now default to async-asupersync. Other migration
+    // pairs remain pending; do not conflate partial adoption with completion.
     for fa in &standard_feature_alignments() {
-        assert!(!fa.aligned, "{} should not be aligned yet", fa.crate_name);
+        let migrated = matches!(fa.crate_name.as_str(), "codec" | "uds" | "async_ossl");
+        assert_eq!(fa.aligned, migrated, "{} alignment", fa.crate_name);
+        if migrated {
+            assert!(fa.legacy_exists && fa.migration_exists);
+            assert!(!fa.default_is_legacy);
+        }
     }
 }
 

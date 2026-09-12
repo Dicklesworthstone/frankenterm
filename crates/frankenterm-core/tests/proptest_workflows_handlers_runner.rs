@@ -302,15 +302,13 @@ impl Workflow for DeadlineOverrunWorkflow {
 
 struct AwaitingWaitWorkflow {
     wait_ms: u64,
-    cancel_after_ms: u64,
     attempts: Arc<AtomicUsize>,
 }
 
 impl AwaitingWaitWorkflow {
-    fn new(wait_ms: u64, cancel_after_ms: u64) -> Self {
+    fn new(wait_ms: u64) -> Self {
         Self {
             wait_ms,
-            cancel_after_ms,
             attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -410,46 +408,30 @@ impl Workflow for AwaitingWaitWorkflow {
         _ctx: &mut WorkflowContext,
         step_idx: usize,
     ) -> BoxFuture<'_, StepResult> {
-        self.execute_step_inner(None, step_idx)
+        self.execute_step_inner(step_idx)
     }
 
     fn execute_step_cx<'a>(
         &'a self,
-        cx: &'a frankenterm_core::cx::Cx,
+        _cx: &'a frankenterm_core::cx::Cx,
         _ctx: &'a mut WorkflowContext,
         step_idx: usize,
     ) -> BoxFuture<'a, StepResult> {
-        self.execute_step_inner(Some(cx.clone()), step_idx)
+        self.execute_step_inner(step_idx)
     }
 }
 
 impl AwaitingWaitWorkflow {
-    fn execute_step_inner(
-        &self,
-        cancel_cx: Option<frankenterm_core::cx::Cx>,
-        step_idx: usize,
-    ) -> BoxFuture<'_, StepResult> {
+    fn execute_step_inner(&self, step_idx: usize) -> BoxFuture<'_, StepResult> {
         let attempts = Arc::clone(&self.attempts);
         let wait_ms = self.wait_ms;
-        let cancel_after_ms = self.cancel_after_ms;
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::SeqCst);
             match step_idx {
-                0 => {
-                    if let Some(cancel_cx) = cancel_cx {
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(cancel_after_ms));
-                            cancel_cx.cancel_with(
-                                frankenterm_core::outcome::CancelKind::User,
-                                Some("workflow wait handler property cancellation"),
-                            );
-                        });
-                    }
-                    StepResult::wait_for_with_timeout(
-                        frankenterm_core::workflows::WaitCondition::sleep(wait_ms),
-                        wait_ms,
-                    )
-                }
+                0 => StepResult::wait_for_with_timeout(
+                    frankenterm_core::workflows::WaitCondition::sleep(wait_ms),
+                    wait_ms,
+                ),
                 _ => StepResult::done(serde_json::json!({"unexpected_step": step_idx})),
             }
         })
@@ -1073,7 +1055,7 @@ proptest! {
                 ..WorkflowRunnerConfig::default()
             };
             let (runner, storage, lock_manager) = build_runner("wait_cancel", config).await;
-            let workflow = Arc::new(AwaitingWaitWorkflow::new(wait_ms, cancel_after_ms));
+            let workflow = Arc::new(AwaitingWaitWorkflow::new(wait_ms));
             let attempts = workflow.attempts();
             runner.register_workflow(workflow.clone());
 
@@ -1087,9 +1069,29 @@ proptest! {
             let cx = frankenterm_core::cx::for_testing();
 
             let started_at = Instant::now();
-            let result = runner
-                .run_workflow_with_cx(&cx, PANE_ID, workflow, &execution_id, 0)
-                .await;
+            let cancel_during_wait = async {
+                // Observe durable waiting state before cancellation; cancellation
+                // during step-log persistence exercises a different contract.
+                loop {
+                    let record = storage.get_workflow(&execution_id).await
+                        .expect("observe workflow phase").expect("workflow exists");
+                    if record.status == "waiting" {
+                        break;
+                    }
+                    assert_eq!(record.status, "running", "workflow never reached its wait");
+                    assert!(started_at.elapsed() < Duration::from_secs(2), "wait phase was not reached");
+                    frankenterm_core::runtime_async::sleep(Duration::from_millis(1)).await;
+                }
+                frankenterm_core::runtime_async::sleep(Duration::from_millis(cancel_after_ms)).await;
+                cx.cancel_with(
+                    frankenterm_core::outcome::CancelKind::User,
+                    Some("workflow wait handler property cancellation"),
+                );
+            };
+            let (result, ()) = futures::future::join(
+                runner.run_workflow_with_cx(&cx, PANE_ID, workflow, &execution_id, 0),
+                cancel_during_wait,
+            ).await;
             let elapsed = started_at.elapsed();
 
             prop_assert!(
@@ -1174,13 +1176,13 @@ proptest! {
             let elapsed = started_at.elapsed();
 
             prop_assert!(
-                matches!(result, WorkflowExecutionResult::Completed { .. }),
-                "explicit wait timeout should let workflow finish before overall deadline; got {result:?}"
+                matches!(result, WorkflowExecutionResult::Aborted { ref reason, step_index: 0, .. } if reason.contains("sleep wait timed out")),
+                "explicit wait timeout should abort before overall deadline; got {result:?}"
             );
             prop_assert_eq!(
                 attempts.load(Ordering::SeqCst),
-                2,
-                "timeout-bounded wait should continue exactly once into the completion step"
+                1,
+                "timed out wait must not continue into the completion step"
             );
             prop_assert!(
                 elapsed < Duration::from_millis(workflow_total_deadline_ms),
@@ -1196,10 +1198,10 @@ proptest! {
                 .await
                 .expect("load timeout-bounded workflow")
                 .expect("timeout-bounded workflow exists");
-            prop_assert_eq!(record.status.as_str(), "completed");
+            prop_assert_eq!(record.status.as_str(), "failed");
             prop_assert!(
-                record.error.is_none(),
-                "timeout-bounded workflow should not persist deadline failure: {:?}",
+                record.error.as_deref().is_some_and(|error| error.contains("sleep wait timed out")),
+                "timeout-bounded workflow should persist wait timeout: {:?}",
                 record.error
             );
             prop_assert!(

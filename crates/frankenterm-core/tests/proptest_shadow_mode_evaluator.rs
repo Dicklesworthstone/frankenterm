@@ -650,26 +650,33 @@ proptest! {
 
         // Generate low-fidelity cycles: no recommendations but unexpected dispatches
         let empty_recs = make_assignment_set(Vec::new());
-        let mut bad_log = make_log();
-        emit_dispatch(&mut bad_log, 1, "unexpected", "unknown-agent");
-        let bad_events = bad_log.events().to_vec();
-
         // Phase 1: low-fidelity cycles
         for i in 0..low_count {
-            eval.evaluate_cycle(i as u64, (i * 1000) as i64, &empty_recs, &bad_events);
+            let mut bad_log = make_log();
+            emit_dispatch(&mut bad_log, i as u64, "unexpected", "unknown-agent");
+            let diff = eval.evaluate_cycle(
+                i as u64, (i * 1000) as i64, &empty_recs, bad_log.events(),
+            );
+            prop_assert!(diff.fidelity_score < 0.5);
         }
 
         // Phase 2: high-fidelity cycles (empty, fidelity=1.0)
         let good_events: Vec<MissionEvent> = Vec::new();
         for i in 0..high_count {
             let cycle = (low_count + i) as u64;
-            eval.evaluate_cycle(cycle, (cycle * 1000) as i64, &empty_recs, &good_events);
+            let diff = eval.evaluate_cycle(cycle, (cycle * 1000) as i64, &empty_recs, &good_events);
+            prop_assert_eq!(diff.fidelity_score, 1.0);
         }
 
         // Phase 3: more low-fidelity cycles
         for i in 0..final_low {
             let cycle = (low_count + high_count + i) as u64;
-            eval.evaluate_cycle(cycle, (cycle * 1000) as i64, &empty_recs, &bad_events);
+            let mut bad_log = make_log();
+            emit_dispatch(&mut bad_log, cycle, "unexpected", "unknown-agent");
+            let diff = eval.evaluate_cycle(
+                cycle, (cycle * 1000) as i64, &empty_recs, bad_log.events(),
+            );
+            prop_assert!(diff.fidelity_score < 0.5);
         }
 
         let metrics = eval.metrics();
