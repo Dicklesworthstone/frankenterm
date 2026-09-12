@@ -84,6 +84,26 @@ def parse_fuzz_bins(toml)
   bins
 end
 
+def validate_fuzz_test_exclusion!(toml)
+  package = toml.split(/^\[package\]\s*$/, 2).last.to_s.split(/^\[/, 2).first.to_s
+  assert_ok(
+    package.match?(/^autobins\s*=\s*false\s*$/),
+    "fuzz package must disable implicit binary discovery",
+    check: "adversarial.fuzz.no_autobins", input_path: FUZZ_CARGO,
+  )
+  bins = parse_fuzz_bins(toml)
+  assert_ok(!bins.empty?, "fuzz binary inventory must not be empty", check: "adversarial.fuzz.nonempty")
+  bins.each do |name, bin|
+    %w[test bench].each do |mode|
+      assert_ok(
+        bin[:section].match?(/^#{mode}\s*=\s*false\s*$/),
+        "#{name} must explicitly disable ordinary cargo #{mode} execution",
+        check: "adversarial.fuzz.exclude_#{mode}", input_path: FUZZ_CARGO,
+      )
+    end
+  end
+end
+
 def validate_privacy!(privacy, manifest_path)
   %w[raw_context_content_stored raw_pane_content_stored raw_content_allowed].each do |field|
     expect_equal(
@@ -269,6 +289,13 @@ manifest = StaticAttestation.read_json!(MANIFEST, check: "adversarial.manifest_j
 workflow_text = StaticAttestation.read_text!(WORKFLOW, check: "adversarial.workflow_text")
 fuzz_toml = StaticAttestation.read_text!(FUZZ_CARGO, check: "adversarial.fuzz_cargo")
 fuzz_bins = parse_fuzz_bins(fuzz_toml)
+validate_fuzz_test_exclusion!(fuzz_toml)
+%w[test bench].each do |mode|
+  fixture = "[package]\nautobins = false\n[[bin]]\nname = \"unbounded\"\npath = \"fuzz_targets/unbounded.rs\"\ntest = false\nbench = false\n"
+  StaticAttestation.expect_failure!("unbounded fuzz #{mode} negative fixture", check: "adversarial.negative.fuzz_#{mode}") do
+    validate_fuzz_test_exclusion!(fixture.sub("#{mode} = false", "#{mode} = true"))
+  end
+end
 
 expect_equal(manifest["schema_version"], 1, "schema_version must be 1", check: "adversarial.schema_version", input_path: MANIFEST)
 expect_equal(manifest["contract_id"], "security.adversarial_contract_fuzz.v1", "unexpected contract_id", check: "adversarial.contract_id", input_path: MANIFEST)
