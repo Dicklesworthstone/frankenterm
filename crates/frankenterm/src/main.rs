@@ -119030,6 +119030,51 @@ printf '%s' 'attacker-controlled download bytes'
 
     #[cfg(unix)]
     #[test]
+    fn installer_version_resolution_never_guesses_an_obsolete_release() {
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let script = format!(
+            r#"set -euo pipefail
+export FT_INSTALL_TEST_LIBRARY_ONLY=1
+source {}
+QUIET=1
+HAS_GUM=0
+curl() {{ return 7; }}
+VERSION=''
+if resolve_version; then exit 91; fi
+test -z "$VERSION"
+VERSION=v0.15.5
+resolve_version
+test "$VERSION" = v0.15.5
+VERSION=''
+curl() {{ printf '%s\n' '{{"tag_name": "v0.15.5"}}'; }}
+resolve_version
+test "$VERSION" = v0.15.5
+VERSION=''
+curl() {{
+  case "$*" in
+    *api.github.com*) return 7 ;;
+    *) printf '%s' 'https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.5' ;;
+  esac
+}}
+resolve_version
+test "$VERSION" = v0.15.5
+"#,
+            shell_single_quote(&installer.to_string_lossy()),
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute installer version resolution proof");
+        assert!(
+            output.status.success(),
+            "release discovery or explicit version contract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installer_requires_minisign_unless_the_operator_explicitly_disables_release_signatures() {
         let fixture = InstallerTestDir::new("create missing-minisign fixture");
         let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
@@ -135515,6 +135560,64 @@ A  docs/new-proof.md\n";
             .is_err(),
             "checkpoint-only bootstrap must not accept an existing cursor token"
         );
+    }
+
+    #[test]
+    fn read_search_policy_audit_target_persists_unobserved_live_pane() {
+        run_async_test(async {
+            use frankenterm_core::policy::{ActionKind, ActorKind, PolicyDecision};
+            use frankenterm_core::storage::AuditQuery;
+
+            let (storage, db_path) = setup_storage("unobserved_live_pane_audit").await;
+            assert!(storage.get_pane(0).await.unwrap().is_none());
+            for (action, decision, result) in [
+                (
+                    ActionKind::ReadOutput,
+                    PolicyDecision::allow_with_rule("test.read"),
+                    "success",
+                ),
+                (
+                    ActionKind::SearchOutput,
+                    PolicyDecision::deny_with_rule("test refusal", "test.search"),
+                    "denied",
+                ),
+            ] {
+                record_read_search_policy_audit(
+                    Some(&storage),
+                    ActorKind::Robot,
+                    action,
+                    Some(0),
+                    Some("local"),
+                    "read/search target 0",
+                    &decision,
+                    result,
+                )
+                .await;
+                let rows = storage
+                    .get_audit_actions(AuditQuery {
+                        pane_id: Some(0),
+                        action_kind: Some(action.as_str().to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "real robot read/search helper must persist its audit"
+                );
+                assert_eq!(rows[0].pane_id, Some(0));
+                assert_eq!(rows[0].actor_kind, "robot");
+                assert_eq!(rows[0].policy_decision, decision.as_str());
+                assert_eq!(rows[0].rule_id.as_deref(), decision.rule_id());
+                assert_eq!(rows[0].result, result);
+            }
+            assert!(
+                storage.get_pane(0).await.unwrap().is_none(),
+                "auditing must not fabricate observation"
+            );
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     #[test]

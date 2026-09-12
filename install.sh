@@ -129,7 +129,6 @@ APP_MINISIGN_SIGNATURE_URL="${APP_MINISIGN_SIGNATURE_URL:-}"
 MINISIGN_PUBLIC_KEY="RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/ft-install.lock"
-HARDCODED_FALLBACK_VERSION="v0.2.0"
 
 # Download and extraction resource contracts. These are deliberately finite
 # and are enforced both before transfer and again through descriptor-pinned
@@ -356,8 +355,8 @@ resolve_version() {
       return 0
     fi
   fi
-  warn "Could not resolve latest version; using hardcoded fallback $HARDCODED_FALLBACK_VERSION"
-  VERSION="$HARDCODED_FALLBACK_VERSION"
+  err "Could not resolve the latest release. Retry when GitHub is reachable or specify --version vX.Y.Z."
+  return 1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6353,7 +6352,7 @@ if [ -z "$ACTIVATE_GENERATION" ]; then
     TAR=$(basename "$OFFLINE_TARBALL")
     URL=""
   else
-    resolve_version
+    resolve_version || exit 1
     detect_platform
     set_artifact_url
   fi
