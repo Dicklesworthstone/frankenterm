@@ -161,6 +161,8 @@ pub struct OnboardingReport {
     pub machine_local_failures: Vec<FailedCheck>,
     pub repo_code_failures: Vec<FailedCheck>,
     pub passed: Vec<OnboardingCheck>,
+    /// Explicit skips and missing required checks, with reasons explaining
+    /// why a required check has not authorized high-risk work.
     pub skipped: Vec<SkippedCheck>,
 }
 
@@ -237,7 +239,11 @@ pub fn compile_report(probe_results: &OnboardingProbeResults) -> OnboardingRepor
             CheckOutcome::Pass => passed.push(*check),
             CheckOutcome::Skipped { reason } => skipped.push(SkippedCheck {
                 check: *check,
-                reason: reason.clone(),
+                reason: if *check == OnboardingCheck::MachineProfile {
+                    reason.clone()
+                } else {
+                    format!("required check did not pass: {reason}")
+                },
             }),
             CheckOutcome::Fail {
                 remediation,
@@ -264,6 +270,14 @@ pub fn compile_report(probe_results: &OnboardingProbeResults) -> OnboardingRepor
         OnboardingCheck::ForbiddenSurfaces,
         OnboardingCheck::SafeProbeBudget,
     ];
+    for check in &required_checks {
+        if !probe_results.outcomes.contains_key(check) {
+            skipped.push(SkippedCheck {
+                check: *check,
+                reason: "required check was not run".into(),
+            });
+        }
+    }
     let eligible_for_high_risk_tasks = machine_local_failures.is_empty()
         && repo_code_failures.is_empty()
         && required_checks.iter().all(|check| passed.contains(check));
@@ -380,10 +394,9 @@ mod tests {
         assert_eq!(report.repo_code_failures.len(), 1);
     }
 
-    /// Skipped checks do not block eligibility (the optional
-    /// MachineProfile check may skip without breaking onboarding).
+    /// The optional MachineProfile check may skip without blocking eligibility.
     #[test]
-    fn skipped_checks_do_not_block_eligibility() {
+    fn skipped_optional_check_does_not_block_eligibility() {
         let mut probes = pass_all();
         probes.record(
             OnboardingCheck::MachineProfile,
@@ -486,6 +499,7 @@ mod tests {
         let report = compile_report(&probes);
         assert!(!report.eligible_for_high_risk_tasks);
         assert!(report.passed.is_empty());
+        assert_eq!(report.skipped.len(), 7);
     }
 
     #[test]
@@ -493,21 +507,44 @@ mod tests {
         for check in pass_all().outcomes.keys().copied() {
             let mut probes = pass_all();
             probes.outcomes.remove(&check);
+            let report = compile_report(&probes);
             assert_eq!(
-                compile_report(&probes).eligible_for_high_risk_tasks,
+                report.eligible_for_high_risk_tasks,
                 check == OnboardingCheck::MachineProfile,
                 "missing {check:?}",
             );
+            if check != OnboardingCheck::MachineProfile {
+                assert_eq!(
+                    report.skipped,
+                    vec![SkippedCheck {
+                        check,
+                        reason: "required check was not run".into(),
+                    }],
+                );
+                let rendered = crate::onboarding_stress_capsule_doctor::OnboardingDoctor::new()
+                    .render_text(&report);
+                assert!(rendered.contains("required check was not run"));
+            }
             probes.record(
                 check,
                 CheckOutcome::Skipped {
                     reason: "not run".into(),
                 },
             );
+            let report = compile_report(&probes);
             assert_eq!(
-                compile_report(&probes).eligible_for_high_risk_tasks,
+                report.eligible_for_high_risk_tasks,
                 check == OnboardingCheck::MachineProfile,
                 "skipped {check:?}",
+            );
+            assert_eq!(report.skipped[0].check, check);
+            assert_eq!(
+                report.skipped[0].reason,
+                if check == OnboardingCheck::MachineProfile {
+                    "not run"
+                } else {
+                    "required check did not pass: not run"
+                },
             );
         }
     }
