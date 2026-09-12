@@ -2855,18 +2855,13 @@ ReadbackWaitSnapshot {
 
     #[test]
     fn wait_for_webgpu_readback_map_propagates_callback_error() {
-        k9::snapshot!(
-            snapshot_readback_wait::<&'static str>([Ok(Err("device lost"))], [0],),
-            "
-ReadbackWaitSnapshot {
-    result: \"mapping webgpu readback buffer failed: \\\"device lost\\\"\",
-    poll_calls: 1,
-    recv_timeouts_ms: [
-        5,
-    ],
-}
-"
+        let snapshot = snapshot_readback_wait::<&'static str>([Ok(Err("device lost"))], [0]);
+        assert_eq!(
+            snapshot.result,
+            "mapping webgpu readback buffer failed: \"device lost\""
         );
+        assert_eq!(snapshot.poll_calls, 1);
+        assert_eq!(snapshot.recv_timeouts_ms, vec![5]);
     }
 
     #[test]

@@ -466,6 +466,10 @@ fn trusted_decoded_image_authority_limits() -> ImageDataValidationLimits {
 }
 
 static FRAME_DECODER_JOBS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    static FRAME_DECODER_TEST_JOBS: Cell<Option<&'static AtomicUsize>> = const { Cell::new(None) };
+}
 static FRAME_DECODER_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
@@ -518,13 +522,17 @@ struct FrameDecoderJobPermit<'a> {
 
 impl FrameDecoderJobPermit<'static> {
     fn try_acquire() -> Option<Self> {
+        #[cfg(test)]
+        if let Some(jobs) = FRAME_DECODER_TEST_JOBS.get() {
+            return Self::try_acquire_from(jobs, MAX_PENDING_FRAME_DECODERS);
+        }
         Self::try_acquire_from(&FRAME_DECODER_JOBS, MAX_PENDING_FRAME_DECODERS)
     }
 }
 
 impl<'a> FrameDecoderJobPermit<'a> {
     fn try_acquire_from(jobs: &'a AtomicUsize, limit: usize) -> Option<Self> {
-        try_reserve_bounded_atomic(jobs, 1, limit).then_some(Self { jobs })
+        try_reserve_bounded_atomic(jobs, 1, limit).then(|| Self { jobs })
     }
 }
 
@@ -641,7 +649,7 @@ impl QueuedFrameBudget {
             bytes,
             MAX_QUEUED_FRAME_DECODER_BYTES,
         )
-        .then_some(Self { bytes })
+        .then(|| Self { bytes })
     }
 
     fn split(&mut self, bytes: usize) -> anyhow::Result<Self> {
@@ -949,8 +957,8 @@ impl FrameState {
 
     fn awaiting_first_visible_frame(&self) -> bool {
         matches!(&self.source, FrameSource::Decoder(_))
-            && self.frames.len() == 1
-            && self.frames[0].duration.is_zero()
+            && (self.frames.is_empty()
+                || (self.frames.len() == 1 && self.frames[0].duration.is_zero()))
     }
 
     fn next_frame_due(&self, due: Instant) -> Option<Instant> {
@@ -3205,6 +3213,24 @@ mod tests {
         assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
     }
 
+    #[test]
+    fn rejected_job_permit_does_not_release_an_existing_reservation() {
+        let jobs = AtomicUsize::new(0);
+        let permit = FrameDecoderJobPermit::try_acquire_from(&jobs, 1)
+            .expect("the first job fits the limit");
+        assert!(FrameDecoderJobPermit::try_acquire_from(&jobs, 1).is_none());
+        assert_eq!(jobs.load(Ordering::Acquire), 1);
+        drop(permit);
+        assert_eq!(jobs.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn oversized_queued_frame_does_not_release_unreserved_bytes() {
+        // This rejection is independent of concurrent decoder activity: the
+        // request alone exceeds the entire budget and cannot own any bytes.
+        assert!(QueuedFrameBudget::try_acquire(MAX_QUEUED_FRAME_DECODER_BYTES + 1).is_none());
+    }
+
     fn test_glyph_cache() -> (GlyphCache, RenderMetrics) {
         test_glyph_cache_with_atlas_size(128)
     }
@@ -4725,9 +4751,9 @@ mod tests {
         assert!(matches!(&state.source, FrameSource::FrameIndex(_)));
         assert_eq!(state.retained_bytes(), 8);
 
-        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedLease(
-            wezterm_blob_leases::BlobManager::store(&[0xaa]).expect("store encoded source lease"),
-        )));
+        // Only the retained decoded frames are under test; an empty owned
+        // source has the same zero retained-byte cost without a global blob store.
+        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![])));
         let decoded = DecodedImage {
             frame_start: RefCell::new(Instant::now()),
             current_frame: RefCell::new(0),
@@ -5200,17 +5226,30 @@ mod tests {
         }
     }
 
-    static IMAGE_PIPELINE_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct IsolatedFrameDecoderJobs;
 
-    fn wait_for_frame_decoder_job_count(expected: usize) {
+    impl IsolatedFrameDecoderJobs {
+        fn new(jobs: &'static AtomicUsize) -> Self {
+            assert!(FRAME_DECODER_TEST_JOBS.replace(Some(jobs)).is_none());
+            Self
+        }
+    }
+
+    impl Drop for IsolatedFrameDecoderJobs {
+        fn drop(&mut self) {
+            FRAME_DECODER_TEST_JOBS.set(None);
+        }
+    }
+
+    fn wait_for_frame_decoder_job_count(jobs: &AtomicUsize, expected: usize) {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(2))
             .expect("short test deadline is representable");
-        while FRAME_DECODER_JOBS.load(Ordering::Acquire) != expected {
+        while jobs.load(Ordering::Acquire) != expected {
             assert!(
                 Instant::now() < deadline,
                 "frame-decoder job count did not settle at {expected}; current={}",
-                FRAME_DECODER_JOBS.load(Ordering::Acquire)
+                jobs.load(Ordering::Acquire)
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -5218,10 +5257,9 @@ mod tests {
 
     #[test]
     fn trusted_local_authority_above_wire_limit_bypasses_fallback_validator() {
-        let _serial = IMAGE_PIPELINE_GLOBAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        wait_for_frame_decoder_job_count(0);
+        static JOBS: AtomicUsize = AtomicUsize::new(0);
+        let _isolated = IsolatedFrameDecoderJobs::new(&JOBS);
+        wait_for_frame_decoder_job_count(&JOBS, 0);
 
         // 4096 * 4097 * 4 = 64 MiB + 16 KiB: just above the remote/fallback
         // boundary and far below the 256 MiB trusted-local ceiling.
@@ -5263,15 +5301,14 @@ mod tests {
         assert!(decoded.decoded_validation.borrow().is_none());
         assert!(decoded.frames.borrow().is_none());
         assert_eq!(decoded.source_retained_bytes.get(), decoded_bytes);
-        assert_eq!(FRAME_DECODER_JOBS.load(Ordering::Acquire), 0);
+        assert_eq!(JOBS.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn transient_validation_queue_saturation_retries_without_negative_cache_poison() {
-        let _serial = IMAGE_PIPELINE_GLOBAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        wait_for_frame_decoder_job_count(0);
+        static JOBS: AtomicUsize = AtomicUsize::new(0);
+        let _isolated = IsolatedFrameDecoderJobs::new(&JOBS);
+        wait_for_frame_decoder_job_count(&JOBS, 0);
 
         let mut permits = (0..MAX_PENDING_FRAME_DECODERS)
             .map(|_| {
@@ -5328,15 +5365,14 @@ mod tests {
         assert!(cache.image_cache.contains_key(&key));
 
         drop(permits);
-        wait_for_frame_decoder_job_count(0);
+        wait_for_frame_decoder_job_count(&JOBS, 0);
     }
 
     #[test]
     fn dropping_validation_receiver_cancels_worker_and_releases_shared_permit() {
-        let _serial = IMAGE_PIPELINE_GLOBAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        wait_for_frame_decoder_job_count(0);
+        static JOBS: AtomicUsize = AtomicUsize::new(0);
+        let _isolated = IsolatedFrameDecoderJobs::new(&JOBS);
+        wait_for_frame_decoder_job_count(&JOBS, 0);
 
         let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             1,
@@ -5354,13 +5390,13 @@ mod tests {
         started_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("validation worker reaches deterministic test gate");
-        assert_eq!(FRAME_DECODER_JOBS.load(Ordering::Acquire), 1);
+        assert_eq!(JOBS.load(Ordering::Acquire), 1);
 
         let cancelled = Arc::clone(&receiver.cancelled);
         drop(receiver);
         assert!(cancelled.load(Ordering::Acquire));
         release_tx.send(()).expect("release cancelled worker gate");
-        wait_for_frame_decoder_job_count(0);
+        wait_for_frame_decoder_job_count(&JOBS, 0);
     }
 
     #[test]

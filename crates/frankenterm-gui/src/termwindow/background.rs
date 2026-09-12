@@ -246,10 +246,9 @@ fn publish_decoded_background_authority(
     is_cancelled: &dyn Fn() -> bool,
 ) -> anyhow::Result<(Arc<ImageData>, usize)> {
     let revision = image.current_content_hash();
-    if let Some(summary) = image.validated_summary_for_content_revision(
-        revision,
-        BACKGROUND_IMAGE_VALIDATION_LIMITS,
-    ) {
+    if let Some(summary) =
+        image.validated_summary_for_content_revision(revision, BACKGROUND_IMAGE_VALIDATION_LIMITS)
+    {
         // Decode and metadata-only speed adjustment publish private authority
         // for their exact revisions. Reuse it rather than hashing the same
         // pixels again before GUI handoff.
@@ -268,10 +267,7 @@ fn publish_decoded_background_authority(
         "decoded background validation unexpectedly produced a replacement"
     );
     debug_assert_eq!(
-        image.validated_summary_for_content_revision(
-            revision,
-            BACKGROUND_IMAGE_VALIDATION_LIMITS,
-        ),
+        image.validated_summary_for_content_revision(revision, BACKGROUND_IMAGE_VALIDATION_LIMITS,),
         Some(validation.summary)
     );
     Ok((Arc::new(image), validation.summary.decoded_bytes))
@@ -340,8 +336,7 @@ fn prepare_background_repeat_axis(
     // this reduction; converting the row to f32 first loses phase and parity
     // beyond 2^24 rows on 64-bit long-session hosts.
     let step = f64::from(step);
-    let Some((scroll_is_odd, scroll_remainder)) =
-        exact_scroll_tile_phase(scroll_distance, step)
+    let Some((scroll_is_odd, scroll_remainder)) = exact_scroll_tile_phase(scroll_distance, step)
     else {
         anyhow::bail!("background repeat scroll could not be reduced exactly");
     };
@@ -350,8 +345,7 @@ fn prepare_background_repeat_axis(
         .ceil()
         .max(0.0);
     anyhow::ensure!(
-        backward_steps.is_finite()
-            && backward_steps <= MAX_BACKGROUND_TILES_PER_LAYER as f64,
+        backward_steps.is_finite() && backward_steps <= MAX_BACKGROUND_TILES_PER_LAYER as f64,
         "background repeat alignment exceeds the per-layer tile limit"
     );
     let normalized_origin = (shifted_origin - backward_steps * step) as f32;
@@ -361,10 +355,7 @@ fn prepare_background_repeat_axis(
     );
 
     let backward_is_odd = backward_steps.rem_euclid(2.0) >= 1.0;
-    Ok((
-        normalized_origin,
-        scroll_is_odd ^ backward_is_odd,
-    ))
+    Ok((normalized_origin, scroll_is_odd ^ backward_is_odd))
 }
 
 /// Return the exact truncated whole-tile parity and signed sub-tile remainder
@@ -396,12 +387,9 @@ fn exact_scroll_tile_phase(distance: f64, step: f64) -> Option<(bool, f64)> {
     let (quotient_is_odd, remainder_significand, common_exponent) = if exponent_delta >= 0 {
         let denominator = u128::from(step_significand);
         let modulus = denominator.checked_mul(2)?;
-        let aligned_numerator_modulus = u128::from(distance_significand)
-            .checked_mul(power_of_two_modulo(
-                u32::try_from(exponent_delta).ok()?,
-                modulus,
-            )?)?
-            % modulus;
+        let aligned_numerator_modulus = u128::from(distance_significand).checked_mul(
+            power_of_two_modulo(u32::try_from(exponent_delta).ok()?, modulus)?,
+        )? % modulus;
         (
             aligned_numerator_modulus >= denominator,
             aligned_numerator_modulus % denominator,
@@ -411,9 +399,8 @@ fn exact_scroll_tile_phase(distance: f64, step: f64) -> Option<(bool, f64)> {
         // `magnitude >= step` bounds this aligned denominator by the distance
         // significand, so the negative-delta branch is always small enough to
         // materialize. Keep the checked arithmetic as an invariant guard.
-        let denominator = u128::from(step_significand).checked_mul(
-            1_u128.checked_shl(exponent_delta.unsigned_abs())?,
-        )?;
+        let denominator = u128::from(step_significand)
+            .checked_mul(1_u128.checked_shl(exponent_delta.unsigned_abs())?)?;
         let numerator = u128::from(distance_significand);
         (
             (numerator / denominator) % 2 == 1,
@@ -479,11 +466,7 @@ fn binary_rational_parts(value: f64) -> Option<(u64, i32)> {
     Some((significand, exponent))
 }
 
-fn background_scroll_distance(
-    top: StableRowIndex,
-    cell_height: isize,
-    factor: f32,
-) -> Option<f64> {
+fn background_scroll_distance(top: StableRowIndex, cell_height: isize, factor: f32) -> Option<f64> {
     if !factor.is_finite() || cell_height <= 0 {
         return None;
     }
@@ -525,7 +508,10 @@ fn linear_gradient_projection_half_extent(
         width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
         "linear-gradient dimensions must be finite and greater than zero"
     );
-    anyhow::ensure!(angle.is_finite(), "background gradient angle must be finite");
+    anyhow::ensure!(
+        angle.is_finite(),
+        "background gradient angle must be finite"
+    );
     let extent = (width * angle.cos().abs() + height * angle.sin().abs()) / 2.0;
     anyhow::ensure!(
         extent.is_finite() && extent > 0.0,
@@ -543,8 +529,7 @@ fn radial_gradient_distance(
     noise_y: f64,
     radius: f64,
 ) -> f64 {
-    ((x + noise_x - center_x).powi(2) + (y + noise_y - center_y).powi(2)).sqrt()
-        / radius
+    ((x + noise_x - center_x).powi(2) + (y + noise_y - center_y).powi(2)).sqrt() / radius
 }
 
 fn background_sources_match(left: &BackgroundSource, right: &BackgroundSource) -> bool {
@@ -730,8 +715,7 @@ impl CachedGradient {
 
         let data = imgbuf.into_vec();
         let image = ImageData::with_data(ImageDataType::new_single_frame(width, height, data));
-        let (image, retained_bytes) =
-            publish_decoded_background_authority(image, is_cancelled)?;
+        let (image, retained_bytes) = publish_decoded_background_authority(image, is_cancelled)?;
         debug_assert_eq!(
             retained_bytes,
             checked_background_pixel_bytes(width, height)?
@@ -856,8 +840,8 @@ impl CachedImage {
         if !speed.is_finite() || speed <= 0.0 {
             anyhow::bail!("background image speed must be finite and greater than zero");
         }
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("getting metadata for {}", path))?;
+        let metadata =
+            std::fs::metadata(path).with_context(|| format!("getting metadata for {}", path))?;
         anyhow::ensure!(
             metadata.file_type().is_file(),
             "background image {path} must be a regular file"
@@ -953,8 +937,7 @@ impl CachedImage {
         // adjustment validates duration scheduling bounds, preserves pixel
         // hashes, and rebinds the decode-time authority to its final revision.
         // Publication below can therefore avoid a second full pixel scan.
-        let (image, retained_bytes) =
-            publish_decoded_background_authority(decoded, is_cancelled)?;
+        let (image, retained_bytes) = publish_decoded_background_authority(decoded, is_cancelled)?;
         anyhow::ensure!(
             retained_bytes <= max_decoded_bytes,
             "background image {path} retains {retained_bytes} decoded bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder"
@@ -982,8 +965,8 @@ impl CachedImage {
         // cannot silently retain the old pixels. A decode can be expensive, so
         // another reload may win while this thread is outside the lock. Never
         // let the older decode overwrite a newer file generation.
-        let current_metadata = std::fs::metadata(path)
-            .with_context(|| format!("rechecking metadata for {path}"))?;
+        let current_metadata =
+            std::fs::metadata(path).with_context(|| format!("rechecking metadata for {path}"))?;
         anyhow::ensure!(
             current_metadata.file_type().is_file(),
             "background image {path} stopped being a regular file while decoding"
@@ -1141,12 +1124,7 @@ fn load_background_layer(
             publish_decoded_background_authority(image, is_cancelled)?.0
         }
         BackgroundSource::File(source) => {
-            CachedImage::load(
-                &source.path,
-                source.speed,
-                max_decoded_bytes,
-                is_cancelled,
-            )?
+            CachedImage::load(&source.path, source.speed, max_decoded_bytes, is_cancelled)?
         }
     };
 
@@ -1196,8 +1174,7 @@ fn reload_background_image(
     }
 
     let mut result = Vec::with_capacity(layer_count);
-    let mut active_budget =
-        ActiveBackgroundByteBudget::new(MAX_ACTIVE_BACKGROUND_DECODED_BYTES);
+    let mut active_budget = ActiveBackgroundByteBudget::new(MAX_ACTIVE_BACKGROUND_DECODED_BYTES);
     for (index, definition) in config.background.iter().take(layer_count).enumerate() {
         if is_cancelled() {
             return existing.to_vec();
@@ -1473,8 +1450,7 @@ impl BackgroundLoadCoordinator {
                     if should_notify {
                         request.window.notify(TermWindowNotif::Apply(Box::new(
                             move |term_window| {
-                                let Some(layers) =
-                                    coordinator.take_ready_if_current(&cancellation)
+                                let Some(layers) = coordinator.take_ready_if_current(&cancellation)
                                 else {
                                     metrics::counter!("gui.background.stale_completion.total")
                                         .increment(1);
@@ -1737,11 +1713,9 @@ impl crate::TermWindow {
         let right_pixel = left_pixel + pixel_width;
         let limit_y = top_pixel + pixel_height;
         let scroll_distance = if let Some(factor) = layer.def.attachment.scroll_factor() {
-            let Some(distance) = background_scroll_distance(
-                top,
-                self.render_metrics.cell_size.height,
-                factor,
-            ) else {
+            let Some(distance) =
+                background_scroll_distance(top, self.render_metrics.cell_size.height, factor)
+            else {
                 metrics::counter!(
                     "gui.background.layer_rejected.total",
                     "reason" => "invalid_scroll_distance",
@@ -1946,8 +1920,7 @@ mod tests {
     #[test]
     fn radial_gradient_noise_offsets_both_axes_before_distance_is_squared() {
         let distance = radial_gradient_distance(10.0, 20.0, 0.0, 0.0, -3.0, -4.0, 2.0);
-        let transposed =
-            radial_gradient_distance(20.0, 10.0, 0.0, 0.0, -4.0, -3.0, 2.0);
+        let transposed = radial_gradient_distance(20.0, 10.0, 0.0, 0.0, -4.0, -3.0, 2.0);
         let expected = (7.0_f64.powi(2) + 16.0_f64.powi(2)).sqrt() / 2.0;
 
         assert!((distance - expected).abs() <= f64::EPSILON);
@@ -1976,11 +1949,17 @@ mod tests {
 
         assert!(budget.try_admit(&shared, 4));
         assert!(budget.try_admit(&shared_alias, 4));
-        assert_eq!(budget.retained_bytes, 4, "a cloned Arc is not new pixel memory");
+        assert_eq!(
+            budget.retained_bytes, 4,
+            "a cloned Arc is not new pixel memory"
+        );
         assert!(budget.try_admit(&distinct, 4));
         assert_eq!(budget.retained_bytes, 8);
         assert!(!budget.try_admit(&overflow, 4));
-        assert_eq!(budget.retained_bytes, 8, "a rejected Arc changes no authority");
+        assert_eq!(
+            budget.retained_bytes, 8,
+            "a rejected Arc changes no authority"
+        );
     }
 
     #[test]
@@ -2095,12 +2074,8 @@ mod tests {
 
     #[test]
     fn background_repeat_count_rejects_zero_nan_and_pathological_tile_counts() {
-        assert!(
-            checked_background_repeat_count(100.0, 0.0, BackgroundRepeat::Repeat).is_err()
-        );
-        assert!(
-            checked_background_repeat_count(f32::NAN, 1.0, BackgroundRepeat::Repeat).is_err()
-        );
+        assert!(checked_background_repeat_count(100.0, 0.0, BackgroundRepeat::Repeat).is_err());
+        assert!(checked_background_repeat_count(f32::NAN, 1.0, BackgroundRepeat::Repeat).is_err());
         assert!(
             checked_background_repeat_count(
                 MAX_BACKGROUND_TILES_PER_LAYER as f32 + 1.0,
@@ -2121,25 +2096,15 @@ mod tests {
 
     #[test]
     fn repeated_background_origin_extends_backward_and_preserves_mirror_parity() {
-        let (origin, mirrored) = prepare_background_repeat_axis(
-            400.0,
-            -500.0,
-            100.0,
-            BackgroundRepeat::Mirror,
-            0.0,
-        )
-        .unwrap();
+        let (origin, mirrored) =
+            prepare_background_repeat_axis(400.0, -500.0, 100.0, BackgroundRepeat::Mirror, 0.0)
+                .unwrap();
         assert_eq!(origin, -500.0);
         assert!(mirrored, "nine backward tiles invert mirror parity");
 
-        let (scrolled_origin, scrolled_mirrored) = prepare_background_repeat_axis(
-            -500.0,
-            -500.0,
-            100.0,
-            BackgroundRepeat::Mirror,
-            -20.0,
-        )
-        .unwrap();
+        let (scrolled_origin, scrolled_mirrored) =
+            prepare_background_repeat_axis(-500.0, -500.0, 100.0, BackgroundRepeat::Mirror, -20.0)
+                .unwrap();
         assert_eq!(scrolled_origin, -580.0);
         assert!(scrolled_mirrored);
     }
@@ -2182,20 +2147,14 @@ mod tests {
         assert!(quotient_is_odd);
         assert_eq!(remainder, 1.0);
 
-        let (origin, mirrored) = prepare_background_repeat_axis(
-            0.0,
-            0.0,
-            3.0,
-            BackgroundRepeat::Mirror,
-            distance,
-        )
-        .expect("exact binary reduction must retain the one-pixel phase");
+        let (origin, mirrored) =
+            prepare_background_repeat_axis(0.0, 0.0, 3.0, BackgroundRepeat::Mirror, distance)
+                .expect("exact binary reduction must retain the one-pixel phase");
         assert_eq!(origin, -1.0);
         assert!(mirrored, "the exact whole-tile quotient is odd");
 
-        let (negative_is_odd, negative_remainder) =
-            exact_scroll_tile_phase(-distance, 3.0)
-                .expect("negative scrolling uses the same exact magnitude");
+        let (negative_is_odd, negative_remainder) = exact_scroll_tile_phase(-distance, 3.0)
+            .expect("negative scrolling uses the same exact magnitude");
         assert_eq!(negative_is_odd, quotient_is_odd);
         assert_eq!(negative_remainder, -1.0);
     }
@@ -2259,14 +2218,8 @@ mod tests {
             .expect("the exact power-of-two scroll distance must be admitted");
         assert_eq!(distance, 2.0_f64.powi(68));
         assert_eq!(
-            prepare_background_repeat_axis(
-                0.0,
-                0.0,
-                1.0,
-                BackgroundRepeat::Mirror,
-                distance,
-            )
-            .expect("mirror parity does not require materializing the tile count"),
+            prepare_background_repeat_axis(0.0, 0.0, 1.0, BackgroundRepeat::Mirror, distance,)
+                .expect("mirror parity does not require materializing the tile count"),
             (0.0, false),
         );
     }
@@ -2322,14 +2275,9 @@ mod tests {
             let distance = background_scroll_distance(top, 2, 1.0)
                 .expect("the 53-bit odd significand and trailing factor remain exact");
             assert_eq!(distance, 18_014_398_509_481_982.0);
-            let prepared = prepare_background_repeat_axis(
-                0.0,
-                0.0,
-                4.0,
-                BackgroundRepeat::Repeat,
-                distance,
-            )
-            .ok();
+            let prepared =
+                prepare_background_repeat_axis(0.0, 0.0, 4.0, BackgroundRepeat::Repeat, distance)
+                    .ok();
             assert_eq!(
                 prepared,
                 Some((-2.0, true)),
@@ -2403,10 +2351,7 @@ mod tests {
     fn decoded_background_cache_evicts_oldest_entries_at_its_count_limit() {
         let mut cache = BackgroundImageCache::default();
         for index in 0..=MAX_BACKGROUND_CACHE_ENTRIES {
-            cache.insert(
-                format!("image-{index}"),
-                cached_image(index as u64, 4),
-            );
+            cache.insert(format!("image-{index}"), cached_image(index as u64, 4));
         }
 
         assert_eq!(cache.entries.len(), MAX_BACKGROUND_CACHE_ENTRIES);

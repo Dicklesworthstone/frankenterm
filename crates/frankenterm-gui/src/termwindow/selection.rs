@@ -351,14 +351,14 @@ impl super::TermWindow {
         }
         let dims = pane.get_dimensions();
 
-        // Scroll viewport when mouse mouves out of its vertical bounds
+        // Scroll viewport when the mouse moves out of its vertical bounds.
         if position.row == 0 && position.y_pixel_offset < 0 {
             self.set_viewport(pane.pane_id(), Some(y.saturating_sub(1)), dims);
         } else if position.row >= dims.viewport_rows as i64 {
             let top = self
                 .get_viewport(pane.pane_id())
                 .unwrap_or(dims.physical_top);
-            self.set_viewport(pane.pane_id(), Some(top + 1), dims);
+            self.set_viewport(pane.pane_id(), Some(top.saturating_add(1)), dims);
         }
 
         if let Some(window) = self.window.as_ref() {

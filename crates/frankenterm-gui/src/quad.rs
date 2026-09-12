@@ -643,33 +643,75 @@ pub struct BoxedQuad {
     hsv: [f32; 3],
     has_color: f32,
     mix_value: f32,
+    // Most quads have uniform style and rectangular coordinates. Imported
+    // vertex streams can also carry gradients and arbitrary corners; retain
+    // those exactly without expanding every ordinary cached quad to 272 bytes.
+    exact_vertices: Option<Box<[Vertex; VERTICES_PER_CELL]>>,
 }
 
 impl QuadTrait for BoxedQuad {
     fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
         self.tex = (x1, x2, y1, y2);
+        if let Some(verts) = self.exact_vertices.as_mut() {
+            Quad {
+                vert: verts.as_mut(),
+            }
+            .set_texture_discrete(x1, x2, y1, y2);
+        }
     }
 
     fn set_has_color_impl(&mut self, has_color: f32) {
         self.has_color = has_color;
+        if let Some(verts) = self.exact_vertices.as_mut() {
+            Quad {
+                vert: verts.as_mut(),
+            }
+            .set_has_color_impl(has_color);
+        }
     }
 
     fn set_fg_color(&mut self, color: LinearRgba) {
         self.fg_color = color.into();
+        self.alt_color = color.into();
+        self.mix_value = 0.;
+        if let Some(verts) = self.exact_vertices.as_mut() {
+            Quad {
+                vert: verts.as_mut(),
+            }
+            .set_fg_color(color);
+        }
     }
     fn set_alt_color_and_mix_value(&mut self, color: LinearRgba, mix_value: f32) {
         self.alt_color = color.into();
         self.mix_value = mix_value;
+        if let Some(verts) = self.exact_vertices.as_mut() {
+            Quad {
+                vert: verts.as_mut(),
+            }
+            .set_alt_color_and_mix_value(color, mix_value);
+        }
     }
     fn set_hsv(&mut self, hsv: Option<HsbTransform>) {
         let (h, s, v) = hsv
             .map(|t| (t.hue, t.saturation, t.brightness))
             .unwrap_or((1., 1., 1.));
         self.hsv = [h, s, v];
+        if let Some(verts) = self.exact_vertices.as_mut() {
+            Quad {
+                vert: verts.as_mut(),
+            }
+            .set_hsv(hsv);
+        }
     }
 
     fn set_position(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
         self.position = (left, top, right, bottom);
+        if let Some(verts) = self.exact_vertices.as_mut() {
+            Quad {
+                vert: verts.as_mut(),
+            }
+            .set_position(left, top, right, bottom);
+        }
     }
 }
 
@@ -680,7 +722,7 @@ impl BoxedQuad {
 
         let [left, top] = verts[V_TOP_LEFT].position;
         let [right, bottom] = verts[V_BOT_RIGHT].position;
-        Self {
+        let mut quad = Self {
             tex: (x1, x2, y1, y2),
             position: (left, top, right, bottom),
             has_color: verts[V_TOP_LEFT].has_color,
@@ -688,10 +730,19 @@ impl BoxedQuad {
             fg_color: verts[V_TOP_LEFT].fg_color,
             hsv: verts[V_TOP_LEFT].hsv,
             mix_value: verts[V_TOP_LEFT].mix_value,
+            exact_vertices: None,
+        };
+        // Byte comparison also preserves NaN payloads and signed zero.
+        if bytemuck::bytes_of(&quad.to_vertices()) != bytemuck::bytes_of(verts) {
+            quad.exact_vertices = Some(Box::new(*verts));
         }
+        quad
     }
 
     fn to_vertices(&self) -> [Vertex; VERTICES_PER_CELL] {
+        if let Some(verts) = self.exact_vertices.as_ref() {
+            return **verts;
+        }
         let mut vert: [Vertex; VERTICES_PER_CELL] = Default::default();
         let mut quad = Quad { vert: &mut vert };
 
@@ -858,7 +909,18 @@ mod tests {
     #[test]
     fn size() {
         assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
-        assert_eq!(std::mem::size_of::<BoxedQuad>(), 84);
+        // Compact fields plus the optional exact-vertex fallback pointer.
+        assert_eq!(std::mem::size_of::<BoxedQuad>(), 96);
+        let mut vertices = configured_quad();
+        vertices[V_BOT_RIGHT].mix_value += 1.0;
+        let exact = BoxedQuad::from_vertices(&vertices);
+        // Requested heap payload, excluding allocator metadata and the owner
+        // Vec's pointer slot: a fallback adds all four original vertices.
+        assert_eq!(
+            std::mem::size_of_val(&exact)
+                + std::mem::size_of_val(exact.exact_vertices.as_ref().unwrap().as_ref()),
+            96 + 272
+        );
     }
 
     #[test]
@@ -1410,9 +1472,49 @@ mod tests {
     fn boxed_quad_round_trip_preserves_geometry_and_style() {
         let vertices = configured_quad();
         let boxed = BoxedQuad::from_vertices(&vertices);
+        assert!(boxed.exact_vertices.is_none());
         let round_tripped = boxed.to_vertices();
 
         assert_vertices_match(&round_tripped, &vertices);
+    }
+
+    #[test]
+    fn boxed_quad_exact_fallback_preserves_bits_and_setter_semantics() {
+        let mut vertices = configured_quad();
+        vertices[V_BOT_RIGHT].mix_value = f32::from_bits(0x7fc0_0123);
+        vertices[V_TOP_RIGHT].position[0] = -0.0;
+        let mut boxed = BoxedQuad::from_vertices(&vertices);
+        assert!(boxed.exact_vertices.is_some());
+        assert_eq!(
+            bytemuck::bytes_of(&boxed.to_vertices()),
+            bytemuck::bytes_of(&vertices)
+        );
+
+        // Each setter must match the direct GPU-vertex implementation while
+        // leaving unrelated, nonuniform attributes intact.
+        let setters: [fn(&mut dyn QuadTrait); 6] = [
+            |quad| quad.set_texture_discrete(0.2, 0.7, 0.3, 0.8),
+            |quad| quad.set_position(4.0, 5.0, 12.0, 14.0),
+            |quad| quad.set_hsv(None),
+            |quad| quad.set_has_color_impl(IS_BG_IMAGE),
+            |quad| {
+                quad.set_alt_color_and_mix_value(
+                    LinearRgba::with_components(0.1, 0.2, 0.3, 0.4),
+                    0.6,
+                )
+            },
+            |quad| quad.set_fg_color(LinearRgba::with_components(0.7, 0.8, 0.9, 1.0)),
+        ];
+        for setter in setters {
+            setter(&mut boxed);
+            setter(&mut Quad {
+                vert: &mut vertices,
+            });
+            assert_eq!(
+                bytemuck::bytes_of(&boxed.to_vertices()),
+                bytemuck::bytes_of(&vertices)
+            );
+        }
     }
 
     #[test]

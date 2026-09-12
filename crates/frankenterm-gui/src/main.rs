@@ -41,8 +41,8 @@ use std::env::{self, current_dir};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
@@ -100,8 +100,7 @@ mod uniforms;
 mod update;
 mod utilsprites;
 use frankenterm_gui::{
-    domain_reconnect_manifest,
-    domain_reconnect_manifest::DomainAttachmentIntent,
+    domain_reconnect_manifest, domain_reconnect_manifest::DomainAttachmentIntent,
     window_state_persist,
 };
 
@@ -121,8 +120,9 @@ enum AdmissionRetryCoordinatorState {
 
 static AUTO_CONNECT_ADMISSION_RETRY_STATE: Mutex<AdmissionRetryCoordinatorState> =
     Mutex::new(AdmissionRetryCoordinatorState::Idle);
-static MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE:
-    Mutex<AdmissionRetryCoordinatorState> = Mutex::new(AdmissionRetryCoordinatorState::Idle);
+static MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE: Mutex<
+    AdmissionRetryCoordinatorState,
+> = Mutex::new(AdmissionRetryCoordinatorState::Idle);
 static DOMAIN_RECONNECT_MANIFEST_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static DOMAIN_RECONNECT_MANIFEST_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 static DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED: AtomicBool = AtomicBool::new(false);
@@ -648,9 +648,7 @@ enum MuxDomainConfigAdmission {
     Terminal(String),
 }
 
-fn try_admit_mux_domain_config_reconciliation(
-    generation: u64,
-) -> MuxDomainConfigAdmission {
+fn try_admit_mux_domain_config_reconciliation(generation: u64) -> MuxDomainConfigAdmission {
     use promise::spawn::MainThreadReservationOutcome;
 
     match promise::spawn::try_reserve_main_thread(
@@ -936,8 +934,7 @@ fn retry_mux_domain_config_admission() {
         match try_admit_mux_domain_config_reconciliation(generation) {
             MuxDomainConfigAdmission::Started => {
                 completion.record_downstream_handoff(generation);
-                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
-                    != generation
+                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation
                 {
                     continue;
                 }
@@ -983,54 +980,28 @@ fn mux_domain_config_lifecycle_names(config: &ConfigHandle, mux: Option<&Mux>) -
         .into_iter()
         .map(|domain| domain.name().to_string())
         .collect::<Vec<_>>();
-    lifecycle_names.extend(
-        config
-            .ssh_domains()
-            .into_iter()
-            .map(|domain| domain.name),
-    );
-    lifecycle_names.extend(
-        config
-            .wsl_domains()
-            .into_iter()
-            .map(|domain| domain.name),
-    );
-    lifecycle_names.extend(
-        config
-            .exec_domains
-            .iter()
-            .map(|domain| domain.name.clone()),
-    );
-    lifecycle_names.extend(
-        config
-            .serial_ports
-            .iter()
-            .map(|domain| domain.name.clone()),
-    );
+    lifecycle_names.extend(config.ssh_domains().into_iter().map(|domain| domain.name));
+    lifecycle_names.extend(config.wsl_domains().into_iter().map(|domain| domain.name));
+    lifecycle_names.extend(config.exec_domains.iter().map(|domain| domain.name.clone()));
+    lifecycle_names.extend(config.serial_ports.iter().map(|domain| domain.name.clone()));
     if let Some(mux) = mux {
-        lifecycle_names.extend(
-            mux.iter_domains()
-                .into_iter()
-                .filter_map(|domain| {
-                    let configuration_owned = domain.downcast_ref::<ClientDomain>().is_some()
-                        || domain
-                            .downcast_ref::<RemoteSshDomain>()
-                            .is_some_and(RemoteSshDomain::is_configuration_owned)
-                        || domain
-                            .downcast_ref::<LocalDomain>()
-                            .is_some_and(LocalDomain::is_configuration_owned);
-                    configuration_owned.then(|| domain.domain_name().to_string())
-                }),
-        );
+        lifecycle_names.extend(mux.iter_domains().into_iter().filter_map(|domain| {
+            let configuration_owned = domain.downcast_ref::<ClientDomain>().is_some()
+                || domain
+                    .downcast_ref::<RemoteSshDomain>()
+                    .is_some_and(RemoteSshDomain::is_configuration_owned)
+                || domain
+                    .downcast_ref::<LocalDomain>()
+                    .is_some_and(LocalDomain::is_configuration_owned);
+            configuration_owned.then(|| domain.domain_name().to_string())
+        }));
     }
     lifecycle_names.sort();
     lifecycle_names.dedup();
     lifecycle_names
 }
 
-async fn reconcile_mux_domain_config_until_converged(
-    generation: u64,
-) {
+async fn reconcile_mux_domain_config_until_converged(generation: u64) {
     if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation {
         return;
     }
@@ -1041,10 +1012,8 @@ async fn reconcile_mux_domain_config_until_converged(
     cancel_auto_connect_supervisor();
     let mut retirement_round = 0_u64;
     let mut retry_delay = std::time::Duration::from_millis(25);
-    const MAX_RECONCILIATION_DELAY: std::time::Duration =
-        std::time::Duration::from_secs(1);
-    let lifecycle_names =
-        mux_domain_config_lifecycle_names(&config, Mux::try_get().as_deref());
+    const MAX_RECONCILIATION_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+    let lifecycle_names = mux_domain_config_lifecycle_names(&config, Mux::try_get().as_deref());
 
     loop {
         if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) != generation {
@@ -1079,9 +1048,7 @@ async fn reconcile_mux_domain_config_until_converged(
                     &MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING,
                     generation,
                 );
-                if accepted_current_generation
-                    && AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
-                {
+                if accepted_current_generation && AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
                     schedule_auto_connect_domains();
                 }
                 return;
@@ -1101,9 +1068,7 @@ async fn reconcile_mux_domain_config_until_converged(
                     );
                 }
                 promise::spawn::sleep(retry_delay).await;
-                retry_delay = retry_delay
-                    .saturating_mul(2)
-                    .min(MAX_RECONCILIATION_DELAY);
+                retry_delay = retry_delay.saturating_mul(2).min(MAX_RECONCILIATION_DELAY);
             }
             Err(error) => {
                 report_mux_domain_config_reload_failure(&error);
@@ -1383,8 +1348,8 @@ fn finish_domain_reconnect_manifest_operation(ticket: u64, release_required: &mu
     }
 }
 
-fn reserve_domain_reconnect_manifest_operation(
-) -> anyhow::Result<DomainReconnectManifestOperationReservation> {
+fn reserve_domain_reconnect_manifest_operation()
+-> anyhow::Result<DomainReconnectManifestOperationReservation> {
     let (ready_sender, ready) = futures::channel::oneshot::channel();
     let mut lane = DOMAIN_RECONNECT_MANIFEST_OPERATION_LANE
         .lock()
@@ -1487,8 +1452,7 @@ fn publish_domain_reconnect_manifest_snapshot(
                 Some(_) => {
                     *snapshot = None;
                     ambiguous_generation = Some(generation);
-                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED
-                        .store(true, Ordering::Release);
+                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED.store(true, Ordering::Release);
                     mint_domain_reconnect_manifest_authority_epoch();
                 }
                 None => {
@@ -1497,10 +1461,8 @@ fn publish_domain_reconnect_manifest_snapshot(
                     // including a pristine generation-zero quorum, establishes
                     // the retained identity. Once present, this branch is never
                     // used to recover from invalidation or rollback.
-                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER
-                        .store(generation, Ordering::Release);
-                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED
-                        .store(false, Ordering::Release);
+                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER.store(generation, Ordering::Release);
+                    DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_CONFLICTED.store(false, Ordering::Release);
                     *high_water_snapshot = Some(manifest.clone());
                     *snapshot = Some(manifest);
                     mint_domain_reconnect_manifest_authority_epoch();
@@ -1516,9 +1478,8 @@ fn publish_domain_reconnect_manifest_snapshot(
         rollback_generation = Some((generation, high_water));
         mint_domain_reconnect_manifest_authority_epoch();
     }
-    let retired_supervisor = fence_and_take_auto_connect_supervisor(
-        "a new remembered-domain authority epoch",
-    );
+    let retired_supervisor =
+        fence_and_take_auto_connect_supervisor("a new remembered-domain authority epoch");
     DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
     drop(high_water_snapshot);
     drop(snapshot);
@@ -1549,16 +1510,16 @@ fn publish_domain_reconnect_manifest_snapshot(
     }
 }
 
-fn domain_reconnect_manifest_snapshot(
-) -> Option<domain_reconnect_manifest::DomainReconnectManifest> {
+fn domain_reconnect_manifest_snapshot() -> Option<domain_reconnect_manifest::DomainReconnectManifest>
+{
     DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
 }
 
-fn domain_reconnect_manifest_high_water_snapshot(
-) -> Option<domain_reconnect_manifest::DomainReconnectManifest> {
+fn domain_reconnect_manifest_high_water_snapshot()
+-> Option<domain_reconnect_manifest::DomainReconnectManifest> {
     DOMAIN_RECONNECT_MANIFEST_HIGH_WATER_SNAPSHOT
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1580,9 +1541,8 @@ fn invalidate_domain_reconnect_manifest_snapshot(
     *snapshot = None;
     mint_domain_reconnect_manifest_authority_epoch();
     DOMAIN_RECONNECT_MANIFEST_INITIALIZED.store(true, Ordering::Release);
-    let retired_supervisor = fence_and_take_auto_connect_supervisor(
-        "unavailable remembered-domain authority",
-    );
+    let retired_supervisor =
+        fence_and_take_auto_connect_supervisor("unavailable remembered-domain authority");
     drop(snapshot);
     drop(retired_supervisor);
 }
@@ -1944,24 +1904,19 @@ pub(crate) async fn remember_attached_domain_best_effort(
     }
 }
 
-fn auto_connect_domain_configs(
-    config: &ConfigHandle,
-) -> (u64, Option<Vec<ClientDomainConfig>>) {
+fn auto_connect_domain_configs(config: &ConfigHandle) -> (u64, Option<Vec<ClientDomainConfig>>) {
     let (authority_epoch, manifest) = {
         let snapshot = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let manifest = snapshot.clone();
-        let authority_epoch =
-            DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire);
+        let authority_epoch = DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire);
         (authority_epoch, manifest)
     };
     let desired_domains = manifest.map(|manifest| {
         frankenterm_mux_server_impl::configured_client_domains(config)
             .into_iter()
-            .filter(|domain| {
-                manifest.should_connect(domain.name(), domain.connect_automatically())
-            })
+            .filter(|domain| manifest.should_connect(domain.name(), domain.connect_automatically()))
             .collect()
     });
     (authority_epoch, desired_domains)
@@ -1975,8 +1930,7 @@ fn auto_connect_generation_is_current(
     AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
         && MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) == 0
         && AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) == generation
-        && AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
-            == request_generation
+        && AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) == request_generation
         && Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, mux))
 }
 
@@ -2130,9 +2084,8 @@ fn bounded_gui_failure_message(summary: &str, error: &anyhow::Error) -> String {
     use frankenterm_core::policy::Redactor;
 
     let redactor = Redactor::new();
-    let safe_summary = sanitize_redact_truncate_bounded(summary, 128, 384, |text| {
-        redactor.redact(text)
-    });
+    let safe_summary =
+        sanitize_redact_truncate_bounded(summary, 128, 384, |text| redactor.redact(text));
     format!("{safe_summary}: {}", bounded_gui_error_detail(error))
 }
 
@@ -2144,9 +2097,8 @@ fn domain_connection_failure_message(
     use frankenterm_core::output::sanitize_redact_truncate_bounded;
     use frankenterm_core::policy::Redactor;
     let redactor = Redactor::new();
-    let safe_domain = sanitize_redact_truncate_bounded(domain_name, 96, 256, |text| {
-        redactor.redact(text)
-    });
+    let safe_domain =
+        sanitize_redact_truncate_bounded(domain_name, 96, 256, |text| redactor.redact(text));
     let safe_error = bounded_gui_error_detail(error);
     let recovery = match recovery {
         DomainConnectionRecovery::AutomaticRetry => {
@@ -2158,21 +2110,17 @@ fn domain_connection_failure_message(
         DomainConnectionRecovery::ExistingWindow => {
             "the current window remains usable; retry the domain after its remote mux is available"
         }
-        DomainConnectionRecovery::NoRecovery => {
-            "the requested domain could not be opened"
-        }
+        DomainConnectionRecovery::NoRecovery => "the requested domain could not be opened",
     };
     format!("connection to domain `{safe_domain}` failed; {recovery}: {safe_error}")
 }
 
 fn domain_requires_auto_connect_reconciliation(mux: &Arc<Mux>, domain_name: &str) -> bool {
-    mux.get_domain_by_name(domain_name)
-        .and_then(|domain| {
-            domain
-                .downcast_ref::<ClientDomain>()
-                .map(|client| client.state())
-        })
-        != Some(mux::domain::DomainState::Attached)
+    mux.get_domain_by_name(domain_name).and_then(|domain| {
+        domain
+            .downcast_ref::<ClientDomain>()
+            .map(|client| client.state())
+    }) != Some(mux::domain::DomainState::Attached)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2188,7 +2136,9 @@ fn refresh_auto_connect_retry_frontier(
     mut requires_reconciliation: impl FnMut(&str) -> bool,
 ) {
     retries.retain(|domain_name, _| {
-        desired_names.iter().any(|candidate| candidate == domain_name)
+        desired_names
+            .iter()
+            .any(|candidate| candidate == domain_name)
             && requires_reconciliation(domain_name)
     });
     for domain_name in desired_names {
@@ -2209,9 +2159,7 @@ fn due_auto_connect_domains(
 ) -> Vec<String> {
     retries
         .iter()
-        .filter_map(|(domain_name, state)| {
-            (state.next_attempt <= now).then(|| domain_name.clone())
-        })
+        .filter_map(|(domain_name, state)| (state.next_attempt <= now).then(|| domain_name.clone()))
         .collect()
 }
 
@@ -2227,8 +2175,7 @@ async fn supervise_auto_connect_domains(
         .collect::<Vec<_>>();
     let mut retries = BTreeMap::<String, AutoConnectRetryState>::new();
     const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-    const HEALTH_RECONCILIATION_INTERVAL: std::time::Duration =
-        std::time::Duration::from_secs(1);
+    const HEALTH_RECONCILIATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
     while auto_connect_generation_is_current(&mux, generation, request_generation) {
         let now = std::time::Instant::now();
@@ -2284,8 +2231,7 @@ async fn supervise_auto_connect_domains(
             };
             state.failure_count = failure_count;
             let shift = u32::try_from(failure_count.saturating_sub(1).min(5)).unwrap_or(5);
-            let retry_ceiling = std::time::Duration::from_secs(1_u64 << shift)
-                .min(MAX_RETRY_DELAY);
+            let retry_ceiling = std::time::Duration::from_secs(1_u64 << shift).min(MAX_RETRY_DELAY);
             state.next_attempt = std::time::Instant::now()
                 + auto_connect_retry_delay(retry_ceiling, generation, failure_count);
 
@@ -2323,12 +2269,7 @@ fn auto_connect_retry_delay(
     generation: u64,
     round: u64,
 ) -> std::time::Duration {
-    auto_connect_retry_delay_with_process_id(
-        ceiling,
-        generation,
-        round,
-        std::process::id(),
-    )
+    auto_connect_retry_delay_with_process_id(ceiling, generation, round, std::process::id())
 }
 
 fn auto_connect_retry_delay_with_process_id(
@@ -2409,9 +2350,7 @@ fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
     false
 }
 
-fn fence_and_take_auto_connect_supervisor(
-    context: &str,
-) -> Option<promise::spawn::Task<()>> {
+fn fence_and_take_auto_connect_supervisor(context: &str) -> Option<promise::spawn::Task<()>> {
     fence_auto_connect_supervisor_authority(context);
     AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take())
 }
@@ -2431,8 +2370,7 @@ fn cancel_auto_connect_supervisor_if_manifest_authority_epoch(
     let manifest_authority = DOMAIN_RECONNECT_MANIFEST_SNAPSHOT
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
-        != expected_authority_epoch
+    if DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire) != expected_authority_epoch
     {
         return false;
     }
@@ -2457,10 +2395,7 @@ enum AutoConnectScheduleOutcome {
 
 impl AutoConnectScheduleOutcome {
     const fn establishes_retry_handoff(self) -> bool {
-        matches!(
-            self,
-            Self::Scheduled | Self::AdmissionRetryPending
-        )
+        matches!(self, Self::Scheduled | Self::AdmissionRetryPending)
     }
 }
 
@@ -2471,13 +2406,8 @@ enum AutoConnectSupervisorAdmission {
     Terminal(String),
 }
 
-fn retry_frontier_includes(
-    pending: &[String],
-    required_domain: Option<&str>,
-) -> bool {
-    required_domain.is_none_or(|required| {
-        pending.iter().any(|candidate| candidate == required)
-    })
+fn retry_frontier_includes(pending: &[String], required_domain: Option<&str>) -> bool {
+    required_domain.is_none_or(|required| pending.iter().any(|candidate| candidate == required))
 }
 
 const fn auto_connect_supervisor_may_schedule(enabled: bool, startup_ready: bool) -> bool {
@@ -2511,9 +2441,7 @@ fn spawn_auto_connect_admission_retry() -> std::io::Result<()> {
 }
 
 fn report_auto_connect_admission_retry_start_failure(error: &std::io::Error) {
-    log::error!(
-        "failed to start automatic domain admission retry coordinator: {error}"
-    );
+    log::error!("failed to start automatic domain admission retry coordinator: {error}");
 }
 
 fn start_auto_connect_admission_retry() -> bool {
@@ -2544,10 +2472,8 @@ fn try_admit_auto_connect_supervisor(
 ) -> AutoConnectSupervisorAdmission {
     use promise::spawn::MainThreadReservationOutcome;
 
-    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
-        != request_generation
-        || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
-            != authority_epoch
+    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) != request_generation
+        || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire) != authority_epoch
         || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
     {
         return AutoConnectSupervisorAdmission::Superseded;
@@ -2568,10 +2494,8 @@ fn try_admit_auto_connect_supervisor(
             return AutoConnectSupervisorAdmission::Terminal(format!("{rejected:?}"));
         }
     };
-    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
-        != request_generation
-        || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
-            != authority_epoch
+    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) != request_generation
+        || DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire) != authority_epoch
         || MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) != 0
     {
         drop(reservation);
@@ -2633,10 +2557,8 @@ fn try_admit_auto_connect_supervisor(
         );
     }
     spawned.detach();
-    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
-        == request_generation
-        && DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire)
-            == authority_epoch
+    if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) == request_generation
+        && DOMAIN_RECONNECT_MANIFEST_AUTHORITY_EPOCH.load(Ordering::Acquire) == authority_epoch
         && MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) == 0
     {
         AutoConnectSupervisorAdmission::Scheduled
@@ -2656,8 +2578,7 @@ fn retry_auto_connect_admission() {
     let mut delay = std::time::Duration::from_millis(10);
     let mut attempts = 0_u64;
     loop {
-        let request_generation =
-            AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        let request_generation = AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
         completion.begin_request(request_generation);
         if !auto_connect_supervisor_may_schedule(
             AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
@@ -2704,9 +2625,7 @@ fn retry_auto_connect_admission() {
             }
             return;
         };
-        if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
-            != request_generation
-        {
+        if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) != request_generation {
             delay = std::time::Duration::from_millis(10);
             attempts = 0;
             continue;
@@ -2774,9 +2693,7 @@ fn schedule_auto_connect_domains() {
     let _ = schedule_auto_connect_domains_requiring(None);
 }
 
-fn schedule_auto_connect_domain(
-    required_domain: &str,
-) -> AutoConnectScheduleOutcome {
+fn schedule_auto_connect_domain(required_domain: &str) -> AutoConnectScheduleOutcome {
     schedule_auto_connect_domains_requiring(Some(required_domain))
 }
 
@@ -2929,8 +2846,7 @@ fn schedule_auto_connect_domains_requiring(
             }
         }
         AutoConnectSupervisorAdmission::Terminal(rejected) => {
-            if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
-                != request_generation
+            if AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire) != request_generation
             {
                 return AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain;
             }
@@ -2949,17 +2865,13 @@ fn schedule_auto_connect_domains_requiring(
     }
 }
 
-fn report_startup_domain_retry_handoff(
-    domain_name: &str,
-    outcome: AutoConnectScheduleOutcome,
-) {
+fn report_startup_domain_retry_handoff(domain_name: &str, outcome: AutoConnectScheduleOutcome) {
     use frankenterm_core::output::sanitize_redact_truncate_bounded;
     use frankenterm_core::policy::Redactor;
 
     let redactor = Redactor::new();
-    let safe_domain = sanitize_redact_truncate_bounded(domain_name, 96, 256, |text| {
-        redactor.redact(text)
-    });
+    let safe_domain =
+        sanitize_redact_truncate_bounded(domain_name, 96, 256, |text| redactor.redact(text));
     let (level, title, message) = if outcome.establishes_retry_handoff() {
         (
             log::Level::Info,
@@ -3049,10 +2961,8 @@ fn log_gui_hook_result(event_name: &str, result: anyhow::Result<bool>) {
             log::warn!("{message}");
         }
         Err(err) => {
-            let message = bounded_gui_failure_message(
-                &format!("while processing {event_name} event"),
-                &err,
-            );
+            let message =
+                bounded_gui_failure_message(&format!("while processing {event_name} event"), &err);
             frankenterm_gui::gui_debug_log::record(
                 log::Level::Error,
                 "frankenterm_gui::lua",
@@ -3254,8 +3164,7 @@ async fn async_run_terminal_gui(
                     // bootstrap delay unrelated automatic connections.
                     initialize_domain_reconnect_manifest_snapshot().await;
                     return Ok(TerminalGuiStartupOutcome {
-                        retry_domain: retry_requested
-                            .then(|| domain.domain_name().to_string()),
+                        retry_domain: retry_requested.then(|| domain.domain_name().to_string()),
                     });
                 }
                 return Err(anyhow!(domain_connection_failure_message(
@@ -3685,8 +3594,9 @@ fn initialize_window_state_persistence() {
         );
         return;
     };
-    mux_lua::install_domain_lifecycle_recorder(&mux, Arc::new(
-        |domain_name, event, lifecycle_worker_hold| {
+    mux_lua::install_domain_lifecycle_recorder(
+        &mux,
+        Arc::new(|domain_name, event, lifecycle_worker_hold| {
             Box::pin(async move {
                 if domain_name == "local" {
                     return Ok(());
@@ -3705,15 +3615,13 @@ fn initialize_window_state_persistence() {
                         schedule_auto_connect_domains();
                         Ok(())
                     }
-                    mux_lua::DomainLifecycleEvent::Detached => {
-                        persist_domain_reconnect_intent(
-                            domain_name,
-                            DomainAttachmentIntent::Detached,
-                            lifecycle_worker_hold,
-                        )
-                        .await
-                        .map(|_| ())
-                    }
+                    mux_lua::DomainLifecycleEvent::Detached => persist_domain_reconnect_intent(
+                        domain_name,
+                        DomainAttachmentIntent::Detached,
+                        lifecycle_worker_hold,
+                    )
+                    .await
+                    .map(|_| ()),
                     mux_lua::DomainLifecycleEvent::AttachFailed => {
                         drop(lifecycle_worker_hold);
                         let outcome = schedule_auto_connect_domain(&domain_name);
@@ -3735,8 +3643,8 @@ fn initialize_window_state_persistence() {
                     }
                 }
             })
-        },
-    ));
+        }),
+    );
 }
 
 fn run_gui_event_loop(gui: Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Result<()> {
@@ -3821,12 +3729,9 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 
         let redactor = Redactor::new();
         let warning_text = warnings.join("\n");
-        let safe_warnings = sanitize_redact_truncate_bounded(
-            &warning_text,
-            512,
-            1_600,
-            |text| redactor.redact(text),
-        );
+        let safe_warnings = sanitize_redact_truncate_bounded(&warning_text, 512, 1_600, |text| {
+            redactor.redact(text)
+        });
         err_text = format!("{err_text}\nConfiguration error: {safe_warnings}");
     }
 
@@ -4028,12 +3933,7 @@ mod tests {
         trj.next_attempt = now + std::time::Duration::from_secs(30);
 
         let peer_detached_at = now + std::time::Duration::from_secs(1);
-        refresh_auto_connect_retry_frontier(
-            &mut retries,
-            &desired,
-            peer_detached_at,
-            |_name| true,
-        );
+        refresh_auto_connect_retry_frontier(&mut retries, &desired, peer_detached_at, |_name| true);
 
         assert_eq!(
             due_auto_connect_domains(&retries, peer_detached_at),
@@ -4084,7 +3984,10 @@ mod tests {
         assert!(!message.contains(secret));
         assert!(!message.contains('\u{1b}'));
         assert!(!message.contains('\u{7}'));
-        assert!(message.len() <= 1_600, "diagnostic exceeded its byte budget");
+        assert!(
+            message.len() <= 1_600,
+            "diagnostic exceeded its byte budget"
+        );
 
         let manual_message = domain_connection_failure_message(
             &domain,
@@ -4186,9 +4089,8 @@ mod tests {
             "blocking manifest bootstrap must not gate the explicit startup transport"
         );
         assert!(
-            !startup[..attach].contains(
-                ".context(\"persisting explicitly requested domain attachment intent\")"
-            ),
+            !startup[..attach]
+                .contains(".context(\"persisting explicitly requested domain attachment intent\")"),
             "optional remembered intent must not regain question-mark admission authority"
         );
     }
@@ -4273,7 +4175,7 @@ mod tests {
             .split_once("async fn initialize_domain_reconnect_manifest_snapshot(")
             .expect("manifest initialization remains present")
             .1
-            .split_once("\nasync fn remember_attached_domain_best_effort(")
+            .split_once("\npub(crate) async fn remember_attached_domain_best_effort(")
             .expect("manifest initialization remains bounded")
             .0;
         assert!(initialization.contains("reserve_domain_reconnect_manifest_operation()"));
@@ -4319,13 +4221,18 @@ mod tests {
 
     #[test]
     fn unavailable_remembered_authority_never_falls_back_to_configured_auto_connect() {
-        let source = include_str!("main.rs");
+        let source = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("production source must end before test assertions")
+            .0;
         assert!(!source.contains("configured_auto_connect_domain_configs"));
         assert!(source.contains("auto_connect_domain_configs(config)"));
         assert!(!source.contains("auto_connect_domain_configs(config).unwrap_or_default()"));
-        assert!(source.contains(
-            "automatic domain connection is paused until authority is durably repaired"
-        ));
+        assert!(
+            source.contains(
+                "automatic domain connection is paused until authority is durably repaired"
+            )
+        );
     }
 
     #[test]
@@ -4348,9 +4255,7 @@ mod tests {
         );
 
         assert!(AutoConnectScheduleOutcome::Scheduled.establishes_retry_handoff());
-        assert!(
-            AutoConnectScheduleOutcome::AdmissionRetryPending.establishes_retry_handoff()
-        );
+        assert!(AutoConnectScheduleOutcome::AdmissionRetryPending.establishes_retry_handoff());
         for outcome in [
             AutoConnectScheduleOutcome::ScheduledWithoutRequiredDomain,
             AutoConnectScheduleOutcome::StartupNotReady,
@@ -4467,10 +4372,7 @@ mod tests {
                 "test",
                 || {
                     assert!(
-                        matches!(
-                            state.try_lock(),
-                            Err(std::sync::TryLockError::WouldBlock)
-                        ),
+                        matches!(state.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
                         "replacement creation must remain inside the owner-state transaction"
                     );
                     restarts.fetch_add(1, Ordering::AcqRel);
@@ -4565,7 +4467,9 @@ mod tests {
             "the original worker panic must continue after nested recovery containment"
         );
         assert_eq!(
-            *state.lock().expect("read state after nested panic recovery"),
+            *state
+                .lock()
+                .expect("read state after nested panic recovery"),
             AdmissionRetryCoordinatorState::Idle,
             "a panicking restart callback must leave retryable Idle state"
         );
@@ -4585,7 +4489,9 @@ mod tests {
                 || Err(std::io::Error::other("planted replacement spawn failure")),
                 |error| {
                     assert_eq!(
-                        *state.lock().expect("failure reporter must run after unlock"),
+                        *state
+                            .lock()
+                            .expect("failure reporter must run after unlock"),
                         AdmissionRetryCoordinatorState::Idle,
                         "spawn failure must publish Idle before invoking callbacks"
                     );
@@ -4608,7 +4514,9 @@ mod tests {
             "one failed replacement must emit exactly one failure report"
         );
         assert_eq!(
-            *state.lock().expect("read state after reported spawn failure"),
+            *state
+                .lock()
+                .expect("read state after reported spawn failure"),
             AdmissionRetryCoordinatorState::Idle
         );
     }
@@ -4779,12 +4687,10 @@ mod tests {
 
     #[test]
     fn cancellation_fences_generation_even_without_a_retained_task_handle() {
-        let request_before =
-            AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        let request_before = AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
         let before = AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire);
         cancel_auto_connect_supervisor();
-        let request_after =
-            AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
+        let request_after = AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire);
         let after = AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire);
         assert_eq!(
             request_after,
@@ -4795,7 +4701,9 @@ mod tests {
         );
         assert_eq!(
             after,
-            before.checked_add(1).expect("test generation must not exhaust"),
+            before
+                .checked_add(1)
+                .expect("test generation must not exhaust"),
             "cancellation must invalidate an old epoch even when its task already completed"
         );
     }

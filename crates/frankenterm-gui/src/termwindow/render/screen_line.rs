@@ -1015,7 +1015,7 @@ mod tests {
     fn paragraph_context_skips_only_ascii_hyperlink_clusters() {
         let attrs = CellAttributes::default();
 
-        let ascii = Line::from_text("link text", &attrs, SEQ_ZERO, None);
+        let ascii = Line::from_text("linktext", &attrs, SEQ_ZERO, None);
         let ascii_clusters = ascii.cluster(None);
         assert_eq!(ascii_clusters.len(), 1);
         assert!(!any_cluster_needs_paragraph_context(&ascii_clusters));
@@ -1024,6 +1024,13 @@ mod tests {
                 .iter()
                 .all(should_shape_cluster_with_paragraph_context)
         );
+
+        // With bidi disabled, whitespace boundaries deliberately split runs.
+        // They need paragraph context just like attribute-split ASCII runs.
+        let spaced_ascii = Line::from_text("link text", &attrs, SEQ_ZERO, None);
+        let spaced_clusters = spaced_ascii.cluster(None);
+        assert!(spaced_clusters.len() > 1);
+        assert!(any_cluster_needs_paragraph_context(&spaced_clusters));
 
         let mut bold_attrs = CellAttributes::default();
         bold_attrs.set_intensity(wezterm_term::Intensity::Bold);

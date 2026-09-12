@@ -71614,7 +71614,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { command }) => {
-            mcp::run_mcp(command, &config, &workspace_root)?;
+            mcp::run_mcp(cx, command, &config, &workspace_root).await?;
         }
 
         Some(Commands::Attestation { command }) => {

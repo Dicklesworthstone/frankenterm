@@ -387,8 +387,7 @@ mod tests {
     #[test]
     fn only_uncommitted_attach_stage_failure_establishes_domain_retry() {
         assert!(
-            planted_failure(DomainAttachmentFailureStage::Attach, false)
-                .establishes_domain_retry()
+            planted_failure(DomainAttachmentFailureStage::Attach, false).establishes_domain_retry()
         );
         for (stage, committed) in [
             (DomainAttachmentFailureStage::Preparation, false),
