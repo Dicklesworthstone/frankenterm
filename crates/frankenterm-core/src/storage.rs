@@ -1004,6 +1004,13 @@ enum WriteCommand {
         workflow: WorkflowRecord,
         respond: oneshot::Sender<Result<()>>,
     },
+    AbortWorkflow {
+        expected: WorkflowRecord,
+        action: AuditActionRecord,
+        undo_attempt: Option<(i64, String)>,
+        on_commit: Box<dyn FnOnce() + Send>,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// Insert or update a workflow action plan
     UpsertActionPlan {
         record: WorkflowActionPlanRecord,
@@ -1419,6 +1426,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::DeleteEventMute { .. } => "DeleteEventMute",
             Self::UpsertPane { .. } => "UpsertPane",
             Self::UpsertWorkflow { .. } => "UpsertWorkflow",
+            Self::AbortWorkflow { .. } => "AbortWorkflow",
             Self::UpsertActionPlan { .. } => "UpsertActionPlan",
             Self::InsertPreparedPlan { .. } => "InsertPreparedPlan",
             Self::ConsumePreparedPlan { .. } => "ConsumePreparedPlan",
@@ -7439,6 +7447,39 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// Atomically abort the observed active execution, settle its owned trigger,
+    /// audit it and retire its start-action undo authority. False means the
+    /// observed state changed. The writer runs `on_commit` before responding,
+    /// even if the admitted caller drops its future; it must be bounded cleanup.
+    pub async fn abort_workflow_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        expected: WorkflowRecord,
+        mut action: AuditActionRecord,
+        undo_attempt: Option<(i64, String)>,
+        on_commit: impl FnOnce() + Send + 'static,
+    ) -> Result<bool> {
+        Self::checkpoint_storage_operation(cx, "abort_workflow")?;
+        action.redact_fields(&Redactor::new());
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::AbortWorkflow {
+                    expected,
+                    action,
+                    undo_attempt,
+                    on_commit: Box::new(on_commit),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("abort_workflow", error))?;
+        // Admission is the cancellation commit point: retain the writer's
+        // authoritative outcome even when the caller is cancelled afterwards.
+        Self::recv_writer_response(rx).await
+    }
+
     /// Upsert a workflow action plan (canonical JSON + hash)
     pub async fn upsert_action_plan(
         &self,
@@ -13083,6 +13124,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         WriteCommand::AcknowledgeRecorderDelivery { respond, .. }
         | WriteCommand::FinalizeEventDelivery { respond, .. }
         | WriteCommand::ReleaseEventDelivery { respond, .. }
+        | WriteCommand::AbortWorkflow { respond, .. }
         | WriteCommand::SetEventTriageState { respond, .. }
         | WriteCommand::AddEventLabel { respond, .. }
         | WriteCommand::RemoveEventLabel { respond, .. }
@@ -18138,6 +18180,42 @@ fn dispatch_write_command_raw(
             let result = upsert_workflow_backend(backend, &workflow);
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::AbortWorkflow {
+            expected,
+            action,
+            undo_attempt,
+            on_commit,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let mut result =
+                abort_workflow_backend(backend, &expected, &action, undo_attempt.as_ref());
+            let committed = matches!(result, Ok(true));
+            if catch_recoverable(
+                RecoverablePanicSite::StorageWriter,
+                std::panic::AssertUnwindSafe(|| {
+                    if committed {
+                        on_commit();
+                    } else {
+                        drop(on_commit);
+                    }
+                }),
+            )
+            .is_err()
+            {
+                saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
+                tracing::error!(
+                    committed,
+                    "storage writer contained workflow abort owner-cleanup panic"
+                );
+                if committed {
+                    result = Err(StorageError::Database(
+                        "workflow abort committed, but owner cleanup panicked; durable audit and undo remain committed".into(),
+                    ).into());
+                }
+            }
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::UpsertActionPlan { record, respond } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
@@ -21277,7 +21355,107 @@ fn upsert_pane_backend(backend: &dyn StorageBackend, pane: &PaneRecord) -> Resul
     Ok(())
 }
 
-/// Upsert workflow execution through the StorageBackend trait path.
+/// Compare-and-set abort with inseparable audit and undo retirement.
+fn abort_workflow_backend(
+    backend: &dyn StorageBackend,
+    expected: &WorkflowRecord,
+    action: &AuditActionRecord,
+    undo_attempt: Option<&(i64, String)>,
+) -> Result<bool> {
+    if matches!(expected.status.as_str(), "completed" | "failed" | "aborted")
+        || action.action_kind != "workflow_aborted"
+        || action.actor_id.as_deref() != Some(expected.id.as_str())
+        || action.pane_id != Some(expected.pane_id)
+        || action.result != "aborted"
+    {
+        return Err(StorageError::Database("invalid atomic workflow abort request".into()).into());
+    }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "atomic workflow abort",
+        || {
+            let error = action
+                .decision_reason
+                .as_ref()
+                .map(|reason| format!("Aborted: {reason}"));
+            let changed = backend
+                .query_row_typed(
+                    "UPDATE workflow_executions SET status = 'aborted', error = ?1,
+             updated_at = ?2, completed_at = ?2
+             WHERE id = ?3 AND status = ?4 AND current_step = ?5 AND updated_at = ?6
+             AND trigger_event_id IS ?7
+             AND status NOT IN ('completed', 'failed', 'aborted') RETURNING id",
+                    &[
+                        ToSqlValue::optional_text(error.as_deref()),
+                        ToSqlValue::Integer(action.ts),
+                        ToSqlValue::Text(&expected.id),
+                        ToSqlValue::Text(&expected.status),
+                        ToSqlValue::Integer(usize_to_i64(expected.current_step, "current_step")?),
+                        ToSqlValue::Integer(expected.updated_at),
+                        ToSqlValue::optional_i64(expected.trigger_event_id),
+                    ],
+                )
+                .map_err(|error| storage_backend_error("Conditional workflow abort", error))?;
+            if changed.is_none() {
+                return Ok(false);
+            }
+            if let Some(event_id) = expected.trigger_event_id {
+                let settled = backend
+                    .query_row_typed(
+                        "UPDATE events SET handled_at = ?1, handled_by_workflow_id = ?2,
+                     handled_status = 'aborted', delivery_lease_token = NULL,
+                     delivery_lease_acquired_at = NULL, delivery_lease_expires_at = NULL
+                     WHERE id = ?3
+                     AND (handled_by_workflow_id IS NULL OR handled_by_workflow_id = ?2)
+                     AND (handled_at IS NULL OR
+                          (handled_by_workflow_id = ?2 AND handled_status = 'aborted'))
+                     AND (delivery_lease_token IS NULL OR delivery_lease_expires_at <= ?1)
+                     RETURNING id",
+                        &[
+                            ToSqlValue::Integer(action.ts),
+                            ToSqlValue::Text(&expected.id),
+                            ToSqlValue::Integer(event_id),
+                        ],
+                    )
+                    .map_err(|error| {
+                        storage_backend_error("Settle aborted workflow trigger", error)
+                    })?;
+                if settled.is_none() {
+                    return Err(StorageError::Database(
+                        "workflow abort trigger is missing, already handled differently, or leased by another owner; no abort committed".into(),
+                    ).into());
+                }
+            }
+            record_audit_action_backend(backend, action)?;
+            if let Some((action_id, actor)) = undo_attempt {
+                let undone = backend.query_row_typed(
+                    "UPDATE action_undo SET undone_at = ?1, undone_by = ?2
+                     WHERE audit_action_id = ?3 AND undoable = 1 AND undone_at IS NULL
+                     AND undo_strategy = 'workflow_abort'
+                     AND EXISTS (SELECT 1 FROM audit_actions WHERE id = ?3
+                         AND actor_id = ?4 AND action_kind = 'workflow_start') RETURNING audit_action_id",
+                    &[ToSqlValue::Integer(action.ts), ToSqlValue::Text(actor),
+                      ToSqlValue::Integer(*action_id), ToSqlValue::Text(&expected.id)],
+                ).map_err(|error| storage_backend_error("Record atomic workflow undo", error))?;
+                if undone.is_none() {
+                    return Err(StorageError::Database(
+                        "workflow undo authority changed; no abort committed".into(),
+                    )
+                    .into());
+                }
+            }
+            execute_typed(backend,
+            "UPDATE action_undo SET undoable = 0, undo_hint = 'workflow no longer running', undo_payload = NULL
+             WHERE audit_action_id IN (SELECT id FROM audit_actions
+             WHERE actor_id = ?1 AND action_kind = 'workflow_start')",
+            &[ToSqlValue::Text(&expected.id)],
+        ).map_err(|error| storage_backend_error("Retire aborted workflow undo", error))?;
+            Ok(true)
+        },
+    )
+}
+
 fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowRecord) -> Result<()> {
     let wait_condition_json = workflow.wait_condition.as_ref().map(|v| {
         serde_json::to_string(v).unwrap_or_else(|e| {
@@ -21301,8 +21479,7 @@ fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
     let pane_id_i64 = u64_to_i64(workflow.pane_id, "pane_id")?;
     let current_step_i64 = usize_to_i64(workflow.current_step, "current_step")?;
 
-    execute_typed(
-        backend,
+    let written = backend.query_row_typed(
         "INSERT INTO workflow_executions (id, workflow_name, pane_id, trigger_event_id,
          current_step, status, wait_condition, context, result, error, started_at, updated_at, completed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -21314,7 +21491,9 @@ fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
             result = excluded.result,
             error = excluded.error,
             updated_at = excluded.updated_at,
-            completed_at = excluded.completed_at",
+            completed_at = excluded.completed_at
+         WHERE workflow_executions.status != 'aborted'
+         RETURNING id",
         &[
             ToSqlValue::Text(workflow.id.as_str()),
             ToSqlValue::Text(workflow.workflow_name.as_str()),
@@ -21332,6 +21511,12 @@ fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
         ],
     )
     .map_err(|err| storage_backend_error("Failed to upsert workflow", err))?;
+    if written.is_none() {
+        return Err(StorageError::Database(
+            "workflow is aborted; stale progress or completion cannot revive it".into(),
+        )
+        .into());
+    }
 
     Ok(())
 }

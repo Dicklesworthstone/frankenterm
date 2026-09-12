@@ -1257,6 +1257,15 @@ impl WorkflowRunner {
                 return workflow_execution_error(execution_id, error);
             }
         };
+        if matches!(
+            execution_record.status.as_str(),
+            "completed" | "failed" | "aborted"
+        ) {
+            return workflow_execution_error(
+                execution_id,
+                "terminal workflow execution cannot start or resume",
+            );
+        }
         let start_action_id_result = if start_step == 0 {
             record_workflow_start_action_with_cx(
                 cx,
@@ -3984,26 +3993,6 @@ impl WorkflowRunner {
         .await
     }
 
-    async fn settle_aborted_trigger_with_fresh_cx(&self, execution_id: &str) -> crate::Result<()> {
-        let cleanup_cx = crate::cx::for_request();
-        match crate::runtime_async::timeout_with_cx(
-            &cleanup_cx,
-            WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT,
-            self.mark_trigger_event_handled_with_cx(&cleanup_cx, execution_id, "aborted"),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => Err(workflow_runner_cancelled(
-                "workflow.abort_trigger_settlement",
-                format!(
-                    "independent trigger settlement exceeded {:?}: {error}",
-                    WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT
-                ),
-            )),
-        }
-    }
-
     /// Abort a running workflow execution.
     ///
     /// This is the external API for aborting workflows (e.g., from robot mode).
@@ -4047,6 +4036,34 @@ impl WorkflowRunner {
         execution_id: &str,
         reason: Option<&str>,
         _force: bool,
+    ) -> crate::Result<AbortResult> {
+        self.abort_execution_inner_with_cx(cx, execution_id, reason, None)
+            .await
+    }
+
+    pub(crate) async fn abort_execution_for_undo_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: Option<&str>,
+        action_id: i64,
+        actor: &str,
+    ) -> crate::Result<AbortResult> {
+        self.abort_execution_inner_with_cx(
+            cx,
+            execution_id,
+            reason,
+            Some((action_id, actor.to_string())),
+        )
+        .await
+    }
+
+    async fn abort_execution_inner_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: Option<&str>,
+        undo_attempt: Option<(i64, String)>,
     ) -> crate::Result<AbortResult> {
         if cx.is_cancel_requested() {
             return Err(workflow_runner_cancelled(
@@ -4116,7 +4133,7 @@ impl WorkflowRunner {
 
         cx.checkpoint().map_err(|err| {
             let detail = format!(
-                "abort_execution cancelled between get_workflow and upsert_workflow (exec_id={execution_id}): {err}"
+                "abort_execution cancelled before atomic abort admission (exec_id={execution_id}): {err}"
             );
             workflow_runner_cancelled("workflow.abort_execution", detail)
         })?;
@@ -4125,44 +4142,55 @@ impl WorkflowRunner {
         let workflow_name = record.workflow_name.clone();
         let pane_id = record.pane_id;
         let aborted_at_step = record.current_step;
-        let now = now_ms();
-
-        let mut updated_record = record;
-        updated_record.status = "aborted".to_string();
-        updated_record.error = reason.map(|r| format!("Aborted: {r}"));
-        updated_record.updated_at = now;
-        updated_record.completed_at = Some(now);
-
-        // ft-rlbvg: take a release guard for the abort sequence so the lock
-        // drops by Drop on every return path, including panic unwind.
-        let _release_guard = self
-            .lock_manager
-            .held_lock_release_guard(pane_id, execution_id);
-
-        self.storage
-            .upsert_workflow_with_cx(cx, updated_record)
-            .await?;
-
-        // The workflow abort is durable after the upsert returns. Caller
-        // cancellation at that boundary must not suppress trigger settlement
-        // and leave the event replayable, so use an independent bounded Cx.
-        if let Err(error) = self
-            .settle_aborted_trigger_with_fresh_cx(execution_id)
-            .await
+        let action = super::engine::build_explicit_abort_action(&record, reason)?;
+        let now = action.ts;
+        let lock_manager = Arc::clone(&self.lock_manager);
+        let owned_execution_id = execution_id.to_string();
+        if !self
+            .storage
+            .abort_workflow_with_cx(cx, record, action, undo_attempt, move || {
+                lock_manager.release(pane_id, &owned_execution_id);
+            })
+            .await?
         {
-            return Err(crate::Error::Workflow(
-                crate::error::WorkflowError::Aborted(format!(
-                    "workflow abort committed for {execution_id}, but trigger settlement failed: \
-                     {error}"
-                )),
-            ));
+            let current = self
+                .storage
+                .get_workflow_with_cx(&crate::cx::for_request(), execution_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                        execution_id.to_string(),
+                    ))
+                })?;
+            if !matches!(current.status.as_str(), "aborted" | "completed" | "failed") {
+                return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                    "workflow changed during abort; no abort committed; retry against current state".into()
+                )));
+            }
+            return Ok(AbortResult {
+                aborted: false,
+                execution_id: execution_id.to_string(),
+                workflow_name: current.workflow_name,
+                pane_id: current.pane_id,
+                previous_status: current.status.clone(),
+                aborted_at_step: current.current_step,
+                reason: None,
+                aborted_at: None,
+                error_reason: Some(format!("already_{}", current.status)),
+            });
         }
+
+        // The writer owns commit-only lock cleanup, including when this future
+        // is dropped after admission and never observes its response.
+
+        // Trigger settlement is part of the same durable writer transaction;
+        // no caller continuation owns post-commit database work.
 
         tracing::info!(
             execution_id,
             workflow_name,
             pane_id,
-            reason = reason.unwrap_or("no reason provided"),
+            reason_present = reason.is_some(),
             "Workflow aborted (cx-first)"
         );
 

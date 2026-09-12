@@ -940,6 +940,15 @@ async fn record_workflow_action_with_cx(
     storage: &crate::storage::StorageHandle,
     input: WorkflowAuditActionInput<'_>,
 ) -> crate::Result<i64> {
+    let action = build_workflow_audit_action(input)?;
+    storage
+        .record_audit_action_redacted_with_cx(cx, action)
+        .await
+}
+
+fn build_workflow_audit_action(
+    input: WorkflowAuditActionInput<'_>,
+) -> crate::Result<crate::storage::AuditActionRecord> {
     let timestamp_ms = now_ms();
     let decision_context = Some(build_workflow_audit_decision_context(
         WorkflowAuditDecisionInput {
@@ -971,9 +980,27 @@ async fn record_workflow_action_with_cx(
         result: input.result.to_string(),
     };
 
-    storage
-        .record_audit_action_redacted_with_cx(cx, action)
-        .await
+    Ok(action)
+}
+
+pub(super) fn build_explicit_abort_action(
+    record: &crate::storage::WorkflowRecord,
+    reason: Option<&str>,
+) -> crate::Result<crate::storage::AuditActionRecord> {
+    build_workflow_audit_action(WorkflowAuditActionInput {
+        action_kind: "workflow_aborted",
+        execution_id: &record.id,
+        pane_id: record.pane_id,
+        workflow_name: &record.workflow_name,
+        input_summary: Some(serde_json::to_string(&serde_json::json!({
+            "workflow_name": record.workflow_name,
+            "execution_id": record.id,
+            "reason": reason,
+            "step_index": record.current_step,
+        }))?),
+        result: "aborted",
+        decision_reason: reason.map(str::to_string),
+    })
 }
 
 fn build_workflow_audit_decision_context(
