@@ -805,18 +805,31 @@ fn dedup_guard_prevents_double_execution() {
 }
 
 #[test]
-fn dedup_guard_eviction_removes_old_entries() {
+fn dedup_guard_eviction_preserves_success_and_removes_old_diagnostics() {
     let mut guard = frankenterm_core::tx_idempotency::DeduplicationGuard::new(100);
     let key1 = IdempotencyKey::new("p1", "s1", "action-a");
     let key2 = IdempotencyKey::new("p1", "s2", "action-b");
+    let diagnostic = IdempotencyKey::new("p1", "s3", "action-c");
 
     guard.record(&key1, "e1", StepOutcome::Success { result: None }, 1_000);
     guard.record(&key2, "e1", StepOutcome::Success { result: None }, 5_000);
-    assert_eq!(guard.len(), 2);
+    guard.record(
+        &diagnostic,
+        "e1",
+        StepOutcome::Skipped {
+            reason: "precondition unmet".into(),
+        },
+        1_000,
+    );
+    assert_eq!(guard.len(), 3);
 
     guard.evict_before(3_000);
-    assert_eq!(guard.len(), 1, "old entry should be evicted");
-    assert!(guard.check(&key1).is_none());
+    assert_eq!(guard.len(), 2, "only the old diagnostic should be evicted");
+    assert!(guard.check(&diagnostic).is_none());
+    assert!(
+        guard.check(&key1).is_some(),
+        "successful effects remain replay proof regardless of age"
+    );
     assert!(guard.check(&key2).is_some());
 }
 

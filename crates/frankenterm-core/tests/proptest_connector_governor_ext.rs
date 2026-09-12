@@ -498,7 +498,7 @@ proptest! {
 // =============================================================================
 
 proptest! {
-    /// total_actions monotonically increases
+    /// Lifetime totals increase only for admitted actions, including after expiry.
     #[test]
     fn quota_total_actions_monotonic(
         n in 1usize..100,
@@ -511,12 +511,16 @@ proptest! {
         let mut qt = QuotaTracker::new(config);
         let mut prev = 0;
         for i in 0..n {
-            qt.record(i as u64 * 100);
+            let admitted = qt.record(i as u64 * 100);
             let total = qt.total_actions();
-            prop_assert!(total > prev, "total should increase: {} -> {}", prev, total);
+            prop_assert_eq!(admitted, i < 50);
+            prop_assert_eq!(total, prev + u64::from(admitted));
             prev = total;
         }
-        prop_assert_eq!(qt.total_actions(), n as u64);
+        prop_assert_eq!(qt.total_actions(), n.min(50) as u64);
+        // All generated attempts occur before 10 seconds; this expires them.
+        prop_assert!(qt.record(20_000));
+        prop_assert_eq!(qt.total_actions(), n.min(50) as u64 + 1);
     }
 
     /// Warning threshold: is_warning is true iff usage >= threshold

@@ -398,7 +398,7 @@ fn replay_rejects_unknown_failure_and_tampered_plan() {
 }
 
 #[test]
-fn materialized_plan_rejects_rehashed_structural_tampering_before_digest_authority() {
+fn materialized_plan_rejects_structural_tampering_before_digest_authority() {
     let corpus = long_haul_corpus();
     let plan = materialize_soak_workload_plan(&corpus, 20).expect("20-pane plan");
 
@@ -445,7 +445,9 @@ fn materialized_plan_rejects_rehashed_structural_tampering_before_digest_authori
         .filter(|identity| identity.actor_id == "quiet-shell")
         .nth(1)
         .expect("second quiet-shell identity");
-    second_quiet.output_bytes_per_second = 1;
+    // Keep each actor's registered adapter/output binding valid so this
+    // mutation reaches the cross-instance template consistency check.
+    second_quiet.payload_profile.push_str("-inconsistent");
     assert!(
         validate_soak_workload_plan(&inconsistent_actor)
             .expect_err("inconsistent actor templates must fail")

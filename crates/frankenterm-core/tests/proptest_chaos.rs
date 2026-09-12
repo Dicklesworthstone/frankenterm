@@ -418,7 +418,13 @@ fn report_on_clean_injector_shows_zeros() {
     assert!(report.faults_by_point.is_empty());
     assert_eq!(report.assertions_passed, 0);
     assert_eq!(report.assertions_failed, 0);
-    assert!(report.all_passed);
+    assert!(!report.all_passed, "no assertions cannot certify a pass");
+
+    let checked = scenario.with_assertion(ChaosAssertion::TotalFaultsInRange(0, 0));
+    let checked_report = ChaosReport::from_scenario(&injector, &checked);
+    assert_eq!(checked_report.assertions_passed, 1);
+    assert_eq!(checked_report.assertions_failed, 0);
+    assert!(checked_report.all_passed);
 }
 
 // ─── Pre-built scenarios: structural validation ─────────────────────

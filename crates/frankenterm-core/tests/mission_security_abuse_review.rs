@@ -179,10 +179,7 @@ fn escalation_pin_to_nonexistent_agent_accepted_but_harmless() {
 
 #[test]
 fn escalation_conflicting_pin_and_exclude_same_bead() {
-    // Security note: When a bead is both pinned AND excluded, the current
-    // implementation lets the pin take effect. This is a known design choice—
-    // pin is considered an explicit operator action, and the operator
-    // can always remove an exclude. Tests validate the behavior is stable.
+    // A pin must not bypass an explicit exclusion of the same bead.
     let mut ml = MissionLoop::new(MissionLoopConfig::default());
     ml.apply_override(override_pin("pin-1", "bead-1", "agent-1"))
         .unwrap();
@@ -191,16 +188,21 @@ fn escalation_conflicting_pin_and_exclude_same_bead() {
     let agents = vec![agent("agent-1"), agent("agent-2")];
     let issues = vec![issue("bead-1", 1), issue("bead-2", 2)];
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
-    // Current behavior: pin takes precedence over exclude.
-    // If security policy changes to exclude-wins, flip this assertion.
     let bead1_assigned = decision
         .assignment_set
         .assignments
         .iter()
         .any(|a| a.bead_id == "bead-1");
     assert!(
-        bead1_assigned,
-        "pin currently takes precedence over exclude"
+        !bead1_assigned,
+        "an explicit exclusion must deny even pinned work"
+    );
+    assert!(
+        decision
+            .assignment_set
+            .assignments
+            .iter()
+            .any(|a| a.bead_id == "bead-2")
     );
 }
 
@@ -659,16 +661,26 @@ fn exhaust_empty_issues_and_agents() {
 #[test]
 fn exhaust_many_overrides_history_bounded() {
     let mut ml = MissionLoop::new(MissionLoopConfig::default());
-    // Apply and clear 200 overrides.
-    for i in 0..200 {
+    // The active and historical sets each have an independent cap of 100.
+    for i in 0..100 {
         ml.apply_override(override_exclude(&format!("ovr-{i}"), &format!("bead-{i}")))
             .unwrap();
     }
-    for i in 0..200 {
-        ml.clear_override(&format!("ovr-{i}"), 2000);
+    assert!(
+        ml.apply_override(override_exclude("over-cap", "bead-200"))
+            .is_err()
+    );
+    assert_eq!(ml.active_overrides().len(), 100);
+    for i in 0..100 {
+        assert!(ml.clear_override(&format!("ovr-{i}"), 2000));
     }
-    // History should be bounded (MAX_HISTORY = 100 in the implementation).
-    // The point is that memory doesn't grow unboundedly.
+    for i in 100..200 {
+        ml.apply_override(override_exclude(&format!("ovr-{i}"), &format!("bead-{i}")))
+            .unwrap();
+        assert!(ml.clear_override(&format!("ovr-{i}"), 2000));
+    }
+    assert!(ml.active_overrides().is_empty());
+    assert_eq!(ml.state().override_state.history.len(), 100);
     let agents = vec![agent("a1")];
     let issues = vec![issue("bead-1", 1)];
     let decision = ml.evaluate(3000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());

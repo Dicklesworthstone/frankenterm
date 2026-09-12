@@ -504,7 +504,14 @@ fn recovery_clear_overrides_restores_normal_dispatch() {
 
 #[test]
 fn recovery_partial_override_clear_gradual_restore() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // Isolate override recovery from the independent reassignment cooldown.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let agents = swarm_agents(3);
     let issues = swarm_issues(3);
 
@@ -554,7 +561,14 @@ fn recovery_partial_override_clear_gradual_restore() {
 
 #[test]
 fn recovery_ttl_based_auto_expiry() {
-    let mut ml = MissionLoop::new(MissionLoopConfig::default());
+    // Isolate TTL expiry from the independent reassignment cooldown.
+    let mut ml = MissionLoop::new(MissionLoopConfig {
+        governor_config: frankenterm_core::planner_features::GovernorConfig {
+            reassignment_cooldown_cycles: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let agents = swarm_agents(2);
     let issues = swarm_issues(2);
 

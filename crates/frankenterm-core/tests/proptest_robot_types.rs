@@ -138,7 +138,7 @@ fn arb_known_error_code_with_category() -> impl Strategy<Value = (ErrorCode, Err
         )),
         Just((
             ErrorCode::parse("robot.code_not_found").unwrap(),
-            ErrorCategory::Internal
+            ErrorCategory::Config
         )),
     ]
 }
@@ -166,7 +166,7 @@ fn arb_known_error_code_with_retryability() -> impl Strategy<Value = (ErrorCode,
         Just((ErrorCode::parse("robot.workflow_not_found").unwrap(), false)),
         Just((ErrorCode::parse("robot.mission_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.tx_error").unwrap(), false)),
-        Just((ErrorCode::parse("robot.cass_timeout").unwrap(), false)),
+        Just((ErrorCode::parse("robot.cass_timeout").unwrap(), true)),
         Just((ErrorCode::parse("robot.config_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.internal_error").unwrap(), false)),
     ]

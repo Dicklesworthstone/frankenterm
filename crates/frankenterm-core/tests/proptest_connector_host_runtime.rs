@@ -554,15 +554,32 @@ fn upgrade_requires_higher_version() {
 fn upgrade_from_stopped_updates_version_without_starting() {
     let mut rt = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
 
+    let rejected = rt
+        .upgrade_and_restart(
+            50,
+            ConnectorProtocolVersion::new(2, 0, 0),
+            StartupProbeResult::healthy(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        rejected,
+        ConnectorHostRuntimeError::ProtocolUpgradeRejected { .. }
+    ));
+    assert_eq!(
+        rt.config().protocol_version,
+        ConnectorProtocolVersion::new(1, 0, 0)
+    );
+    assert_eq!(rt.state().phase(), ConnectorLifecyclePhase::Stopped);
+
     rt.upgrade_and_restart(
         100,
-        ConnectorProtocolVersion::new(2, 0, 0),
+        ConnectorProtocolVersion::new(1, 1, 0),
         StartupProbeResult::healthy(),
     )
     .unwrap();
     assert_eq!(
         rt.config().protocol_version,
-        ConnectorProtocolVersion::new(2, 0, 0)
+        ConnectorProtocolVersion::new(1, 1, 0)
     );
     // Host should still be stopped since it was never started
     assert_eq!(rt.state().phase(), ConnectorLifecyclePhase::Stopped);

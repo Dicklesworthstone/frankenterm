@@ -652,12 +652,13 @@ fn standard_contract_artifacts_render_successfully() {
     let bundle = standard_contract_artifacts().unwrap();
     assert_eq!(
         bundle.sdk_count(),
-        3,
+        4,
         "production bundle should include every fully-supported SDK language"
     );
     assert!(!bundle.endpoint_specs_json.is_empty());
     assert!(!bundle.ntm_compat_markdown.is_empty());
     assert!(!bundle.replay_tests_json.is_empty());
+    assert!(bundle.sdk_sources.contains_key("frankenterm_client_go.go"));
     assert!(
         bundle
             .sdk_sources
@@ -768,6 +769,7 @@ fn robot_sdk_supported_matrix_fixture_matches_generated_artifacts() {
     assert_eq!(
         supported_artifacts,
         vec![
+            "frankenterm_client_go.go",
             "frankenterm_client_python.py",
             "frankenterm_client_rust.rs",
             "frankenterm_client_typescript.ts",
