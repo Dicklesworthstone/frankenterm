@@ -25,6 +25,28 @@ use frankenterm_core::simd_scan::{
 // Strategies
 // =============================================================================
 
+#[test]
+fn csi_final_bytes_do_not_open_strings() {
+    for final_byte in 0x40..=0x7e {
+        let bytes = [0x1b, b'[', b'1', final_byte, b't', b'e', b'x', b't'];
+        for split in 0..=bytes.len() {
+            let mut state = OutputScanState::default();
+            let first = scan_newlines_and_ansi_with_state(&bytes[..split], &mut state);
+            let second = scan_newlines_and_ansi_with_state(&bytes[split..], &mut state);
+            assert_eq!(first.ansi_byte_count + second.ansi_byte_count, 4);
+            assert_eq!(state, OutputScanState::default());
+        }
+    }
+    // The same bytes directly after ESC still introduce string bodies.
+    for intro in [b'P', b'X', b']', b'^', b'_'] {
+        let bytes = [0x1b, intro, b'x', 0x1b, b'\\', b't'];
+        let mut state = OutputScanState::default();
+        let metrics = scan_newlines_and_ansi_with_state(&bytes, &mut state);
+        assert_eq!(metrics.ansi_byte_count, 5);
+        assert_eq!(state, OutputScanState::default());
+    }
+}
+
 fn arb_bytes(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..max_len)
 }
