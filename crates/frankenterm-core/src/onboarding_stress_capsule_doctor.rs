@@ -333,6 +333,13 @@ mod tests {
         // Skipped section present for MachineProfile.
         assert!(text.contains("skipped:"));
         assert!(text.contains("machine_profile"));
+        for check in [
+            "runtime_policy",
+            "robot_output_available",
+            "storage_path_writable",
+        ] {
+            assert!(text.contains(&format!("{check} (required check was not run)")));
+        }
     }
 
     #[test]
@@ -354,7 +361,28 @@ mod tests {
         assert_eq!(rendering.verdict, Verdict::Ineligible);
         assert_eq!(rendering.machine_local_failures.len(), 1);
         assert_eq!(rendering.repo_code_failures.len(), 1);
-        assert_eq!(rendering.skipped.len(), 1);
+        assert_eq!(
+            rendering
+                .skipped
+                .iter()
+                .map(|skipped| (skipped.check, skipped.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    OnboardingCheck::MachineProfile,
+                    "small machine — profile not applicable",
+                ),
+                (OnboardingCheck::RuntimePolicy, "required check was not run"),
+                (
+                    OnboardingCheck::RobotOutputAvailable,
+                    "required check was not run",
+                ),
+                (
+                    OnboardingCheck::StoragePathWritable,
+                    "required check was not run",
+                ),
+            ],
+        );
         // Issue class faithfully carried through from substrate.
         assert_eq!(
             rendering.machine_local_failures[0].issue_class,
