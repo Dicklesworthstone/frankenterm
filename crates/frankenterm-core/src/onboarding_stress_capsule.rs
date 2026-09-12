@@ -108,7 +108,7 @@ pub enum CheckOutcome {
         issue_class: IssueClass,
     },
     /// Check was skipped (e.g., optional and not applicable).
-    /// Skipped checks do not block eligibility.
+    /// Only the optional MachineProfile check may skip without blocking eligibility.
     Skipped { reason: String },
 }
 
@@ -152,9 +152,8 @@ impl Default for OnboardingProbeResults {
     }
 }
 
-/// br-ft-1650n.17: report. The eligibility flag is derived from
-/// `failures` — `eligible_for_high_risk_tasks` is true iff
-/// every check has Pass or Skipped outcome.
+/// br-ft-1650n.17: report. Eligibility requires every required check to
+/// pass and no failures. Only MachineProfile may be absent or skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingReport {
     pub schema_version: String,
@@ -256,8 +255,18 @@ pub fn compile_report(probe_results: &OnboardingProbeResults) -> OnboardingRepor
         }
     }
 
-    let eligible_for_high_risk_tasks =
-        machine_local_failures.is_empty() && repo_code_failures.is_empty();
+    let required_checks = [
+        OnboardingCheck::HooksInstalled,
+        OnboardingCheck::RuntimePolicy,
+        OnboardingCheck::CargoWrapperSane,
+        OnboardingCheck::RobotOutputAvailable,
+        OnboardingCheck::StoragePathWritable,
+        OnboardingCheck::ForbiddenSurfaces,
+        OnboardingCheck::SafeProbeBudget,
+    ];
+    let eligible_for_high_risk_tasks = machine_local_failures.is_empty()
+        && repo_code_failures.is_empty()
+        && required_checks.iter().all(|check| passed.contains(check));
 
     OnboardingReport {
         schema_version: ONBOARDING_REPORT_SCHEMA_VERSION.to_string(),
@@ -470,16 +479,37 @@ mod tests {
         assert_eq!(sanitized, raw);
     }
 
-    /// Empty probe results: zero failures means eligibility is
-    /// true (vacuous). Operators should NOT call this with an
-    /// empty input — the substrate is permissive but the
-    /// wired-pass slice should ensure all required checks ran.
+    /// Missing evidence cannot authorize high-risk work.
     #[test]
-    fn empty_probe_results_eligible_vacuously() {
+    fn empty_probe_results_are_ineligible() {
         let probes = OnboardingProbeResults::new();
         let report = compile_report(&probes);
-        assert!(report.eligible_for_high_risk_tasks);
+        assert!(!report.eligible_for_high_risk_tasks);
         assert!(report.passed.is_empty());
+    }
+
+    #[test]
+    fn every_required_check_must_be_present_and_pass() {
+        for check in pass_all().outcomes.keys().copied() {
+            let mut probes = pass_all();
+            probes.outcomes.remove(&check);
+            assert_eq!(
+                compile_report(&probes).eligible_for_high_risk_tasks,
+                check == OnboardingCheck::MachineProfile,
+                "missing {check:?}",
+            );
+            probes.record(
+                check,
+                CheckOutcome::Skipped {
+                    reason: "not run".into(),
+                },
+            );
+            assert_eq!(
+                compile_report(&probes).eligible_for_high_risk_tasks,
+                check == OnboardingCheck::MachineProfile,
+                "skipped {check:?}",
+            );
+        }
     }
 
     /// OnboardingReport serde roundtrip preserves every section
