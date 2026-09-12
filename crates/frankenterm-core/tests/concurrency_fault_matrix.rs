@@ -795,7 +795,7 @@ fn cfm_cancellation_safety() {
     assert_cancellation_workload(999, "cfm_cancellation_safety", 4, 2);
 }
 
-fn assert_cancellation_workload(seed: u64, name: &str, task_count: u64, cancel_count: u64) {
+fn assert_cancellation_workload(seed: u64, name: &'static str, task_count: u64, cancel_count: u64) {
     let _scenario = fault_scenario_guard();
     assert!(cancel_count > 0 && cancel_count < task_count);
     let state = SharedWorkloadState::new();

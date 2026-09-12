@@ -311,7 +311,7 @@ fn make_session_db() -> (tempfile::NamedTempFile, Connection) {
     (file, conn)
 }
 
-async fn insert_closed_session(conn: &Connection, path: &std::path::Path, created_at: i64) {
+async fn create_closed_session(path: &std::path::Path, created_at: i64) -> String {
     use frankenterm_core::config::SnapshotConfig;
     use frankenterm_core::snapshot_engine::SnapshotEngine;
     let engine = SnapshotEngine::new(
@@ -322,15 +322,7 @@ async fn insert_closed_session(conn: &Connection, path: &std::path::Path, create
         .shutdown_checkpoint(&[], std::time::Duration::from_secs(10))
         .await
         .unwrap_or_else(|error| panic!("persist clean session created_at={created_at}: {error:?}"));
-    // Model a closed process rather than the still-live test process. Keep the
-    // real checkpoint witness and clean authority created by SnapshotEngine.
-    conn.execute(
-        "UPDATE mux_sessions SET created_at = ?2, host_id = NULL,
-         owner_pid = NULL, owner_process_start = NULL, owner_heartbeat_at = NULL
-         WHERE session_id = ?1",
-        rusqlite::params![receipt.session_id, created_at],
-    )
-    .expect("insert session");
+    receipt.session_id
 }
 
 fn count_sessions(conn: &Connection) -> i64 {
@@ -354,7 +346,18 @@ fn session_retention_max_closed_sessions_drives_cleanup() {
     // All writes belong to one runtime lifecycle, matching the live scheduler.
     run_async(async {
         for i in 0..5 {
-            insert_closed_session(&conn, file.path(), 1_000 + i64::from(i)).await;
+            let created_at = 1_000 + i64::from(i);
+            let session_id = create_closed_session(file.path(), created_at).await;
+            // Model a closed process rather than the still-live test process.
+            // Preserve the real checkpoint witness and clean authority, and
+            // keep this non-Sync SQLite connection out of the async helper.
+            conn.execute(
+                "UPDATE mux_sessions SET created_at = ?2, host_id = NULL,
+                 owner_pid = NULL, owner_process_start = NULL, owner_heartbeat_at = NULL
+                 WHERE session_id = ?1",
+                rusqlite::params![session_id, created_at],
+            )
+            .expect("mark fixture session owner closed");
         }
     });
     assert_eq!(
