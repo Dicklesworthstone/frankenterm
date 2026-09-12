@@ -817,8 +817,8 @@ fn catalog_fingerprint<'a>(patterns: impl IntoIterator<Item = (&'a str, &'a str)
         hash.update((field.len() as u64).to_be_bytes());
         hash.update(field.as_bytes());
     }
-    for (name, expression) in patterns {
-        for field in [name, expression] {
+    for pattern in patterns {
+        for field in <[&str; 2]>::from(pattern) {
             hash.update((field.len() as u64).to_be_bytes());
             hash.update(field.as_bytes());
         }

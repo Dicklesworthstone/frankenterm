@@ -1005,7 +1005,7 @@ enum WriteCommand {
         respond: oneshot::Sender<Result<()>>,
     },
     AbortWorkflow {
-        expected: WorkflowRecord,
+        expected: Box<WorkflowRecord>,
         action: AuditActionRecord,
         undo_attempt: Option<(i64, String)>,
         on_commit: Box<dyn FnOnce() + Send>,
@@ -7466,7 +7466,7 @@ impl StorageHandle {
             .send_with_cx(
                 cx,
                 WriteCommand::AbortWorkflow {
-                    expected,
+                    expected: Box::new(expected),
                     action,
                     undo_attempt,
                     on_commit: Box::new(on_commit),
