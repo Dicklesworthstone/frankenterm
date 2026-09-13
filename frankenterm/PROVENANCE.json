@@ -641,7 +641,7 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 187,
-        "fix": 206,
+        "fix": 207,
         "other": 38,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 73
       },
-      "fork_side_commit_count": 572,
+      "fork_side_commit_count": 573,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-13T00:23:04-04:00",
-        "sha": "8e4407389a359933a65a60b237ffe19e40556bd2",
-        "subject": "feat(mux): capture pane title metadata without waiting on reflow"
+        "classification": "fix",
+        "committed_at": "2026-09-13T18:22:05-04:00",
+        "sha": "b7cb1d47221b8238b43b5b6545b11022bbf31785",
+        "subject": "fix(gui): capture coherent native frames without waiting on pane locks"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -851,19 +851,19 @@
         "cosmetic": 7,
         "feat": 14,
         "fix": 35,
-        "other": 17,
-        "refactor": 2,
+        "other": 23,
+        "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 101,
+      "fork_side_commit_count": 108,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-12T15:27:49-04:00",
-        "sha": "a1785c951b81d4d86b11f1b7e58fe0d20ef4bdfb",
-        "subject": "feat(term): keep line/cell identity stable across selection snapshots"
+        "classification": "other",
+        "committed_at": "2026-09-13T18:22:58-04:00",
+        "sha": "6e1ad67aa80e7647b7d11a6aed3a4cc373a2e71a",
+        "subject": "perf(term): construct compact logical ranges on reflow workers"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -897,19 +897,19 @@
         "docs": 1,
         "feat": 53,
         "fix": 93,
-        "other": 34,
+        "other": 39,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 47
       },
-      "fork_side_commit_count": 259,
+      "fork_side_commit_count": 264,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-13T00:46:26-04:00",
-        "sha": "60c27396323c5aed67add143cc02ca3589fe770f",
-        "subject": "perf(term): reuse prepared line wraps after concurrent output"
+        "committed_at": "2026-09-13T18:22:58-04:00",
+        "sha": "6e1ad67aa80e7647b7d11a6aed3a4cc373a2e71a",
+        "subject": "perf(term): construct compact logical ranges on reflow workers"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 84,
+        "fix": 85,
         "other": 12,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 136,
+      "fork_side_commit_count": 137,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-12T12:31:56-04:00",
-        "sha": "4bfb1d9fea21adcd583c356aade3399033f6d43f",
-        "subject": "fix(release): repair native Windows APIs and RC contract regressions"
+        "committed_at": "2026-09-13T17:34:40-04:00",
+        "sha": "33be5d11c4ba07171ac24f11dc72a2f37d4789d3",
+        "subject": "fix(window): opt-in native wakeup traces on macOS spawn coalescing"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2517,
-  "generated_at": "2026-09-13T08:07:30.843911Z",
+  "fork_side_commit_total": 2531,
+  "generated_at": "2026-09-13T22:36:55.430634Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
