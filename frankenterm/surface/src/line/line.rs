@@ -9,8 +9,9 @@ use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
 use crate::{Change, SequenceNo, SEQ_ZERO};
 use alloc::borrow::Cow;
+use alloc::sync::Arc;
 #[cfg(feature = "appdata")]
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Weak;
 #[cfg(feature = "appdata")]
 use core::any::Any;
 use core::cmp::Ordering;
@@ -537,83 +538,21 @@ impl Line {
             cells.truncate(end_idx + 1);
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
             let geometry_hash = compute_wrap_geometry_hash(self.bits, &cells);
-            let tokens: Vec<Cell> = cells.into_iter().map(|cell| cell.as_cell()).collect();
-
-            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
-            let cache_key = MemoizedWrapPointCacheKey {
+            let tokens: Arc<[Cell]> = cells.into_iter().map(|cell| cell.as_cell()).collect();
+            plan_wrap_tokens(
+                tokens,
+                #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
                 geometry_hash,
                 width,
                 cost_model,
-            };
-
-            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
-            if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
-                return LineWrapLayout {
-                    tokens,
-                    break_offsets: cached.break_offsets,
-                    blank: None,
-                    scorecard: cached.scorecard,
-                };
-            }
-
-            width_prefix_scratch.rebuild(&tokens);
-            let plan = bounded_monospace_wrap_plan_with_width_prefix(
-                &tokens,
-                width,
-                cost_model,
                 width_prefix_scratch,
-            );
-            let selected_candidate = evaluate_break_offsets_with_width_prefix(
-                &tokens,
-                &plan.break_offsets,
-                width,
-                cost_model,
-                width_prefix_scratch,
-            );
-            let greedy_offsets =
-                greedy_break_offsets_from_width_prefix(&tokens, width, width_prefix_scratch);
-            let greedy_candidate = evaluate_break_offsets_with_width_prefix(
-                &tokens,
-                &greedy_offsets,
-                width,
-                cost_model,
-                width_prefix_scratch,
-            );
-
-            let scorecard = LineWrapScorecard {
-                mode: plan.mode,
-                greedy_total_cost: greedy_candidate.total_cost,
-                selected_total_cost: selected_candidate.total_cost,
-                badness_delta: saturating_diff_i64(
-                    selected_candidate.total_cost,
-                    greedy_candidate.total_cost,
-                ),
-                greedy_forced_breaks: greedy_candidate.forced_breaks,
-                selected_forced_breaks: selected_candidate.forced_breaks,
-                line_count: selected_candidate.line_count,
-                estimated_states: plan.estimated_states,
-                evaluated_states: plan.evaluated_states,
-            };
-
-            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
-            memoized_wrap_point_cache_insert(
-                cache_key,
-                MemoizedWrapPointCacheEntry {
-                    break_offsets: plan.break_offsets.clone(),
-                    scorecard,
-                },
-            );
-
-            LineWrapLayout {
-                tokens,
-                break_offsets: plan.break_offsets,
-                blank: None,
-                scorecard,
-            }
+            )
         } else {
             width_prefix_scratch.clear();
             LineWrapLayout {
-                tokens: Vec::new(),
+                tokens: Arc::from([]),
+                #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+                geometry_hash: [0; 16],
                 break_offsets: Vec::new(),
                 blank: Some(self),
                 scorecard: LineWrapScorecard {
@@ -2079,9 +2018,11 @@ pub struct LineWrapReport {
 /// Owned logical cells plus width-dependent break metadata. No output `Line`
 /// or wide-cell padding is allocated until a row is requested. As with `Line`,
 /// attached image handles are not deep-frozen by this representation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LineWrapLayout {
-    tokens: Vec<Cell>,
+    tokens: Arc<[Cell]>,
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    geometry_hash: [u8; 16],
     break_offsets: Vec<usize>,
     // Preserve the existing all-whitespace behavior, including line metadata.
     blank: Option<Line>,
@@ -2089,6 +2030,28 @@ pub struct LineWrapLayout {
 }
 
 impl LineWrapLayout {
+    /// Plan another width from the same immutable token allocation. Content
+    /// extraction and its geometry hash are independent of viewport width.
+    pub fn replan(
+        &self,
+        width: usize,
+        cost_model: MonospaceKpCostModel,
+        scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> Self {
+        if self.blank.is_some() {
+            scratch.clear();
+            return self.clone();
+        }
+        plan_wrap_tokens(
+            Arc::clone(&self.tokens),
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            self.geometry_hash,
+            width,
+            cost_model,
+            scratch,
+        )
+    }
+
     pub fn row_count(&self) -> usize {
         if self.blank.is_some() {
             1
@@ -2141,6 +2104,75 @@ impl LineWrapLayout {
             lines,
             scorecard: self.scorecard,
         }
+    }
+}
+
+fn plan_wrap_tokens(
+    tokens: Arc<[Cell]>,
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))] geometry_hash: [u8; 16],
+    width: usize,
+    cost_model: MonospaceKpCostModel,
+    scratch: &mut LineWrapWidthPrefixScratch,
+) -> LineWrapLayout {
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    let cache_key = MemoizedWrapPointCacheKey {
+        geometry_hash,
+        width,
+        cost_model,
+    };
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
+        return LineWrapLayout {
+            tokens,
+            geometry_hash,
+            break_offsets: cached.break_offsets,
+            blank: None,
+            scorecard: cached.scorecard,
+        };
+    }
+    scratch.rebuild(&tokens);
+    let plan = bounded_monospace_wrap_plan_with_width_prefix(&tokens, width, cost_model, scratch);
+    let selected = evaluate_break_offsets_with_width_prefix(
+        &tokens,
+        &plan.break_offsets,
+        width,
+        cost_model,
+        scratch,
+    );
+    let greedy_offsets = greedy_break_offsets_from_width_prefix(&tokens, width, scratch);
+    let greedy = evaluate_break_offsets_with_width_prefix(
+        &tokens,
+        &greedy_offsets,
+        width,
+        cost_model,
+        scratch,
+    );
+    let scorecard = LineWrapScorecard {
+        mode: plan.mode,
+        greedy_total_cost: greedy.total_cost,
+        selected_total_cost: selected.total_cost,
+        badness_delta: saturating_diff_i64(selected.total_cost, greedy.total_cost),
+        greedy_forced_breaks: greedy.forced_breaks,
+        selected_forced_breaks: selected.forced_breaks,
+        line_count: selected.line_count,
+        estimated_states: plan.estimated_states,
+        evaluated_states: plan.evaluated_states,
+    };
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    memoized_wrap_point_cache_insert(
+        cache_key,
+        MemoizedWrapPointCacheEntry {
+            break_offsets: plan.break_offsets.clone(),
+            scorecard,
+        },
+    );
+    LineWrapLayout {
+        tokens,
+        #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+        geometry_hash,
+        break_offsets: plan.break_offsets,
+        blank: None,
+        scorecard,
     }
 }
 
@@ -4369,6 +4401,39 @@ mod tests {
             assert_eq!(layout.materialize_rows(0..1, 99), vec![source.clone()]);
             assert!(layout.materialize_rows(1..2, 99).is_empty());
             assert_eq!(layout.into_report(99).lines, vec![source]);
+        }
+    }
+
+    #[test]
+    fn replanning_widths_reuses_logical_cells_and_preserves_quality() {
+        let source = Line::from_text(
+            &"界面 e\u{301} 🚀 ffi אבג ".repeat(20),
+            &CellAttributes::default(),
+            4,
+            None,
+        );
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let seed = source.clone().plan_wrap_with_width_prefix_scratch(
+            10,
+            MonospaceKpCostModel::terminal_default(),
+            &mut scratch,
+        );
+        for width in [1, 17, 3, 31, 8, 17] {
+            let layout = seed.replan(
+                width,
+                MonospaceKpCostModel::terminal_default(),
+                &mut scratch,
+            );
+            assert!(Arc::ptr_eq(&seed.tokens, &layout.tokens));
+            let fresh =
+                source
+                    .clone()
+                    .wrap_with_report(width, 9, MonospaceKpCostModel::terminal_default());
+            assert_eq!(layout.scorecard(), fresh.scorecard);
+            assert_eq!(
+                layout.materialize_rows(0..layout.row_count(), 9),
+                fresh.lines
+            );
         }
     }
 

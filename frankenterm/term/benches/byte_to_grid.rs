@@ -373,6 +373,20 @@ fn bench_resize_reflow(c: &mut Criterion) {
                 });
                 assert_reflow_content(&term, 120, &expected);
             });
+            // Exceed the six-layout cache. A four-width warm cycle cannot
+            // qualify dragging through previously uncached window geometries.
+            let widths = [57, 63, 69, 75, 81, 87, 93, 99];
+            group.throughput(Throughput::Elements(widths.len() as u64));
+            group.bench_function(format!("{label}/uncached_width_cycle"), |b| {
+                let mut term = make_reflow_terminal(&input);
+                b.iter(|| {
+                    for cols in widths {
+                        term.resize(reflow_size(cols));
+                    }
+                    black_box(term.cursor_pos());
+                });
+                assert_reflow_content(&term, 99, &expected);
+            });
         }
     }
     group.finish();

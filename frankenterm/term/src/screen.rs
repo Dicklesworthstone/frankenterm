@@ -7,7 +7,7 @@ use crate::config::{
     ScrollbackSnapshotLimits,
 };
 use frankenterm_surface::line::{
-    LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
+    LineWrapLayout, LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
     MonospaceKpCostModel, MonospaceWrapMode,
 };
 use frankenterm_surface::SequenceNo;
@@ -1846,9 +1846,33 @@ struct CachedResizeLines {
 #[derive(Debug, Clone)]
 struct LogicalLineWrapCache {
     source_signature: u64,
-    logical_lines: Vec<Line>,
+    logical_lines: Vec<CachedLogicalLine>,
     wrapped_by_key: HashMap<WrapCacheKey, CachedResizeLines>,
     wrap_key_order: VecDeque<WrapCacheKey>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedLogicalLine {
+    line: Line,
+    // Shared across preparation snapshots. Content extraction happens once on
+    // a compute worker; width changes reuse the immutable token allocation.
+    wrap_source: Option<Arc<std::sync::OnceLock<LineWrapLayout>>>,
+}
+
+// Bound retained token and break-array slots while physical-row storage still
+// coexists with logical content. This is not a bound on the entire terminal or
+// externally shared image/attribute payloads. Prefer recent history.
+const MAX_RETAINED_WRAP_TOKEN_BYTES: usize = 64 * 1024 * 1024;
+
+fn retained_wrap_token_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if std::env::var_os("FT_DISABLE_RETAINED_WRAP_TOKENS").is_some_and(|value| value == "1") {
+            0
+        } else {
+            MAX_RETAINED_WRAP_TOKEN_BYTES
+        }
+    })
 }
 
 /// Owned wrap work. This carries no authority to replace terminal state.
@@ -2073,6 +2097,34 @@ impl ColdScrollbackReflowWorker {
 
 impl LogicalLineWrapCache {
     fn new(source_signature: u64, logical_lines: Vec<Line>) -> Self {
+        Self::with_token_budget(
+            source_signature,
+            logical_lines,
+            retained_wrap_token_budget(),
+        )
+    }
+
+    fn with_token_budget(
+        source_signature: u64,
+        logical_lines: Vec<Line>,
+        mut remaining: usize,
+    ) -> Self {
+        let mut logical_lines: Vec<_> = logical_lines
+            .into_iter()
+            .rev()
+            .map(|line| {
+                let bytes = line
+                    .len()
+                    .checked_mul(std::mem::size_of::<Cell>() + std::mem::size_of::<usize>())
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<LineWrapLayout>()));
+                let wrap_source = bytes.filter(|bytes| *bytes <= remaining).map(|bytes| {
+                    remaining -= bytes;
+                    Arc::new(std::sync::OnceLock::new())
+                });
+                CachedLogicalLine { line, wrap_source }
+            })
+            .collect();
+        logical_lines.reverse();
         Self {
             source_signature,
             logical_lines,
@@ -2143,6 +2195,24 @@ trait ReflowLogicalLine {
     }
 
     fn scratch_for_unwrapped(&self) -> RewrapScratch;
+
+    fn retained_wrap_source(&self) -> Option<&std::sync::OnceLock<LineWrapLayout>> {
+        None
+    }
+}
+
+impl ReflowLogicalLine for CachedLogicalLine {
+    fn line<'a>(&'a self, _physical_lines: &'a VecDeque<Line>) -> &'a Line {
+        &self.line
+    }
+
+    fn scratch_for_unwrapped(&self) -> RewrapScratch {
+        RewrapScratch::Lines(vec![self.line.clone()])
+    }
+
+    fn retained_wrap_source(&self) -> Option<&std::sync::OnceLock<LineWrapLayout>> {
+        self.wrap_source.as_deref()
+    }
 }
 
 impl ReflowLogicalLine for LogicalLineForResize {
@@ -4068,6 +4138,22 @@ impl Screen {
         let line = logical_line.line(physical_lines);
         if line.len() <= physical_cols {
             return (logical_line.scratch_for_unwrapped(), None);
+        }
+
+        if let Some(retained) = logical_line.retained_wrap_source() {
+            let source = retained.get_or_init(|| {
+                line.clone().plan_wrap_with_width_prefix_scratch(
+                    physical_cols,
+                    policy.kp_cost_model,
+                    width_prefix_scratch,
+                )
+            });
+            let layout = source.replan(physical_cols, policy.kp_cost_model, width_prefix_scratch);
+            let scorecard = policy.scorecard_enabled.then(|| layout.scorecard());
+            return (
+                RewrapScratch::Lines(layout.materialize_rows(0..layout.row_count(), seqno)),
+                scorecard,
+            );
         }
 
         let line = logical_line.clone_line(physical_lines);
@@ -8708,6 +8794,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cached_logical_content_survives_distinct_width_plans_and_snapshot_clones() {
+        let screen = test_screen(3, 20, 96);
+        let logical = CachedLogicalLine {
+            line: Line::from_text(
+                &"界面 e\u{301} ffi ".repeat(12),
+                &CellAttributes::blank(),
+                1,
+                None,
+            ),
+            wrap_source: Some(Arc::new(std::sync::OnceLock::new())),
+        };
+        let snapshot = logical.clone();
+        let physical = VecDeque::new();
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        for cols in [8, 13, 5, 21] {
+            let (actual, scorecard) = Screen::wrap_logical_line_source_for_resize(
+                &snapshot,
+                &physical,
+                cols,
+                2,
+                screen.resize_wrap_policy,
+                &mut scratch,
+            );
+            let (expected, expected_scorecard) = Screen::wrap_single_logical_line_for_resize(
+                logical.line.clone(),
+                cols,
+                2,
+                screen.resize_wrap_policy,
+                &mut scratch,
+            );
+            let RewrapScratch::Lines(actual) = actual else {
+                panic!("expected wrapped rows")
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(scorecard, expected_scorecard);
+            assert!(logical.wrap_source.as_ref().unwrap().get().is_some());
+            assert!(std::ptr::eq(
+                logical.wrap_source.as_ref().unwrap().get().unwrap(),
+                snapshot.wrap_source.as_ref().unwrap().get().unwrap(),
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_wrap_budget_prefers_recent_lines_without_changing_row_order() {
+        let first = Line::from_text("first", &CellAttributes::blank(), 1, None);
+        let last = Line::from_text("last!", &CellAttributes::blank(), 1, None);
+        let one_line_budget = first.len()
+            * (std::mem::size_of::<Cell>() + std::mem::size_of::<usize>())
+            + std::mem::size_of::<LineWrapLayout>();
+        let cache = LogicalLineWrapCache::with_token_budget(
+            0,
+            vec![first.clone(), last.clone()],
+            one_line_budget,
+        );
+        assert_eq!(cache.logical_lines[0].line, first);
+        assert_eq!(cache.logical_lines[1].line, last);
+        assert!(cache.logical_lines[0].wrap_source.is_none());
+        assert!(cache.logical_lines[1].wrap_source.is_some());
+        let screen = test_screen(3, 20, 96);
+        let (actual, _) = Screen::wrap_logical_line_source_for_resize(
+            &cache.logical_lines[0],
+            &VecDeque::new(),
+            2,
+            2,
+            screen.resize_wrap_policy,
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        let RewrapScratch::Lines(actual) = actual else {
+            panic!("expected wrapped rows")
+        };
+        assert_eq!(actual, first.wrap(2, 2));
+    }
+
+    #[test]
     fn cached_no_match_scan_cannot_suppress_a_new_rule_epoch() {
         use frankenterm_surface::hyperlink::Rule;
         let mut screen = test_screen(4, 6, 96);
@@ -8724,6 +8885,7 @@ pub(crate) mod tests {
         }
         let cursor = screen.resize(test_size(4, 4, 96), test_cursor(0, 0, 1), 1, false);
         assert!(screen.rewrap_cache.as_ref().unwrap().logical_lines[0]
+            .line
             .implicit_hyperlinks_are_scanned());
         let cursor = screen.resize(test_size(4, 3, 96), cursor, 1, false);
         // Rule epochs can change at the SAME sequence. The cache contains a
