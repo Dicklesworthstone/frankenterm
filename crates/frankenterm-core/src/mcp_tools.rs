@@ -23708,7 +23708,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["ok"], true, "rollback envelope: {envelope}");
         assert_eq!(
             envelope["data"]["compensation_report"]["compensated_count"],
             1

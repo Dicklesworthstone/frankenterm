@@ -3041,9 +3041,10 @@ pub mod task {
 
         /// Cancel all tasks in the set.
         ///
-        /// Signals every task but retains the handles so callers can drain
-        /// terminal acknowledgements with `join_next`. A returned aborted
-        /// handle means the corresponding task future has been dropped.
+        /// Signals every task but retains the handles. Full terminal
+        /// settlement requires `drain_next_with_cx` or `drain_next_trusted`;
+        /// `join_next` can return None while quarantined handles remain.
+        /// A returned aborted handle means the task future has been dropped.
         pub fn abort_all(&mut self) {
             for handle in self.handles.iter().chain(&self.unacknowledged) {
                 handle.abort();
@@ -4632,9 +4633,10 @@ pub mod process {
     /// implementation set `watcher_done` manually after the
     /// `spawn_blocking(...).await?` line, which the `?` early-exit
     /// bypassed on JoinError, leaking the watcher task until the
-    /// caller's cx eventually cancelled. RAII closes that gap —
-    /// the guard's `Drop` always sets the flag, even on `?`,
-    /// `return`, or panic in the surrounding function body.
+    /// caller's cx eventually cancelled. The guard records completion on
+    /// every exit, but the flag alone cannot wake a sleeping watcher.
+    /// The owned JoinSet supplies abort-on-drop; normal return also drains
+    /// terminal acknowledgement through `settle_output_watcher`.
     struct WatcherDoneGuard {
         done: Arc<AtomicBool>,
     }
@@ -4649,6 +4651,15 @@ pub mod process {
         fn drop(&mut self) {
             self.done.store(true, Ordering::SeqCst);
         }
+    }
+
+    async fn settle_output_watcher(done: &AtomicBool, tasks: &mut super::task::JoinSet<()>) {
+        done.store(true, Ordering::SeqCst);
+        tasks.abort_all();
+        // Ordinary join_next can return None with an unacknowledged handle
+        // quarantined after waker registration failure. Only the trusted
+        // drain reserves None for genuine terminal settlement.
+        while tasks.drain_next_trusted().await.is_some() {}
     }
 
     impl Command {
@@ -5046,9 +5057,7 @@ pub mod process {
             // a foreign or frozen caller timer. Abort wakes the watcher on its
             // owning scheduler; drain terminal acknowledgement on success AND
             // blocking-executor failure before returning the original result.
-            watcher_done.store(true, Ordering::SeqCst);
-            watcher_tasks.abort_all();
-            while watcher_tasks.join_next().await.is_some() {}
+            settle_output_watcher(&watcher_done, &mut watcher_tasks).await;
 
             let result = result?;
             kill_guard.disarm();
@@ -6803,12 +6812,53 @@ pub mod process {
         // br-ft-xffjo: pin the RAII contract that
         // `WatcherDoneGuard::Drop` sets the inner `AtomicBool` to
         // true exactly once, regardless of construction site exit
-        // path. This is the structural guarantee that closes the
-        // `output_with_cx` watcher-leak window — if Drop fails to
-        // signal, the watcher tight-loops until cx cancel.
+        // path. Actual task wakeup and terminal acknowledgement are
+        // separate ownership guarantees checked below.
         use super::WatcherDoneGuard;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn process_watcher_settlement_drains_quarantined_registration_failure() {
+            use crate::runtime_async::{CompatRuntime, RuntimeBuilder, task, timeout};
+
+            struct Dropped(Arc<AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let dropped = Arc::new(AtomicBool::new(false));
+                let guard = Dropped(Arc::clone(&dropped));
+                let mut tasks = task::JoinSet::new();
+                tasks.spawn(async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                });
+                tasks.force_join_registration_failure_for_test();
+                let error = tasks.join_next().await.unwrap().unwrap_err();
+                assert_eq!(error.kind(), task::JoinErrorKind::WakerRegistrationFailed);
+                assert_eq!(tasks.unacknowledged_len(), 1);
+                assert!(!dropped.load(Ordering::SeqCst));
+
+                let done = AtomicBool::new(false);
+                timeout(
+                    std::time::Duration::from_secs(5),
+                    super::settle_output_watcher(&done, &mut tasks),
+                )
+                .await
+                .expect("watcher settlement must not strand quarantine");
+                assert!(done.load(Ordering::SeqCst));
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "watcher must be destroyed before return"
+                );
+                assert_eq!(tasks.settlement(), task::JoinSetSettlement::Settled);
+            });
+        }
 
         #[test]
         fn watcher_done_guard_sets_flag_on_drop() {
