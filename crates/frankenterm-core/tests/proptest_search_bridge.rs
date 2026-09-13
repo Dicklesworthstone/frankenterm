@@ -1,9 +1,12 @@
-//! Property-based tests for the search bridge (Tokio↔frankensearch adapter).
+//! Property-based tests for the search bridge (asupersync↔frankensearch adapter).
 //!
 //! Covers: BridgeCancellationToken state machine, SearchBridgeRequest builder
 //! chain composition, update_best_results phase selection, map_search_error
 //! priority, and concurrent cancellation safety.
 #![cfg(feature = "frankensearch")]
+// The cancellation future and runtime task wrappers require a deeper Send
+// proof than the default 128 levels under the pinned compiler's trait solver.
+#![recursion_limit = "256"]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
