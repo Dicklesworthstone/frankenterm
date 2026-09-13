@@ -5005,27 +5005,29 @@ pub mod process {
             let watcher_done_inner = Arc::clone(&watcher_done);
             let watcher_cx = cx.clone();
             let watcher_spawn_cx = watcher_cx.clone();
-            let watcher_handle =
-                super::task::spawn_with_cx(&watcher_spawn_cx, move |_child_cx| async move {
-                    while !watcher_done_inner.load(Ordering::SeqCst) {
-                        if watcher_cx.checkpoint().is_err() {
-                            watcher_cancel.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                        if super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL)
-                            .await
-                            .is_err()
-                        {
-                            // A finite budget can wake `sleep_with_cx` with an
-                            // error before the Cx cancellation bit is latched.
-                            // Fail closed and stop the child instead of
-                            // spinning this watcher without yielding.
-                            let _ = watcher_cx.checkpoint();
-                            watcher_cancel.store(true, Ordering::SeqCst);
-                            return;
-                        }
+            // Retain cancellation ownership even if this command future is
+            // dropped or unwinds before normal settlement.
+            let mut watcher_tasks = super::task::JoinSet::new();
+            watcher_tasks.spawn_with_cx(&watcher_spawn_cx, move |_child_cx| async move {
+                while !watcher_done_inner.load(Ordering::SeqCst) {
+                    if watcher_cx.checkpoint().is_err() {
+                        watcher_cancel.store(true, Ordering::SeqCst);
+                        return;
                     }
-                });
+                    if super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL)
+                        .await
+                        .is_err()
+                    {
+                        // A finite budget can wake `sleep_with_cx` with an
+                        // error before the Cx cancellation bit is latched.
+                        // Fail closed and stop the child instead of
+                        // spinning this watcher without yielding.
+                        let _ = watcher_cx.checkpoint();
+                        watcher_cancel.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
 
             // br-ft-xffjo: RAII guard ensures `watcher_done` is set
             // on every exit path (normal return, `?` early-exit on
@@ -5037,20 +5039,18 @@ pub mod process {
 
             let result = super::spawn_blocking(move || run_output_command(spec, cancel, deadline))
                 .await
-                .map_err(std::io::Error::other)?;
+                .map_err(std::io::Error::other);
 
-            // Drain the watcher on the normal path so it exits
-            // before this function returns. The guard above already
-            // signalled it via Drop on early-exit paths; here we
-            // explicitly signal + drain so the watcher task is
-            // joined (not just abandoned) when the function
-            // returns Ok. The `_watcher_done_guard` Drop on
-            // function exit re-stores `true` (idempotent — no-op
-            // since we just set it), then the guard goes out of
-            // scope cleanly.
+            // The process supervisor has settled. Its cancellation watcher
+            // owns no process cleanup and must not hold the result hostage to
+            // a foreign or frozen caller timer. Abort wakes the watcher on its
+            // owning scheduler; drain terminal acknowledgement on success AND
+            // blocking-executor failure before returning the original result.
             watcher_done.store(true, Ordering::SeqCst);
-            let _ = watcher_handle.await;
+            watcher_tasks.abort_all();
+            while watcher_tasks.join_next().await.is_some() {}
 
+            let result = result?;
             kill_guard.disarm();
             result
         }
@@ -9396,6 +9396,80 @@ mod tests {
 
             let result = sleep_with_cx(&cx, Duration::from_secs(1)).await;
             assert!(result.is_err(), "expired budgets must short-circuit sleep");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_completion_drains_watcher_without_advancing_foreign_clock() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_clock, caller_cx) =
+                virtual_timeout_context(asupersync::Time::ZERO, asupersync::Budget::INFINITE);
+            let timer = caller_cx.timer_driver().expect("foreign timer driver");
+            let directory = tempfile::tempdir().unwrap();
+            let release_path = directory.path().join("release");
+            let child_release_path = release_path.clone();
+            let command = task::spawn(async move {
+                let mut command = process::Command::new("sh");
+                command.args([
+                    "-c",
+                    "while [ ! -f \"$1\" ]; do sleep 0.01; done; printf settled",
+                    "watcher-clock-test",
+                ]);
+                command.arg(child_release_path);
+                command.kill_on_drop(true);
+                command
+                    .output_with_cx_timeout(&caller_cx, Duration::from_secs(10))
+                    .await
+            });
+            let armed = timeout(Duration::from_secs(5), async {
+                while timer.pending_count() == 0 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            // Release the subprocess even if the registration observation
+            // failed, so assertion failure does not strand intentional work.
+            std::fs::write(&release_path, b"release").unwrap();
+            let result = timeout(Duration::from_secs(5), command).await;
+            armed.expect("watcher must register on the frozen foreign timer");
+            let output = result
+                .expect("completed process must not await the foreign timer")
+                .expect("command task joins")
+                .expect("supervisor result preserved");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"settled");
+            assert!(output.stderr.is_empty());
+            assert_eq!(timer.now(), asupersync::Time::ZERO);
+            assert_eq!(timer.pending_count(), 0, "watcher dropped before return");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_spawn_failure_preserves_error_and_drains_foreign_clock_watcher() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_clock, caller_cx) =
+                virtual_timeout_context(asupersync::Time::ZERO, asupersync::Budget::INFINITE);
+            let timer = caller_cx.timer_driver().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = process::Command::new(directory.path().join("absent-program"));
+            let error = timeout(
+                Duration::from_secs(5),
+                command.output_with_cx_timeout(&caller_cx, Duration::from_secs(5)),
+            )
+            .await
+            .expect("spawn error must not wait for the foreign clock")
+            .expect_err("absent executable must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            assert!(caller_cx.checkpoint().is_ok());
+            assert_eq!(
+                timer.pending_count(),
+                0,
+                "failed command drains its watcher"
+            );
         });
     }
 

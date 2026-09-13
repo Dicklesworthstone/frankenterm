@@ -9517,12 +9517,16 @@ impl ToolHandler for WaSendTool {
                     "database path has no parent directory".to_string(),
                 ))
             })?;
+            tracing::debug!(phase = "storage_open_begin", "wa.send request progress");
             let storage =
                 StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
+            tracing::debug!(phase = "storage_open_complete", "wa.send request progress");
             let wezterm = Arc::clone(&self.wezterm);
+            tracing::debug!(phase = "pane_lookup_begin", "wa.send request progress");
             let pane_info = wezterm
                 .get_pane_with_cx(&wezterm_cx, params.pane_id)
                 .await?;
+            tracing::debug!(phase = "pane_lookup_complete", "wa.send request progress");
             let domain = pane_info.inferred_domain();
             let submit_agent_type = mcp_infer_submit_agent_type(&pane_info);
             let submit_profile = submit_guarantee_level
@@ -9552,8 +9556,10 @@ impl ToolHandler for WaSendTool {
                     .unwrap_or(&params.text)
             };
 
+            tracing::debug!(phase = "capabilities_begin", "wa.send request progress");
             let resolution =
                 resolve_pane_capabilities(&config, Some(&storage), params.pane_id).await;
+            tracing::debug!(phase = "capabilities_complete", "wa.send request progress");
             let capabilities = resolution.capabilities;
 
             let mut engine = build_policy_engine_with_shared_rate_limiter(
@@ -9593,6 +9599,7 @@ impl ToolHandler for WaSendTool {
             };
 
             if params.dry_run {
+                tracing::debug!(phase = "preview_authorize", "wa.send request progress");
                 let decision = engine.authorize_preview(&input);
                 let injection = injection_from_decision(
                     decision,
@@ -9600,6 +9607,7 @@ impl ToolHandler for WaSendTool {
                     params.pane_id,
                     ActionKind::SendText,
                 );
+                tracing::debug!(phase = "preview_complete", "wa.send request progress");
                 return Ok(McpSendData {
                     pane_id: params.pane_id,
                     injection,

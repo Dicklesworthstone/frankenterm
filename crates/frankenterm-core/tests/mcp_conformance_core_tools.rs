@@ -345,6 +345,13 @@ fn mcp_policy_test_config(
 fn spawn_client_with_config(config: Config, db_path: Option<PathBuf>) -> FrameworkTestClient {
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
+        // Keep finite, content-free handler phase receipts on the actual
+        // serving thread so a stalled synchronous request identifies its await.
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("frankenterm_core::mcp::mcp_tools=debug")
+            .with_test_writer()
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build MCP test runtime");
