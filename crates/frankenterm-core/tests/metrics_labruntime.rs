@@ -5,6 +5,9 @@
 //! Feature-gated behind `asupersync-runtime` and `metrics`.
 
 #![cfg(all(feature = "asupersync-runtime", feature = "metrics"))]
+// MetricsServer's context-aware task wrappers require a deeper Send proof
+// than the default 128 levels under the pinned compiler's trait solver.
+#![recursion_limit = "256"]
 
 mod common;
 
