@@ -519,6 +519,19 @@ impl Line {
         cost_model: MonospaceKpCostModel,
         width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
     ) -> LineWrapReport {
+        self.plan_wrap_with_width_prefix_scratch(width, cost_model, width_prefix_scratch)
+            .into_report(seqno)
+    }
+
+    /// Compute wrapping without allocating physical output rows. The returned
+    /// plan owns its source, so callers can materialize a viewport later without
+    /// borrowing mutable terminal state.
+    pub fn plan_wrap_with_width_prefix_scratch(
+        self,
+        width: usize,
+        cost_model: MonospaceKpCostModel,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> LineWrapLayout {
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
@@ -535,12 +548,10 @@ impl Line {
 
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
             if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
-                return LineWrapReport {
-                    lines: materialize_wrap_lines_from_tokens(
-                        &tokens,
-                        &cached.break_offsets,
-                        seqno,
-                    ),
+                return LineWrapLayout {
+                    tokens,
+                    break_offsets: cached.break_offsets,
+                    blank: None,
                     scorecard: cached.scorecard,
                 };
             }
@@ -593,14 +604,18 @@ impl Line {
                 },
             );
 
-            LineWrapReport {
-                lines: materialize_wrap_lines_from_tokens(&tokens, &plan.break_offsets, seqno),
+            LineWrapLayout {
+                tokens,
+                break_offsets: plan.break_offsets,
+                blank: None,
                 scorecard,
             }
         } else {
             width_prefix_scratch.clear();
-            LineWrapReport {
-                lines: vec![self],
+            LineWrapLayout {
+                tokens: Vec::new(),
+                break_offsets: Vec::new(),
+                blank: Some(self),
                 scorecard: LineWrapScorecard {
                     mode: MonospaceWrapMode::Fallback,
                     greedy_total_cost: 0,
@@ -2061,6 +2076,74 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
+/// Owned logical cells plus width-dependent break metadata. No output `Line`
+/// or wide-cell padding is allocated until a row is requested. As with `Line`,
+/// attached image handles are not deep-frozen by this representation.
+#[derive(Debug)]
+pub struct LineWrapLayout {
+    tokens: Vec<Cell>,
+    break_offsets: Vec<usize>,
+    // Preserve the existing all-whitespace behavior, including line metadata.
+    blank: Option<Line>,
+    scorecard: LineWrapScorecard,
+}
+
+impl LineWrapLayout {
+    pub fn row_count(&self) -> usize {
+        if self.blank.is_some() {
+            1
+        } else {
+            self.break_offsets.len()
+        }
+    }
+
+    /// Quality describes the whole logical line, not a materialized subset.
+    pub fn scorecard(&self) -> LineWrapScorecard {
+        self.scorecard
+    }
+
+    /// Materialize only the requested physical rows. Out-of-range ends are
+    /// clipped; empty, reversed, and entirely out-of-range requests are empty.
+    /// Wrap markers refer to the full logical line, including offscreen rows.
+    pub fn materialize_rows(&self, rows: Range<usize>, seqno: SequenceNo) -> Vec<Line> {
+        let end = rows.end.min(self.row_count());
+        if rows.start >= end {
+            return Vec::new();
+        }
+        if let Some(blank) = &self.blank {
+            return vec![blank.clone()];
+        }
+        let mut lines = Vec::with_capacity(end - rows.start);
+        for row in rows.start..end {
+            let start = if row == 0 {
+                0
+            } else {
+                self.break_offsets[row - 1]
+            };
+            let stop = self.break_offsets[row];
+            lines.push(materialize_wrap_line(
+                &self.tokens[start..stop],
+                stop < self.tokens.len(),
+                seqno,
+            ));
+        }
+        lines
+    }
+
+    fn into_report(mut self, seqno: SequenceNo) -> LineWrapReport {
+        // Move the passthrough line rather than cloning its metadata/appdata.
+        let lines = if let Some(blank) = self.blank.take() {
+            vec![blank]
+        } else {
+            self.materialize_rows(0..self.row_count(), seqno)
+        };
+        LineWrapReport {
+            lines,
+            scorecard: self.scorecard,
+        }
+    }
+}
+
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
 const MAX_MEMOIZED_WRAP_POINT_CACHE_ENTRIES: usize = 16_384;
 
@@ -2584,6 +2667,7 @@ fn saturating_diff_i64(lhs: u64, rhs: u64) -> i64 {
 }
 
 #[inline]
+#[cfg(test)]
 fn materialize_wrap_lines_from_tokens(
     tokens: &[Cell],
     break_offsets: &[usize],
@@ -2597,23 +2681,11 @@ fn materialize_wrap_lines_from_tokens(
             continue;
         }
 
-        let mut current_cells: Vec<Cell> = Vec::new();
-        for token in &tokens[start..end] {
-            let grapheme = token.clone();
-            let fill_count = grapheme.width().saturating_sub(1);
-            let fill_attr = grapheme.attrs().clone();
-            current_cells.push(grapheme);
-
-            for _ in 0..fill_count {
-                current_cells.push(Cell::blank_with_attrs(fill_attr.clone()));
-            }
-        }
-
-        let mut line = Line::from_cells(current_cells, seqno);
-        if end < tokens.len() {
-            line.set_last_cell_was_wrapped(true, seqno);
-        }
-        lines.push(line);
+        lines.push(materialize_wrap_line(
+            &tokens[start..end],
+            end < tokens.len(),
+            seqno,
+        ));
         start = end;
     }
 
@@ -2622,6 +2694,24 @@ fn materialize_wrap_lines_from_tokens(
     }
 
     lines
+}
+
+fn materialize_wrap_line(tokens: &[Cell], wrapped: bool, seqno: SequenceNo) -> Line {
+    let mut cells = Vec::new();
+    for token in tokens {
+        let grapheme = token.clone();
+        let fill_count = grapheme.width().saturating_sub(1);
+        let fill_attr = grapheme.attrs().clone();
+        cells.push(grapheme);
+        for _ in 0..fill_count {
+            cells.push(Cell::blank_with_attrs(fill_attr.clone()));
+        }
+    }
+    let mut line = Line::from_cells(cells, seqno);
+    if wrapped {
+        line.set_last_cell_was_wrapped(true, seqno);
+    }
+    line
 }
 
 impl<'a> From<&'a str> for Line {
@@ -4231,6 +4321,55 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].last_cell_was_wrapped());
         assert!(!lines[1].last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn planned_wrap_materializes_only_requested_rows_with_global_wrap_markers() {
+        for text in [
+            "abcdef ghijkl mnopqr",
+            "界面 e\u{301} 🚀 ffi אבג ".repeat(8).as_str(),
+        ] {
+            for width in [1, 3, 8, 17] {
+                let mut source = Line::from_text(text, &CellAttributes::default(), 4, None);
+                let layout = source.clone().plan_wrap_with_width_prefix_scratch(
+                    width,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                let expected =
+                    materialize_wrap_lines_from_tokens(&layout.tokens, &layout.break_offsets, 9);
+                assert_eq!(layout.row_count(), expected.len());
+                assert_eq!(layout.scorecard().line_count, expected.len());
+                // The plan owns the original text even after its source changes.
+                source.set_cell(0, Cell::new('X', CellAttributes::default()), 10);
+                for start in 0..=expected.len() {
+                    let end = start.saturating_add(2).min(expected.len());
+                    assert_eq!(layout.materialize_rows(start..end, 9), expected[start..end]);
+                }
+                assert_eq!(layout.materialize_rows(0..usize::MAX, 9), expected);
+                assert!(layout
+                    .materialize_rows(usize::MAX..usize::MAX, 9)
+                    .is_empty());
+                let start = 2;
+                assert!(layout.materialize_rows(start..1, 9).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn planned_blank_wrap_preserves_passthrough_line_metadata() {
+        for text in ["", "   "] {
+            let source = Line::from_text(text, &CellAttributes::default(), 41, None);
+            let layout = source.clone().plan_wrap_with_width_prefix_scratch(
+                1,
+                MonospaceKpCostModel::terminal_default(),
+                &mut LineWrapWidthPrefixScratch::default(),
+            );
+            assert_eq!(layout.row_count(), 1);
+            assert_eq!(layout.materialize_rows(0..1, 99), vec![source.clone()]);
+            assert!(layout.materialize_rows(1..2, 99).is_empty());
+            assert_eq!(layout.into_report(99).lines, vec![source]);
+        }
     }
 
     // ── Line clone / eq ────────────────────────────────────
