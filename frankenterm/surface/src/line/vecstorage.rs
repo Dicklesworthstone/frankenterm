@@ -209,6 +209,56 @@ impl VecStorage {
         self.cells.cells.len()
     }
 
+    /// Reassemble unchanged physical slices of one logical source without
+    /// copying their cells or decoding widths again. Refuse any boundary whose
+    /// original token would need a wrap-bit edit, and any mutable image source.
+    #[cfg(feature = "std")]
+    pub(crate) fn try_join_token_rows<'a>(
+        mut rows: impl Iterator<Item = Option<&'a Self>>,
+    ) -> Option<Self> {
+        let first = rows.next()??.cells.deferred.as_ref()?;
+        let clean_boundary = |row: &DeferredRow| {
+            !row.has_images
+                && row
+                    .range
+                    .end
+                    .checked_sub(1)
+                    .and_then(|index| row.tokens.get(index))
+                    .is_some_and(|cell| !cell.attrs().wrapped())
+        };
+        if !clean_boundary(first) {
+            return None;
+        }
+        let mut end = first.range.end;
+        let mut len = first.len;
+        for storage in rows {
+            let row = storage?.cells.deferred.as_ref()?;
+            if !Arc::ptr_eq(&first.tokens, &row.tokens)
+                || row.range.start != end
+                || !clean_boundary(row)
+            {
+                return None;
+            }
+            end = row.range.end;
+            len = len.checked_add(row.len)?;
+        }
+        Some(Self {
+            cells: Arc::new(CellBuffer {
+                cells: Vec::new(),
+                deferred: Some(DeferredRow {
+                    tokens: Arc::clone(&first.tokens),
+                    range: first.range.start..end,
+                    tail: None,
+                    len,
+                    has_images: false,
+                    materialized: std::sync::OnceLock::new(),
+                }),
+                shape_hash: std::sync::OnceLock::new(),
+                wrap_boundary: std::sync::OnceLock::new(),
+            }),
+        })
+    }
+
     pub(crate) fn visible_cells(&self) -> CellViewIter<'_> {
         #[cfg(feature = "std")]
         if let Some(row) = &self.cells.deferred {
@@ -219,6 +269,16 @@ impl VecStorage {
             idx: 0,
             skip_width: 0,
         })
+    }
+
+    pub(crate) fn reusable_wrap_tokens(&self) -> Option<Arc<[Cell]>> {
+        #[cfg(feature = "std")]
+        if let Some(row) = &self.cells.deferred {
+            if row.range == (0..row.tokens.len()) && row.tail.is_none() {
+                return Some(Arc::clone(&row.tokens));
+            }
+        }
+        None
     }
 
     #[cfg(any(feature = "std", feature = "use_image"))]

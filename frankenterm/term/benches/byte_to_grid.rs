@@ -387,6 +387,35 @@ fn bench_resize_reflow(c: &mut Criterion) {
                 });
                 assert_reflow_content(&term, 99, &expected);
             });
+            // New output invalidates the whole-layout source signature. Check
+            // that unchanged logical history is reusable in that real case,
+            // rather than qualifying only an idle terminal's width cache.
+            let mut oracle = make_reflow_terminal(&input);
+            oracle.resize(reflow_size(61));
+            let mut updated_text = expected.clone();
+            for cols in widths {
+                oracle.advance_bytes(b"update\r\n");
+                updated_text.push_str("update");
+                oracle.resize(reflow_size(cols));
+                assert_reflow_content(&oracle, cols, &updated_text);
+            }
+            group.bench_function(format!("{label}/output_invalidated_width_cycle"), |b| {
+                b.iter_batched_ref(
+                    || {
+                        let mut term = make_reflow_terminal(&input);
+                        term.resize(reflow_size(61));
+                        term
+                    },
+                    |term| {
+                        for cols in widths {
+                            term.advance_bytes(b"update\r\n");
+                            term.resize(reflow_size(cols));
+                        }
+                        black_box(term.cursor_pos());
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
         }
     }
     group.finish();

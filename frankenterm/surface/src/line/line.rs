@@ -538,7 +538,13 @@ impl Line {
             cells.truncate(end_idx + 1);
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
             let geometry_hash = compute_wrap_geometry_hash(self.bits, &cells);
-            let tokens: Arc<[Cell]> = cells.into_iter().map(|cell| cell.as_cell()).collect();
+            let reusable = match &self.cells {
+                CellStorage::V(storage) => storage.reusable_wrap_tokens(),
+                CellStorage::C(_) => None,
+            };
+            let tokens: Arc<[Cell]> = reusable
+                .filter(|tokens| tokens.len() == cells.len())
+                .unwrap_or_else(|| cells.into_iter().map(|cell| cell.as_cell()).collect());
             plan_wrap_tokens(
                 tokens,
                 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -1765,6 +1771,50 @@ impl Line {
         }
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
+    }
+
+    /// Join unchanged row views from the same logical source. The caller must
+    /// supply exactly one logical line (ending at a hard break or screen end).
+    /// Refusal leaves every source row untouched for ordinary reconstruction.
+    pub fn try_join_deferred_logical_rows<'a>(
+        rows: impl Iterator<Item = &'a Line> + Clone,
+        seqno: SequenceNo,
+    ) -> Option<Line> {
+        #[cfg(feature = "std")]
+        {
+            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *DISABLED.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_DEFERRED_LOGICAL_JOIN")
+                    .is_some_and(|value| value == "1")
+            }) {
+                return None;
+            }
+            let first = rows.clone().next()?;
+            let count = rows.clone().count();
+            if rows
+                .clone()
+                .take(count.saturating_sub(1))
+                .any(|line| !line.last_cell_was_wrapped())
+            {
+                return None;
+            }
+            let cells = VecStorage::try_join_token_rows(rows.map(|line| match &line.cells {
+                CellStorage::V(cells) => Some(cells),
+                CellStorage::C(_) => None,
+            }))?;
+            let mut logical = first.clone();
+            logical.cells = CellStorage::V(cells);
+            logical.update_last_change_seqno(seqno);
+            if count > 1 {
+                logical.invalidate_zones();
+            }
+            Some(logical)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (rows, seqno);
+            None
+        }
     }
 
     /// mutable access the cell data, but the caller must take care
@@ -4604,6 +4654,58 @@ mod tests {
                 assert_eq!(deferred, eager);
             }
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn deferred_logical_join_preserves_cells_and_refuses_changed_sources() {
+        if std::env::var_os("FT_DISABLE_DEFERRED_REFLOW_CELLS").is_some()
+            || std::env::var_os("FT_DISABLE_DEFERRED_LOGICAL_JOIN").is_some()
+        {
+            return;
+        }
+        let source = Line::from_text(
+            "界面 e\u{301} 🚀 ffi אבג long logical content",
+            &CellAttributes::default(),
+            4,
+            None,
+        );
+        let layout = source.plan_wrap_with_width_prefix_scratch(
+            5,
+            MonospaceKpCostModel::terminal_default(),
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        let rows = layout.deferred_rows(0..usize::MAX, 9);
+        let joined = Line::try_join_deferred_logical_rows(rows.iter(), 10).unwrap();
+        for row in rows.iter().chain(core::iter::once(&joined)) {
+            let CellStorage::V(storage) = &row.cells else {
+                panic!("not vector storage")
+            };
+            assert!(storage.is_deferred_unmaterialized());
+        }
+        let replanned = joined.clone().plan_wrap_with_width_prefix_scratch(
+            7,
+            MonospaceKpCostModel::terminal_default(),
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        assert!(Arc::ptr_eq(&layout.tokens, &replanned.tokens));
+        let mut expected: Option<Line> = None;
+        for mut row in layout.materialize_rows(0..usize::MAX, 9) {
+            row.set_last_cell_was_wrapped(false, 10);
+            match expected.as_mut() {
+                Some(line) => line.append_line(row, 10),
+                None => expected = Some(row),
+            }
+        }
+        assert_eq!(joined, expected.unwrap());
+        let mut changed = rows.clone();
+        changed[1].cells_mut()[0] = Cell::new('X', CellAttributes::default());
+        assert!(Line::try_join_deferred_logical_rows(changed.iter(), 10).is_none());
+        assert!(Line::try_join_deferred_logical_rows(
+            rows.iter().take(1).chain(rows.iter().skip(2)),
+            10,
+        )
+        .is_none());
     }
 
     // ── Line clone / eq ────────────────────────────────────

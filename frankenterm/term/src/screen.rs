@@ -4485,10 +4485,32 @@ impl Screen {
         let mut physical_ranges: Vec<Range<usize>> = Vec::with_capacity(self.lines.len());
         let mut logical_line: Option<Line> = None;
         let mut logical_start = 0usize;
+        let mut joined_until = 0usize;
 
         for (idx, physical_line) in self.lines.iter().enumerate() {
             if let Some(hasher) = signature_hasher.as_deref_mut() {
                 Self::hash_layout_line(hasher, physical_line);
+            }
+
+            if idx < joined_until {
+                continue;
+            }
+
+            if logical_line.is_none() && physical_line.last_cell_was_wrapped() {
+                let end = self
+                    .lines
+                    .range(idx..)
+                    .position(|line| !line.last_cell_was_wrapped())
+                    .map_or(self.lines.len(), |offset| idx + offset + 1);
+                if let Some(joined) =
+                    Line::try_join_deferred_logical_rows(self.lines.range(idx..end), seqno)
+                {
+                    logical_lines.push(LogicalLineForResize::Owned(joined));
+                    physical_ranges.push(idx..end);
+                    logical_start = end;
+                    joined_until = end;
+                    continue;
+                }
             }
 
             let was_wrapped = physical_line.last_cell_was_wrapped();
