@@ -210,8 +210,22 @@ impl crate::TermWindow {
     /// swap from bypassing the bounded retry lane via an immediate animation or
     /// frame-budget repaint.
     pub(crate) fn complete_presented_paint(&mut self, outcome: PaintOutcome) {
-        for state in self.pane_state.borrow_mut().values_mut() {
-            state.selection_frame.presented();
+        for (pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
+            if let Some(frame) = state.selection_frame.presented() {
+                // This record is emitted only after backend acceptance and uses
+                // the complete frame actually staged for drawing. It is not a
+                // GPU completion or scanout timestamp. An external observer can
+                // timestamp receipt on its capture clock to bound submission.
+                log::debug!(
+                    target: "frankenterm_gui::native_present_profile",
+                    "native_present_complete pane_id={} damage={} source_sequence={} viewport={} geometry={:?}",
+                    pane_id,
+                    outcome.damage_generation.value,
+                    frame.source_sequence,
+                    frame.viewport,
+                    frame.geometry,
+                );
+            }
         }
         if let Some(pane_id) = self.active_selection_drag_pane {
             if let Some(pos) = self

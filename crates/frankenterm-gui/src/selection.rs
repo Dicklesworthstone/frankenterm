@@ -202,8 +202,11 @@ impl SelectionFrameState {
         self.pending = before
             .filter(|before| complete && after.is_some_and(|after| before.same_coordinates(after)));
     }
-    pub fn presented(&mut self) {
+    /// Return only the complete stamp promoted by this successful submission.
+    /// An omitted/incomplete pane must not report its previously displayed stamp.
+    pub fn presented(&mut self) -> Option<SelectionFrameStamp> {
         self.presented = self.pending.take();
+        self.presented
     }
     pub fn for_mouse(&self, current: Option<SelectionFrameStamp>) -> Option<SelectionFrameStamp> {
         self.presented
@@ -788,7 +791,7 @@ mod tests {
         state.begin_attempt();
         state.stage(Some(a), Some(a), true);
         assert_eq!(state.for_mouse(Some(a)), None); // geometry is not presentation
-        state.presented();
+        assert_eq!(state.presented(), Some(a));
         assert_eq!(state.for_mouse(Some(a)), Some(a));
         state.begin_attempt();
         state.stage(Some(b), Some(b), true);
@@ -797,15 +800,15 @@ mod tests {
         assert_eq!(state.for_mouse(Some(a)), Some(a));
         state.begin_attempt(); // atlas retry must discard the B candidate
         state.stage(Some(b), Some(b), false); // incomplete cold rows
-        state.presented();
+        assert_eq!(state.presented(), None);
         assert_eq!(state.for_mouse(Some(b)), None);
         state.begin_attempt();
         state.stage(Some(a), Some(b), true); // layout changed during snapshot
-        state.presented();
+        assert_eq!(state.presented(), None);
         assert_eq!(state.for_mouse(Some(b)), None);
         state.begin_attempt();
         state.stage(Some(b), Some(b), true);
-        state.presented();
+        assert_eq!(state.presented(), Some(b));
         assert_eq!(state.for_mouse(Some(b)), Some(b));
         let mut scrolled = b;
         scrolled.viewport += 1;
@@ -818,10 +821,10 @@ mod tests {
         assert_eq!(state.for_mouse(Some(output)), Some(b));
         state.begin_attempt();
         state.stage(Some(b), Some(output), true);
-        state.presented();
+        assert_eq!(state.presented(), Some(b));
         assert_eq!(state.for_mouse(Some(output)), Some(b));
         state.begin_attempt(); // pane omitted by successful next frame
-        state.presented();
+        assert_eq!(state.presented(), None);
         assert_eq!(state.for_mouse(Some(b)), None);
     }
 
@@ -844,7 +847,7 @@ mod tests {
         selection.authority = Some(frame.authority);
         let mut state = SelectionFrameState::default();
         state.stage(Some(frame), Some(frame), true);
-        state.presented();
+        assert_eq!(state.presented(), Some(frame));
 
         // Unlike an established drag, a busy press must retain its ORIGINAL
         // click until a usable frame is available, regardless of later motion.
@@ -870,7 +873,7 @@ mod tests {
             PendingSelectionResolution::Wait
         ));
         unpresented.stage(Some(frame), Some(frame), true);
-        unpresented.presented();
+        assert_eq!(unpresented.presented(), Some(frame));
         assert!(matches!(
             pending.resolve(Some(frame), &unpresented),
             PendingSelectionResolution::Ready
@@ -898,7 +901,7 @@ mod tests {
         assert!(!selection.is_invalidated_by(Some(scrolled.authority)));
         state.begin_attempt();
         state.stage(Some(scrolled), Some(scrolled), true);
-        state.presented();
+        assert_eq!(state.presented(), Some(scrolled));
         assert_eq!(state.for_mouse(Some(scrolled)), Some(scrolled));
         assert_eq!(selection.origin, Some(anchor));
 
