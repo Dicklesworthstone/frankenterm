@@ -425,7 +425,7 @@ impl WakeCoalescer {
         self.pending.store(false, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, target_os = "macos"))]
     fn is_pending(&self) -> bool {
         self.pending.load(Ordering::Acquire)
     }
@@ -568,7 +568,10 @@ impl SpawnQueue {
     }
 
     fn request_wakeup(&self) {
-        if self.wake.request_signal() {
+        let signal = self.wake.request_signal();
+        #[cfg(target_os = "macos")]
+        self.trace_native_wakeup(if signal { "signal" } else { "coalesced" }, None);
+        if signal {
             self.signal_platform_wakeup();
         }
     }
@@ -695,6 +698,34 @@ impl SpawnQueue {
 
 #[cfg(target_os = "macos")]
 impl SpawnQueue {
+    /// Opt-in diagnosis only: queue locking and log I/O perturb dispatch
+    /// latency, so these records are never an uninstrumented performance gate.
+    fn trace_native_wakeup(&self, phase: &str, activity: Option<CFRunLoopActivity>) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("FT_PROFILE_NATIVE_WAKEUP").is_some_and(|value| value == "1")
+        }) {
+            return;
+        }
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let elapsed_us = EPOCH.get_or_init(Instant::now).elapsed().as_micros();
+        let (admitted, legacy_high, legacy_low, pending) = {
+            let state = lock_or_recover(&self.core.state);
+            (
+                state.admitted_high.len() + state.admitted_low.len(),
+                state.legacy_high.len(),
+                state.legacy_low.len(),
+                self.wake.is_pending(),
+            )
+        };
+        log::debug!(
+            "native_wakeup phase={phase} elapsed_us={elapsed_us} activity={activity:?} \
+             pending={pending} admitted={admitted} legacy_high={legacy_high} \
+             legacy_low={legacy_low} thread={:?}",
+            std::thread::current().id()
+        );
+    }
+
     fn new_impl(core: SpawnQueueCore) -> anyhow::Result<Self> {
         let observer = unsafe {
             CFRunLoopObserverCreate(
@@ -726,13 +757,16 @@ impl SpawnQueue {
 
     extern "C" fn trigger(
         _observer: *mut __CFRunLoopObserver,
-        _: CFRunLoopActivity,
+        activity: CFRunLoopActivity,
         _: *mut std::ffi::c_void,
     ) {
         let Some(_trigger_guard) = enter_platform_trigger() else {
+            SPAWN_QUEUE.trace_native_wakeup("observer_reentry", Some(activity));
             return;
         };
+        SPAWN_QUEUE.trace_native_wakeup("observer_enter", Some(activity));
         SPAWN_QUEUE.run();
+        SPAWN_QUEUE.trace_native_wakeup("observer_exit", Some(activity));
     }
 
     fn signal_platform_wakeup(&self) {
