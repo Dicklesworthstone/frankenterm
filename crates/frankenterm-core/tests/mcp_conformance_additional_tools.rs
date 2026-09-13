@@ -11,7 +11,7 @@ use frankenterm_core::mcp_framework::{
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, StorageHandle};
 use frankenterm_core::wezterm::set_wezterm_cli_override;
-use insta::assert_json_snapshot;
+use insta::assert_snapshot;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -380,12 +380,50 @@ fn canonical_value<T: Serialize>(value: &T) -> Value {
     value
 }
 
-fn snapshot_capture(capture: &ToolGoldenCapture) -> Value {
-    canonical_value(&json!({
+fn snapshot_capture(capture: &ToolGoldenCapture) -> String {
+    let value = canonical_value(&json!({
         "tool": capture.tool,
         "ok": capture.success_envelope["ok"].clone(),
         "data": capture.success_envelope["data"].clone(),
-    }))
+    }));
+    // Serialize with the JSON implementation that owns Number's representation.
+    // Insta's generic ContentSerializer exposes arbitrary_precision's private
+    // number struct when workspace feature unification enables that feature.
+    serde_json::to_string_pretty(&value).expect("serialize canonical JSON snapshot")
+}
+
+#[test]
+fn snapshot_capture_preserves_json_numeric_types_and_precision() {
+    let data = json!({
+        "count": 1,
+        "fraction": 50.0,
+        "nested": [-42, u64::MAX, "42"],
+    });
+    let mut capture = ToolGoldenCapture {
+        tool: "numeric-control".to_string(),
+        input_schema: Value::Null,
+        success_envelope: json!({"ok": true, "data": data}),
+        invalid_args_response: Value::Null,
+    };
+    let rendered = snapshot_capture(&capture);
+    assert!(rendered.contains("18446744073709551615"));
+    assert!(rendered.contains("\"fraction\": 50.0"));
+    assert!(!rendered.contains("$serde_json::private::Number"));
+    let round_trip: Value = serde_json::from_str(&rendered).expect("snapshot is valid JSON");
+    assert_eq!(round_trip["data"], data);
+
+    capture.success_envelope["data"]["count"] = json!("1");
+    assert_ne!(
+        snapshot_capture(&capture),
+        rendered,
+        "numeric strings must remain distinct"
+    );
+    capture.success_envelope["data"]["count"] = json!(2);
+    assert_ne!(
+        snapshot_capture(&capture),
+        rendered,
+        "changed numeric values must remain visible"
+    );
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
@@ -557,7 +595,7 @@ fn mcp_conformance_wa_accounts_matches_snapshot() {
         "missing required field: service",
     );
 
-    assert_json_snapshot!("wa_accounts_conformance", snapshot_capture(&capture));
+    assert_snapshot!("wa_accounts_conformance", snapshot_capture(&capture));
 }
 
 #[test]
@@ -584,7 +622,7 @@ fn mcp_conformance_wa_accounts_refresh_matches_snapshot() {
     assert_accounts_refresh_success(&capture.success_envelope);
     assert_framework_invalid_params_response(&capture.invalid_args_response, "root.service");
 
-    assert_json_snapshot!(
+    assert_snapshot!(
         "wa_accounts_refresh_conformance",
         snapshot_capture(&capture)
     );
@@ -615,7 +653,7 @@ fn mcp_conformance_wa_cass_search_matches_snapshot() {
         "missing required field: query",
     );
 
-    assert_json_snapshot!("wa_cass_search_conformance", snapshot_capture(&capture));
+    assert_snapshot!("wa_cass_search_conformance", snapshot_capture(&capture));
 }
 
 #[test]
@@ -642,7 +680,7 @@ fn mcp_conformance_wa_cass_status_matches_snapshot() {
     assert_cass_status_success(&capture.success_envelope);
     assert_framework_invalid_params_response(&capture.invalid_args_response, "root.timeout_secs");
 
-    assert_json_snapshot!("wa_cass_status_conformance", snapshot_capture(&capture));
+    assert_snapshot!("wa_cass_status_conformance", snapshot_capture(&capture));
 }
 
 #[test]
@@ -675,7 +713,7 @@ fn mcp_conformance_wa_cass_view_matches_snapshot() {
         "missing required field: line_number",
     );
 
-    assert_json_snapshot!("wa_cass_view_conformance", snapshot_capture(&capture));
+    assert_snapshot!("wa_cass_view_conformance", snapshot_capture(&capture));
 }
 
 #[test]
@@ -778,7 +816,7 @@ fn mcp_conformance_wa_workflow_run_matches_snapshot() {
         "missing required field: name",
     );
 
-    assert_json_snapshot!("wa_workflow_run_conformance", snapshot_capture(&capture));
+    assert_snapshot!("wa_workflow_run_conformance", snapshot_capture(&capture));
 }
 
 /// Build a capture struct for the execute-path snapshots — same shape as
@@ -792,8 +830,8 @@ struct WorkflowRunExecuteCapture {
     envelope: Value,
 }
 
-fn workflow_execute_snapshot(capture: &WorkflowRunExecuteCapture) -> Value {
-    canonical_value(&json!({
+fn workflow_execute_snapshot(capture: &WorkflowRunExecuteCapture) -> String {
+    let value = canonical_value(&json!({
         "tool": capture.tool,
         "scenario": capture.scenario,
         "ok": capture.envelope["ok"].clone(),
@@ -801,7 +839,8 @@ fn workflow_execute_snapshot(capture: &WorkflowRunExecuteCapture) -> Value {
         "error": capture.envelope.get("error").cloned().unwrap_or(Value::Null),
         "error_code": capture.envelope.get("error_code").cloned().unwrap_or(Value::Null),
         "hint": capture.envelope.get("hint").cloned().unwrap_or(Value::Null),
-    }))
+    }));
+    serde_json::to_string_pretty(&value).expect("serialize canonical workflow JSON snapshot")
 }
 
 #[test]
@@ -845,7 +884,7 @@ fn mcp_conformance_wa_workflow_run_execute_path_matches_snapshot() {
         scenario: "execute_real_workflow_no_preconditions",
         envelope,
     };
-    assert_json_snapshot!(
+    assert_snapshot!(
         "wa_workflow_run_execute_path",
         workflow_execute_snapshot(&capture)
     );
@@ -885,7 +924,7 @@ fn mcp_conformance_wa_workflow_run_unknown_name_matches_snapshot() {
         scenario: "execute_unknown_workflow_name",
         envelope,
     };
-    assert_json_snapshot!(
+    assert_snapshot!(
         "wa_workflow_run_execute_unknown_name",
         workflow_execute_snapshot(&capture)
     );
