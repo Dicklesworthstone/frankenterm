@@ -232,18 +232,20 @@ fn mcp_stdio_transport_bootstrap_stays_centralized_to_framework_seam() {
     assert!(
         !bridge.contains("FrameworkStdioTransport")
             && !bridge.contains("StdioTransport::stdio()")
-            && !bridge.contains("server.run_transport("),
+            && !bridge.contains("server.run_transport(")
+            && !bridge.contains("server.run_transport_returning_with_cx("),
         "mcp_bridge.rs should route stdio transport wiring through mcp_framework.rs"
     );
     assert!(
         bridge.contains("framework_server_builder(")
-            && bridge.contains("run_framework_stdio_server(server)"),
-        "mcp_bridge.rs should use framework_server_builder + run_framework_stdio_server helpers"
+            && bridge.contains("run_framework_stdio_server(cx, server).await"),
+        "mcp_bridge.rs should build through the framework seam and await stdio transport with the caller Cx"
     );
     assert!(
         framework.contains("fn framework_server_builder")
             && framework.contains("fn run_framework_stdio_server")
-            && framework.contains("FrameworkStdioTransport::stdio()"),
+            && framework.contains("FrameworkStdioTransport::stdio()")
+            && framework.contains("server.run_transport_returning_with_cx(&transport_cx,"),
         "mcp_framework.rs must own the MCP stdio transport/bootstrap seam"
     );
 }

@@ -102,9 +102,11 @@
     },
     {
       "category": "security/redaction-hygiene",
-      "path": "docs/security/redaction-hygiene.json",
+      "path": null,
       "media_type": "application/json",
       "produced_by_bead": "ft-7h5da.1.5",
+      "deferred_to_bead": "ft-7h5da.1.5",
+      "deferred_reason": "Scoped redaction regression receipts are retained in docs/security/redaction-hygiene.json, but the producer remains in progress. Complete the producing-bead checklist and final artifact bundle verification before resolving this slot; retained tests do not establish deployment corpus cleanliness.",
       "proof_categories": [7, 9],
       "description": "Scoped remote regression evidence for expression-sensitive catalog identity and atomic redaction maintenance receipts. Does not certify deployment corpus cleanliness or external index rebuilds; final signed release qualification remains separate."
     },
@@ -166,9 +168,11 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": "docs/attestations/proofs/operating-envelope.json",
+      "path": null,
       "media_type": "application/json",
       "produced_by_bead": "ft-booek.7",
+      "deferred_to_bead": "ft-booek.7",
+      "deferred_reason": "The retained operating-envelope artifact reports pending bundle verification and the producer remains in progress. Refresh the artifact/source inventory and verify the final artifact bytes through the producing-bead checklist before resolving this slot; target-class capacity remains unproven.",
       "proof_categories": [4, 5],
       "description": "Scoped remote operating-envelope read-only admission and fixture-calendar contract proof. Target-class production capacity remains skipped and unproven; this artifact does not authorize service mutation or promote capacity claims."
     },
@@ -214,9 +218,11 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": "docs/attestations/proofs/robot-contract-doctor.json",
+      "path": null,
       "media_type": "application/json",
       "produced_by_bead": "ft-7h5da.13.7",
+      "deferred_to_bead": "ft-7h5da.13.7",
+      "deferred_reason": "The retained Doctor artifact reports pending final qualification and the producer remains in progress. Retain the final strict Cargo verdict, updated golden proof and artifact bundle round-trip required by the producing-bead checklist before resolving this slot; the covered inventory alone is not release qualification.",
       "proof_categories": [4],
       "description": "Unified Robot/MCP Contract Doctor inventory with scoped remote policy and actual CLI/MCP parity evidence. All234 matrix cells are covered; final immutable-source DSR test, snapshot and signed-bundle qualification remain required."
     },

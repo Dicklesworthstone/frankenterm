@@ -825,6 +825,7 @@ fn deferred_bead_accepts_only_correctly_owned_incoming_root_edges() {
         slot["deferred_to_bead"] = json!(producer);
         slot["deferred_reason"] = json!("release awaits this producer");
         let issues = [
+            json!({"id": "ft-syqcz.3", "status": "closed", "dependencies": []}),
             json!({"id": producer, "status": "in_progress", "dependencies": []}),
             json!({
                 "id": record_owner,
@@ -843,6 +844,11 @@ fn deferred_bead_accepts_only_correctly_owned_incoming_root_edges() {
             result.expect("correctly owned incoming root edge must resolve deferred graph linkage");
         } else {
             let errors = result.expect_err("wrong owner, target, or type must not resolve linkage");
+            assert_eq!(
+                errors.len(),
+                1,
+                "negative control must fail only graph linkage"
+            );
             assert_error_contains(&errors, "orphan_deferred_bead", producer);
         }
     }
