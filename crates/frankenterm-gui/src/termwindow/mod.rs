@@ -1595,6 +1595,7 @@ fn run_clear_dirty_lines_after_frame(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RenderFailureStage {
     Paint,
+    NativeFramePending,
     Draw(DrawFailureStage),
     SurfaceAcquire(webgpu::WebGpuSurfaceTextureError),
     BackendFinish,
@@ -1612,6 +1613,7 @@ impl RenderFailureStage {
     const fn label(self) -> &'static str {
         match self {
             Self::Paint => "paint",
+            Self::NativeFramePending => "native_frame_pending",
             Self::Draw(stage) => stage.label(),
             Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Timeout) => "surface_timeout",
             Self::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => "surface_occluded",
@@ -1660,7 +1662,12 @@ impl RenderAttemptFailure {
     }
 
     pub(crate) fn paint(source: anyhow::Error) -> Self {
-        Self::new(RenderFailureStage::Paint, source)
+        let stage = if source.is::<NativeFramePending>() {
+            RenderFailureStage::NativeFramePending
+        } else {
+            RenderFailureStage::Paint
+        };
+        Self::new(stage, source)
     }
 
     fn draw(source: impl Into<anyhow::Error>) -> Self {
@@ -1684,6 +1691,17 @@ impl RenderAttemptFailure {
         self.stage
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct NativeFramePending;
+
+impl std::fmt::Display for NativeFramePending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native paint snapshot busy, changed, or awaiting cold rows")
+    }
+}
+
+impl std::error::Error for NativeFramePending {}
 
 impl std::fmt::Display for RenderAttemptFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2944,6 +2962,9 @@ fn render_recovery_directive(
     };
 
     match stage {
+        RenderFailureStage::NativeFramePending => {
+            RenderRecoveryDirective::RetryAfter(Duration::from_millis(16))
+        }
         RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => {
             RenderRecoveryDirective::Park
         }
@@ -2995,7 +3016,13 @@ impl RenderRecoveryState {
     }
 
     fn record_failure(&mut self, stage: RenderFailureStage) -> RenderRecoveryDirective {
-        self.failed_attempts_since_success = self.failed_attempts_since_success.saturating_add(1);
+        // Snapshot contention is not evidence that the renderer is broken.
+        // Preserve earlier real failures, but do not exhaust their circuit
+        // budget while waiting for a parser/resize or cold-read publication.
+        if stage != RenderFailureStage::NativeFramePending {
+            self.failed_attempts_since_success =
+                self.failed_attempts_since_success.saturating_add(1);
+        }
         render_recovery_directive(stage, self.failed_attempts_since_success)
     }
 
@@ -4967,8 +4994,9 @@ impl TermWindow {
     fn check_for_dirty_lines_and_invalidate_selection(
         &mut self,
         pane: &Arc<dyn Pane>,
+        frame: Option<&mux::localpane::NativeRenderFrame>,
     ) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        let dims = frame.map_or_else(|| pane.get_dimensions(), |frame| frame.dimensions);
         let pane_id = pane.pane_id();
         let viewport = self.get_viewport(pane_id).unwrap_or(dims.physical_top);
         let Some(visible_range) =
@@ -5000,8 +5028,15 @@ impl TermWindow {
             .pane_state(pane_id)
             .render_dirty
             .last_observed_source_end();
-        let (source_end, dirty) = pane
-            .get_changed_since_with_source_fence(visible_range.clone(), last_observed_source_end);
+        let (source_end, dirty) = frame.map_or_else(
+            || {
+                pane.get_changed_since_with_source_fence(
+                    visible_range.clone(),
+                    last_observed_source_end,
+                )
+            },
+            |frame| (frame.source_sequence, frame.dirty.clone()),
+        );
         self.pane_state(pane_id)
             .render_dirty
             .advance_after_query(source_end);
@@ -5034,7 +5069,15 @@ impl TermWindow {
                 let selection = self.selection(pane_id);
                 selection.origin.is_some() || selection.range.is_some()
             };
-            if has_selection_anchor && self.selection_authority_has_changed(pane) {
+            let authority_changed = frame.map_or_else(
+                || self.selection_authority_has_changed(pane),
+                |frame| {
+                    self.selection(pane_id).is_invalidated_by(
+                        crate::selection::SelectionAuthority::from_native_frame(&**pane, frame),
+                    )
+                },
+            );
+            if has_selection_anchor && authority_changed {
                 self.selection(pane_id).clear();
                 if self.active_selection_drag_pane == Some(pane_id) {
                     self.clear_selection_drag();
@@ -5057,8 +5100,13 @@ impl TermWindow {
                 // through the same atomic source fence as render damage so a
                 // reset/regression or saturated source cannot make an old high
                 // selection seqno suppress unrelated replacement content.
-                let (_, selection_dirty) =
-                    pane.get_changed_since_with_source_fence(visible_range, selection_seqno);
+                let selection_dirty = frame.map_or_else(
+                    || {
+                        pane.get_changed_since_with_source_fence(visible_range, selection_seqno)
+                            .1
+                    },
+                    |frame| frame.selection_dirty.clone(),
+                );
                 let intersects = selection_rows
                     .clone()
                     .into_iter()
@@ -5087,7 +5135,8 @@ impl TermWindow {
                 self.clear_selection_drag();
                 self.selection(pane.pane_id()).range.take();
                 self.selection(pane.pane_id()).origin.take();
-                self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
+                self.selection(pane.pane_id()).seqno =
+                    frame.map_or_else(|| pane.get_current_seqno(), |frame| frame.source_sequence);
 
                 // Per ft-camu6: selection-clear is a per-row event
                 // — mark every row that was previously selected so
@@ -8673,6 +8722,32 @@ impl Drop for TermWindow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_native_frame_preserves_real_failure_budget_without_opening_circuit() {
+        let mut recovery = super::RenderRecoveryState::default();
+        recovery.record_failure(super::RenderFailureStage::Paint);
+        let failures = recovery.failed_attempts_since_success;
+        for _ in 0..100 {
+            assert_eq!(
+                recovery.record_failure(super::RenderFailureStage::NativeFramePending),
+                super::RenderRecoveryDirective::RetryAfter(std::time::Duration::from_millis(16))
+            );
+            assert_eq!(recovery.failed_attempts_since_success, failures);
+        }
+        let failure = super::RenderAttemptFailure::paint(
+            anyhow::Error::new(super::NativeFramePending).context("paint_pass"),
+        );
+        assert_eq!(
+            failure.stage(),
+            super::RenderFailureStage::NativeFramePending
+        );
+        recovery.record_failure(super::RenderFailureStage::Paint);
+        assert_eq!(
+            recovery.record_failure(super::RenderFailureStage::Paint),
+            super::RenderRecoveryDirective::OpenCircuit
+        );
+    }
+
     use super::{
         DamageAdvanceOutcome, DamageCommitOutcome, DamageGeneration, DrawFailure, DrawFailureStage,
         FrameCompletion, PaintAdmission, RenderAttemptFailure, RenderFailureStage,

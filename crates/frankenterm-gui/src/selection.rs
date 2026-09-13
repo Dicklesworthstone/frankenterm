@@ -45,6 +45,28 @@ pub struct SelectionAuthority {
 }
 
 impl SelectionAuthority {
+    pub fn from_native_frame(
+        pane: &dyn Pane,
+        frame: &mux::localpane::NativeRenderFrame,
+    ) -> Option<Self> {
+        if frame.layout_floor == SequenceNo::MAX {
+            return None;
+        }
+        let dims = frame.dimensions;
+        Some(Self {
+            source: pane as *const dyn Pane as *const () as usize,
+            sequence: frame.layout_floor,
+            geometry: (
+                dims.cols,
+                dims.viewport_rows,
+                dims.dpi,
+                dims.pixel_width,
+                dims.pixel_height,
+            ),
+            alternate: false,
+        })
+    }
+
     pub fn capture(pane: &dyn Pane) -> Option<Self> {
         Self::capture_source(pane).map(|(authority, _, _)| authority)
     }

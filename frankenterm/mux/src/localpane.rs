@@ -54,6 +54,30 @@ use crossbeam::queue::ArrayQueue;
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 const LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+/// Owned native paint input. Terminal metadata, damage and resident rows are
+/// captured under one nonblocking terminal acquisition. Rendering never holds
+/// that lock, and must retain damage if capture returns `None`.
+pub struct NativeRenderFrame {
+    pub layout_floor: SequenceNo,
+    pub source_sequence: SequenceNo,
+    pub dimensions: RenderableDimensions,
+    pub cursor: StableCursorPosition,
+    pub palette: ColorPalette,
+    pub dirty: RangeSet<StableRowIndex>,
+    pub selection_dirty: RangeSet<StableRowIndex>,
+    pub first: StableRowIndex,
+    pub lines: Vec<Line>,
+    pub password_input: bool,
+    coordinate_witness: frankenterm_term::screen::ScreenCoordinateWitness,
+}
+
+impl WithPaneLines for NativeRenderFrame {
+    fn with_lines_mut(&mut self, first: StableRowIndex, lines: &mut [&mut Line]) {
+        self.first = first;
+        self.lines.extend(lines.iter().map(|line| (**line).clone()));
+    }
+}
+
 struct ColdViewportEntry {
     registration: [u8; 16],
     requested: Range<StableRowIndex>,
@@ -2713,6 +2737,136 @@ impl LocalPane {
         ))
     }
 
+    pub fn try_capture_render_frame(
+        &self,
+        viewport: Option<StableRowIndex>,
+        damage_baseline: SequenceNo,
+        selection_baseline: SequenceNo,
+        rules: &[termwiz::hyperlink::Rule],
+        detect_password_input: bool,
+    ) -> Option<NativeRenderFrame> {
+        let mut term = self.terminal.try_lock()?;
+        #[cfg(feature = "disruptor-pane-io")]
+        self.drain_action_ring_locked(&mut term);
+        let hide_cursor = self.tmux_domain.try_lock()?.is_some();
+        #[allow(unused_mut)]
+        let mut password_input = false;
+        #[cfg(unix)]
+        if detect_password_input {
+            use nix::sys::termios::LocalFlags;
+            if let Some(tio) = self.pty.try_lock()?.get_termios() {
+                password_input = !tio.local_flags.contains(LocalFlags::ECHO)
+                    && tio.local_flags.contains(LocalFlags::ICANON);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = detect_password_input;
+        let layout_floor = self.refresh_line_layout_floor(&mut term)?;
+        let dimensions = terminal_get_dimensions(&mut term);
+        // Scrollback eviction and clearing can invalidate a stored viewport
+        // without a GUI scroll event. Normalize against this same observation;
+        // requesting an evicted row would otherwise retry hydration forever.
+        let first = viewport
+            .unwrap_or(dimensions.physical_top)
+            .max(dimensions.scrollback_top)
+            .min(dimensions.physical_top);
+        let end = first.checked_add(StableRowIndex::try_from(dimensions.viewport_rows).ok()?)?;
+        let range = first..end;
+        let mut cursor = terminal_get_cursor_position(&mut term);
+        if hide_cursor {
+            cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
+        }
+        let mut frame = NativeRenderFrame {
+            layout_floor,
+            source_sequence: term.current_seqno(),
+            dimensions,
+            cursor,
+            palette: term.palette(),
+            dirty: RangeSet::new(),
+            selection_dirty: RangeSet::new(),
+            first,
+            lines: Vec::with_capacity(dimensions.viewport_rows),
+            password_input,
+            coordinate_witness: term.screen().capture_coordinate_witness(),
+        };
+        let cold = first < term.screen().phys_to_stable_row_index(0);
+        if cold {
+            // Cold hydration has its own worker/cache and must run outside the
+            // terminal lock. Revalidate the complete source after that read;
+            // a coordinate witness alone does not detect content-only edits.
+            drop(term);
+            self.with_lines_mut_and_apply_hyperlinks(range.clone(), rules, &mut frame);
+            term = self.terminal.try_lock()?;
+            if term.current_seqno() != frame.source_sequence
+                || !term
+                    .screen()
+                    .matches_coordinate_witness(&frame.coordinate_witness)
+            {
+                return None;
+            }
+        } else {
+            terminal_with_lines_mut_and_apply_hyperlinks(
+                &mut term,
+                range.clone(),
+                rules,
+                &mut frame,
+            );
+        }
+        frame.source_sequence = term.current_seqno();
+        let damage_baseline =
+            crate::pane::changed_since_query_baseline(damage_baseline, frame.source_sequence);
+        let selection_baseline =
+            crate::pane::changed_since_query_baseline(selection_baseline, frame.source_sequence);
+        frame.dirty = terminal_get_dirty_lines(&mut term, range.clone(), damage_baseline);
+        frame.selection_dirty = terminal_get_dirty_lines(&mut term, range, selection_baseline);
+        if frame.first != first || frame.lines.len() != dimensions.viewport_rows {
+            // A cold cache miss has already scheduled hydration. Preserve the
+            // previously presented frame instead of settling its damage with
+            // a partial or empty replacement.
+            return None;
+        }
+        drop(term);
+        if !cold {
+            if let Some(pending) = self
+                .cold_viewport_pending
+                .try_lock()
+                .and_then(|mut pending| pending.take())
+            {
+                pending.cancelled.store(true, Ordering::Release);
+            }
+        }
+        Some(frame)
+    }
+
+    /// Optional renderer-cache writeback, guarded by unchanged coordinates and
+    /// exact row equality. A busy parser never delays an already drawn frame.
+    pub fn publish_render_frame_appdata(&self, frame: &NativeRenderFrame) {
+        let Some(end) = StableRowIndex::try_from(frame.lines.len())
+            .ok()
+            .and_then(|len| frame.first.checked_add(len))
+        else {
+            return;
+        };
+        let Some(mut term) = self.terminal.try_lock() else {
+            return;
+        };
+        let screen = term.screen_mut();
+        if !screen.matches_coordinate_witness(&frame.coordinate_witness) {
+            return;
+        }
+        let physical = screen.stable_range(&(frame.first..end));
+        if screen.phys_to_stable_row_index(physical.start) != frame.first {
+            return;
+        }
+        screen.with_phys_lines(physical, |current| {
+            for (current, rendered) in current.iter().zip(&frame.lines) {
+                if *current == rendered {
+                    current.copy_appdata_from(rendered);
+                }
+            }
+        });
+    }
+
     fn cold_viewport_lines(&self, requested: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let empty = || (requested.start, Vec::new());
         if requested.end.saturating_sub(requested.start).max(0) as usize
@@ -4881,6 +5035,107 @@ mod tests {
             dimensions,
             &mut || panic!("alternate-screen ABA published")
         ));
+    }
+
+    #[test]
+    fn native_render_frame_is_owned_and_captures_both_damage_baselines() {
+        let pane = LocalPane::new(
+            701,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x71; 16],
+            "native-render-frame".to_string(),
+        );
+        pane.terminal.lock().advance_bytes(b"original");
+        let source = pane.get_current_seqno();
+        let frame = pane
+            .try_capture_render_frame(None, 0, source, &[], false)
+            .unwrap();
+        assert_eq!(frame.source_sequence, source);
+        assert_eq!(frame.dimensions, pane.get_dimensions());
+        assert_eq!(frame.cursor, pane.get_cursor_position());
+        assert!(frame.dirty.contains(frame.first));
+        assert!(frame.selection_dirty.is_empty());
+        assert!(frame.lines[0].as_str().starts_with("original"));
+        pane.terminal.lock().advance_bytes(b" changed");
+        pane.publish_render_frame_appdata(&frame);
+        assert!(!frame.lines[0].as_str().contains("changed"));
+        assert!(pane.get_lines(frame.first..frame.first + 1).1[0]
+            .as_str()
+            .contains("changed"));
+        let dimensions = pane.get_dimensions();
+        for requested in [StableRowIndex::MIN, StableRowIndex::MAX] {
+            let normalized = pane
+                .try_capture_render_frame(Some(requested), 0, 0, &[], false)
+                .expect("an out-of-range viewport must converge to available rows");
+            assert_eq!(
+                normalized.first,
+                requested
+                    .max(dimensions.scrollback_top)
+                    .min(dimensions.physical_top)
+            );
+            assert_eq!(normalized.lines.len(), dimensions.viewport_rows);
+        }
+    }
+
+    #[test]
+    fn native_render_frame_does_not_wait_for_terminal_pty_or_tmux_locks() {
+        let pane = LocalPane::new(
+            702,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x72; 16],
+            "native-render-busy".to_string(),
+        );
+        for lock in [0, 1, 2] {
+            if lock == 1 && !cfg!(unix) {
+                continue;
+            }
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let pane = &pane;
+                let holder = scope.spawn(move || {
+                    let wait = || {
+                        locked_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+                    };
+                    match lock {
+                        0 => {
+                            let _guard = pane.terminal.lock();
+                            wait()
+                        }
+                        1 => {
+                            let _guard = pane.pty.lock();
+                            wait()
+                        }
+                        _ => {
+                            let _guard = pane.tmux_domain.lock();
+                            wait()
+                        }
+                    }
+                });
+                locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let captured = pane.try_capture_render_frame(None, 0, 0, &[], true);
+                let _ = release_tx.send(());
+                assert!(holder.join().unwrap(), "capture waited for lock {}", lock);
+                assert!(
+                    captured.is_none(),
+                    "busy lock {} must defer the frame",
+                    lock
+                );
+            });
+        }
     }
 
     #[test]

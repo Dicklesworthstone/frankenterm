@@ -234,8 +234,60 @@ impl crate::TermWindow {
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
-        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane)?;
-        let selection_frame_before = self.selection_frame_stamp_for_position(&pos.pane, pos);
+        let pane_id = pos.pane.pane_id();
+        let local = pos.pane.downcast_ref::<mux::localpane::LocalPane>();
+        let mut native_frame = if let Some(local) = local {
+            let damage_baseline = self
+                .pane_state(pane_id)
+                .render_dirty
+                .last_observed_source_end();
+            let selection_baseline = self.selection(pane_id).seqno;
+            Some(
+                local
+                    .try_capture_render_frame(
+                        self.get_viewport(pane_id),
+                        damage_baseline,
+                        selection_baseline,
+                        &self.config.hyperlink_rules,
+                        self.config.detect_password_input,
+                    )
+                    // Tab topology publishes its target before the native
+                    // worker finishes reflow. Do not bind old-width text to
+                    // new pane geometry (or authorize selection over it).
+                    .filter(|frame| {
+                        frame.dimensions.cols == pos.width
+                            && frame.dimensions.viewport_rows == pos.height
+                            && frame.dimensions.pixel_width == pos.pixel_width
+                            && frame.dimensions.pixel_height == pos.pixel_height
+                    })
+                    .ok_or(crate::termwindow::NativeFramePending)?,
+            )
+        } else {
+            None
+        };
+        if let Some(frame) = &native_frame {
+            // Capture may clamp a viewport whose rows were evicted. Publish
+            // that effective viewport before damage, selection, and rendering
+            // derive any row coordinates from GUI state.
+            self.set_viewport(pane_id, Some(frame.first), frame.dimensions);
+        }
+        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane, native_frame.as_ref())?;
+        let selection_frame_before = if let Some(frame) = &native_frame {
+            crate::selection::SelectionAuthority::from_native_frame(&*pos.pane, frame)
+                .zip(self.selection_frame_geometry(pos))
+                .map(
+                    |(authority, geometry)| crate::selection::SelectionFrameStamp {
+                        authority,
+                        source_sequence: frame.source_sequence,
+                        viewport: self
+                            .get_viewport(pane_id)
+                            .unwrap_or(frame.dimensions.physical_top),
+                        geometry,
+                    },
+                )
+        } else {
+            self.selection_frame_stamp_for_position(&pos.pane, pos)
+        };
         let complete_selection_frame;
         /*
         let zone = {
@@ -256,7 +308,9 @@ impl crate::TermWindow {
         let global_cursor_fg = self.palette().cursor_fg;
         let global_cursor_bg = self.palette().cursor_bg;
         let config = self.config.clone();
-        let palette = pos.pane.palette();
+        let palette = native_frame
+            .as_ref()
+            .map_or_else(|| pos.pane.palette(), |frame| frame.palette.clone());
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -275,10 +329,13 @@ impl crate::TermWindow {
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
-        let cursor = pos.pane.get_cursor_position();
-        let pane_id = pos.pane.pane_id();
+        let cursor = native_frame
+            .as_ref()
+            .map_or_else(|| pos.pane.get_cursor_position(), |frame| frame.cursor);
         let current_viewport = self.get_viewport(pane_id);
-        let dims = pos.pane.get_dimensions();
+        let dims = native_frame
+            .as_ref()
+            .map_or_else(|| pos.pane.get_dimensions(), |frame| frame.dimensions);
         if pos.is_active {
             if let Some(previous_cursor) = self.prev_cursor.update(&cursor) {
                 let viewport = current_viewport.unwrap_or(dims.physical_top);
@@ -581,6 +638,7 @@ impl crate::TermWindow {
                 error: Option<anyhow::Error>,
                 expected_range: std::ops::Range<StableRowIndex>,
                 complete: bool,
+                native_password_input: Option<bool>,
             }
 
             let left_pixel_x = padding_left
@@ -613,6 +671,7 @@ impl crate::TermWindow {
                 error: None,
                 expected_range: stable_range.clone(),
                 complete: false,
+                native_password_input: native_frame.as_ref().map(|frame| frame.password_input),
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -654,7 +713,9 @@ impl crate::TermWindow {
                                 }
                                 _ => None,
                             },
-                            if self.term_window.config.detect_password_input {
+                            if let Some(password_input) = self.native_password_input {
+                                password_input
+                            } else if self.term_window.config.detect_password_input {
                                 match self.pos.pane.get_metadata() {
                                     Value::Object(obj) => {
                                         match obj.get(&Value::String("password_input".to_string()))
@@ -847,11 +908,18 @@ impl crate::TermWindow {
                 }
             }
 
-            pos.pane.with_lines_mut_and_apply_hyperlinks(
-                stable_range.clone(),
-                &render_config.hyperlink_rules,
-                &mut render,
-            );
+            if let Some(frame) = &mut native_frame {
+                render.with_lines_mut(frame.first, &mut frame.lines.iter_mut().collect::<Vec<_>>());
+                if let Some(local) = local {
+                    local.publish_render_frame_appdata(frame);
+                }
+            } else {
+                pos.pane.with_lines_mut_and_apply_hyperlinks(
+                    stable_range.clone(),
+                    &render_config.hyperlink_rules,
+                    &mut render,
+                );
+            }
             if let Some(error) = render.error.take() {
                 return Err(error)
                     .context("error while calling with_lines_mut_and_apply_hyperlinks");
