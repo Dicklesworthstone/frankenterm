@@ -1949,6 +1949,11 @@ enum WrappedResizeLines {
 #[derive(Debug, Clone)]
 enum LogicalLineForResize {
     PhysicalLine(usize),
+    PhysicalRange {
+        range: Range<usize>,
+        seqno: SequenceNo,
+        logical: std::sync::OnceLock<Line>,
+    },
     Owned(Line),
 }
 
@@ -2204,7 +2209,7 @@ trait ReflowLogicalLine {
         self.line(physical_lines).clone()
     }
 
-    fn scratch_for_unwrapped(&self) -> RewrapScratch;
+    fn scratch_for_unwrapped(&self, physical_lines: &VecDeque<Line>) -> RewrapScratch;
 
     fn retained_wrap_source(&self) -> Option<&std::sync::OnceLock<LineWrapLayout>> {
         None
@@ -2216,7 +2221,7 @@ impl ReflowLogicalLine for CachedLogicalLine {
         &self.line
     }
 
-    fn scratch_for_unwrapped(&self) -> RewrapScratch {
+    fn scratch_for_unwrapped(&self, _physical_lines: &VecDeque<Line>) -> RewrapScratch {
         RewrapScratch::Lines(vec![self.line.clone()])
     }
 
@@ -2229,13 +2234,40 @@ impl ReflowLogicalLine for LogicalLineForResize {
     fn line<'a>(&'a self, physical_lines: &'a VecDeque<Line>) -> &'a Line {
         match self {
             Self::PhysicalLine(idx) => &physical_lines[*idx],
+            Self::PhysicalRange {
+                range,
+                seqno,
+                logical,
+            } => logical.get_or_init(|| {
+                let rows = physical_lines.range(range.clone());
+                Line::try_compact_logical_rows(rows.clone(), *seqno).unwrap_or_else(|| {
+                    // Images and the diagnostic eager control retain the
+                    // original reconstruction semantics on the same worker.
+                    let mut joined: Option<Line> = None;
+                    for row in rows {
+                        let mut row = row.clone();
+                        row.update_last_change_seqno(*seqno);
+                        if row.last_cell_was_wrapped() {
+                            row.set_last_cell_was_wrapped(false, *seqno);
+                        }
+                        match &mut joined {
+                            Some(line) => line.append_line(row, *seqno),
+                            None => joined = Some(row),
+                        }
+                    }
+                    joined.expect("a logical physical range is nonempty")
+                })
+            }),
             Self::Owned(line) => line,
         }
     }
 
-    fn scratch_for_unwrapped(&self) -> RewrapScratch {
+    fn scratch_for_unwrapped(&self, physical_lines: &VecDeque<Line>) -> RewrapScratch {
         match self {
             Self::PhysicalLine(idx) => RewrapScratch::PhysicalLine(*idx),
+            Self::PhysicalRange { .. } => {
+                RewrapScratch::Lines(vec![self.line(physical_lines).clone()])
+            }
             Self::Owned(line) => RewrapScratch::Lines(vec![line.clone()]),
         }
     }
@@ -2246,7 +2278,7 @@ impl ReflowLogicalLine for Line {
         self
     }
 
-    fn scratch_for_unwrapped(&self) -> RewrapScratch {
+    fn scratch_for_unwrapped(&self, _physical_lines: &VecDeque<Line>) -> RewrapScratch {
         RewrapScratch::Lines(vec![self.clone()])
     }
 }
@@ -4127,7 +4159,7 @@ impl Screen {
     {
         let line = logical_line.line(physical_lines);
         if line.len() <= physical_cols {
-            return (logical_line.scratch_for_unwrapped(), None);
+            return (logical_line.scratch_for_unwrapped(physical_lines), None);
         }
 
         if let Some(retained) = logical_line.retained_wrap_source() {
@@ -4483,8 +4515,6 @@ impl Screen {
     ) -> LogicalLineRebuild {
         let mut logical_lines: Vec<LogicalLineForResize> = Vec::with_capacity(self.lines.len());
         let mut physical_ranges: Vec<Range<usize>> = Vec::with_capacity(self.lines.len());
-        let mut logical_line: Option<Line> = None;
-        let mut logical_start = 0usize;
         let mut joined_until = 0usize;
 
         for (idx, physical_line) in self.lines.iter().enumerate() {
@@ -4496,66 +4526,32 @@ impl Screen {
                 continue;
             }
 
-            if logical_line.is_none() && physical_line.last_cell_was_wrapped() {
+            if physical_line.last_cell_was_wrapped() {
                 let end = self
                     .lines
                     .range(idx..)
                     .position(|line| !line.last_cell_was_wrapped())
                     .map_or(self.lines.len(), |offset| idx + offset + 1);
-                if let Some(joined) =
+                let logical =
                     Line::try_join_deferred_logical_rows(self.lines.range(idx..end), seqno)
-                {
-                    logical_lines.push(LogicalLineForResize::Owned(joined));
-                    physical_ranges.push(idx..end);
-                    logical_start = end;
-                    joined_until = end;
-                    continue;
-                }
-            }
-
-            let was_wrapped = physical_line.last_cell_was_wrapped();
-            let mut line = if logical_line.is_some() || was_wrapped {
-                let mut line = physical_line.clone();
-                line.update_last_change_seqno(seqno);
-                Some(line)
-            } else {
-                None
-            };
-
-            if !was_wrapped {
-                if let Some(mut prior) = logical_line.take() {
-                    prior.append_line(line.take().expect("continued line must be owned"), seqno);
-                    logical_lines.push(LogicalLineForResize::Owned(prior));
-                } else {
-                    logical_lines.push(LogicalLineForResize::PhysicalLine(idx));
-                }
-                physical_ranges.push(logical_start..idx + 1);
-                logical_start = idx + 1;
+                        .map(LogicalLineForResize::Owned)
+                        .unwrap_or_else(|| LogicalLineForResize::PhysicalRange {
+                            range: idx..end,
+                            seqno,
+                            logical: std::sync::OnceLock::new(),
+                        });
+                // Only discover ranges here. Expensive first-use token
+                // construction runs when the existing viewport-prioritized
+                // wrap workers first access a range, under their admission
+                // and cancellation batch bounds. Cache publication reuses it.
+                logical_lines.push(logical);
+                physical_ranges.push(idx..end);
+                joined_until = end;
                 continue;
             }
 
-            let mut line = line.take().expect("wrapped line must be owned");
-            line.set_last_cell_was_wrapped(false, seqno);
-
-            let line = match logical_line.take() {
-                None => line,
-                Some(mut prior) => {
-                    prior.append_line(line, seqno);
-                    prior
-                }
-            };
-
-            if was_wrapped {
-                logical_line.replace(line);
-                continue;
-            }
-
-            logical_lines.push(LogicalLineForResize::Owned(line));
-        }
-
-        if let Some(line) = logical_line.take() {
-            logical_lines.push(LogicalLineForResize::Owned(line));
-            physical_ranges.push(logical_start..self.lines.len());
+            logical_lines.push(LogicalLineForResize::PhysicalLine(idx));
+            physical_ranges.push(idx..idx + 1);
         }
 
         LogicalLineRebuild {
@@ -9631,7 +9627,12 @@ pub(crate) mod tests {
         assert_eq!(fused_signature, expected_signature);
         assert_eq!(fused_ranges, expected_ranges);
         assert_eq!(logical_lines.len(), 2);
-        assert!(matches!(logical_lines[0], LogicalLineForResize::Owned(_)));
+        let LogicalLineForResize::PhysicalRange { logical, .. } = &logical_lines[0] else {
+            panic!("first-use range must defer its token construction");
+        };
+        assert!(logical.get().is_none());
+        assert_eq!(logical_lines[0].line(&screen.lines).as_str(), "abcdefghij");
+        assert!(logical.get().is_some());
         assert!(matches!(
             logical_lines[1],
             LogicalLineForResize::PhysicalLine(2)

@@ -1817,6 +1817,63 @@ impl Line {
         }
     }
 
+    /// Build a first-use logical source directly from physical graphemes.
+    /// Avoid the intermediate filler-expanded concatenation that would be
+    /// discarded as soon as the wrap planner extracts the same tokens again.
+    pub fn try_compact_logical_rows<'a>(
+        rows: impl Iterator<Item = &'a Line> + Clone,
+        seqno: SequenceNo,
+    ) -> Option<Line> {
+        #[cfg(feature = "std")]
+        {
+            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *DISABLED.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_COMPACT_LOGICAL_ROWS")
+                    .is_some_and(|value| value == "1")
+            }) {
+                return None;
+            }
+            let first = rows.clone().next()?;
+            let count = rows.clone().count();
+            let capacity = rows
+                .clone()
+                .try_fold(0usize, |total, row| total.checked_add(row.len()))?;
+            for (index, row) in rows.clone().enumerate() {
+                if index + 1 < count && !row.last_cell_was_wrapped() {
+                    return None;
+                }
+                #[cfg(feature = "use_image")]
+                if row.has_image_attachments() {
+                    return None;
+                }
+            }
+            let mut tokens = Vec::with_capacity(capacity);
+            for row in rows {
+                let start = tokens.len();
+                tokens.extend(row.visible_cells().map(|cell| cell.as_cell()));
+                if row.last_cell_was_wrapped() {
+                    if let Some(last) = tokens[start..].last_mut() {
+                        last.attrs_mut().set_wrapped(false);
+                    }
+                }
+            }
+            let end = tokens.len();
+            let mut logical = first.clone();
+            logical.cells =
+                CellStorage::V(VecStorage::from_token_range(tokens.into(), 0..end, false));
+            logical.update_last_change_seqno(seqno);
+            if count > 1 {
+                logical.invalidate_zones();
+            }
+            Some(logical)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (rows, seqno);
+            None
+        }
+    }
+
     /// mutable access the cell data, but the caller must take care
     /// to only mutate attributes rather than the cell textual content.
     /// Use set_cell if you need to modify the textual content of the
@@ -4706,6 +4763,70 @@ mod tests {
             10,
         )
         .is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn compact_physical_logical_rows_match_eager_reconstruction_and_share_tokens() {
+        if std::env::var_os("FT_DISABLE_COMPACT_LOGICAL_ROWS").is_some() {
+            return;
+        }
+        for text in [
+            "ascii ffi -> long logical content",
+            "界面 e\u{301} 🚀 אבג repeated text",
+        ] {
+            for width in [1, 5, 80] {
+                let source = Line::from_text(text, &CellAttributes::default(), 4, None);
+                let layout = source.plan_wrap_with_width_prefix_scratch(
+                    width,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                let physical = layout.materialize_rows(0..usize::MAX, 9);
+                let compact = Line::try_compact_logical_rows(physical.iter(), 10).unwrap();
+                let CellStorage::V(storage) = &compact.cells else {
+                    panic!("not vector storage");
+                };
+                assert!(storage.is_deferred_unmaterialized());
+                let tokens = storage.reusable_wrap_tokens().unwrap();
+                let mut eager: Option<Line> = None;
+                for mut row in physical.clone() {
+                    if row.last_cell_was_wrapped() {
+                        row.set_last_cell_was_wrapped(false, 10);
+                    }
+                    match &mut eager {
+                        Some(line) => line.append_line(row, 10),
+                        None => {
+                            row.update_last_change_seqno(10);
+                            eager = Some(row);
+                        }
+                    }
+                }
+                let eager = eager.unwrap();
+                assert_eq!(compact, eager);
+                let replanned = compact.plan_wrap_with_width_prefix_scratch(
+                    7,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                assert!(Arc::ptr_eq(&tokens, &replanned.tokens));
+                let expected = eager.plan_wrap_with_width_prefix_scratch(
+                    7,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                assert_eq!(
+                    replanned.materialize_rows(0..usize::MAX, 11),
+                    expected.materialize_rows(0..usize::MAX, 11)
+                );
+            }
+        }
+        let rows = [
+            Line::from_text("one", &CellAttributes::default(), 1, None),
+            Line::from_text("two", &CellAttributes::default(), 1, None),
+        ];
+        assert!(Line::try_compact_logical_rows(rows.iter(), 2).is_none());
+        assert!(Line::try_compact_logical_rows(core::iter::empty(), 2).is_none());
     }
 
     // ── Line clone / eq ────────────────────────────────────
