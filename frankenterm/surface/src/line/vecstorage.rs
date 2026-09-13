@@ -119,7 +119,12 @@ impl Clone for VecStorage {
             if *EAGER_COPY.get_or_init(|| {
                 std::env::var_os("FT_DISABLE_SHARED_LINE_CELLS").is_some_and(|v| v == "1")
             }) {
-                Arc::new(self.cells.as_ref().clone())
+                Arc::new(CellBuffer {
+                    cells: self.cells.materialized().clone(),
+                    deferred: None,
+                    shape_hash: self.cells.shape_hash.clone(),
+                    wrap_boundary: self.cells.wrap_boundary.clone(),
+                })
             } else {
                 Arc::clone(&self.cells)
             }
@@ -165,7 +170,9 @@ impl VecStorage {
         let mut len = 0usize;
         let mut has_images = false;
         for cell in slice {
-            len = len.checked_add(cell.width().max(1)).expect("row width overflow");
+            len = len
+                .checked_add(cell.width().max(1))
+                .expect("row width overflow");
             has_images |= cell.attrs().has_image_attachments();
         }
         let tail = if wrapped {
@@ -181,7 +188,11 @@ impl VecStorage {
             cells: Arc::new(CellBuffer {
                 cells: Vec::new(),
                 deferred: Some(DeferredRow {
-                    tokens, range, tail, len, has_images,
+                    tokens,
+                    range,
+                    tail,
+                    len,
+                    has_images,
                     materialized: std::sync::OnceLock::new(),
                 }),
                 shape_hash: std::sync::OnceLock::new(),
@@ -204,22 +215,31 @@ impl VecStorage {
             return CellViewIter::Tokens(row.iter());
         }
         CellViewIter::Physical(VecStorageIter {
-            cells: self.cells.cells.iter(), idx: 0, skip_width: 0,
+            cells: self.cells.cells.iter(),
+            idx: 0,
+            skip_width: 0,
         })
     }
 
+    #[cfg(any(feature = "std", feature = "use_image"))]
     pub(crate) fn has_image_attachments(&self) -> bool {
         #[cfg(feature = "std")]
         if let Some(row) = &self.cells.deferred {
             return row.has_images;
         }
         // Include malformed spacer cells on the physical-storage path.
-        self.cells.cells.iter().any(|cell| cell.attrs().has_image_attachments())
+        self.cells
+            .cells
+            .iter()
+            .any(|cell| cell.attrs().has_image_attachments())
     }
 
     #[cfg(all(test, feature = "std"))]
     pub(crate) fn is_deferred_unmaterialized(&self) -> bool {
-        self.cells.deferred.as_ref().is_some_and(|row| row.materialized.get().is_none())
+        self.cells
+            .deferred
+            .as_ref()
+            .is_some_and(|row| row.materialized.get().is_none())
     }
 
     pub(crate) fn cached_wrap_boundary(&self, compute: impl FnOnce() -> bool) -> bool {
@@ -286,10 +306,20 @@ impl VecStorage {
     pub(crate) fn set_cell(&mut self, idx: usize, mut cell: Cell, clear_image_placement: bool) {
         #[cfg(feature = "use_image")]
         if !clear_image_placement {
-            if let Some(images) = self.cells.materialized()[idx].attrs().images() {
-                for image in images {
-                    if image.has_placement_id() {
-                        cell.attrs_mut().attach_image(Box::new(image));
+            #[cfg(feature = "std")]
+            let may_have_images = self
+                .cells
+                .deferred
+                .as_ref()
+                .is_none_or(|row| row.has_images);
+            #[cfg(not(feature = "std"))]
+            let may_have_images = true;
+            if may_have_images {
+                if let Some(images) = self.cells.materialized()[idx].attrs().images() {
+                    for image in images {
+                        if image.has_placement_id() {
+                            cell.attrs_mut().attach_image(Box::new(image));
+                        }
                     }
                 }
             }
@@ -356,7 +386,11 @@ impl<'a> Iterator for TokenRowIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let original = self.cells.next()?;
-        let cell = if self.cells.len() == 0 { self.tail.unwrap_or(original) } else { original };
+        let cell = if self.cells.len() == 0 {
+            self.tail.unwrap_or(original)
+        } else {
+            original
+        };
         let cell_index = self.idx;
         self.idx += cell.width().max(1);
         Some(CellRef::CellRef { cell_index, cell })
@@ -404,6 +438,65 @@ mod tests {
         s.chars()
             .map(|c| Cell::new(c, CellAttributes::default()))
             .collect()
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn deferred_rows_preserve_indices_padding_and_detach_on_mutation() {
+        for wrapped in [false, true] {
+            let tokens: Arc<[Cell]> = vec![
+                Cell::new_grapheme_with_width("e\u{301}", 0, CellAttributes::default()),
+                Cell::new('x', CellAttributes::default()),
+                Cell::new_grapheme_with_width("界", 2, CellAttributes::default()),
+                Cell::new_grapheme_with_width("🚀", 3, CellAttributes::default()),
+            ]
+            .into();
+            let mut expected = Vec::new();
+            for (index, token) in tokens.iter().enumerate() {
+                let mut token = token.clone();
+                if wrapped && index + 1 == tokens.len() {
+                    token.attrs_mut().set_wrapped(true);
+                }
+                let attrs = token.attrs().clone();
+                let width = token.width();
+                expected.push(token);
+                for _ in 1..width {
+                    expected.push(Cell::blank_with_attrs(attrs.clone()));
+                }
+            }
+            let mut row = VecStorage::from_token_range(tokens.clone(), 0..tokens.len(), wrapped);
+            let frozen = row.snapshot_clone();
+            let eager = VecStorage::new(expected.clone());
+            assert_eq!(row.len(), expected.len());
+            let views: Vec<_> = row.visible_cells().collect();
+            let eager_views: Vec<_> = eager.visible_cells().collect();
+            assert_eq!(views.len(), eager_views.len());
+            for (actual, expected) in views.iter().zip(eager_views.iter()) {
+                assert_eq!(actual.cell_index(), expected.cell_index());
+                assert!(actual.same_contents(expected));
+            }
+            assert!(!row.has_image_attachments());
+            assert!(row.is_deferred_unmaterialized());
+            row.set_cell(1, Cell::new('Z', CellAttributes::default()), false);
+            assert!(!row.shares_cells_with(&frozen));
+            // Editing a clone must not force or alter the original row.
+            assert!(frozen.is_deferred_unmaterialized());
+            assert_eq!(frozen.as_slice(), expected.as_slice());
+            assert_eq!(row[1].str(), "Z");
+        }
+    }
+
+    #[cfg(all(feature = "std", feature = "use_serde"))]
+    #[test]
+    fn deferred_rows_serialize_as_original_cell_arrays() {
+        let tokens: Arc<[Cell]> = make_cells("wire").into();
+        let row = VecStorage::from_token_range(tokens.clone(), 0..tokens.len(), false);
+        assert!(row.is_deferred_unmaterialized());
+        let expected = serde_json::json!({"cells": tokens.as_ref()});
+        let actual = serde_json::to_value(&row).unwrap();
+        assert_eq!(actual, expected);
+        let restored: VecStorage = serde_json::from_value(actual).unwrap();
+        assert_eq!(row, restored);
     }
 
     // ── VecStorage ─────────────────────────────────────────

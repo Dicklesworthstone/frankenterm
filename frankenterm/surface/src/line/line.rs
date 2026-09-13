@@ -2129,13 +2129,21 @@ impl LineWrapLayout {
                 }
                 return (rows.start..end)
                     .map(|row| {
-                        let start = if row == 0 { 0 } else { self.break_offsets[row - 1] };
+                        let start = if row == 0 {
+                            0
+                        } else {
+                            self.break_offsets[row - 1]
+                        };
                         let stop = self.break_offsets[row];
                         Line {
                             cells: CellStorage::V(VecStorage::from_token_range(
-                                Arc::clone(&self.tokens), start..stop, stop < self.tokens.len(),
+                                Arc::clone(&self.tokens),
+                                start..stop,
+                                stop < self.tokens.len(),
                             )),
-                            zones: Vec::new(), seqno, bits: LineBits::NONE,
+                            zones: Vec::new(),
+                            seqno,
+                            bits: LineBits::NONE,
                             #[cfg(feature = "appdata")]
                             appdata: Mutex::new(None),
                         }
@@ -4557,6 +4565,45 @@ mod tests {
             .retain_width_prefix();
         assert!(layout.width_prefix.is_none());
         assert_eq!(layout.materialize_rows(0..1, 9), vec![source]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn deferred_reflow_geometry_reads_do_not_materialize_offscreen_cells() {
+        for text in ["plain ascii text", "界面 e\u{301} 🚀 ffi אבג"] {
+            let source = Line::from_text(text, &CellAttributes::default(), 4, None);
+            for width in [1, 2, 3, 7, 19] {
+                let layout = source.clone().plan_wrap_with_width_prefix_scratch(
+                    width,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                let deferred = layout.deferred_rows(0..usize::MAX, 9);
+                let eager = layout.materialize_rows(0..usize::MAX, 9);
+                assert_eq!(deferred.len(), eager.len());
+                for (row, expected) in deferred.iter().zip(&eager) {
+                    assert_eq!(row.len(), expected.len());
+                    assert_eq!(
+                        row.last_cell_was_wrapped(),
+                        expected.last_cell_was_wrapped()
+                    );
+                    assert_eq!(row.compute_shape_hash(), expected.compute_shape_hash());
+                    assert_eq!(row.as_str(), expected.as_str());
+                    #[cfg(feature = "use_image")]
+                    assert_eq!(
+                        row.has_image_attachments(),
+                        expected.has_image_attachments()
+                    );
+                    let CellStorage::V(storage) = &row.cells else {
+                        panic!("not vector storage")
+                    };
+                    if std::env::var_os("FT_DISABLE_DEFERRED_REFLOW_CELLS").is_none() {
+                        assert!(storage.is_deferred_unmaterialized());
+                    }
+                }
+                assert_eq!(deferred, eager);
+            }
+        }
     }
 
     // ── Line clone / eq ────────────────────────────────────

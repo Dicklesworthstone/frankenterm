@@ -4038,36 +4038,16 @@ impl Screen {
             return (vec![line], None);
         }
 
-        if policy.scorecard_enabled {
-            let report = line.wrap_with_report_and_width_prefix_scratch(
-                physical_cols,
-                seqno,
-                policy.kp_cost_model,
-                width_prefix_scratch,
-            );
-            return (report.lines, Some(report.scorecard));
-        }
-
-        if policy.kp_cost_model == MonospaceKpCostModel::terminal_default() {
-            return (
-                line.wrap_with_cost_model_and_width_prefix_scratch(
-                    physical_cols,
-                    seqno,
-                    policy.kp_cost_model,
-                    width_prefix_scratch,
-                )
-                .0,
-                None,
-            );
-        }
-
-        let (wrapped, _mode) = line.wrap_with_cost_model_and_width_prefix_scratch(
+        let layout = line.plan_wrap_with_width_prefix_scratch(
             physical_cols,
-            seqno,
             policy.kp_cost_model,
             width_prefix_scratch,
         );
-        (wrapped, None)
+        let scorecard = policy.scorecard_enabled.then(|| layout.scorecard());
+        (
+            layout.deferred_rows(0..layout.row_count(), seqno),
+            scorecard,
+        )
     }
 
     #[cfg(feature = "use_serde")]
@@ -4163,7 +4143,7 @@ impl Screen {
             let layout = source.replan(physical_cols, policy.kp_cost_model, width_prefix_scratch);
             let scorecard = policy.scorecard_enabled.then(|| layout.scorecard());
             return (
-                RewrapScratch::Lines(layout.materialize_rows(0..layout.row_count(), seqno)),
+                RewrapScratch::Lines(layout.deferred_rows(0..layout.row_count(), seqno)),
                 scorecard,
             );
         }
