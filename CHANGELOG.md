@@ -30,6 +30,9 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+- Mouse selection survives ordinary terminal output and temporary frame contention while retaining displayed-layout validation. Forward and reverse drags, Unicode copying, and word/line selection are covered by native Mac acceptance checks.
+- Explicit-context timers isolate cleanup from unrelated ambient cancellation. Interrupted mux writes preserve typed cancellation and discard ambiguous connections.
+- Numeric fields in tagged JSON messages and saved layouts round-trip correctly with arbitrary-precision JSON enabled. Unicode emoji lookup again uses the hash version matching its generated tables.
 - Local-pane resize prepares text wrapping outside the terminal and resize-admission locks. It validates the captured text, cursor, geometry and policy before applying the result; parser output or a superseding resize invalidates stale work. Image-bearing content retains the synchronous path.
 - Flexible-pane layout no longer reads terminal dimensions while planning a resize. This avoids waiting on the parser's terminal lock for dimensions that only fixed-size panes require.
 - WebGPU rendering reuses vertex buffers across frames and uploads only the active vertices. Glyph instances from earlier allocator borrows survive until the end of the same frame.
