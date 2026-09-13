@@ -4,10 +4,10 @@ use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkMcpError, FrameworkResource, FrameworkResourceContent,
-    FrameworkResourceTemplate, FrameworkTestClient, FrameworkTool,
-    framework_create_memory_transport_pair,
+    FrameworkMcpError, FrameworkResource, FrameworkResourceTemplate, FrameworkTestClient,
+    FrameworkTool, framework_create_memory_transport_pair,
 };
+use frankenterm_core::runtime_async::CompatRuntime;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -44,22 +44,26 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     client
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
-    contents
-        .first()
-        .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .expect("expected first MCP content to be text")
+fn first_text_content<T: serde::Serialize>(contents: &[T]) -> String {
+    let content = serde_json::to_value(contents.first().expect("expected MCP content"))
+        .expect("serialize received MCP content");
+    assert_eq!(
+        content["type"], "text",
+        "expected first MCP content to be text"
+    );
+    content["text"]
+        .as_str()
+        .expect("MCP text payload")
+        .to_owned()
 }
 
-fn first_resource_text(resources: &[FrameworkResourceContent]) -> &str {
-    let resource = resources.first().expect("at least one resource payload");
-    resource
-        .text
-        .as_deref()
+fn first_resource_text<T: serde::Serialize>(resources: &[T]) -> String {
+    let resource = serde_json::to_value(resources.first().expect("at least one resource payload"))
+        .expect("serialize received resource payload");
+    resource["text"]
+        .as_str()
         .expect("resource payload should have JSON text")
+        .to_owned()
 }
 
 fn parse_json_value(text: &str) -> Value {
@@ -72,17 +76,17 @@ fn parse_toon_value(text: &str) -> Value {
     serde_json::from_str(&json_text).expect("TOON payload should stringify back to JSON")
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent], format: &str) -> Value {
+fn parse_tool_envelope<T: serde::Serialize>(contents: &[T], format: &str) -> Value {
     let text = first_text_content(contents);
     if format == "json" {
-        parse_json_value(text)
+        parse_json_value(&text)
     } else {
-        parse_toon_value(text)
+        parse_toon_value(&text)
     }
 }
 
-fn parse_resource_envelope(resources: &[FrameworkResourceContent]) -> Value {
-    parse_json_value(first_resource_text(resources))
+fn parse_resource_envelope<T: serde::Serialize>(resources: &[T]) -> Value {
+    parse_json_value(&first_resource_text(resources))
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
@@ -101,8 +105,8 @@ fn assert_success_envelope_shape(envelope: &Value) {
     assert!(envelope.get("hint").is_none());
 }
 
-fn assert_framework_invalid_params(
-    result: Result<Vec<FrameworkContent>, FrameworkMcpError>,
+fn assert_framework_invalid_params<T: serde::Serialize + std::fmt::Debug>(
+    result: Result<Vec<T>, FrameworkMcpError>,
     message_substring: &str,
 ) {
     match result {
@@ -343,10 +347,11 @@ fn mcp_conformance_rules_resource_returns_well_formed_json_envelope() {
     let mut client = spawn_client(None);
     let resources = client.read_resource("wa://rules").expect("read wa://rules");
     let resource = resources.first().expect("rules resource entry");
+    let resource = serde_json::to_value(resource).expect("serialize rules resource entry");
 
-    assert_eq!(resource.uri, "wa://rules");
-    assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
-    assert!(resource.blob.is_none());
+    assert_eq!(resource["uri"], "wa://rules");
+    assert_eq!(resource["mimeType"], "application/json");
+    assert!(resource.get("blob").is_none_or(Value::is_null));
 
     let envelope = parse_resource_envelope(&resources);
     assert_success_envelope_shape(&envelope);
@@ -361,10 +366,11 @@ fn mcp_conformance_rules_template_resource_returns_filtered_json_envelope() {
         .read_resource("wa://rules/codex")
         .expect("read wa://rules/codex");
     let resource = resources.first().expect("rules template resource entry");
+    let resource = serde_json::to_value(resource).expect("serialize rules template resource entry");
 
-    assert_eq!(resource.uri, "wa://rules/codex");
-    assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
-    assert!(resource.blob.is_none());
+    assert_eq!(resource["uri"], "wa://rules/codex");
+    assert_eq!(resource["mimeType"], "application/json");
+    assert!(resource.get("blob").is_none_or(Value::is_null));
 
     let envelope = parse_resource_envelope(&resources);
     assert_success_envelope_shape(&envelope);
@@ -380,10 +386,11 @@ fn mcp_conformance_workflows_resource_returns_counted_json_payload() {
         .read_resource("wa://workflows")
         .expect("read wa://workflows");
     let resource = resources.first().expect("workflows resource entry");
+    let resource = serde_json::to_value(resource).expect("serialize workflows resource entry");
 
-    assert_eq!(resource.uri, "wa://workflows");
-    assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
-    assert!(resource.blob.is_none());
+    assert_eq!(resource["uri"], "wa://workflows");
+    assert_eq!(resource["mimeType"], "application/json");
+    assert!(resource.get("blob").is_none_or(Value::is_null));
 
     let envelope = parse_resource_envelope(&resources);
     assert_success_envelope_shape(&envelope);
@@ -409,10 +416,11 @@ fn mcp_conformance_herd_wave_resource_matches_robot_contract_shape() {
         .read_resource("wa://herd-wave")
         .expect("read wa://herd-wave");
     let resource = resources.first().expect("herd-wave resource entry");
+    let resource = serde_json::to_value(resource).expect("serialize herd-wave resource entry");
 
-    assert_eq!(resource.uri, "wa://herd-wave");
-    assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
-    assert!(resource.blob.is_none());
+    assert_eq!(resource["uri"], "wa://herd-wave");
+    assert_eq!(resource["mimeType"], "application/json");
+    assert!(resource.get("blob").is_none_or(Value::is_null));
 
     let envelope = parse_resource_envelope(&resources);
     assert_success_envelope_shape(&envelope);

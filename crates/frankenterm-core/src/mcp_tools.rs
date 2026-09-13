@@ -5406,6 +5406,11 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         let started = Instant::now();
         while !self.is_ready() {
             if started.elapsed() >= timeout {
+                eprintln!(
+                    "MCP await-event readiness deadline: phase={} stats={:?}",
+                    self.phase.load(Ordering::Acquire),
+                    self.stats.snapshot(),
+                );
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

@@ -8,6 +8,9 @@
 //! - **FTS search p95 < 15ms** (common query, DB ~100K segments)
 //! - **upsert_pane p95 < 1ms** (metadata write)
 
+// Storage appends traverse the owner-Cx and writer-response future layers.
+#![recursion_limit = "256"]
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,

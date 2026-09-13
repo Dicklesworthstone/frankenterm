@@ -119,7 +119,7 @@ default-members = [
 # - optional frontends (mcp/web/tui/browser) are feature-gated
 
 [workspace.package]
-version = "0.15.6-rc.1"
+version = "0.15.6-rc.2"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Dicklesworthstone"]
@@ -452,7 +452,7 @@ smol = "2.0.2"
 socket2 = "0.6.4"
 ssh2 = "0.9.5"
 strsim = "0.11.1"
-syn = "3.0.4"
+syn = "3.0.5"
 tempfile = "3.27.0"
 terminfo = "0.9"
 termios = "0.3.3"

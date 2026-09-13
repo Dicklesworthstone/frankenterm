@@ -6,6 +6,9 @@
 //! - pipeline_depth_saturation
 //! - sequence_number_matching
 
+// Mux connection setup traverses the owner-Cx and transport future layers.
+#![recursion_limit = "256"]
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;

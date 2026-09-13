@@ -161,11 +161,20 @@ pub fn mcp_bridge_degraded_mode_skipped_entries() -> u64 {
 /// degraded-startup observable instead of implicit.
 static MCP_BRIDGE_TOOLS_SKIPPED_NO_DB: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_DEGRADED_COUNTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Cumulative count of MCP tool + resource registrations skipped
 /// because `build_server_with_db` was called with `db_path=None`.
 /// See [`MCP_BRIDGE_TOOLS_SKIPPED_NO_DB`].
 #[must_use]
 pub fn mcp_bridge_tools_skipped_no_db_count() -> u64 {
+    #[cfg(test)]
+    if let Some(value) = TEST_DEGRADED_COUNTER.get() {
+        return value;
+    }
     MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.load(Ordering::Relaxed)
 }
 
@@ -174,10 +183,21 @@ pub fn mcp_bridge_tools_skipped_no_db_count() -> u64 {
 /// without state leakage from sibling tests.
 #[cfg(test)]
 fn reset_mcp_bridge_tools_skipped_no_db_count_for_test() {
-    MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.store(0, Ordering::Relaxed);
+    assert!(
+        TEST_DEGRADED_COUNTER.get().is_some(),
+        "counter fixture required"
+    );
+    TEST_DEGRADED_COUNTER.set(Some(0));
 }
 
 fn record_mcp_bridge_degraded_startup() {
+    #[cfg(test)]
+    if let Some(value) = TEST_DEGRADED_COUNTER.get() {
+        TEST_DEGRADED_COUNTER.set(Some(
+            value.wrapping_add(mcp_bridge_degraded_mode_skipped_entries()),
+        ));
+        return;
+    }
     MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.fetch_add(
         mcp_bridge_degraded_mode_skipped_entries(),
         Ordering::Relaxed,
@@ -269,6 +289,9 @@ async fn build_server_inner(
     let db_path = db_path.map(Arc::new);
     let response_delivery = Arc::new(FrameworkResponseDeliveryCoordinator::default());
 
+    // Resource registration is explicitly legacy-only as well as dispatch:
+    // dual-era registration rejects overlapping routes permitted by the
+    // existing 2024 resource specificity rules.
     let mut builder = framework_server_builder("wezterm-automata", crate::VERSION)
         // Delivery completion currently follows the sequential 2024 response
         // stream. Modern concurrent dispatch requires request-keyed authority.
@@ -335,39 +358,39 @@ async fn build_server_inner(
         .tool(FormatAwareToolHandler::new(WaMissionExplainTool::new(
             Arc::clone(&config),
         )))
-        .resource(WaPanesResource::new(
+        .legacy_resource(WaPanesResource::new(
             Arc::clone(&config),
             config.ingest.panes.clone(),
             db_path.clone(),
         ))
-        .resource(WaWorkflowsResource::new(Arc::clone(&config)))
-        .resource(WaAgentMailOutboxResource::new(Arc::clone(&config)))
-        .resource(WaHerdWaveResource)
-        .resource(WaMissionObjectivePlanTemplateResource)
-        .resource(WaOperatingEnvelopeCurrentResource)
-        .resource(WaOperatingEnvelopeRunTemplateResource)
-        .resource(WaAttentionCurrentResource)
-        .resource(WaAttentionItemTemplateResource)
-        .resource(WaSwarmScentResource::new(
+        .legacy_resource(WaWorkflowsResource::new(Arc::clone(&config)))
+        .legacy_resource(WaAgentMailOutboxResource::new(Arc::clone(&config)))
+        .legacy_resource(WaHerdWaveResource)
+        .legacy_resource(WaMissionObjectivePlanTemplateResource)
+        .legacy_resource(WaOperatingEnvelopeCurrentResource)
+        .legacy_resource(WaOperatingEnvelopeRunTemplateResource)
+        .legacy_resource(WaAttentionCurrentResource)
+        .legacy_resource(WaAttentionItemTemplateResource)
+        .legacy_resource(WaSwarmScentResource::new(
             Arc::clone(&config),
             db_path.clone(),
         ))
-        .resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config)))
-        .resource(WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(
+        .legacy_resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config)))
+        .legacy_resource(WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(
             &config,
         )))
-        .resource(WaSwarmCapacityCurrentResource)
-        .resource(WaSwarmCapacityRunTemplateResource)
-        .resource(WaRendererInputToPhotonResource)
-        .resource(WaRendererSsimParityResource)
-        .resource(WaProofHistoryResource::new(Arc::clone(&config)))
-        .resource(WaProofHistoryReleaseBlockingResource::new(Arc::clone(
+        .legacy_resource(WaSwarmCapacityCurrentResource)
+        .legacy_resource(WaSwarmCapacityRunTemplateResource)
+        .legacy_resource(WaRendererInputToPhotonResource)
+        .legacy_resource(WaRendererSsimParityResource)
+        .legacy_resource(WaProofHistoryResource::new(Arc::clone(&config)))
+        .legacy_resource(WaProofHistoryReleaseBlockingResource::new(Arc::clone(
             &config,
         )))
-        .resource(WaProofHistoryTemplateResource::new(Arc::clone(&config)))
-        .resource(WaAttestationRetractionsResource::new(Arc::clone(&config)))
-        .resource(WaRulesResource)
-        .resource(WaRulesByAgentTemplateResource);
+        .legacy_resource(WaProofHistoryTemplateResource::new(Arc::clone(&config)))
+        .legacy_resource(WaAttestationRetractionsResource::new(Arc::clone(&config)))
+        .legacy_resource(WaRulesResource)
+        .legacy_resource(WaRulesByAgentTemplateResource);
 
     if let Some(ref db_path) = db_path {
         builder = builder
@@ -549,16 +572,16 @@ async fn build_server_inner(
                 "wa.mission_abort",
                 Arc::clone(db_path),
             )))
-            .resource(WaEventsResource::new(Arc::clone(db_path)))
-            .resource(WaEventsTemplateResource::new(Arc::clone(db_path)))
-            .resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path)))
-            .resource(WaAccountsResource::new(Arc::clone(db_path)))
-            .resource(WaAccountsByServiceTemplateResource::new(Arc::clone(
+            .legacy_resource(WaEventsResource::new(Arc::clone(db_path)))
+            .legacy_resource(WaEventsTemplateResource::new(Arc::clone(db_path)))
+            .legacy_resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path)))
+            .legacy_resource(WaAccountsResource::new(Arc::clone(db_path)))
+            .legacy_resource(WaAccountsByServiceTemplateResource::new(Arc::clone(
                 db_path,
             )))
-            .resource(WaContextHorizonResource::new(Arc::clone(db_path)))
-            .resource(WaReservationsResource::new(Arc::clone(db_path)))
-            .resource(WaReservationsByPaneTemplateResource::new(Arc::clone(
+            .legacy_resource(WaContextHorizonResource::new(Arc::clone(db_path)))
+            .legacy_resource(WaReservationsResource::new(Arc::clone(db_path)))
+            .legacy_resource(WaReservationsByPaneTemplateResource::new(Arc::clone(
                 db_path,
             )));
     } else {
@@ -599,9 +622,15 @@ async fn build_server_inner(
 
     #[cfg(feature = "mcp-client")]
     {
-        builder =
-            super::mcp_proxy::compose_proxy_tools(cx, builder, config.as_ref(), db_path.clone())
-                .await?;
+        // Keep the remote connection/catalog state machine out of every
+        // enclosing startup future while polling it under the same owner.
+        builder = Box::pin(super::mcp_proxy::compose_proxy_tools(
+            cx,
+            builder,
+            config.as_ref(),
+            db_path.clone(),
+        ))
+        .await?;
     }
 
     let framework_server =
@@ -625,6 +654,15 @@ async fn build_server_inner(
     }
     let server = Server::new(framework_server, response_delivery);
 
+    // Startup can yield while composing remote catalogs. Recheck the owner
+    // before publishing the assembled server, including local-only fallback.
+    cx.checkpoint()
+        .map_err(|_| crate::error::Error::RuntimeOperation {
+            operation: "mcp_bridge.build_server",
+            source: crate::error::RuntimeOperationSource::Backend(
+                "MCP startup cancelled".to_string(),
+            ),
+        })?;
     Ok(server)
 }
 
@@ -656,22 +694,30 @@ pub async fn run_stdio_server(
     })
 }
 
-/// br-ft-kske1 + ft-0eby0: parent-visible mutex serializing every test
-/// that constructs a server (degraded or full). The
-/// `MCP_BRIDGE_TOOLS_SKIPPED_NO_DB` counter is process-global, so any
-/// test that calls `reset_..._for_test()` followed by
-/// `build_server_degraded` (or `build_server`) and asserts the
-/// post-build delta MUST hold this lock; otherwise a sibling test that
-/// builds a server in parallel can bump the counter between the reset
-/// and the post-build read, breaking exact-delta assertions. Lives at
-/// module scope (not inside `mod tests`) because the bumping tests in
-/// `crate::mcp::tests` — which build degraded servers too — must take
-/// the SAME lock; while it was tests-private they couldn't, and each of
-/// their builds injected +29 into this module's delta assertions.
+/// Counter fixture for synchronous test-thread startup. Its local counter
+/// prevents unrelated unguarded server builds from contaminating assertions;
+/// the retained lock also preserves existing test serialization contracts.
 #[cfg(test)]
-pub fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub struct McpBridgeCounterTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<u64>,
+}
+
+#[cfg(test)]
+impl Drop for McpBridgeCounterTestGuard {
+    fn drop(&mut self) {
+        TEST_DEGRADED_COUNTER.set(self.previous);
+    }
+}
+
+#[cfg(test)]
+pub fn mcp_bridge_counter_test_lock() -> McpBridgeCounterTestGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    McpBridgeCounterTestGuard {
+        _lock: lock,
+        previous: TEST_DEGRADED_COUNTER.replace(Some(0)),
+    }
 }
 
 #[cfg(test)]
@@ -883,6 +929,26 @@ mod tests {
             skipped_entries,
             "br-ft-647cj: explicit degraded startup must bump counter by {}",
             skipped_entries
+        );
+    }
+
+    /// An unrelated startup must not change the fixture's measured counter.
+    #[test]
+    fn degraded_counter_fixture_excludes_unguarded_parallel_startup() {
+        let _guard = mcp_bridge_counter_test_lock();
+        reset_mcp_bridge_tools_skipped_no_db_count_for_test();
+        std::thread::spawn(|| {
+            // Intentionally no fixture/lock: this models another test module
+            // constructing a server while the current test measures a delta.
+            let _server = build_server_degraded(&Config::default()).expect("unrelated startup");
+        })
+        .join()
+        .expect("unrelated startup completed");
+        assert_eq!(mcp_bridge_tools_skipped_no_db_count(), 0);
+        let _server = build_server_degraded(&Config::default()).expect("measured startup");
+        assert_eq!(
+            mcp_bridge_tools_skipped_no_db_count(),
+            mcp_bridge_degraded_mode_skipped_entries()
         );
     }
 

@@ -4,6 +4,9 @@
 //! - FTS query common patterns (DB ~100k captures):
 //!   - **p50 < 10ms**, **p99 < 50ms** (hard cap: < 50ms for common queries)
 
+// Storage appends traverse the owner-Cx and writer-response future layers.
+#![recursion_limit = "256"]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};

@@ -8,6 +8,7 @@ use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
     FrameworkTestClient, framework_create_memory_transport_pair,
 };
+use frankenterm_core::runtime_async::CompatRuntime;
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -18,11 +19,28 @@ struct ServerSnapshot {
     template_uris: BTreeSet<String>,
 }
 
-fn spawn_client(db_path: Option<PathBuf>) -> (FrameworkTestClient, ServerSnapshot) {
+struct ClientHarness {
+    client: FrameworkTestClient,
+    server_join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ClientHarness {
+    fn drop(&mut self) {
+        self.client.close();
+        if let Some(join) = self.server_join.take() {
+            let result = join.join();
+            if !std::thread::panicking() {
+                result.expect("MCP server thread must finish successfully");
+            }
+        }
+    }
+}
+
+fn spawn_client(db_path: Option<PathBuf>) -> (ClientHarness, ServerSnapshot) {
     let config = Config::default();
     let (snapshot_sender, snapshot_receiver) = std::sync::mpsc::sync_channel(1);
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
-    std::thread::spawn(move || {
+    let server_join = std::thread::spawn(move || {
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build MCP test runtime");
@@ -45,8 +63,24 @@ fn spawn_client(db_path: Option<PathBuf>) -> (FrameworkTestClient, ServerSnapsho
                 .expect("run MCP transport");
         });
     });
+    // Own cleanup before receiving metadata so startup failures also join.
+    let harness = ClientHarness {
+        client: FrameworkTestClient::new(client_transport),
+        server_join: Some(server_join),
+    };
     let snapshot = snapshot_receiver.recv().expect("receive MCP metadata");
-    (FrameworkTestClient::new(client_transport), snapshot)
+    (harness, snapshot)
+}
+
+#[test]
+fn client_harness_propagates_server_thread_failure() {
+    let (client_transport, _server_transport) = framework_create_memory_transport_pair();
+    let harness = ClientHarness {
+        client: FrameworkTestClient::new(client_transport),
+        server_join: Some(std::thread::spawn(|| panic!("server failure oracle"))),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(harness)));
+    assert!(result.is_err(), "server failure must fail the owning test");
 }
 
 fn tool_names(
@@ -72,7 +106,8 @@ fn template_uris(
 
 #[test]
 fn initialize_reports_expected_server_identity_and_instructions() {
-    let (mut client, _snapshot) = spawn_client(None);
+    let (mut harness, _snapshot) = spawn_client(None);
+    let client = &mut harness.client;
     let init = client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -98,7 +133,8 @@ proptest! {
         suffix in "[a-z0-9_-]{1,24}",
     ) {
         let db_path = use_db.then(|| PathBuf::from(format!("/tmp/ft-cod1-mcp-proto-{suffix}.sqlite3")));
-        let (mut client, snapshot) = spawn_client(db_path);
+        let (mut harness, snapshot) = spawn_client(db_path);
+        let client = &mut harness.client;
         client.initialize().expect("initialize in-memory MCP client");
 
         let listed = tool_names(client.list_tools().expect("list tools"));
@@ -112,7 +148,8 @@ proptest! {
         suffix in "[a-z0-9_-]{1,24}",
     ) {
         let db_path = use_db.then(|| PathBuf::from(format!("/tmp/ft-cod1-mcp-proto-res-{suffix}.sqlite3")));
-        let (mut client, snapshot) = spawn_client(db_path);
+        let (mut harness, snapshot) = spawn_client(db_path);
+        let client = &mut harness.client;
         client.initialize().expect("initialize in-memory MCP client");
 
         let listed_resources = resource_uris(client.list_resources().expect("list resources"));

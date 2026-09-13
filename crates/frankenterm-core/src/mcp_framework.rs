@@ -13,6 +13,9 @@ use crate::mcp_client::{
 
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[allow(unused_imports)]
+pub use fastmcp::legacy_2024::LegacyContent as FrameworkLegacyContent;
+#[cfg(any(feature = "mcp", feature = "mcp-client"))]
+#[allow(unused_imports)]
 pub use fastmcp::memory::create_memory_transport_pair as framework_create_memory_transport_pair;
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[allow(unused_imports)]
@@ -219,7 +222,7 @@ fn preserve_legacy_request_negotiation(message: &mut FrameworkJsonRpcMessage) {
     };
     if request.method == "initialized" {
         // The previous server explicitly accepted this legacy alias.
-        request.method = "notifications/initialized".to_owned();
+        "notifications/initialized".clone_into(&mut request.method);
     }
     let Some(params) = request
         .params
@@ -497,15 +500,6 @@ impl FrameworkDeliveryServer {
         self.inner.prompts()
     }
 
-    /// Run forever on an acknowledgment-capable transport using a root request context.
-    pub fn run_transport<T>(self, transport: T) -> !
-    where
-        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
-    {
-        let cx = crate::cx::for_request();
-        self.run_transport_with_cx(&cx, transport)
-    }
-
     /// Run forever on an acknowledgment-capable transport with an explicit context.
     pub fn run_transport_with_cx<T>(self, cx: &crate::cx::Cx, transport: T) -> !
     where
@@ -517,15 +511,6 @@ impl FrameworkDeliveryServer {
         )
     }
 
-    /// Run until the acknowledgment-capable transport closes, then return.
-    pub fn run_transport_returning<T>(self, transport: T)
-    where
-        T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
-    {
-        let cx = crate::cx::for_request();
-        self.run_transport_returning_with_cx(&cx, transport);
-    }
-
     /// Run with an explicit context until the transport closes, then return.
     pub fn run_transport_returning_with_cx<T>(
         self,
@@ -535,16 +520,10 @@ impl FrameworkDeliveryServer {
     where
         T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
     {
-        if let Err(error) = self.inner.run_transport_returning_with_cx(
+        self.inner.run_transport_returning_with_cx(
             cx,
             FrameworkDeliveryAwareTransport::new(transport, self.coordinator),
-        ) {
-            tracing::warn!(
-                target: "ft::mcp_framework",
-                code = ?error.code,
-                "MCP server transport reported an error"
-            );
-        }
+        )
     }
 }
 
@@ -601,9 +580,6 @@ pub(crate) struct OutboundFrameworkClient {
     ///      bound across every supported platform and synchronous transport.
     configured_response_timeout_ms: u64,
     connection_cx: crate::cx::Cx,
-    // Field order keeps the runtime alive while Client::drop settles its
-    // transport and subprocess. A connection may outlive its connect caller.
-    _runtime: asupersync::runtime::Runtime,
 }
 
 #[cfg(feature = "mcp-client")]
@@ -620,7 +596,7 @@ pub(crate) enum OutboundFrameworkError {
 #[cfg(feature = "mcp-client")]
 #[derive(serde::Deserialize)]
 struct LegacyClientToolResult {
-    content: Vec<LegacyClientContent>,
+    content: Vec<serde_json::Value>,
     #[serde(rename = "isError", default)]
     is_error: bool,
 }
@@ -658,10 +634,8 @@ struct LegacyClientResourceContent {
 }
 
 #[cfg(feature = "mcp-client")]
-fn map_legacy_client_content(
-    content: LegacyClientContent,
-) -> Result<McpClientContentItem, McpClientError> {
-    let content = match content {
+fn map_legacy_client_content(content: LegacyClientContent) -> FrameworkContent {
+    match content {
         LegacyClientContent::Text { text } => FrameworkContent::Text { text },
         LegacyClientContent::Image { data, mime_type } => {
             FrameworkContent::Image { data, mime_type }
@@ -677,38 +651,107 @@ fn map_legacy_client_content(
                 blob: resource.blob,
             },
         },
-    };
-    McpClientContentItem::from_framework(content)
+    }
 }
 
 #[cfg(feature = "mcp-client")]
 fn map_legacy_tool_result(
     result: serde_json::Value,
 ) -> Result<Vec<McpClientContentItem>, OutboundFrameworkError> {
-    let result: LegacyClientToolResult = serde_json::from_value(result).map_err(|error| {
-        OutboundFrameworkError::Transport(FrameworkMcpError::internal_error(format!(
-            "Failed to deserialize response: {error}"
-        )))
-    })?;
+    let invalid_result = || {
+        OutboundFrameworkError::Transport(FrameworkMcpError::internal_error(
+            "Invalid remote tool result payload",
+        ))
+    };
+    let result: LegacyClientToolResult =
+        serde_json::from_value(result).map_err(|_| invalid_result())?;
+    // Validate supported payload fields without projecting away annotations
+    // and extensions from the direct client's neutral DTO.
+    for content in &result.content {
+        let _: LegacyClientContent =
+            serde::Deserialize::deserialize(content).map_err(|_| invalid_result())?;
+    }
     if result.is_error {
         let message = result
             .content
             .first()
-            .and_then(|content| match content {
-                LegacyClientContent::Text { text } => Some(text.clone()),
-                _ => None,
+            .and_then(|content| {
+                if content.get("type")?.as_str()? == "text" {
+                    content.get("text")?.as_str().map(str::to_owned)
+                } else {
+                    None
+                }
             })
             .unwrap_or_else(|| "Tool execution failed".to_owned());
         return Err(OutboundFrameworkError::Transport(
             FrameworkMcpError::tool_error(message),
         ));
     }
-    result
+    Ok(result
         .content
         .into_iter()
-        .map(map_legacy_client_content)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(OutboundFrameworkError::Mapping)
+        .map(McpClientContentItem)
+        .collect())
+}
+
+#[cfg(feature = "mcp-client")]
+fn map_legacy_tool_response(
+    response: fastmcp::JsonRpcResponse,
+) -> Result<Vec<McpClientContentItem>, OutboundFrameworkError> {
+    map_legacy_tool_result(map_legacy_response_result(response)?)
+}
+
+#[cfg(feature = "mcp-client")]
+fn map_legacy_response_result(
+    response: fastmcp::JsonRpcResponse,
+) -> Result<serde_json::Value, OutboundFrameworkError> {
+    if let Some(error) = response.error {
+        // FastMCP's raw multiplexed response preserves the error envelope.
+        // Its private convenience converter maps canonical i32 codes directly
+        // and retains wider/noncanonical integers as diagnostic data. Apply
+        // that same boundary here without losing peer data or classification.
+        let peer_code = error.code;
+        let local_code = peer_code.as_i32();
+        let code = local_code
+            .map(FrameworkMcpErrorCode::from)
+            .unwrap_or(FrameworkMcpErrorCode::InternalError);
+        let data = if local_code.is_none_or(|local| peer_code.as_str() != local.to_string()) {
+            Some(serde_json::json!({
+                "jsonrpcErrorCode": peer_code.to_number(),
+                "jsonrpcErrorData": error.data,
+            }))
+        } else {
+            error.data
+        };
+        return Err(OutboundFrameworkError::Transport(FrameworkMcpError {
+            code,
+            message: error.message,
+            data,
+        }));
+    }
+    response.result.ok_or_else(|| {
+        OutboundFrameworkError::Transport(FrameworkMcpError::internal_error(
+            "No result in response",
+        ))
+    })
+}
+
+/// Measure retained catalog bytes without allocating another copy of a page.
+#[cfg(feature = "mcp-client")]
+struct CatalogByteBudget(usize);
+
+#[cfg(feature = "mcp-client")]
+impl std::io::Write for CatalogByteBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+            std::io::Error::other("Automatic pagination serialized-byte limit exceeded")
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "mcp-client")]
@@ -718,17 +761,11 @@ impl OutboundFrameworkClient {
         server: &ExternalServerConfig,
         settings: &McpClientConfig,
     ) -> Result<Self, FrameworkMcpError> {
-        let timeout = std::time::Duration::from_millis(settings.timeout_ms);
         let mut builder = FrameworkClientBuilder::new()
             .protocol_plan(FrameworkClientProtocolPlan::stdio(
                 FrameworkProtocolPolicy::LegacyOnly,
             ))
             .client_info("frankenterm-mcp-client", env!("CARGO_PKG_VERSION"))
-            // The prior client started with the 2024 initialize handshake.
-            // Preserve that startup instead of probing modern MCP first.
-            .protocol_plan(fastmcp::ClientProtocolPlan::stdio(
-                fastmcp::protocol_policy::ProtocolPolicy::LegacyOnly,
-            ))
             .request_timeout_policy(fastmcp::RequestTimeoutPolicy::from_application_timeout_ms(
                 settings.timeout_ms,
             )?)
@@ -742,26 +779,13 @@ impl OutboundFrameworkClient {
         }
 
         let args_ref: Vec<&str> = server.args.iter().map(String::as_str).collect();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|_| FrameworkMcpError::internal_error("MCP client runtime creation failed"))?;
-        // Raw Asupersync block_on restores both its runtime handle and Cx on
-        // return. The application CompatRuntime intentionally retains its TLS
-        // handle, so it cannot serve as a temporary nested connection driver.
-        let (client, connection_cx) = runtime.block_on(async {
-            let cx = crate::cx::Cx::current().ok_or_else(|| {
-                FrameworkMcpError::internal_error("MCP client runtime context is unavailable")
-            })?;
-            let client = builder
-                .connect_stdio_with_cx(&server.command, &args_ref, &cx)
-                .await?;
-            Ok::<_, FrameworkMcpError>((client, cx))
-        })?;
+        let client = builder
+            .connect_stdio_with_cx(&server.command, &args_ref, cx)
+            .await?;
         Ok(Self {
             inner: client,
             configured_response_timeout_ms: settings.timeout_ms,
-            connection_cx,
-            _runtime: runtime,
+            connection_cx: cx.clone(),
         })
     }
 
@@ -794,13 +818,75 @@ impl OutboundFrameworkClient {
     pub(crate) fn list_tool_definitions(
         &mut self,
     ) -> std::result::Result<Vec<McpClientToolDefinition>, OutboundFrameworkError> {
-        self.inner
-            .list_tools()
-            .map_err(OutboundFrameworkError::Transport)?
-            .into_iter()
-            .map(McpClientToolDefinition::from_framework)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(OutboundFrameworkError::Mapping)
+        use sha2::{Digest, Sha256};
+
+        // Use the same prefix-retaining ingress as tools/call. FastMCP 180a's
+        // sequential list adapter applies a strict read deadline to each 10ms
+        // scheduling slice, closing a healthy pipe when a frame is fragmented.
+        // Retain its exact legacy page type and automatic pagination bounds.
+        let invalid =
+            |message| OutboundFrameworkError::Transport(FrameworkMcpError::internal_error(message));
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut bytes = CatalogByteBudget(64 * 1_024 * 1_024);
+        for _ in 0..1_024 {
+            let mut execution = self
+                .inner
+                .start_yielding_stdio_request(
+                    "tools/list",
+                    Some(cursor.as_ref().map_or_else(
+                        || serde_json::json!({}),
+                        |cursor| serde_json::json!({"cursor": cursor}),
+                    )),
+                )
+                .map_err(OutboundFrameworkError::Transport)?;
+            let response = self
+                .inner
+                .wait_multiplexed_request(&self.connection_cx, &mut execution)
+                .map_err(OutboundFrameworkError::Transport)?;
+            let result = map_legacy_response_result(response)?;
+            let result_source = serde_json::to_string(&result)
+                .map_err(|_| invalid("Invalid remote tools/list result payload"))?;
+            let request = fastmcp::CoreRequest::Legacy(fastmcp::LegacyCoreRequest::ToolsList(
+                fastmcp::ListToolsParams::default(),
+            ));
+            let page = match request.decode_result(&result_source) {
+                Ok(fastmcp::CoreResult::Legacy(fastmcp::LegacyCoreResult::ToolsList(page))) => page,
+                _ => {
+                    // A result contradicting its negotiated core method is
+                    // terminal, just as in the framework's typed adapter.
+                    self.inner
+                        .close()
+                        .map_err(OutboundFrameworkError::Transport)?;
+                    return Err(invalid("Invalid remote tools/list result payload"));
+                }
+            };
+            if page.tools.len() > 100_000 - tools.len() {
+                return Err(invalid("Automatic pagination item limit exceeded"));
+            }
+            serde_json::to_writer(&mut bytes, &page.tools)
+                .map_err(|_| invalid("Automatic pagination serialized-byte limit exceeded"))?;
+            for tool in page.tools {
+                tools.push(
+                    McpClientToolDefinition::from_framework(tool)
+                        .map_err(OutboundFrameworkError::Mapping)?,
+                );
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(tools);
+            };
+            if next_cursor.len() > 4 * 1_024 {
+                return Err(invalid("Automatic pagination cursor byte limit exceeded"));
+            }
+            // Retain only fixed-size digests of opaque peer cursors. Never
+            // include their potentially sensitive contents in diagnostics.
+            if !seen_cursors.insert(Sha256::digest(next_cursor.as_bytes())) {
+                return Err(invalid("Automatic pagination cursor repeated"));
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(invalid("Automatic pagination page limit exceeded"))
     }
 
     /// Call a remote tool.
@@ -827,28 +913,12 @@ impl OutboundFrameworkClient {
             .inner
             .wait_multiplexed_request(&self.connection_cx, &mut execution)
             .map_err(OutboundFrameworkError::Transport)?;
-        let result = response.result.ok_or_else(|| {
-            OutboundFrameworkError::Transport(FrameworkMcpError::internal_error(
-                "No result in response",
-            ))
-        })?;
-        map_legacy_tool_result(result)
+        map_legacy_tool_response(response)
     }
 
-    /// br-ft-dnzum: gracefully terminate the stdio connection.
-    ///
-    /// Consumes the application wrapper, closes the framework transport and
-    /// reaps its subprocess while the connection's runtime is still alive.
-    /// The existing unit-returning API is retained; newly reported framework
-    /// cleanup errors are logged by code without exposing peer-controlled text.
-    pub(crate) fn shutdown(mut self) {
-        if let Err(error) = self.inner.close() {
-            tracing::warn!(
-                target: "ft::mcp_framework",
-                code = ?error.code,
-                "MCP client cleanup reported an error"
-            );
-        }
+    /// Close the connection and report whether owned subprocess cleanup succeeded.
+    pub(crate) fn shutdown(mut self) -> FrameworkMcpResult<()> {
+        self.inner.close()
     }
 }
 
@@ -856,46 +926,14 @@ impl OutboundFrameworkClient {
 pub(crate) fn project_legacy_proxy_content(
     content: McpClientContentItem,
 ) -> Result<FrameworkContent, McpClientError> {
-    use fastmcp::legacy_2024::{LegacyContent, LegacyResourceContent};
-
-    // The legacy ToolHandler return type cannot carry annotations or open
-    // metadata. Preserve its existing payload projection explicitly; the
-    // direct outbound client retains the complete JSON in its neutral DTO.
-    let content: LegacyContent = serde_json::from_value(content.0).map_err(|_| {
+    // This application's ToolHandler vocabulary includes audio and optional
+    // resource payloads. Validate all supported fields with the same schema
+    // as the direct client, then project only at this narrower return boundary.
+    // Annotations and extensions remain intact in the direct client's DTO.
+    let content: LegacyClientContent = serde_json::from_value(content.0).map_err(|_| {
         McpClientError::new("mcp_client.protocol", "Invalid remote legacy tool content")
     })?;
-    Ok(match content {
-        LegacyContent::Text { text, .. } => FrameworkContent::Text { text },
-        LegacyContent::Image {
-            data, mime_type, ..
-        } => FrameworkContent::Image { data, mime_type },
-        LegacyContent::Resource { resource, .. } => FrameworkContent::Resource {
-            resource: match resource {
-                LegacyResourceContent::Text {
-                    uri,
-                    text,
-                    mime_type,
-                    ..
-                } => fastmcp::ResourceContent {
-                    uri,
-                    mime_type,
-                    text: Some(text),
-                    blob: None,
-                },
-                LegacyResourceContent::Blob {
-                    uri,
-                    blob,
-                    mime_type,
-                    ..
-                } => fastmcp::ResourceContent {
-                    uri,
-                    mime_type,
-                    text: None,
-                    blob: Some(blob),
-                },
-            },
-        },
-    })
+    Ok(map_legacy_client_content(content))
 }
 
 #[cfg(feature = "mcp-client")]
@@ -925,17 +963,31 @@ pub(crate) fn discover_server_configs(
     // of discarding every server when the new fallible load_all encounters
     // one bad source.
     let mut merged = fastmcp::mcp_config::McpConfig::new();
+    let mut loaded_source = false;
+    let mut failed_source = false;
     for path in loader.search_paths() {
-        if path.exists() {
-            match fastmcp::mcp_config::McpConfig::from_file(path) {
-                Ok(config) => merged.merge(config),
-                Err(_) => tracing::warn!(
+        match fastmcp::mcp_config::McpConfig::from_file(path) {
+            Ok(config) => {
+                merged.merge(config);
+                loaded_source = true;
+            }
+            Err(fastmcp::mcp_config::ConfigError::NotFound(_)) => {}
+            Err(_) => {
+                failed_source = true;
+                tracing::warn!(
                     target: "ft::mcp_framework",
                     event = "mcp_framework_discovery_source_skipped",
                     "MCP discovery skipped an unreadable or malformed configuration source"
-                ),
+                );
             }
         }
+    }
+    if failed_source && !loaded_source {
+        return Err(McpClientError::new(
+            "mcp_client.discovery_failed",
+            "No enabled MCP discovery configuration could be read and parsed",
+        )
+        .with_hint("Check the syntax and permissions of configured MCP discovery files."));
     }
 
     let mut servers: Vec<ExternalServerConfig> = merged
@@ -1056,17 +1108,30 @@ mod server_compat_tests {
             Arc::new(FrameworkResponseDeliveryCoordinator::default()),
         );
         let (mut client, transport) = framework_create_memory_transport_pair();
-        let cx = crate::cx::for_testing();
-        let server_cx = cx.clone();
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel();
         let server_worker = std::thread::spawn(move || {
-            server.run_transport_returning_with_cx(&server_cx, transport);
+            use crate::runtime_async::CompatRuntime;
+            let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+                .build()
+                .expect("server test runtime");
+            runtime.block_on(async {
+                let cx = crate::cx::Cx::current().expect("runtime-owned server context");
+                owner_tx.send(cx.clone()).expect("test owner receiver");
+                server.run_transport_returning_with_cx(&cx, transport)
+            })
         });
+        let cx = owner_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server publishes its runtime owner");
         let operation_cx = cx.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let operation = std::thread::spawn(move || {
             exercise(&mut client, &operation_cx);
             client.close().expect("close client transport");
-            server_worker.join().expect("server loop returns on EOF");
+            server_worker
+                .join()
+                .expect("server loop returns on EOF")
+                .expect("server transport settlement succeeds");
             done_tx.send(()).expect("completion observer is present");
         });
         match done_rx.recv_timeout(std::time::Duration::from_secs(15)) {
@@ -1202,6 +1267,47 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn raw_tool_response_preserves_remote_error_classification_and_data() {
+        for code in [
+            super::FrameworkMcpErrorCode::InvalidParams,
+            super::FrameworkMcpErrorCode::ResourceForbidden,
+            super::FrameworkMcpErrorCode::Custom(-32_099),
+        ] {
+            let data = serde_json::json!(["peer diagnostic", {"retry": false}]);
+            let response = fastmcp::JsonRpcResponse::error(
+                Some(7.into()),
+                fastmcp::JsonRpcError {
+                    code: i32::from(code).into(),
+                    message: "remote rejected request".to_owned(),
+                    data: Some(data.clone()),
+                },
+            );
+            assert!(matches!(
+                super::map_legacy_tool_response(response),
+                Err(super::OutboundFrameworkError::Transport(error))
+                    if error.code == code
+                        && error.message == "remote rejected request"
+                        && error.data == Some(data)
+            ));
+        }
+        let response = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 7,
+            "error": {"code": 2_147_483_648_u64, "message": "wide code", "data": [1, 2]}
+        }))
+        .expect("valid wide JSON-RPC error code");
+        assert!(matches!(
+            super::map_legacy_tool_response(response),
+            Err(super::OutboundFrameworkError::Transport(error))
+                if error.code == super::FrameworkMcpErrorCode::InternalError
+                    && error.message == "wide code"
+                    && error.data == Some(serde_json::json!({
+                        "jsonrpcErrorCode": 2_147_483_648_u64,
+                        "jsonrpcErrorData": [1, 2],
+                    }))
+        ));
+    }
+
+    #[test]
     fn legacy_content_preserves_existing_client_and_proxy_projection() {
         use serde_json::json;
 
@@ -1231,8 +1337,9 @@ mod tests {
             }))
             .unwrap_or_else(|_| panic!("previously accepted tool-result shape"));
             let neutral = result.into_iter().next().expect("one content item");
-            assert_eq!(neutral.0, expected);
-            let proxy = neutral.into_framework().expect("existing proxy conversion");
+            assert_eq!(neutral.0, legacy_wire);
+            let proxy =
+                super::project_legacy_proxy_content(neutral).expect("application proxy conversion");
             assert_eq!(serde_json::to_value(proxy).unwrap(), expected);
         }
     }
@@ -1319,8 +1426,11 @@ mod tests {
                 "type": "resource", "resource": resource
             }))
             .expect("legacy optional null field");
-            let mapped = map_legacy_client_content(legacy).expect("null remains absent");
-            assert_eq!(mapped.0, json!({"type": "resource", "resource": ordinary}));
+            let mapped = map_legacy_client_content(legacy);
+            assert_eq!(
+                serde_json::to_value(mapped).expect("encode projection"),
+                json!({"type": "resource", "resource": ordinary})
+            );
         }
     }
 
@@ -1419,11 +1529,14 @@ mod tests {
         let paths = vec![first, malformed, missing, last];
         let settings = McpClientConfig {
             include_default_paths: false,
-            discovery_paths: paths.clone(),
+            discovery_paths: paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
             ..Default::default()
         };
 
-        let discovered = discover_server_configs(&settings);
+        let discovered = discover_server_configs(&settings).expect("valid discovery sources");
         assert_eq!(
             discovered.search_paths,
             paths
@@ -1571,6 +1684,7 @@ mod tests {
             serde_json::json!({"type": "image", "data": "YQ==", "mimeType": "image/png"}),
             serde_json::json!({"type": "resource", "resource": {"uri": "file:///a", "text": "hello"}}),
             serde_json::json!({"type": "resource", "resource": {"uri": "file:///a", "blob": "YQ=="}}),
+            serde_json::json!({"type": "resource", "resource": {"uri": "file:///a", "text": "hello", "blob": "YQ=="}}),
         ] {
             let mut annotated = payload.clone();
             annotated["annotations"] = serde_json::json!({"audience": ["user"]});
@@ -1595,6 +1709,18 @@ mod tests {
         .expect_err("an extension cannot substitute for required image data");
         assert_eq!(error.code, "mcp_client.protocol");
         assert!(!error.message.contains("private-remote-content"));
+        for resource in [
+            serde_json::json!({"uri": "file:///a", "text": "hello", "blob": 42}),
+            serde_json::json!({"uri": "file:///a", "blob": "YQ==", "text": 42}),
+        ] {
+            assert!(
+                super::project_legacy_proxy_content(McpClientContentItem(
+                    serde_json::json!({"type": "resource", "resource": resource}),
+                ))
+                .is_err(),
+                "open legacy members must still satisfy supported payload field types"
+            );
+        }
     }
 
     #[test]

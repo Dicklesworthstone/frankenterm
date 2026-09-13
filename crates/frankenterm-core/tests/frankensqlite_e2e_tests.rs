@@ -3,6 +3,9 @@
 //! Tests the full M0→M5 pipeline and rollback tiers using AppendLog source
 //! and mock target storage.
 
+// Recorder appends traverse the runtime's structured blocking-task wrappers.
+#![recursion_limit = "256"]
+
 use frankenterm_core::recorder_migration::{
     MigrationConfig, MigrationEngine, MigrationError, MigrationManifest,
 };

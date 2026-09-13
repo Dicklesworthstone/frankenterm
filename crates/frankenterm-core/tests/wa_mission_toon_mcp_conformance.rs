@@ -3,12 +3,14 @@
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
+    FrameworkLegacyContent, FrameworkTestClient, FrameworkTool,
+    framework_create_memory_transport_pair,
 };
 use frankenterm_core::plan::{
     ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
     MissionActorRole, MissionId, MissionLifecycleState, MissionOwnership, Outcome, StepAction,
 };
+use frankenterm_core::runtime_async::CompatRuntime;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -20,13 +22,40 @@ struct CwdGuard {
 
 impl Drop for CwdGuard {
     fn drop(&mut self) {
-        std::env::set_current_dir(&self.original_cwd).expect("restore original cwd");
+        let restored = std::env::set_current_dir(&self.original_cwd);
+        if std::thread::panicking() {
+            if let Err(error) = restored {
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("failed to restore original cwd during unwind: {error}\n"),
+                );
+            }
+        } else {
+            restored.expect("restore original cwd");
+        }
     }
+}
+
+#[test]
+fn cwd_restore_failure_preserves_active_panic() {
+    let directory = tempfile::tempdir().expect("test directory");
+    let missing = directory.path().join("missing");
+    let result = std::panic::catch_unwind(|| {
+        let _guard = CwdGuard {
+            original_cwd: missing,
+        };
+        panic!("original assertion failure");
+    });
+    let panic = result.expect_err("original assertion must remain a failure");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original assertion failure")
+    );
 }
 
 struct TestHarness {
     workspace: PathBuf,
-    client: FrameworkTestClient,
+    client: OwnedTestClient,
     _cwd_guard: CwdGuard,
 }
 
@@ -39,11 +68,42 @@ struct ToolContractCapture {
     boundary_invalid_params_error: String,
 }
 
-fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
+struct OwnedTestClient {
+    inner: FrameworkTestClient,
+    server_join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::ops::Deref for OwnedTestClient {
+    type Target = FrameworkTestClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for OwnedTestClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for OwnedTestClient {
+    fn drop(&mut self) {
+        self.inner.close();
+        if let Some(join) = self.server_join.take() {
+            let result = join.join();
+            if !std::thread::panicking() {
+                result.expect("MCP server thread must finish successfully");
+            }
+        }
+    }
+}
+
+fn spawn_client(db_path: Option<PathBuf>) -> OwnedTestClient {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
-    std::thread::spawn(move || {
+    let server_join = std::thread::spawn(move || {
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build MCP test runtime");
@@ -58,7 +118,10 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client = OwnedTestClient {
+        inner: FrameworkTestClient::new(client_transport),
+        server_join: Some(server_join),
+    };
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -70,11 +133,12 @@ fn new_harness() -> TestHarness {
     fs::create_dir_all(workspace.join(".ft/mission")).expect("create mission dir");
     let original_cwd = std::env::current_dir().expect("capture current cwd");
     std::env::set_current_dir(&workspace).expect("enter temp workspace");
+    let cwd_guard = CwdGuard { original_cwd };
     let client = spawn_client(Some(workspace.join("mcp.sqlite3")));
     TestHarness {
         workspace,
         client,
-        _cwd_guard: CwdGuard { original_cwd },
+        _cwd_guard: cwd_guard,
     }
 }
 
@@ -127,11 +191,11 @@ fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     );
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
+fn first_text_content(contents: &[FrameworkLegacyContent]) -> &str {
     contents
         .first()
         .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
+            FrameworkLegacyContent::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .expect("expected first MCP content to be text")
@@ -147,7 +211,7 @@ fn parse_toon_value(text: &str) -> Value {
     serde_json::from_str(&json_text).expect("TOON payload should stringify back to JSON")
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent], format: &str) -> Value {
+fn parse_tool_envelope(contents: &[FrameworkLegacyContent], format: &str) -> Value {
     let text = first_text_content(contents);
     if format == "json" {
         parse_json_value(text)

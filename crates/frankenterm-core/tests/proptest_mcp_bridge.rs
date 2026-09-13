@@ -6,7 +6,7 @@ use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
 use frankenterm_core::cx::Cx;
 use frankenterm_core::mcp_framework::FrameworkDeliveryServer;
-use frankenterm_core::runtime_async::RuntimeBuilder;
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;

@@ -3,9 +3,10 @@
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
+    FrameworkLegacyContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
     framework_create_memory_transport_pair,
 };
+use frankenterm_core::runtime_async::CompatRuntime;
 use frankenterm_core::wezterm::set_wezterm_cli_override;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -218,21 +219,23 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing manifest schema for {tool_name}"))
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
+fn first_text_content(contents: &[FrameworkLegacyContent]) -> &str {
     contents
         .first()
         .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
+            FrameworkLegacyContent::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .expect("expected first MCP content to be text")
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
+fn parse_tool_envelope(contents: &[FrameworkLegacyContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
+fn parse_invalid_args_response(
+    result: Result<Vec<FrameworkLegacyContent>, FrameworkMcpError>,
+) -> Value {
     match result {
         Ok(contents) => json!({
             "kind": "tool_envelope",

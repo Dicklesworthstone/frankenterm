@@ -4,6 +4,9 @@
 //! deduplication of duplicate batch IDs, corrupt record recovery,
 //! and migration manifest fixture validity.
 
+// Resolve the finite Send chain through the recorder's blocking runtime adapter.
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

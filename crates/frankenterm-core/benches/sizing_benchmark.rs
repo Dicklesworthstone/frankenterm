@@ -22,6 +22,9 @@
 //! | Large    | 1M         | ~7 days                                |
 //! | XLarge   | 10M        | ~70 days                               |
 
+// Storage appends traverse the owner-Cx and writer-response future layers.
+#![recursion_limit = "256"]
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};

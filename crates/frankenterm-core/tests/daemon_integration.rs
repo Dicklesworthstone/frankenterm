@@ -14,6 +14,9 @@
 //! - Temp databases with fixed ordering
 //! - No timing-based assertions
 
+// Capture persistence traverses the owner-Cx and guarded storage future layers.
+#![recursion_limit = "256"]
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankenterm_core::ingest::{

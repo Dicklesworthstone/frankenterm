@@ -3,7 +3,7 @@
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkDeliveryAcknowledgingTransport, FrameworkJsonRpcMessage,
+    FrameworkDeliveryAcknowledgingTransport, FrameworkJsonRpcMessage, FrameworkLegacyContent,
     FrameworkTestClient, FrameworkTool, FrameworkTransport, FrameworkTransportError,
     framework_create_memory_transport_pair,
 };
@@ -205,21 +205,21 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing manifest schema for {tool_name}"))
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
+fn first_text_content(contents: &[FrameworkLegacyContent]) -> &str {
     contents
         .first()
         .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
+            FrameworkLegacyContent::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .expect("expected first MCP content to be text")
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
+fn parse_tool_envelope(contents: &[FrameworkLegacyContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn parse_toon_tool_envelope(contents: &[FrameworkContent]) -> Value {
+fn parse_toon_tool_envelope(contents: &[FrameworkLegacyContent]) -> Value {
     let decoded =
         toon_rust::try_decode(first_text_content(contents), None).expect("decode TOON envelope");
     let json_text = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");

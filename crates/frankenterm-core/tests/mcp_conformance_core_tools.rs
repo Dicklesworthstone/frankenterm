@@ -5,8 +5,7 @@ use frankenterm_core::config::{
 };
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkMcpError, FrameworkResourceContent, FrameworkTestClient,
-    FrameworkTool, framework_create_memory_transport_pair,
+    FrameworkMcpError, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{FtsSyncConfig, PaneRecord, SearchOptions, StorageHandle};
@@ -538,30 +537,34 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing manifest schema for {tool_name}"))
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
-    contents
-        .first()
-        .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .expect("expected first MCP content to be text")
+fn first_text_content<T: serde::Serialize>(contents: &[T]) -> String {
+    let content = serde_json::to_value(contents.first().expect("expected MCP content"))
+        .expect("serialize received MCP content");
+    assert_eq!(
+        content["type"], "text",
+        "expected first MCP content to be text"
+    );
+    content["text"]
+        .as_str()
+        .expect("MCP text payload")
+        .to_owned()
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
-    serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
+fn parse_tool_envelope<T: serde::Serialize>(contents: &[T]) -> Value {
+    serde_json::from_str(&first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn parse_resource_envelope(contents: &[FrameworkResourceContent], expected_uri: &str) -> Value {
-    let content = contents.first().expect("expected one MCP resource content");
-    assert_eq!(content.uri, expected_uri);
-    assert_eq!(content.mime_type.as_deref(), Some("application/json"));
-    let text = content
-        .text
-        .as_deref()
+fn parse_resource_envelope<T: serde::Serialize>(contents: &[T], expected_uri: &str) -> Value {
+    let content =
+        serde_json::to_value(contents.first().expect("expected one MCP resource content"))
+            .expect("serialize received resource content");
+    assert_eq!(content["uri"], expected_uri);
+    assert_eq!(content["mimeType"], "application/json");
+    let text = content["text"]
+        .as_str()
         .expect("expected text resource content");
     assert!(
-        content.blob.is_none(),
+        content.get("blob").is_none_or(Value::is_null),
         "JSON resource should not include a blob"
     );
     serde_json::from_str(text).expect("parse JSON resource envelope")
@@ -573,16 +576,18 @@ fn parse_toon_value(text: &str) -> Value {
     serde_json::from_str(&json_text).expect("TOON payload should stringify back to JSON")
 }
 
-fn parse_tool_envelope_with_format(contents: &[FrameworkContent], format: &str) -> Value {
+fn parse_tool_envelope_with_format<T: serde::Serialize>(contents: &[T], format: &str) -> Value {
     let text = first_text_content(contents);
     if format == "toon" {
-        parse_toon_value(text)
+        parse_toon_value(&text)
     } else {
-        serde_json::from_str(text).expect("parse JSON envelope")
+        serde_json::from_str(&text).expect("parse JSON envelope")
     }
 }
 
-fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
+fn parse_invalid_args_response<T: serde::Serialize>(
+    result: Result<Vec<T>, FrameworkMcpError>,
+) -> Value {
     match result {
         Ok(contents) => json!({
             "kind": "tool_envelope",

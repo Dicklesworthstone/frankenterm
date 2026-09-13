@@ -22,6 +22,9 @@
 //! is intentionally severed; the parent crate's `lib.rs` no longer
 //! declares `pub mod tantivy_*`. Cargo cycle-free by construction.
 
+// Test fixtures append through the runtime's structured blocking-task wrappers.
+#![cfg_attr(test, recursion_limit = "256")]
+
 pub mod recorder_lexical_ingest;
 pub mod recorder_lexical_schema;
 pub mod tantivy_ingest;

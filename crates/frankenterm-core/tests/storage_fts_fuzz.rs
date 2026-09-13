@@ -26,6 +26,9 @@
 //!   (4) repeated calls with the same query are idempotent (same
 //!       `(segment_id, score)` list).
 
+// Storage writes traverse the owner-Cx and writer-response future layers.
+#![recursion_limit = "256"]
+
 use frankenterm_core::StorageError;
 use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, SearchResult, StorageHandle};

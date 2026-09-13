@@ -7,6 +7,9 @@
 //! - idle eviction scan time by pool size
 //! - connection factory (`DirectMuxClient::connect`) overhead
 
+// Mux acquisition and cancellation wrappers form a finite, deeply nested Send proof.
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::path::PathBuf;

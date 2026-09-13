@@ -529,11 +529,11 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
 mod tests {
     use super::{
         Config, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PROMPT_NOT_FOUND, ERR_PROTOCOL,
-        ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SERVER_NOT_FOUND,
-        ERR_SPAWN, ERR_TOOL_EXECUTION, ERR_UNSUPPORTED, ExternalServerConfig, FrameworkMcpError,
-        FrameworkMcpErrorCode, FtMcpClient, LOG_TARGET, McpClientConfig, McpClientContentItem,
-        McpClientError, McpClientToolDefinition, discover_servers, map_mcp_error,
-        report_server_outcome, select_server, select_server_via_bandit,
+        ERR_REQUEST_CANCELLED, ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED,
+        ERR_SERVER_NOT_FOUND, ERR_SPAWN, ERR_TOOL_EXECUTION, ERR_UNSUPPORTED, ExternalServerConfig,
+        FrameworkMcpError, FrameworkMcpErrorCode, FtMcpClient, LOG_TARGET, McpClientConfig,
+        McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
+        map_mcp_error, report_server_outcome, select_server, select_server_via_bandit,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;

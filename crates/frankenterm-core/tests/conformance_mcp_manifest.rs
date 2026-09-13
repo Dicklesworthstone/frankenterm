@@ -11,7 +11,7 @@ use frankenterm_core::config::Config;
 use frankenterm_core::cx::Cx;
 use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::FrameworkDeliveryServer;
-use frankenterm_core::runtime_async::RuntimeBuilder;
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;

@@ -1,3 +1,6 @@
+// IPC I/O and cancellation wrappers form a finite, deeply nested Send proof.
+#![recursion_limit = "256"]
+
 use frankenterm_core::degradation::ResizeDegradationTier;
 use frankenterm_core::resize_scheduler::{
     ResizeDomain, ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,

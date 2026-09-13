@@ -1,4 +1,6 @@
 #![cfg(feature = "recorder-lexical")]
+// Recorder appends traverse the runtime's structured blocking-task wrappers.
+#![recursion_limit = "256"]
 
 //! Cross-module integration tests for the Tantivy pipeline.
 //!

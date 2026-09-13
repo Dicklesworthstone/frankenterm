@@ -1,9 +1,13 @@
 #![cfg(feature = "mcp")]
+// The Cx-aware IPC future nests timeout/registry futures beyond the default
+// trait solver depth; retain compiler verification of its complete Send chain.
+#![recursion_limit = "256"]
 
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
+    FrameworkLegacyContent, FrameworkTestClient, FrameworkTool,
+    framework_create_memory_transport_pair,
 };
 use frankenterm_core::plan::{
     ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
@@ -11,6 +15,7 @@ use frankenterm_core::plan::{
     MissionTxState, Outcome, StepAction, TxCompensation, TxId, TxIntent, TxOutcome, TxPlan,
     TxPlanId, TxPrecondition, TxStep, TxStepId,
 };
+use frankenterm_core::runtime_async::CompatRuntime;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -22,7 +27,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 mod owned_mux;
 
 struct TestHarness {
-    client: FrameworkTestClient,
+    client: OwnedTestClient,
     #[cfg(all(unix, feature = "vendored"))]
     live: Option<LiveTxFixture>,
     workspace: tempfile::TempDir,
@@ -56,8 +61,35 @@ impl WorkspaceRootGuard {
 
 impl Drop for WorkspaceRootGuard {
     fn drop(&mut self) {
-        std::env::set_current_dir(&self.previous_cwd).expect("restore current dir");
+        let restored = std::env::set_current_dir(&self.previous_cwd);
+        if std::thread::panicking() {
+            if let Err(error) = restored {
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("failed to restore current dir during unwind: {error}\n"),
+                );
+            }
+        } else {
+            restored.expect("restore current dir");
+        }
     }
+}
+
+#[test]
+fn cwd_restore_failure_preserves_active_panic() {
+    let directory = tempfile::tempdir().expect("test directory");
+    let missing = directory.path().join("missing");
+    let result = std::panic::catch_unwind(|| {
+        let _guard = WorkspaceRootGuard {
+            previous_cwd: missing,
+        };
+        panic!("original assertion failure");
+    });
+    let panic = result.expect_err("original assertion must remain a failure");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original assertion failure")
+    );
 }
 
 fn workspace_root_lock() -> MutexGuard<'static, ()> {
@@ -67,10 +99,41 @@ fn workspace_root_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> FrameworkTestClient {
+struct OwnedTestClient {
+    inner: FrameworkTestClient,
+    server_join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::ops::Deref for OwnedTestClient {
+    type Target = FrameworkTestClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for OwnedTestClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for OwnedTestClient {
+    fn drop(&mut self) {
+        self.inner.close();
+        if let Some(join) = self.server_join.take() {
+            let result = join.join();
+            if !std::thread::panicking() {
+                result.expect("MCP server thread must finish successfully");
+            }
+        }
+    }
+}
+
+fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> OwnedTestClient {
     let config = config.clone();
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
-    std::thread::spawn(move || {
+    let server_join = std::thread::spawn(move || {
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build MCP test runtime");
@@ -85,7 +148,10 @@ fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> FrameworkTestClien
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client = OwnedTestClient {
+        inner: FrameworkTestClient::new(client_transport),
+        server_join: Some(server_join),
+    };
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -473,17 +539,17 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing manifest schema for {tool_name}"))
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
+fn first_text_content(contents: &[FrameworkLegacyContent]) -> &str {
     contents
         .first()
         .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
+            FrameworkLegacyContent::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .expect("expected first MCP content to be text")
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
+fn parse_tool_envelope(contents: &[FrameworkLegacyContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 

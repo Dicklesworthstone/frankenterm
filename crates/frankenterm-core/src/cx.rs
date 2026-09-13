@@ -45,6 +45,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+/// Type-level capability sets and their monotone runtime restriction masks.
+pub use asupersync::cx::{CapSet, CapSetRuntimeMask};
 pub use asupersync::runtime::{JoinHandle, Runtime, RuntimeConfig, RuntimeHandle, SpawnError};
 pub use asupersync::{Budget, Cx, Scope};
 

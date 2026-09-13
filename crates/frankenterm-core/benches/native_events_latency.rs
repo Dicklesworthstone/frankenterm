@@ -5,6 +5,9 @@
 //! - steady-state native event throughput
 //! - legacy Lua->CLI process-spawn baseline (approximation)
 
+// Listener I/O and cancellation wrappers form a finite, deeply nested Send proof.
+#![recursion_limit = "256"]
+
 use std::hint::black_box;
 use std::process::Command;
 use std::sync::Arc;

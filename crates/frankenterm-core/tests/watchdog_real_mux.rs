@@ -30,6 +30,8 @@
 //! cannot drive externally without going through real failures.
 
 #![cfg(feature = "asupersync-runtime")]
+// RSS checks traverse the runtime's structured blocking-task wrappers.
+#![recursion_limit = "256"]
 
 mod common;
 

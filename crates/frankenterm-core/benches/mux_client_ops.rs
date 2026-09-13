@@ -2,6 +2,8 @@
 //!
 //! Bead: ft-p48pw
 #![allow(clippy::large_futures)]
+// Mux connection setup traverses the owner-Cx and transport future layers.
+#![recursion_limit = "256"]
 
 use std::collections::HashMap;
 use std::hint::black_box;

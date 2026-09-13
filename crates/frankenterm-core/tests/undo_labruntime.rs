@@ -8,6 +8,8 @@
 //! Bead: ft-22x4r (Port existing async tests to LabRuntime)
 
 #![cfg(feature = "asupersync-runtime")]
+// Storage writes traverse the owner-Cx and writer-response future layers.
+#![recursion_limit = "256"]
 
 mod common;
 

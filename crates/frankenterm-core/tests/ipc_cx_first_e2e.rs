@@ -14,6 +14,8 @@
 //! stack coverage.
 
 #![cfg(all(unix, feature = "asupersync-runtime"))]
+// IPC I/O and cancellation wrappers form a finite, deeply nested Send proof.
+#![recursion_limit = "256"]
 
 use frankenterm_core::events::EventBus;
 use frankenterm_core::ipc::{

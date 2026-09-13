@@ -1,3 +1,6 @@
+// Storage appends traverse the owner-Cx and writer-response future layers.
+#![recursion_limit = "256"]
+
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use rusqlite::Connection;

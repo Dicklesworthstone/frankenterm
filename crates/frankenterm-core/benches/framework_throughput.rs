@@ -10,9 +10,9 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkMcpContext, FrameworkMcpResult, FrameworkServer,
-    FrameworkTestClient as FrameworkMcpTestClient, FrameworkTool, FrameworkToolHandler,
-    framework_create_memory_transport_pair,
+    FrameworkContent, FrameworkLegacyContent, FrameworkMcpContext, FrameworkMcpResult,
+    FrameworkServer, FrameworkTestClient as FrameworkMcpTestClient, FrameworkTool,
+    FrameworkToolHandler, framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::web_framework::{
@@ -215,7 +215,7 @@ impl McpBenchHarness {
             .call_tool("echo", json!({"message": message}))
             .expect("echo tool should succeed");
         match reply.first() {
-            Some(FrameworkContent::Text { text }) => text.len(),
+            Some(FrameworkLegacyContent::Text { text, .. }) => text.len(),
             other => panic!("unexpected echo response: {other:?}"),
         }
     }

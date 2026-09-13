@@ -8,6 +8,8 @@
 //! Bead: ft-22x4r
 
 #![cfg(all(feature = "asupersync-runtime", feature = "recorder-lexical"))]
+// Recorder appends traverse the runtime's structured blocking-task wrappers.
+#![recursion_limit = "256"]
 
 mod common;
 

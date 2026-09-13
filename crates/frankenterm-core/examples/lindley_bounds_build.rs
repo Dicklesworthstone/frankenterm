@@ -79,6 +79,10 @@
 //! Exit 0 alone is not release evidence or proof of an upper bound: the
 //! separate `exceeds_analytical_bound` field reports empirical exceedance.
 
+// Storage reads traverse a finite stack of blocking-task and cancellation
+// wrappers; their Send proof exceeds the default trait recursion depth.
+#![recursion_limit = "256"]
+
 use frankenterm_core::latency_stages::LindleyTelemetryModel;
 use frankenterm_core::network_calculus_bound::{LindleyBoundsArtifact, pipeline_delay_bound};
 use serde::Serialize;
@@ -222,7 +226,10 @@ mod live_measurement {
 
     #[cfg(all(unix, feature = "vendored"))]
     mod measured {
-        use super::super::*;
+        use super::super::{
+            Digest, JSON_BEGIN, JSON_END, LindleyBoundsArtifact, LindleyTelemetryModel, Read,
+            Serialize, Sha256, fs, optional_env, pipeline_delay_bound,
+        };
         use frankenterm_core::cx::Cx;
         use frankenterm_core::ingest::{CapturedSegmentKind, PaneCursor};
         use frankenterm_core::latency_stages::{LatencyStage, LindleyStageTelemetry};
@@ -280,7 +287,7 @@ mod live_measurement {
                 let result = frankenterm_core::runtime_async::timeout_with_cx(
                     cx,
                     remaining,
-                    read(),
+                    Box::pin(read()),
                 )
                 .await
                 .map_err(|error| {
@@ -392,7 +399,7 @@ mod live_measurement {
                 let result = frankenterm_core::runtime_async::timeout_with_cx(
                     &cx,
                     Duration::from_secs(2400),
-                    measure(&cx, &storage, &socket, pane_id, arrival_rate),
+                    Box::pin(measure(&cx, &storage, &socket, pane_id, arrival_rate)),
                 )
                 .await
                 .map_err(|error| format!("overall workload timeout: {error}"))
@@ -676,7 +683,9 @@ mod live_measurement {
                     .max()
                     .ok_or("empty calibration")?;
                 let rate = rows
-                    .chunks_exact(BURST)
+                    .as_chunks::<BURST>()
+                    .0
+                    .iter()
                     .map(|batch| {
                         let first = batch
                             .iter()
@@ -731,9 +740,10 @@ mod live_measurement {
                     .enumerate()
                     .take_while(|(_, start)| **start <= time)
                     .map(|(count, start)| {
-                        count as f64
-                            + model.service_rate_events_per_ms
-                                * (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0)
+                        model.service_rate_events_per_ms.mul_add(
+                            (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0),
+                            count as f64,
+                        )
                     })
                     .fold(f64::INFINITY, f64::min);
                 // s=t is also a candidate in the min-plus convolution.

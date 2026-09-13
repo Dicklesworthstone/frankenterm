@@ -6,6 +6,9 @@
 //! - negotiation_overhead
 //! - fallback_detection_latency
 
+// Mux connection setup traverses the owner-Cx and transport future layers.
+#![recursion_limit = "256"]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

@@ -4,6 +4,9 @@
 //! with a minimal RPC handler so the generated client surface is backed by a
 //! concrete control-plane transport rather than a render-time stub.
 
+// IPC I/O and cancellation wrappers form a finite, deeply nested Send proof.
+#![recursion_limit = "256"]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

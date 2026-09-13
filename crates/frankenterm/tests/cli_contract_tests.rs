@@ -15,10 +15,10 @@ use assert_cmd::Command;
 
 #[cfg(all(feature = "mcp", target_os = "linux"))]
 mod mcp_runtime_migration {
-    use asupersync::cx::cap::CapSetRuntimeMask;
     use frankenterm_core::config::McpClientConfig;
-    use frankenterm_core::cx::Cx;
+    use frankenterm_core::cx::{CapSet, CapSetRuntimeMask, Cx};
     use frankenterm_core::mcp_client::{ExternalServerConfig, FtMcpClient};
+    use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, yield_now};
 
     #[test]
     fn real_stdio_client_restores_caller_and_reaps_server() {
@@ -71,6 +71,9 @@ mod mcp_runtime_migration {
     }
 
     fn run_real_stdio_client_case(restricted: bool, workspace: std::path::PathBuf) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let config_path = workspace.join("ft.toml");
         let upstream_config_path = workspace.join("upstream.json");
         let upstream_pid_path = workspace.join("upstream.pid");
@@ -79,7 +82,7 @@ mod mcp_runtime_migration {
         // Controlled protocol peer, not a live external-service proof. Both
         // FtMcpClient connections and the real ft discovery/mount/audit/format
         // and RemoteProxyToolHandler paths run unchanged around this fixture.
-        let upstream_program = r#"
+        let upstream_program = r"
 import json, os, pathlib, sys
 pid_path, calls_path, closed_path = map(pathlib.Path, sys.argv[1:])
 pid_path.write_text(str(os.getpid()))
@@ -110,7 +113,7 @@ for line in sys.stdin:
         raise AssertionError(method)
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
 closed_path.write_text('stdin closed')
-"#;
+";
         std::fs::write(
             &upstream_config_path,
             serde_json::to_vec_pretty(&serde_json::json!({"mcpServers": {"fixture": {
@@ -119,7 +122,8 @@ closed_path.write_text('stdin closed')
             }}})).expect("upstream discovery configuration"),
         ).expect("write upstream discovery configuration");
         let mut server_config = frankenterm_core::config::Config::default();
-        server_config.storage.db_path = workspace.join("mcp-audit.db").display().to_string();
+        "mcp-audit.db".clone_into(&mut server_config.storage.db_path);
+        let audit_db_path = server_config.effective_db_path(&workspace);
         server_config.mcp_client = McpClientConfig {
             enabled: true,
             include_default_paths: false,
@@ -133,11 +137,18 @@ closed_path.write_text('stdin closed')
             ..Default::default()
         };
         server_config.validate().expect("valid proxy configuration");
-        std::fs::write(
-            &config_path,
-            toml::to_string(&server_config).expect("server TOML"),
-        )
-        .expect("write server configuration");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path)
+            .expect("create private server configuration")
+            .write_all(
+                toml::to_string(&server_config)
+                    .expect("server TOML")
+                    .as_bytes(),
+            )
+            .expect("write server configuration");
         let pid_path = workspace.join("server.pid");
         let server = ExternalServerConfig {
             name: "real-ft".to_owned(),
@@ -177,30 +188,33 @@ closed_path.write_text('stdin closed')
         caller_config
             .validate()
             .expect("accepted application configuration");
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("parent runtime");
         runtime.block_on(async {
             let original = Cx::current().expect("parent Cx");
-            type NoRemote = asupersync::cx::CapSet<true, true, true, true, false>;
-            type AllCapabilities = asupersync::cx::CapSet<true, true, true, true, true>;
+            type NoRemote = CapSet<true, true, true, true, false>;
+            type AllCapabilities = CapSet<true, true, true, true, true>;
             let mask = if restricted {
                 <NoRemote as CapSetRuntimeMask>::MASK
             } else {
                 <AllCapabilities as CapSetRuntimeMask>::MASK
             };
-            let restriction = Cx::push_restriction(mask);
             let installed = Cx::set_current(Some(original.clone()));
+            let restriction = Cx::push_restriction(mask);
             let parent = Cx::current().expect("restricted parent");
             assert_eq!(parent.capabilities().effective.remote, !restricted);
+            assert_eq!(Cx::is_restricted(), restricted);
             let assert_parent = || {
                 let current = Cx::current().expect("restored caller Cx");
                 assert_eq!(current.region_id(), parent.region_id());
                 assert_eq!(current.task_id(), parent.task_id());
                 assert_eq!(current.capabilities(), parent.capabilities());
+                assert_eq!(Cx::is_restricted(), restricted);
             };
 
-            let mut client = FtMcpClient::connect_external(server, &settings)
+            let mut client = FtMcpClient::connect_external(&parent, server, &settings)
+                .await
                 .expect("connect actual ft stdio server");
             assert_parent();
             let pid: u32 = std::fs::read_to_string(&pid_path)
@@ -246,7 +260,7 @@ closed_path.write_text('stdin closed')
             let audit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 let count = rusqlite::Connection::open_with_flags(
-                    &server_config.storage.db_path,
+                    &audit_db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 ).and_then(|connection| connection.query_row(
                     "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'mcp.remote/fixture/content' AND actor_kind = 'mcp' AND policy_decision = 'allow' AND result = 'success'",
@@ -259,7 +273,7 @@ closed_path.write_text('stdin closed')
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             assert_parent();
-            client.shutdown();
+            client.shutdown().expect("settle actual MCP subprocess cleanup");
             assert!(
                 !process_path.exists(),
                 "shutdown must reap the actual server"
@@ -274,15 +288,15 @@ closed_path.write_text('stdin closed')
             }
             assert_parent();
 
-            let child = asupersync::runtime::Runtime::current_handle()
+            let child = frankenterm_core::cx::Runtime::current_handle()
                 .expect("parent runtime handle restored")
                 .spawn(async {
-                    asupersync::runtime::yield_now().await;
+                    yield_now().await;
                     Cx::current().expect("ordinary child context").region_id()
                 });
             assert_eq!(child.await, parent.region_id());
-            drop(installed);
             drop(restriction);
+            drop(installed);
             let restored = Cx::current().expect("original parent restored");
             assert_eq!(restored.capabilities(), original.capabilities());
         });
@@ -1971,7 +1985,7 @@ fn setup_populated_workspace() -> (TempDir, String) {
 fn contract_doctor_cli_mcp_read_and_refresh_parity() {
     use frankenterm_core::mcp::build_server_with_db;
     use frankenterm_core::mcp_framework::{
-        FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
+        FrameworkTestClient, framework_create_memory_transport_pair,
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -2090,11 +2104,15 @@ printf '%s\n' '{"schemaVersion":"caut.v1","generatedAt":"2026-02-27T21:05:00Z","
         let contents = client
             .call_tool(tool, arguments)
             .expect("actual MCP dispatch");
+        let contents = serde_json::to_value(contents).expect("serialize actual MCP content");
         let text = contents
+            .as_array()
+            .expect("MCP content array")
             .iter()
-            .find_map(|item| match item {
-                FrameworkContent::Text { text } => Some(text.as_str()),
-                _ => None,
+            .find_map(|item| {
+                (item.get("type")?.as_str()? == "text")
+                    .then(|| item.get("text")?.as_str())
+                    .flatten()
             })
             .expect("MCP text envelope");
         let mut mcp: serde_json::Value = serde_json::from_str(text).unwrap();

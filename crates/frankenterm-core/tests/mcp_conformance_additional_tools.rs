@@ -6,8 +6,7 @@ use frankenterm_core::caut::set_caut_cli_override;
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
-    framework_create_memory_transport_pair,
+    FrameworkMcpError, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, StorageHandle};
@@ -304,21 +303,26 @@ fn manifest_tool_schema(tool_name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing manifest schema for {tool_name}"))
 }
 
-fn first_text_content(contents: &[FrameworkContent]) -> &str {
-    contents
-        .first()
-        .and_then(|content| match content {
-            FrameworkContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .expect("expected first MCP content to be text")
+fn first_text_content<T: serde::Serialize>(contents: &[T]) -> String {
+    let content = serde_json::to_value(contents.first().expect("expected MCP content"))
+        .expect("serialize received MCP content");
+    assert_eq!(
+        content["type"], "text",
+        "expected first MCP content to be text"
+    );
+    content["text"]
+        .as_str()
+        .expect("MCP text payload")
+        .to_owned()
 }
 
-fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
-    serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
+fn parse_tool_envelope<T: serde::Serialize>(contents: &[T]) -> Value {
+    serde_json::from_str(&first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
+fn parse_invalid_args_response<T: serde::Serialize>(
+    result: Result<Vec<T>, FrameworkMcpError>,
+) -> Value {
     match result {
         Ok(contents) => json!({
             "kind": "tool_envelope",

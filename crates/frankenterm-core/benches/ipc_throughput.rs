@@ -7,6 +7,9 @@
 //! - JSON serialization/deserialization overhead
 //! - connection establishment latency (accept + handler spawn)
 
+// IPC I/O and cancellation wrappers form a finite, deeply nested Send proof.
+#![recursion_limit = "256"]
+
 use std::hint::black_box;
 use std::io;
 use std::path::{Path, PathBuf};

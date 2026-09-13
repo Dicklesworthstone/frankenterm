@@ -1,16 +1,17 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
 
-use frankenterm_core::config::Config;
+use frankenterm_core::config::{Config, McpClientConfig};
 use frankenterm_core::cx::Cx;
+use frankenterm_core::mcp_client::{ExternalServerConfig, FtMcpClient, McpClientContentItem};
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkDeliveryServer, FrameworkTestClient,
+    FrameworkDeliveryServer, FrameworkLegacyContent, FrameworkTestClient,
     framework_create_memory_transport_pair,
 };
 use frankenterm_core::policy::{ActionKind, ActorKind, DecisionContext, PolicySurface};
-use frankenterm_core::runtime_async::RuntimeBuilder;
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
@@ -59,10 +60,22 @@ fn write_mock_proxy_server_script(dir: &Path) -> PathBuf {
     let script_path = dir.join("mock_proxy_server.py");
     let script = r#"#!/usr/bin/env python3
 import json
+import os
 import sys
+import time
 
-def send(payload):
-    sys.stdout.write(json.dumps(payload) + "\n")
+def send(payload, fragmented=False):
+    encoded = json.dumps(payload) + "\n"
+    if fragmented:
+        # A scheduling slice is 10ms; the application's deadline is 5s.
+        # Retain an incomplete JSON frame across several scheduling slices.
+        split = len(encoded) // 2
+        sys.stdout.write(encoded[:split])
+        sys.stdout.flush()
+        time.sleep(0.05)
+        sys.stdout.write(encoded[split:])
+    else:
+        sys.stdout.write(encoded)
     sys.stdout.flush()
 
 for raw in sys.stdin:
@@ -90,6 +103,25 @@ for raw in sys.stdin:
             }
         })
     elif method == "tools/list":
+        mode = os.environ.get("FT_TEST_FRAGMENTED_LIST")
+        if mode:
+            params = request.get("params") or {}
+            cursor = params.get("cursor")
+            assert "cursor" not in params or isinstance(cursor, str), params
+            assert cursor in (None, "second-page"), cursor
+            result = {
+                "tools": [{
+                    "name": "echo_second" if cursor else "echo",
+                    "description": "Echo input text",
+                    "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}
+                }]
+            }
+            if mode == "cross_era":
+                result["resultType"] = "complete"
+            elif cursor is None or mode == "cycle":
+                result["nextCursor"] = "second-page"
+            send({"jsonrpc": "2.0", "id": req_id, "result": result}, fragmented=True)
+            continue
         send({
             "jsonrpc": "2.0",
             "id": req_id,
@@ -154,6 +186,108 @@ for raw in sys.stdin:
 "#;
     std::fs::write(&script_path, script).expect("write mock proxy server script");
     script_path
+}
+
+#[test]
+fn outbound_mcp_fragmented_tool_pages_preserve_connection() {
+    fragmented_tool_pages_probe("pages");
+}
+
+#[test]
+fn outbound_mcp_fragmented_tool_cursor_cycle_is_rejected() {
+    fragmented_tool_pages_probe("cycle");
+}
+
+#[test]
+fn outbound_mcp_fragmented_tool_cross_era_result_is_rejected() {
+    fragmented_tool_pages_probe("cross_era");
+}
+
+fn fragmented_tool_pages_probe(mode: &str) {
+    assert!(
+        Command::new("python3")
+            .arg("--version")
+            .output()
+            .expect("fragmented stdio regression requires python3")
+            .status
+            .success()
+    );
+    let temp_dir = tempdir().expect("temp dir");
+    let script_path = write_mock_proxy_server_script(temp_dir.path());
+    let server = ExternalServerConfig {
+        name: "fragmented-pages".to_owned(),
+        command: "python3".to_owned(),
+        args: vec!["-u".to_owned(), script_path.display().to_string()],
+        env: HashMap::from([("FT_TEST_FRAGMENTED_LIST".to_owned(), mode.to_owned())]),
+        cwd: None,
+        disabled: false,
+    };
+    let settings = McpClientConfig {
+        enabled: true,
+        timeout_ms: 5_000,
+        ..McpClientConfig::default()
+    };
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("MCP client test runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("runtime-owned client context");
+        let mut client = FtMcpClient::connect_external(&cx, server, &settings)
+            .await
+            .expect("connect to fragmented stdio server");
+        if mode == "cross_era" {
+            let error = client
+                .list_tools()
+                .expect_err("legacy session must reject a cross-era result discriminator");
+            assert_ne!(error.code, "mcp_client.timeout");
+            assert!(
+                error.message.contains("tools/list"),
+                "typed result rejection must identify the failing operation: {error:?}"
+            );
+            client
+                .call_tool("echo", json!({"text": "after invalid result"}))
+                .expect_err("contradictory typed result must terminate the connection");
+            client.shutdown().expect("settle rejected server cleanup");
+            return;
+        }
+        if mode == "cycle" {
+            let error = client
+                .list_tools()
+                .expect_err("repeated cursor must stop pagination");
+            assert!(
+                error.message.to_ascii_lowercase().contains("cursor"),
+                "{error:?}"
+            );
+            assert_ne!(error.code, "mcp_client.timeout");
+        } else {
+            let tools = client.list_tools().expect("decode both fragmented pages");
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["echo", "echo_second"]
+            );
+            for tool in &tools {
+                assert_eq!(tool.description.as_deref(), Some("Echo input text"));
+                assert_eq!(
+                    tool.input_schema,
+                    json!({
+                        "type": "object", "properties": {"text": {"type": "string"}}
+                    })
+                );
+            }
+        }
+        let output = client
+            .call_tool("echo", json!({"text": "after pagination"}))
+            .expect("pagination must preserve the connection");
+        assert_eq!(
+            output.first().and_then(McpClientContentItem::as_text),
+            Some("after pagination")
+        );
+        client.shutdown().expect("settle fragmented server cleanup");
+    });
 }
 
 fn write_discovery_config(
@@ -379,7 +513,7 @@ fn proxy_routes_calls_to_remote_tools() {
     eprintln!("Proxied tool reply: {reply:?}");
     assert!(matches!(
         reply.first(),
-        Some(FrameworkContent::Text { text }) if text == "proxy-route-check"
+        Some(FrameworkLegacyContent::Text { text, .. }) if text == "proxy-route-check"
     ));
 }
 
@@ -430,7 +564,7 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
         .expect("invoke proxied remote tool");
     assert!(matches!(
         reply.first(),
-        Some(FrameworkContent::Text { text }) if text == secret_payload
+        Some(FrameworkLegacyContent::Text { text, .. }) if text == secret_payload
     ));
 
     let (input_summary, result, decision_context) =

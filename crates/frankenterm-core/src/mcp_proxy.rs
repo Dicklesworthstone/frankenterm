@@ -405,7 +405,17 @@ pub(super) async fn compose_proxy_tools(
         };
 
         let shared_client = Arc::new(Mutex::new(remote));
-        let tools = match list_remote_tools(&shared_client, &server_name) {
+        let catalog = list_remote_tools(&shared_client, &server_name);
+        // Catalog I/O uses the connection owner. Its cancellation must not
+        // become a successful local-only fallback or admit remote handlers.
+        cx.checkpoint()
+            .map_err(|_| crate::error::Error::RuntimeOperation {
+                operation: "mcp_proxy.catalog",
+                source: crate::error::RuntimeOperationSource::Backend(
+                    "MCP proxy startup cancelled".to_string(),
+                ),
+            })?;
+        let tools = match catalog {
             Ok(tools) => tools,
             Err(err) => {
                 if fail_fast {
@@ -1097,6 +1107,90 @@ mod tests {
             tags: Vec::new(),
             annotations: Some(serde_json::json!({"destructive": false, "readOnly": true})),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellation_during_catalog_fetch_cannot_become_local_only_fallback() {
+        let _guard = proxy_counter_test_lock();
+        let temp = tempfile::tempdir().expect("proxy cancellation fixture");
+        let requested = temp.path().join("catalog-requested");
+        let script = temp.path().join("catalog_server.py");
+        std::fs::write(
+            &script,
+            r#"import json, pathlib, sys, time
+for raw in sys.stdin:
+    request = json.loads(raw)
+    if "id" not in request:
+        continue
+    if request.get("method") == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {
+            "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "catalog-cancellation", "version": "1"}
+        }}), flush=True)
+    elif request.get("method") == "tools/list":
+        pathlib.Path(sys.argv[1]).touch()
+        time.sleep(10)
+"#,
+        )
+        .expect("write catalog server");
+        let discovery = temp.path().join("mcp-config.json");
+        std::fs::write(
+            &discovery,
+            serde_json::to_vec(&serde_json::json!({"mcpServers": {"remote": {
+                "command": "python3", "args": ["-u", script, requested]
+            }}}))
+            .expect("encode discovery"),
+        )
+        .expect("write discovery");
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.proxy_enabled = true;
+        config.mcp_client.proxy_strict = false;
+        config.mcp_client.proxy_fallback_to_local = true;
+        config.mcp_client.proxy_mount_all_discovered = true;
+        config.mcp_client.include_default_paths = false;
+        config.mcp_client.discovery_paths = vec![discovery.display().to_string()];
+        config.mcp_client.timeout_ms = 5_000;
+        config.mcp_client.max_retries = 0;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("proxy cancellation runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned startup context");
+            let cancelling_cx = cx.clone();
+            let cancel = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !requested.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let reached_catalog = requested.exists();
+                cancelling_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel while fetching catalog"),
+                );
+                reached_catalog
+            });
+            let result = super::compose_proxy_tools(
+                &cx,
+                crate::mcp_framework::framework_server_builder("cancellation-test", "1"),
+                &config,
+                Some(std::sync::Arc::new(temp.path().join("audit.db"))),
+            )
+            .await;
+            assert!(
+                cancel.join().expect("cancellation thread"),
+                "catalog request reached peer"
+            );
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::RuntimeOperation {
+                    operation: "mcp_proxy.catalog",
+                    ..
+                })
+            ));
+        });
     }
 
     #[test]

@@ -3,6 +3,9 @@
 //! Verifies that critical recorder/migration/rollback code paths emit structured
 //! tracing fields needed for observability and incident triage.
 
+// Recorder appends traverse the runtime's structured blocking-task wrappers.
+#![recursion_limit = "256"]
+
 use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, AppendResponse,
