@@ -3326,7 +3326,19 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
+        Self::settle_blocking_storage_read(
+            cx,
+            join_error_prefix,
+            crate::runtime_async::spawn_blocking_with_cx(cx, work).await,
+        )
+    }
+
+    fn settle_blocking_storage_read<T>(
+        cx: &crate::cx::Cx,
+        join_error_prefix: &'static str,
+        outcome: std::result::Result<Result<T>, SpawnBlockingWithCxError>,
+    ) -> Result<T> {
+        match outcome {
             Ok(result) => {
                 Self::checkpoint_storage_operation(cx, join_error_prefix)?;
                 result
@@ -3349,9 +3361,10 @@ impl StorageHandle {
     ///
     /// `CancelledBeforeSpawn` proves the closure never ran. Every other
     /// wrapper-level failure can occur after the closure started and therefore
-    /// has an indeterminate durable outcome. An authoritative closure result,
-    /// including success, is returned unchanged and is not overwritten by a
-    /// cancellation that races after completion.
+    /// has an indeterminate durable outcome. A closure result delivered by the
+    /// runtime, including success, is returned unchanged without a later
+    /// cancellation checkpoint. Closure completion alone does not prove result
+    /// delivery: cancellation can still win before publication is observed.
     async fn spawn_blocking_storage_mutation_with_cx<T, F>(
         cx: &crate::cx::Cx,
         operation: &'static str,
@@ -3361,7 +3374,17 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
+        Self::settle_blocking_storage_mutation(
+            operation,
+            crate::runtime_async::spawn_blocking_with_cx(cx, work).await,
+        )
+    }
+
+    fn settle_blocking_storage_mutation<T>(
+        operation: &'static str,
+        outcome: std::result::Result<Result<T>, SpawnBlockingWithCxError>,
+    ) -> Result<T> {
+        match outcome {
             Ok(result) => result,
             Err(error) => Err(Self::classify_blocking_storage_mutation_failure(
                 operation, error,
@@ -42036,44 +42059,80 @@ fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
 
 #[test]
 fn blocking_storage_read_and_mutation_have_distinct_cancel_boundaries() {
-    run_storage_async_test(async {
-        let read_cx = crate::cx::for_testing();
-        let cancel_read = read_cx.clone();
-        let read = StorageHandle::spawn_blocking_storage_with_cx_with_join_error(
-            &read_cx,
-            "test_read",
-            move || {
-                cancel_read.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("cancel completed synthetic read"),
-                );
-                Ok(7_u64)
-            },
-        )
-        .await;
-        assert!(
-            matches!(read, Err(crate::Error::Cancelled(_))),
-            "a completed read must not be admitted after its caller cancelled: {read:?}"
-        );
+    // Exercise the actual settlement boundary with results already published
+    // by the runtime. Cancelling inside a closure occurs before publication
+    // and can correctly produce an indeterminate mutation instead.
+    let cx = crate::cx::for_testing();
+    let read_outcome = Ok(Ok(7_u64));
+    let mutation_outcome = Ok(Ok(11_u64));
+    cx.cancel_with(
+        crate::outcome::CancelKind::User,
+        Some("cancel after authoritative result publication"),
+    );
+    let read = StorageHandle::settle_blocking_storage_read(&cx, "test_read", read_outcome);
+    assert!(
+        matches!(read, Err(crate::Error::Cancelled(_))),
+        "a completed read must not be admitted after its caller cancelled: {read:?}"
+    );
+    let mutation =
+        StorageHandle::settle_blocking_storage_mutation("synthetic_mutation", mutation_outcome);
+    assert_eq!(
+        mutation.expect("an authoritative mutation result must win a later cancellation"),
+        11
+    );
+    let live_cx = crate::cx::for_testing();
+    assert_eq!(
+        StorageHandle::settle_blocking_storage_read(&live_cx, "test_read", Ok(Ok(7_u64)))
+            .expect("an uncancelled read retains its published result"),
+        7
+    );
+}
 
-        let mutation_cx = crate::cx::for_testing();
-        let cancel_mutation = mutation_cx.clone();
-        let mutation = StorageHandle::spawn_blocking_storage_mutation_with_cx(
-            &mutation_cx,
-            "synthetic_mutation",
-            move || {
-                cancel_mutation.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("cancel completed synthetic mutation"),
-                );
-                Ok(11_u64)
-            },
+#[test]
+fn blocking_storage_mutation_cancel_before_result_publication_is_indeterminate() {
+    run_storage_async_test(async {
+        let cx = crate::cx::for_testing();
+        let helper_cx = cx.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let helper = crate::runtime_async::task::spawn(async move {
+            StorageHandle::spawn_blocking_storage_mutation_with_cx(
+                &helper_cx,
+                "held_mutation",
+                move || {
+                    let delivery_cx = crate::cx::for_request();
+                    let _ = started_tx.send_with_cx(&delivery_cx, ());
+                    let released = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                    let _ = finished_tx.send_with_cx(&delivery_cx, released.is_ok());
+                    Ok(11_u64)
+                },
+            )
+            .await
+        });
+        let started = crate::runtime_async::timeout(
+            std::time::Duration::from_secs(5),
+            crate::runtime_async::oneshot_recv(started_rx),
         )
         .await;
-        assert_eq!(
-            mutation.expect("an authoritative mutation result must win a later cancellation"),
-            11
-        );
+        cx.cancel_with(crate::outcome::CancelKind::User, Some("cancel held mutation"));
+        let outcome = crate::runtime_async::timeout(std::time::Duration::from_secs(5), helper).await;
+        // Release and observe the worker before asserting, including failure
+        // paths, so the test never leaves an intentionally blocked closure.
+        let _ = release_tx.send(());
+        let finished = crate::runtime_async::timeout(
+            std::time::Duration::from_secs(5),
+            crate::runtime_async::oneshot_recv(finished_rx),
+        )
+        .await;
+        started.expect("closure must start").expect("start signal");
+        assert!(finished.expect("closure must settle").expect("finish signal"));
+        assert!(matches!(
+            outcome.expect("cancelled await must settle").expect("helper task joins"),
+            Err(crate::Error::Storage(StorageError::IndeterminateMutation {
+                operation: "held_mutation"
+            }))
+        ));
     });
 }
 

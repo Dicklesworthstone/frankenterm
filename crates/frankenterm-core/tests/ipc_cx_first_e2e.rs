@@ -163,8 +163,24 @@ fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
             server.run_with_cx(&run_cx, event_bus, shutdown_rx).await;
         });
 
-        // Let the accept loop settle.
-        frankenterm_core::runtime_async::sleep(Duration::from_millis(50)).await;
+        // Prove that the real accept loop is serving before cancelling it.
+        // A scheduling delay alone can let cancellation precede server startup.
+        let response = frankenterm_core::runtime_async::timeout_with_cx(
+            &cx,
+            Duration::from_secs(5),
+            send_ping_request(&path),
+        )
+        .await
+        .expect("server must accept a ping before cancellation")
+        .expect("ping transport");
+        assert!(response.ok, "live server ping: {response:?}");
+        assert!(!server_task.is_finished(), "server must still be running");
+
+        // runtime_ipc_cx is also the test task's ambient context. Cancelling
+        // it must stop the server, not cancel the independent cleanup observer.
+        let cleanup_cx = frankenterm_core::cx::Cx::for_request_with_budget(
+            frankenterm_core::cx::Budget::INFINITE,
+        );
 
         // Cancel via cx only — no shutdown signal.
         let started = Instant::now();
@@ -173,10 +189,19 @@ fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
             Some("ft-xbnl0.2.3 e2e cx cancel"),
         );
 
-        frankenterm_core::runtime_async::timeout(Duration::from_secs(5), server_task)
-            .await
-            .expect("server join should not time out after cx cancel")
-            .expect("server task");
+        assert!(cx.checkpoint().is_err(), "server context is cancelled");
+        assert!(
+            cleanup_cx.checkpoint().is_ok(),
+            "cleanup context stays live"
+        );
+        frankenterm_core::runtime_async::timeout_with_cx(
+            &cleanup_cx,
+            Duration::from_secs(5),
+            server_task,
+        )
+        .await
+        .expect("server join should not time out after cx cancel")
+        .expect("server task");
         let elapsed = started.elapsed();
 
         // Cx cancel must propagate into accept loop shutdown-poll; the
