@@ -7,6 +7,10 @@
 //!
 //! Bead: wa-3cyp.2
 
+// Spawned pool-acquisition futures require a deeper Send proof than the
+// default 128 levels under the pinned compiler's trait solver.
+#![recursion_limit = "256"]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

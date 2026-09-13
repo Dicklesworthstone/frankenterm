@@ -22,6 +22,10 @@
 //! - spawn_blocking with heavy computation: values correct
 //! - Sleep non-negative: always completes (never panics)
 
+// Blocking-task and select futures require a deeper Send proof than the
+// default 128 levels under the pinned compiler's trait solver.
+#![recursion_limit = "256"]
+
 use proptest::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
