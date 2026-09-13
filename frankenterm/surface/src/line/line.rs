@@ -545,12 +545,14 @@ impl Line {
                 geometry_hash,
                 width,
                 cost_model,
+                None,
                 width_prefix_scratch,
             )
         } else {
             width_prefix_scratch.clear();
             LineWrapLayout {
                 tokens: Arc::from([]),
+                width_prefix: None,
                 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
                 geometry_hash: [0; 16],
                 break_offsets: Vec::new(),
@@ -2021,6 +2023,7 @@ pub struct LineWrapReport {
 #[derive(Debug, Clone)]
 pub struct LineWrapLayout {
     tokens: Arc<[Cell]>,
+    width_prefix: Option<Arc<LineWrapWidthPrefixScratch>>,
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
     geometry_hash: [u8; 16],
     break_offsets: Vec<usize>,
@@ -2030,6 +2033,22 @@ pub struct LineWrapLayout {
 }
 
 impl LineWrapLayout {
+    /// Retain width-independent geometry for repeated planning. Ordinary eager
+    /// wrapping keeps using caller-owned scratch and does not pay this storage
+    /// cost. Callers retaining a source must include this allocation in their
+    /// retention budget. The prefix is built from this source, never from
+    /// possibly stale scratch left by a memoized-plan hit.
+    pub fn retain_width_prefix(mut self) -> Self {
+        if self.blank.is_none() && self.width_prefix.is_none() {
+            let mut prefix = LineWrapWidthPrefixScratch {
+                widths: Vec::with_capacity(self.tokens.len().saturating_add(1)),
+            };
+            prefix.rebuild(&self.tokens);
+            self.width_prefix = Some(Arc::new(prefix));
+        }
+        self
+    }
+
     /// Plan another width from the same immutable token allocation. Content
     /// extraction and its geometry hash are independent of viewport width.
     pub fn replan(
@@ -2048,6 +2067,7 @@ impl LineWrapLayout {
             self.geometry_hash,
             width,
             cost_model,
+            self.width_prefix.clone(),
             scratch,
         )
     }
@@ -2088,6 +2108,9 @@ impl LineWrapLayout {
                 &self.tokens[start..stop],
                 stop < self.tokens.len(),
                 seqno,
+                self.width_prefix.as_ref().map_or(stop - start, |prefix| {
+                    prefix.width_between(start, stop).max(stop - start)
+                }),
             ));
         }
         lines
@@ -2112,6 +2135,7 @@ fn plan_wrap_tokens(
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))] geometry_hash: [u8; 16],
     width: usize,
     cost_model: MonospaceKpCostModel,
+    width_prefix: Option<Arc<LineWrapWidthPrefixScratch>>,
     scratch: &mut LineWrapWidthPrefixScratch,
 ) -> LineWrapLayout {
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -2124,28 +2148,35 @@ fn plan_wrap_tokens(
     if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
         return LineWrapLayout {
             tokens,
+            width_prefix,
             geometry_hash,
             break_offsets: cached.break_offsets,
             blank: None,
             scorecard: cached.scorecard,
         };
     }
-    scratch.rebuild(&tokens);
-    let plan = bounded_monospace_wrap_plan_with_width_prefix(&tokens, width, cost_model, scratch);
+    let prefix = match width_prefix.as_deref() {
+        Some(prefix) => prefix,
+        None => {
+            scratch.rebuild(&tokens);
+            &*scratch
+        }
+    };
+    let plan = bounded_monospace_wrap_plan_with_width_prefix(&tokens, width, cost_model, prefix);
     let selected = evaluate_break_offsets_with_width_prefix(
         &tokens,
         &plan.break_offsets,
         width,
         cost_model,
-        scratch,
+        prefix,
     );
-    let greedy_offsets = greedy_break_offsets_from_width_prefix(&tokens, width, scratch);
+    let greedy_offsets = greedy_break_offsets_from_width_prefix(&tokens, width, prefix);
     let greedy = evaluate_break_offsets_with_width_prefix(
         &tokens,
         &greedy_offsets,
         width,
         cost_model,
-        scratch,
+        prefix,
     );
     let scorecard = LineWrapScorecard {
         mode: plan.mode,
@@ -2168,6 +2199,7 @@ fn plan_wrap_tokens(
     );
     LineWrapLayout {
         tokens,
+        width_prefix,
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         geometry_hash,
         break_offsets: plan.break_offsets,
@@ -2717,6 +2749,7 @@ fn materialize_wrap_lines_from_tokens(
             &tokens[start..end],
             end < tokens.len(),
             seqno,
+            end - start,
         ));
         start = end;
     }
@@ -2728,8 +2761,15 @@ fn materialize_wrap_lines_from_tokens(
     lines
 }
 
-fn materialize_wrap_line(tokens: &[Cell], wrapped: bool, seqno: SequenceNo) -> Line {
-    let mut cells = Vec::new();
+fn materialize_wrap_line(
+    tokens: &[Cell],
+    wrapped: bool,
+    seqno: SequenceNo,
+    cell_capacity: usize,
+) -> Line {
+    // Retained geometry supplies the row's display width without another
+    // Unicode scan. Eager wrapping reserves at least one slot per token.
+    let mut cells = Vec::with_capacity(cell_capacity);
     for token in tokens {
         let grapheme = token.clone();
         let fill_count = grapheme.width().saturating_sub(1);
@@ -4435,6 +4475,58 @@ mod tests {
                 fresh.lines
             );
         }
+    }
+
+    #[test]
+    fn retained_width_prefix_ignores_stale_scratch_and_survives_replanning() {
+        for text in ["ascii text", "界面 e\u{301} 🚀 ffi אבג"] {
+            let source = Line::from_text(text, &CellAttributes::default(), 4, None);
+            let model = MonospaceKpCostModel::terminal_default();
+            let mut scratch = LineWrapWidthPrefixScratch::default();
+            // Prime memoization, then leave unrelated geometry in scratch.
+            let _ = source
+                .clone()
+                .plan_wrap_with_width_prefix_scratch(7, model, &mut scratch);
+            scratch.widths = vec![0, 99, 100];
+            let seed = source
+                .clone()
+                .plan_wrap_with_width_prefix_scratch(7, model, &mut scratch)
+                .retain_width_prefix();
+            let retained = seed.width_prefix.as_ref().unwrap().clone();
+            let again = seed.clone().retain_width_prefix();
+            assert!(Arc::ptr_eq(&retained, again.width_prefix.as_ref().unwrap()));
+            for width in [0, 1, 2, 3, 5, 7, 11, 19, 23] {
+                scratch.widths = vec![0, 999];
+                let layout = seed.replan(width, model, &mut scratch);
+                assert_eq!(scratch.widths, vec![0, 999]);
+                assert!(Arc::ptr_eq(
+                    &retained,
+                    layout.width_prefix.as_ref().unwrap()
+                ));
+                let fresh = source.clone().wrap_with_report(width, 9, model);
+                assert_eq!(layout.scorecard(), fresh.scorecard);
+                assert_eq!(
+                    layout.materialize_rows(0..layout.row_count(), 9),
+                    fresh.lines
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blank_wrap_source_does_not_retain_width_storage() {
+        let source = Line::from_text("   ", &CellAttributes::default(), 4, None);
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let layout = source
+            .clone()
+            .plan_wrap_with_width_prefix_scratch(
+                1,
+                MonospaceKpCostModel::terminal_default(),
+                &mut scratch,
+            )
+            .retain_width_prefix();
+        assert!(layout.width_prefix.is_none());
+        assert_eq!(layout.materialize_rows(0..1, 9), vec![source]);
     }
 
     // ── Line clone / eq ────────────────────────────────────

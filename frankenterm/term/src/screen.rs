@@ -1859,7 +1859,7 @@ struct CachedLogicalLine {
     wrap_source: Option<Arc<std::sync::OnceLock<LineWrapLayout>>>,
 }
 
-// Bound retained token and break-array slots while physical-row storage still
+// Bound retained token, width-prefix and break-array slots while physical-row storage still
 // coexists with logical content. This is not a bound on the entire terminal or
 // externally shared image/attribute payloads. Prefer recent history.
 const MAX_RETAINED_WRAP_TOKEN_BYTES: usize = 64 * 1024 * 1024;
@@ -2115,8 +2115,18 @@ impl LogicalLineWrapCache {
             .map(|line| {
                 let bytes = line
                     .len()
-                    .checked_mul(std::mem::size_of::<Cell>() + std::mem::size_of::<usize>())
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<LineWrapLayout>()));
+                    .checked_mul(
+                        std::mem::size_of::<Cell>()
+                            + std::mem::size_of::<usize>()
+                            + std::mem::size_of::<u128>(),
+                    )
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            std::mem::size_of::<LineWrapLayout>()
+                                + std::mem::size_of::<LineWrapWidthPrefixScratch>()
+                                + std::mem::size_of::<u128>(),
+                        )
+                    });
                 let wrap_source = bytes.filter(|bytes| *bytes <= remaining).map(|bytes| {
                     remaining -= bytes;
                     Arc::new(std::sync::OnceLock::new())
@@ -4142,11 +4152,13 @@ impl Screen {
 
         if let Some(retained) = logical_line.retained_wrap_source() {
             let source = retained.get_or_init(|| {
-                line.clone().plan_wrap_with_width_prefix_scratch(
-                    physical_cols,
-                    policy.kp_cost_model,
-                    width_prefix_scratch,
-                )
+                line.clone()
+                    .plan_wrap_with_width_prefix_scratch(
+                        physical_cols,
+                        policy.kp_cost_model,
+                        width_prefix_scratch,
+                    )
+                    .retain_width_prefix()
             });
             let layout = source.replan(physical_cols, policy.kp_cost_model, width_prefix_scratch);
             let scorecard = policy.scorecard_enabled.then(|| layout.scorecard());
@@ -8842,8 +8854,12 @@ pub(crate) mod tests {
         let first = Line::from_text("first", &CellAttributes::blank(), 1, None);
         let last = Line::from_text("last!", &CellAttributes::blank(), 1, None);
         let one_line_budget = first.len()
-            * (std::mem::size_of::<Cell>() + std::mem::size_of::<usize>())
-            + std::mem::size_of::<LineWrapLayout>();
+            * (std::mem::size_of::<Cell>()
+                + std::mem::size_of::<usize>()
+                + std::mem::size_of::<u128>())
+            + std::mem::size_of::<LineWrapLayout>()
+            + std::mem::size_of::<LineWrapWidthPrefixScratch>()
+            + std::mem::size_of::<u128>();
         let cache = LogicalLineWrapCache::with_token_budget(
             0,
             vec![first.clone(), last.clone()],
