@@ -1,6 +1,6 @@
 use crate::line::cellref::CellRef;
 use crate::line::clusterline::{ClusterLineCellIter, ClusteredLine};
-use crate::line::vecstorage::{VecStorage, VecStorageIter};
+use crate::line::vecstorage::{CellViewIter, VecStorage};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ pub(crate) enum CellStorage {
 }
 
 pub(crate) enum VisibleCellIter<'a> {
-    V(VecStorageIter<'a>),
+    V(CellViewIter<'a>),
     C(ClusterLineCellIter<'a>),
 }
 

@@ -20,11 +20,14 @@ pub(crate) struct VecStorage {
     cells: Arc<CellBuffer>,
 }
 
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "use_serde", derive(Deserialize))]
 #[cfg_attr(feature = "use_serde", serde(transparent))]
 #[derive(Clone)]
 struct CellBuffer {
     cells: Vec<Cell>,
+    #[cfg(feature = "std")]
+    #[cfg_attr(feature = "use_serde", serde(skip))]
+    deferred: Option<DeferredRow>,
     // All cell mutations pass through this type. Keeping the cache beside
     // the payload makes invalidation independent of callers' sequence numbers.
     #[cfg(feature = "std")]
@@ -37,10 +40,61 @@ struct CellBuffer {
     wrap_boundary: std::sync::OnceLock<bool>,
 }
 
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct DeferredRow {
+    tokens: Arc<[Cell]>,
+    range: core::ops::Range<usize>,
+    tail: Option<Cell>,
+    len: usize,
+    has_images: bool,
+    materialized: std::sync::OnceLock<Vec<Cell>>,
+}
+
+#[cfg(feature = "std")]
+impl DeferredRow {
+    fn iter(&self) -> TokenRowIter<'_> {
+        TokenRowIter {
+            cells: self.tokens[self.range.clone()].iter(),
+            tail: self.tail.as_ref(),
+            idx: 0,
+        }
+    }
+
+    fn build_cells(&self) -> Vec<Cell> {
+        let mut cells = Vec::with_capacity(self.len);
+        for token in self.iter() {
+            cells.push(token.as_cell());
+            for _ in 1..token.width() {
+                cells.push(Cell::blank_with_attrs(token.attrs().clone()));
+            }
+        }
+        cells
+    }
+}
+
+impl CellBuffer {
+    fn materialized(&self) -> &Vec<Cell> {
+        #[cfg(feature = "std")]
+        if let Some(row) = &self.deferred {
+            return row.materialized.get_or_init(|| row.build_cells());
+        }
+        &self.cells
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl Serialize for CellBuffer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Preserve the original transparent cell-array wire representation.
+        self.materialized().serialize(serializer)
+    }
+}
+
 impl core::fmt::Debug for VecStorage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VecStorage")
-            .field("cells", &self.cells.cells)
+            .field("cells", self.cells.materialized())
             .finish()
     }
 }
@@ -50,7 +104,7 @@ impl PartialEq for VecStorage {
         // Snapshot validation is normally comparing the same immutable cell
         // allocation. All edits detach through Arc::make_mut, so this skips a
         // full row scan without weakening equality after either side changes.
-        self.shares_cells_with(other) || self.cells.cells == other.cells.cells
+        self.shares_cells_with(other) || self.cells.materialized() == other.cells.materialized()
     }
 }
 
@@ -92,11 +146,80 @@ impl VecStorage {
             cells: Arc::new(CellBuffer {
                 cells,
                 #[cfg(feature = "std")]
+                deferred: None,
+                #[cfg(feature = "std")]
                 shape_hash: std::sync::OnceLock::new(),
                 #[cfg(feature = "std")]
                 wrap_boundary: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn from_token_range(
+        tokens: Arc<[Cell]>,
+        range: core::ops::Range<usize>,
+        wrapped: bool,
+    ) -> Self {
+        let slice = &tokens[range.clone()];
+        let mut len = 0usize;
+        let mut has_images = false;
+        for cell in slice {
+            len = len.checked_add(cell.width().max(1)).expect("row width overflow");
+            has_images |= cell.attrs().has_image_attachments();
+        }
+        let tail = if wrapped {
+            slice.last().map(|cell| {
+                let mut cell = cell.clone();
+                cell.attrs_mut().set_wrapped(true);
+                cell
+            })
+        } else {
+            None
+        };
+        Self {
+            cells: Arc::new(CellBuffer {
+                cells: Vec::new(),
+                deferred: Some(DeferredRow {
+                    tokens, range, tail, len, has_images,
+                    materialized: std::sync::OnceLock::new(),
+                }),
+                shape_hash: std::sync::OnceLock::new(),
+                wrap_boundary: std::sync::OnceLock::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        #[cfg(feature = "std")]
+        if let Some(row) = &self.cells.deferred {
+            return row.len;
+        }
+        self.cells.cells.len()
+    }
+
+    pub(crate) fn visible_cells(&self) -> CellViewIter<'_> {
+        #[cfg(feature = "std")]
+        if let Some(row) = &self.cells.deferred {
+            return CellViewIter::Tokens(row.iter());
+        }
+        CellViewIter::Physical(VecStorageIter {
+            cells: self.cells.cells.iter(), idx: 0, skip_width: 0,
+        })
+    }
+
+    pub(crate) fn has_image_attachments(&self) -> bool {
+        #[cfg(feature = "std")]
+        if let Some(row) = &self.cells.deferred {
+            return row.has_images;
+        }
+        // Include malformed spacer cells on the physical-storage path.
+        self.cells.cells.iter().any(|cell| cell.attrs().has_image_attachments())
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn is_deferred_unmaterialized(&self) -> bool {
+        self.cells.deferred.as_ref().is_some_and(|row| row.materialized.get().is_none())
     }
 
     pub(crate) fn cached_wrap_boundary(&self, compute: impl FnOnce() -> bool) -> bool {
@@ -137,11 +260,7 @@ impl VecStorage {
             // for different bits; retaining the first key bounds cache memory.
             return compute();
         }
-        let cacheable = !self
-            .cells
-            .cells
-            .iter()
-            .any(|cell| cell.attrs().has_image_attachments());
+        let cacheable = !self.has_image_attachments();
         let hash = compute();
         let _ = self
             .cells
@@ -154,6 +273,9 @@ impl VecStorage {
         let buffer = Arc::make_mut(&mut self.cells);
         #[cfg(feature = "std")]
         {
+            if let Some(mut row) = buffer.deferred.take() {
+                buffer.cells = row.materialized.take().unwrap_or_else(|| row.build_cells());
+            }
             buffer.shape_hash.take();
             buffer.wrap_boundary.take();
         }
@@ -164,7 +286,7 @@ impl VecStorage {
     pub(crate) fn set_cell(&mut self, idx: usize, mut cell: Cell, clear_image_placement: bool) {
         #[cfg(feature = "use_image")]
         if !clear_image_placement {
-            if let Some(images) = self.cells.cells[idx].attrs().images() {
+            if let Some(images) = self.cells.materialized()[idx].attrs().images() {
                 for image in images {
                     if image.has_placement_id() {
                         cell.attrs_mut().attach_image(Box::new(image));
@@ -199,7 +321,45 @@ impl core::ops::Deref for VecStorage {
     type Target = Vec<Cell>;
 
     fn deref(&self) -> &Vec<Cell> {
-        &self.cells.cells
+        self.cells.materialized()
+    }
+}
+
+pub(crate) enum CellViewIter<'a> {
+    Physical(VecStorageIter<'a>),
+    #[cfg(feature = "std")]
+    Tokens(TokenRowIter<'a>),
+}
+
+impl<'a> Iterator for CellViewIter<'a> {
+    type Item = CellRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Physical(iter) => iter.next(),
+            #[cfg(feature = "std")]
+            Self::Tokens(iter) => iter.next(),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+pub(crate) struct TokenRowIter<'a> {
+    cells: core::slice::Iter<'a, Cell>,
+    tail: Option<&'a Cell>,
+    idx: usize,
+}
+
+#[cfg(feature = "std")]
+impl<'a> Iterator for TokenRowIter<'a> {
+    type Item = CellRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let original = self.cells.next()?;
+        let cell = if self.cells.len() == 0 { self.tail.unwrap_or(original) } else { original };
+        let cell_index = self.idx;
+        self.idx += cell.width().max(1);
+        Some(CellRef::CellRef { cell_index, cell })
     }
 }
 

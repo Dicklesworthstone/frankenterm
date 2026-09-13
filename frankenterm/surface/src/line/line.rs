@@ -6,7 +6,7 @@ use crate::line::cellref::CellRef;
 use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
-use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
+use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage};
 use crate::{Change, SequenceNo, SEQ_ZERO};
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
@@ -639,9 +639,7 @@ impl Line {
     #[cfg(feature = "use_image")]
     pub fn has_image_attachments(&self) -> bool {
         match &self.cells {
-            CellStorage::V(cells) => cells
-                .iter()
-                .any(|cell| cell.attrs().has_image_attachments()),
+            CellStorage::V(cells) => cells.has_image_attachments(),
             CellStorage::C(line) => line.iter().any(|cell| cell.attrs().has_image_attachments()),
         }
     }
@@ -1645,11 +1643,7 @@ impl Line {
     /// as using .enumerate() on this iterator wouldn't be as useful.
     pub fn visible_cells<'a>(&'a self) -> impl Iterator<Item = CellRef<'a>> {
         match &self.cells {
-            CellStorage::V(cells) => VisibleCellIter::V(VecStorageIter {
-                cells: cells.iter(),
-                idx: 0,
-                skip_width: 0,
-            }),
+            CellStorage::V(cells) => VisibleCellIter::V(cells.visible_cells()),
             CellStorage::C(cl) => VisibleCellIter::C(cl.iter()),
         }
     }
@@ -2114,6 +2108,42 @@ impl LineWrapLayout {
             ));
         }
         lines
+    }
+
+    /// Construct physical row views sharing this logical source. Read-only
+    /// geometry, shaping and visible-cell iteration do not allocate cell arrays.
+    /// Mutations and contiguous-cell access materialize an independent row.
+    /// Serialization retains the eager representation. no_std stays eager.
+    pub fn deferred_rows(&self, rows: Range<usize>, seqno: SequenceNo) -> Vec<Line> {
+        #[cfg(feature = "std")]
+        {
+            static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let disabled = *DISABLED.get_or_init(|| {
+                std::env::var_os("FT_DISABLE_DEFERRED_REFLOW_CELLS")
+                    .is_some_and(|value| value == "1")
+            });
+            if !disabled && self.blank.is_none() {
+                let end = rows.end.min(self.row_count());
+                if rows.start >= end {
+                    return Vec::new();
+                }
+                return (rows.start..end)
+                    .map(|row| {
+                        let start = if row == 0 { 0 } else { self.break_offsets[row - 1] };
+                        let stop = self.break_offsets[row];
+                        Line {
+                            cells: CellStorage::V(VecStorage::from_token_range(
+                                Arc::clone(&self.tokens), start..stop, stop < self.tokens.len(),
+                            )),
+                            zones: Vec::new(), seqno, bits: LineBits::NONE,
+                            #[cfg(feature = "appdata")]
+                            appdata: Mutex::new(None),
+                        }
+                    })
+                    .collect();
+            }
+        }
+        self.materialize_rows(rows, seqno)
     }
 
     fn into_report(mut self, seqno: SequenceNo) -> LineWrapReport {
