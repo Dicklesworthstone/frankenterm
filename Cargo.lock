@@ -3714,7 +3714,7 @@ version = "0.1.3"
 dependencies = [
  "criterion",
  "k9",
- "phf 0.14.0",
+ "phf 0.13.1",
  "serde",
  "termwiz 0.24.0",
  "ucd-trie",
