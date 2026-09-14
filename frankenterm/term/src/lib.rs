@@ -100,9 +100,11 @@ pub type ScrollbackOrVisibleRowIndex = i32;
 /// which is the same value that that logical line had prior to data being purged
 /// out of the scrollback.
 ///
-/// As per ScrollbackOrVisibleRowIndex above, a StableRowIndex can never
-/// legally be a negative number.  We're just using a differently sized type
-/// to have the compiler assist us in detecting improper usage.
+/// Tiered cold-scrollback reflow can project rows before zero while retaining
+/// the resident frontier, so a negative StableRowIndex can be valid. Check the
+/// screen's reachable range and coordinate identity rather than the sign.
+/// The differently sized type helps catch mixing these coordinates with
+/// ScrollbackOrVisibleRowIndex.
 pub type StableRowIndex = isize;
 
 /// Returns true if r1 intersects r2
