@@ -9643,8 +9643,8 @@ pub(crate) mod tests {
             sink.requests.lock().unwrap().clear();
             let read = captured.hydrate(|| false).unwrap();
             assert_eq!(
-                *sink.requests.lock().unwrap(),
-                [row..row + 1],
+                sink.requests.lock().unwrap().as_slice(),
+                std::slice::from_ref(&(row..row + 1)),
                 "Busy after capture must not trigger a 65-group payload reindex"
             );
             assert_eq!(
