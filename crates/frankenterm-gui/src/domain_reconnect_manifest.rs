@@ -13,10 +13,10 @@ use cap_std::fs::DirBuilderExt as _;
 use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
 use cap_std::fs::{
     Dir as CapDir, DirBuilder as CapDirBuilder, File as CapFile, Metadata as CapMetadata,
+    OpenOptions as CapOpenOptions,
 };
 #[cfg(unix)]
-use cap_std::fs::{MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
-use cap_std::fs::{OpenOptions as CapOpenOptions, OpenOptionsExt as _};
+use cap_std::fs::{MetadataExt as CapUnixMetadataExt, OpenOptionsExt as _, PermissionsExt as _};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -391,9 +391,13 @@ fn open_or_create_directory_tree_durably(
     };
 
     if !exists {
-        let mut builder = CapDirBuilder::new();
+        let builder = CapDirBuilder::new();
         #[cfg(unix)]
-        builder.mode(0o700);
+        let builder = {
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
         match parent.create_dir_with(name, &builder) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -442,6 +446,8 @@ fn validate_private_file(
     metadata: &CapMetadata,
     directory: &CapDir,
 ) -> Result<(), DomainReconnectManifestError> {
+    #[cfg(not(unix))]
+    let _ = directory;
     if !metadata.is_file() {
         return Err(DomainReconnectManifestError::UnsafeFile {
             reason: "authority path is not a regular file",
@@ -588,6 +594,8 @@ fn validate_opened_name(
 }
 
 fn sync_directory(directory: &CapDir) -> Result<(), DomainReconnectManifestError> {
+    #[cfg(not(unix))]
+    let _ = directory;
     #[cfg(unix)]
     directory
         .open(".")
