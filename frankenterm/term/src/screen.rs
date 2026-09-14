@@ -3929,6 +3929,9 @@ impl Screen {
     /// observation. The caller must hold terminal ownership and supply its
     /// current sequence. Cold rows and ambiguous gaps in wrapped rows require
     /// a separate source-bound history projection and are not certified here.
+    /// Points are [origin, range start, range end] in the original drag order;
+    /// both range endpoints must be present or both absent. Endpoint roles
+    /// determine the meaning of BeforeZero when a physical row is unwrapped.
     pub fn capture_selection_anchor(
         &mut self,
         source_sequence: SequenceNo,
@@ -3937,6 +3940,7 @@ impl Screen {
         if !self.allow_scrollback
             || source_sequence == SequenceNo::MAX
             || points.iter().all(Option::is_none)
+            || points[1].is_some() != points[2].is_some()
             || points[0].is_some_and(|point| point.column.is_none())
             || (points[1] == points[2] && points[1].is_some_and(|point| point.column.is_none()))
             || !self.selection_anchor_points_are_resident(&points)
@@ -6181,6 +6185,20 @@ impl Screen {
         verified: Option<VerifiedPreparedResize>,
         selection_anchors: &mut SelectionAnchorRegistry,
     ) -> (usize, PhysRowIndex) {
+        self.invalidate_coordinate_witnesses();
+        let started = Instant::now();
+        let old_cols = self.physical_cols;
+        let original_len = self.lines.len();
+        // Profiling-only stage attribution. Enable with
+        // RUST_LOG=frankenterm_term::screen::reflow_profile=debug.
+        // No extra clock reads are performed when this target is disabled.
+        let profile_start =
+            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
+                .then(Instant::now);
+        let logical_cursor = verified.as_ref().map_or_else(
+            || self.logical_cursor_from_physical(cursor_x, cursor_y),
+            |prepared| prepared.logical_cursor,
+        );
         // These are the live points at commit, never the worker snapshot's
         // points. Mapping reads only row lengths/wrap flags, not cell payloads.
         let logical_anchors: Vec<_> = selection_anchors
@@ -6208,20 +6226,6 @@ impl Screen {
                 })
             })
             .collect();
-        self.invalidate_coordinate_witnesses();
-        let started = Instant::now();
-        let old_cols = self.physical_cols;
-        let original_len = self.lines.len();
-        // Profiling-only stage attribution. Enable with
-        // RUST_LOG=frankenterm_term::screen::reflow_profile=debug.
-        // No extra clock reads are performed when this target is disabled.
-        let profile_start =
-            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
-                .then(Instant::now);
-        let logical_cursor = verified.as_ref().map_or_else(
-            || self.logical_cursor_from_physical(cursor_x, cursor_y),
-            |prepared| prepared.logical_cursor,
-        );
         let cursor_elapsed = profile_start.map(|start| start.elapsed());
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
             if let Some(mut verified) = verified {
@@ -8439,6 +8443,24 @@ pub(crate) mod tests {
     fn selection_anchor_registry_is_bounded_and_reclaims_retired_tokens() {
         let mut screen = test_screen(1, 12, 96);
         let points = [anchor_point(0, 0); 3];
+        for malformed in [
+            [points[0], points[1], None],
+            [points[0], None, points[2]],
+            [
+                None,
+                Some(SelectionAnchorCoordinate {
+                    row: 0,
+                    column: None,
+                }),
+                None,
+            ],
+        ] {
+            assert!(screen.capture_selection_anchor(1, malformed).is_none());
+        }
+        assert!(
+            screen.selection_anchors.0.is_empty(),
+            "malformed tuples must not consume registry capacity"
+        );
         let tokens: Vec<_> = (0..16)
             .map(|_| screen.capture_selection_anchor(1, points).unwrap())
             .collect();
