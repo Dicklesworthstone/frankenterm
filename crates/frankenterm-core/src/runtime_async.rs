@@ -9827,6 +9827,7 @@ mod tests {
         struct ObservedReactor {
             inner: std::sync::Arc<dyn Reactor>,
             armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            suppress_wakes: std::sync::atomic::AtomicBool,
             long_poll: std::sync::mpsc::SyncSender<u64>,
             poll_returns: std::sync::atomic::AtomicU64,
             long_poll_generation: std::sync::atomic::AtomicU64,
@@ -9869,31 +9870,77 @@ mod tests {
                 result
             }
             fn wake(&self) -> std::io::Result<()> {
-                self.inner.wake()
+                if self
+                    .suppress_wakes
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Ok(())
+                } else {
+                    self.inner.wake()
+                }
             }
             fn registration_count(&self) -> usize {
                 self.inner.registration_count()
             }
         }
 
-        for mode in ["raw", "sleep", "interruptible", "timeout"] {
+        struct TimerWake(std::sync::mpsc::SyncSender<()>);
+        impl std::task::Wake for TimerWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                let _ = self.0.try_send(());
+            }
+        }
+
+        struct RestoreReactorWake(std::sync::Arc<ObservedReactor>);
+        impl Drop for RestoreReactorWake {
+            fn drop(&mut self) {
+                self.0
+                    .suppress_wakes
+                    .store(false, std::sync::atomic::Ordering::Release);
+                let _ = self.0.inner.wake();
+            }
+        }
+
+        for mode in [
+            "raw",
+            "sleep",
+            "interruptible",
+            "timeout",
+            "raw-single",
+            "raw-muted",
+        ] {
             let (long_poll_tx, long_poll_rx) = std::sync::mpsc::sync_channel(1);
-            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
             let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let reactor = std::sync::Arc::new(ObservedReactor {
                 inner: asupersync::runtime::reactor::create_reactor().expect("native reactor"),
                 armed: std::sync::Arc::clone(&armed),
+                suppress_wakes: std::sync::atomic::AtomicBool::new(false),
                 long_poll: long_poll_tx,
                 poll_returns: std::sync::atomic::AtomicU64::new(0),
                 long_poll_generation: std::sync::atomic::AtomicU64::new(0),
             });
             let runtime = asupersync::runtime::RuntimeBuilder::new()
-                .worker_threads(2)
+                // The matched single-worker positive/negative pair excludes
+                // any second worker pumping timers while the leader is parked.
+                .worker_threads(if matches!(mode, "raw-single" | "raw-muted") {
+                    1
+                } else {
+                    2
+                })
                 .with_reactor(reactor.clone())
                 .build()
-                .expect("two-worker native runtime");
-            let task = runtime.handle().spawn(async move {
+                .expect("native runtime");
+            let _restore_reactor_wake = RestoreReactorWake(reactor.clone());
+            // Keep scheduler workers available. A worker that blocks on
+            // a synchronous channel may strand its peer in follower parking,
+            // where shared timer deadlines deliberately do not wake it.
+            // This caller-polled body never yields to block_on's executor:
+            // only the native runtime workers can pump the timer wheel.
+            runtime.block_on(async {
                 let cx = crate::cx::Cx::current().expect("scheduler context");
                 let driver = cx.timer_driver().expect("scheduler timer driver");
                 // Registering the timer wakes the peer reactor immediately.
@@ -9904,95 +9951,128 @@ mod tests {
                     driver.now() + Duration::from_secs(5),
                     std::task::Waker::noop().clone(),
                 );
-                // Intentionally hold this worker while its peer selects the
-                // long timer. This channel does not wake the reactor.
-                let released = release_rx.recv_timeout(Duration::from_secs(3));
-                if released.is_ok() {
-                    let started = std::time::Instant::now();
-                    let result = match mode {
-                        "sleep" => sleep_with_cx(&cx, Duration::from_millis(20)).await,
-                        "interruptible" => {
-                            sleep_with_cx_interruptible(&cx, Duration::from_millis(20))
-                                .await
-                                .map_err(|error| error.to_string())
-                        }
-                        "timeout" => match timeout_with_cx_typed(
-                            &cx,
-                            Duration::from_millis(20),
-                            std::future::pending::<()>(),
-                        )
-                        .await
-                        {
-                            Err(TimeoutError::Elapsed) => Ok(()),
-                            other => Err(format!("unexpected timeout result: {other:?}")),
-                        },
-                        "raw" => {
-                            // Exercise the dependency's own reactor notification
-                            // without the bridge's extra scheduler wake.
-                            asupersync::time::budget_sleep(
+                let observation_started = std::time::Instant::now();
+                let parked = loop {
+                    let Some(remaining) =
+                        Duration::from_secs(2).checked_sub(observation_started.elapsed())
+                    else {
+                        break Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+                    };
+                    if let Err(error) = long_poll_rx.recv_timeout(remaining) {
+                        break Err(error);
+                    }
+                    // The bounded channel coalesces notifications; use the
+                    // latest generation and reject any poll that returned
+                    // because a startup wake was still in flight.
+                    let generation = reactor
+                        .long_poll_generation
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    std::thread::sleep(Duration::from_millis(20));
+                    if reactor
+                        .poll_returns
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == generation
+                    {
+                        reactor
+                            .armed
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        break Ok(generation);
+                    }
+                };
+                if let Err(error) = parked {
+                    let _ = driver.cancel(&later);
+                    reactor.wake().expect("wake reactor after setup failure");
+                    panic!(
+                        "{mode}: reactor must enter the long wait before short-timer publication: {error}"
+                    );
+                }
+                let parked_generation = parked.expect("checked parked observation");
+                reactor
+                    .suppress_wakes
+                    .store(mode == "raw-muted", std::sync::atomic::Ordering::Release);
+                let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+                let waker = std::task::Waker::from(std::sync::Arc::new(TimerWake(wake_tx)));
+                let mut context = std::task::Context::from_waker(&waker);
+                let started = std::time::Instant::now();
+                let completed = {
+                    let timer = async {
+                        match mode {
+                            "sleep" => sleep_with_cx(&cx, Duration::from_millis(20)).await,
+                            "interruptible" => {
+                                sleep_with_cx_interruptible(&cx, Duration::from_millis(20))
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            }
+                            "timeout" => match timeout_with_cx_typed(
                                 &cx,
                                 Duration::from_millis(20),
-                                driver.now(),
+                                std::future::pending::<()>(),
                             )
                             .await
-                            .map_err(|error| error.to_string())
+                            {
+                                Err(TimeoutError::Elapsed) => Ok(()),
+                                other => Err(format!("unexpected timeout result: {other:?}")),
+                            },
+                            "raw" | "raw-single" | "raw-muted" => {
+                                // Exercise the dependency's own reactor notification
+                                // without the bridge's extra scheduler wake.
+                                asupersync::time::budget_sleep(
+                                    &cx,
+                                    Duration::from_millis(20),
+                                    driver.now(),
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
+                            }
+                            _ => unreachable!("fixed test cases"),
                         }
-                        _ => unreachable!("fixed test cases"),
                     };
-                    let _ = done_tx.send((result, started.elapsed()));
-                }
-                let _ = driver.cancel(&later);
-            });
-            let observation_started = std::time::Instant::now();
-            loop {
-                let remaining = Duration::from_secs(2)
-                    .checked_sub(observation_started.elapsed())
-                    .expect("reactor must establish its parked long wait within two seconds");
-                let _notification = long_poll_rx
-                    .recv_timeout(remaining)
-                    .expect("reactor must enter the long wait before short-timer publication");
-                // The bounded channel coalesces notifications; its atomic
-                // generation identifies the latest announced long poll.
-                let generation = reactor
-                    .long_poll_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
-                // Confirm that this native poll has not already returned due
-                // to an unrelated startup notification. Re-observe a new poll
-                // if it has, before publishing any short timer at all.
-                std::thread::sleep(Duration::from_millis(20));
-                if reactor
+                    let mut timer = std::pin::pin!(timer);
+                    loop {
+                        if let std::task::Poll::Ready(result) = timer.as_mut().poll(&mut context) {
+                            break Ok(result);
+                        }
+                        let Some(remaining) =
+                            Duration::from_secs(1).checked_sub(started.elapsed())
+                        else {
+                            break Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+                        };
+                        if let Err(error) = wake_rx.recv_timeout(remaining) {
+                            break Err(error);
+                        }
+                    }
+                };
+                let elapsed = started.elapsed();
+                let final_generation = reactor
                     .poll_returns
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    == generation
-                {
-                    reactor
-                        .armed
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    break;
+                    .load(std::sync::atomic::Ordering::Acquire);
+                // Drop the short timer and cancel the long registration before
+                // teardown; always restore native wake delivery, even when
+                // setup or the bounded acceptance wait failed.
+                let _ = driver.cancel(&later);
+                reactor
+                    .suppress_wakes
+                    .store(false, std::sync::atomic::Ordering::Release);
+                reactor.wake().expect("wake reactor for bounded cleanup");
+                if mode == "raw-muted" {
+                    assert!(matches!(
+                        completed,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    assert!(elapsed >= Duration::from_secs(1));
+                    assert_eq!(
+                        final_generation, parked_generation,
+                        "negative control must leave the native reactor parked"
+                    );
+                } else {
+                    let result = completed.unwrap_or_else(|error| {
+                        panic!("{mode}: short timer must interrupt the long reactor wait: {error}")
+                    });
+                    assert!(result.is_ok(), "budget sleep failed: {result:?}");
+                    assert!(elapsed >= Duration::from_millis(20));
+                    assert!(elapsed < Duration::from_secs(1));
                 }
-            }
-            release_tx.send(()).expect("release short-timer publisher");
-            let completed = done_rx.recv_timeout(Duration::from_secs(1));
-            // Explicitly wake the real reactor to drain a failed timer;
-            // neither teardown nor a five-second timer is the test watchdog.
-            reactor.wake().expect("wake reactor for bounded cleanup");
-            if completed.is_err() {
-                let (result, _) = done_rx
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("forced reactor wake must drain the pending timer");
-                assert!(result.is_ok());
-            }
-            drop(task);
-            drop(runtime);
-            // Asupersync 0.5 also wakes registered reactors directly when a
-            // new earlier timer is published. Raw sleep is now a positive
-            // acceptance case for that dependency contract.
-            let (result, elapsed) = completed.unwrap_or_else(|error| {
-                panic!("{mode}: short timer must interrupt the long reactor wait: {error}")
             });
-            assert!(result.is_ok(), "budget sleep failed: {result:?}");
-            assert!(elapsed >= Duration::from_millis(20));
-            assert!(elapsed < Duration::from_secs(1));
         }
     }
 
