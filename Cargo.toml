@@ -576,7 +576,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
 wasmtime = { version = "48.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "47.0.4", default-features = false, features = ["p1"] }
+wasmtime-wasi = { version = "48.0.2", default-features = false, features = ["p1"] }
 
 # Benchmarking
 criterion = "0.8.2"
