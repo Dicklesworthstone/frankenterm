@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 extern crate alloc;
 use alloc::vec::Vec;
 
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    pub(super) static DEFERRED_METADATA_TOKEN_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HyperlinkCellMatch {
     pub(crate) cell_indices: Vec<usize>,
@@ -170,11 +175,38 @@ impl VecStorage {
         let mut len = 0usize;
         let mut has_images = false;
         for cell in slice {
+            #[cfg(test)]
+            DEFERRED_METADATA_TOKEN_VISITS.with(|count| count.set(count.get() + 1));
             len = len
                 .checked_add(cell.width().max(1))
                 .expect("row width overflow");
             has_images |= cell.attrs().has_image_attachments();
         }
+        Self::from_token_range_metadata(tokens, range, wrapped, len, has_images)
+    }
+
+    /// The caller must derive the width and image absence from these exact
+    /// immutable tokens, never from a geometry-cache key or unrelated scratch.
+    #[cfg(feature = "std")]
+    pub(super) fn from_image_free_token_range(
+        tokens: Arc<[Cell]>,
+        range: core::ops::Range<usize>,
+        wrapped: bool,
+        len: usize,
+    ) -> Self {
+        assert!(len >= range.len(), "row width must include every token");
+        Self::from_token_range_metadata(tokens, range, wrapped, len, false)
+    }
+
+    #[cfg(feature = "std")]
+    fn from_token_range_metadata(
+        tokens: Arc<[Cell]>,
+        range: core::ops::Range<usize>,
+        wrapped: bool,
+        len: usize,
+        has_images: bool,
+    ) -> Self {
+        let slice = &tokens[range.clone()];
         let tail = if wrapped {
             slice.last().map(|cell| {
                 let mut cell = cell.clone();

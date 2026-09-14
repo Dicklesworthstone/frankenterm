@@ -548,7 +548,14 @@ impl Line {
         cost_model: MonospaceKpCostModel,
         width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
     ) -> LineWrapLayout {
-        let mut cells: Vec<CellRef> = self.visible_cells().collect();
+        #[cfg(feature = "std")]
+        let mut image_free = true;
+        let cells = self.visible_cells();
+        #[cfg(feature = "std")]
+        let cells = cells.inspect(|cell| {
+            image_free &= !cell.attrs().has_image_attachments();
+        });
+        let mut cells: Vec<CellRef> = cells.collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -566,13 +573,16 @@ impl Line {
                         (tokens, range.start..end)
                     }
                     None => {
+                        #[cfg(feature = "std")]
+                        let tokens: Arc<[Cell]> = cells.iter().map(CellRef::as_cell).collect();
+                        #[cfg(not(feature = "std"))]
                         let tokens: Arc<[Cell]> =
                             cells.into_iter().map(|cell| cell.as_cell()).collect();
                         let end = tokens.len();
                         (tokens, 0..end)
                     }
                 };
-            plan_wrap_tokens(
+            let layout = plan_wrap_tokens(
                 tokens,
                 token_range,
                 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -581,7 +591,17 @@ impl Line {
                 cost_model,
                 None,
                 width_prefix_scratch,
-            )
+            );
+            #[cfg(feature = "std")]
+            let layout = {
+                let mut layout = layout;
+                layout.image_free = image_free;
+                if image_free {
+                    layout.row_widths = layout.row_widths_from_cells(&cells);
+                }
+                layout
+            };
+            layout
         } else {
             width_prefix_scratch.clear();
             LineWrapLayout {
@@ -591,6 +611,10 @@ impl Line {
                 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
                 geometry_hash: [0; 16],
                 break_offsets: Vec::new(),
+                #[cfg(feature = "std")]
+                row_widths: None,
+                #[cfg(feature = "std")]
+                image_free: false,
                 blank: Some(self),
                 scorecard: LineWrapScorecard {
                     mode: MonospaceWrapMode::Fallback,
@@ -2164,21 +2188,68 @@ pub struct LineWrapLayout {
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
     geometry_hash: [u8; 16],
     break_offsets: Vec<usize>,
+    // Initial plans derive exact row widths from their current CellRef
+    // endpoints, including on memoized geometry hits. Retention discards this
+    // temporary array and uses the source-bound width prefix instead.
+    #[cfg(feature = "std")]
+    row_widths: Option<Vec<usize>>,
+    #[cfg(feature = "std")]
+    image_free: bool,
     // Preserve the existing all-whitespace behavior, including line metadata.
     blank: Option<Line>,
     scorecard: LineWrapScorecard,
 }
 
 impl LineWrapLayout {
+    #[cfg(feature = "std")]
+    fn row_widths_from_cells(&self, cells: &[CellRef<'_>]) -> Option<Vec<usize>> {
+        if cells.len() != self.token_range.len()
+            || self.break_offsets.last().copied() != Some(cells.len())
+        {
+            return None;
+        }
+        // Line::visible_cells guarantees consecutive physical positions:
+        // vector and token iterators advance by max(width, 1), while clustered
+        // cells have normalized widths of one or two. Use the current source's
+        // endpoints, not widths cached for another line with the same hash.
+        let mut widths = Vec::with_capacity(self.break_offsets.len());
+        let mut start = 0;
+        for &stop in &self.break_offsets {
+            if stop <= start || stop > cells.len() {
+                return None;
+            }
+            let first = &cells[start];
+            let last = &cells[stop - 1];
+            let width = last
+                .cell_index()
+                .checked_add(last.width().max(1))?
+                .checked_sub(first.cell_index())?;
+            if width < stop - start {
+                return None;
+            }
+            widths.push(width);
+            start = stop;
+        }
+        Some(widths)
+    }
+
     /// Retain width-independent geometry for repeated planning. Ordinary eager
     /// wrapping keeps using caller-owned scratch and does not pay this storage
     /// cost. Callers retaining a source must include this allocation in their
     /// retention budget. The prefix is built from this source, never from
     /// possibly stale scratch left by a memoized-plan hit.
     pub fn retain_width_prefix(mut self) -> Self {
+        #[cfg(feature = "std")]
+        {
+            // Release temporary row widths before allocating the retained
+            // prefix. Zero-width sources keep the scan fallback.
+            self.row_widths = None;
+        }
         if self.blank.is_none() && self.width_prefix.is_none() {
             let mut prefix = LineWrapWidthPrefixScratch {
                 widths: Vec::with_capacity(self.token_range.len().saturating_add(1)),
+                #[cfg(feature = "std")]
+                all_widths_positive: false,
             };
             prefix.rebuild(&self.tokens[self.token_range.clone()]);
             self.width_prefix = Some(Arc::new(prefix));
@@ -2198,7 +2269,7 @@ impl LineWrapLayout {
             scratch.clear();
             return self.clone();
         }
-        plan_wrap_tokens(
+        let layout = plan_wrap_tokens(
             Arc::clone(&self.tokens),
             self.token_range.clone(),
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -2207,7 +2278,14 @@ impl LineWrapLayout {
             cost_model,
             self.width_prefix.clone(),
             scratch,
-        )
+        );
+        #[cfg(feature = "std")]
+        let layout = {
+            let mut layout = layout;
+            layout.image_free = self.image_free;
+            layout
+        };
+        layout
     }
 
     pub fn row_count(&self) -> usize {
@@ -2279,12 +2357,35 @@ impl LineWrapLayout {
                             self.break_offsets[row - 1]
                         };
                         let stop = self.break_offsets[row];
-                        Line {
-                            cells: CellStorage::V(VecStorage::from_token_range(
+                        let range = self.token_range.start + start..self.token_range.start + stop;
+                        let exact_width = self
+                            .image_free
+                            .then(|| {
+                                self.row_widths
+                                    .as_ref()
+                                    .and_then(|widths| widths.get(row).copied())
+                                    .or_else(|| {
+                                        self.width_prefix.as_ref().and_then(|prefix| {
+                                            prefix.exact_positive_width_between(start, stop)
+                                        })
+                                    })
+                            })
+                            .flatten();
+                        let cells = match exact_width {
+                            Some(width) => VecStorage::from_image_free_token_range(
                                 Arc::clone(&self.tokens),
-                                self.token_range.start + start..self.token_range.start + stop,
+                                range,
                                 stop < self.token_range.len(),
-                            )),
+                                width,
+                            ),
+                            None => VecStorage::from_token_range(
+                                Arc::clone(&self.tokens),
+                                range,
+                                stop < self.token_range.len(),
+                            ),
+                        };
+                        Line {
+                            cells: CellStorage::V(cells),
                             zones: Vec::new(),
                             seqno,
                             bits: LineBits::NONE,
@@ -2335,6 +2436,10 @@ fn plan_wrap_tokens(
             width_prefix,
             geometry_hash,
             break_offsets: cached.break_offsets,
+            #[cfg(feature = "std")]
+            row_widths: None,
+            #[cfg(feature = "std")]
+            image_free: false,
             blank: None,
             scorecard: cached.scorecard,
         };
@@ -2390,6 +2495,10 @@ fn plan_wrap_tokens(
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         geometry_hash,
         break_offsets: plan.break_offsets,
+        #[cfg(feature = "std")]
+        row_widths: None,
+        #[cfg(feature = "std")]
+        image_free: false,
         blank: None,
         scorecard,
     }
@@ -2563,11 +2672,17 @@ fn memoized_wrap_point_cache_key_hits_for_test(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LineWrapWidthPrefixScratch {
     widths: Vec<u128>,
+    #[cfg(feature = "std")]
+    all_widths_positive: bool,
 }
 
 impl LineWrapWidthPrefixScratch {
     pub fn clear(&mut self) {
         self.widths.clear();
+        #[cfg(feature = "std")]
+        {
+            self.all_widths_positive = false;
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -2578,12 +2693,33 @@ impl LineWrapWidthPrefixScratch {
         self.widths.clear();
         self.widths.reserve(tokens.len().saturating_add(1));
         self.widths.push(0);
+        #[cfg(feature = "std")]
+        {
+            self.all_widths_positive = true;
+        }
 
         let mut total = 0u128;
         for token in tokens {
-            total = total.saturating_add(token.width() as u128);
+            let width = token.width();
+            #[cfg(feature = "std")]
+            {
+                self.all_widths_positive &= width > 0;
+            }
+            total = total.saturating_add(width as u128);
             self.widths.push(total);
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn exact_positive_width_between(&self, start: usize, end: usize) -> Option<usize> {
+        if !self.all_widths_positive || end <= start {
+            return None;
+        }
+        let width = self
+            .widths
+            .get(end)?
+            .checked_sub(*self.widths.get(start)?)?;
+        (width <= usize::MAX as u128).then_some(width as usize)
     }
 
     #[inline]
@@ -4912,6 +5048,7 @@ mod tests {
                 );
                 assert_eq!(layout.scorecard(), expected.scorecard);
                 assert_eq!(layout.materialize_rows(0..usize::MAX, 9), expected.lines);
+                assert_deferred_metadata_scan_contract(&layout, true);
                 let deferred = layout.deferred_rows(0..usize::MAX, 9);
                 for (row, expected) in deferred.iter().zip(&expected.lines) {
                     assert_eq!(row.len(), expected.len());
@@ -4957,6 +5094,251 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn assert_deferred_metadata_scan_contract(layout: &LineWrapLayout, fast: bool) {
+        use crate::line::vecstorage::DEFERRED_METADATA_TOKEN_VISITS;
+        let deferred_enabled = std::env::var_os("FT_DISABLE_DEFERRED_REFLOW_CELLS")
+            != Some(std::ffi::OsString::from("1"));
+        let visits = || DEFERRED_METADATA_TOKEN_VISITS.with(|count| count.get());
+        let before = visits();
+        let actual = layout.deferred_rows(0..usize::MAX, 9);
+        assert_eq!(
+            visits() - before,
+            if fast || !deferred_enabled {
+                0
+            } else {
+                layout.token_range.len()
+            },
+            "count the actual constructor token visits"
+        );
+        let mut control = layout.clone();
+        control.image_free = false;
+        let before = visits();
+        let fallback = control.deferred_rows(0..usize::MAX, 9);
+        assert_eq!(
+            visits() - before,
+            if deferred_enabled {
+                layout.token_range.len()
+            } else {
+                0
+            },
+            "suppressing the source witness must restore the original scan"
+        );
+        let eager = layout.materialize_rows(0..usize::MAX, 9);
+        for (row, expected) in actual.iter().zip(&eager) {
+            assert_eq!(row.len(), expected.len());
+            assert_eq!(row.current_seqno(), expected.current_seqno());
+            assert_eq!(
+                row.last_cell_was_wrapped(),
+                expected.last_cell_was_wrapped()
+            );
+            assert_eq!(row.compute_shape_hash(), expected.compute_shape_hash());
+            assert_eq!(
+                row.visible_cells()
+                    .map(|cell| cell.cell_index())
+                    .collect::<Vec<_>>(),
+                expected
+                    .visible_cells()
+                    .map(|cell| cell.cell_index())
+                    .collect::<Vec<_>>()
+            );
+            #[cfg(feature = "use_image")]
+            assert_eq!(
+                row.has_image_attachments(),
+                expected.has_image_attachments()
+            );
+            if deferred_enabled {
+                let CellStorage::V(storage) = &row.cells else {
+                    panic!("expected deferred vector storage");
+                };
+                assert!(storage.is_deferred_unmaterialized());
+            }
+        }
+        let mut changed = actual.clone();
+        changed[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 10);
+        let mut changed_eager = eager.clone();
+        changed_eager[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 10);
+        assert_eq!(changed, changed_eager);
+        assert_eq!(actual, eager);
+        assert_eq!(actual, fallback);
+        #[cfg(feature = "use_serde")]
+        {
+            let wire = serde_json::to_value(&actual).unwrap();
+            assert_eq!(wire, serde_json::to_value(&eager).unwrap());
+            let restored: Vec<Line> = serde_json::from_value(wire).unwrap();
+            assert_eq!(restored, eager);
+        }
+        assert_eq!(actual, layout.materialize_rows(0..usize::MAX, 9));
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn deferred_metadata_uses_current_endpoints_on_geometry_cache_hits() {
+        let _guard = memoized_wrap_point_cache_test_lock().lock().unwrap();
+        let model = MonospaceKpCostModel::terminal_default();
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let plain = Line::from_text("ab界 cd界 ef界 gh界", &CellAttributes::blank(), 1, None);
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        let source = Line::from_text("xy面 zw面 uv面 rs面", &attrs, 2, None);
+        for clustered in [false, true] {
+            let mut current = source.clone();
+            if clustered {
+                current.compress_for_scrollback();
+            }
+            let _ = plain
+                .clone()
+                .plan_wrap_with_width_prefix_scratch(7, model, &mut scratch);
+            // The content-key diagnostic deliberately disables cross-content
+            // geometry hits. Prime the current source there as well.
+            if std::env::var_os("FT_DISABLE_WRAP_GEOMETRY_KEY")
+                == Some(std::ffi::OsString::from("1"))
+            {
+                let _ = current
+                    .clone()
+                    .plan_wrap_with_width_prefix_scratch(7, model, &mut scratch);
+            }
+            let before = memoized_wrap_point_cache_key_hits_for_test(&current, 7, model);
+            scratch.widths = vec![0, 999];
+            scratch.all_widths_positive = true;
+            let layout =
+                current
+                    .clone()
+                    .plan_wrap_with_width_prefix_scratch(7, model, &mut scratch);
+            assert!(memoized_wrap_point_cache_key_hits_for_test(&current, 7, model) > before);
+            assert_eq!(
+                scratch.widths,
+                vec![0, 999],
+                "the cache hit did not refresh scratch"
+            );
+            assert!(layout.width_prefix.is_none());
+            assert!(layout.row_widths.is_some());
+            assert_deferred_metadata_scan_contract(&layout, true);
+            let retained = layout.retain_width_prefix();
+            assert!(
+                retained.row_widths.is_none(),
+                "retention must discard transient row widths"
+            );
+            let prefix = retained.width_prefix.as_ref().unwrap();
+            assert!(prefix.all_widths_positive);
+            for width in [3, 7, 11] {
+                scratch.widths = vec![0, 12345];
+                let next = retained.replan(width, model, &mut scratch);
+                assert!(Arc::ptr_eq(prefix, next.width_prefix.as_ref().unwrap()));
+                assert!(next.row_widths.is_none());
+                assert_deferred_metadata_scan_contract(&next, true);
+                assert_eq!(
+                    next.materialize_rows(0..usize::MAX, 9),
+                    current.clone().wrap(width, 9)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn deferred_metadata_zero_width_sources_keep_retained_scan_fallback() {
+        let zero = Cell::new_grapheme(
+            "\u{301}\u{301}\u{301}\u{301}",
+            CellAttributes::blank(),
+            None,
+        );
+        assert_eq!(
+            zero.width(),
+            0,
+            "explicit width zero would normalize to one"
+        );
+        let source = Line::from_cells(
+            vec![
+                zero,
+                Cell::new('界', CellAttributes::blank()),
+                Cell::new(' ', CellAttributes::blank()),
+                Cell::new('a', CellAttributes::blank()),
+            ],
+            1,
+        );
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let layout = source.plan_wrap_with_width_prefix_scratch(
+            3,
+            MonospaceKpCostModel::terminal_default(),
+            &mut scratch,
+        );
+        assert!(layout.image_free);
+        assert_deferred_metadata_scan_contract(&layout, true);
+        let retained = layout.retain_width_prefix();
+        assert!(!retained.width_prefix.as_ref().unwrap().all_widths_positive);
+        assert!(retained.row_widths.is_none());
+        assert_deferred_metadata_scan_contract(&retained, false);
+        for width in [1, 2, 5] {
+            let next = retained.replan(
+                width,
+                MonospaceKpCostModel::terminal_default(),
+                &mut scratch,
+            );
+            assert_deferred_metadata_scan_contract(&next, false);
+        }
+    }
+
+    #[cfg(all(feature = "std", feature = "use_image"))]
+    #[test]
+    fn deferred_metadata_image_witness_is_independent_of_geometry_cache() {
+        use frankenterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        )));
+        let mut attrs = CellAttributes::blank();
+        attrs.set_image(Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&image),
+        )));
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let model = MonospaceKpCostModel::terminal_default();
+        let plain = Line::from_text("ab界 cd界", &CellAttributes::blank(), 1, None);
+        let _ = plain.plan_wrap_with_width_prefix_scratch(3, model, &mut scratch);
+        let source = Line::from_text("xy面 zw面", &attrs, 1, None);
+        let layout = source.plan_wrap_with_width_prefix_scratch(3, model, &mut scratch);
+        assert!(!layout.image_free);
+        assert!(layout.row_widths.is_none());
+        assert_deferred_metadata_scan_contract(&layout, false);
+        let retained = layout.retain_width_prefix();
+        assert_deferred_metadata_scan_contract(&retained, false);
+        {
+            let mut payload = image.data_mut();
+            let ImageDataType::Rgba8 { data, .. } = &mut *payload else {
+                panic!("expected RGBA payload");
+            };
+            data[0] = 99;
+        }
+        assert_deferred_metadata_scan_contract(&retained.replan(5, model, &mut scratch), false);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn deferred_metadata_rejects_invalid_endpoint_arithmetic() {
+        let source = Line::from_text("ab", &CellAttributes::blank(), 1, None);
+        let layout = source.clone().plan_wrap_with_width_prefix_scratch(
+            2,
+            MonospaceKpCostModel::terminal_default(),
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        assert_eq!(layout.break_offsets, vec![2]);
+        let cell = Cell::new('a', CellAttributes::blank());
+        for indices in [[0, usize::MAX], [3, 0]] {
+            let cells: Vec<_> = indices
+                .iter()
+                .map(|&cell_index| CellRef::CellRef {
+                    cell_index,
+                    cell: &cell,
+                })
+                .collect();
+            assert!(layout.row_widths_from_cells(&cells).is_none());
+        }
+        assert!(layout.row_widths_from_cells(&[]).is_none());
     }
 
     #[cfg(feature = "std")]
