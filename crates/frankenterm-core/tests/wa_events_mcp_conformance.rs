@@ -90,10 +90,86 @@ const FIXTURE_RULE_ID: &str = "codex.usage.reached";
 const CLAIM_DELIVERY_TIMEOUT_SECS: u64 = 5;
 
 struct TestHarness {
-    client: FrameworkTestClient,
+    client: BoundedTestClient,
     db_path: PathBuf,
     // Drop the client before releasing the database fixture directory.
     _workspace: tempfile::TempDir,
+}
+
+// MemoryTransport checks cancellation, not capability deadlines. Own a real
+// wall-clock cancellation watchdog so a missing server reply cannot bypass
+// the readiness loop's post-response deadline forever.
+struct BoundedTestClient {
+    client: FrameworkTestClient,
+    stop: std::sync::mpsc::Sender<()>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BoundedTestClient {
+    fn new(client: impl FnOnce(frankenterm_core::cx::Cx) -> FrameworkTestClient) -> Self {
+        Self::with_timeout(client, std::time::Duration::from_secs(120))
+    }
+
+    fn with_timeout(
+        client: impl FnOnce(frankenterm_core::cx::Cx) -> FrameworkTestClient,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let cx = frankenterm_core::cx::for_testing();
+        let watchdog_cx = cx.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if matches!(
+                stopped.recv_timeout(timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                watchdog_cx.set_cancel_requested(true);
+            }
+        });
+        Self {
+            client: client(cx),
+            stop,
+            watchdog: Some(watchdog),
+        }
+    }
+}
+
+impl std::ops::Deref for BoundedTestClient {
+    type Target = FrameworkTestClient;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl std::ops::DerefMut for BoundedTestClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
+impl Drop for BoundedTestClient {
+    fn drop(&mut self) {
+        self.client.close();
+        let _ = self.stop.send(());
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+#[test]
+fn conformance_client_watchdog_bounds_a_peer_that_never_replies() {
+    let (transport, _silent_peer) = framework_create_memory_transport_pair();
+    let mut client = BoundedTestClient::with_timeout(
+        |cx| FrameworkTestClient::with_cx(transport, cx),
+        std::time::Duration::from_millis(100),
+    );
+    let started = std::time::Instant::now();
+    assert!(
+        client.initialize().is_err(),
+        "silent peer must not report success"
+    );
+    drop(client);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
 #[derive(Serialize)]
@@ -104,7 +180,7 @@ struct ToolContractCapture {
     boundary_invalid_params_error: String,
 }
 
-fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
+fn spawn_client(db_path: Option<PathBuf>) -> BoundedTestClient {
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
@@ -121,7 +197,8 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        BoundedTestClient::new(|cx| FrameworkTestClient::with_cx(client_transport, cx));
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -170,7 +247,7 @@ fn wait_for_await_service_ready(client: &mut FrameworkTestClient) {
     }
 }
 
-fn spawn_ready_client(db_path: PathBuf) -> FrameworkTestClient {
+fn spawn_ready_client(db_path: PathBuf) -> BoundedTestClient {
     let mut client = spawn_client(Some(db_path));
     wait_for_await_service_ready(&mut client);
     client
@@ -1306,7 +1383,8 @@ fn assert_await_event_claim_send_failure_releases_lease(
             )
         })
     });
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        BoundedTestClient::new(|cx| FrameworkTestClient::with_cx(client_transport, cx));
     client.initialize().expect("initialize MCP client");
     wait_for_await_service_ready(&mut client);
     seed_events_fixture_at(&db_path);

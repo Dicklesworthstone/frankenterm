@@ -6495,6 +6495,12 @@ async fn mcp_await_event_wait_with_cx(
     cx: &crate::cx::Cx,
     wait: std::time::Duration,
 ) -> crate::Result<()> {
+    // The service executes on its own runtime while the request's runtime
+    // may be synchronously waiting for our reply. Registering the poll timer
+    // on that request's driver would strand it. Only scheduling belongs to
+    // the service context; request cancellation/budgets remain authoritative
+    // at each bounded checkpoint below.
+    let timer_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     let started = Instant::now();
     loop {
         mcp_await_event_checkpoint(cx)?;
@@ -6503,7 +6509,7 @@ async fn mcp_await_event_wait_with_cx(
             return Ok(());
         }
         let step = remaining.min(MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL);
-        crate::runtime_async::sleep_with_cx(cx, step)
+        crate::runtime_async::sleep_with_cx(&timer_cx, step)
             .await
             .map_err(|error| {
                 crate::Error::Cancelled(format!(
@@ -19742,6 +19748,57 @@ mod tests {
             };
             assert!(storage.release_event_delivery(&lease).await.unwrap());
             storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn await_event_poll_delay_uses_service_timer_with_foreign_request_clock() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let clock = Arc::new(asupersync::time::VirtualClock::starting_at(
+            asupersync::Time::ZERO,
+        ));
+        let driver = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let identity = crate::cx::Cx::for_testing();
+        let request = crate::cx::Cx::new_with_drivers(
+            identity.region_id(),
+            identity.task_id(),
+            asupersync::Budget::INFINITE,
+            None,
+            None,
+            None,
+            Some(driver.clone()),
+            None,
+        );
+        runtime.block_on(async {
+            let owner = crate::cx::Cx::current().expect("service runtime context");
+            crate::runtime_async::timeout_with_cx(
+                &owner,
+                std::time::Duration::from_secs(2),
+                super::mcp_await_event_wait_with_cx(&request, std::time::Duration::from_millis(20)),
+            )
+            .await
+            .expect("service delay must not await the frozen request clock")
+            .expect("live request completes its polling delay");
+            assert_eq!(driver.now(), asupersync::Time::ZERO);
+            assert_eq!(
+                driver.pending_count(),
+                0,
+                "no timer borrowed from parked caller"
+            );
+            assert!(request.checkpoint().is_ok());
+
+            request.set_cancel_requested(true);
+            let result =
+                super::mcp_await_event_wait_with_cx(&request, std::time::Duration::from_secs(60))
+                    .await;
+            assert!(
+                result.is_err(),
+                "service scheduling must not erase request cancellation"
+            );
+            assert!(
+                owner.checkpoint().is_ok(),
+                "caller cancel must not cancel service"
+            );
         });
     }
 
