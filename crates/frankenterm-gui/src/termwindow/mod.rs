@@ -4400,6 +4400,11 @@ impl TermWindow {
             TermWindowNotif::EmitStatusUpdate => {
                 let _ = self.poll_idle_scheduler();
                 self.emit_status_event();
+                // Lua callbacks may intentionally leave unchanged status text
+                // alone. Their setters must not be responsible for keeping the
+                // periodic event alive. The deadline guard coalesces early or
+                // duplicate notifications with an already pending timer.
+                self.schedule_next_status_update();
                 // ft-kciew: drive the quad-buffer policy's idle
                 // shrink consideration on the same cadence as the
                 // status timer. No-op while a resize gesture is
