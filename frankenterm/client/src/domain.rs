@@ -3202,6 +3202,33 @@ impl ClientDomain {
             }
             remote_pane_ids.push(entry.pane_id);
         }
+
+        // A numeric tab mapping is only a lookup hint. Validate every live
+        // target against this exact attachment before reserving IDs or changing
+        // any title/tree: a stale mapping must never replace another client's
+        // panes, even when both attachments use the same domain and remote IDs.
+        for remote_tab_id in remote_tab_owners.keys() {
+            let Some(tab) = inner
+                .remote_to_local_tab_id(*remote_tab_id)
+                .and_then(|local_tab_id| mux.get_tab(local_tab_id))
+            else {
+                continue;
+            };
+            let panes = tab.iter_all_panes();
+            ensure!(
+                !panes.is_empty()
+                    && panes.iter().all(|pane| {
+                        pane.downcast_ref::<ClientPane>()
+                            .is_some_and(|client_pane| {
+                                client_pane.belongs_to_client(&inner)
+                                    && client_pane.remote_tab_id == *remote_tab_id
+                            })
+                    }),
+                "remote tab {} mapping targets local tab {} outside this exact client attachment",
+                remote_tab_id,
+                tab.tab_id(),
+            );
+        }
         let mut reserved_local_pane_ids = inner
             .reserve_local_pane_ids(remote_pane_ids)
             .context("reserve local pane identifiers for remote topology")?;
@@ -5828,6 +5855,67 @@ mod tests {
         assert!(mux.get_pane(local_float_id).is_none());
         assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
         assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn topology_resync_rejects_previous_attachment_tab_order_before_mutation() {
+        for current in [false, true] {
+            let scope = MuxTestScope::enter();
+            let mux = Arc::new(Mux::new(None));
+            scope.set_mux(&mux);
+            let owner = test_client_inner(91_024);
+            let _domain = register_test_client_domain(&mux, &owner);
+            ClientDomain::process_pane_list(
+                &mux,
+                Arc::clone(&owner),
+                sample_remote_tab_listing(),
+                None,
+            )
+            .expect("attach original client");
+            let window_id = owner.remote_to_local_window(41).expect("original window");
+            let tab_id = owner.remote_to_local_tab_id(51).expect("original tab");
+            let tab = mux.get_tab(tab_id).expect("original tab allocation");
+            let pane = tab
+                .iter_all_panes()
+                .into_iter()
+                .next()
+                .expect("original pane");
+            let title = tab.get_title();
+            let order = mux.window_order_snapshot(window_id).unwrap().unwrap();
+            let topology = mux.topology_snapshot_authority().unwrap();
+
+            // Same numeric domain, remote tab and remote pane IDs; a distinct
+            // attachment must still have no authority over the original Arcs.
+            let successor = test_client_inner(owner.local_domain_id);
+            successor.record_remote_to_local_tab_mapping(51, tab_id);
+            successor.record_remote_to_local_window_mapping(41, window_id);
+            let mut listing = sample_remote_tab_listing();
+            listing.tab_titles[0] = "must not overwrite the original".to_string();
+            let error = ClientDomain::process_pane_snapshot(
+                &mux,
+                Arc::clone(&successor),
+                listing.tabs,
+                listing.tab_titles,
+                listing.window_titles,
+                current.then_some(listing.floating_panes),
+                None,
+            )
+            .expect_err("a stale tab mapping must reject the complete snapshot");
+            assert!(format!("{error:#}").contains("outside this exact client attachment"));
+            assert_eq!(mux.topology_snapshot_authority().unwrap(), topology);
+            assert_eq!(tab.get_title(), title);
+            assert_eq!(mux.iter_windows().len(), 1);
+            assert_eq!(mux.iter_panes().len(), 1);
+            assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &pane));
+            assert!(Arc::ptr_eq(&mux.get_tab(tab_id).unwrap(), &tab));
+            let after = mux.window_order_snapshot(window_id).unwrap().unwrap();
+            assert_eq!(after.ordered_tab_ids().collect::<Vec<_>>(), vec![tab_id]);
+            assert_eq!(after.order_revision(), order.order_revision());
+            assert_eq!(after.active_tab_id(), order.active_tab_id());
+            assert_eq!(mux.window_containing_tab(tab_id), Some(window_id));
+            assert!(lock_or_recover(&successor.spare_local_pane_ids, "spares").is_empty());
+            assert!(lock_or_recover(&successor.remote_to_local_pane, "pane map").is_empty());
+        }
     }
 
     #[test]
