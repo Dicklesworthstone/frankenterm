@@ -5231,7 +5231,7 @@ mod tests {
         use frankenterm_term::screen::SelectionAnchorCoordinate;
         let pane = LocalPane::new(
             704,
-            test_terminal(term_size(80, 24)),
+            guardian_lifetime_test_terminal(),
             Box::new(KillCountingChild {
                 kills: Arc::new(AtomicUsize::new(0)),
             }),
