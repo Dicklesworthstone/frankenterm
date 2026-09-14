@@ -176,6 +176,39 @@ impl Drop for PendingMuxTitleRefresh {
     }
 }
 
+/// One queued fallback invalidation for this window. Resolver jobs have already
+/// published their handles before acquiring this ticket; a single cache clear
+/// can expose all of those pending changes. Keep the ticket through Window::notify.
+pub struct PendingFallbackInvalidation(Option<Arc<AtomicBool>>);
+
+impl PendingFallbackInvalidation {
+    fn acquire(pending: &Arc<AtomicBool>) -> Option<Self> {
+        pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Some(Arc::clone(pending))))
+    }
+
+    fn begin_invalidation(mut self) {
+        // Release before clearing caches. A resolver completing after that
+        // boundary must be able to request another invalidation, even if this
+        // frame has already consumed its font's pending handles.
+        if let Some(pending) = self.0.take() {
+            pending.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for PendingFallbackInvalidation {
+    fn drop(&mut self) {
+        // Cancellation/rejected delivery must not permanently suppress future
+        // notifications. A consumed ticket cannot clear a successor's slot.
+        if let Some(pending) = self.0.take() {
+            pending.store(false, Ordering::Release);
+        }
+    }
+}
+
 fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         log::warn!("recovering poisoned {name} lock");
@@ -214,6 +247,7 @@ pub enum MouseCapture {
 /// context of the window-specific event loop
 pub enum TermWindowNotif {
     InvalidateShapeCache(RenderInvalidationCause),
+    FallbackFontsReady(PendingFallbackInvalidation),
     PerformAssignment {
         pane_id: PaneId,
         assignment: KeyAssignment,
@@ -1093,6 +1127,7 @@ pub struct TermWindow {
 
     quad_generation: usize,
     shape_generation: usize,
+    fallback_invalidation_pending: Arc<AtomicBool>,
     /// Per-pane render-side dirty-line bitmap (ft-tfzhy / ft-mpc9b.1.2).
     ///
     /// The TermWindow keeps one `DirtyLineBitmap` per `PaneId` to retain
@@ -3364,6 +3399,7 @@ impl TermWindow {
             current_highlight: None,
             quad_generation: 0,
             shape_generation: 0,
+            fallback_invalidation_pending: Arc::new(AtomicBool::new(false)),
             dirty_lines: HashMap::new(),
             damage_generation: DamageGeneration::default(),
             render_recovery_state: RenderRecoveryState::default(),
@@ -3899,6 +3935,39 @@ impl TermWindow {
         )
     }
 
+    fn fallback_font_completion(&self) -> impl FnOnce() + Send + 'static + use<> {
+        let window = self.window.clone();
+        let pending = Arc::clone(&self.fallback_invalidation_pending);
+        move || {
+            if let Some(window) = window {
+                if let Some(ticket) = PendingFallbackInvalidation::acquire(&pending) {
+                    window.notify(TermWindowNotif::FallbackFontsReady(ticket));
+                }
+            }
+        }
+    }
+
+    fn invalidate_shape_cache_notification(
+        &mut self,
+        cause: RenderInvalidationCause,
+        window: &Window,
+    ) {
+        let cause = cause.for_shape_notification();
+        self.invalidate_render_caches(cause);
+        self.invalidate_modal();
+        use frankenterm_core::dirty_line_telemetry::DirtyEventSource;
+        match cause {
+            RenderInvalidationCause::Palette => {
+                self.mark_all_panes_dirty_with_source(DirtyEventSource::ThemeSwap);
+            }
+            RenderInvalidationCause::FallbackFont => {
+                self.mark_all_panes_dirty_with_source(DirtyEventSource::FontSwap);
+            }
+            _ => self.mark_all_panes_dirty(),
+        }
+        window.invalidate();
+    }
+
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
         fn chan_err<T>(e: TrySendError<T>) -> anyhow::Error {
             anyhow::anyhow!("{}", e)
@@ -3906,20 +3975,14 @@ impl TermWindow {
 
         match notif {
             TermWindowNotif::InvalidateShapeCache(cause) => {
-                let cause = cause.for_shape_notification();
-                self.invalidate_render_caches(cause);
-                self.invalidate_modal();
-                use frankenterm_core::dirty_line_telemetry::DirtyEventSource;
-                match cause {
-                    RenderInvalidationCause::Palette => {
-                        self.mark_all_panes_dirty_with_source(DirtyEventSource::ThemeSwap);
-                    }
-                    RenderInvalidationCause::FallbackFont => {
-                        self.mark_all_panes_dirty_with_source(DirtyEventSource::FontSwap);
-                    }
-                    _ => self.mark_all_panes_dirty(),
-                }
-                window.invalidate();
+                self.invalidate_shape_cache_notification(cause, window);
+            }
+            TermWindowNotif::FallbackFontsReady(ticket) => {
+                ticket.begin_invalidation();
+                self.invalidate_shape_cache_notification(
+                    RenderInvalidationCause::FallbackFont,
+                    window,
+                );
             }
             TermWindowNotif::PerformAssignment {
                 pane_id,
@@ -8735,6 +8798,54 @@ impl Drop for TermWindow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_completion_burst_coalesces_until_the_window_handler() {
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other_window = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut notifications = vec![];
+        for _ in 0..64 {
+            if let Some(ticket) = super::PendingFallbackInvalidation::acquire(&pending) {
+                notifications.push(super::TermWindowNotif::FallbackFontsReady(ticket));
+            }
+        }
+        assert_eq!(notifications.len(), 1);
+        assert!(super::PendingFallbackInvalidation::acquire(&other_window).is_some());
+        let super::TermWindowNotif::FallbackFontsReady(ticket) = notifications.pop().unwrap()
+        else {
+            panic!("unexpected notification");
+        };
+        assert!(super::PendingFallbackInvalidation::acquire(&pending).is_none());
+        ticket.begin_invalidation();
+        assert!(super::PendingFallbackInvalidation::acquire(&pending).is_some());
+    }
+
+    #[test]
+    fn fallback_completion_after_invalidation_queues_a_successor() {
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = super::PendingFallbackInvalidation::acquire(&pending).unwrap();
+        first.begin_invalidation();
+        let late = super::PendingFallbackInvalidation::acquire(&pending)
+            .expect("a fallback published after the invalidation boundary needs another repaint");
+        assert!(super::PendingFallbackInvalidation::acquire(&pending).is_none());
+        late.begin_invalidation();
+        assert!(super::PendingFallbackInvalidation::acquire(&pending).is_some());
+    }
+
+    #[test]
+    fn fallback_completion_cancelled_delivery_releases_only_its_window() {
+        let old = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let replacement = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abandoned = super::TermWindowNotif::FallbackFontsReady(
+            super::PendingFallbackInvalidation::acquire(&old).unwrap(),
+        );
+        let current = super::PendingFallbackInvalidation::acquire(&replacement).unwrap();
+        drop(abandoned);
+        assert!(super::PendingFallbackInvalidation::acquire(&old).is_some());
+        assert!(super::PendingFallbackInvalidation::acquire(&replacement).is_none());
+        current.begin_invalidation();
+        assert!(super::PendingFallbackInvalidation::acquire(&replacement).is_some());
+    }
+
     #[test]
     fn pending_native_frame_preserves_real_failure_budget_without_opening_circuit() {
         let mut recovery = super::RenderRecoveryState::default();

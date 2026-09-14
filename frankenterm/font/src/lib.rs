@@ -133,6 +133,86 @@ mod scale_font_tests {
     }
 
     #[test]
+    fn pending_fallback_batch_preserves_real_insertion_and_late_shape_fences() {
+        let fonts = fonts(96);
+        let font = fonts.default_font().unwrap();
+        let fallback = font
+            .clone_handles()
+            .into_iter()
+            .find(|handle| handle.names().family == "Noto Color Emoji")
+            .expect("the test configuration includes the bundled emoji fallback");
+        let text = "🚀";
+        let fresh = FontConfiguration::new(Some(fonts.config()), 96).unwrap();
+        let fresh_font = fresh.default_font().unwrap();
+        let expected = fresh_font
+            .blocking_shape(
+                text,
+                Some(Presentation::Emoji),
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        let expected_pixels = glyph_pixels(&fresh_font, &expected);
+
+        // Start with a real font chain lacking the emoji face. Publishing that
+        // face into pending_fallback models the resolver's actual handoff;
+        // neither a fake shaper nor a placeholder glyph can satisfy the oracle.
+        font.handles
+            .borrow_mut()
+            .retain(|handle| *handle != fallback);
+        *font.shaper.borrow_mut() = new_shaper(&fonts.config(), &font.handles.borrow()).unwrap();
+        lock_or_recover(&font.pending_fallback).extend([fallback.clone(), fallback.clone()]);
+        let shape = || {
+            font.shape(
+                text,
+                || panic!("bundled emoji must not need another fallback search"),
+                |_| {},
+                Some(Presentation::Emoji),
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+        };
+        let error = shape().expect_err("installing a real fallback must invalidate old shaping");
+        assert!(error.downcast_ref::<ClearShapeCache>().is_some());
+        assert_eq!(
+            font.clone_handles()
+                .iter()
+                .filter(|handle| **handle == fallback)
+                .count(),
+            1
+        );
+        let inserted = shape().unwrap();
+        assert!(inserted
+            .iter()
+            .any(|glyph| glyph.font_idx > 0 && glyph.glyph_pos != 0));
+        assert_same_pixels(&expected_pixels, &glyph_pixels(&font, &inserted));
+
+        lock_or_recover(&font.pending_fallback).push(fallback);
+        assert_eq!(
+            shape().unwrap(),
+            inserted,
+            "duplicate discovery is not a new font insertion"
+        );
+
+        let late = FontDatabase::with_built_in()
+            .unwrap()
+            .list_available()
+            .into_iter()
+            .find(|handle| !font.handles.borrow().contains(handle))
+            .expect("a distinct bundled font for the late insertion control");
+        lock_or_recover(&font.pending_fallback).push(late);
+        assert!(shape()
+            .unwrap_err()
+            .downcast_ref::<ClearShapeCache>()
+            .is_some());
+        let after_late = shape().unwrap();
+        assert_eq!(after_late, inserted);
+        assert_same_pixels(&expected_pixels, &glyph_pixels(&font, &after_late));
+    }
+
+    #[test]
     fn returning_to_previous_scale_reuses_fonts_with_fresh_glyph_parity() {
         let fonts = fonts(96);
         let original = fonts.default_font().unwrap();

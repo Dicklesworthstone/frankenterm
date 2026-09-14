@@ -3,11 +3,9 @@ use crate::color::LinearRgba;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
 use crate::quad::{QuadImpl, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
-use crate::termwindow::{
-    ColorEase, MouseCapture, RenderState, TermWindowNotif, UIItem, UIItemType,
-};
+use crate::termwindow::{ColorEase, MouseCapture, RenderState, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
-use ::window::{RectF, WindowOps};
+use ::window::RectF;
 use anyhow::anyhow;
 use config::{Dimension, DimensionContext};
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -612,17 +610,11 @@ impl super::TermWindow {
 
         match &element.content {
             ElementContent::Text(s) => {
-                let window = self.window.clone();
+                let fallback_completion = self.fallback_font_completion();
                 let direction = wezterm_bidi::Direction::LeftToRight;
                 let infos = element.font.shape(
                     &s,
-                    move || {
-                        if let Some(window) = window.as_ref() {
-                            window.notify(TermWindowNotif::InvalidateShapeCache(
-                                super::resize::RenderInvalidationCause::FallbackFont,
-                            ));
-                        }
-                    },
+                    fallback_completion,
                     BlockKey::filter_out_synthetic,
                     element.presentation,
                     direction,

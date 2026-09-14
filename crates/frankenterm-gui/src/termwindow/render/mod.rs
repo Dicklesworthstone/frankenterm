@@ -7,10 +7,10 @@ use crate::quad::{
 };
 use crate::shapecache::*;
 use crate::termwindow::render::paint::AllowImage;
-use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo, TermWindowNotif};
+use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
-use ::window::{DeadKeyStatus, PointF, RectF, SizeF, WindowOps};
+use ::window::{DeadKeyStatus, PointF, RectF, SizeF};
 use anyhow::{Context, anyhow};
 use config::{
     BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment, TextStyle,
@@ -989,7 +989,7 @@ impl crate::TermWindow {
                     Some(f) => Rc::clone(f),
                     None => self.fonts.resolve_font(style)?,
                 };
-                let window = self.window.clone();
+                let fallback_completion = self.fallback_font_completion();
 
                 let paragraph_byte_offset = paragraph_range.as_ref().map(|range| range.start);
                 let presentation_width = match paragraph_byte_offset {
@@ -1001,13 +1001,7 @@ impl crate::TermWindow {
 
                 match font.shape(
                     shape_text,
-                    move || {
-                        if let Some(window) = window.as_ref() {
-                            window.notify(TermWindowNotif::InvalidateShapeCache(
-                                super::resize::RenderInvalidationCause::FallbackFont,
-                            ));
-                        }
-                    },
+                    fallback_completion,
                     BlockKey::filter_out_synthetic,
                     Some(cluster.presentation),
                     cluster.direction,
