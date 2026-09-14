@@ -9442,11 +9442,11 @@ mod tests {
         let task = handle
             .try_spawn_local(async move {
                 let _probe = probe;
-                let _local_marker = local_marker;
                 ready_tx
                     .send(())
                     .expect("root must wait for the parked task");
                 std::future::pending::<()>().await;
+                drop(local_marker);
             })
             .expect("current-thread body must own the local lane");
         drop(task);
