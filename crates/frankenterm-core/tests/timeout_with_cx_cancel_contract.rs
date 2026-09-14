@@ -7,8 +7,9 @@
 //
 //   - it bounds the wait by the cx BUDGET deadline (via budget_timeout), but
 //   - it does NOT itself check `cx.is_cancel_requested()`, so a pre-cancelled
-//     cx with an infinite budget waits the full requested `duration` before
-//     returning `Err` — short-circuit on cancel is the caller's job
+//     cx can still return ready work successfully. Pending work is bounded
+//     by the timer, which may finish early when its context is cancelled.
+//     Rejecting cancelled work before it starts is the caller's job
 //     (`cx.checkpoint()?` before the call).
 //
 // These tests pin both the ordinary timeout behavior and that subtle
@@ -101,14 +102,37 @@ fn timeout_with_cx_precancel_still_times_out_rather_than_hangs() {
     let result: Result<usize, String> = runtime.block_on(runtime_async::timeout_with_cx(
         &cx,
         Duration::from_millis(20),
-        async move {
-            runtime_async::sleep(Duration::from_secs(3600)).await;
-            123usize
-        },
+        // A cancellation-aware sleep is not a pending-work oracle: the
+        // cancelled context can complete it immediately, making Ok correct.
+        std::future::pending(),
     ));
     assert!(
         result.is_err(),
         "a long future under a short deadline must time out, not hang, on a cancelled cx"
+    );
+}
+
+#[test]
+fn timeout_with_cx_preserves_ready_value_when_inner_sleep_observes_precancel() {
+    let runtime = current_thread_runtime();
+    let cx = for_testing();
+    cx.cancel_with(CancelKind::User, Some("inner timer cancellation control"));
+    let result = runtime.block_on(runtime_async::timeout_with_cx(
+        &cx,
+        Duration::from_secs(1),
+        async {
+            runtime_async::sleep(Duration::from_secs(3600)).await;
+            123usize
+        },
+    ));
+    assert_eq!(
+        result,
+        Ok(123),
+        "cancelled inner sleep can finish immediately; ready work must retain its value"
+    );
+    assert!(
+        cx.checkpoint().is_err(),
+        "completion does not clear cancellation"
     );
 }
 
