@@ -7,11 +7,13 @@
 //! - Bounded: log memory does not grow unbounded
 //! - Queryable: filtering by phase/cycle/kind works correctly
 //! - Serde-stable: events and metrics roundtrip through JSON
-//! - Deterministic: identical inputs produce identical telemetry
+//! - Deterministic: identical inputs produce identical decision fields;
+//!   measured evaluation durations remain physical-clock observations
 
 #![cfg(feature = "subprocess-bridge")]
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{
@@ -415,10 +417,14 @@ fn metrics_latency_recorded() {
     let agents = vec![agent("a1")];
     let issues = vec![issue("b1", 1)];
 
+    let started = Instant::now();
     ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let elapsed_ms = started.elapsed().as_millis();
 
     let latest = ml.latest_metrics().unwrap();
-    // Latency should be >= 0 (nanosecond precision means it could be 0)
+    // Millisecond truncation can produce zero for a fast evaluation. The
+    // measured inner interval must fit inside the caller's elapsed interval.
+    assert!(u128::from(latest.evaluation_latency_ms) <= elapsed_ms);
     assert!(
         latest.evaluation_latency_ms < 10_000,
         "Latency sanity check"
@@ -726,7 +732,7 @@ fn determinism_event_log_identical_across_runs() {
 }
 
 #[test]
-fn determinism_metrics_identical_across_runs() {
+fn determinism_metrics_decision_fields_identical_across_runs() {
     let run = || {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         let agents = vec![agent("a1"), agent("a2")];
@@ -734,6 +740,7 @@ fn determinism_metrics_identical_across_runs() {
         let c = ctx();
 
         for i in 0..10 {
+            let started = Instant::now();
             ml.evaluate(
                 (i + 1) * 30_000,
                 MissionTrigger::CadenceTick,
@@ -741,12 +748,26 @@ fn determinism_metrics_identical_across_runs() {
                 &agents,
                 &c,
             );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(u128::from(ml.latest_metrics().unwrap().evaluation_latency_ms) <= elapsed_ms);
         }
 
         ml.state()
             .metrics_history
             .iter()
-            .map(|s| serde_json::to_value(s).unwrap())
+            .map(|sample| {
+                let mut serialized = serde_json::to_value(sample).unwrap();
+                // Validate the measured field before excluding only that
+                // independent physical-clock input from decision comparison.
+                assert_eq!(
+                    serialized
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("evaluation_latency_ms"),
+                    Some(serde_json::json!(sample.evaluation_latency_ms))
+                );
+                serialized
+            })
             .collect::<Vec<serde_json::Value>>()
     };
 
@@ -754,7 +775,7 @@ fn determinism_metrics_identical_across_runs() {
 }
 
 #[test]
-fn determinism_report_json_identical() {
+fn determinism_report_decision_fields_identical() {
     let run = || {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         let agents = vec![agent("a1")];
@@ -762,6 +783,7 @@ fn determinism_report_json_identical() {
         let c = ctx();
 
         for i in 0..5 {
+            let started = Instant::now();
             ml.evaluate(
                 (i + 1) * 30_000,
                 MissionTrigger::CadenceTick,
@@ -769,9 +791,25 @@ fn determinism_report_json_identical() {
                 &agents,
                 &c,
             );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(u128::from(ml.latest_metrics().unwrap().evaluation_latency_ms) <= elapsed_ms);
         }
         let report = ml.generate_operator_report(Some(&elog()), None);
-        serde_json::to_value(&report).unwrap()
+        let history = &ml.state().metrics_history;
+        let expected_latency = history
+            .iter()
+            .map(|sample| sample.evaluation_latency_ms as f64)
+            .sum::<f64>()
+            / history.len() as f64;
+        let mut serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["health"]
+                .as_object_mut()
+                .unwrap()
+                .remove("avg_evaluation_latency_ms"),
+            Some(serde_json::json!(expected_latency))
+        );
+        serialized
     };
 
     assert_eq!(run(), run());

@@ -12,6 +12,7 @@
 #![cfg(feature = "subprocess-bridge")]
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{
@@ -873,7 +874,7 @@ fn adoption_state_serde_for_persistence() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[test]
-fn determinism_runbook_procedures_identical() {
+fn determinism_runbook_decision_fields_identical() {
     let run = || {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         let agents = vec![agent("a1"), agent("a2")];
@@ -881,6 +882,7 @@ fn determinism_runbook_procedures_identical() {
         let c = ctx();
 
         for i in 0..5 {
+            let started = Instant::now();
             ml.evaluate(
                 (i + 1) * 30_000,
                 MissionTrigger::CadenceTick,
@@ -888,10 +890,28 @@ fn determinism_runbook_procedures_identical() {
                 &agents,
                 &c,
             );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(u128::from(ml.latest_metrics().unwrap().evaluation_latency_ms) <= elapsed_ms);
         }
 
         let report = ml.generate_operator_report(Some(&elog()), None);
-        serde_json::to_string(&report).unwrap()
+        let history = &ml.state().metrics_history;
+        let expected_latency = history
+            .iter()
+            .map(|sample| sample.evaluation_latency_ms as f64)
+            .sum::<f64>()
+            / history.len() as f64;
+        let mut serialized = serde_json::to_value(&report).unwrap();
+        // The report must preserve the measured average, while independent
+        // evaluations need only agree on all remaining decision fields.
+        assert_eq!(
+            serialized["health"]
+                .as_object_mut()
+                .unwrap()
+                .remove("avg_evaluation_latency_ms"),
+            Some(serde_json::json!(expected_latency))
+        );
+        serialized
     };
 
     assert_eq!(run(), run());

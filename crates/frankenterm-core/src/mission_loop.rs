@@ -4999,6 +4999,19 @@ mod tests {
         assert_eq!(report.health.overall, "degraded");
         assert!((report.health.conflict_rate - 0.25).abs() < 1e-10);
         assert!((report.health.planner_churn_rate - 0.35).abs() < 1e-10);
+        assert!((report.health.avg_evaluation_latency_ms - 50.0).abs() < f64::EPSILON);
+
+        // Known nonzero observations pin the real aggregation independently
+        // of how many milliseconds a fast evaluation takes on a test worker.
+        let mut second_sample = ml.state.metrics_history[0].clone();
+        second_sample.cycle_id = 2;
+        second_sample.timestamp_ms = 2000;
+        second_sample.evaluation_latency_ms = 100;
+        ml.state.metrics_history.push_back(second_sample);
+        let report = ml.generate_operator_report(None, None);
+        assert!((report.health.avg_evaluation_latency_ms - 75.0).abs() < f64::EPSILON);
+        assert_eq!(ml.state.metrics_history[0].evaluation_latency_ms, 50);
+        assert_eq!(ml.state.metrics_history[1].evaluation_latency_ms, 100);
     }
 
     #[test]
