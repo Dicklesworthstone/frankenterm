@@ -447,19 +447,19 @@
         "cosmetic": 8,
         "docs": 1,
         "feat": 2,
-        "fix": 19,
-        "other": 5,
+        "fix": 22,
+        "other": 6,
         "refactor": 1,
         "rename": 1,
-        "test": 1
+        "test": 2
       },
-      "fork_side_commit_count": 39,
+      "fork_side_commit_count": 44,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-14T06:48:12-04:00",
-        "sha": "add9cd32dbde1874fa8a8cd0231137d5b71c5530",
-        "subject": "perf(gui): coalesce queued fallback font invalidations"
+        "classification": "fix",
+        "committed_at": "2026-09-14T09:38:29-04:00",
+        "sha": "b4a71c897cbdb3559cc64db5a06c5a83eeac474f",
+        "subject": "fix(font): shape incomplete combining clusters exactly once"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -641,21 +641,21 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 187,
-        "fix": 211,
+        "fix": 212,
         "other": 38,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 76
+        "test": 77
       },
-      "fork_side_commit_count": 580,
+      "fork_side_commit_count": 582,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-14T06:52:54-04:00",
-        "sha": "a83ce6094ee7d35d47a833c716a809cf93ddf682",
-        "subject": "test(mux): construct selection fixture with its local terminal helper"
+        "committed_at": "2026-09-14T08:45:57-04:00",
+        "sha": "cad56f3ff7126ef6dd42b14920ca43322bb98739",
+        "subject": "test(mux): reject durable storage mutation in cold resize fixture"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 1,
         "feat": 53,
-        "fix": 99,
+        "fix": 100,
         "other": 48,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 51
+        "test": 53
       },
-      "fork_side_commit_count": 283,
+      "fork_side_commit_count": 286,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-14T06:56:12-04:00",
-        "sha": "f70dbd90820da305a4f5fda0c53290a2c2a4869d",
-        "subject": "test(gui): read selected rows through the public screen API"
+        "committed_at": "2026-09-14T09:14:13-04:00",
+        "sha": "9ece873ffcc3231bc6ab3b63ea0b73083193d864",
+        "subject": "test(term): clarify one-range cold read assertion"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2571,
-  "generated_at": "2026-09-14T10:56:18.119998Z",
+  "fork_side_commit_total": 2581,
+  "generated_at": "2026-09-14T13:41:36.254313Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
