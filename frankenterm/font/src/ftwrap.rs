@@ -224,7 +224,9 @@ impl Face {
         if res != 0 {
             None
         } else {
-            Some(String::from_utf8_lossy(&buf).into_owned())
+            CStr::from_bytes_until_nul(&buf)
+                .ok()
+                .map(|name| name.to_string_lossy().into_owned())
         }
     }
 

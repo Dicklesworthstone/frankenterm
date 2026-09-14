@@ -919,6 +919,16 @@ mod test {
     }
 
     #[test]
+    fn freetype_glyph_names_exclude_c_buffer_padding() {
+        let handles = fallback_test_handles(1);
+        let lib = ftwrap::Library::new().unwrap();
+        let face = lib.face_from_locator(&handles[0].handle).unwrap();
+
+        assert_eq!(face.get_glyph_name(0).as_deref(), Some(".notdef"));
+        assert_eq!(face.get_glyph_name(u32::MAX), None);
+    }
+
+    #[test]
     fn missing_fallback_requests_exclude_available_paragraph_context() {
         let handles = fallback_test_handles(1);
         let config = config::configuration();
