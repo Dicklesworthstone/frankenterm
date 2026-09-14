@@ -643,6 +643,9 @@ impl ColdSeamReflow {
 
     pub fn hydrate(mut self, cancelled: impl Fn() -> bool) -> anyhow::Result<Self> {
         anyhow::ensure!(self.replacement.is_none(), "cold seam already prepared");
+        let profile_start =
+            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
+                .then(Instant::now);
         let retained = self
             .interval
             .rows()
@@ -717,6 +720,7 @@ impl ColdSeamReflow {
         if rows.is_empty() {
             return Ok(self);
         }
+        let load_elapsed = profile_start.map(|start| start.elapsed());
         let mut logical: Option<Line> = None;
         let mut cells = 0usize;
         for source in rows.iter().chain(&self.resident) {
@@ -743,6 +747,7 @@ impl ColdSeamReflow {
             }
         }
         let logical = logical.ok_or_else(|| anyhow::anyhow!("cold seam empty context"))?;
+        let join_elapsed = profile_start.map(|start| start.elapsed());
         let seqno = logical.current_seqno();
         let (mut wrapped, _) = Screen::wrap_single_logical_line_for_resize(
             logical,
@@ -791,6 +796,7 @@ impl ColdSeamReflow {
                 "cold seam prefix requires full paragraph geometry"
             );
         }
+        let wrap_elapsed = profile_start.map(|start| start.elapsed());
         let mut replacements = BTreeMap::new();
         if let Some(previous) = &self.previous {
             for (key, line) in previous.rows.range(retained.clone()) {
@@ -836,6 +842,25 @@ impl ColdSeamReflow {
             }),
             replacement_resident,
         ));
+        if let (Some(start), Some(load), Some(join), Some(wrap)) =
+            (profile_start, load_elapsed, join_elapsed, wrap_elapsed)
+        {
+            let total = start.elapsed();
+            log::debug!(
+                target: "frankenterm_term::screen::reflow_profile",
+                "cold_seam_stages frontier={} cols={} source_rows={} resident_rows={} reused_fragments={} load_us={} join_us={} wrap_us={} fragments_us={} total_us={}",
+                self.frontier,
+                self.witness.cols,
+                rows.len(),
+                self.resident.len(),
+                fragment_start.is_some(),
+                load.as_micros(),
+                join.saturating_sub(load).as_micros(),
+                wrap.saturating_sub(join).as_micros(),
+                total.saturating_sub(wrap).as_micros(),
+                total.as_micros(),
+            );
+        }
         Ok(self)
     }
 }
@@ -937,6 +962,9 @@ impl ScreenLineRead {
         limit: usize,
         cancelled: &impl Fn() -> bool,
     ) -> anyhow::Result<Option<(Arc<ColdVisualLayout>, usize)>> {
+        let profile_start =
+            log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
+                .then(Instant::now);
         let Some(snapshot) = &self.geometry else {
             return Ok(None);
         };
@@ -1109,6 +1137,18 @@ impl ScreenLineRead {
             "cold_geometry_counts plans={} reuses={}",
             counts.plans, counts.reuses
         );
+        if let Some(start) = profile_start {
+            log::debug!(
+                target: "frankenterm_term::screen::reflow_profile",
+                "cold_geometry_stages cols={} source_rows={} groups={} plans={} reuses={} total_us={}",
+                self.witness.cols,
+                snapshot.rows.len(),
+                groups.len(),
+                counts.plans,
+                counts.reuses,
+                start.elapsed().as_micros(),
+            );
+        }
         Ok(Some((
             Arc::new(ColdVisualLayout {
                 kind: ColdVisualLayoutKind::Canonical,
