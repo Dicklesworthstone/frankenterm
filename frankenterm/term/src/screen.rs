@@ -25,6 +25,7 @@ use termwiz::input::KeyboardEncoding;
 std::thread_local! {
     static REFLOW_SOURCE_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_FULL_LAYOUT_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_LAYOUT_LINE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_CURSOR_PREFIX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_ROW_PREFIX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_CACHED_RESERVED_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -219,18 +220,113 @@ pub struct ScreenLineRead {
 }
 
 /// Visual coordinates never replace authenticated backing-store row keys.
-/// Each entry describes one complete logical group in both coordinate spaces.
+/// Canonical entries describe complete reflowed logical groups. StoredPhysical
+/// entries preserve admitted physical rows, including a clipped first group or
+/// a last group that continues across the resident frontier.
 /// Only compact metadata is retained by Screen; decoded cells remain worker
 /// owned and are retired by the read consumer.
 #[cfg(feature = "use_serde")]
 #[derive(Debug)]
 struct ColdVisualLayout {
+    kind: ColdVisualLayoutKind,
     source: Range<StableRowIndex>,
     visual: Range<StableRowIndex>,
     resident_frontier: StableRowIndex,
     groups: Vec<(Range<StableRowIndex>, Range<StableRowIndex>)>,
     witness: ScreenCoordinateWitness,
     interval: crate::config::ScrollbackInterval,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdVisualLayoutKind {
+    Canonical,
+    StoredPhysical { open_tail: bool },
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdVisualLayout {
+    fn stored_physical(&self) -> bool {
+        matches!(self.kind, ColdVisualLayoutKind::StoredPhysical { .. })
+    }
+
+    fn extends(&self, before: &Self) -> bool {
+        self.source.start == before.source.start
+            && self.visual.start == before.visual.start
+            && self.source.end >= before.source.end
+            && self.stored_physical() == before.stored_physical()
+            && (self.stored_physical() || self.groups.starts_with(&before.groups))
+    }
+}
+
+/// Append metadata captured before Screen relinquishes the exact physical row.
+/// No decoded cells or per-spill copy of the complete index is retained here.
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone)]
+struct StoredPhysicalLayout {
+    sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+    interval: crate::config::ScrollbackInterval,
+    witness: ScreenCoordinateWitness,
+    source: Range<StableRowIndex>,
+    groups: VecDeque<Range<StableRowIndex>>,
+    open_tail: bool,
+}
+
+#[cfg(feature = "use_serde")]
+impl StoredPhysicalLayout {
+    // Bound both the builder allocation and its frozen range-pair snapshot.
+    const MAX_GROUPS: usize = (ScreenLineRead::MAX_INDEX_METADATA_BYTES
+        - std::mem::size_of::<Self>()
+        - std::mem::size_of::<ColdVisualLayout>()
+        - 2 * std::mem::size_of::<usize>())
+        / (3 * std::mem::size_of::<Range<StableRowIndex>>());
+
+    fn append(&mut self, row: StableRowIndex, line: &Line) -> bool {
+        let Some(end) = row.checked_add(1) else {
+            return false;
+        };
+        let Some(retained) = self.interval.rows() else {
+            return false;
+        };
+        while self
+            .groups
+            .front()
+            .is_some_and(|group| group.end <= retained.start)
+        {
+            self.groups.pop_front();
+        }
+        if let Some(first) = self.groups.front_mut() {
+            first.start = first.start.max(retained.start);
+        }
+        if self.open_tail && !self.groups.is_empty() {
+            self.groups.back_mut().unwrap().end = end;
+        } else {
+            if self.groups.len() >= Self::MAX_GROUPS {
+                return false;
+            }
+            if self.groups.len() == self.groups.capacity() {
+                let capacity = self
+                    .groups
+                    .capacity()
+                    .max(32)
+                    .saturating_mul(2)
+                    .min(Self::MAX_GROUPS);
+                if self
+                    .groups
+                    .try_reserve_exact(capacity - self.groups.len())
+                    .is_err()
+                    || self.groups.capacity() > Self::MAX_GROUPS
+                {
+                    return false;
+                }
+            }
+            self.groups.push_back(row..end);
+        }
+        self.source.start = self.source.start.max(retained.start);
+        self.source.end = end;
+        self.open_tail = line.last_cell_was_wrapped();
+        true
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -677,6 +773,7 @@ impl ScreenLineRead {
         anyhow::ensure!(!cancelled(), "cold index cancelled");
         Ok((
             Arc::new(ColdVisualLayout {
+                kind: ColdVisualLayoutKind::Canonical,
                 source: retained.start..source_end,
                 visual: visual_first..source_end,
                 resident_frontier: self.hot_top,
@@ -823,6 +920,7 @@ impl ScreenLineRead {
                     "cold logical context unavailable"
                 );
                 for line in batch {
+                    anyhow::ensure!(!cancelled(), "cold read cancelled");
                     serde_json::to_writer(&mut *charge, &line)?;
                     let line = cold_row_with_fragment(fragments, range.start, line);
                     if fragments.is_some() {
@@ -853,29 +951,75 @@ impl ScreenLineRead {
             let end_group = layout
                 .groups
                 .partition_point(|(_, visual)| visual.start < self.resident_first);
-            for (source, visual) in &layout.groups[first_group..end_group.max(first_group)] {
+            let groups = &layout.groups[first_group..end_group.max(first_group)];
+            let source_end = groups.last().map_or(0, |(source, _)| source.end);
+            let mut next_source_row = groups.first().map_or(0, |(source, _)| source.start);
+            let context_source_start = next_source_row;
+            if layout.stored_physical() {
+                anyhow::ensure!(self.fragments.is_none(), ColdReadGeometryUnavailable);
+                let metadata_bytes = std::mem::size_of::<ColdVisualLayout>()
+                    + 2 * std::mem::size_of::<usize>()
+                    + layout.groups.capacity()
+                        * std::mem::size_of::<(Range<StableRowIndex>, Range<StableRowIndex>)>();
+                anyhow::ensure!(metadata_bytes <= limit, "cold physical index payload limit");
+                charge.used = metadata_bytes;
+                anyhow::ensure!(
+                    source_end.saturating_sub(next_source_row) as usize
+                        <= Self::MAX_ROWS.saturating_sub(self.resident.len()),
+                    "cold logical context row limit"
+                );
+            }
+            let mut prefetched = Vec::new().into_iter();
+            for (source, visual) in groups {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
+                anyhow::ensure!(
+                    source.start == next_source_row && source.start < source.end,
+                    "cold visual index source discontinuity"
+                );
                 let mut source_row = source.start;
                 let mut logical: Option<Line> = None;
                 while source_row < source.end {
-                    let batch = context_batch(
-                        sink.as_ref(),
-                        source_row..source.end.min(source_row.saturating_add(32)),
-                        &mut charge,
-                        &cancelled,
-                        self.fragments.as_deref(),
-                    )?;
-                    for mut line in batch {
-                        let seqno = line.current_seqno();
-                        line.set_last_cell_was_wrapped(false, seqno);
-                        if let Some(logical) = &mut logical {
-                            let seqno = logical.current_seqno().max(seqno);
-                            logical.append_line(line, seqno);
-                        } else {
-                            logical = Some(line);
-                        }
-                        source_row += 1;
+                    anyhow::ensure!(!cancelled(), "cold read cancelled");
+                    if prefetched.len() == 0 {
+                        // Neighboring logical groups share one bounded storage
+                        // read. Charge every prefetched row, including fragment
+                        // replacements, before retaining it across a group.
+                        // Never read beyond the selected logical context.
+                        prefetched = context_batch(
+                            sink.as_ref(),
+                            source_row..source_end.min(source_row.saturating_add(32)),
+                            &mut charge,
+                            &cancelled,
+                            self.fragments.as_deref(),
+                        )?
+                        .into_iter();
                     }
+                    let mut line = prefetched
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("cold logical context unavailable"))?;
+                    if layout.stored_physical() {
+                        // The admission receipt binds these exact physical
+                        // rows to the unchanged coordinate generation. Joining
+                        // and wrapping again could change even same-width rows.
+                        visible.push(line);
+                        source_row += 1;
+                        continue;
+                    }
+                    let seqno = line.current_seqno();
+                    line.set_last_cell_was_wrapped(false, seqno);
+                    if let Some(logical) = &mut logical {
+                        let seqno = logical.current_seqno().max(seqno);
+                        logical.append_line(line, seqno);
+                    } else {
+                        logical = Some(line);
+                    }
+                    source_row += 1;
+                }
+                next_source_row = source_row;
+                if layout.stored_physical() {
+                    anyhow::ensure!(source == visual, "cold physical index coordinates changed");
+                    context_first.get_or_insert(visual.start);
+                    continue;
                 }
                 let logical =
                     logical.ok_or_else(|| anyhow::anyhow!("cold logical group unavailable"))?;
@@ -926,7 +1070,11 @@ impl ScreenLineRead {
                 selected.len() == self.requested_row_count(),
                 "cold visual index incomplete viewport"
             );
-            self.cold_context = Some(layout.source.clone());
+            self.cold_context = Some(if layout.stored_physical() {
+                context_source_start..source_end
+            } else {
+                layout.source.clone()
+            });
             self.logical_view = Some((context_first, visible));
             self.rendered = Some(selected);
             self.payload_bytes = charge.used;
@@ -1184,6 +1332,7 @@ impl ScreenLineRead {
             };
             self.layout = cold_source.as_ref().map(|_| {
                 Arc::new(ColdVisualLayout {
+                    kind: ColdVisualLayoutKind::Canonical,
                     source: context_first..index_source_end,
                     visual: visual_first..index_source_end,
                     resident_frontier: self.hot_top,
@@ -1244,6 +1393,8 @@ pub struct Screen {
     coordinate_identity: ScreenCoordinateIdentity,
     #[cfg(feature = "use_serde")]
     cold_visual_layout: Option<Arc<ColdVisualLayout>>,
+    #[cfg(feature = "use_serde")]
+    stored_physical_layout: Option<StoredPhysicalLayout>,
     #[cfg(feature = "use_serde")]
     cold_row_fragments: Option<Arc<ColdRowFragments>>,
     #[cfg(feature = "use_serde")]
@@ -1848,7 +1999,6 @@ struct CachedWrappedLine {
 struct CachedResizeLines {
     lines: Arc<[Arc<[Line]>]>,
     row_prefix: Arc<std::sync::OnceLock<Arc<[usize]>>>,
-    layout_signature: Option<u64>,
     has_images: bool,
     scorecard: Option<ResizeWrapScorecard>,
     gate_payload: Option<String>,
@@ -1876,9 +2026,13 @@ impl CachedResizeLines {
 #[derive(Debug, Clone)]
 struct LogicalLineWrapCache {
     // Cold preparation relies on exact source-row validation at publication.
-    // Until then, None cannot authorize a generic cache lookup. Publication
-    // replaces it with the complete target-layout signature.
+    // Until then, an unsigned cache cannot authorize a generic cache lookup.
+    // Images and direct source reconstruction retain the fresh-hash path.
     source_signature: Option<u64>,
+    // At most one published target, sharing immutable chunks from the most
+    // recent layout. Reuse requires exact ordered content equality, not a hash
+    // or the publication seqno. Pruning must discard this witness entirely.
+    published_target: Option<Arc<[Arc<[Line]>]>>,
     logical_lines: Arc<[CachedLogicalLine]>,
     wrapped_by_key: HashMap<WrapCacheKey, CachedResizeLines>,
     wrap_key_order: VecDeque<WrapCacheKey>,
@@ -1963,20 +2117,12 @@ impl ScreenReflowPreparation {
             self.ready = false;
             return false;
         }
-        // The first target-layout hash is another full-history traversal.
-        // Do it here as well: publishing cached rows changes only seqnos
-        // and derived no-match scan bits, which this signature excludes.
         let cache = Arc::make_mut(self.snapshot.rewrap_cache.as_mut().unwrap());
         let key = WrapCacheKey {
             physical_cols: self.target.cols.max(1),
             dpi: self.target.dpi,
         };
         if let Some(wrapped) = cache.wrapped_by_key.get_mut(&key) {
-            if !wrapped.has_images && wrapped.layout_signature.is_none() {
-                wrapped.layout_signature = Some(Screen::compute_layout_signature_for_lines(
-                    wrapped.lines.iter().flat_map(|chunk| chunk.iter()),
-                ));
-            }
             // Populate once on this worker. A direct uncached resize keeps
             // using its existing scratch prefix, without paying a second pass.
             wrapped.row_prefix();
@@ -2196,10 +2342,25 @@ impl LogicalLineWrapCache {
         logical_lines.reverse();
         Self {
             source_signature,
+            published_target: None,
             logical_lines: Arc::from(logical_lines),
             wrapped_by_key: HashMap::new(),
             wrap_key_order: VecDeque::new(),
         }
+    }
+
+    fn matches_published_target(&self, current: &VecDeque<Line>) -> bool {
+        self.published_target.as_ref().is_some_and(|chunks| {
+            let mut published = chunks.iter().flat_map(|chunk| chunk.iter());
+            current.iter().all(|line| {
+                published.next().is_some_and(|before| {
+                    (reuse_unlinked_scan_state_for_reflow()
+                        || line.implicit_hyperlinks_are_scanned()
+                            == before.implicit_hyperlinks_are_scanned())
+                        && line.is_same_reflow_content(before)
+                })
+            }) && published.next().is_none()
+        })
     }
 
     fn touch_key(&mut self, key: WrapCacheKey) {
@@ -2242,7 +2403,6 @@ impl LogicalLineWrapCache {
             CachedResizeLines {
                 lines: Arc::from(wrapped),
                 row_prefix: Arc::new(std::sync::OnceLock::new()),
-                layout_signature: None,
                 has_images,
                 scorecard,
                 gate_payload,
@@ -2843,6 +3003,18 @@ impl Screen {
         } else {
             Vec::new()
         };
+        let layout = if first < resident_first {
+            let stored = cold.as_ref().and_then(|(sink, interval)| {
+                self.capture_stored_physical_layout(sink, interval, hot_top, budget)
+            });
+            stored.or_else(|| {
+                self.current_cold_visual_layout()
+                    .filter(|layout| resident_first <= layout.visual.end)
+                    .and_then(|_| self.cold_visual_layout.as_ref().map(Arc::clone))
+            })
+        } else {
+            None
+        };
         Ok(ScreenLineRead {
             witness: self.capture_coordinate_witness(),
             layout_seqno: self.cold_visual_seqno,
@@ -2858,13 +3030,7 @@ impl Screen {
             rendered: None,
             hot_top,
             wrap_policy: self.resize_wrap_policy,
-            layout: if first < resident_first {
-                self.current_cold_visual_layout()
-                    .filter(|layout| resident_first <= layout.visual.end)
-                    .and_then(|_| self.cold_visual_layout.as_ref().map(Arc::clone))
-            } else {
-                None
-            },
+            layout,
             logical_view: None,
             index_budget_exhausted: Arc::clone(&self.cold_index_budget_exhausted),
             attempted_index: !self
@@ -2872,6 +3038,70 @@ impl Screen {
                 .load(std::sync::atomic::Ordering::Acquire),
             fragments: self.cold_row_fragments.clone(),
         })
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn capture_stored_physical_layout(
+        &self,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: &crate::config::ScrollbackInterval,
+        frontier: StableRowIndex,
+        budget: &mut LineReadCaptureBudget,
+    ) -> Option<Arc<ColdVisualLayout>> {
+        let stored = self.stored_physical_layout.as_ref()?;
+        let retained = interval.rows()?;
+        if self.cold_row_fragments.is_some()
+            || self
+                .current_cold_visual_layout()
+                .is_some_and(|layout| !layout.stored_physical())
+            || !Arc::ptr_eq(sink, &stored.sink)
+            || !self.matches_coordinate_witness(&stored.witness)
+            || stored.source.start > retained.start
+            || stored.source.end != frontier
+            || !interval.retains(&stored.interval, retained.start..frontier)
+        {
+            return None;
+        }
+        if let Some(layout) = self.cold_visual_layout.as_ref().filter(|layout| {
+            layout.stored_physical()
+                && layout.source == (retained.start..frontier)
+                && self.matches_coordinate_witness(&layout.witness)
+                && interval.retains(&layout.interval, layout.source.clone())
+        }) {
+            return Some(Arc::clone(layout));
+        }
+        let count = stored.groups.len();
+        let bytes = count
+            .checked_mul(std::mem::size_of::<(
+                Range<StableRowIndex>,
+                Range<StableRowIndex>,
+            )>())?
+            .checked_add(
+                std::mem::size_of::<ColdVisualLayout>() + 2 * std::mem::size_of::<usize>(),
+            )?;
+        if count > budget.work_left || bytes > budget.bytes_left {
+            return None;
+        }
+        let mut groups = Vec::with_capacity(count);
+        for group in &stored.groups {
+            let source = group.start.max(retained.start)..group.end.min(frontier);
+            if source.start < source.end {
+                groups.push((source.clone(), source));
+            }
+        }
+        budget.work_left -= count;
+        budget.bytes_left -= bytes;
+        Some(Arc::new(ColdVisualLayout {
+            kind: ColdVisualLayoutKind::StoredPhysical {
+                open_tail: stored.open_tail,
+            },
+            source: retained.start..frontier,
+            visual: retained.start..frontier,
+            resident_frontier: frontier,
+            groups,
+            witness: stored.witness.clone(),
+            interval: interval.clone(),
+        }))
     }
 
     /// Call under the terminal lock, in the same critical section as publication.
@@ -2896,10 +3126,8 @@ impl Screen {
                     .zip(self.current_cold_visual_layout())
                     .is_some_and(|(before, now)| {
                         std::ptr::eq(before.as_ref(), now)
-                            || (before.source.start == now.source.start
-                                && before.visual.start == now.visual.start
-                                && (before.groups.starts_with(&now.groups)
-                                    || now.groups.starts_with(&before.groups)))
+                            || before.extends(now)
+                            || now.extends(before)
                     });
                 if !compatible {
                     return false;
@@ -2965,10 +3193,7 @@ impl Screen {
                 }
                 // Extending an unchanged prefix with already-current-width
                 // rows does not invalidate older visual coordinates.
-                current.source.start != next.source.start
-                    || current.visual.start != next.visual.start
-                    || current.source.end > next.source.end
-                    || !next.groups.starts_with(&current.groups)
+                !next.extends(current)
             })
         })
     }
@@ -3016,11 +3241,7 @@ impl Screen {
     pub fn install_line_read_layout(&mut self, read: &ScreenLineRead, seqno: SequenceNo) {
         if let Some(layout) = &read.layout {
             if self.current_cold_visual_layout().is_some_and(|current| {
-                std::ptr::eq(layout.as_ref(), current)
-                    || (current.source.start == layout.source.start
-                        && current.visual.start == layout.visual.start
-                        && current.source.end >= layout.source.end
-                        && current.groups.starts_with(&layout.groups))
+                std::ptr::eq(layout.as_ref(), current) || current.extends(layout)
             }) {
                 return;
             }
@@ -3058,8 +3279,31 @@ impl Screen {
         if first >= end {
             return requested;
         }
-        layout.groups[first].1.start.min(requested.start)
-            ..layout.groups[end - 1].1.end.max(requested.end)
+        let start = layout.groups[first].1.start.min(requested.start);
+        let mut stop = layout.groups[end - 1].1.end.max(requested.end);
+        if matches!(
+            layout.kind,
+            ColdVisualLayoutKind::StoredPhysical { open_tail: true }
+        ) && end == layout.groups.len()
+            && layout.resident_frontier == self.phys_to_stable_row_index(0)
+        {
+            // The spill frontier may split a logical group. Its resident tail
+            // is already decoded; inspect only bounded wrap bits, never reflow
+            // or cold IO under the terminal lock.
+            for (offset, line) in self.lines.iter().enumerate().take(ScreenLineRead::MAX_ROWS) {
+                let row_end = layout
+                    .resident_frontier
+                    .saturating_add(offset as StableRowIndex + 1);
+                if row_end.saturating_sub(start) as usize > ScreenLineRead::MAX_ROWS {
+                    break;
+                }
+                stop = stop.max(row_end);
+                if !line.last_cell_was_wrapped() {
+                    break;
+                }
+            }
+        }
+        start..stop
     }
 
     #[cfg(feature = "use_serde")]
@@ -3110,6 +3354,7 @@ impl Screen {
         #[cfg(feature = "use_serde")]
         {
             self.cold_index_budget_exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.stored_physical_layout = None;
         }
     }
 
@@ -3482,6 +3727,8 @@ impl Screen {
             #[cfg(feature = "use_serde")]
             cold_visual_layout: None,
             #[cfg(feature = "use_serde")]
+            stored_physical_layout: None,
+            #[cfg(feature = "use_serde")]
             cold_row_fragments: None,
             #[cfg(feature = "use_serde")]
             cold_visual_seqno: 0,
@@ -3841,8 +4088,21 @@ impl Screen {
             let Some(sink) = self.config.scrollback_spill_sink() else {
                 return false;
             };
+            #[cfg(not(feature = "use_serde"))]
             if !sink.store_scrollback_line(stable_row, line, max_retained_rows) {
                 return false;
+            }
+            #[cfg(feature = "use_serde")]
+            match sink.store_scrollback_line_with_receipt(stable_row, line, max_retained_rows) {
+                crate::config::ScrollbackLineAdmission::Refused => return false,
+                crate::config::ScrollbackLineAdmission::Admitted {
+                    interval: Some(interval),
+                } => {
+                    self.record_stored_physical_row(sink, interval, stable_row, line);
+                }
+                crate::config::ScrollbackLineAdmission::Admitted { interval: None } => {
+                    self.stored_physical_layout = None;
+                }
             }
         }
         let line_bytes = Self::estimate_line_bytes(line);
@@ -3851,6 +4111,49 @@ impl Screen {
             .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
         self.apply_cold_spill_outcome(seqno, spill_outcome, "budget_overflow");
         true
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn record_stored_physical_row(
+        &mut self,
+        sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: crate::config::ScrollbackInterval,
+        row: StableRowIndex,
+        line: &Line,
+    ) {
+        let Some(end) = row.checked_add(1) else {
+            self.stored_physical_layout = None;
+            return;
+        };
+        if self.cold_row_fragments.is_some()
+            || !interval
+                .rows()
+                .is_some_and(|rows| rows.start <= row && rows.end == end)
+        {
+            self.stored_physical_layout = None;
+            return;
+        }
+        let extends = self.stored_physical_layout.as_ref().is_some_and(|stored| {
+            Arc::ptr_eq(&sink, &stored.sink)
+                && self.matches_coordinate_witness(&stored.witness)
+                && interval.same_lineage(&stored.interval)
+                && stored.source.end == row
+        });
+        if !extends {
+            self.stored_physical_layout = Some(StoredPhysicalLayout {
+                sink,
+                interval: interval.clone(),
+                witness: self.capture_coordinate_witness(),
+                source: row..row,
+                groups: VecDeque::new(),
+                open_tail: false,
+            });
+        }
+        let stored = self.stored_physical_layout.as_mut().unwrap();
+        stored.interval = interval;
+        if !stored.append(row, line) {
+            self.stored_physical_layout = None;
+        }
     }
 
     /// Retry hot-tier overflow after a deferred sink has drained. Returns None
@@ -4317,6 +4620,8 @@ impl Screen {
     }
 
     fn hash_layout_line(hasher: &mut DefaultHasher, line: &Line) {
+        #[cfg(test)]
+        REFLOW_LAYOUT_LINE_HASHES.with(|count| count.set(count.get() + 1));
         line.len().hash(hasher);
         line.last_cell_was_wrapped().hash(hasher);
         if reuse_unlinked_scan_state_for_reflow()
@@ -4661,9 +4966,9 @@ impl Screen {
         }
     }
 
-    // Direct resizing retains a source signature for subsequent cache lookup.
     // Preparation can omit its first source hash because exact source rows
-    // authorize publication, which installs the target signature instead.
+    // authorize publication. Subsequent text-only lookup uses an exact COW
+    // target witness; images and unpublished direct sources retain hashing.
     fn logical_wraps_for_resize(
         &mut self,
         physical_cols: usize,
@@ -4681,9 +4986,13 @@ impl Screen {
         let mut logical_cache_hit = false;
         let mut wrap_cache_hit = false;
         let mut cache = self.rewrap_cache.take();
-        let source_signature = if cache
+        let published_target_matches = cache
             .as_ref()
-            .is_some_and(|entry| entry.source_signature.is_some())
+            .is_some_and(|entry| entry.matches_published_target(&self.lines));
+        let source_signature = if !published_target_matches
+            && cache
+                .as_ref()
+                .is_some_and(|entry| entry.source_signature.is_some())
         {
             #[cfg(test)]
             REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(count.get() + 1));
@@ -4692,8 +5001,11 @@ impl Screen {
             None
         };
 
-        if let (Some(entry), Some(source_signature)) = (cache.as_mut(), source_signature) {
-            if entry.source_signature == Some(source_signature) {
+        if let Some(entry) = cache.as_mut() {
+            if published_target_matches
+                || source_signature
+                    .is_some_and(|signature| entry.source_signature == Some(signature))
+            {
                 let entry = Arc::make_mut(entry);
                 logical_cache_hit = true;
                 let logical_count = entry.logical_lines.len();
@@ -4992,16 +5304,6 @@ impl Screen {
                                         wrap_policy,
                                         &mut width_prefix_scratch,
                                     );
-                                if let RewrapScratch::Lines(lines) = &wrapped_lines {
-                                    // Populate immutable row metadata while this
-                                    // worker owns the freshly wrapped chunk. The
-                                    // final ordered signature uses the same oracle
-                                    // and benefits from these per-buffer caches.
-                                    for line in lines {
-                                        line.compute_shape_hash();
-                                        line.last_cell_was_wrapped();
-                                    }
-                                }
                                 let cache_insert = match (cache_key, &wrapped_lines) {
                                     (Some(key), RewrapScratch::Lines(lines)) => Some((
                                         key,
@@ -5161,14 +5463,11 @@ impl Screen {
                     .expect("synchronous reflow cannot be cancelled")
             };
         let wraps_elapsed = profile_start.map(|start| start.elapsed());
-        let (cached_layout_signature, cached_row_prefix) = match &wrapped {
-            WrappedResizeLines::Cached(wrapped) => (
-                wrapped.layout_signature,
-                Some(Arc::clone(wrapped.row_prefix())),
-            ),
+        let cached_row_prefix = match &wrapped {
+            WrappedResizeLines::Cached(wrapped) => Some(Arc::clone(wrapped.row_prefix())),
             WrappedResizeLines::Scratch { logical_count } => {
                 self.rebuild_rewrap_row_prefix_scratch_from_slots(*logical_count);
-                (None, None)
+                None
             }
         };
         let row_prefix = cached_row_prefix
@@ -5286,23 +5585,27 @@ impl Screen {
         if pruned_rows > 0 {
             self.rewrap_cache = None;
         } else {
-            // Source content was freshly validated before selecting a cache
-            // entry. Cloning its immutable text Lines and changing only seqno
-            // preserves the exact target hash already computed on first use.
-            let layout_signature =
-                cached_layout_signature.unwrap_or_else(|| self.compute_layout_signature());
+            let key = WrapCacheKey {
+                physical_cols,
+                dpi: self.dpi,
+            };
+            let published_target = self
+                .rewrap_cache
+                .as_ref()
+                .and_then(|cache| cache.wrapped_by_key.get(&key))
+                .filter(|wrapped| !wrapped.has_images)
+                .map(|wrapped| Arc::clone(&wrapped.lines));
+            // Text rows retain the exact immutable chunks used for this
+            // publication. The next lookup compares every ordered row against
+            // them, ignoring only seqno and the existing no-match scan bit.
+            // Mutable image payloads require a fresh complete content hash.
+            let source_signature = published_target
+                .is_none()
+                .then(|| self.compute_layout_signature());
             if let Some(cache) = self.rewrap_cache.as_mut() {
                 let cache = Arc::make_mut(cache);
-                cache.source_signature = Some(layout_signature);
-                let key = WrapCacheKey {
-                    physical_cols,
-                    dpi: self.dpi,
-                };
-                if let Some(wrapped) = cache.wrapped_by_key.get_mut(&key) {
-                    if !wrapped.has_images {
-                        wrapped.layout_signature = Some(layout_signature);
-                    }
-                }
+                cache.source_signature = source_signature;
+                cache.published_target = published_target;
             }
         }
 
@@ -6675,7 +6978,7 @@ impl Screen {
             #[cfg(feature = "use_serde")]
             if let Some(layout) = layout
                 .as_ref()
-                .filter(|layout| layout.visual.contains(&stable_row))
+                .filter(|layout| !layout.stored_physical() && layout.visual.contains(&stable_row))
             {
                 let Some((source, visual)) = layout
                     .groups
@@ -7610,6 +7913,319 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "use_serde")]
+    #[derive(Debug)]
+    struct ColdPrefetchTestSink {
+        inner: TestColdScrollbackSink,
+        max_batch_rows: usize,
+        requests: Mutex<Vec<Range<StableRowIndex>>>,
+        cancel_on_read: AtomicBool,
+        cancelled: AtomicBool,
+        overfill: AtomicBool,
+    }
+
+    #[cfg(feature = "use_serde")]
+    impl ScrollbackSpillSink for ColdPrefetchTestSink {
+        fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
+            self.inner.try_capture_scrollback_interval()
+        }
+        fn store_scrollback_line(&self, row: StableRowIndex, line: &Line, limit: usize) -> bool {
+            self.inner.store_scrollback_line(row, line, limit)
+        }
+        fn load_scrollback_line(&self, row: StableRowIndex) -> Option<Line> {
+            self.inner.load_scrollback_line(row)
+        }
+        fn load_scrollback_lines(&self, requested: Range<StableRowIndex>) -> Vec<Line> {
+            self.requests.lock().unwrap().push(requested.clone());
+            assert!(requested.end - requested.start <= 32);
+            let end = if self.overfill.load(Ordering::Relaxed) {
+                requested.end + 1
+            } else {
+                requested.end
+            };
+            let rows = self.inner.rows.lock().unwrap();
+            let result = (requested.start..end)
+                .take(self.max_batch_rows)
+                .map_while(|row| rows.get(&row).cloned())
+                .collect();
+            if self.cancel_on_read.load(Ordering::Relaxed) {
+                self.cancelled.store(true, Ordering::Relaxed);
+            }
+            result
+        }
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.inner.oldest_scrollback_row()
+        }
+        fn retained_scrollback_rows(&self) -> usize {
+            self.inner.retained_scrollback_rows()
+        }
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.inner.retained_scrollback_bytes()
+        }
+        fn snapshot_scrollback(
+            &self,
+            _: StableRowIndex,
+            _: crate::config::ScrollbackSnapshotLimits,
+        ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError>
+        {
+            panic!("cold prefetch must not request a full storage snapshot")
+        }
+        fn replace_scrollback_prefix(
+            &self,
+            _: Option<crate::config::ScrollbackSnapshotGeneration>,
+            _: crate::config::ScrollbackPrefix<'_>,
+            _: usize,
+        ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
+        {
+            panic!("cold prefetch must not replace storage")
+        }
+        fn clear_scrollback(
+            &self,
+        ) -> Result<crate::config::ScrollbackClearCommit, crate::config::ScrollbackSpillError>
+        {
+            panic!("cold prefetch must not clear storage")
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn cold_prefetch_fixture(max_batch_rows: usize) -> (Screen, Arc<ColdPrefetchTestSink>) {
+        let sink = Arc::new(ColdPrefetchTestSink {
+            inner: TestColdScrollbackSink::default(),
+            max_batch_rows,
+            requests: Mutex::new(Vec::new()),
+            cancel_on_read: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            overfill: AtomicBool::new(false),
+        });
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        for row in 0..65 {
+            let line = Line::from_text(&format!("{row:02}界e\u{301}"), &attrs, 1, None);
+            assert!(sink.store_scrollback_line(row, &line, 65));
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            8,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 65;
+        let indexed = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&indexed));
+        screen.install_line_read_layout(&indexed, 2);
+        assert_eq!(
+            screen.current_cold_visual_layout().unwrap().groups.len(),
+            65
+        );
+        sink.requests.lock().unwrap().clear();
+        (screen, sink)
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_prefetch_coalesces_groups_with_exact_rows_and_charges() {
+        for batch_rows in [32, 2] {
+            let (screen, sink) = cold_prefetch_fixture(batch_rows);
+            let mut expected = Vec::new();
+            let mut expected_bytes = 0;
+            // Separate logical-group reads are the non-coalesced reference.
+            for row in 0..65 {
+                let read = screen
+                    .capture_line_read(row..row + 1)
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap();
+                expected.extend(read.lines().cloned());
+                expected_bytes += read.payload_bytes();
+            }
+            assert_eq!(sink.requests.lock().unwrap().len(), 65);
+            sink.requests.lock().unwrap().clear();
+            let read = screen
+                .capture_line_read(0..65)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(read.lines().cloned().collect::<Vec<_>>(), expected);
+            assert_eq!(read.payload_bytes(), expected_bytes);
+            assert!(screen.validates_line_read(&read));
+            let requests = sink.requests.lock().unwrap();
+            assert_eq!(requests.len(), 65usize.div_ceil(batch_rows));
+            assert_eq!(requests.first(), Some(&(0..32)));
+            assert_eq!(requests.last(), Some(&(64..65)));
+            drop(requests);
+            let replacement = Line::from_text("changed", &CellAttributes::blank(), 1, None);
+            assert!(sink.store_scrollback_line(20, &replacement, 65));
+            assert!(
+                !screen.validates_line_read(&read),
+                "same-key replacement must reject publication"
+            );
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_prefetch_continues_wrapped_groups_across_batch_boundaries() {
+        for batch_rows in [32, 2] {
+            let (mut screen, sink) = cold_prefetch_fixture(batch_rows);
+            for row in 30..33 {
+                let mut line = Line::from_text("abcdefgh", &CellAttributes::blank(), 1, None);
+                line.set_last_cell_was_wrapped(row < 32, 1);
+                assert!(sink.store_scrollback_line(row, &line, 65));
+            }
+            assert!(screen.current_cold_visual_layout().is_none());
+            let indexed = screen
+                .capture_line_read(0..1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&indexed));
+            screen.install_line_read_layout(&indexed, 3);
+            let groups = &screen.current_cold_visual_layout().unwrap().groups;
+            assert_eq!(groups[30], (30..33, 30..33));
+            let mut expected = Vec::new();
+            let mut expected_bytes = 0;
+            for (_, visual) in groups {
+                let read = screen
+                    .capture_line_read(visual.clone())
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap();
+                expected.extend(read.lines().cloned());
+                expected_bytes += read.payload_bytes();
+            }
+            sink.requests.lock().unwrap().clear();
+            let read = screen
+                .capture_line_read(0..65)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(read.lines().cloned().collect::<Vec<_>>(), expected);
+            assert_eq!(read.payload_bytes(), expected_bytes);
+            assert!(screen.validates_line_read(&read));
+            assert_eq!(
+                sink.requests.lock().unwrap().len(),
+                65usize.div_ceil(batch_rows)
+            );
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_prefetch_stops_at_selected_context_and_refuses_missing_or_excess_rows() {
+        let (screen, sink) = cold_prefetch_fixture(33);
+        sink.inner.rows.lock().unwrap().remove(&20);
+        let read = screen
+            .capture_line_read(18..20)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(read.row_count(), 2);
+        assert_eq!(*sink.requests.lock().unwrap(), [18..20]);
+        sink.requests.lock().unwrap().clear();
+        let error = screen
+            .capture_line_read(18..21)
+            .unwrap()
+            .hydrate(|| false)
+            .err()
+            .expect("a missing row must refuse the entire read");
+        assert!(error
+            .to_string()
+            .contains("cold logical context unavailable"));
+        assert_eq!(*sink.requests.lock().unwrap(), [18..21, 20..21]);
+        sink.requests.lock().unwrap().clear();
+        sink.overfill.store(true, Ordering::Relaxed);
+        let error = screen
+            .capture_line_read(0..2)
+            .unwrap()
+            .hydrate(|| false)
+            .err()
+            .expect("an oversized sink response must be refused");
+        assert!(error
+            .to_string()
+            .contains("cold logical context unavailable"));
+        assert_eq!(*sink.requests.lock().unwrap(), [0..2]);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_prefetch_cancels_before_read_and_after_a_short_batch() {
+        let (screen, sink) = cold_prefetch_fixture(2);
+        assert!(screen
+            .capture_line_read(0..65)
+            .unwrap()
+            .hydrate(|| true)
+            .is_err());
+        assert!(sink.requests.lock().unwrap().is_empty());
+        sink.cancel_on_read.store(true, Ordering::Relaxed);
+        let error = screen
+            .capture_line_read(0..65)
+            .unwrap()
+            .hydrate(|| sink.cancelled.load(Ordering::Relaxed))
+            .err()
+            .expect("cancellation during the first batch must stop continuation");
+        assert!(error.to_string().contains("cold read cancelled"));
+        assert_eq!(*sink.requests.lock().unwrap(), [0..32]);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_prefetch_preserves_fragment_charges_and_payload_boundary() {
+        let (mut screen, sink) = cold_prefetch_fixture(32);
+        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+            sink.try_capture_scrollback_interval()
+        else {
+            panic!("fixture interval must be available");
+        };
+        screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
+            sink: sink.clone(),
+            interval,
+            rows: [(
+                31,
+                Line::from_text("换界", &CellAttributes::blank(), 1, None),
+            )]
+            .into(),
+            aligned_frontier: 65,
+            aligned_source_start: 0,
+            cols: 8,
+            dpi: 96,
+            policy: screen.resize_wrap_policy,
+        }));
+        let mut expected = Vec::new();
+        let mut expected_bytes = 0;
+        for row in 0..64 {
+            let read = screen
+                .capture_line_read(row..row + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            expected.extend(read.lines().cloned());
+            expected_bytes += read.payload_bytes();
+        }
+        sink.requests.lock().unwrap().clear();
+        let read = screen
+            .capture_line_read(0..64)
+            .unwrap()
+            .hydrate_with_payload_limit(expected_bytes, || false)
+            .unwrap();
+        assert_eq!(read.lines().cloned().collect::<Vec<_>>(), expected);
+        assert_eq!(read.lines().nth(31).unwrap().as_str(), "换界");
+        assert_eq!(read.payload_bytes(), expected_bytes);
+        assert!(screen.validates_line_read(&read));
+        assert_eq!(*sink.requests.lock().unwrap(), [0..32, 32..64]);
+        assert!(screen
+            .capture_line_read(0..64)
+            .unwrap()
+            .hydrate_with_payload_limit(expected_bytes - 1, || false)
+            .is_err());
+    }
+
+    #[cfg(feature = "use_serde")]
     #[test]
     fn owned_line_read_payload_boundary_and_resident_mutation() {
         let mut screen = test_screen(3, 8, 96);
@@ -8318,12 +8934,293 @@ pub(crate) mod tests {
         assert_eq!(screen.stable_row_index_offset, usize::MAX);
     }
 
+    #[cfg(feature = "use_serde")]
+    fn stored_physical_fixture(
+        cold_rows: usize,
+        retention: usize,
+    ) -> (Screen, Arc<TestColdScrollbackSink>) {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut screen = test_screen_with_config(
+            4,
+            20,
+            96,
+            TestTermConfig {
+                scrollback: retention + 1,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        for row in 0..cold_rows {
+            let mut line = Line::from_text(
+                ["café e\u{301} ", "中文🙂", " tail  "][row % 3],
+                &CellAttributes::blank(),
+                1,
+                None,
+            );
+            line.set_last_cell_was_wrapped(row % 3 != 2, 1);
+            assert!(screen.record_scrollback_spill(row as StableRowIndex, &line, 1));
+            screen.advance_stable_row_index_offset(1);
+        }
+        screen.lines[0] = Line::from_text("resident tail", &CellAttributes::blank(), 1, None);
+        (screen, sink)
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_first_large_prefix_read_decodes_only_requested_groups() {
+        let (mut screen, sink) = stored_physical_fixture(20_001, 30_000);
+        let requested = 19_969..19_997;
+        let expected: Vec<_> = requested
+            .clone()
+            .map(|row| sink.load_scrollback_line(row).unwrap())
+            .collect();
+        let captured = screen.capture_line_read(requested.clone()).unwrap();
+        assert!(captured.layout.as_ref().unwrap().stored_physical());
+        assert_eq!(
+            sink.batch_reads.load(Ordering::Relaxed),
+            0,
+            "capture must perform no cold IO"
+        );
+        let ready = captured.hydrate(|| false).unwrap();
+        assert_eq!(ready.cold_context, Some(19_968..19_998));
+        // This sink deliberately returns two rows per call. Reading the full
+        // prefix would require 10,001 calls; only these ten groups are loaded.
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 15);
+        assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), expected);
+        assert!(screen.validates_line_read(&ready));
+        screen.install_line_read_layout(&ready, 2);
+        assert_eq!(screen.lines_in_stable_range(requested).1, expected);
+        assert!(screen.validates_line_read(&ready));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_admission_refusal_and_unwitnessed_success_do_not_extend_index() {
+        let (mut screen, sink) = stored_physical_fixture(6, 32);
+        let offered = Line::from_text("not admitted", &CellAttributes::blank(), 1, None);
+        sink.refuse_admission.store(true, Ordering::Relaxed);
+        assert!(!screen.record_scrollback_spill(6, &offered, 1));
+        assert_eq!(screen.stored_physical_layout.as_ref().unwrap().source, 0..6);
+        assert!(sink.load_scrollback_line(6).is_none());
+        sink.refuse_admission.store(false, Ordering::Relaxed);
+        sink.omit_admission_receipt.store(true, Ordering::Relaxed);
+        assert!(screen.record_scrollback_spill(6, &offered, 1));
+        screen.advance_stable_row_index_offset(1);
+        assert!(screen.stored_physical_layout.is_none());
+        assert!(screen.capture_line_read(0..3).unwrap().layout.is_none());
+        assert_eq!(sink.load_scrollback_line(6), Some(offered));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_busy_replacement_and_clear_reject_old_authority() {
+        let (mut screen, sink) = stored_physical_fixture(6, 32);
+        let ready = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        assert!(!screen.validates_line_read(&ready));
+        assert!(screen.capture_line_read(0..3).is_err());
+        sink.force_busy_probe.store(false, Ordering::Relaxed);
+        assert!(screen.validates_line_read(&ready));
+        *sink.interval_identity.lock().unwrap() = Default::default();
+        assert!(
+            !screen.validates_line_read(&ready),
+            "identical bounds are not source authority"
+        );
+        assert!(screen.capture_line_read(0..3).unwrap().layout.is_none());
+        sink.clear_scrollback().unwrap();
+        let line = Line::from_text("after clear", &CellAttributes::blank(), 1, None);
+        assert!(screen.record_scrollback_spill(6, &line, 1));
+        screen.advance_stable_row_index_offset(1);
+        let after = screen
+            .capture_line_read(6..7)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(after.layout.as_ref().unwrap().stored_physical());
+        assert_eq!(after.lines().cloned().collect::<Vec<_>>(), vec![line]);
+        assert!(!screen.validates_line_read(&ready));
+        assert!(screen.validates_line_read(&after));
+
+        // A different sink is not authorized even if a caller supplies equal
+        // row values and forgets to install a new configuration generation.
+        let replacement = Arc::new(TestColdScrollbackSink::default());
+        for (row, line) in sink.rows.lock().unwrap().iter() {
+            assert!(replacement.store_scrollback_line(*row, line, 32));
+        }
+        screen.config = Arc::new(TestTermConfig {
+            cold_sink: Some(replacement),
+            ..TestTermConfig::default()
+        });
+        assert!(!screen.validates_line_read(&after));
+        assert!(screen.capture_line_read(6..7).unwrap().layout.is_none());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_retention_clips_group_without_rewrapping_unicode_or_spaces() {
+        let (mut screen, sink) = stored_physical_fixture(9, 5);
+        assert_eq!(screen.stored_physical_layout.as_ref().unwrap().source, 4..9);
+        let ready = screen
+            .capture_line_read(4..6)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(ready.cold_context, Some(4..6));
+        let expected: Vec<_> = (4..6)
+            .map(|row| sink.load_scrollback_line(row).unwrap())
+            .collect();
+        assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), expected);
+        assert!(ready.lines().next().unwrap().last_cell_was_wrapped());
+        assert_eq!(ready.lines().last().unwrap().as_str(), " tail  ");
+        screen.install_line_read_layout(&ready, 2);
+        sink.rows.lock().unwrap().remove(&4);
+        assert!(!screen.validates_line_read(&ready));
+        let clipped = screen
+            .capture_line_read(5..6)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&clipped));
+        assert_eq!(clipped.lines().cloned().collect::<Vec<_>>(), expected[1..]);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_open_seam_preserves_raw_rows_and_resident_logical_context() {
+        let (mut screen, sink) = stored_physical_fixture(8, 32);
+        let expected: Vec<_> = (6..8)
+            .map(|row| sink.load_scrollback_line(row).unwrap())
+            .chain(std::iter::once(screen.lines[0].clone()))
+            .collect();
+        let ready = screen
+            .capture_line_read(6..9)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            ready.layout.as_ref().unwrap().kind,
+            ColdVisualLayoutKind::StoredPhysical { open_tail: true }
+        );
+        assert!(screen.validates_line_read(&ready));
+        screen.install_line_read_layout(&ready, 2);
+        assert_eq!(screen.expand_cold_logical_range(7..8), 6..9);
+        assert_eq!(screen.lines_in_stable_range(6..9).1, expected);
+        screen.lines[0] = Line::from_text("changed tail", &CellAttributes::blank(), 1, None);
+        assert!(!screen.validates_line_read(&ready));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_geometry_aba_and_configuration_invalidate_admission_metadata() {
+        for size in [
+            test_size(4, 21, 96),
+            test_size(5, 20, 96),
+            test_size(4, 20, 120),
+        ] {
+            let (mut screen, _) = stored_physical_fixture(6, 32);
+            let read = screen
+                .capture_line_read(0..3)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            let cursor = screen.resize(size, CursorPosition::default(), 2, false);
+            assert!(screen.stored_physical_layout.is_none());
+            screen.resize(test_size(4, 20, 96), cursor, 3, false);
+            assert!(!screen.validates_line_read(&read));
+            assert!(screen.capture_line_read(0..3).unwrap().layout.is_none());
+        }
+        let (mut screen, _) = stored_physical_fixture(6, 32);
+        let read = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let config = Arc::clone(&screen.config);
+        screen.install_prepared_config(&config, screen.resize_wrap_policy);
+        assert!(screen.stored_physical_layout.is_none());
+        assert!(!screen.validates_line_read(&read));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_loads_remain_charged_and_cancellable() {
+        let (screen, sink) = stored_physical_fixture(60, 100);
+        assert!(screen
+            .capture_line_read(3..33)
+            .unwrap()
+            .hydrate_with_payload_limit(1, || false)
+            .is_err());
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = screen
+            .capture_line_read(3..33)
+            .unwrap()
+            .hydrate(|| calls.fetch_add(1, Ordering::Relaxed) >= 5);
+        assert!(result.is_err());
+        assert!(sink.batch_reads.load(Ordering::Relaxed) < 15);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_metadata_cap_and_layout_kind_are_real_boundaries() {
+        let (mut screen, _) = stored_physical_fixture(3, 32);
+        let ready = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let physical = ready.layout.as_ref().unwrap();
+        let canonical = ColdVisualLayout {
+            kind: ColdVisualLayoutKind::Canonical,
+            source: physical.source.clone(),
+            visual: physical.visual.clone(),
+            resident_frontier: physical.resident_frontier,
+            groups: physical.groups.clone(),
+            witness: physical.witness.clone(),
+            interval: physical.interval.clone(),
+        };
+        assert!(!physical.extends(&canonical));
+        assert!(!canonical.extends(physical));
+        screen.cold_visual_layout = Some(Arc::new(canonical));
+        assert!(screen.line_read_changes_layout(&ready));
+        screen.cold_visual_seqno = 2;
+        assert!(!screen.validates_line_read(&ready));
+
+        let stored = screen.stored_physical_layout.as_mut().unwrap();
+        let count = StoredPhysicalLayout::MAX_GROUPS;
+        let end = count as StableRowIndex;
+        stored.groups = (0..end).map(|row| row..row + 1).collect();
+        stored.source = 0..end;
+        stored.open_tail = false;
+        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+            crate::config::ScrollbackIntervalIdentity::default().capture(Some(0..end + 1))
+        else {
+            panic!("test interval unavailable");
+        };
+        stored.interval = interval;
+        assert!(!stored.append(end, &Line::new(1)));
+        assert_eq!(stored.groups.len(), count);
+        assert_eq!(stored.source, 0..end);
+    }
+
     #[derive(Debug, Default)]
     pub(crate) struct TestColdScrollbackSink {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
         interval_identity: Mutex<crate::config::ScrollbackIntervalIdentity>,
         batch_reads: AtomicU64,
         force_busy_probe: AtomicBool,
+        refuse_admission: AtomicBool,
+        omit_admission_receipt: AtomicBool,
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
         revision: AtomicU64,
@@ -8358,12 +9255,23 @@ pub(crate) mod tests {
             line: &Line,
             max_retained_rows: usize,
         ) -> bool {
-            if max_retained_rows == 0 {
-                return false;
+            self.store_scrollback_line_with_receipt(stable_row, line, max_retained_rows)
+                .accepted()
+        }
+
+        fn store_scrollback_line_with_receipt(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            max_retained_rows: usize,
+        ) -> crate::config::ScrollbackLineAdmission {
+            use crate::config::ScrollbackLineAdmission;
+            if max_retained_rows == 0 || self.refuse_admission.load(Ordering::Relaxed) {
+                return ScrollbackLineAdmission::Refused;
             }
 
             let Some(next_revision) = self.revision.load(Ordering::Relaxed).checked_add(1) else {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             };
 
             let mut rows = self.rows.lock().expect("test sink mutex");
@@ -8378,7 +9286,24 @@ pub(crate) mod tests {
                 rows.remove(&oldest);
             }
             self.revision.store(next_revision, Ordering::Relaxed);
-            true
+            let interval = if self.omit_admission_receipt.load(Ordering::Relaxed) {
+                None
+            } else {
+                let first = *rows.first_key_value().unwrap().0;
+                let end = rows.last_key_value().unwrap().0.checked_add(1);
+                match end.map(|end| {
+                    self.interval_identity
+                        .lock()
+                        .unwrap()
+                        .capture(Some(first..end))
+                }) {
+                    Some(crate::config::ScrollbackIntervalCapture::Ready(interval)) => {
+                        Some(interval)
+                    }
+                    _ => None,
+                }
+            };
+            ScrollbackLineAdmission::Admitted { interval }
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
@@ -9253,6 +10178,7 @@ pub(crate) mod tests {
             assert!(screen.rewrap_cache.is_none());
             let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
             REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            REFLOW_LAYOUT_LINE_HASHES.with(|count| count.set(0));
             assert!(prepared.prepare(|| false));
             assert_eq!(
                 REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()),
@@ -9290,12 +10216,16 @@ pub(crate) mod tests {
                 expected_prefix.push(expected_prefix.last().unwrap() + chunk.len());
             }
             assert_eq!(prepared_prefix.as_ref(), expected_prefix.as_slice());
-            assert_eq!(
-                prepared_target.layout_signature,
-                Some(Screen::compute_layout_signature_for_lines(
-                    prepared_target.lines.iter().flat_map(|chunk| chunk.iter()),
-                )),
-                "the worker must compute the exact target signature before commit"
+            assert_eq!(REFLOW_LAYOUT_LINE_HASHES.with(|count| count.get()), 0);
+            assert!(
+                prepared
+                    .snapshot
+                    .rewrap_cache
+                    .as_ref()
+                    .unwrap()
+                    .published_target
+                    .is_none(),
+                "unpublished targets must not authorize their source cache"
             );
             if stale {
                 // Keep the sequence unchanged: only exact source validation
@@ -9335,7 +10265,10 @@ pub(crate) mod tests {
                 );
             } else {
                 assert_eq!(scans, 0, "validated commit must not hash the source again");
-                assert_eq!(full_scans, 0, "target hashing must also stay on the worker");
+                assert_eq!(
+                    full_scans, 0,
+                    "immutable target publication needs no full hash"
+                );
                 assert_eq!(
                     cursor_scans, 0,
                     "accepted commit must reuse worker cursor mapping"
@@ -9349,11 +10282,9 @@ pub(crate) mod tests {
                     screen.rewrap_cache.as_ref().unwrap().wrapped_by_key[&key].row_prefix(),
                 ));
             }
-            assert_eq!(
-                screen.rewrap_cache.as_ref().unwrap().source_signature,
-                Some(screen.compute_layout_signature()),
-                "publication must install the complete target signature"
-            );
+            let cache = screen.rewrap_cache.as_ref().unwrap();
+            assert_eq!(cache.source_signature, None);
+            assert!(cache.matches_published_target(&screen.lines));
             assert_eq!(actual_cursor, expected_cursor);
             assert_eq!(screen.lines, expected.lines);
             assert_eq!(screen.physical_cols, expected.physical_cols);
@@ -9643,7 +10574,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cached_target_signatures_match_fresh_hashing_and_complete_line_state() {
+    fn published_target_witness_matches_fresh_reflow_and_complete_line_state() {
         let mut attrs = CellAttributes::blank();
         attrs.set_hyperlink(Some(Arc::new(
             frankenterm_escape_parser::hyperlink::Hyperlink::new_with_id(
@@ -9670,17 +10601,13 @@ pub(crate) mod tests {
                     .rewrap_cache
                     .as_ref()
                     .and_then(|cache| cache.wrapped_by_key.get(&key))
-                    .and_then(|wrapped| wrapped.layout_signature)
                     .is_some()
                 {
                     reused += 1;
                 }
                 let mut fresh = screen.clone();
-                if let Some(cache) = fresh.rewrap_cache.as_mut() {
-                    for wrapped in Arc::make_mut(cache).wrapped_by_key.values_mut() {
-                        wrapped.layout_signature = None;
-                    }
-                }
+                fresh.rewrap_cache = None;
+                fresh.clear_rewrap_line_cache();
                 let seqno = index + 2;
                 let expected = fresh.resize(test_size(3, cols, 96), cursor, seqno, false);
                 cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
@@ -9702,13 +10629,176 @@ pub(crate) mod tests {
                     vec![text.clone(); 3],
                     "width {cols} must retain the original three logical records"
                 );
-                let full_hash = screen.compute_layout_signature();
                 let cache = screen.rewrap_cache.as_ref().unwrap();
-                assert_eq!(cache.source_signature, Some(full_hash));
-                assert_eq!(cache.wrapped_by_key[&key].layout_signature, Some(full_hash));
+                assert_eq!(cache.source_signature, None);
+                assert!(cache.matches_published_target(&screen.lines));
+                assert!(Arc::ptr_eq(
+                    cache.published_target.as_ref().unwrap(),
+                    &cache.wrapped_by_key[&key].lines,
+                ));
             }
-            assert!(reused >= 4, "must exercise repeated target signatures");
+            assert!(reused >= 4, "must exercise repeated target layouts");
         }
+    }
+
+    #[test]
+    fn published_target_preparation_skips_history_hashes_for_cached_and_unseen_widths() {
+        let mut screen = test_screen_with_scorecard(3, 40);
+        screen.lines = (0..16)
+            .map(|index| {
+                Line::from_text(
+                    &format!("{index:02} 界👩‍💻e\u{301} אב abcdefghijklmnopqrstuvwxyz"),
+                    &CellAttributes::blank(),
+                    1,
+                    None,
+                )
+            })
+            .collect();
+        let mut cursor = test_cursor(2, 2, 1);
+        for (index, cols) in [7, 19, 11, 7, 19, 5].iter().copied().enumerate() {
+            let size = test_size(3, cols, 96);
+            let mut fresh = screen.clone();
+            fresh.rewrap_cache = None;
+            fresh.clear_rewrap_line_cache();
+            let expected = fresh.resize(size, cursor, index + 2, false);
+            let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.set(0));
+            REFLOW_LAYOUT_LINE_HASHES.with(|count| count.set(0));
+            assert!(prepared.prepare(|| false));
+            assert_eq!(REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()), 0);
+            assert_eq!(
+                REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.get()),
+                0
+            );
+            assert_eq!(
+                REFLOW_LAYOUT_LINE_HASHES.with(|count| count.get()),
+                0,
+                "preparation at width {cols} must not hash source or target physical rows"
+            );
+            cursor = screen.resize_with_prepared_reflow(
+                size,
+                cursor,
+                index + 2,
+                false,
+                Some(&mut prepared),
+            );
+            assert!(prepared.was_applied());
+            assert_eq!(cursor, expected);
+            assert_eq!(screen.lines, fresh.lines);
+            assert_eq!(
+                screen.last_resize_wrap_scorecard,
+                fresh.last_resize_wrap_scorecard
+            );
+            assert!(screen
+                .rewrap_cache
+                .as_ref()
+                .unwrap()
+                .matches_published_target(&screen.lines));
+        }
+
+        let cache = Arc::clone(screen.rewrap_cache.as_ref().unwrap());
+        let rows = screen.lines.clone();
+        let mut cancelled = screen
+            .capture_reflow_preparation(test_size(3, 13, 96), cursor)
+            .unwrap();
+        let checks = std::cell::Cell::new(0);
+        assert!(!cancelled.prepare(|| {
+            checks.set(checks.get() + 1);
+            checks.get() == 4
+        }));
+        assert!(!cancelled.ready && !cancelled.was_applied());
+        assert!(Arc::ptr_eq(&cache, screen.rewrap_cache.as_ref().unwrap()));
+        assert!(cache.matches_published_target(&screen.lines));
+        assert_eq!(screen.lines, rows);
+    }
+
+    #[test]
+    fn published_target_rejects_same_seqno_cell_attribute_wrap_order_and_length_changes() {
+        let mut seed = test_screen(3, 40, 96);
+        seed.lines = (0..6)
+            .map(|index| {
+                Line::from_text(
+                    &format!("{index:02} abcdefghijklmnopqrstuvwxyz"),
+                    &CellAttributes::blank(),
+                    1,
+                    None,
+                )
+            })
+            .collect();
+        let cursor = seed.resize(test_size(3, 7, 96), test_cursor(0, 2, 1), 2, false);
+        assert!(seed
+            .rewrap_cache
+            .as_ref()
+            .unwrap()
+            .matches_published_target(&seed.lines));
+        for mutation in 0..6 {
+            let mut screen = seed.clone();
+            match mutation {
+                0 => {
+                    screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 2);
+                }
+                1 => {
+                    let mut attrs = CellAttributes::blank();
+                    attrs.set_italic(true);
+                    screen.lines[0].set_cell(0, Cell::new('0', attrs), 2);
+                }
+                2 => screen.lines[0].set_last_cell_was_wrapped(false, 2),
+                3 => screen.lines.swap(0, 1),
+                4 => {
+                    screen.lines.pop_back();
+                }
+                _ => screen.lines.push_back(Line::from_text(
+                    "new row",
+                    &CellAttributes::blank(),
+                    2,
+                    None,
+                )),
+            }
+            assert!(screen.lines.iter().all(|line| line.current_seqno() == 2));
+            assert!(!screen
+                .rewrap_cache
+                .as_ref()
+                .unwrap()
+                .matches_published_target(&screen.lines));
+            let mut fresh = screen.clone();
+            fresh.rewrap_cache = None;
+            fresh.clear_rewrap_line_cache();
+            let expected = fresh.resize(test_size(3, 11, 96), cursor, 3, false);
+            let actual = screen.resize(test_size(3, 11, 96), cursor, 3, false);
+            assert_eq!(actual, expected, "mutation {mutation}");
+            assert_eq!(screen.lines, fresh.lines, "mutation {mutation}");
+            assert_eq!(
+                screen.rewrap_cache.as_ref().unwrap().wrapped_by_key.len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn reflow_pruning_discards_published_target_authority() {
+        let mut screen = test_screen_with_config(
+            1,
+            12,
+            96,
+            TestTermConfig {
+                scrollback: 0,
+                ..Default::default()
+            },
+        );
+        screen.lines = VecDeque::from([
+            Line::from_text("abcdefghijkl", &CellAttributes::blank(), 1, None),
+            Line::new(1),
+            Line::new(1),
+        ]);
+        let cursor = screen.rewrap_lines(3, 1, 0, 0, 2, None);
+        assert_eq!(cursor, (0, 0));
+        assert_eq!(screen.lines.len(), 4, "two trailing blank rows were pruned");
+        assert!(
+            screen.rewrap_cache.is_none(),
+            "pruned targets cannot authorize full logical reuse"
+        );
+        assert_eq!(screen.lines.back().unwrap().as_str(), "jkl");
     }
 
     #[test]
@@ -9749,7 +10839,8 @@ pub(crate) mod tests {
             assert!(cache
                 .wrapped_by_key
                 .values()
-                .all(|wrapped| { wrapped.has_images && wrapped.layout_signature.is_none() }));
+                .all(|wrapped| wrapped.has_images));
+            assert!(cache.published_target.is_none());
         }
         let before = screen.compute_layout_signature();
         {
@@ -9774,7 +10865,8 @@ pub(crate) mod tests {
         assert!(cache
             .wrapped_by_key
             .values()
-            .all(|wrapped| { wrapped.has_images && wrapped.layout_signature.is_none() }));
+            .all(|wrapped| wrapped.has_images));
+        assert!(cache.published_target.is_none());
     }
 
     #[test]

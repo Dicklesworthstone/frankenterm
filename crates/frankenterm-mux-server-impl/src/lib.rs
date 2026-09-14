@@ -550,32 +550,55 @@ mod deferred_scrollback {
             line: &Line,
             retention: usize,
         ) -> bool {
+            self.store_scrollback_line_with_receipt(stable_row, line, retention)
+                .accepted()
+        }
+
+        fn store_scrollback_line_with_receipt(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> wezterm_term::config::ScrollbackLineAdmission {
+            use wezterm_term::config::ScrollbackLineAdmission;
             // Queue saturation or another operation leaves the offered row in
             // Screen; never wait for filesystem IO while the terminal is held.
             let Ok(_operation) = self.operation.try_lock() else {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             };
             let Ok(mut state) = self.state.lock() else {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             };
             if state.publication_uncertain {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             }
             if let Some(existing) = state
                 .pending
                 .iter()
                 .find(|row| row.stable_row == stable_row)
             {
-                return existing.line.as_ref() == line && existing.retention == retention;
+                if existing.line.as_ref() != line || existing.retention != retention {
+                    return ScrollbackLineAdmission::Refused;
+                }
+                let interval = match (state.oldest, state.newest_exclusive) {
+                    (Some(first), Some(end)) if (first..end).contains(&stable_row) => {
+                        match state.interval_identity.capture(Some(first..end)) {
+                            ScrollbackIntervalCapture::Ready(interval) => Some(interval),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                return ScrollbackLineAdmission::Admitted { interval };
             }
             let Ok(retention_rows) = StableRowIndex::try_from(retention) else {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             };
             let Some(next) = stable_row.checked_add(1) else {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             };
             let Some(charge) = Self::row_charge(line) else {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             };
             if retention == 0
                 || state
@@ -584,7 +607,7 @@ mod deferred_scrollback {
                 || state.pending.len() >= MAX_PENDING_ROWS
                 || charge > MAX_PENDING_BYTES.saturating_sub(state.pending_bytes)
             {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             }
             let oldest = state
                 .oldest
@@ -600,7 +623,11 @@ mod deferred_scrollback {
             state.oldest = Some(oldest);
             state.newest_exclusive = Some(next);
             metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
-            true
+            let interval = match state.interval_identity.capture(Some(oldest..next)) {
+                ScrollbackIntervalCapture::Ready(interval) => Some(interval),
+                _ => None,
+            };
+            ScrollbackLineAdmission::Admitted { interval }
         }
 
         fn requires_scrollback_flush(&self) -> bool {
@@ -828,6 +855,64 @@ mod deferred_scrollback {
             Ok(receipt)
         }
     }
+    #[test]
+    fn deferred_admission_receipt_binds_exact_pending_row_and_rejects_busy_or_reused_source() {
+        use wezterm_term::CellAttributes;
+        use wezterm_term::config::ScrollbackLineAdmission;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let line = Line::from_text("café 中文 🙂  ", &CellAttributes::blank(), 1, None);
+        let ScrollbackLineAdmission::Admitted {
+            interval: Some(admitted),
+        } = deferred.store_scrollback_line_with_receipt(10, &line, 2)
+        else {
+            panic!("exact admission must carry its atomic interval");
+        };
+        assert_eq!(admitted.rows(), Some(10..11));
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            0,
+            "admission is not durability"
+        );
+        assert_eq!(deferred.load_scrollback_line(10), Some(line.clone()));
+        let operation = deferred.operation.lock().unwrap();
+        assert!(
+            !deferred
+                .store_scrollback_line_with_receipt(11, &line, 2)
+                .accepted()
+        );
+        drop(operation);
+        assert!(
+            !deferred
+                .store_scrollback_line_with_receipt(10, &Line::new(1), 2)
+                .accepted()
+        );
+        let ScrollbackLineAdmission::Admitted {
+            interval: Some(retried),
+        } = deferred.store_scrollback_line_with_receipt(10, &line, 2)
+        else {
+            panic!("exact pending retry must carry its original lineage");
+        };
+        assert!(retried.retains(&admitted, 10..11));
+        deferred.flush_scrollback().unwrap();
+        let ScrollbackIntervalCapture::Ready(flushed) = deferred.try_capture_scrollback_interval()
+        else {
+            panic!("flushed interval unavailable");
+        };
+        assert!(flushed.retains(&admitted, 10..11));
+        deferred.clear_scrollback().unwrap();
+        let ScrollbackLineAdmission::Admitted {
+            interval: Some(reused),
+        } = deferred.store_scrollback_line_with_receipt(10, &line, 2)
+        else {
+            panic!("new source admission unavailable");
+        };
+        assert!(
+            !reused.same_lineage(&admitted),
+            "same keys and bytes after clear are a new source"
+        );
+    }
+
     #[test]
     fn durable_pending_read_does_not_acquire_whole_flush_operation() {
         use wezterm_term::CellAttributes;

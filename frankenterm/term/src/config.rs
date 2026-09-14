@@ -169,6 +169,8 @@ mod tests {
             other => panic!("expected ready interval, got {:?}", other),
         };
         let before = ready(&identity, Some(10..20));
+        assert!(before.same_lineage(&ready(&identity, None)));
+        assert!(!before.same_lineage(&ready(&ScrollbackIntervalIdentity::default(), None)));
         let appended = ready(&identity, Some(10..30));
         assert!(appended.retains(&before, 10..20));
         assert!(!appended.retains(&before, 19..21));
@@ -986,6 +988,12 @@ impl ScrollbackInterval {
         self.rows.clone()
     }
 
+    /// Compare append-only lineage, including an empty capture. This does not
+    /// establish that any row is retained; use `retains` for publication.
+    pub fn same_lineage(&self, earlier: &Self) -> bool {
+        Arc::ptr_eq(&self.identity.0, &earlier.identity.0)
+    }
+
     /// Does this fresh capture still retain the requested part of an earlier
     /// capture's append-only lineage? No allocation, row scan, or storage IO.
     /// Callers must serialize capture + publication against destructive changes;
@@ -1009,6 +1017,24 @@ pub enum ScrollbackIntervalCapture {
     Busy,
     /// Unsupported, poisoned, or uncertain publication authority.
     Unavailable,
+}
+
+/// Ownership admission, optionally bound to the exact append-only interval
+/// under the same mutation guard as the admitted row. This is not durability
+/// or authenticated decode evidence. An unwitnessed admission remains readable
+/// through the ordinary sink API, but cannot authorize spill-time layout reuse.
+#[derive(Clone, Debug)]
+pub enum ScrollbackLineAdmission {
+    Refused,
+    Admitted {
+        interval: Option<ScrollbackInterval>,
+    },
+}
+
+impl ScrollbackLineAdmission {
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
 }
 
 /// External cold-scrollback sink used by tiered scrollback integrations.
@@ -1046,6 +1072,22 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         line: &Line,
         max_retained_rows: usize,
     ) -> bool;
+
+    /// A witnessed implementation must capture the interval atomically with
+    /// admission of this exact row. Capturing metadata after `store` returns is
+    /// insufficient: clear/replacement may have reused the same row key.
+    fn store_scrollback_line_with_receipt(
+        &self,
+        stable_row: StableRowIndex,
+        line: &Line,
+        max_retained_rows: usize,
+    ) -> ScrollbackLineAdmission {
+        if self.store_scrollback_line(stable_row, line, max_retained_rows) {
+            ScrollbackLineAdmission::Admitted { interval: None }
+        } else {
+            ScrollbackLineAdmission::Refused
+        }
+    }
 
     /// Store a contiguous prefix and return its durably acknowledged length.
     /// The caller retains every row beyond that prefix, including on failure.

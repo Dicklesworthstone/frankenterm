@@ -40,6 +40,11 @@ use alloc::vec::Vec;
 // physical-row width used at the PTY boundary.
 const MAX_MATERIALIZED_LINE_LEN: usize = u16::MAX as usize;
 
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    static REFLOW_CONTENT_SHAPE_HASH_SCANS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 fn normalize_cell_width(width: usize) -> usize {
     width.clamp(1, 2)
 }
@@ -285,9 +290,16 @@ impl Line {
     /// Renderer appdata and a no-match hyperlink scan do not change wrapping;
     /// all cell attributes, layout bits and mutation sequence numbers do.
     pub fn is_same_reflow_source(&self, other: &Self) -> bool {
-        if self.seqno != other.seqno {
-            return false;
-        }
+        self.seqno == other.seqno && self.is_same_reflow_content(other)
+    }
+
+    /// Exact immutable wrapping content, independent of publication seqno.
+    /// Use this only when comparing an already-published target with current
+    /// rows; prepared-work admission still requires `is_same_reflow_source`.
+    /// Shared copy-on-write cells avoid rescanning unchanged row contents.
+    /// Images, all cell attributes and the same normalized layout bits retain
+    /// the conservative source-check contract above.
+    pub fn is_same_reflow_content(&self, other: &Self) -> bool {
         #[cfg(feature = "use_image")]
         if self.has_image_attachments() {
             return false;
@@ -367,6 +379,8 @@ impl Line {
     }
 
     fn compute_shape_hash_uncached(&self) -> [u8; 16] {
+        #[cfg(all(test, feature = "std"))]
+        REFLOW_CONTENT_SHAPE_HASH_SCANS.with(|count| count.set(count.get() + 1));
         let mut hasher = SipHasher::new();
         self.bits.bits().hash(&mut hasher);
         for cell in self.visible_cells() {
@@ -2973,6 +2987,63 @@ mod tests {
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn reflow_content_equality_ignores_only_publication_sequence_and_derived_scan() {
+        let source = Line::from_text("ab界e\u{301}🚀 xyz", &CellAttributes::blank(), 1, None);
+        for storage in 0..3 {
+            let mut original = source.clone();
+            match storage {
+                1 => original.compress_for_scrollback(),
+                2 => {
+                    original = source
+                        .clone()
+                        .plan_wrap_with_width_prefix_scratch(
+                            7,
+                            MonospaceKpCostModel::terminal_default(),
+                            &mut LineWrapWidthPrefixScratch::default(),
+                        )
+                        .deferred_rows(0..1, 1)
+                        .pop()
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let frozen = original.clone();
+            assert!(original.is_same_reflow_source(&frozen));
+            let mut published = original.clone();
+            published.update_last_change_seqno(9);
+            published.scan_and_create_hyperlinks(&[]);
+            REFLOW_CONTENT_SHAPE_HASH_SCANS.with(|count| count.set(0));
+            assert!(published.is_same_reflow_content(&frozen));
+            assert!(frozen.is_same_reflow_content(&published));
+            assert!(!published.is_same_reflow_source(&frozen));
+            assert_eq!(REFLOW_CONTENT_SHAPE_HASH_SCANS.with(|count| count.get()), 0);
+            if storage == 2 && std::env::var_os("FT_DISABLE_DEFERRED_REFLOW_CELLS").is_none() {
+                let CellStorage::V(cells) = &published.cells else {
+                    panic!("expected deferred cells");
+                };
+                assert!(cells.is_deferred_unmaterialized());
+            }
+            for mutation in 0..4 {
+                let mut changed = original.clone();
+                match mutation {
+                    0 => {
+                        changed.set_cell(0, Cell::new('Z', CellAttributes::blank()), 1);
+                    }
+                    1 => {
+                        changed.cells_mut()[0].attrs_mut().set_italic(true);
+                    }
+                    2 => changed.set_last_cell_was_wrapped(!original.last_cell_was_wrapped(), 1),
+                    _ => changed.set_double_width(1),
+                }
+                assert_eq!(changed.current_seqno(), frozen.current_seqno());
+                assert!(!changed.is_same_reflow_content(&frozen));
+                assert!(!changed.is_same_reflow_source(&frozen));
+            }
+        }
+    }
+
     #[test]
     fn clustered_snapshots_share_payload_and_isolate_same_seqno_mutations() {
         let mutations: &[fn(&mut Line)] = &[
@@ -3097,6 +3168,8 @@ mod tests {
         assert!(line.has_image_attachments());
         assert!(frozen.has_image_attachments());
         assert!(!line.is_same_reflow_source(&frozen));
+        assert!(!line.is_same_reflow_content(&frozen));
+        assert!(!frozen.is_same_reflow_content(&line));
 
         // Compare the cluster scan with the prior visible-cell oracle across
         // empty, image-free, and mixed attribute clusters, including wide text.
