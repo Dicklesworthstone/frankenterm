@@ -107,20 +107,20 @@
         "cosmetic": 2,
         "docs": 1,
         "feat": 5,
-        "fix": 15,
+        "fix": 16,
         "other": 3,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 35,
+      "fork_side_commit_count": 36,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-12T03:21:41-04:00",
-        "sha": "66f315e08a34c10f4c5a4d956aac99e959254654",
-        "subject": "fix(cell): support attachment queries in text-only builds"
+        "committed_at": "2026-09-14T04:31:12-04:00",
+        "sha": "f743df19ffa8b7f745a662807d372102d8c0e1ad",
+        "subject": "fix(cell): preserve zero width when cloning heap-backed text"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 52,
-        "fix": 78,
+        "fix": 79,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 27
       },
-      "fork_side_commit_count": 208,
+      "fork_side_commit_count": 209,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-12T17:31:31-04:00",
-        "sha": "504b25e81b137d2d8176d7e5ba450f30fa3862dd",
-        "subject": "fix(mux): keep the nonblocking terminal lock through paint capture"
+        "committed_at": "2026-09-14T05:42:11-04:00",
+        "sha": "319d1b294d5e981cf24a3a40cfc5552d9e75046d",
+        "subject": "fix(mux): correlate render observations with their current source"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 35,
-        "other": 27,
+        "fix": 36,
+        "other": 29,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
-        "test": 20
+        "test": 21
       },
-      "fork_side_commit_count": 112,
+      "fork_side_commit_count": 116,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-14T03:38:35-04:00",
-        "sha": "eb8cc5cef8fa44d909c4fd64178d95f028383d76",
-        "subject": "perf(term): reuse published rows and index admitted cold history"
+        "classification": "test",
+        "committed_at": "2026-09-14T05:38:41-04:00",
+        "sha": "7eadc70a17ce9795221bb713f02be53ac0a2578d",
+        "subject": "test(term): qualify cold geometry through the actual Unicode parser"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 1,
         "feat": 53,
-        "fix": 94,
-        "other": 46,
+        "fix": 97,
+        "other": 48,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 47
+        "test": 50
       },
-      "fork_side_commit_count": 272,
+      "fork_side_commit_count": 280,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-14T03:38:35-04:00",
-        "sha": "eb8cc5cef8fa44d909c4fd64178d95f028383d76",
-        "subject": "perf(term): reuse published rows and index admitted cold history"
+        "classification": "test",
+        "committed_at": "2026-09-14T05:38:41-04:00",
+        "sha": "7eadc70a17ce9795221bb713f02be53ac0a2578d",
+        "subject": "test(term): qualify cold geometry through the actual Unicode parser"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 86,
-        "other": 12,
+        "fix": 87,
+        "other": 13,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 138,
+      "fork_side_commit_count": 140,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T01:09:34-04:00",
-        "sha": "8175d4c59f1ab90ad1c139390f2c247457a90e42",
-        "subject": "fix(window): use returned Windows display status and source identity"
+        "classification": "other",
+        "committed_at": "2026-09-14T06:17:49-04:00",
+        "sha": "d5152cceeacc346157cc19614637c65c9e97d3e0",
+        "subject": "perf(window): route native font shortcuts through ordered menu prefix"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2549,
-  "generated_at": "2026-09-14T07:50:50.291483Z",
+  "fork_side_commit_total": 2565,
+  "generated_at": "2026-09-14T10:20:40.733825Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
