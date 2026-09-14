@@ -2353,6 +2353,15 @@ impl MuxRequestErrorContext {
                     ),
             };
         }
+        if matches!(
+            self.request_ident,
+            GetLines::IDENT | GetLinesAtLayout::IDENT
+        ) && error
+            .downcast_ref::<wezterm_term::screen::ColdReadPayloadLimit>()
+            .is_some()
+        {
+            return ErrorResponse::quota_exceeded(self.request_ident);
+        }
         if self.may_mutate {
             ErrorResponse::indeterminate_mutation(self.request_ident, self.object)
         } else {
@@ -12480,6 +12489,49 @@ mod tests {
         bidirectional_failure
             .validate()
             .expect("bidirectional client request must retain exact rejection correlation");
+    }
+
+    #[test]
+    fn line_read_payload_limit_projects_quota_only_for_exact_read_requests() {
+        for request_ident in [
+            GetLines::IDENT,
+            GetLinesAtLayout::IDENT,
+            Ping::IDENT,
+            KillPane::IDENT,
+        ] {
+            let context = MuxRequestErrorContext {
+                request_ident,
+                object: None,
+                may_mutate: request_ident == KillPane::IDENT,
+            };
+            let error = anyhow::Error::new(wezterm_term::screen::ColdReadPayloadLimit)
+                .context("private decode context must not cross the wire");
+            let response = context.response_for_error(&error);
+            response.validate().expect("finite quota projection");
+            if matches!(request_ident, GetLines::IDENT | GetLinesAtLayout::IDENT) {
+                assert_eq!(response.code, MuxErrorCode::QUOTA_EXCEEDED);
+                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+                assert_eq!(
+                    context
+                        .response_for_error(&anyhow!("cold read payload limit"))
+                        .code,
+                    MuxErrorCode::BACKEND_FAILURE
+                );
+                assert_eq!(
+                    context
+                        .response_for_error(&anyhow::Error::new(SessionAuthorityError::Retired))
+                        .code,
+                    MuxErrorCode::CANCELLED
+                );
+            } else if request_ident == KillPane::IDENT {
+                assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
+            } else {
+                assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+            }
+            assert_eq!(response.request_ident, request_ident);
+            assert!(!format!("{response:?}").contains("private"));
+        }
     }
 
     fn tick_until_response(

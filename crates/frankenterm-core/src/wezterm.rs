@@ -1126,22 +1126,6 @@ const MAX_CLI_BULK_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 /// an 8 KiB byte prefix. Enforce that exact byte budget during capture.
 const MAX_CLI_ERROR_OUTPUT_BYTES: usize = 8 * 1024;
 
-#[cfg(any(test, all(feature = "vendored", unix)))]
-fn append_mux_text_line_bounded(out: &mut String, line: &str, cap: usize) -> Result<()> {
-    let next_len = out.len().saturating_add(line.len()).saturating_add(1);
-    if next_len > cap {
-        return Err(WeztermError::OutputTooLarge {
-            command: "mux get-text".to_string(),
-            len: next_len,
-            cap,
-        }
-        .into());
-    }
-    out.push_str(line);
-    out.push('\n');
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CliCaptureContract {
     stdout_limit: usize,
@@ -1646,10 +1630,9 @@ impl WeztermClient {
     /// Get text content from a pane, bound to the caller's asupersync
     /// capability context (ft-xbnl0.2.3 Cx-first entry point).
     ///
-    /// Mux-pool fast path uses `pool.get_pane_render_changes_with_cx(cx)`
-    /// plus `pool.get_lines_with_cx(cx)` for each scrollback chunk, so
-    /// a caller-cancelled long scrollback read terminates promptly
-    /// instead of consuming the full scrollback-fetch budget.
+    /// The mux-pool fast path leases one connection for a complete source/layout
+    /// transaction. Byte-quota refusals reduce chunk size; cancellation remains
+    /// bound to the caller and changed snapshots discard all partial text.
     ///
     /// When `escapes == true` the mux path is not used (vendored mux
     /// does not support escape-sequence extraction) and the call
@@ -1667,118 +1650,38 @@ impl WeztermClient {
                     "mux pool get_text_with_cx does not support escapes; falling back to CLI"
                 );
             } else if self.mux_circuit_guard() {
-                let mut pool_text: Option<String> = None;
-                'mux_text: {
-                    let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
-                        crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
-                        0,
-                    );
-                    let changes_result = pool.get_pane_render_changes_with_cx(cx, pane_id).await;
-                    capacity_timer.finish_result(&changes_result);
-                    let changes = match changes_result {
-                        Ok(changes) => changes,
-                        Err(e) => {
-                            self.mux_circuit_record_error(&e);
-                            if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                                return Err(Self::mux_cancelled_error("get_text_with_cx", e));
-                            }
-                            tracing::debug!(
-                                failure_class = Self::mux_error_public_code(&e),
-                                "mux pool get_text_with_cx: render_changes failed; falling back to CLI"
-                            );
-                            break 'mux_text;
-                        }
-                    };
-
-                    let scrollback_top = changes.dimensions.scrollback_top;
-                    let scrollback_rows: isize = match changes.dimensions.scrollback_rows.try_into()
-                    {
-                        Ok(v) => v,
-                        Err(_) => {
-                            self.mux_circuit_record_contract_failure();
-                            tracing::debug!(
-                                rows = changes.dimensions.scrollback_rows,
-                                "mux pool get_text_with_cx: scrollback_rows overflow; falling back to CLI"
-                            );
-                            break 'mux_text;
-                        }
-                    };
-                    let scrollback_end = match scrollback_top.checked_add(scrollback_rows) {
-                        Some(v) => v,
-                        None => {
-                            self.mux_circuit_record_contract_failure();
-                            tracing::debug!(
-                                top = scrollback_top,
-                                rows = scrollback_rows,
-                                "mux pool get_text_with_cx: scrollback range overflow; falling back to CLI"
-                            );
-                            break 'mux_text;
-                        }
-                    };
-
-                    if scrollback_rows <= 0 || scrollback_end <= scrollback_top {
-                        pool_text = Some(String::new());
-                        break 'mux_text;
+                use crate::vendored::mux_client::MuxTextReadResult;
+                let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                    crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
+                    0,
+                );
+                let result = pool
+                    .get_text_with_cx(cx, pane_id, MAX_CLI_BULK_OUTPUT_BYTES)
+                    .await;
+                capacity_timer.finish_result(&result);
+                match result {
+                    Ok(MuxTextReadResult::Text(text)) => {
+                        self.mux_circuit_record_success();
+                        return Ok(text);
                     }
-
-                    const CHUNK_ROWS: isize = 2_000;
-                    let mut out = String::new();
-                    let mut start = scrollback_top;
-
-                    while start < scrollback_end {
-                        let chunk_end = start
-                            .checked_add(CHUNK_ROWS)
-                            .unwrap_or(scrollback_end)
-                            .min(scrollback_end);
-
-                        let capacity_timer =
-                            crate::runtime_telemetry::SwarmCapacityStageTimer::start(
-                                crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
-                                0,
-                            );
-                        let lines_result = pool
-                            .get_lines_with_cx(
-                                cx,
-                                pane_id,
-                                std::iter::once(start..chunk_end).collect(),
-                            )
-                            .await;
-                        capacity_timer.finish_result(&lines_result);
-                        match lines_result {
-                            Ok(resp) => {
-                                let (mut lines, _images) = resp.lines.extract_data();
-                                lines.sort_by_key(|(idx, _)| *idx);
-                                for (_, line) in lines {
-                                    let line = line.as_str();
-                                    append_mux_text_line_bounded(
-                                        &mut out,
-                                        line.as_ref(),
-                                        MAX_CLI_BULK_OUTPUT_BYTES,
-                                    )?;
-                                }
-                            }
-                            Err(e) => {
-                                self.mux_circuit_record_error(&e);
-                                if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                                    return Err(Self::mux_cancelled_error("get_text_with_cx", e));
-                                }
-                                tracing::debug!(
-                                    failure_class = Self::mux_error_public_code(&e),
-                                    "mux pool get_text_with_cx: get_lines failed; falling back to CLI"
-                                );
-                                break 'mux_text;
-                            }
+                    Ok(MuxTextReadResult::OutputTooLarge { len, cap }) => {
+                        return Err(WeztermError::OutputTooLarge {
+                            command: "mux get-text".to_string(),
+                            len,
+                            cap,
                         }
-
-                        start = chunk_end;
+                        .into());
                     }
-
-                    pool_text = Some(out);
-                }
-
-                if let Some(text) = pool_text {
-                    self.mux_circuit_record_success();
-                    return Ok(text);
+                    Err(error) => {
+                        self.mux_circuit_record_error(&error);
+                        if !self.mux_error_should_fallback_to_cli_for_client(&error) {
+                            return Err(Self::mux_cancelled_error("get_text_with_cx", error));
+                        }
+                        tracing::debug!(
+                            failure_class = Self::mux_error_public_code(&error),
+                            "mux pool get_text_with_cx failed; falling back to CLI"
+                        );
+                    }
                 }
             }
         }
@@ -6866,26 +6769,6 @@ mod tests {
             }
             other => panic!("expected WeztermError::OutputTooLarge, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn direct_mux_text_append_enforces_bulk_cap_before_growth() {
-        let mut output = String::from("abc\n");
-        append_mux_text_line_bounded(&mut output, "de", 7).expect("exact-cap append");
-        assert_eq!(output, "abc\nde\n");
-
-        let before = output.clone();
-        let error = append_mux_text_line_bounded(&mut output, "x", 7)
-            .expect_err("one byte beyond the direct-mux cap must fail");
-        assert_eq!(output, before, "failed append must not mutate output");
-        assert!(matches!(
-            error,
-            crate::Error::Wezterm(WeztermError::OutputTooLarge {
-                command,
-                len: 9,
-                cap: 7,
-            }) if command == "mux get-text"
-        ));
     }
 
     #[test]

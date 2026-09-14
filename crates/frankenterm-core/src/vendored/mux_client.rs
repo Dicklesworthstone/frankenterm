@@ -23,13 +23,14 @@ use crate::runtime_async::{task, timeout};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
-    GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetLinesAtLayout, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones,
-    GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse, MoveFloatingPane,
-    OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos, PduWireRole,
-    RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ,
-    SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer, SwapToLayout,
-    ToggleFloatingPane, TopologyCapabilities, UnitResponse, UpdatePaneConstraints, WriteToPane,
+    GetSemanticZonesResponse, InputSerial, LineReadLayout, ListPanes, ListPanesResponse,
+    MoveFloatingPane, OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos,
+    PduWireRole, RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId,
+    SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer,
+    SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse, UpdatePaneConstraints,
+    WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -47,6 +48,31 @@ const DEFAULT_MAX_PENDING_RENDER_CHANGE_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_MAX_RENDER_CHANGE_SNAPSHOTS: usize = 512;
 const DEFAULT_MAX_RENDER_CHANGE_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A completed text transaction or a local output bound, neither of which
+/// requires transport recovery. Partial text is never returned.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MuxTextReadResult {
+    Text(String),
+    OutputTooLarge { len: usize, cap: usize },
+}
+
+fn mux_text_contract_error(reason: &'static str) -> DirectMuxError {
+    DirectMuxError::AlignedUnexpectedResponse {
+        expected: "complete text from one pane and source/layout".to_string(),
+        got: reason.to_string(),
+    }
+}
+
+fn append_mux_text_line(out: &mut String, line: &str, cap: usize) -> Result<(), MuxTextReadResult> {
+    let len = out.len().saturating_add(line.len()).saturating_add(1);
+    if len > cap {
+        return Err(MuxTextReadResult::OutputTooLarge { len, cap });
+    }
+    out.push_str(line);
+    out.push('\n');
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct DirectMuxClientConfig {
@@ -2433,6 +2459,134 @@ impl DirectMuxClient {
             Pdu::GetLinesResponse(payload) => Ok(payload),
             other => self.unexpected_response("GetLinesResponse", &other, true),
         }
+    }
+
+    /// Read all physical rows from one source/layout on this connection.
+    /// The server's byte quota, rather than a fixed row count, bounds each
+    /// decoded cold reply. A changing snapshot discards the entire buffer.
+    pub async fn get_text_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        max_output_bytes: usize,
+    ) -> Result<MuxTextReadResult, DirectMuxError> {
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+        let mut chunk_rows = 512isize;
+        'snapshot: for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
+            checkpoint_mux_cx(cx, self.connection_id, "text_read_snapshot")?;
+            let initial = self.get_pane_render_changes_with_cx(cx, pane_id).await?;
+            let layout = LineReadLayout {
+                seqno: initial.seqno,
+                dimensions: initial.dimensions,
+            };
+            let rows = isize::try_from(layout.dimensions.scrollback_rows)
+                .map_err(|_| mux_text_contract_error("scrollback row count overflow"))?;
+            let mut start = layout.dimensions.scrollback_top;
+            let end = start
+                .checked_add(rows)
+                .ok_or_else(|| mux_text_contract_error("scrollback range overflow"))?;
+            let mut out = String::new();
+            while start < end {
+                checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
+                let chunk_end = start.saturating_add(chunk_rows).min(end);
+                let response = self
+                    .send_request_with_cx(
+                        cx,
+                        Pdu::GetLinesAtLayout(GetLinesAtLayout {
+                            pane_id: initial.pane_id,
+                            layout,
+                            lines: std::iter::once(start..chunk_end).collect(),
+                        }),
+                    )
+                    .await;
+                let response = match response {
+                    Err(DirectMuxError::RemoteRejection(error))
+                        if error.validate().is_ok()
+                            && error.request_ident
+                                == <GetLinesAtLayout as codec::PduWireIdent>::IDENT
+                            && error.effect == codec::MuxErrorEffect::NOT_APPLIED
+                            && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF =>
+                    {
+                        if error.code == codec::MuxErrorCode::QUOTA_EXCEEDED
+                            && chunk_end - start > 1
+                        {
+                            // At most nine reductions for the whole transaction,
+                            // including restarts. A one-row refusal is terminal.
+                            chunk_rows = (chunk_end - start) / 2;
+                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                                .await
+                                .map_err(|error| cancelled_mux_error("text_read_backoff", error))?;
+                            continue;
+                        }
+                        if error.code == codec::MuxErrorCode::BACKEND_FAILURE {
+                            // Installing a cold visual layout can invalidate the
+                            // first fence and move the oldest row. Observe the
+                            // actual new state before deciding to restart.
+                            let current = self.get_pane_render_changes_with_cx(cx, pane_id).await?;
+                            if current.seqno != layout.seqno
+                                || current.dimensions != layout.dimensions
+                            {
+                                if attempt + 1 == MAX_SNAPSHOT_ATTEMPTS {
+                                    return Err(mux_text_contract_error(
+                                        "source/layout changed during bounded read",
+                                    ));
+                                }
+                                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                                    .await
+                                    .map_err(|error| {
+                                        cancelled_mux_error("text_snapshot_backoff", error)
+                                    })?;
+                                continue 'snapshot;
+                            }
+                        }
+                        return Err(DirectMuxError::RemoteRejection(error));
+                    }
+                    result => result?,
+                };
+                let response = match response {
+                    Pdu::GetLinesAtLayoutResponse(response) => response,
+                    other => {
+                        return self.unexpected_response("GetLinesAtLayoutResponse", &other, true);
+                    }
+                };
+                if response.pane_id != initial.pane_id || response.layout != layout {
+                    return Err(mux_text_contract_error("line reply pane/layout mismatch"));
+                }
+                let (lines, _images) = response.lines.extract_data();
+                if lines.len() != (chunk_end - start) as usize
+                    || lines
+                        .iter()
+                        .enumerate()
+                        .any(|(offset, (row, _))| *row != start + offset as isize)
+                {
+                    return Err(mux_text_contract_error(
+                        "line reply range incomplete or unordered",
+                    ));
+                }
+                for (_, line) in lines {
+                    checkpoint_mux_cx(cx, self.connection_id, "text_read_append")?;
+                    if let Err(limit) =
+                        append_mux_text_line(&mut out, line.as_str().as_ref(), max_output_bytes)
+                    {
+                        return Ok(limit);
+                    }
+                }
+                start = chunk_end;
+            }
+            let final_state = self.get_pane_render_changes_with_cx(cx, pane_id).await?;
+            checkpoint_mux_cx(cx, self.connection_id, "text_read_complete")?;
+            if final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions {
+                return Ok(MuxTextReadResult::Text(out));
+            }
+            if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS {
+                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                    .await
+                    .map_err(|error| cancelled_mux_error("text_snapshot_backoff", error))?;
+            }
+        }
+        Err(mux_text_contract_error(
+            "source/layout changed during bounded read",
+        ))
     }
 
     /// Fetch OSC 133 semantic zones from a pane through the native mux protocol.
@@ -6304,6 +6458,578 @@ mod tests {
                 .expect("list panes with cx");
             assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
         });
+    }
+
+    async fn text_read_server(
+        connections: usize,
+        mut handle: impl FnMut(usize, Pdu) -> Option<Pdu> + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf, task::JoinHandle<()>) {
+        let dir = tempfile::tempdir().expect("text tempdir");
+        let path = dir.path().join("text.sock");
+        let listener = compat_unix::bind(&path).await.expect("bind text socket");
+        let server = task::spawn(async move {
+            for connection in 0..connections {
+                let (mut stream, _) = listener.accept().await.expect("accept text client");
+                let mut buffered = StreamingPduBuffer::new();
+                'connection: loop {
+                    let mut bytes = [0; 4096];
+                    let count = unix_stream_read(&mut stream, &mut bytes)
+                        .await
+                        .expect("read text request");
+                    if count == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&bytes[..count]);
+                    while let Some(decoded) =
+                        Pdu::stream_decode(&mut buffered).expect("decode text request")
+                    {
+                        let reply = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Some(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    min_supported: CODEC_VERSION_MIN_SUPPORTED,
+                                    version_string: "text-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/ft"),
+                                    config_file_path: None,
+                                }))
+                            }
+                            Pdu::SetClientId(_) => Some(Pdu::UnitResponse(UnitResponse {})),
+                            pdu => handle(connection, pdu),
+                        };
+                        let Some(reply) = reply else {
+                            break 'connection;
+                        };
+                        let mut encoded = Vec::new();
+                        reply
+                            .encode(&mut encoded, decoded.serial)
+                            .expect("encode text reply");
+                        if stream.write_all(&encoded).await.is_err() {
+                            // Cancellation may retire the client before this
+                            // complete fixture response reaches its socket.
+                            break 'connection;
+                        }
+                    }
+                }
+            }
+        });
+        (dir, path, server)
+    }
+
+    fn text_read_state(seqno: usize, top: isize, rows: usize) -> Pdu {
+        let mut state = test_render_change(9, seqno, "text fixture");
+        state.dimensions.scrollback_top = top;
+        state.dimensions.scrollback_rows = rows;
+        state.dimensions.viewport_rows = rows.min(24);
+        state.dimensions.physical_top = top + rows.saturating_sub(24) as isize;
+        Pdu::GetPaneRenderChangesResponse(state)
+    }
+
+    fn text_read_row(row: isize, generation: &str) -> String {
+        if row % 7 == 0 {
+            String::new()
+        } else {
+            format!("{generation}:{row} 界e\u{301}👩‍💻  ")
+        }
+    }
+
+    fn text_read_reply(request: GetLinesAtLayout, generation: &str) -> Pdu {
+        let lines = request
+            .lines
+            .iter()
+            .cloned()
+            .flatten()
+            .map(|row| {
+                let mut line = frankenterm_term::Line::from_text(
+                    &text_read_row(row, generation),
+                    &termwiz::cell::CellAttributes::default(),
+                    1,
+                    None,
+                );
+                line.set_last_cell_was_wrapped(row % 2 == 0, 1);
+                (row, line)
+            })
+            .collect::<Vec<_>>();
+        Pdu::GetLinesAtLayoutResponse(codec::GetLinesAtLayoutResponse {
+            pane_id: request.pane_id,
+            layout: request.layout,
+            lines: lines.into(),
+        })
+    }
+
+    fn text_read_expected(range: std::ops::Range<isize>, generation: &str) -> String {
+        range
+            .map(|row| format!("{}\n", text_read_row(row, generation)))
+            .collect()
+    }
+
+    #[test]
+    fn text_read_adapts_quota_and_preserves_every_unicode_physical_row() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let ranges = Arc::new(StdMutex::new(Vec::new()));
+            let seen = Arc::clone(&ranges);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, -7, 600),
+                    Pdu::GetLinesAtLayout(request) => {
+                        assert_eq!(request.layout.seqno, 7);
+                        assert_eq!(request.pane_id, 9);
+                        let range = request.lines[0].clone();
+                        seen.lock().unwrap().push(range.clone());
+                        if range.end - range.start > 128 {
+                            Pdu::ErrorResponse(codec::ErrorResponse::quota_exceeded(
+                                GetLinesAtLayout::IDENT,
+                            ))
+                        } else {
+                            text_read_reply(request, "stable")
+                        }
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap();
+            assert_eq!(
+                result,
+                MuxTextReadResult::Text(text_read_expected(-7..593, "stable"))
+            );
+            assert_eq!(
+                *ranges.lock().unwrap(),
+                vec![
+                    -7..505,
+                    -7..249,
+                    -7..121,
+                    121..249,
+                    249..377,
+                    377..505,
+                    505..593
+                ]
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_restarts_after_initial_stale_fence_or_final_source_change() {
+        for stale_first in [true, false] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let ranges = Arc::new(StdMutex::new(Vec::new()));
+                let seen = Arc::clone(&ranges);
+                let mut generation = 7;
+                let mut render_count = 0;
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => {
+                            render_count += 1;
+                            if !stale_first && render_count == 2 {
+                                generation = 8;
+                            }
+                            let mut response = text_read_state(
+                                generation,
+                                if generation == 7 { -7 } else { 3 },
+                                600,
+                            );
+                            if let Pdu::GetPaneRenderChangesResponse(ref mut state) = response {
+                                state.dimensions.cols = if generation == 7 { 80 } else { 60 };
+                            }
+                            response
+                        }
+                        Pdu::GetLinesAtLayout(request) => {
+                            seen.lock()
+                                .unwrap()
+                                .push((request.layout.seqno, request.lines[0].clone()));
+                            if stale_first && generation == 7 {
+                                generation = 8;
+                                Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            } else {
+                                text_read_reply(
+                                    request,
+                                    if generation == 7 { "old" } else { "new" },
+                                )
+                            }
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
+                    MuxTextReadResult::Text(text_read_expected(3..603, "new"))
+                );
+                let actual = ranges.lock().unwrap().clone();
+                let mut expected = vec![(7, -7..505)];
+                if !stale_first {
+                    expected.push((7, 505..593));
+                }
+                expected.extend([(8, 3..515), (8, 515..603)]);
+                assert_eq!(
+                    actual, expected,
+                    "restart must re-read the new oldest row without mixed text"
+                );
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_refuses_incomplete_wrong_pane_or_wrong_layout_replies() {
+        for defect in ["missing", "extra", "gap", "reordered", "pane", "layout"] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                        Pdu::GetLinesAtLayout(request) => {
+                            let Pdu::GetLinesAtLayoutResponse(mut reply) =
+                                text_read_reply(request, "test")
+                            else {
+                                unreachable!()
+                            };
+                            let (mut lines, _) = reply.lines.extract_data();
+                            match defect {
+                                "missing" => {
+                                    lines.pop();
+                                }
+                                "extra" => {
+                                    lines.push((3, frankenterm_term::Line::with_width(0, 1)));
+                                }
+                                "gap" => {
+                                    lines[1].0 = 4;
+                                }
+                                "reordered" => {
+                                    lines.swap(0, 1);
+                                }
+                                "pane" => {
+                                    reply.pane_id += 1;
+                                }
+                                "layout" => {
+                                    reply.layout.seqno += 1;
+                                }
+                                _ => unreachable!(),
+                            }
+                            reply.lines = lines.into();
+                            Pdu::GetLinesAtLayoutResponse(reply)
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                assert!(
+                    matches!(
+                        client.get_text_with_cx(&cx, 9, 100_000).await,
+                        Err(DirectMuxError::AlignedUnexpectedResponse { .. })
+                    ),
+                    "{defect}"
+                );
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_one_row_quota_and_changing_snapshot_stop_boundedly() {
+        for quota in [true, false] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let counts = Arc::new(StdMutex::new((0usize, 0usize)));
+                let seen = Arc::clone(&counts);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => {
+                            let mut count = seen.lock().unwrap();
+                            count.0 += 1;
+                            text_read_state(if quota { 7 } else { count.0 }, 0, 3)
+                        }
+                        Pdu::GetLinesAtLayout(request) => {
+                            seen.lock().unwrap().1 += 1;
+                            if quota {
+                                Pdu::ErrorResponse(codec::ErrorResponse::quota_exceeded(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            } else {
+                                text_read_reply(request, "test")
+                            }
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+                if quota {
+                    assert!(
+                        matches!(error, DirectMuxError::RemoteRejection(ref e) if e.code == codec::MuxErrorCode::QUOTA_EXCEEDED)
+                    );
+                    assert_eq!(
+                        *counts.lock().unwrap(),
+                        (1, 2),
+                        "three rows shrink directly to one, then stop"
+                    );
+                } else {
+                    assert!(matches!(
+                        error,
+                        DirectMuxError::AlignedUnexpectedResponse { .. }
+                    ));
+                    assert_eq!(
+                        *counts.lock().unwrap(),
+                        (6, 3),
+                        "only three whole-snapshot attempts"
+                    );
+                }
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_cancellation_after_quota_does_not_retry_or_return_partial_text() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let cancel_cx = cx.clone();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 600),
+                    Pdu::GetLinesAtLayout(request) => {
+                        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                            text_read_reply(request, "partial")
+                        } else {
+                            cancel_cx.cancel_with(
+                                crate::outcome::CancelKind::User,
+                                Some("cancel text quota retry"),
+                            );
+                            Pdu::ErrorResponse(codec::ErrorResponse::quota_exceeded(
+                                GetLinesAtLayout::IDENT,
+                            ))
+                        }
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+            assert_cancelled_mux_error(&error);
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_pool_reconnection_discards_previous_connection_text() {
+        run_async_test(async {
+            use crate::vendored::mux_pool::{MuxPool, MuxPoolConfig};
+            let cx = crate::cx::for_testing();
+            let (_dir, path, server) = text_read_server(2, |connection, pdu| match pdu {
+                Pdu::GetPaneRenderChanges(_) => Some(text_read_state(7, 0, 600)),
+                Pdu::GetLinesAtLayout(request) => {
+                    if connection == 0 && request.lines[0].start == 512 {
+                        None
+                    } else {
+                        Some(text_read_reply(
+                            request,
+                            if connection == 0 { "old" } else { "new" },
+                        ))
+                    }
+                }
+                other => panic!("unexpected text request {other:?}"),
+            })
+            .await;
+            let pool = MuxPool::new(MuxPoolConfig {
+                mux: direct_mux_client_config(path),
+                ..Default::default()
+            });
+            assert_eq!(
+                pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
+                MuxTextReadResult::Text(text_read_expected(0..600, "new"))
+            );
+            let stats = pool.stats_with_cx(&cx).await.unwrap();
+            assert_eq!(stats.connections_created, 2);
+            assert_eq!(
+                stats.pool.total_acquired, 2,
+                "one lease per whole transaction, not per chunk"
+            );
+            assert_eq!(stats.recovery_attempts, 1);
+            pool.clear_with_cx(&cx).await.unwrap();
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_empty_history_still_requires_final_source_fence() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let mut observers = 0;
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => {
+                        observers += 1;
+                        if observers == 1 {
+                            text_read_state(7, 0, 0)
+                        } else {
+                            text_read_state(8, 1, 2)
+                        }
+                    }
+                    Pdu::GetLinesAtLayout(request) => text_read_reply(request, "arrived"),
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
+                MuxTextReadResult::Text(text_read_expected(1..3, "arrived"))
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_output_cap_is_terminal_for_pool_recovery() {
+        for exact_cap in [true, false] {
+            run_async_test(async move {
+                use crate::vendored::mux_pool::{MuxPool, MuxPoolConfig};
+                let cx = crate::cx::for_testing();
+                let (_dir, path, server) = text_read_server(1, |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 1, 2),
+                        Pdu::GetLinesAtLayout(request) => text_read_reply(request, "unicode"),
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let pool = MuxPool::new(MuxPoolConfig {
+                    mux: direct_mux_client_config(path),
+                    ..Default::default()
+                });
+                let expected = text_read_expected(1..3, "unicode");
+                let cap = expected.len() - usize::from(!exact_cap);
+                let result = pool.get_text_with_cx(&cx, 9, cap).await.unwrap();
+                if exact_cap {
+                    assert_eq!(result, MuxTextReadResult::Text(expected));
+                } else {
+                    assert_eq!(
+                        result,
+                        MuxTextReadResult::OutputTooLarge {
+                            len: expected.len(),
+                            cap
+                        }
+                    );
+                }
+                let stats = pool.stats_with_cx(&cx).await.unwrap();
+                assert_eq!(stats.pool.total_acquired, 1);
+                assert_eq!(stats.recovery_attempts, 0);
+                pool.clear_with_cx(&cx).await.unwrap();
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_unrelated_rejections_never_shrink_the_request() {
+        for rejection in [
+            codec::ErrorResponse::backend_failure(GetLinesAtLayout::IDENT),
+            codec::ErrorResponse::deadline_exceeded(GetLinesAtLayout::IDENT),
+            codec::ErrorResponse::pane_not_found(GetLinesAtLayout::IDENT, 9),
+            codec::ErrorResponse::quota_exceeded(GetLines::IDENT),
+        ] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let requests = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&requests);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                        Pdu::GetLinesAtLayout(_) => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            Pdu::ErrorResponse(rejection.clone())
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    DirectMuxError::RemoteRejection(_)
+                        | DirectMuxError::RemoteRejectionRequestMismatch { .. }
+                ));
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_append_enforces_bulk_cap_before_growth() {
+        let mut output = String::from("abc\n");
+        append_mux_text_line(&mut output, "de", 7).unwrap();
+        assert_eq!(output, "abc\nde\n");
+        assert_eq!(
+            append_mux_text_line(&mut output, "x", 7),
+            Err(MuxTextReadResult::OutputTooLarge { len: 9, cap: 7 })
+        );
+        assert_eq!(output, "abc\nde\n", "failed append must not mutate output");
     }
 
     #[test]

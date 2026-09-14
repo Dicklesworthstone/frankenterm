@@ -45,7 +45,7 @@ use crate::runtime_async::sleep;
 
 use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, DirectMuxOutboundBudget,
-    validate_render_batch_panes,
+    MuxTextReadResult, validate_render_batch_panes,
 };
 use codec::{
     GetLinesResponse, GetPaneRenderChangesResponse, GetPaneTieredScrollbackStatusesV1Response,
@@ -933,6 +933,26 @@ impl MuxPool {
             let lines = lines.clone();
             let op_cx = op_cx.clone();
             Box::pin(async move { client.get_lines_with_cx(&op_cx, pane_id, lines).await })
+        })
+        .await
+    }
+
+    /// Lease one connection for the entire fenced text transaction. Recovery
+    /// invokes a fresh transaction, so no buffer survives a reconnection.
+    pub async fn get_text_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+        max_output_bytes: usize,
+    ) -> Result<MuxTextReadResult, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "get_text", move |client| {
+            let op_cx = op_cx.clone();
+            Box::pin(async move {
+                client
+                    .get_text_with_cx(&op_cx, pane_id, max_output_bytes)
+                    .await
+            })
         })
         .await
     }
