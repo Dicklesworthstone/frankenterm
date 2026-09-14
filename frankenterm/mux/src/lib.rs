@@ -30763,10 +30763,11 @@ mod tests {
     fn scheduled_pane_output_drain_remains_bound_to_originating_mux() {
         let _guard = global_test_lock();
         Mux::shutdown();
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = BoundedTestExecutor::new();
         let originating_mux = Arc::new(Mux::new(None));
         let replacement_mux = Arc::new(Mux::new(None));
         let _pane = register_test_pane(&originating_mux, 7);
+        let _replacement_pane = register_test_pane(&replacement_mux, 7);
         let pane_outputs = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&pane_outputs);
         originating_mux
@@ -30777,18 +30778,54 @@ mod tests {
                 true
             })
             .expect("test mux subscription should allocate an identifier");
+        let replacement_outputs = Arc::new(Mutex::new(Vec::new()));
+        let observed_replacement = Arc::clone(&replacement_outputs);
+        replacement_mux
+            .subscribe(move |notification| {
+                if let MuxNotification::PaneOutput(pane_id) = notification {
+                    observed_replacement.lock().push(pane_id);
+                }
+                true
+            })
+            .expect("replacement mux subscription should allocate an identifier");
+
+        // A tick runs one queued callback, not necessarily this test's drain.
+        // Make that distinction causal: an earlier task in the same queue must
+        // run first, just as unrelated background work can during a full suite.
+        let predecessor_ran = Arc::new(AtomicBool::new(false));
+        let observed_predecessor = Arc::clone(&predecessor_ran);
+        assert!(schedule_mux_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            "test pane output predecessor",
+            move || async move {
+                observed_predecessor.store(true, Ordering::Release);
+            },
+        ));
 
         Mux::set_mux(&originating_mux);
         originating_mux.enqueue_pane_output_notification(7);
         Mux::set_mux(&replacement_mux);
-        executor
-            .tick()
-            .expect("scheduled pane-output drain should run");
+        executor.run_until(Duration::from_secs(5), || {
+            predecessor_ran.load(Ordering::Acquire)
+        });
+        assert!(pane_outputs.lock().is_empty());
+        assert!(originating_mux
+            .pane_output_drain_scheduled
+            .load(Ordering::Acquire));
+        executor.run_until(Duration::from_secs(5), || {
+            !originating_mux
+                .pane_output_drain_scheduled
+                .load(Ordering::Acquire)
+        });
 
         assert_eq!(
             &*pane_outputs.lock(),
             &[7],
             "mux replacement must not redirect an already-scheduled output drain",
+        );
+        assert!(
+            replacement_outputs.lock().is_empty(),
+            "the same pane id in a replacement mux must not receive the originating output",
         );
         assert!(originating_mux
             .pending_pane_output
