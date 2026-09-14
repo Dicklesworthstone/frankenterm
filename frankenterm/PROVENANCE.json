@@ -401,20 +401,20 @@
         "cosmetic": 5,
         "docs": 1,
         "feat": 7,
-        "fix": 19,
+        "fix": 20,
         "other": 6,
         "refactor": 1,
         "rename": 1,
         "security-fix": 49,
         "test": 6
       },
-      "fork_side_commit_count": 97,
+      "fork_side_commit_count": 98,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-12T02:34:49-04:00",
-        "sha": "39063de24071df1aa7e84af09f9f4c4102f0951a",
-        "subject": "fix(parser): retain bounded first-sequence actions across chunks"
+        "committed_at": "2026-09-14T11:53:35-04:00",
+        "sha": "997b2e2056d7875c7f1ac253bc296ce712a4d40a",
+        "subject": "fix(parser): drop ESC sequences with extra intermediates instead of rewriting them"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -640,7 +640,7 @@
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
-        "feat": 187,
+        "feat": 188,
         "fix": 212,
         "other": 38,
         "refactor": 11,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 77
       },
-      "fork_side_commit_count": 582,
+      "fork_side_commit_count": 583,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-14T08:45:57-04:00",
-        "sha": "cad56f3ff7126ef6dd42b14920ca43322bb98739",
-        "subject": "test(mux): reject durable storage mutation in cold resize fixture"
+        "classification": "feat",
+        "committed_at": "2026-09-14T11:53:31-04:00",
+        "sha": "99ad44cf1b80a56eb77a239238828617cac0915e",
+        "subject": "feat(term): prepare cold layout from admitted geometry without hydrating a dummy row"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -895,7 +895,7 @@
         "cleanup": 3,
         "cosmetic": 15,
         "docs": 1,
-        "feat": 53,
+        "feat": 54,
         "fix": 100,
         "other": 48,
         "refactor": 5,
@@ -903,13 +903,13 @@
         "security-fix": 6,
         "test": 53
       },
-      "fork_side_commit_count": 286,
+      "fork_side_commit_count": 287,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-14T09:14:13-04:00",
-        "sha": "9ece873ffcc3231bc6ab3b63ea0b73083193d864",
-        "subject": "test(term): clarify one-range cold read assertion"
+        "classification": "feat",
+        "committed_at": "2026-09-14T11:53:31-04:00",
+        "sha": "99ad44cf1b80a56eb77a239238828617cac0915e",
+        "subject": "feat(term): prepare cold layout from admitted geometry without hydrating a dummy row"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 87,
+        "fix": 88,
         "other": 13,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 140,
+      "fork_side_commit_count": 141,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-14T06:17:49-04:00",
-        "sha": "d5152cceeacc346157cc19614637c65c9e97d3e0",
-        "subject": "perf(window): route native font shortcuts through ordered menu prefix"
+        "classification": "fix",
+        "committed_at": "2026-09-14T11:53:29-04:00",
+        "sha": "e5ac537af571e7ee99df81bb12dcd09c4f131346",
+        "subject": "fix(window): complete overdue repaint in the admitted Render task"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2581,
-  "generated_at": "2026-09-14T13:41:36.254313Z",
+  "fork_side_commit_total": 2585,
+  "generated_at": "2026-09-14T15:58:16.948236Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
