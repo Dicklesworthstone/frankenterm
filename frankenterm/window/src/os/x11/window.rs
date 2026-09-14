@@ -467,9 +467,11 @@ impl XWindowInner {
                                 let Some(current) = Connection::get() else {
                                     return;
                                 };
+                                #[cfg(not(feature = "wayland"))]
+                                let Connection::X11(active) = current.as_ref();
+                                #[cfg(feature = "wayland")]
                                 let active = match current.as_ref() {
                                     Connection::X11(active) => active,
-                                    #[cfg(feature = "wayland")]
                                     Connection::Wayland(_) => return,
                                 };
                                 if !Rc::ptr_eq(&connection, active) {
