@@ -5277,6 +5277,107 @@ impl Tab {
         )
     }
 
+    /// Capture coherent tab topology including title, physical dimensions,
+    /// active/zoomed pane, split tree (`PaneNode`), and floating panes.
+    ///
+    /// Locks are held only during callback-free snapshot acquisition, and retried
+    /// boundedly (3 attempts) if concurrent mutations occur.
+    pub fn capture_tab_topology(
+        &self,
+        window_id: WindowId,
+        workspace: &str,
+    ) -> anyhow::Result<MuxCapturedTab> {
+        const SNAPSHOT_ATTEMPTS: usize = 3;
+
+        for _ in 0..SNAPSHOT_ATTEMPTS {
+            let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+            let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
+
+            let snapshot = {
+                let inner = self.inner.lock();
+                let current = inner.snapshot_panes_callback_free();
+                if !callback_snapshot_matches(&current, &pane_ids)? {
+                    None
+                } else {
+                    let floating_panes: Vec<MuxCapturedFloatingPane> = inner
+                        .floating_panes
+                        .iter()
+                        .map(|fp| MuxCapturedFloatingPane {
+                            pane_id: fp.pane_id,
+                            rect: fp.rect,
+                            z_order: fp.z_order,
+                            visible: fp.visible,
+                            pinned: fp.pinned,
+                            opacity: fp.opacity,
+                            is_focused: inner.floating_focus == Some(fp.pane_id),
+                        })
+                        .collect();
+
+                    Some((
+                        inner.pane.clone(),
+                        inner.raw_active_pane_callback_free(&pane_ids),
+                        inner.zoomed.as_ref().map(Arc::clone),
+                        inner.title.to_string(),
+                        inner.size,
+                        inner.size_before_zoom,
+                        floating_panes,
+                        inner.floating_focus,
+                    ))
+                }
+            };
+            let Some((
+                tree,
+                active,
+                zoomed,
+                title,
+                size,
+                size_before_zoom,
+                floating_panes,
+                floating_focus,
+            )) = snapshot
+            else {
+                continue;
+            };
+
+            let active_pane_id =
+                active.as_ref().and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
+            let zoomed_pane_id =
+                zoomed.as_ref().and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
+
+            let split_tree = match tree {
+                Some(tree) => pane_tree(
+                    &tree,
+                    self.tab_id,
+                    window_id,
+                    active.as_ref(),
+                    zoomed.as_ref(),
+                    workspace,
+                    0,
+                    0,
+                ),
+                None => PaneNode::Empty,
+            };
+
+            return Ok(MuxCapturedTab {
+                tab_id: self.tab_id,
+                window_id,
+                title,
+                size,
+                size_before_zoom,
+                active_pane_id,
+                zoomed_pane_id,
+                split_tree,
+                floating_panes,
+                floating_focus,
+            });
+        }
+
+        anyhow::bail!(
+            "tab {} topology changed during all {SNAPSHOT_ATTEMPTS} capture attempts",
+            self.tab_id,
+        )
+    }
+
     /// Append one callback-coherent tab directly to an ordered pane arena.
     ///
     /// Unlike [`Self::codec_pane_tree_in_window`], this path never constructs
@@ -14264,6 +14365,31 @@ pub struct PaneEntry {
     pub tty_name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MuxCapturedFloatingPane {
+    pub pane_id: PaneId,
+    pub rect: FloatingPaneRect,
+    pub z_order: u32,
+    pub visible: bool,
+    pub pinned: bool,
+    pub opacity: f32,
+    pub is_focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MuxCapturedTab {
+    pub tab_id: TabId,
+    pub window_id: WindowId,
+    pub title: String,
+    pub size: TerminalSize,
+    pub size_before_zoom: TerminalSize,
+    pub active_pane_id: Option<PaneId>,
+    pub zoomed_pane_id: Option<PaneId>,
+    pub split_tree: PaneNode,
+    pub floating_panes: Vec<MuxCapturedFloatingPane>,
+    pub floating_focus: Option<PaneId>,
+}
+
 #[derive(Deserialize, Clone, PartialEq, Debug)]
 #[serde(try_from = "String")]
 pub struct SerdeUrl {
@@ -22981,5 +23107,93 @@ mod test {
 
         // Non-existent pane returns false.
         assert!(!tab.set_floating_pane_focus(999));
+    }
+
+    #[test]
+    fn capture_tab_topology_preserves_splits_floating_and_focus() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 750,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.set_title("test-tab-capture");
+        tab.assign_pane(&FakePane::new(1, size));
+
+        // Create horizontal split
+        let req_h = SplitRequest {
+            direction: SplitDirection::Horizontal,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Percent(50),
+        };
+        tab.split_and_insert(0, req_h, FakePane::new(2, size))
+            .expect("split and insert pane 2");
+
+        // Create vertical split on pane 2 (index 1)
+        let req_v = SplitRequest {
+            direction: SplitDirection::Vertical,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Percent(50),
+        };
+        tab.split_and_insert(1, req_v, FakePane::new(3, size))
+            .expect("split and insert pane 3");
+
+        // Add a floating pane
+        let floating_rect = FloatingPaneRect {
+            left: 20,
+            top: 10,
+            width: 30,
+            height: 15,
+        };
+        tab.add_floating_pane(FakePane::new(99, size), floating_rect)
+            .expect("add floating pane 99");
+
+        let captured = tab
+            .capture_tab_topology(42, "default-workspace")
+            .expect("capture tab topology");
+
+        assert_eq!(captured.tab_id, tab.tab_id());
+        assert_eq!(captured.window_id, 42);
+        assert_eq!(captured.title, "test-tab-capture");
+        assert_eq!(captured.size, size);
+        assert_eq!(captured.size_before_zoom, size);
+
+        // Floating pane 99 was added last, so it has floating focus and is active
+        assert_eq!(captured.floating_focus, Some(99));
+        assert_eq!(captured.active_pane_id, Some(99));
+        assert_eq!(captured.floating_panes.len(), 1);
+        let fp = &captured.floating_panes[0];
+        assert_eq!(fp.pane_id, 99);
+        assert_eq!(fp.rect.left, 20);
+        assert_eq!(fp.rect.top, 10);
+        assert_eq!(fp.rect.width, 30);
+        assert_eq!(fp.rect.height, 15);
+        assert!(fp.is_focused);
+
+        // Verify split tree preserves exact nested splits
+        match &captured.split_tree {
+            PaneNode::Split { left, right, node } => {
+                assert_eq!(node.direction, SplitDirection::Horizontal);
+                assert!(matches!(**left, PaneNode::Leaf(ref e) if e.pane_id == 1));
+                match &**right {
+                    PaneNode::Split {
+                        left: v_left,
+                        right: v_right,
+                        node: v_node,
+                    } => {
+                        assert_eq!(v_node.direction, SplitDirection::Vertical);
+                        assert!(matches!(**v_left, PaneNode::Leaf(ref e) if e.pane_id == 2));
+                        assert!(matches!(**v_right, PaneNode::Leaf(ref e) if e.pane_id == 3));
+                    }
+                    _ => panic!("expected nested vertical split on right child"),
+                }
+            }
+            _ => panic!("expected root horizontal split"),
+        }
     }
 }

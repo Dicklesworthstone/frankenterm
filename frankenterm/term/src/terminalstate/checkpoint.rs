@@ -3272,6 +3272,14 @@ impl TerminalCheckpointV2 {
         terminal: &TerminalState,
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, TerminalCheckpointError> {
+        Self::capture_staged(terminal, limits)?.materialize_cold_history(limits)
+    }
+
+    /// Capture bounded hot terminal state and pin cold-history generation under the terminal lock.
+    pub fn capture_staged(
+        terminal: &TerminalState,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<StagedHotCheckpoint, TerminalCheckpointError> {
         limits.validate_policy()?;
         let lease_config = Arc::clone(&terminal.config);
         let _config_lease = lease_config.acquire_recovery_activation_lease();
@@ -3316,14 +3324,65 @@ impl TerminalCheckpointV2 {
         {
             Self::preflight_checkpoint_attributes(&saved.pen, limits, &mut screen_usage)?;
         }
-        let primary_screen = terminal
-            .screen
-            .screen
-            .checkpoint_parts(&screen_limits, &mut screen_usage)?;
+
+        // Alternate screen has no scrollback; capture resident parts directly
         let alternate_screen = terminal
             .screen
             .alt_screen
             .checkpoint_parts(&screen_limits, &mut screen_usage)?;
+
+        // Primary screen: preflight resident lines and capture resident lines in memory without calling sink
+        terminal.screen.screen.preflight_resident_checkpoint_usage(&screen_limits, &mut screen_usage)?;
+        let resident_lines = terminal.screen.screen.lines_in_phys_range(0..usize::MAX);
+        let resident_oldest = terminal.screen.screen.phys_to_stable_row_index(0);
+        let mut primary_lines = Vec::new();
+        primary_lines
+            .try_reserve_exact(resident_lines.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
+        for line in &resident_lines {
+            primary_lines.push(CheckpointLine::capture(line)?);
+        }
+        let mut keyboard_stack = Vec::new();
+        keyboard_stack
+            .try_reserve_exact(terminal.screen.screen.keyboard_stack.len())
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.keyboard_stack"))?;
+        for encoding in &terminal.screen.screen.keyboard_stack {
+            keyboard_stack.push(CheckpointKeyboardEncoding::from(*encoding));
+        }
+        let primary_screen = CheckpointScreen {
+            lines: primary_lines,
+            stable_row_index_offset: resident_oldest as u64,
+            cold_snapshot_generation: None,
+            cold_prefix_line_count: 0,
+            allow_scrollback: true,
+            keyboard_stack,
+            physical_rows: u32::try_from(terminal.screen.screen.physical_rows).map_err(|_| {
+                TerminalCheckpointError::InvalidField {
+                    field: "screen.physical_rows",
+                    reason: "value does not fit the checkpoint wire type",
+                }
+            })?,
+            physical_cols: u32::try_from(terminal.screen.screen.physical_cols).map_err(|_| {
+                TerminalCheckpointError::InvalidField {
+                    field: "screen.physical_cols",
+                    reason: "value does not fit the checkpoint wire type",
+                }
+            })?,
+            dpi: terminal.screen.screen.dpi,
+            saved_cursor: terminal
+                .screen
+                .screen
+                .saved_cursor
+                .as_ref()
+                .map(CheckpointSavedCursor::capture)
+                .transpose()?,
+        };
+
+        // Pin cold history generation from sink
+        let sink = terminal.config.scrollback_spill_sink();
+        let pinned_interval = sink.as_ref().map(|s| s.try_capture_scrollback_interval());
+        let expected_newest_exclusive = resident_oldest;
+
         let checkpoint_unicode_version =
             CheckpointUnicodeVersion::capture(&terminal.unicode_version, &custom_cell_width_maps)?;
         let mut checkpoint_unicode_version_stack = Vec::new();
@@ -3341,7 +3400,7 @@ impl TerminalCheckpointV2 {
             version: TERMINAL_CHECKPOINT_VERSION,
             custom_cell_width_maps,
             replay_config,
-            primary_screen: CheckpointScreen::capture(primary_screen)?,
+            primary_screen,
             alternate_screen: CheckpointScreen::capture(alternate_screen)?,
             alternate_screen_active: terminal.screen.alt_screen_is_active,
             pen: CheckpointCellAttributes::capture(&terminal.pen)?,
@@ -3437,8 +3496,16 @@ impl TerminalCheckpointV2 {
             bidi_enabled: terminal.bidi_enabled,
             bidi_hint: terminal.bidi_hint.map(CheckpointBidiHint::from),
         };
-        checkpoint.validate(limits)?;
-        Ok(checkpoint)
+
+        Ok(StagedHotCheckpoint {
+            checkpoint,
+            sink,
+            pinned_interval,
+            expected_newest_exclusive,
+            screen_limits,
+            screen_usage,
+            limits,
+        })
     }
 
     /// Validate the complete semantic authority before any runtime object,
@@ -4265,6 +4332,7 @@ pub enum TerminalCheckpointError {
     ColdScrollbackMetadataInconsistent,
     ColdScrollbackSnapshot(crate::config::ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
+    StaleColdGeneration,
     InvalidCurrentDirectory,
     InvalidRestoreConfiguration {
         reason: &'static str,
@@ -4354,6 +4422,9 @@ impl std::fmt::Display for TerminalCheckpointError {
             }
             Self::ColdScrollbackNotRecoveryGrade => formatter.write_str(
                 "terminal checkpoint cold scrollback is not exact semantic recovery data",
+            ),
+            Self::StaleColdGeneration => formatter.write_str(
+                "cold scrollback snapshot generation is stale",
             ),
             Self::InvalidCurrentDirectory => {
                 formatter.write_str("terminal checkpoint current directory is not a valid URL")
