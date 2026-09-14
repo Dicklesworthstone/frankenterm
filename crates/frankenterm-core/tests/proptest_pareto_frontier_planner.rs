@@ -26,7 +26,7 @@
 //!    set.
 //! 6. **Frontier is permutation-stable** — shuffling the input
 //!    produces an identical `frontier` (the substrate's
-//!    documented determinism contract via `KnobConfig::cmp_lex`).
+//!    documented ordering of complete observations).
 //! 7. **No frontier point dominates another frontier point** —
 //!    pairwise check: for any two distinct frontier points,
 //!    `is_dominated_by` is false in both directions.
@@ -89,19 +89,38 @@ fn arb_resources() -> impl Strategy<Value = ResourceMetrics> {
 }
 
 fn arb_measurement_point() -> impl Strategy<Value = MeasurementPoint> {
-    (arb_knob_config(), arb_latency(), arb_resources()).prop_map(|(config, latency, resources)| {
-        MeasurementPoint {
-            config,
-            latency,
-            resources,
-            machine_shape: "proptest".to_string(),
-            workload_id: "proptest".to_string(),
-        }
-    })
+    (
+        arb_knob_config(),
+        arb_latency(),
+        arb_resources(),
+        "machine-[a-c]",
+        "workload-[a-c]",
+    )
+        .prop_map(|(config, latency, resources, machine_shape, workload_id)| {
+            MeasurementPoint {
+                config,
+                latency,
+                resources,
+                machine_shape,
+                workload_id,
+            }
+        })
 }
 
 fn arb_measurement_set() -> impl Strategy<Value = Vec<MeasurementPoint>> {
-    prop::collection::vec(arb_measurement_point(), 1..=12)
+    (
+        prop::collection::vec(arb_measurement_point(), 1..=12),
+        any::<bool>(),
+    )
+        .prop_map(|(mut points, shared_config)| {
+            if shared_config {
+                let config = points[0].config;
+                for point in &mut points {
+                    point.config = config;
+                }
+            }
+            points
+        })
 }
 
 proptest! {
@@ -176,9 +195,8 @@ proptest! {
 
     /// **Permutation stability**: the frontier is invariant
     /// under input ordering. The substrate's documented
-    /// determinism via `KnobConfig::cmp_lex` lex sort means the
-    /// returned vector is byte-identical regardless of the input
-    /// order.
+    /// complete-observation order also makes the full report, including
+    /// the selected dominators and their explanations, byte-identical.
     #[test]
     fn frontier_is_permutation_stable(
         mut points in arb_measurement_set(),
@@ -186,6 +204,7 @@ proptest! {
     ) {
         init_test_tracing_json();
         let original_frontier = compute_frontier(&points);
+        let original_report = serde_json::to_string(&plan(&points)).unwrap();
         // Deterministic shuffle via a tiny linear-congruential
         // generator seeded from `seed`. Avoids pulling in `rand`
         // and keeps the proptest reproducible.
@@ -197,6 +216,18 @@ proptest! {
         }
         let shuffled_frontier = compute_frontier(&points);
         prop_assert_eq!(original_frontier, shuffled_frontier);
+        prop_assert_eq!(original_report, serde_json::to_string(&plan(&points)).unwrap());
+    }
+
+    /// Every distinct nondominated observation survives exactly once,
+    /// including repeated configurations with different metrics/provenance.
+    #[test]
+    fn frontier_retains_every_nondominated_observation(points in arb_measurement_set()) {
+        let frontier = compute_frontier(&points);
+        for point in &points {
+            let expected_count = usize::from(!points.iter().any(|other| is_dominated_by(point, other)));
+            prop_assert_eq!(frontier.iter().filter(|entry| *entry == point).count(), expected_count);
+        }
     }
 
     /// **No frontier point dominates another frontier point**:
@@ -255,16 +286,13 @@ proptest! {
 
     /// **Frontier ⊆ input**: every frontier point is one of the
     /// input points (the extractor doesn't synthesize new
-    /// points). Pinned via the `KnobConfig` field — every
-    /// frontier point's config must appear in the input.
+    /// points). Metrics and provenance must also match exactly.
     #[test]
     fn frontier_is_subset_of_input(points in arb_measurement_set()) {
         init_test_tracing_json();
         let frontier = compute_frontier(&points);
         for fp in &frontier {
-            let found = points.iter().any(|p| p.config == fp.config
-                && p.latency == fp.latency
-                && p.resources == fp.resources);
+            let found = points.contains(fp);
             prop_assert!(found, "frontier point not in input set");
         }
     }

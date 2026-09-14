@@ -54,11 +54,21 @@ fn arb_search_lint() -> impl Strategy<Value = SearchLint> {
         })
 }
 
-/// Generates valid FTS query strings (alphanumeric words, no leading operators).
+/// An unquoted term cannot be a reserved boolean operator. Construct valid
+/// syntax independently of the parser so parser failures remain observable.
+fn arb_query_term() -> impl Strategy<Value = String> {
+    "[a-z]{3,15}".prop_filter("unquoted term is not a boolean operator", |term| {
+        !matches!(term.as_str(), "and" | "or" | "not")
+    })
+}
+
+/// Generates unquoted terms and quoted phrases, including operator words
+/// inside phrases where they are ordinary searchable text.
 fn arb_valid_query() -> impl Strategy<Value = String> {
     prop_oneof![
-        "[a-z]{3,15}",
-        "[a-z]{3,10} [a-z]{3,10}",
+        arb_query_term(),
+        (arb_query_term(), arb_query_term())
+            .prop_map(|(first, second)| format!("{first} {second}")),
         "\"[a-z]{3,10} [a-z]{3,10}\"",
     ]
 }
@@ -132,6 +142,49 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
 }
 
 // ── Parse validation invariants ───────────────────────────────────────
+
+#[test]
+fn reserved_operator_edges_are_rejected_but_quoted_and_longer_terms_are_valid() {
+    for operator in ["and", "or", "not", "AND", "OR", "NOT"] {
+        for (query, code) in [
+            (format!("{operator} aaa"), "leading_operator"),
+            (format!("aaa {operator}"), "trailing_operator"),
+        ] {
+            let error = parse_unified_search_query(
+                SearchQueryInput {
+                    query,
+                    ..SearchQueryInput::default()
+                },
+                SearchQueryDefaults::default(),
+            )
+            .expect_err("an unquoted edge operator must remain invalid");
+            assert!(
+                error.lints().unwrap().iter().any(|lint| {
+                    lint.code == code && lint.severity == SearchLintSeverity::Error
+                })
+            );
+        }
+    }
+    for query in [
+        "\"not aaa\"",
+        "\"and aaa\"",
+        "\"or aaa\"",
+        "notable aaa",
+        "aaa northern",
+        "andromeda aaa",
+        "origin aaa",
+    ] {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: query.to_string(),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("quoted operators and non-operator words must stay valid");
+        assert_eq!(parsed.query.query, query);
+    }
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
@@ -463,6 +516,38 @@ proptest! {
 
 // ── UnifiedSearchQuery serde roundtrip ────────────────────────────────
 
+#[test]
+fn optional_field_names_in_query_text_do_not_affect_json_keys() {
+    for text in ["pane", "zone", "since", "until", "explain"] {
+        for zone in [None, Some("prompt"), Some("input"), Some("output")] {
+            let query = UnifiedSearchQuery {
+                query: text.to_string(),
+                limit: 1,
+                pane: None,
+                zone: zone.map(str::to_string),
+                since: None,
+                until: None,
+                snippets: false,
+                mode: UnifiedSearchMode::Lexical,
+                explain: false,
+            };
+            let mut expected = serde_json::json!({
+                "query": text,
+                "limit": 1,
+                "snippets": false,
+                "mode": "lexical",
+            });
+            if let Some(zone) = zone {
+                expected["zone"] = serde_json::json!(zone);
+            }
+            assert_eq!(serde_json::to_value(&query).unwrap(), expected);
+            let encoded = serde_json::to_string(&query).unwrap();
+            let restored: UnifiedSearchQuery = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(restored, query);
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
@@ -474,6 +559,7 @@ proptest! {
         prop_assert_eq!(restored.query, query.query);
         prop_assert_eq!(restored.limit, query.limit);
         prop_assert_eq!(restored.pane, query.pane);
+        prop_assert_eq!(restored.zone, query.zone);
         prop_assert_eq!(restored.since, query.since);
         prop_assert_eq!(restored.until, query.until);
         prop_assert_eq!(restored.snippets, query.snippets);
@@ -495,12 +581,12 @@ proptest! {
             mode: UnifiedSearchMode::Lexical,
             explain: false,
         };
-        let json = serde_json::to_string(&q).expect("serialize");
-        prop_assert!(!json.contains("pane"), "pane:None should be omitted");
-        prop_assert!(!json.contains("zone"), "zone:None should be omitted");
-        prop_assert!(!json.contains("since"), "since:None should be omitted");
-        prop_assert!(!json.contains("until"), "until:None should be omitted");
-        prop_assert!(!json.contains("explain"), "explain:false should be omitted");
+        let json = serde_json::to_value(&q).expect("serialize");
+        let object = json.as_object().expect("query serializes as an object");
+        prop_assert_eq!(object.get("query").and_then(serde_json::Value::as_str), Some(q.query.as_str()));
+        for field in ["pane", "zone", "since", "until", "explain"] {
+            prop_assert!(!object.contains_key(field), "{} should be omitted as a field", field);
+        }
     }
 }
 

@@ -145,6 +145,40 @@ pub struct MeasurementPoint {
     pub workload_id: String,
 }
 
+impl MeasurementPoint {
+    /// Order complete observations without conflating repeated measurements
+    /// of the same configuration. This is a canonical order, not dominance.
+    fn cmp_lex(&self, other: &Self) -> std::cmp::Ordering {
+        self.config
+            .cmp_lex(&other.config)
+            .then_with(|| self.latency.p50_us.cmp(&other.latency.p50_us))
+            .then_with(|| self.latency.p95_us.cmp(&other.latency.p95_us))
+            .then_with(|| self.latency.p99_us.cmp(&other.latency.p99_us))
+            .then_with(|| {
+                self.resources
+                    .memory_bytes
+                    .cmp(&other.resources.memory_bytes)
+            })
+            .then_with(|| {
+                self.resources
+                    .cpu_percent_e3
+                    .cmp(&other.resources.cpu_percent_e3)
+            })
+            .then_with(|| {
+                self.resources
+                    .storage_write_pressure_e3
+                    .cmp(&other.resources.storage_write_pressure_e3)
+            })
+            .then_with(|| {
+                self.resources
+                    .token_output_quality_e3
+                    .cmp(&other.resources.token_output_quality_e3)
+            })
+            .then_with(|| self.machine_shape.cmp(&other.machine_shape))
+            .then_with(|| self.workload_id.cmp(&other.workload_id))
+    }
+}
+
 /// br-ft-1650n.13: Pareto dominance predicate.
 ///
 /// Returns `true` iff `b` strictly dominates `a` — i.e., `b` is
@@ -186,9 +220,10 @@ pub fn is_dominated_by(a: &MeasurementPoint, b: &MeasurementPoint) -> bool {
 }
 
 /// br-ft-1650n.13: extract the Pareto frontier from a set of
-/// measurement points. Frontier points are sorted by
-/// `KnobConfig::cmp_lex` so the output is deterministic across
-/// runs.
+/// measurement points. Frontier points are sorted by configuration,
+/// metrics, then provenance so the output is independent of input order.
+/// Only identical observations are deduplicated: different outcomes from
+/// the same configuration can be incomparable and must both survive.
 ///
 /// Implementation is `O(n²)` — fine for the substrate; the
 /// expected sweep size is dozens to a few hundred points. A
@@ -201,12 +236,8 @@ pub fn compute_frontier(points: &[MeasurementPoint]) -> Vec<MeasurementPoint> {
         .filter(|p| !points.iter().any(|q| is_dominated_by(p, q)))
         .cloned()
         .collect();
-    frontier.sort_by(|a, b| a.config.cmp_lex(&b.config));
-    // Deduplicate adjacent equal configs after sort. Two configs
-    // can be byte-identical (same knob settings, identical
-    // metrics) when the sweep harness re-ran a config — the
-    // operator-facing frontier should list each config once.
-    frontier.dedup_by(|a, b| a.config == b.config);
+    frontier.sort_by(MeasurementPoint::cmp_lex);
+    frontier.dedup();
     frontier
 }
 
@@ -218,34 +249,39 @@ pub fn compute_frontier(points: &[MeasurementPoint]) -> Vec<MeasurementPoint> {
 pub struct DominatedExplanation {
     /// The dominated configuration.
     pub dominated_config: KnobConfig,
-    /// One representative dominator (the lex-smallest by config
-    /// among all dominators, for determinism).
+    /// One representative dominator (the lex-smallest complete observation,
+    /// ordered by config, metrics, then provenance, for determinism).
     pub dominator_config: KnobConfig,
     /// Names of the dimensions the dominator strictly improved.
     pub strict_dimensions: Vec<String>,
 }
 
 /// br-ft-1650n.13: build dominated-config explanations. For each
-/// dominated point, picks the lex-smallest dominator (by knob
-/// config) so the output is deterministic.
+/// dominated point, picks the lex-smallest complete dominator observation
+/// and sorts the explanations by all output fields for determinism.
 #[must_use]
 pub fn explain_dominated(points: &[MeasurementPoint]) -> Vec<DominatedExplanation> {
     let mut out = Vec::new();
     for p in points {
-        let mut dominators: Vec<&MeasurementPoint> =
-            points.iter().filter(|q| is_dominated_by(p, q)).collect();
-        if dominators.is_empty() {
+        let Some(dominator) = points
+            .iter()
+            .filter(|q| is_dominated_by(p, q))
+            .min_by(|a, b| a.cmp_lex(b))
+        else {
             continue;
-        }
-        dominators.sort_by(|a, b| a.config.cmp_lex(&b.config));
-        let dominator = dominators[0];
+        };
         out.push(DominatedExplanation {
             dominated_config: p.config,
             dominator_config: dominator.config,
             strict_dimensions: strict_winning_dimensions(p, dominator),
         });
     }
-    out.sort_by(|a, b| a.dominated_config.cmp_lex(&b.dominated_config));
+    out.sort_by(|a, b| {
+        a.dominated_config
+            .cmp_lex(&b.dominated_config)
+            .then_with(|| a.dominator_config.cmp_lex(&b.dominator_config))
+            .then_with(|| a.strict_dimensions.cmp(&b.strict_dimensions))
+    });
     out
 }
 
@@ -512,13 +548,9 @@ mod tests {
         }
     }
 
-    /// Pinned: when two byte-identical configs (same KnobConfig
-    /// AND same metrics) are present, the dedup_by reduces them
-    /// to one frontier entry. Sweep harnesses sometimes re-run a
-    /// config; the operator-facing frontier should list each
-    /// config once.
+    /// Repeating an identical observation does not repeat its frontier entry.
     #[test]
-    fn frontier_dedups_identical_configs() {
+    fn frontier_dedups_identical_observations() {
         let p = point(2, 64, 1000, 2000, 4000, 100, 2000, 800);
         let p_dup = p.clone();
         let other = point(4, 128, 800, 1500, 3000, 200, 1500, 900);
@@ -528,6 +560,83 @@ mod tests {
             assert_eq!(frontier.len(), 2);
         } else {
             panic!("expected Frontier");
+        }
+    }
+
+    #[test]
+    fn frontier_preserves_incomparable_measurements_of_the_same_config() {
+        let fast = point(0, 0, 0, 0, 0, 2, 0, 0);
+        let small = point(0, 0, 1, 1, 1, 1, 0, 0);
+        let expected = vec![fast.clone(), small.clone()];
+        assert_eq!(compute_frontier(&expected), expected);
+        assert_eq!(compute_frontier(&[small, fast]), expected);
+    }
+
+    #[test]
+    fn frontier_preserves_and_orders_distinct_provenance() {
+        let first = point(0, 0, 1, 1, 1, 1, 0, 0);
+        let workload = MeasurementPoint {
+            workload_id: "z-workload".to_string(),
+            ..first.clone()
+        };
+        let machine = MeasurementPoint {
+            machine_shape: "z-machine".to_string(),
+            ..first.clone()
+        };
+        let expected = vec![first, workload, machine];
+        for offset in 0..expected.len() {
+            let mut input = expected.clone();
+            input.rotate_left(offset);
+            input.push(input[0].clone());
+            assert_eq!(compute_frontier(&input), expected);
+            input.reverse();
+            assert_eq!(compute_frontier(&input), expected);
+        }
+    }
+
+    #[test]
+    fn same_config_dominators_and_explanations_have_stable_report_order() {
+        let fast = point(0, 0, 5, 5, 5, 10, 0, 0);
+        let small = point(0, 0, 10, 10, 10, 5, 0, 0);
+        let dominated = point(0, 0, 10, 10, 10, 10, 0, 0);
+        let more_memory = point(0, 0, 10, 10, 10, 20, 0, 0);
+        let input = [fast.clone(), small.clone(), dominated, more_memory];
+        let expected = PlannerReport::Frontier {
+            frontier: vec![fast.clone(), small],
+            dominated: vec![
+                DominatedExplanation {
+                    dominated_config: fast.config,
+                    dominator_config: fast.config,
+                    strict_dimensions: vec![
+                        "p50_us".to_string(),
+                        "p95_us".to_string(),
+                        "p99_us".to_string(),
+                    ],
+                },
+                DominatedExplanation {
+                    dominated_config: fast.config,
+                    dominator_config: fast.config,
+                    strict_dimensions: vec![
+                        "p50_us".to_string(),
+                        "p95_us".to_string(),
+                        "p99_us".to_string(),
+                        "memory_bytes".to_string(),
+                    ],
+                },
+            ],
+        };
+        let expected_json = serde_json::to_string(&expected).unwrap();
+        for offset in 0..input.len() {
+            let mut reordered = input.clone();
+            reordered.rotate_left(offset);
+            for reverse in [false, true] {
+                if reverse {
+                    reordered.reverse();
+                }
+                let report = plan(&reordered);
+                assert_eq!(report, expected);
+                assert_eq!(serde_json::to_string(&report).unwrap(), expected_json);
+            }
         }
     }
 
