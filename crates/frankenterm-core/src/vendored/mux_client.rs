@@ -3142,11 +3142,14 @@ impl DirectMuxClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        // A caller's concurrency ceiling cannot require more slots than this
+        // batch contains. Use the same bound for admission and allocation.
+        let max_pipeline_depth = max_pipeline_depth.min(requests.len());
         self.ensure_connection_usable()?;
         for request in &requests {
             self.authorize_outbound_pdu(request)?;
         }
-        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))
+        self.ensure_outstanding_request_slots(max_pipeline_depth)
             .map_err(DirectMuxError::proven_pre_write_rejection)?;
 
         tracing::trace!(
@@ -6552,13 +6555,24 @@ mod tests {
         });
     }
 
-    /// ft-xbnl0.2.3 Cx-first: verify pub-elevated
-    /// `batch_with_cx` accepts a heterogeneous PDU batch from
-    /// an external caller and returns responses in request
-    /// order. Uses two ListPanes requests so the server can
-    /// count how many it saw before responding.
+    /// Exercise the public Cx-aware batch entry point with two ListPanes
+    /// requests and distinguish their responses by the server's request count.
     #[test]
     fn batch_with_cx_pub_entry_returns_responses_in_request_order() {
+        exercise_public_batch_depth(2);
+    }
+
+    #[test]
+    fn batch_with_cx_extreme_pipeline_depth_is_bounded_by_request_count() {
+        exercise_public_batch_depth(usize::MAX);
+    }
+
+    #[test]
+    fn batch_with_cx_zero_pipeline_depth_still_completes() {
+        exercise_public_batch_depth(0);
+    }
+
+    fn exercise_public_batch_depth(max_pipeline_depth: usize) {
         run_async_test(async {
             let cx = crate::cx::for_testing();
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -6598,7 +6612,10 @@ mod tests {
                                 Pdu::ListPanesResponse(codec::ListPanesResponse {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
-                                    window_titles: std::collections::HashMap::new(),
+                                    window_titles: HashMap::from([(
+                                        0,
+                                        list_panes_seen.to_string(),
+                                    )]),
                                     floating_panes: Vec::new(),
                                 })
                             }
@@ -6632,13 +6649,19 @@ mod tests {
                 Pdu::ListPanes(codec::ListPanes {}),
             ];
             let responses = client
-                .batch_with_cx(&cx, requests, 2, Duration::from_secs(2))
+                .batch_with_cx(&cx, requests, max_pipeline_depth, Duration::from_secs(2))
                 .await
                 .expect("batch_with_cx roundtrip");
 
             assert_eq!(responses.len(), 2);
-            for resp in &responses {
-                assert!(matches!(resp, Pdu::ListPanesResponse(_)));
+            for (index, response) in responses.iter().enumerate() {
+                let Pdu::ListPanesResponse(response) = response else {
+                    panic!("expected ListPanesResponse, got {}", response.pdu_name());
+                };
+                assert_eq!(
+                    response.window_titles.get(&0),
+                    Some(&(index + 1).to_string())
+                );
             }
 
             drop(client);
