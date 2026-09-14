@@ -3119,6 +3119,19 @@ fn pane_tree(
             left_col,
             top_row,
         )),
+}
+
+fn check_pane_tree_depth(tree: &Tree, depth: usize, max_depth: usize) -> anyhow::Result<()> {
+    if depth > max_depth {
+        anyhow::bail!("tab pane tree depth {depth} exceeds limit {max_depth}");
+    }
+    match tree {
+        Tree::Empty | Tree::Leaf(_) => Ok(()),
+        Tree::Node { left, right, .. } => {
+            check_pane_tree_depth(left, depth + 1, max_depth)?;
+            check_pane_tree_depth(right, depth + 1, max_depth)?;
+            Ok(())
+        }
     }
 }
 
@@ -5313,6 +5326,24 @@ impl Tab {
                         })
                         .collect();
 
+                    let mut pane_stacks: Vec<MuxCapturedPaneStack> = inner
+                        .pane_stacks
+                        .iter()
+                        .map(|(&slot_index, stack)| {
+                            let stack_pane_ids: Vec<PaneId> = stack
+                                .panes()
+                                .iter()
+                                .filter_map(|pane| pane_ids.get(&pane_identity(pane)).copied())
+                                .collect();
+                            MuxCapturedPaneStack {
+                                slot_index,
+                                pane_ids: stack_pane_ids,
+                                active_index: stack.active_index(),
+                            }
+                        })
+                        .collect();
+                    pane_stacks.sort_by_key(|stack| stack.slot_index);
+
                     Some((
                         inner.pane.clone(),
                         inner.raw_active_pane_callback_free(&pane_ids),
@@ -5322,6 +5353,7 @@ impl Tab {
                         inner.size_before_zoom,
                         floating_panes,
                         inner.floating_focus,
+                        pane_stacks,
                     ))
                 }
             };
@@ -5334,10 +5366,15 @@ impl Tab {
                 size_before_zoom,
                 floating_panes,
                 floating_focus,
+                pane_stacks,
             )) = snapshot
             else {
                 continue;
             };
+
+            if let Some(ref t) = tree {
+                check_pane_tree_depth(t, 1, 64)?;
+            }
 
             let active_pane_id =
                 active.as_ref().and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
@@ -5369,6 +5406,7 @@ impl Tab {
                 split_tree,
                 floating_panes,
                 floating_focus,
+                pane_stacks,
             });
         }
 
@@ -14377,6 +14415,13 @@ pub struct MuxCapturedFloatingPane {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MuxCapturedPaneStack {
+    pub slot_index: usize,
+    pub pane_ids: Vec<PaneId>,
+    pub active_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MuxCapturedTab {
     pub tab_id: TabId,
     pub window_id: WindowId,
@@ -14388,6 +14433,7 @@ pub struct MuxCapturedTab {
     pub split_tree: PaneNode,
     pub floating_panes: Vec<MuxCapturedFloatingPane>,
     pub floating_focus: Option<PaneId>,
+    pub pane_stacks: Vec<MuxCapturedPaneStack>,
 }
 
 #[derive(Deserialize, Clone, PartialEq, Debug)]
@@ -23175,6 +23221,8 @@ mod test {
         assert_eq!(fp.rect.height, 15);
         assert!(fp.is_focused);
 
+        assert_eq!(captured.pane_stacks.len(), 0);
+
         // Verify split tree preserves exact nested splits
         match &captured.split_tree {
             PaneNode::Split { left, right, node } => {
@@ -23196,4 +23244,49 @@ mod test {
             _ => panic!("expected root horizontal split"),
         }
     }
+
+    #[test]
+    fn capture_tab_topology_preserves_pane_stacks_and_hidden_members() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.set_title("stack-test-tab");
+
+        let visible: Arc<dyn Pane> = FakePane::new(501, size);
+        let hidden: Arc<dyn Pane> = FakePane::new(502, size);
+
+        {
+            let mut inner = tab.inner.lock();
+            inner.pane = Some(Tree::Leaf(Arc::clone(&visible)));
+            inner.pane_stacks.insert(
+                0,
+                PaneStack::new(vec![Arc::clone(&visible), Arc::clone(&hidden)]),
+            );
+        }
+
+        let captured = tab
+            .capture_tab_topology(10, "stack-workspace")
+            .expect("capture tab topology with stacks");
+
+        assert_eq!(captured.pane_stacks.len(), 1);
+        let stack = &captured.pane_stacks[0];
+        assert_eq!(stack.slot_index, 0);
+        assert_eq!(stack.active_index, 0);
+        assert_eq!(stack.pane_ids, vec![501, 502]);
+
+        // Split tree leaf only has the active visible pane
+        match &captured.split_tree {
+            PaneNode::Leaf(ref entry) => {
+                assert_eq!(entry.pane_id, 501);
+            }
+            _ => panic!("expected leaf split tree with active pane"),
+        }
+    }
 }
+

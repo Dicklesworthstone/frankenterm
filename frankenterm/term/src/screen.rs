@@ -500,15 +500,15 @@ impl StoredPhysicalLayout {
 
 #[cfg(feature = "use_serde")]
 #[derive(Debug, Clone)]
-struct ColdRowFragments {
-    sink: Arc<dyn crate::config::ScrollbackSpillSink>,
-    interval: crate::config::ScrollbackInterval,
-    rows: BTreeMap<StableRowIndex, Line>,
-    aligned_frontier: StableRowIndex,
-    aligned_source_start: StableRowIndex,
-    cols: usize,
-    dpi: u32,
-    policy: ResizeWrapPolicy,
+pub(crate) struct ColdRowFragments {
+    pub(crate) sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+    pub(crate) interval: crate::config::ScrollbackInterval,
+    pub(crate) rows: BTreeMap<StableRowIndex, Line>,
+    pub(crate) aligned_frontier: StableRowIndex,
+    pub(crate) aligned_source_start: StableRowIndex,
+    pub(crate) cols: usize,
+    pub(crate) dpi: u32,
+    pub(crate) policy: ResizeWrapPolicy,
 }
 
 #[cfg(feature = "use_serde")]
@@ -2086,7 +2086,7 @@ pub struct Screen {
     #[cfg(feature = "use_serde")]
     cold_geometry_index: Option<ColdGeometryIndex>,
     #[cfg(feature = "use_serde")]
-    cold_row_fragments: Option<Arc<ColdRowFragments>>,
+    pub(crate) cold_row_fragments: Option<Arc<ColdRowFragments>>,
     #[cfg(feature = "use_serde")]
     cold_visual_seqno: SequenceNo,
     #[cfg(feature = "use_serde")]
@@ -2176,6 +2176,32 @@ pub(crate) struct ScreenCheckpointParts {
     pub physical_cols: usize,
     pub dpi: u32,
     pub saved_cursor: Option<SavedCursor>,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Clone, Debug)]
+pub(crate) struct StagedColdSource {
+    pub(crate) sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+    pub(crate) before_interval: crate::config::ScrollbackInterval,
+    pub(crate) expected_newest_exclusive: StableRowIndex,
+    pub(crate) max_cold_bytes: u64,
+    pub(crate) fragments: Option<Arc<ColdRowFragments>>,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Clone, Debug)]
+pub(crate) struct StagedScreenCheckpoint {
+    pub(crate) resident_lines: Vec<Line>,
+    pub(crate) resident_oldest: usize,
+    pub(crate) cold_snapshot_generation: Option<ScrollbackSnapshotGeneration>,
+    pub(crate) cold_prefix_line_count: usize,
+    pub(crate) allow_scrollback: bool,
+    pub(crate) keyboard_stack: Vec<KeyboardEncoding>,
+    pub(crate) physical_rows: usize,
+    pub(crate) physical_cols: usize,
+    pub(crate) dpi: u32,
+    pub(crate) saved_cursor: Option<SavedCursor>,
+    pub(crate) cold_source: Option<StagedColdSource>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -4444,11 +4470,11 @@ impl Screen {
     }
 
     #[cfg(feature = "use_serde")]
-    pub(crate) fn checkpoint_parts(
+    pub(crate) fn checkpoint_parts_staged(
         &self,
         limits: &ScreenCheckpointLimits,
         usage: &mut ScreenCheckpointUsage,
-    ) -> Result<ScreenCheckpointParts, ScreenCheckpointCaptureError> {
+    ) -> Result<StagedScreenCheckpoint, ScreenCheckpointCaptureError> {
         let resident_oldest = self.stable_row_index_offset;
 
         // Inspect every resident line before asking the sink to allocate or
@@ -4456,164 +4482,256 @@ impl Screen {
         // checkpoint budget supplied to the sink.
         self.preflight_resident_checkpoint_usage(limits, usage)?;
 
-        let (oldest, cold_snapshot_generation, cold_prefix_line_count, mut cold_lines) =
-            if let Some(recovery) = self.recovery_scrollback {
-                let oldest_stable = StableRowIndex::try_from(resident_oldest).map_err(|_| {
+        if let Some(recovery) = self.recovery_scrollback {
+            let oldest_stable = StableRowIndex::try_from(resident_oldest).map_err(|_| {
+                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+            })?;
+            let resident_count = StableRowIndex::try_from(self.lines.len()).map_err(|_| {
+                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+            })?;
+            let resident_newest = oldest_stable
+                .checked_add(resident_count)
+                .ok_or(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
+            let boundary = recovery.original_cold_prefix_newest_exclusive;
+            if boundary < oldest_stable || boundary > resident_newest {
+                return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
+            }
+            let cold_prefix_line_count =
+                usize::try_from(boundary - oldest_stable).map_err(|_| {
                     ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
                 })?;
-                let resident_count = StableRowIndex::try_from(self.lines.len()).map_err(|_| {
-                    ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-                })?;
-                let resident_newest = oldest_stable
-                    .checked_add(resident_count)
-                    .ok_or(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
-                let boundary = recovery.original_cold_prefix_newest_exclusive;
-                if boundary < oldest_stable || boundary > resident_newest {
-                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
-                }
-                let cold_prefix_line_count =
-                    usize::try_from(boundary - oldest_stable).map_err(|_| {
+            if !self.allow_scrollback
+                && (cold_prefix_line_count != 0 || recovery.expected_generation.is_some())
+            {
+                return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
+            }
+            let mut keyboard_stack = Vec::new();
+            keyboard_stack
+                .try_reserve_exact(self.keyboard_stack.len())
+                .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("keyboard_stack"))?;
+            keyboard_stack.extend(self.keyboard_stack.iter().cloned());
+
+            return Ok(StagedScreenCheckpoint {
+                resident_lines: self.lines.iter().map(Line::semantic_checkpoint_clone).collect(),
+                resident_oldest,
+                cold_snapshot_generation: recovery.expected_generation,
+                cold_prefix_line_count,
+                allow_scrollback: self.allow_scrollback,
+                keyboard_stack,
+                physical_rows: self.physical_rows,
+                physical_cols: self.physical_cols,
+                dpi: self.dpi,
+                saved_cursor: self.saved_cursor.clone(),
+                cold_source: None,
+            });
+        }
+
+        let cold_source = if self.allow_scrollback {
+            if let Some(sink) = self.config.scrollback_spill_sink() {
+                let expected_newest_exclusive = StableRowIndex::try_from(resident_oldest)
+                    .map_err(|_| {
                         ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
                     })?;
-                if !self.allow_scrollback
-                    && (cold_prefix_line_count != 0 || recovery.expected_generation.is_some())
+                let max_cold_bytes =
+                    u64::try_from(limits.max_cold_scrollback_bytes).map_err(|_| {
+                        ScreenCheckpointCaptureError::ArithmeticOverflow(
+                            "cold_scrollback_bytes",
+                        )
+                    })?;
+                let (before_interval, fragments) = if let Some(fragments) = &self.cold_row_fragments {
+                    let crate::config::ScrollbackIntervalCapture::Ready(before) =
+                        sink.try_capture_scrollback_interval()
+                    else {
+                        return Err(
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                        );
+                    };
+                    if !Self::fragments_match_interval(fragments, &sink, &before) {
+                        return Err(
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                        );
+                    }
+                    (before, Some(Arc::clone(fragments)))
+                } else {
+                    let crate::config::ScrollbackIntervalCapture::Ready(before) =
+                        sink.try_capture_scrollback_interval()
+                    else {
+                        return Err(
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                        );
+                    };
+                    (before, None)
+                };
+                Some(StagedColdSource {
+                    sink,
+                    before_interval,
+                    expected_newest_exclusive,
+                    max_cold_bytes,
+                    fragments,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut keyboard_stack = Vec::new();
+        keyboard_stack
+            .try_reserve_exact(self.keyboard_stack.len())
+            .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("keyboard_stack"))?;
+        keyboard_stack.extend(self.keyboard_stack.iter().cloned());
+
+        Ok(StagedScreenCheckpoint {
+            resident_lines: self.lines.iter().map(Line::semantic_checkpoint_clone).collect(),
+            resident_oldest,
+            cold_snapshot_generation: None,
+            cold_prefix_line_count: 0,
+            allow_scrollback: self.allow_scrollback,
+            keyboard_stack,
+            physical_rows: self.physical_rows,
+            physical_cols: self.physical_cols,
+            dpi: self.dpi,
+            saved_cursor: self.saved_cursor.clone(),
+            cold_source,
+        })
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn checkpoint_parts(
+        &self,
+        limits: &ScreenCheckpointLimits,
+        usage: &mut ScreenCheckpointUsage,
+    ) -> Result<ScreenCheckpointParts, ScreenCheckpointCaptureError> {
+        self.checkpoint_parts_staged(limits, usage)?
+            .materialize(limits, usage)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl StagedScreenCheckpoint {
+    pub(crate) fn materialize(
+        self,
+        limits: &ScreenCheckpointLimits,
+        usage: &mut ScreenCheckpointUsage,
+    ) -> Result<ScreenCheckpointParts, ScreenCheckpointCaptureError> {
+        let (oldest, cold_snapshot_generation, cold_prefix_line_count, mut cold_lines) =
+            if let Some(cold) = self.cold_source {
+                let snapshot = cold
+                    .sink
+                    .snapshot_scrollback(
+                        cold.expected_newest_exclusive,
+                        ScrollbackSnapshotLimits {
+                            max_rows: limits.max_total_lines.saturating_sub(usage.lines),
+                            max_stored_bytes: cold.max_cold_bytes,
+                            max_decoded_bytes: limits
+                                .max_retained_capture_bytes
+                                .saturating_sub(usage.retained_capture_bytes),
+                            max_physical_bytes: cold.max_cold_bytes,
+                        },
+                    )
+                    .map_err(ScreenCheckpointCaptureError::ColdScrollbackSnapshot)?;
+                if !snapshot.rows().is_empty()
+                    && snapshot.fidelity() != ScrollbackSnapshotFidelity::ExactSemantic
                 {
-                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade);
                 }
+                if snapshot.newest_stable_row_exclusive() != cold.expected_newest_exclusive
+                    || snapshot.stored_bytes() > cold.max_cold_bytes
+                    || snapshot.decoded_bytes()
+                        > limits
+                            .max_retained_capture_bytes
+                            .saturating_sub(usage.retained_capture_bytes)
+                {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                }
+                let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
+                    (None, true) => self.resident_oldest,
+                    (Some(oldest), false) => usize::try_from(oldest).map_err(|_| {
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+                    })?,
+                    _ => {
+                        return Err(
+                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                        );
+                    }
+                };
+                if oldest > self.resident_oldest
+                    || self.resident_oldest.checked_sub(oldest) != Some(snapshot.rows().len())
+                {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                }
+                let generation = snapshot.generation();
+                let cold_prefix_line_count = snapshot.rows().len();
+
+                let crate::config::ScrollbackIntervalCapture::Ready(after) =
+                    cold.sink.try_capture_scrollback_interval()
+                else {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                };
+                if !after.same_lineage(&cold.before_interval) {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                }
+                let oldest_stable = StableRowIndex::try_from(oldest).map_err(|_| {
+                    ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+                })?;
+                if cold_prefix_line_count > 0
+                    && (!after.retains(
+                        &cold.before_interval,
+                        oldest_stable..cold.expected_newest_exclusive,
+                    ) || cold.before_interval
+                        .rows()
+                        .is_none_or(|rows| rows.start != oldest_stable)
+                        || after
+                            .rows()
+                            .is_none_or(|rows| rows.start != oldest_stable))
+                {
+                    return Err(
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                    );
+                }
+
+                let mut cold_lines = snapshot.into_rows();
+                for (index, line) in cold_lines.iter_mut().enumerate() {
+                    let stable_idx = match oldest_stable.checked_add(index as StableRowIndex) {
+                        Some(idx) => idx,
+                        None => {
+                            return Err(
+                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
+                            )
+                        }
+                    };
+                    if let Some(replacement) =
+                        cold.fragments.as_ref().and_then(|fragments| {
+                            fragments.rows.get(&stable_idx)
+                        })
+                    {
+                        inspect_checkpoint_line(replacement, limits, usage)?;
+                        *line = replacement.semantic_checkpoint_clone();
+                    } else {
+                        inspect_checkpoint_line(line, limits, usage)?;
+                        *line = line.semantic_checkpoint_clone();
+                    }
+                }
+                (oldest, Some(generation), cold_prefix_line_count, cold_lines)
+            } else {
                 (
-                    resident_oldest,
-                    recovery.expected_generation,
-                    cold_prefix_line_count,
+                    self.resident_oldest,
+                    self.cold_snapshot_generation,
+                    self.cold_prefix_line_count,
                     Vec::new(),
                 )
-            } else if self.allow_scrollback {
-                if let Some(sink) = self.config.scrollback_spill_sink() {
-                    let expected_newest_exclusive = StableRowIndex::try_from(resident_oldest)
-                        .map_err(|_| {
-                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-                        })?;
-                    let max_cold_bytes =
-                        u64::try_from(limits.max_cold_scrollback_bytes).map_err(|_| {
-                            ScreenCheckpointCaptureError::ArithmeticOverflow(
-                                "cold_scrollback_bytes",
-                            )
-                        })?;
-                    let fragment_interval = if let Some(fragments) = &self.cold_row_fragments {
-                        let crate::config::ScrollbackIntervalCapture::Ready(before) =
-                            sink.try_capture_scrollback_interval()
-                        else {
-                            return Err(
-                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            );
-                        };
-                        if !Self::fragments_match_interval(fragments, &sink, &before) {
-                            return Err(
-                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            );
-                        }
-                        Some(before)
-                    } else {
-                        None
-                    };
-                    let snapshot = sink
-                        .snapshot_scrollback(
-                            expected_newest_exclusive,
-                            ScrollbackSnapshotLimits {
-                                max_rows: limits.max_total_lines.saturating_sub(usage.lines),
-                                max_stored_bytes: max_cold_bytes,
-                                max_decoded_bytes: limits
-                                    .max_retained_capture_bytes
-                                    .saturating_sub(usage.retained_capture_bytes),
-                                max_physical_bytes: max_cold_bytes,
-                            },
-                        )
-                        .map_err(ScreenCheckpointCaptureError::ColdScrollbackSnapshot)?;
-                    if !snapshot.rows().is_empty()
-                        && snapshot.fidelity() != ScrollbackSnapshotFidelity::ExactSemantic
-                    {
-                        return Err(ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade);
-                    }
-                    if snapshot.newest_stable_row_exclusive() != expected_newest_exclusive
-                        || snapshot.stored_bytes() > max_cold_bytes
-                        || snapshot.decoded_bytes()
-                            > limits
-                                .max_retained_capture_bytes
-                                .saturating_sub(usage.retained_capture_bytes)
-                    {
-                        return Err(
-                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                        );
-                    }
-                    let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
-                        (None, true) => resident_oldest,
-                        (Some(oldest), false) => usize::try_from(oldest).map_err(|_| {
-                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-                        })?,
-                        _ => {
-                            return Err(
-                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            );
-                        }
-                    };
-                    if oldest > resident_oldest
-                        || resident_oldest.checked_sub(oldest) != Some(snapshot.rows().len())
-                    {
-                        return Err(
-                            ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                        );
-                    }
-                    let generation = snapshot.generation();
-                    let cold_prefix_line_count = snapshot.rows().len();
-                    if let Some(before) = fragment_interval {
-                        let crate::config::ScrollbackIntervalCapture::Ready(after) =
-                            sink.try_capture_scrollback_interval()
-                        else {
-                            return Err(
-                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            );
-                        };
-                        if cold_prefix_line_count > 0
-                            && (!after.retains(
-                                &before,
-                                oldest as StableRowIndex..expected_newest_exclusive,
-                            ) || before
-                                .rows()
-                                .is_none_or(|rows| rows.start != oldest as StableRowIndex)
-                                || after
-                                    .rows()
-                                    .is_none_or(|rows| rows.start != oldest as StableRowIndex))
-                        {
-                            return Err(
-                                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            );
-                        }
-                    }
-                    let mut cold_lines = snapshot.into_rows();
-                    for (index, line) in cold_lines.iter_mut().enumerate() {
-                        if let Some(replacement) =
-                            self.cold_row_fragments.as_ref().and_then(|fragments| {
-                                fragments.rows.get(&((oldest + index) as StableRowIndex))
-                            })
-                        {
-                            // Flatten semantic replacements into the existing
-                            // checkpoint. Keep the authenticated snapshot's
-                            // generation as recovery's prefix-replacement CAS.
-                            inspect_checkpoint_line(replacement, limits, usage)?;
-                            *line = replacement.semantic_checkpoint_clone();
-                        } else {
-                            inspect_checkpoint_line(line, limits, usage)?;
-                            *line = line.semantic_checkpoint_clone();
-                        }
-                    }
-                    (oldest, Some(generation), cold_prefix_line_count, cold_lines)
-                } else {
-                    (resident_oldest, None, 0, Vec::new())
-                }
-            } else {
-                (resident_oldest, None, 0, Vec::new())
             };
 
-        let total_lines = cold_lines.len().checked_add(self.lines.len()).ok_or(
+        let total_lines = cold_lines.len().checked_add(self.resident_lines.len()).ok_or(
             ScreenCheckpointCaptureError::ArithmeticOverflow("screen_lines"),
         )?;
         if usage.lines > limits.max_total_lines {
@@ -4629,12 +4747,7 @@ impl Screen {
             .try_reserve_exact(total_lines)
             .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("screen_lines"))?;
         lines.append(&mut cold_lines);
-        lines.extend(self.lines.iter().map(Line::semantic_checkpoint_clone));
-        let mut keyboard_stack = Vec::new();
-        keyboard_stack
-            .try_reserve_exact(self.keyboard_stack.len())
-            .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("keyboard_stack"))?;
-        keyboard_stack.extend(self.keyboard_stack.iter().cloned());
+        lines.extend(self.resident_lines);
 
         Ok(ScreenCheckpointParts {
             lines,
@@ -4642,14 +4755,17 @@ impl Screen {
             cold_snapshot_generation,
             cold_prefix_line_count,
             allow_scrollback: self.allow_scrollback,
-            keyboard_stack,
+            keyboard_stack: self.keyboard_stack,
             physical_rows: self.physical_rows,
             physical_cols: self.physical_cols,
             dpi: self.dpi,
-            saved_cursor: self.saved_cursor.clone(),
+            saved_cursor: self.saved_cursor,
         })
     }
 
+}
+
+impl Screen {
     /// Rebuild a screen from parts that have already passed the terminal
     /// checkpoint validator.  Only semantic state is installed; all caches,
     /// workers, scorecards, telemetry, and configuration-derived policies come

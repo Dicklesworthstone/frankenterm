@@ -1888,12 +1888,15 @@ impl Pane for LocalPane {
         // Apply this parser's still-local actions and capture staged hot state
         // under the terminal lock, then release the lock immediately so cold-history
         // materialization and serialization do not block the terminal mutex.
-        let staged = {
+        let (staged, rows, cols) = {
             let mut terminal = self.locked_terminal();
             terminal.perform_actions(std::mem::take(pending_actions));
-            TerminalCheckpointV2::capture_staged(&terminal, limits)
-                .map_err(RecoveryTerminalCheckpointError::Checkpoint)
-                .map_err(LiveParserPaneCaptureError::Terminal)?
+            let rows = terminal.get_size().rows;
+            let cols = terminal.get_size().cols;
+            let staged = terminal
+                .capture_staged(limits)
+                .map_err(LiveParserPaneCaptureError::Terminal)?;
+            (staged, rows, cols)
         };
 
         let checkpoint = staged
@@ -1901,10 +1904,17 @@ impl Pane for LocalPane {
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
             .map_err(LiveParserPaneCaptureError::Terminal)?;
 
-        checkpoint
-            .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
+        let canonical_payload = checkpoint
+            .to_canonical_json(limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
-            .map_err(LiveParserPaneCaptureError::Terminal)
+            .map_err(LiveParserPaneCaptureError::Terminal)?;
+
+        Ok(RecoveryTerminalCheckpointV2::from_canonical_parts(
+            canonical_payload,
+            rows,
+            cols,
+            ground.stream_bytes(),
+        ))
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -2839,19 +2849,20 @@ impl LocalPane {
         let _output_application = self.output_application.lock();
 
         // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
-        let staged = {
+        let (staged, rows, cols) = {
             let mut terminal = self.locked_terminal();
             if policy == PendingActionDrainPolicy::DrainAndApply {
                 terminal.perform_actions(std::mem::take(pending_actions));
             }
-            TerminalCheckpointV2::capture_staged(&terminal, limits).map_err(|e| match e {
-                TerminalCheckpointError::StaleColdGeneration => {
+            let rows = terminal.get_size().rows;
+            let cols = terminal.get_size().cols;
+            let staged = terminal.capture_staged(limits).map_err(|e| match e {
+                RecoveryTerminalCheckpointError::Checkpoint(TerminalCheckpointError::StaleColdGeneration) => {
                     LegacyTerminalCaptureError::StaleColdGeneration
                 }
-                other => LegacyTerminalCaptureError::Terminal(
-                    RecoveryTerminalCheckpointError::Checkpoint(other),
-                ),
-            })?
+                other => LegacyTerminalCaptureError::Terminal(other),
+            })?;
+            (staged, rows, cols)
         }; // Terminal mutex is released immediately here!
 
         // 2. Outside terminal lock: materialize cold history rows
@@ -2866,9 +2877,9 @@ impl LocalPane {
                 ),
             })?;
 
-        // 3. Assemble canonical RecoveryTerminalCheckpointV2 outside terminal lock
-        checkpoint
-            .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
+        // 3. Serialize canonical payload and assemble RecoveryTerminalCheckpointV2 outside terminal lock
+        let canonical_payload = checkpoint
+            .to_canonical_json(limits)
             .map_err(|e| match e {
                 TerminalCheckpointError::StaleColdGeneration => {
                     LegacyTerminalCaptureError::StaleColdGeneration
@@ -2876,7 +2887,14 @@ impl LocalPane {
                 other => LegacyTerminalCaptureError::Terminal(
                     RecoveryTerminalCheckpointError::Checkpoint(other),
                 ),
-            })
+            })?;
+
+        Ok(RecoveryTerminalCheckpointV2::from_canonical_parts(
+            canonical_payload,
+            rows,
+            cols,
+            ground.stream_bytes(),
+        ))
     }
 
     /// Convenience capture for legacy mux-owned panes when no pending actions or custom parser ground are needed.
@@ -8489,4 +8507,510 @@ mod disruptor_ring_keep_gate {
             );
         }
     }
+
+    struct MuxCheckpointTestSink {
+        identity: std::sync::Mutex<frankenterm_term::config::ScrollbackIntervalIdentity>,
+        rows: std::sync::Mutex<Vec<(StableRowIndex, Line)>>,
+        generation: std::sync::Mutex<frankenterm_term::config::ScrollbackSnapshotGeneration>,
+        mutate_on_snapshot: std::sync::atomic::AtomicBool,
+        snapshot_probe: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl std::fmt::Debug for MuxCheckpointTestSink {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MuxCheckpointTestSink").finish_non_exhaustive()
+        }
+    }
+
+    impl MuxCheckpointTestSink {
+        fn new() -> Self {
+            Self {
+                identity: std::sync::Mutex::new(
+                    frankenterm_term::config::ScrollbackIntervalIdentity::default(),
+                ),
+                rows: std::sync::Mutex::new(Vec::new()),
+                generation: std::sync::Mutex::new(
+                    frankenterm_term::config::ScrollbackSnapshotGeneration::new([1; 16], 1),
+                ),
+                mutate_on_snapshot: std::sync::atomic::AtomicBool::new(false),
+                snapshot_probe: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn add_row(&self, row: StableRowIndex, line: Line) {
+            self.rows.lock().unwrap().push((row, line));
+        }
+
+        fn advance_identity(&self) {
+            *self.identity.lock().unwrap() =
+                frankenterm_term::config::ScrollbackIntervalIdentity::default();
+        }
+    }
+
+    impl frankenterm_term::config::ScrollbackSpillSink for MuxCheckpointTestSink {
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            self.rows.lock().unwrap().push((stable_row, line.clone()));
+            true
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(r, _)| *r == stable_row)
+                .map(|(_, l)| l.clone())
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows.lock().unwrap().first().map(|(r, _)| *r)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.rows.lock().unwrap().len() * 80
+        }
+
+        fn try_capture_scrollback_interval(&self) -> frankenterm_term::config::ScrollbackIntervalCapture {
+            let rows = self.rows.lock().unwrap();
+            let range = if rows.is_empty() {
+                None
+            } else {
+                let first = rows.first().unwrap().0;
+                let last = rows.last().unwrap().0;
+                Some(first..last + 1)
+            };
+            self.identity.lock().unwrap().capture(range)
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            expected_newest_exclusive: StableRowIndex,
+            _limits: frankenterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<frankenterm_term::config::ScrollbackSnapshot, frankenterm_term::config::ScrollbackSpillError> {
+            if let Some(probe) = self.snapshot_probe.lock().unwrap().as_ref() {
+                probe();
+            }
+            if self.mutate_on_snapshot.load(std::sync::atomic::Ordering::SeqCst) {
+                self.advance_identity();
+            }
+            let rows = self.rows.lock().unwrap();
+            let filtered: Vec<Line> = rows
+                .iter()
+                .filter(|(idx, _)| *idx < expected_newest_exclusive)
+                .map(|(_, line)| line.clone())
+                .collect();
+            let oldest = if filtered.is_empty() {
+                None
+            } else {
+                filtered.first().and_then(|_| rows.first().map(|(idx, _)| *idx))
+            };
+            let gen = *self.generation.lock().unwrap();
+            let count = filtered.len();
+            frankenterm_term::config::ScrollbackSnapshot::from_contiguous_rows(
+                gen,
+                frankenterm_term::config::ScrollbackSnapshotFidelity::ExactSemantic,
+                oldest,
+                expected_newest_exclusive,
+                (count * 80) as u64,
+                count * 80,
+                filtered,
+            )
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<frankenterm_term::config::ScrollbackSnapshotGeneration>,
+            _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<frankenterm_term::config::ScrollbackReplaceCommit, frankenterm_term::config::ScrollbackSpillError> {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[derive(Debug)]
+    struct MuxCheckpointTestConfig {
+        sink: Arc<MuxCheckpointTestSink>,
+    }
+
+    impl TerminalConfiguration for MuxCheckpointTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn scrollback_size(&self) -> usize {
+            1000
+        }
+
+        fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+            frankenterm_term::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 5,
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn scrollback_spill_sink(&self) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+            Some(Arc::clone(&self.sink) as Arc<dyn frankenterm_term::config::ScrollbackSpillSink>)
+        }
+    }
+
+    fn make_legacy_test_pane(pane_id: PaneId, terminal: Terminal) -> LocalPane {
+        LocalPane::new(
+            pane_id,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x88; 16],
+            "legacy-test-pane".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_legacy_terminal_checkpoint_positive_roundtrip() {
+        let sink = Arc::new(MuxCheckpointTestSink::new());
+        let blank_attr = termwiz::cell::CellAttributes::blank();
+        sink.add_row(
+            0,
+            Line::from_text("cold scrollback line 0", &blank_attr, 1, None),
+        );
+        sink.add_row(
+            1,
+            Line::from_text("cold scrollback line 1", &blank_attr, 1, None),
+        );
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
+            sink: Arc::clone(&sink),
+        });
+
+        let mut terminal = Terminal::new(
+            term_size(80, 24),
+            config,
+            "FrankenTerm",
+            "checkpoint-pos-test",
+            Box::new(Vec::<u8>::new()),
+        );
+
+        terminal.screen_mut().stable_row_index_offset = 2;
+
+        terminal.advance_bytes("\x1b[1;31mPrimary \u{1F980} Crab\x1b[0m\r\n".as_bytes());
+        terminal.advance_bytes(b"\x1b[?2004h");
+        terminal.advance_bytes(b"\x1b[6;11H");
+
+        terminal.advance_bytes(b"\x1b[?1049h\x1b[4;32mAlternate \u{26A1} HighVolt\x1b[0m");
+
+        let pane = make_legacy_test_pane(777, terminal);
+
+        let authority = ModelParserCaptureAuthority::issue();
+        let limits = TerminalCheckpointLimits::default();
+        let mut pending = Vec::new();
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("fresh parser must be at recovery ground");
+
+        let recovery = pane
+            .capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits)
+            .expect("legacy terminal checkpoint capture must succeed");
+
+        assert_eq!(recovery.rows(), 24);
+        assert_eq!(recovery.cols(), 80);
+        assert!(!recovery.canonical_payload().is_empty());
+
+        let validated = TerminalCheckpointV2::decode_canonical_json(
+            recovery.canonical_payload(),
+            limits,
+        )
+        .expect("canonical payload must decode and validate");
+
+        let checkpoint = validated.checkpoint();
+
+        // 1. Both screens preserved
+        assert_eq!(checkpoint.primary_lines_count(), 26);
+        assert_eq!(checkpoint.alternate_lines_count(), 24);
+        assert!(checkpoint.is_alternate_screen_active());
+
+        // 2. Scrollback preserved
+        assert_eq!(checkpoint.primary_cold_prefix_lines(), 2);
+        assert_eq!(checkpoint.primary_cell_text(0, 0), Some("c"));
+        assert_eq!(checkpoint.primary_cell_text(0, 1), Some("o"));
+
+        // 3. Modes preserved (bracketed paste)
+        assert!(checkpoint.bracketed_paste());
+
+        // 4. Cursor preserved on active alternate screen
+        let (cursor_row, _cursor_col) = checkpoint.cursor_position();
+        assert_eq!(cursor_row, 0);
+
+        // 5. Styled cells & Unicode preserved on alternate screen
+        assert_eq!(checkpoint.alternate_cell_text(0, 0), Some("A"));
+        assert_eq!(
+            checkpoint.alternate_cell_underline(0, 0),
+            Some(termwiz::cell::Underline::Single)
+        );
+        assert_eq!(checkpoint.alternate_cell_text(0, 10), Some("\u{26A1}"));
+
+        // 6. Styled cells & Unicode preserved on primary screen
+        assert_eq!(checkpoint.primary_cell_text(2, 0), Some("P"));
+        assert_eq!(
+            checkpoint.primary_cell_intensity(2, 0),
+            Some(termwiz::cell::Intensity::Bold)
+        );
+        assert_eq!(checkpoint.primary_cell_text(2, 8), Some("\u{1F980}"));
+    }
+
+    #[test]
+    fn test_legacy_terminal_checkpoint_rejects_pending_actions() {
+        let terminal = guardian_lifetime_test_terminal();
+        let pane = make_legacy_test_pane(778, terminal);
+
+        let authority = ModelParserCaptureAuthority::issue();
+        let limits = TerminalCheckpointLimits::default();
+        let mut pending = vec![
+            Action::Print('h'),
+            Action::Print('i'),
+        ];
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("fresh parser must be at recovery ground");
+
+        let result = pane.capture_legacy_terminal_checkpoint_with_policy(
+            authority,
+            &mut pending,
+            ground,
+            limits,
+            PendingActionDrainPolicy::RequireEmpty,
+        );
+
+        match result {
+            Err(LegacyTerminalCaptureError::PendingActionsRemain(count)) => {
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected PendingActionsRemain(2), got {:?}", other),
+        }
+
+        // Under DrainAndApply policy, pending actions are applied and drained
+        let result = pane.capture_legacy_terminal_checkpoint_with_policy(
+            authority,
+            &mut pending,
+            ground,
+            limits,
+            PendingActionDrainPolicy::DrainAndApply,
+        );
+        assert!(result.is_ok());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_terminal_checkpoint_rejects_false_guardian_authority() {
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = guardian_lifetime_test_pane(779, identity, control, kills);
+
+        let authority = ModelParserCaptureAuthority::issue();
+        let limits = TerminalCheckpointLimits::default();
+        let mut pending = Vec::new();
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("fresh parser must be at recovery ground");
+
+        let result = pane.capture_legacy_terminal_checkpoint(
+            authority,
+            &mut pending,
+            ground,
+            limits,
+        );
+
+        match result {
+            Err(LegacyTerminalCaptureError::FalseGuardianAuthority) => {}
+            other => panic!("expected FalseGuardianAuthority, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_legacy_terminal_checkpoint_rejects_stale_cold_generation() {
+        let sink = Arc::new(MuxCheckpointTestSink::new());
+        let blank_attr = termwiz::cell::CellAttributes::blank();
+        let line0 = Line::from_text("cold row 0", &blank_attr, 1, None);
+        sink.add_row(0, line0);
+        sink.mutate_on_snapshot
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
+            sink: Arc::clone(&sink),
+        });
+
+        let mut terminal = Terminal::new(
+            term_size(80, 24),
+            config,
+            "FrankenTerm",
+            "stale-cold-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.screen_mut().stable_row_index_offset = 1;
+
+        let pane = make_legacy_test_pane(780, terminal);
+
+        let authority = ModelParserCaptureAuthority::issue();
+        let limits = TerminalCheckpointLimits::default();
+        let mut pending = Vec::new();
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("fresh parser must be at recovery ground");
+
+        let result = pane.capture_legacy_terminal_checkpoint(
+            authority,
+            &mut pending,
+            ground,
+            limits,
+        );
+
+        match result {
+            Err(LegacyTerminalCaptureError::StaleColdGeneration) => {}
+            other => panic!("expected StaleColdGeneration, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_legacy_terminal_checkpoint_lock_release_causal() {
+        let sink = Arc::new(MuxCheckpointTestSink::new());
+        let blank_attr = termwiz::cell::CellAttributes::blank();
+        let line0 = Line::from_text("cold row 0", &blank_attr, 1, None);
+        sink.add_row(0, line0);
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
+            sink: Arc::clone(&sink),
+        });
+
+        let mut terminal = Terminal::new(
+            term_size(80, 24),
+            config,
+            "FrankenTerm",
+            "causal-lock-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.screen_mut().stable_row_index_offset = 1;
+
+        let pane = Arc::new(make_legacy_test_pane(781, terminal));
+
+        // Install a probe into the spill sink that executes during `snapshot_scrollback`.
+        // If the terminal mutex is dropped before cold materialization occurs,
+        // `pane.terminal.try_lock()` will succeed (return Some) inside the probe!
+        let pane_clone = Arc::clone(&pane);
+        let lock_acquired_during_snapshot = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = Arc::clone(&lock_acquired_during_snapshot);
+        *sink.snapshot_probe.lock().unwrap() = Some(Arc::new(move || {
+            if pane_clone.terminal.try_lock().is_some() {
+                probe_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+
+        let authority = ModelParserCaptureAuthority::issue();
+        let limits = TerminalCheckpointLimits::default();
+        let mut pending = Vec::new();
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("fresh parser must be at recovery ground");
+
+        let result = pane.capture_legacy_terminal_checkpoint(
+            authority,
+            &mut pending,
+            ground,
+            limits,
+        );
+
+        assert!(result.is_ok(), "capture must succeed: {:?}", result.err());
+        assert!(
+            lock_acquired_during_snapshot.load(std::sync::atomic::Ordering::SeqCst),
+            "terminal mutex must NOT be held during cold scrollback snapshot materialization"
+        );
+    }
+
+    #[test]
+    fn test_legacy_terminal_checkpoint_cold_reflow_roundtrip() {
+        let sink = Arc::new(MuxCheckpointTestSink::new());
+        let blank_attr = termwiz::cell::CellAttributes::blank();
+        sink.add_row(
+            0,
+            Line::from_text("unreflowed cold row 0", &blank_attr, 1, None),
+        );
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
+            sink: Arc::clone(&sink),
+        });
+
+        let mut terminal = Terminal::new(
+            term_size(80, 24),
+            config,
+            "FrankenTerm",
+            "cold-reflow-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.screen_mut().stable_row_index_offset = 1;
+
+        let frankenterm_term::config::ScrollbackIntervalCapture::Ready(interval) =
+            sink.try_capture_scrollback_interval()
+        else {
+            panic!("expected sink interval to be ready");
+        };
+
+        // Install cold row fragments representing a reflowed split row
+        let reflowed_line = Line::from_text("reflowed replacement cold row 0", &blank_attr, 1, None);
+        let mut replacements = std::collections::BTreeMap::new();
+        replacements.insert(0, reflowed_line);
+
+        terminal.set_cold_row_fragments_for_test(
+            Arc::clone(&sink) as Arc<dyn frankenterm_term::config::ScrollbackSpillSink>,
+            interval,
+            replacements,
+        );
+
+        let pane = make_legacy_test_pane(782, terminal);
+
+        let authority = ModelParserCaptureAuthority::issue();
+        let limits = TerminalCheckpointLimits::default();
+        let mut pending = Vec::new();
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("fresh parser must be at recovery ground");
+
+        let recovery = pane
+            .capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits)
+            .expect("capture with cold reflow fragments must succeed");
+
+        let validated = TerminalCheckpointV2::decode_canonical_json(
+            recovery.canonical_payload(),
+            limits,
+        )
+        .expect("canonical payload must decode and validate");
+
+        let checkpoint = validated.checkpoint();
+
+        // Verify that the replacement from cold_row_fragments was applied
+        assert_eq!(checkpoint.primary_lines_count(), 25);
+        assert_eq!(checkpoint.primary_cold_prefix_lines(), 1);
+        // Cell (0, 0) should be 'r' from "reflowed", not 'u' from "unreflowed"
+        assert_eq!(checkpoint.primary_cell_text(0, 0), Some("r"));
+        assert_eq!(checkpoint.primary_cell_text(0, 1), Some("e"));
+        assert_eq!(checkpoint.primary_cell_text(0, 2), Some("f"));
+    }
 }
+

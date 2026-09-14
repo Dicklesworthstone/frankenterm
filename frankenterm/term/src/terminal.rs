@@ -470,6 +470,23 @@ impl RecoveryTerminalCheckpointV2 {
     pub fn into_canonical_payload(mut self) -> Zeroizing<Vec<u8>> {
         std::mem::take(&mut self.canonical_payload)
     }
+
+    /// Construct canonical recovery checkpoint from pre-serialized canonical payload,
+    /// dimensions, and stream byte watermark.
+    #[must_use]
+    pub fn from_canonical_parts(
+        canonical_payload: Zeroizing<Vec<u8>>,
+        rows: usize,
+        cols: usize,
+        parser_stream_bytes: u64,
+    ) -> Self {
+        Self {
+            canonical_payload,
+            rows,
+            cols,
+            parser_stream_bytes,
+        }
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -1045,6 +1062,36 @@ impl Terminal {
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
         self.capture_recovery_checkpoint_at_stream_watermark(ground.stream_bytes(), limits)
+    }
+
+    /// Capture bounded hot terminal state and pin cold generation under lock.
+    /// The returned staged checkpoint can then be materialized outside the terminal lock.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_staged(
+        &self,
+        limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
+    ) -> Result<crate::terminalstate::checkpoint::StagedHotCheckpoint, RecoveryTerminalCheckpointError> {
+        crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_staged(&self.state, limits)
+            .map_err(RecoveryTerminalCheckpointError::Checkpoint)
+    }
+
+    #[doc(hidden)]
+    pub fn set_cold_row_fragments_for_test(
+        &mut self,
+        sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: crate::config::ScrollbackInterval,
+        replacements: std::collections::BTreeMap<StableRowIndex, termwiz::surface::Line>,
+    ) {
+        self.state.screen.screen.cold_row_fragments = Some(Arc::new(crate::screen::ColdRowFragments {
+            sink,
+            interval,
+            rows: replacements,
+            aligned_frontier: self.state.screen.screen.phys_to_stable_row_index(0),
+            aligned_source_start: 0,
+            cols: self.state.screen.screen.physical_cols,
+            dpi: self.state.screen.screen.dpi,
+            policy: self.state.screen.screen.resize_wrap_policy,
+        }));
     }
 
     #[cfg(feature = "use_serde")]

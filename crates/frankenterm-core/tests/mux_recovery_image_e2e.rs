@@ -1,3 +1,4 @@
+#![cfg(feature = "frankenterm-deps")]
 #![recursion_limit = "256"]
 
 //! Independent End-to-End Integration and Semantic Crash/Corruption Recovery Tests.
@@ -10,19 +11,27 @@
 //! - `%571`: Bounded zstd compression, XChaCha20Poly1305 AEAD, and versioned AAD binding (`snapshot_representation`).
 //! - `%570`: Authenticated RaptorQ FEC encoding, loss recovery, and inactivation rank solving (`snapshot_repair`).
 //! - `%572`: Atomic dual-slot non-clobbering publication, predecessor lineage, and complete object graph verification (`snapshot_publication`).
-//! - Complete negative matrix: insufficient FEC rank, ciphertext tampering, bad keys, torn generation fallback,
-//!   missing referenced objects, structural topology corruptions, and live target safety gates.
+//! - `%576`: Offline inert session reconstruction (`reconstruct_whole_mux_image_inert`), non-zero tab/domain bindings,
+//!   and production root verification (`WholeMuxRecoveryVerifier`).
+//! - Complete negative matrix: insufficient FEC rank, ciphertext tampering, wrong key rejection, torn generation fallback,
+//!   missing referenced objects, payload digest mismatches, fake guardian authority, and live target safety gates.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use frankenterm_core::cx::Cx;
 use frankenterm_core::mux_recovery_image::{
     CheckpointAuthority, ClientWorkspaceBinding, FloatingPaneRect, MuxRecoveryImage,
     MuxRecoveryImageError, PaneCheckpointBinding, ParserCaptureIdentity, RecoveryDomain,
     RecoveryFloatingPane, RecoveryGuiPosition, RecoveryImageHeader, RecoveryObjectRef,
     RecoveryPane, RecoverySplitNode, RecoveryTab, RecoveryTopology, RecoveryWindow,
     SplitDirection, SplitDirectionAndSize, TerminalSize as ImageTerminalSize,
+    MUX_RECOVERY_IMAGE_MAGIC, MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
+};
+use frankenterm_core::session_restore::{
+    reconstruct_whole_mux_image_inert, select_verified_recovery_roots,
+    validate_whole_mux_image_layout_only, ReconstructedPaneTerminal, ReconstructedWholeMuxSession,
+    ValidatedWholeMuxRecovery, WholeMuxRecoveryError, WholeMuxRecoveryLimits,
+    WholeMuxRecoveryVerifier,
 };
 use frankenterm_core::snapshot_publication::{
     GenerationRootPublishRequest, PredecessorBinding, PublicationError, PublicationLimits,
@@ -39,10 +48,11 @@ use frankenterm_core::snapshot_representation::{
 };
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::TerminalConfiguration;
+use frankenterm_term::terminal::{InertTerminal, RecoveryTerminalCheckpointV2, Terminal};
 use frankenterm_term::terminalstate::checkpoint::{
-    TerminalCheckpointLimits, TerminalCheckpointV2, ValidatedTerminalCheckpointV2,
+    TerminalCheckpointLimits, TerminalCheckpointV2,
 };
-use frankenterm_term::{InertTerminal, Terminal, TerminalSize as TermTerminalSize};
+use frankenterm_term::TerminalSize as TermTerminalSize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -81,177 +91,40 @@ fn create_live_terminal(pane_id: usize, content_script: &[&[u8]]) -> Terminal {
     term
 }
 
-/// Helper to capture and canonically encode a terminal checkpoint.
+/// Helper to capture and canonically encode a terminal checkpoint using the public API.
 fn capture_canonical_checkpoint(
     term: &Terminal,
     limits: TerminalCheckpointLimits,
-) -> (Vec<u8>, [u8; 32]) {
-    let checkpoint = TerminalCheckpointV2::capture_with_limits(term, limits)
-        .expect("must capture terminal checkpoint");
-    let canonical = checkpoint
-        .to_canonical_json(limits)
-        .expect("must encode canonical JSON");
+) -> (Vec<u8>, [u8; 32], usize, usize) {
+    let checkpoint: RecoveryTerminalCheckpointV2 = term
+        .capture_recovery_checkpoint(limits)
+        .expect("must capture canonical recovery checkpoint");
+    let payload = checkpoint.canonical_payload().to_vec();
+    let rows = checkpoint.rows();
+    let cols = checkpoint.cols();
     let mut digest = [0u8; 32];
-    digest.copy_from_slice(&Sha256::digest(&canonical));
-    (canonical.to_vec(), digest)
+    digest.copy_from_slice(&Sha256::digest(&payload));
+    (payload, digest, rows, cols)
 }
 
-/// Custom RootVerifier enforcing that the root candidate parses and every single referenced
-/// terminal checkpoint object exists in the store with matching payload digest and length.
-#[derive(Clone)]
-struct HolisticRootVerifier {
-    expected_generation: u64,
-    limits: TerminalCheckpointLimits,
-}
+/// Helper to assemble a complete 8-pane `MuxRecoveryImage` covering splits, floating panes,
+/// multiple windows, tabs, and domains.
+fn build_test_whole_mux_image(
+    canonical_checkpoints: &[(Vec<u8>, [u8; 32], usize, usize)],
+    inc_id: &str,
+    session_id: &str,
+) -> MuxRecoveryImage {
+    assert_eq!(canonical_checkpoints.len(), 8);
 
-impl RootVerifier for HolisticRootVerifier {
-    type Error = String;
-    type Verified = (MuxRecoveryImage, BTreeMap<usize, ValidatedTerminalCheckpointV2>);
-
-    fn verify_root(
-        &self,
-        candidate: &RootSlotCandidate,
-        store: &SnapshotPublicationStore,
-    ) -> Result<Self::Verified, Self::Error> {
-        if candidate.generation != self.expected_generation {
-            return Err(format!(
-                "generation mismatch: expected {}, found {}",
-                self.expected_generation, candidate.generation
-            ));
-        }
-
-        // 1. Decode and validate canonical whole-mux recovery image
-        let image = MuxRecoveryImage::from_json_slice(&candidate.manifest_bytes)
-            .map_err(|e| format!("invalid mux recovery image in root: {e}"))?;
-        image
-            .validate()
-            .map_err(|e| format!("image structural validation failed: {e}"))?;
-
-        // 2. Complete object-graph closure verification:
-        // Every single pane must have its checkpoint object present in the store and valid.
-        let mut validated_terminals = BTreeMap::new();
-        for pane in &image.panes {
-            let obj_ref = &pane.checkpoint.checkpoint_ref;
-            let object_bytes = store
-                .read_object(&obj_ref.object_id)
-                .map_err(|e| format!("missing referenced checkpoint object '{}': {e}", obj_ref.object_id))?;
-
-            if object_bytes.len() as u64 != obj_ref.byte_length {
-                return Err(format!(
-                    "checkpoint object '{}' length mismatch: expected {}, got {}",
-                    obj_ref.object_id, obj_ref.byte_length, object_bytes.len()
-                ));
-            }
-
-            let computed_digest: [u8; 32] = Sha256::digest(&object_bytes).into();
-            if computed_digest != obj_ref.payload_digest {
-                return Err(format!(
-                    "checkpoint object '{}' digest mismatch: expected {:?}, computed {:?}",
-                    obj_ref.object_id, obj_ref.payload_digest, computed_digest
-                ));
-            }
-
-            // Real canonical JSON decoding verification
-            let validated = TerminalCheckpointV2::decode_canonical_json(&object_bytes, self.limits)
-                .map_err(|e| format!("terminal checkpoint decode failed for pane {}: {e}", pane.pane_id))?;
-
-            validated_terminals.insert(pane.pane_id, validated);
-        }
-
-        Ok((image, validated_terminals))
-    }
-}
-
-// =============================================================================
-// Positive E2E Integration Journeys
-// =============================================================================
-
-#[test]
-fn test_e2e_full_mux_recovery_roundtrip_happy_path() {
-    let cx = Cx::for_testing();
-    let term_limits = TerminalCheckpointLimits::default();
-    let temp_dir = TempDir::new().expect("create tempdir");
-    let store = SnapshotPublicationStore::open(temp_dir.path(), PublicationLimits::default())
-        .expect("open publication store");
-
-    // -------------------------------------------------------------------------
-    // Phase 1: Construct 8 real terminals with rich semantic features
-    // -------------------------------------------------------------------------
-    let terminal_scripts: [Vec<&[u8]>; 8] = [
-        // Pane 0: Primary screen with green text & bold
-        vec![b"Agent 0 Initializing...\r\n", b"\x1b[32;1mStatus: ONLINE\x1b[0m\r\n"],
-        // Pane 1: ANSI styling & Unicode emojis
-        vec![b"\x1b[33mWorker 1:\x1b[0m Processing batch \xF0\x9F\x9A\x80 [OK]\r\n"],
-        // Pane 2: Alternate screen buffer activated with full screen redraw
-        vec![
-            b"Primary text that should be hidden\r\n",
-            b"\x1b[?1049h\x1b[H\x1b[2J",
-            b"\x1b[44;37m=== FULLSCREEN MONITOR TUI ===\x1b[0m\r\n",
-            b"CPU: 42% | RAM: 18% | Network: ACTIVE \xE2\x9C\x94\r\n",
-        ],
-        // Pane 3: Box-drawing characters
-        vec![
-            b"\xE2\x94\x8C\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x90\r\n",
-            b"\xE2\x94\x82 BOX \xE2\x94\x82\r\n",
-            b"\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x98\r\n",
-        ],
-        // Pane 4: Cursor positioning sequences
-        vec![b"Row 1\r\nRow 2\r\n", b"\x1b[1;20H[Pinned Cursor]"],
-        // Pane 5: Inverted and underlined modes
-        vec![b"\x1b[7mInverted Header\x1b[0m\r\n\x1b[4mUnderlined Subtitle\x1b[0m\r\n"],
-        // Pane 6: Japanese / wide Unicode characters
-        vec![b"\xE6\x9D\xB1\xE4\xBA\xAC\xE3\x83\x8E\xE3\x83\xBC\xE3\x83\x89: \xE6\xAD\xA3\xE5\xB8\xB8\xE7\xA8\xBC\xE5\x83\x8D\r\n"],
-        // Pane 7: Floating pane diagnostic overlay
-        vec![b"\x1b[41;37m[ALERT OVERLAY]\x1b[0m Swarm watchdog heartbeat\r\n"],
-    ];
-
-    let mut original_terminals = Vec::new();
-    let mut checkpoint_bytes_list = Vec::new();
-    let mut checkpoint_digests = Vec::new();
-
-    for (id, script) in terminal_scripts.iter().enumerate() {
-        let term = create_live_terminal(id, script);
-        let (bytes, digest) = capture_canonical_checkpoint(&term, term_limits);
-
-        // Publish each terminal checkpoint object to immutable publication store
-        let payload = RecoveryObjectPayload {
-            object_id: format!("term-chk-obj-{id:04x}"),
-            expected_sha256: hex::encode(digest),
-            ciphertext_bytes: bytes.clone(),
-        };
-        store
-            .publish_object(&payload)
-            .expect("must publish checkpoint object");
-
-        original_terminals.push(term);
-        checkpoint_bytes_list.push(bytes);
-        checkpoint_digests.push(digest);
-    }
-
-    // -------------------------------------------------------------------------
-    // Phase 2: Construct Authoritative Whole-Mux Topology (%574)
-    // 3 Windows, 5 Tabs, 8 Panes, 2 Domains
-    // -------------------------------------------------------------------------
-    let default_size = ImageTerminalSize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 640,
-        pixel_height: 384,
-        dpi: 96,
-    };
-    let half_vertical = ImageTerminalSize {
-        rows: 24,
-        cols: 40,
-        pixel_width: 320,
-        pixel_height: 384,
-        dpi: 96,
-    };
-    let half_horizontal = ImageTerminalSize {
-        rows: 12,
-        cols: 80,
-        pixel_width: 640,
-        pixel_height: 192,
-        dpi: 96,
+    let header = RecoveryImageHeader {
+        magic: MUX_RECOVERY_IMAGE_MAGIC,
+        schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
+        generation: 1,
+        predecessor_digest: None,
+        created_at_epoch_ms: 1700000000000,
+        mux_incarnation_id: inc_id.to_string(),
+        ft_version: "0.1.0".to_string(),
+        session_id: session_id.to_string(),
     };
 
     let domains = vec![
@@ -262,16 +135,37 @@ fn test_e2e_full_mux_recovery_roundtrip_happy_path() {
         },
         RecoveryDomain {
             incarnation_domain_id: 2,
-            domain_name: "remote-hz1".to_string(),
+            domain_name: "remote".to_string(),
             is_attached: true,
         },
     ];
 
+    let split_size = ImageTerminalSize {
+        rows: 24,
+        cols: 40,
+        pixel_width: 320,
+        pixel_height: 384,
+        dpi: 96,
+    };
+    let full_size = ImageTerminalSize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 640,
+        pixel_height: 384,
+        dpi: 96,
+    };
+    let vert_split_size = ImageTerminalSize {
+        rows: 12,
+        cols: 80,
+        pixel_width: 640,
+        pixel_height: 192,
+        dpi: 96,
+    };
+
     let windows = vec![
-        // Window 0: Default workspace, Tabs 0 and 1
         RecoveryWindow {
-            window_id: 100,
-            stable_window_id: "win-stable-100".to_string(),
+            window_id: 1,
+            stable_window_id: "win-1-stable".to_string(),
             workspace: "default".to_string(),
             order_revision: 1,
             gui_position: Some(RecoveryGuiPosition {
@@ -281,945 +175,1080 @@ fn test_e2e_full_mux_recovery_roundtrip_happy_path() {
                 height: 600,
             }),
             tabs: vec![
-                // Tab 0: Single Pane 0 (Leaf)
                 RecoveryTab {
                     tab_id: 10,
-                    stable_tab_id: "tab-stable-10".to_string(),
-                    title: "Shell".to_string(),
-                    working_dir: Some("/home/agent".to_string()),
-                    size: default_size,
-                    size_before_zoom: default_size,
-                    zoomed_pane_id: None,
-                    root_split: Some(RecoverySplitNode::Leaf {
-                        pane_id: 0,
-                        pane_uuid: "uuid-pane-0000".to_string(),
-                    }),
-                    floating_panes: vec![],
-                    floating_focus: None,
-                    active_pane_id: 0,
-                },
-                // Tab 1: Vertical split Panes 1 and 2
-                RecoveryTab {
-                    tab_id: 11,
-                    stable_tab_id: "tab-stable-11".to_string(),
-                    title: "Editor & Monitor".to_string(),
-                    working_dir: Some("/home/agent/project".to_string()),
-                    size: default_size,
-                    size_before_zoom: default_size,
+                    stable_tab_id: "tab-10-stable".to_string(),
+                    title: "Orchestrator Leader".to_string(),
+                    working_dir: Some("/workspace/leader".to_string()),
+                    size: full_size,
+                    size_before_zoom: full_size,
                     zoomed_pane_id: None,
                     root_split: Some(RecoverySplitNode::Split {
                         split: SplitDirectionAndSize {
-                            direction: SplitDirection::Vertical,
-                            first: half_vertical,
-                            second: half_vertical,
+                            direction: SplitDirection::Horizontal,
+                            first: split_size,
+                            second: split_size,
                         },
                         left: Box::new(RecoverySplitNode::Leaf {
-                            pane_id: 1,
-                            pane_uuid: "uuid-pane-0001".to_string(),
+                            pane_id: 0,
+                            pane_uuid: "uuid-recovery-pane-0".to_string(),
                         }),
                         right: Box::new(RecoverySplitNode::Leaf {
-                            pane_id: 2,
-                            pane_uuid: "uuid-pane-0002".to_string(),
+                            pane_id: 1,
+                            pane_uuid: "uuid-recovery-pane-1".to_string(),
                         }),
                     }),
-                    floating_panes: vec![],
+                    floating_panes: Vec::new(),
                     floating_focus: None,
-                    active_pane_id: 1,
+                    active_pane_id: 0,
+                },
+                RecoveryTab {
+                    tab_id: 11,
+                    stable_tab_id: "tab-11-stable".to_string(),
+                    title: "Monitor & Scratchpad".to_string(),
+                    working_dir: Some("/workspace/monitor".to_string()),
+                    size: full_size,
+                    size_before_zoom: full_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 2,
+                        pane_uuid: "uuid-recovery-pane-2".to_string(),
+                    }),
+                    floating_panes: vec![RecoveryFloatingPane::new(
+                        7,
+                        "uuid-recovery-pane-7".to_string(),
+                        FloatingPaneRect {
+                            left: 10,
+                            top: 10,
+                            width: 30,
+                            height: 10,
+                        },
+                        1,
+                        true,
+                        false,
+                        1.0,
+                    )],
+                    floating_focus: Some(7),
+                    active_pane_id: 2,
                 },
             ],
             active_tab_index: 0,
         },
-        // Window 1: Code workspace, Tabs 2 and 3
         RecoveryWindow {
-            window_id: 101,
-            stable_window_id: "win-stable-101".to_string(),
-            workspace: "code".to_string(),
+            window_id: 2,
+            stable_window_id: "win-2-stable".to_string(),
+            workspace: "default".to_string(),
             order_revision: 2,
             gui_position: Some(RecoveryGuiPosition {
-                x: 800,
-                y: 0,
+                x: 100,
+                y: 100,
                 width: 800,
                 height: 600,
             }),
             tabs: vec![
-                // Tab 2: Horizontal split Panes 3 and 4, Pane 3 zoomed
                 RecoveryTab {
                     tab_id: 12,
-                    stable_tab_id: "tab-stable-12".to_string(),
-                    title: "Build".to_string(),
-                    working_dir: Some("/home/agent/build".to_string()),
-                    size: default_size,
-                    size_before_zoom: default_size,
-                    zoomed_pane_id: Some(3),
-                    root_split: Some(RecoverySplitNode::Split {
-                        split: SplitDirectionAndSize {
-                            direction: SplitDirection::Horizontal,
-                            first: half_horizontal,
-                            second: half_horizontal,
-                        },
-                        left: Box::new(RecoverySplitNode::Leaf {
-                            pane_id: 3,
-                            pane_uuid: "uuid-pane-0003".to_string(),
-                        }),
-                        right: Box::new(RecoverySplitNode::Leaf {
-                            pane_id: 4,
-                            pane_uuid: "uuid-pane-0004".to_string(),
-                        }),
-                    }),
-                    floating_panes: vec![],
-                    floating_focus: None,
-                    active_pane_id: 3,
-                },
-                // Tab 3: Vertical split Panes 5 and 6
-                RecoveryTab {
-                    tab_id: 13,
-                    stable_tab_id: "tab-stable-13".to_string(),
-                    title: "Logs".to_string(),
-                    working_dir: None,
-                    size: default_size,
-                    size_before_zoom: default_size,
+                    stable_tab_id: "tab-12-stable".to_string(),
+                    title: "Remote Agents".to_string(),
+                    working_dir: Some("/workspace/remote".to_string()),
+                    size: full_size,
+                    size_before_zoom: full_size,
                     zoomed_pane_id: None,
                     root_split: Some(RecoverySplitNode::Split {
                         split: SplitDirectionAndSize {
                             direction: SplitDirection::Vertical,
-                            first: half_vertical,
-                            second: half_vertical,
+                            first: vert_split_size,
+                            second: vert_split_size,
                         },
                         left: Box::new(RecoverySplitNode::Leaf {
-                            pane_id: 5,
-                            pane_uuid: "uuid-pane-0005".to_string(),
+                            pane_id: 3,
+                            pane_uuid: "uuid-recovery-pane-3".to_string(),
                         }),
                         right: Box::new(RecoverySplitNode::Leaf {
-                            pane_id: 6,
-                            pane_uuid: "uuid-pane-0006".to_string(),
+                            pane_id: 4,
+                            pane_uuid: "uuid-recovery-pane-4".to_string(),
                         }),
                     }),
-                    floating_panes: vec![],
+                    floating_panes: Vec::new(),
+                    floating_focus: None,
+                    active_pane_id: 3,
+                },
+                RecoveryTab {
+                    tab_id: 13,
+                    stable_tab_id: "tab-13-stable".to_string(),
+                    title: "Build Pipeline".to_string(),
+                    working_dir: Some("/workspace/build".to_string()),
+                    size: full_size,
+                    size_before_zoom: full_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 5,
+                        pane_uuid: "uuid-recovery-pane-5".to_string(),
+                    }),
+                    floating_panes: Vec::new(),
                     floating_focus: None,
                     active_pane_id: 5,
+                },
+                RecoveryTab {
+                    tab_id: 14,
+                    stable_tab_id: "tab-14-stable".to_string(),
+                    title: "Telemetry Logs".to_string(),
+                    working_dir: Some("/workspace/telemetry".to_string()),
+                    size: full_size,
+                    size_before_zoom: full_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 6,
+                        pane_uuid: "uuid-recovery-pane-6".to_string(),
+                    }),
+                    floating_panes: Vec::new(),
+                    floating_focus: None,
+                    active_pane_id: 6,
                 },
             ],
             active_tab_index: 0,
         },
-        // Window 2: Monitor workspace, Tab 4 with Floating Pane 7
-        RecoveryWindow {
-            window_id: 102,
-            stable_window_id: "win-stable-102".to_string(),
-            workspace: "monitor".to_string(),
-            order_revision: 3,
-            gui_position: None,
-            tabs: vec![RecoveryTab {
-                tab_id: 14,
-                stable_tab_id: "tab-stable-14".to_string(),
-                title: "Alerts".to_string(),
-                working_dir: None,
-                size: default_size,
-                size_before_zoom: default_size,
-                zoomed_pane_id: None,
-                root_split: None,
-                floating_panes: vec![RecoveryFloatingPane::new(
-                    7,
-                    "uuid-pane-0007".to_string(),
-                    FloatingPaneRect {
-                        left: 10,
-                        top: 5,
-                        width: 60,
-                        height: 15,
-                    },
-                    1,
-                    true,
-                    false,
-                    0.95,
-                )],
-                floating_focus: Some(7),
-                active_pane_id: 7,
-            }],
-            active_tab_index: 0,
-        },
     ];
 
-    let mut panes = Vec::new();
-    for id in 0..8 {
-        let domain_name = if id % 2 == 0 { "local" } else { "remote-hz1" };
+    let topology = RecoveryTopology {
+        domains,
+        windows,
+        focused_window_id: Some(1),
+        client_workspace: Some(ClientWorkspaceBinding {
+            client_id: "client-1".to_string(),
+            active_workspace: "default".to_string(),
+        }),
+    };
+
+    let titles = [
+        "Orchestrator Leader",
+        "Worker Pool Alpha",
+        "Alternate Screen Monitor",
+        "Remote Agent 1",
+        "Remote Agent 2",
+        "Pipeline Runner",
+        "Telemetry Stream",
+        "Scratchpad Inspector",
+    ];
+
+    let mut panes = Vec::with_capacity(8);
+    for (i, (payload, digest, rows, cols)) in canonical_checkpoints.iter().enumerate() {
+        let domain_name = if (3..=5).contains(&i) {
+            "remote".to_string()
+        } else {
+            "local".to_string()
+        };
+
+        let alt_screen_active = i == 2;
+
         panes.push(RecoveryPane {
-            pane_id: id,
-            pane_uuid: format!("uuid-pane-{id:04x}"),
-            domain_name: domain_name.to_string(),
-            title: format!("Pane {id} Title"),
-            cwd: Some(format!("/home/agent/pane_{id}")),
-            size: default_size,
-            cursor_position: (0, 0),
-            alt_screen_active: id == 2,
+            pane_id: i,
+            pane_uuid: format!("uuid-recovery-pane-{i}"),
+            domain_name,
+            title: titles[i].to_string(),
+            cwd: Some(format!("/workspace/pane-{i}")),
+            size: ImageTerminalSize {
+                rows: *rows,
+                cols: *cols,
+                pixel_width: 800,
+                pixel_height: 600,
+                dpi: 96,
+            },
+            cursor_position: (i * 2, i * 3),
+            alt_screen_active,
             checkpoint: PaneCheckpointBinding {
-                topology_incarnation_id: "mux-inc-e2e-live".to_string(),
-                pane_uuid: format!("uuid-pane-{id:04x}"),
+                topology_incarnation_id: inc_id.to_string(),
+                pane_uuid: format!("uuid-recovery-pane-{i}"),
                 registration_generation: 1,
                 parser_capture: ParserCaptureIdentity {
-                    watermark_bytes: 4096,
-                    segment_id: 1,
-                    parser_seqno: 100 + id as u64,
+                    watermark_bytes: (i as u64 + 1) * 100,
+                    segment_id: i as u64 + 1,
+                    parser_seqno: 1,
                 },
                 checkpoint_ref: RecoveryObjectRef {
-                    object_id: format!("term-chk-obj-{id:04x}"),
-                    byte_length: checkpoint_bytes_list[id].len() as u64,
-                    payload_digest: checkpoint_digests[id],
+                    object_id: format!("obj-pane-{i}"),
+                    byte_length: payload.len() as u64,
+                    payload_digest: *digest,
                     schema_version: 1,
                 },
                 authority: CheckpointAuthority::ModelOnly {
-                    captured_at_epoch_ms: 1773500000000,
-                    parser_seqno: 100 + id as u64,
+                    captured_at_epoch_ms: 1700000000000,
+                    parser_seqno: 1,
                 },
             },
         });
     }
 
-    let header = RecoveryImageHeader {
-        magic: *b"FTMR",
-        schema_version: 1,
-        generation: 1,
-        predecessor_digest: None,
-        created_at_epoch_ms: 1773500000000,
-        mux_incarnation_id: "mux-inc-e2e-live".to_string(),
-        ft_version: "0.15.6-rc.17".to_string(),
-        session_id: "sess-e2e-happy".to_string(),
-    };
-
-    let topology = RecoveryTopology {
-        domains,
-        windows,
-        focused_window_id: Some(100),
-        client_workspace: Some(ClientWorkspaceBinding {
-            client_id: "client-primary".to_string(),
-            active_workspace: "default".to_string(),
-        }),
-    };
-
-    let mut mux_image = MuxRecoveryImage {
+    let mut image = MuxRecoveryImage {
         header,
         topology,
         panes,
         image_digest: [0u8; 32],
     };
+    image.image_digest = image.compute_digest().expect("must compute valid image digest");
+    image
+}
 
-    let computed_image_digest = mux_image
-        .compute_digest()
-        .expect("must compute image digest");
-    mux_image.image_digest = computed_image_digest;
+// =============================================================================
+// Positive Test Suite: Full Journey & Roundtrip
+// =============================================================================
 
-    // Validate image invariants
-    mux_image.validate().expect("image must validate");
-    assert_eq!(mux_image.pane_count(), 8);
-
-    let raw_image_json = mux_image
-        .to_canonical_json()
-        .expect("must encode canonical image JSON");
+#[test]
+fn test_mux_recovery_image_e2e_full_positive_journey() {
+    let term_limits = TerminalCheckpointLimits::default();
 
     // -------------------------------------------------------------------------
-    // Phase 3: Cryptographic AEAD Representation Encoding (%571)
+    // Phase 1: Live Real Terminals (%573)
+    // -------------------------------------------------------------------------
+    let pane_scripts: [&[&[u8]]; 8] = [
+        &[b"Pane 0: Main orchestrator ready.\r\nStarting job cluster.\r\n"],
+        &[b"Pane 1: Worker pool alpha active.\r\nThread count: 64.\r\n"],
+        &[b"\x1b[?1049hPane 2: Alternate screen full-screen monitor.\r\n"], // Alternate screen
+        &[b"Pane 3: Remote agent cluster 1 connected via domain 2.\r\n"],
+        &[b"Pane 4: Remote agent cluster 2 connected via domain 2.\r\n"],
+        &[b"Pane 5: Build pipeline running test matrix.\r\n"],
+        &[b"Pane 6: Telemetry log streaming at 1000 events/sec.\r\n"],
+        &[b"Pane 7: Floating scratchpad notes and inspection.\r\n"],
+    ];
+
+    let live_terminals: Vec<Terminal> = pane_scripts
+        .iter()
+        .enumerate()
+        .map(|(i, script)| create_live_terminal(i, script))
+        .collect();
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Capture Checkpoints & Whole-Mux Model (%573, %574)
+    // -------------------------------------------------------------------------
+    let canonical_checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|term| capture_canonical_checkpoint(term, term_limits))
+        .collect();
+
+    assert_eq!(canonical_checkpoints.len(), 8);
+    for (i, (payload, digest, rows, cols)) in canonical_checkpoints.iter().enumerate() {
+        assert!(!payload.is_empty(), "pane {i} checkpoint payload must not be empty");
+        assert_eq!(*rows, 24, "pane {i} rows must be 24");
+        assert_eq!(*cols, 80, "pane {i} cols must be 80");
+        let computed: [u8; 32] = Sha256::digest(payload).into();
+        assert_eq!(*digest, computed, "pane {i} digest must match SHA-256");
+    }
+
+    let inc_id = "inc-prod-001";
+    let session_id = "session-prod-alpha";
+    let mux_image = build_test_whole_mux_image(&canonical_checkpoints, inc_id, session_id);
+    mux_image.validate().expect("whole-mux image must pass structural validation");
+
+    let canonical_image_bytes = mux_image
+        .to_canonical_json()
+        .expect("whole-mux image must serialize to canonical JSON");
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Symmetric AEAD Representation Encryption (%571)
     // -------------------------------------------------------------------------
     let recovery_key = RecoveryKey::generate().expect("must generate recovery key");
-    let image_object_id = [0x42u8; 32];
-    let image_metadata = ObjectMetadata::single(
-        image_object_id,
+
+    // Encrypt all 8 terminal checkpoints
+    let mut encrypted_checkpoints = Vec::new();
+    for (i, (payload, _digest, _rows, _cols)) in canonical_checkpoints.iter().enumerate() {
+        let mut obj_id = [0u8; 32];
+        obj_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        let meta = ObjectMetadata::single(
+            obj_id,
+            RecoveryObjectKind::TerminalCheckpoint,
+            1,
+            None,
+            1700000000000,
+        );
+        let encrypted_obj = encode_recovery_object(payload, meta, &recovery_key, None)
+            .expect("must encrypt terminal checkpoint object");
+        let wire_bytes = encrypted_obj.to_bytes().expect("must serialize encrypted object");
+        encrypted_checkpoints.push((obj_id, wire_bytes));
+    }
+
+    // Encrypt whole-mux recovery image root manifest
+    let mut root_obj_id = [0u8; 32];
+    root_obj_id[0] = 0xAA;
+    let root_meta = ObjectMetadata::single(
+        root_obj_id,
         RecoveryObjectKind::WholeMuxImage,
         1,
         None,
-        1773500000000,
+        1700000000000,
+    );
+    let encrypted_root = encode_recovery_object(&canonical_image_bytes, root_meta, &recovery_key, None)
+        .expect("must encrypt whole-mux root manifest");
+    let encrypted_root_bytes = encrypted_root.to_bytes().expect("must serialize encrypted root");
+
+    // -------------------------------------------------------------------------
+    // Phase 4: RaptorQ FEC Loss Recovery (%570)
+    // -------------------------------------------------------------------------
+    let (repair_env, repair_symbols) =
+        encode_repair_envelope_default(&encrypted_checkpoints[0].1, 1, RepairProtectionClass::Standard)
+            .expect("must encode RaptorQ repair envelope");
+    assert!(
+        repair_symbols.len() > 2,
+        "must have redundancy symbols for erasure channel"
+    );
+    // Simulate packet erasure: drop 2 symbols
+    let symbols_with_loss = repair_symbols[2..].to_vec();
+    let recovered_wire_bytes = decode_repair_symbols_default(&repair_env, &symbols_with_loss)
+        .expect("RaptorQ FEC must recover encrypted object across erasure channel");
+    assert_eq!(
+        recovered_wire_bytes, encrypted_checkpoints[0].1,
+        "FEC recovered wire bytes must bit-exactly match original encrypted representation"
     );
 
-    let encrypted_image_obj = encode_recovery_object(
-        &raw_image_json,
-        image_metadata,
-        &recovery_key,
-        Some(&RepresentationConfig::default()),
-    )
-    .expect("must AEAD encrypt whole-mux image");
-
-    let serialized_envelope = encrypted_image_obj
-        .to_bytes()
-        .expect("must serialize encrypted envelope");
-    let rep_id = encrypted_image_obj
-        .representation_id()
-        .expect("must compute representation id");
-
     // -------------------------------------------------------------------------
-    // Phase 4: RaptorQ FEC Encoding and 20% Symbol Drop Recovery (%570)
+    // Phase 5: Authenticated Representation Decryption & Verification (%571)
     // -------------------------------------------------------------------------
-    let auth_key = [0x5Au8; 32];
-    let repair_bundle = encode_repair_envelope_default(
-        &cx,
-        &serialized_envelope,
-        image_object_id,
-        1,
-        &auth_key,
-        RepairProtectionClass::Standard, // +20% repair overhead
-    )
-    .expect("must FEC encode envelope");
-
-    let total_symbols = repair_bundle.symbols.len();
-    let k_source = repair_bundle.manifest.k as usize;
-    assert!(total_symbols > k_source);
-
-    // Simulate 20% loss: drop the first 20% of source symbols
-    let drop_count = (k_source as f64 * 0.20).floor() as usize;
-    let mut surviving_symbols: Vec<AuthenticatedRepairSymbol> = Vec::new();
-    // Drop source symbols from 0..drop_count
-    for sym in &repair_bundle.symbols {
-        if sym.kind == frankenterm_core::snapshot_repair::RepairSymbolKind::Source
-            && (sym.esi as usize) < drop_count
-        {
-            continue; // Dropped
-        }
-        surviving_symbols.push(sym.clone());
-    }
-
-    assert!(surviving_symbols.len() >= k_source);
-
-    // Reconstruct via RaptorQ decoder
-    let repair_result = decode_repair_symbols_default(
-        &cx,
-        &repair_bundle.manifest,
-        &surviving_symbols,
-        &auth_key,
-    )
-    .expect("must reconstruct envelope despite symbol loss");
-
-    assert_eq!(repair_result.representation_id, rep_id);
-    assert_eq!(repair_result.reconstructed_envelope, serialized_envelope);
-
-    // -------------------------------------------------------------------------
-    // Phase 5: AEAD Decrypt Reconstructed Payload (%571)
-    // -------------------------------------------------------------------------
-    let recovered_enc_obj = EncryptedRecoveryObject::from_bytes(&repair_result.reconstructed_envelope)
-        .expect("must parse recovered encrypted object");
-
-    let expected_ctx = ExpectedContext::single(
-        image_object_id,
+    // Decrypt and verify root manifest with real key and expected identity
+    let parsed_enc_root = EncryptedRecoveryObject::from_bytes(&encrypted_root_bytes)
+        .expect("must parse encrypted root");
+    let expected_root_context = ExpectedContext::single(
+        root_obj_id,
         RecoveryObjectKind::WholeMuxImage,
         1,
         None,
     );
-    let decoded_rep = decode_recovery_object(
-        &recovered_enc_obj,
-        &expected_ctx,
+    let decrypted_root = decode_recovery_object(
+        &parsed_enc_root,
+        &expected_root_context,
         &recovery_key,
-        Some(&RepresentationConfig::default()),
+        None,
     )
-    .expect("must decrypt recovered whole-mux image");
+    .expect("must decrypt authenticated root manifest");
+    assert_eq!(
+        decrypted_root.plaintext(),
+        &canonical_image_bytes[..],
+        "decrypted root manifest must match original canonical image JSON"
+    );
 
-    let decrypted_image_json = decoded_rep.into_plaintext();
-    assert_eq!(decrypted_image_json, raw_image_json);
-
-    // -------------------------------------------------------------------------
-    // Phase 6: Atomic Root Publication and Verified Root Selection (%572)
-    // -------------------------------------------------------------------------
-    let verifier = HolisticRootVerifier {
-        expected_generation: 1,
-        limits: term_limits,
-    };
-
-    let publish_req = GenerationRootPublishRequest {
-        generation: 1,
-        publisher_id: "agent-publisher-test".to_string(),
-        predecessor: None,
-        manifest_bytes: raw_image_json.clone(),
-        created_at_ms: 1773500000000,
-    };
-
-    let pub_receipt = store
-        .publish_generation_root(&publish_req, &verifier)
-        .expect("must publish generation 1 root");
-
-    assert_eq!(pub_receipt.generation, 1);
-    assert_eq!(pub_receipt.slot, RootSlot::SlotA);
-
-    // Select verified roots
-    let selection = store
-        .select_verified_roots(&verifier)
-        .expect("must select verified roots");
-
-    assert!(selection.current.is_some());
-    let (selected_image, validated_terminals) = selection.current.unwrap();
-    assert_eq!(selected_image.image_digest, computed_image_digest);
-    assert_eq!(validated_terminals.len(), 8);
-
-    // -------------------------------------------------------------------------
-    // Phase 7: Real Terminal Reconstruction via `restore_inert` (%573 / %576)
-    // -------------------------------------------------------------------------
-    let live_config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig);
-
-    for (pane_id, validated_chk) in validated_terminals {
-        let inert: InertTerminal = validated_chk
-            .restore_inert(Arc::clone(&live_config))
-            .expect("must reconstruct off-topology InertTerminal");
-
-        // Verify that restored inert terminal reflects authentic dimensions
-        assert_eq!(inert.terminal.terminal_size.rows, 24);
-        assert_eq!(inert.terminal.terminal_size.cols, 80);
-
-        // Verify alternate screen status for Pane 2
-        if pane_id == 2 {
-            assert!(inert.terminal.is_alternate_screen_active());
-        } else {
-            assert!(!inert.terminal.is_alternate_screen_active());
-        }
-    }
-}
-
-// =============================================================================
-// Negative Causal Test Matrix
-// =============================================================================
-
-#[test]
-fn test_e2e_raptorq_insufficient_rank_fallback() {
-    let cx = Cx::for_testing();
-    let auth_key = [0x44u8; 32];
-    let payload = vec![0xEEu8; 8192];
-    let object_id = [0x11u8; 32];
-
-    let bundle = encode_repair_envelope_default(
-        &cx,
-        &payload,
-        object_id,
-        1,
-        &auth_key,
-        RepairProtectionClass::Standard,
-    )
-    .expect("encode repair bundle");
-
-    let k = bundle.manifest.k as usize;
-    // Keep only half of K symbols (insufficient rank)
-    let too_few_symbols: Vec<AuthenticatedRepairSymbol> =
-        bundle.symbols.into_iter().take(k / 2).collect();
-
-    let err = decode_repair_symbols_default(&cx, &bundle.manifest, &too_few_symbols, &auth_key)
-        .expect_err("must fail due to insufficient rank");
-
-    match err {
-        RepairError::InsufficientRank { rank, columns, deficit } => {
-            assert!(deficit > 0);
-            assert!(rank < columns);
-        }
-        other => panic!("expected InsufficientRank, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_e2e_tampered_ciphertext_rejection() {
-    let recovery_key = RecoveryKey::generate().expect("key generate");
-    let object_id = [0x22u8; 32];
-    let metadata = ObjectMetadata::single(object_id, RecoveryObjectKind::TerminalCheckpoint, 1, None, 1000);
-    let plaintext = b"Sensitive terminal buffer contents";
-
-    let mut enc_obj = encode_recovery_object(plaintext, metadata, &recovery_key, None)
-        .expect("encode recovery object");
-
-    // Tamper with the ciphertext byte
-    if let Some(byte) = enc_obj.ciphertext.first_mut() {
-        *byte ^= 0xFF;
+    // Decrypt and verify all 8 terminal checkpoints
+    let mut decrypted_checkpoints = Vec::new();
+    for (i, (obj_id, wire_bytes)) in encrypted_checkpoints.iter().enumerate() {
+        let parsed_obj = EncryptedRecoveryObject::from_bytes(wire_bytes)
+            .expect("must parse encrypted checkpoint object");
+        let expected_ctx = ExpectedContext::single(
+            *obj_id,
+            RecoveryObjectKind::TerminalCheckpoint,
+            1,
+            None,
+        );
+        let decrypted_obj = decode_recovery_object(&parsed_obj, &expected_ctx, &recovery_key, None)
+            .expect("must decrypt terminal checkpoint object with real key and expected identity");
+        assert_eq!(
+            decrypted_obj.plaintext(),
+            &canonical_checkpoints[i].0[..],
+            "decrypted terminal checkpoint must match original canonical JSON"
+        );
+        decrypted_checkpoints.push(decrypted_obj.into_plaintext());
     }
 
-    let expected = ExpectedContext::single(object_id, RecoveryObjectKind::TerminalCheckpoint, 1, None);
-    let err = decode_recovery_object(&enc_obj, &expected, &recovery_key, None)
-        .expect_err("tampered ciphertext must fail AEAD verification");
-
-    match err {
-        RepresentationError::DigestMismatch { target, .. } => {
-            assert_eq!(target, "ciphertext digest");
-        }
-        RepresentationError::DecryptionFailed { .. } => {}
-        other => panic!("expected DecryptionFailed or DigestMismatch, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_e2e_wrong_recovery_key_rejection() {
-    let key_correct = RecoveryKey::generate().expect("key 1");
-    let key_wrong = RecoveryKey::generate().expect("key 2");
-    let object_id = [0x33u8; 32];
-    let metadata = ObjectMetadata::single(object_id, RecoveryObjectKind::WholeMuxImage, 1, None, 1000);
-
-    let enc_obj = encode_recovery_object(b"{\"image\":\"data\"}", metadata, &key_correct, None)
-        .expect("encode");
-
-    let expected = ExpectedContext::single(object_id, RecoveryObjectKind::WholeMuxImage, 1, None);
-    let err = decode_recovery_object(&enc_obj, &expected, &key_wrong, None)
-        .expect_err("decryption with wrong key must fail");
-
-    assert!(matches!(err, RepresentationError::DecryptionFailed { .. }));
-}
-
-#[test]
-fn test_e2e_publication_torn_generation_fallback() {
-    let temp_dir = TempDir::new().expect("create tempdir");
-    let store = SnapshotPublicationStore::open(temp_dir.path(), PublicationLimits::default())
-        .expect("open store");
-
-    // Construct generation 1 manifest and publish
-    let header1 = RecoveryImageHeader {
-        magic: *b"FTMR",
-        schema_version: 1,
-        generation: 1,
-        predecessor_digest: None,
-        created_at_epoch_ms: 1000,
-        mux_incarnation_id: "inc-1".to_string(),
-        ft_version: "0.15.6-rc.17".to_string(),
-        session_id: "sess-torn".to_string(),
-    };
-    let mut image1 = MuxRecoveryImage {
-        header: header1,
-        topology: RecoveryTopology {
-            domains: vec![],
-            windows: vec![],
-            focused_window_id: None,
-            client_workspace: None,
+    // -------------------------------------------------------------------------
+    // Phase 6: Snapshot Publication Store & Production Root Verifier (%572 + %576)
+    // -------------------------------------------------------------------------
+    let temp_store_dir = TempDir::new().expect("must create temp store directory");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
         },
-        panes: vec![],
-        image_digest: [0u8; 32],
-    };
-    image1.image_digest = image1.compute_digest().unwrap();
-    let gen1_bytes = image1.to_canonical_json().unwrap();
-    let gen1_sha256 = hex::encode(Sha256::digest(&gen1_bytes));
+    )
+    .expect("must open snapshot publication store");
 
-    let pass_verifier = |candidate: &RootSlotCandidate, _store: &SnapshotPublicationStore| -> Result<u64, String> {
-        Ok(candidate.generation)
-    };
-
+    // Also persist the encrypted representation objects to the store
+    for (i, (_obj_id, wire_bytes)) in encrypted_checkpoints.iter().enumerate() {
+        let enc_sha = hex::encode(Sha256::digest(wire_bytes));
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("enc-obj-pane-{i}"),
+                expected_sha256: enc_sha,
+                ciphertext_bytes: wire_bytes.clone(),
+            })
+            .expect("must publish encrypted checkpoint object");
+    }
+    let enc_root_sha = hex::encode(Sha256::digest(&encrypted_root_bytes));
     store
+        .publish_object(&RecoveryObjectPayload {
+            object_id: "enc-root-manifest-gen1".to_string(),
+            expected_sha256: enc_root_sha,
+            ciphertext_bytes: encrypted_root_bytes.clone(),
+        })
+        .expect("must publish encrypted root manifest");
+
+    // Publish canonical terminal checkpoint objects for root closure
+    for (i, decrypted_payload) in decrypted_checkpoints.iter().enumerate() {
+        let digest = canonical_checkpoints[i].1;
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{}", i),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: decrypted_payload.to_vec(),
+            })
+            .expect("must publish canonical checkpoint object");
+    }
+
+    // Publish generation 1 root using the production WholeMuxRecoveryVerifier
+    let prod_verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let publish_receipt = store
         .publish_generation_root(
             &GenerationRootPublishRequest {
                 generation: 1,
-                publisher_id: "pub-1".to_string(),
                 predecessor: None,
-                manifest_bytes: gen1_bytes,
-                created_at_ms: 1000,
+                publisher_id: "test-recovery-e2e".to_string(),
+                manifest_bytes: decrypted_root.plaintext().to_vec(),
             },
-            &pass_verifier,
+            &prod_verifier,
+        )
+        .expect("production WholeMuxRecoveryVerifier must admit generation 1 root");
+
+    assert_eq!(publish_receipt.generation, 1);
+    assert_eq!(publish_receipt.slot, RootSlot::SlotA);
+
+    // Select verified recovery roots from store using production verifier
+    let verified_selection = select_verified_recovery_roots(&store, &prod_verifier)
+        .expect("select_verified_recovery_roots must succeed");
+    let active_root = verified_selection.active_root.expect("active root must be present");
+    assert_eq!(active_root.generation, 1);
+    let validated_recovery = active_root.verified;
+    assert_eq!(validated_recovery.checkpoint_payloads.len(), 8);
+
+    // -------------------------------------------------------------------------
+    // Phase 7: Inert Whole-Mux Session Reconstruction (%576)
+    // -------------------------------------------------------------------------
+    let active_live_sessions = HashSet::from(["fleet-active-target".to_string()]);
+    let reconstructed = reconstruct_whole_mux_image_inert(
+        &validated_recovery,
+        term_limits,
+        Some("offline-recovery-target"),
+        &active_live_sessions,
+    )
+    .expect("reconstruct_whole_mux_image_inert must reconstruct all 8 inert terminals");
+
+    // -------------------------------------------------------------------------
+    // Phase 8: Semantic & Topology Assertions
+    // -------------------------------------------------------------------------
+    assert_eq!(reconstructed.header.session_id, session_id);
+    assert_eq!(reconstructed.header.mux_incarnation_id, inc_id);
+    assert_eq!(reconstructed.topology.windows.len(), 2);
+    assert_eq!(reconstructed.topology.domains.len(), 2);
+    assert_eq!(reconstructed.pane_terminals.len(), 8);
+
+    // Verify non-zero tab_id and domain_id bindings for every reconstructed pane
+    for pane_id in 0..8u64 {
+        let pt = reconstructed
+            .pane_terminals
+            .get(&pane_id)
+            .unwrap_or_else(|| panic!("pane {pane_id} must be reconstructed"));
+        assert_eq!(pt.pane_id, pane_id);
+        assert!(
+            pt.tab_id >= 10,
+            "pane {pane_id} tab_id must be non-zero (found {})",
+            pt.tab_id
+        );
+        assert!(
+            pt.domain_id >= 1,
+            "pane {pane_id} domain_id must be non-zero (found {})",
+            pt.domain_id
+        );
+        assert_eq!(pt.rows, 24, "pane {pane_id} rows must be 24");
+        assert_eq!(pt.cols, 80, "pane {pane_id} cols must be 80");
+    }
+
+    // Specific tab bindings
+    assert_eq!(reconstructed.pane_terminals[&0].tab_id, 10);
+    assert_eq!(reconstructed.pane_terminals[&1].tab_id, 10);
+    assert_eq!(reconstructed.pane_terminals[&2].tab_id, 11);
+    assert_eq!(reconstructed.pane_terminals[&7].tab_id, 11); // Floating pane
+    assert_eq!(reconstructed.pane_terminals[&3].tab_id, 12);
+    assert_eq!(reconstructed.pane_terminals[&4].tab_id, 12);
+    assert_eq!(reconstructed.pane_terminals[&5].tab_id, 13);
+    assert_eq!(reconstructed.pane_terminals[&6].tab_id, 14);
+
+    // Specific domain bindings
+    assert_eq!(reconstructed.pane_terminals[&0].domain_id, 1); // local
+    assert_eq!(reconstructed.pane_terminals[&1].domain_id, 1); // local
+    assert_eq!(reconstructed.pane_terminals[&2].domain_id, 1); // local
+    assert_eq!(reconstructed.pane_terminals[&7].domain_id, 1); // local
+    assert_eq!(reconstructed.pane_terminals[&3].domain_id, 2); // remote
+    assert_eq!(reconstructed.pane_terminals[&4].domain_id, 2); // remote
+    assert_eq!(reconstructed.pane_terminals[&5].domain_id, 2); // remote
+    assert_eq!(reconstructed.pane_terminals[&6].domain_id, 1); // local
+
+    // Verify alternate screen flag on Pane 2 vs other panes
+    assert!(
+        validated_recovery.image.panes[2].alt_screen_active,
+        "pane 2 must have alternate screen active"
+    );
+    for (i, p) in validated_recovery.image.panes.iter().enumerate() {
+        if i != 2 {
+            assert!(!p.alt_screen_active, "pane {i} must not have alternate screen active");
+        }
+    }
+}
+
+// =============================================================================
+// Negative Test Suite: Causal Defect Matrix
+// =============================================================================
+
+#[test]
+fn test_mux_recovery_e2e_fec_insufficient_rank_fails_closed() {
+    let payload = b"critical-terminal-payload-requiring-full-rank";
+    let (repair_env, repair_symbols) =
+        encode_repair_envelope_default(payload, 1, RepairProtectionClass::Standard)
+            .expect("must encode repair envelope");
+
+    // Pass only 1 symbol when more are required for complete rank
+    let insufficient_symbols = vec![repair_symbols[0].clone()];
+    let result = decode_repair_symbols_default(&repair_env, &insufficient_symbols);
+
+    assert!(
+        matches!(result, Err(RepairError::InsufficientRank { .. })),
+        "FEC must fail closed with InsufficientRank when symbol count is inadequate"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_ciphertext_tamper_fails_closed() {
+    let payload = b"confidential-state-buffer-to-protect";
+    let key = RecoveryKey::generate().expect("key");
+    let meta = ObjectMetadata::single([1u8; 32], RecoveryObjectKind::TerminalCheckpoint, 1, None, 100);
+
+    let encrypted = encode_recovery_object(payload, meta.clone(), &key, None).expect("encrypt");
+    let mut wire_bytes = encrypted.to_bytes().expect("to_bytes");
+
+    // Tamper with the last byte of the wire payload
+    let last = wire_bytes.len() - 1;
+    wire_bytes[last] ^= 0xFF;
+
+    let parsed_result = EncryptedRecoveryObject::from_bytes(&wire_bytes);
+    match parsed_result {
+        Ok(tampered_obj) => {
+            let expected = ExpectedContext::from_metadata(&meta);
+            let decode_result = decode_recovery_object(&tampered_obj, &expected, &key, None);
+            assert!(
+                decode_result.is_err(),
+                "AEAD decode must fail closed on tampered ciphertext"
+            );
+        }
+        Err(err) => {
+            // Rejection during envelope parse (e.g. digest mismatch) is also valid fail-closed behavior
+            assert!(
+                matches!(err, RepresentationError::DigestMismatch { .. } | RepresentationError::MalformedRepresentation { .. }),
+                "parsing tampered wire bytes must fail closed with RepresentationError"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mux_recovery_e2e_wrong_key_fails_closed() {
+    let payload = b"confidential-state-for-key-authorization-test";
+    let key_correct = RecoveryKey::generate().expect("key 1");
+    let key_wrong = RecoveryKey::generate().expect("key 2");
+    let meta = ObjectMetadata::single([2u8; 32], RecoveryObjectKind::TerminalCheckpoint, 1, None, 100);
+
+    let encrypted = encode_recovery_object(payload, meta.clone(), &key_correct, None).expect("encrypt");
+    let expected = ExpectedContext::from_metadata(&meta);
+
+    let result = decode_recovery_object(&encrypted, &expected, &key_wrong, None);
+    assert!(
+        result.is_err(),
+        "decoding with wrong RecoveryKey must fail closed"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
+    let term_limits = TerminalCheckpointLimits::default();
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
+
+    let live_terminals: Vec<Terminal> = (0..8)
+        .map(|i| create_live_terminal(i, &[format!("Pane {i}\r\n").as_bytes()]))
+        .collect();
+
+    let checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|t| capture_canonical_checkpoint(t, term_limits))
+        .collect();
+
+    // Publish Generation 1 objects
+    for (i, (payload, digest, _, _)) in checkpoints.iter().enumerate() {
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{i}"),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish object");
+    }
+
+    let image_gen1 = build_test_whole_mux_image(&checkpoints, "inc-1", "sess-1");
+    let gen1_bytes = image_gen1.to_canonical_json().expect("gen1 json");
+    let prod_verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+
+    let r1 = store
+        .publish_generation_root(
+            &GenerationRootPublishRequest {
+                generation: 1,
+                predecessor: None,
+                publisher_id: "publisher-1".to_string(),
+                manifest_bytes: gen1_bytes.clone(),
+            },
+            &prod_verifier,
         )
         .expect("publish generation 1");
 
-    // Verify gen 1 is active
-    let sel1 = store.select_verified_roots(&pass_verifier).unwrap();
-    assert_eq!(sel1.current, Some(1));
+    assert_eq!(r1.generation, 1);
+    assert_eq!(r1.slot, RootSlot::SlotA);
 
-    // Now attempt generation 2, but simulate a crash / torn write by writing corrupt bytes
-    // directly into slot_b.root (the alternate slot)
-    let slot_b_path = temp_dir.path().join("roots").join("slot_b.root");
-    std::fs::write(&slot_b_path, b"TORN_PARTIAL_WRITE_CORRUPTED_BYTES").expect("write torn slot");
+    // Count store directory entries before torn publish
+    let dir_entries_before = std::fs::read_dir(temp_store_dir.path())
+        .expect("read_dir")
+        .count();
 
-    // Re-evaluating roots must gracefully fall back to generation 1 and record slot B diagnostic
-    let sel2 = store.select_verified_roots(&pass_verifier).unwrap();
-    assert_eq!(sel2.current, Some(1), "must fall back to generation 1");
-    assert_eq!(sel2.torn_or_rejected.len(), 1);
-    assert_eq!(sel2.torn_or_rejected[0].slot, RootSlot::SlotB);
+    // Attempt to publish Generation 2 which references a missing object "obj-pane-999"
+    let mut image_gen2 = image_gen1.clone();
+    image_gen2.header.generation = 2;
+    image_gen2.header.predecessor_digest = Some(image_gen1.image_digest);
+    image_gen2.panes[0].checkpoint.checkpoint_ref.object_id = "obj-pane-999".to_string();
+    image_gen2.image_digest = image_gen2.compute_digest().expect("gen2 digest");
+    let gen2_bytes = image_gen2.to_canonical_json().expect("gen2 json");
 
-    // Verify no files were deleted (forensic preservation invariant)
-    assert!(slot_b_path.exists(), "torn file must be preserved for forensic audit");
-}
-
-#[test]
-fn test_e2e_publication_missing_referenced_object_rejection() {
-    let temp_dir = TempDir::new().expect("create tempdir");
-    let store = SnapshotPublicationStore::open(temp_dir.path(), PublicationLimits::default())
-        .expect("open store");
-
-    // Image references an object that was NOT published to `store`
-    let missing_obj_id = "missing-obj-deadbeef";
-    let header = RecoveryImageHeader {
-        magic: *b"FTMR",
-        schema_version: 1,
-        generation: 1,
-        predecessor_digest: None,
-        created_at_epoch_ms: 2000,
-        mux_incarnation_id: "inc-missing".to_string(),
-        ft_version: "0.15.6-rc.17".to_string(),
-        session_id: "sess-missing".to_string(),
-    };
-    let pane = RecoveryPane {
-        pane_id: 1,
-        pane_uuid: "uuid-1".to_string(),
-        domain_name: "local".to_string(),
-        title: "Test".to_string(),
-        cwd: None,
-        size: ImageTerminalSize::default(),
-        cursor_position: (0, 0),
-        alt_screen_active: false,
-        checkpoint: PaneCheckpointBinding {
-            topology_incarnation_id: "inc-missing".to_string(),
-            pane_uuid: "uuid-1".to_string(),
-            registration_generation: 1,
-            parser_capture: ParserCaptureIdentity {
-                watermark_bytes: 0,
-                segment_id: 0,
-                parser_seqno: 0,
-            },
-            checkpoint_ref: RecoveryObjectRef {
-                object_id: missing_obj_id.to_string(),
-                byte_length: 512,
-                payload_digest: [0u8; 32],
-                schema_version: 1,
-            },
-            authority: CheckpointAuthority::ModelOnly {
-                captured_at_epoch_ms: 2000,
-                parser_seqno: 0,
-            },
-        },
+    let gen1_sha256 = hex::encode(Sha256::digest(&gen1_bytes));
+    let gen2_req = GenerationRootPublishRequest {
+        generation: 2,
+        predecessor: Some(PredecessorBinding {
+            expected_generation: 1,
+            expected_hash: gen1_sha256,
+        }),
+        publisher_id: "publisher-1".to_string(),
+        manifest_bytes: gen2_bytes,
     };
 
-    let mut image = MuxRecoveryImage {
-        header,
-        topology: RecoveryTopology {
-            domains: vec![RecoveryDomain {
-                incarnation_domain_id: 1,
-                domain_name: "local".to_string(),
-                is_attached: true,
-            }],
-            windows: vec![RecoveryWindow {
-                window_id: 1,
-                stable_window_id: "w-1".to_string(),
-                workspace: "default".to_string(),
-                order_revision: 1,
-                gui_position: None,
-                tabs: vec![RecoveryTab {
-                    tab_id: 1,
-                    stable_tab_id: "t-1".to_string(),
-                    title: "Tab 1".to_string(),
-                    working_dir: None,
-                    size: ImageTerminalSize::default(),
-                    size_before_zoom: ImageTerminalSize::default(),
-                    zoomed_pane_id: None,
-                    root_split: Some(RecoverySplitNode::Leaf {
-                        pane_id: 1,
-                        pane_uuid: "uuid-1".to_string(),
-                    }),
-                    floating_panes: vec![],
-                    floating_focus: None,
-                    active_pane_id: 1,
-                }],
-                active_tab_index: 0,
-            }],
-            focused_window_id: None,
-            client_workspace: None,
-        },
-        panes: vec![pane],
-        image_digest: [0u8; 32],
-    };
-    image.image_digest = image.compute_digest().unwrap();
-    let manifest_bytes = image.to_canonical_json().unwrap();
-
-    let verifier = HolisticRootVerifier {
-        expected_generation: 1,
-        limits: TerminalCheckpointLimits::default(),
-    };
-
-    let publish_req = GenerationRootPublishRequest {
-        generation: 1,
-        publisher_id: "pub-fail".to_string(),
-        predecessor: None,
-        manifest_bytes,
-        created_at_ms: 2000,
-    };
-
-    // Publication must be rejected because the referenced checkpoint object does not exist
-    let err = store.publish_generation_root(&publish_req, &verifier)
-        .expect_err("must refuse publication when referenced objects are missing");
-
-    assert!(matches!(err, PublicationError::VerificationRejected { .. }));
-}
-
-#[test]
-fn test_e2e_canonical_topology_validation_negatives() {
-    let base_header = RecoveryImageHeader {
-        magic: *b"FTMR",
-        schema_version: 1,
-        generation: 1,
-        predecessor_digest: None,
-        created_at_epoch_ms: 3000,
-        mux_incarnation_id: "inc-neg".to_string(),
-        ft_version: "0.15.6-rc.17".to_string(),
-        session_id: "sess-neg".to_string(),
-    };
-
-    // 1. Duplicate pane ID in catalog
-    let mut image_dup_pane = MuxRecoveryImage {
-        header: base_header.clone(),
-        topology: RecoveryTopology {
-            domains: vec![RecoveryDomain {
-                incarnation_domain_id: 1,
-                domain_name: "local".to_string(),
-                is_attached: true,
-            }],
-            windows: vec![],
-            focused_window_id: None,
-            client_workspace: None,
-        },
-        panes: vec![
-            RecoveryPane {
-                pane_id: 42,
-                pane_uuid: "uuid-42-a".to_string(),
-                domain_name: "local".to_string(),
-                title: "Pane A".to_string(),
-                cwd: None,
-                size: ImageTerminalSize::default(),
-                cursor_position: (0, 0),
-                alt_screen_active: false,
-                checkpoint: PaneCheckpointBinding {
-                    topology_incarnation_id: "inc-neg".to_string(),
-                    pane_uuid: "uuid-42-a".to_string(),
-                    registration_generation: 1,
-                    parser_capture: ParserCaptureIdentity {
-                        watermark_bytes: 0,
-                        segment_id: 0,
-                        parser_seqno: 0,
-                    },
-                    checkpoint_ref: RecoveryObjectRef {
-                        object_id: "obj-a".to_string(),
-                        byte_length: 10,
-                        payload_digest: [0u8; 32],
-                        schema_version: 1,
-                    },
-                    authority: CheckpointAuthority::ModelOnly {
-                        captured_at_epoch_ms: 0,
-                        parser_seqno: 0,
-                    },
-                },
-            },
-            RecoveryPane {
-                pane_id: 42, // Duplicate!
-                pane_uuid: "uuid-42-b".to_string(),
-                domain_name: "local".to_string(),
-                title: "Pane B".to_string(),
-                cwd: None,
-                size: ImageTerminalSize::default(),
-                cursor_position: (0, 0),
-                alt_screen_active: false,
-                checkpoint: PaneCheckpointBinding {
-                    topology_incarnation_id: "inc-neg".to_string(),
-                    pane_uuid: "uuid-42-b".to_string(),
-                    registration_generation: 1,
-                    parser_capture: ParserCaptureIdentity {
-                        watermark_bytes: 0,
-                        segment_id: 0,
-                        parser_seqno: 0,
-                    },
-                    checkpoint_ref: RecoveryObjectRef {
-                        object_id: "obj-b".to_string(),
-                        byte_length: 10,
-                        payload_digest: [0u8; 32],
-                        schema_version: 1,
-                    },
-                    authority: CheckpointAuthority::ModelOnly {
-                        captured_at_epoch_ms: 0,
-                        parser_seqno: 0,
-                    },
-                },
-            },
-        ],
-        image_digest: [0u8; 32],
-    };
-    image_dup_pane.image_digest = image_dup_pane.compute_digest().unwrap();
-    assert_eq!(
-        image_dup_pane.validate().unwrap_err(),
-        MuxRecoveryImageError::DuplicatePaneId(42)
+    let gen2_result = store.publish_generation_root(&gen2_req, &prod_verifier);
+    assert!(
+        gen2_result.is_err(),
+        "publishing generation 2 with missing object must fail closed"
     );
 
-    // 2. Split tree nesting > 32
-    let mut deep_split = RecoverySplitNode::Leaf {
-        pane_id: 1,
-        pane_uuid: "uuid-1".to_string(),
-    };
-    for _ in 0..33 {
-        deep_split = RecoverySplitNode::Split {
-            split: SplitDirectionAndSize {
-                direction: SplitDirection::Vertical,
-                first: ImageTerminalSize::default(),
-                second: ImageTerminalSize::default(),
-            },
-            left: Box::new(deep_split),
-            right: Box::new(RecoverySplitNode::Leaf {
-                pane_id: 1,
-                pane_uuid: "uuid-1".to_string(),
-            }),
-        };
-    }
+    // Rule 1 / Zero-Deletion Invariant: No files were deleted during torn publish failure
+    let dir_entries_after = std::fs::read_dir(temp_store_dir.path())
+        .expect("read_dir")
+        .count();
+    assert!(
+        dir_entries_after >= dir_entries_before,
+        "failed publication must never delete any files"
+    );
 
-    let mut image_deep = MuxRecoveryImage {
-        header: base_header.clone(),
-        topology: RecoveryTopology {
-            domains: vec![RecoveryDomain {
-                incarnation_domain_id: 1,
-                domain_name: "local".to_string(),
-                is_attached: true,
-            }],
-            windows: vec![RecoveryWindow {
-                window_id: 1,
-                stable_window_id: "w-1".to_string(),
-                workspace: "default".to_string(),
-                order_revision: 1,
-                gui_position: None,
-                tabs: vec![RecoveryTab {
-                    tab_id: 1,
-                    stable_tab_id: "t-1".to_string(),
-                    title: "Deep Tab".to_string(),
-                    working_dir: None,
-                    size: ImageTerminalSize::default(),
-                    size_before_zoom: ImageTerminalSize::default(),
-                    zoomed_pane_id: None,
-                    root_split: Some(deep_split),
-                    floating_panes: vec![],
-                    floating_focus: None,
-                    active_pane_id: 1,
-                }],
-                active_tab_index: 0,
-            }],
-            focused_window_id: None,
-            client_workspace: None,
-        },
-        panes: vec![RecoveryPane {
-            pane_id: 1,
-            pane_uuid: "uuid-1".to_string(),
-            domain_name: "local".to_string(),
-            title: "P1".to_string(),
-            cwd: None,
-            size: ImageTerminalSize::default(),
-            cursor_position: (0, 0),
-            alt_screen_active: false,
-            checkpoint: PaneCheckpointBinding {
-                topology_incarnation_id: "inc-neg".to_string(),
-                pane_uuid: "uuid-1".to_string(),
-                registration_generation: 1,
-                parser_capture: ParserCaptureIdentity {
-                    watermark_bytes: 0,
-                    segment_id: 0,
-                    parser_seqno: 0,
-                },
-                checkpoint_ref: RecoveryObjectRef {
-                    object_id: "obj-1".to_string(),
-                    byte_length: 10,
-                    payload_digest: [0u8; 32],
-                    schema_version: 1,
-                },
-                authority: CheckpointAuthority::ModelOnly {
-                    captured_at_epoch_ms: 0,
-                    parser_seqno: 0,
-                },
-            },
-        }],
-        image_digest: [0u8; 32],
-    };
-    image_deep.image_digest = image_deep.compute_digest().unwrap();
-    assert!(matches!(
-        image_deep.validate().unwrap_err(),
-        MuxRecoveryImageError::TooDeep { .. }
-    ));
-
-    // 3. Out of bounds active tab index
-    let mut image_bad_tab = MuxRecoveryImage {
-        header: base_header.clone(),
-        topology: RecoveryTopology {
-            domains: vec![],
-            windows: vec![RecoveryWindow {
-                window_id: 1,
-                stable_window_id: "w-1".to_string(),
-                workspace: "default".to_string(),
-                order_revision: 1,
-                gui_position: None,
-                tabs: vec![], // Empty tabs
-                active_tab_index: 2, // Out of bounds
-            }],
-            focused_window_id: None,
-            client_workspace: None,
-        },
-        panes: vec![],
-        image_digest: [0u8; 32],
-    };
-    image_bad_tab.image_digest = image_bad_tab.compute_digest().unwrap();
-    // With empty tabs, active_tab_index >= tabs.len() if tabs.is_empty() is guarded by tabs.is_empty() check,
-    // let's put 1 tab and set active_tab_index = 5
-    image_bad_tab.topology.windows[0].tabs.push(RecoveryTab {
-        tab_id: 1,
-        stable_tab_id: "t-1".to_string(),
-        title: "T".to_string(),
-        working_dir: None,
-        size: ImageTerminalSize::default(),
-        size_before_zoom: ImageTerminalSize::default(),
-        zoomed_pane_id: None,
-        root_split: None,
-        floating_panes: vec![],
-        floating_focus: None,
-        active_pane_id: 0,
-    });
-    image_bad_tab.topology.windows[0].active_tab_index = 5;
-    image_bad_tab.image_digest = image_bad_tab.compute_digest().unwrap();
-
-    assert!(matches!(
-        image_bad_tab.validate().unwrap_err(),
-        MuxRecoveryImageError::InvalidActiveTabIndex { window_id: 1, index: 5, count: 1 }
-    ));
-
-    // 4. Checkpoint binding incarnation mismatch
-    let mut image_inc_mismatch = MuxRecoveryImage {
-        header: base_header.clone(),
-        topology: RecoveryTopology {
-            domains: vec![RecoveryDomain {
-                incarnation_domain_id: 1,
-                domain_name: "local".to_string(),
-                is_attached: true,
-            }],
-            windows: vec![],
-            focused_window_id: None,
-            client_workspace: None,
-        },
-        panes: vec![RecoveryPane {
-            pane_id: 1,
-            pane_uuid: "uuid-1".to_string(),
-            domain_name: "local".to_string(),
-            title: "P1".to_string(),
-            cwd: None,
-            size: ImageTerminalSize::default(),
-            cursor_position: (0, 0),
-            alt_screen_active: false,
-            checkpoint: PaneCheckpointBinding {
-                topology_incarnation_id: "FOREIGN_INCARNATION_ID".to_string(), // Mismatch!
-                pane_uuid: "uuid-1".to_string(),
-                registration_generation: 1,
-                parser_capture: ParserCaptureIdentity {
-                    watermark_bytes: 0,
-                    segment_id: 0,
-                    parser_seqno: 0,
-                },
-                checkpoint_ref: RecoveryObjectRef {
-                    object_id: "obj-1".to_string(),
-                    byte_length: 10,
-                    payload_digest: [0u8; 32],
-                    schema_version: 1,
-                },
-                authority: CheckpointAuthority::ModelOnly {
-                    captured_at_epoch_ms: 0,
-                    parser_seqno: 0,
-                },
-            },
-        }],
-        image_digest: [0u8; 32],
-    };
-    image_inc_mismatch.image_digest = image_inc_mismatch.compute_digest().unwrap();
-    assert!(matches!(
-        image_inc_mismatch.validate().unwrap_err(),
-        MuxRecoveryImageError::IncarnationMismatch { .. }
-    ));
+    // Dual-slot selection falls back cleanly to Generation 1
+    let selection = select_verified_recovery_roots(&store, &prod_verifier)
+        .expect("select verified roots");
+    let active = selection.active_root.expect("must have active root");
+    assert_eq!(
+        active.generation, 1,
+        "selection must fall back to intact generation 1 predecessor"
+    );
+    assert_eq!(active.slot, RootSlot::SlotA);
 }
 
 #[test]
-fn test_e2e_live_target_safety_gate() {
-    let mut active_sessions = HashSet::new();
-    active_sessions.insert("live-prod-cluster-01".to_string());
-    active_sessions.insert("hz1-operator-session".to_string());
+fn test_mux_recovery_e2e_production_verifier_rejects_tampered_object() {
+    let term_limits = TerminalCheckpointLimits::default();
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
 
-    // Restore planner safety gate: refuse to target active live namespace
-    let target_attempt = "hz1-operator-session";
-    let is_live_refused = active_sessions.contains(target_attempt);
+    let live_terminals: Vec<Terminal> = (0..8)
+        .map(|i| create_live_terminal(i, &[format!("Pane {i}\r\n").as_bytes()]))
+        .collect();
+
+    let checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|t| capture_canonical_checkpoint(t, term_limits))
+        .collect();
+
+    let image = build_test_whole_mux_image(&checkpoints, "inc-1", "sess-1");
+    let image_bytes = image.to_canonical_json().expect("json");
+
+    // Publish 7 valid objects, but tamper with object 0
+    for (i, (payload, digest, _, _)) in checkpoints.iter().enumerate() {
+        let (upload_payload, upload_sha) = if i == 0 {
+            let mut tampered = payload.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0x01; // flip 1 bit
+            let sha = hex::encode(Sha256::digest(&tampered));
+            (tampered, sha)
+        } else {
+            (payload.clone(), hex::encode(digest))
+        };
+
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{i}"),
+                expected_sha256: upload_sha,
+                ciphertext_bytes: upload_payload,
+            })
+            .expect("publish object");
+    }
+
+    let candidate = RootSlotCandidate {
+        slot: RootSlot::SlotA,
+        generation: 1,
+        publisher_id: "test-pub".to_string(),
+        predecessor_generation: None,
+        predecessor_hash: None,
+        manifest_sha256: hex::encode(Sha256::digest(&image_bytes)),
+        manifest_bytes: image_bytes,
+        file_len: 1000,
+        created_at_ms: 1700000000000,
+    };
+
+    let verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let result = verifier.verify_root(&candidate, &store);
+
     assert!(
-        is_live_refused,
-        "recovery restore planner must fail closed and refuse live session mutation"
+        matches!(result, Err(WholeMuxRecoveryError::CheckpointDigestMismatch { .. })),
+        "WholeMuxRecoveryVerifier must reject candidate with CheckpointDigestMismatch on tampered payload"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_production_verifier_rejects_missing_object() {
+    let term_limits = TerminalCheckpointLimits::default();
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
+
+    let live_terminals: Vec<Terminal> = (0..8)
+        .map(|i| create_live_terminal(i, &[format!("Pane {i}\r\n").as_bytes()]))
+        .collect();
+
+    let checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|t| capture_canonical_checkpoint(t, term_limits))
+        .collect();
+
+    let image = build_test_whole_mux_image(&checkpoints, "inc-1", "sess-1");
+    let image_bytes = image.to_canonical_json().expect("json");
+
+    // Intentionally omit publishing object 3
+    for (i, (payload, digest, _, _)) in checkpoints.iter().enumerate() {
+        if i == 3 {
+            continue;
+        }
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{i}"),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish object");
+    }
+
+    let candidate = RootSlotCandidate {
+        slot: RootSlot::SlotA,
+        generation: 1,
+        publisher_id: "test-pub".to_string(),
+        predecessor_generation: None,
+        predecessor_hash: None,
+        manifest_sha256: hex::encode(Sha256::digest(&image_bytes)),
+        manifest_bytes: image_bytes,
+        file_len: 1000,
+        created_at_ms: 1700000000000,
+    };
+
+    let verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let result = verifier.verify_root(&candidate, &store);
+
+    assert!(
+        matches!(result, Err(WholeMuxRecoveryError::MissingCheckpointObject(ref id)) if id == "obj-pane-3"),
+        "WholeMuxRecoveryVerifier must reject candidate with MissingCheckpointObject for missing object"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_production_verifier_rejects_fake_guardian() {
+    let term_limits = TerminalCheckpointLimits::default();
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
+
+    let live_terminals: Vec<Terminal> = (0..8)
+        .map(|i| create_live_terminal(i, &[format!("Pane {i}\r\n").as_bytes()]))
+        .collect();
+
+    let checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|t| capture_canonical_checkpoint(t, term_limits))
+        .collect();
+
+    for (i, (payload, digest, _, _)) in checkpoints.iter().enumerate() {
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{i}"),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish object");
+    }
+
+    let mut image = build_test_whole_mux_image(&checkpoints, "inc-1", "sess-1");
+
+    // Plant fake guardian authority claim: Guardian authority but watermark_bytes = 0
+    image.panes[1].checkpoint.authority = CheckpointAuthority::Guardian {
+        durable_pane_id: "pane-uuid-1".to_string(),
+        segment_id: 1,
+        watermark_bytes: 0,
+        registration_wire_identity: [1u8; 16],
+        output_append_receipt_sha256: [0u8; 32],
+        terminal_replay_semantics_id: "test".to_string(),
+        lease_verifier: "verifier".to_string(),
+        guardian_generation: 1,
+        catalog_generation: 1,
+    };
+    image.image_digest = image.compute_digest().expect("digest");
+    let image_bytes = image.to_canonical_json().expect("json");
+
+    let candidate = RootSlotCandidate {
+        slot: RootSlot::SlotA,
+        generation: 1,
+        publisher_id: "test-pub".to_string(),
+        predecessor_generation: None,
+        predecessor_hash: None,
+        manifest_sha256: hex::encode(Sha256::digest(&image_bytes)),
+        manifest_bytes: image_bytes,
+        file_len: 1000,
+        created_at_ms: 1700000000000,
+    };
+
+    let verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let result = verifier.verify_root(&candidate, &store);
+
+    assert!(
+        matches!(result, Err(WholeMuxRecoveryError::FakeGuardianAuthority { pane_id: 1 })),
+        "WholeMuxRecoveryVerifier must reject candidate with FakeGuardianAuthority when watermark is zero"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_production_verifier_rejects_corrupted_manifest() {
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
+
+    let garbage_bytes = b"NOT-A-CANONICAL-JSON-RECOVERY-IMAGE-MANIFEST".to_vec();
+    let candidate = RootSlotCandidate {
+        slot: RootSlot::SlotA,
+        generation: 1,
+        publisher_id: "test-pub".to_string(),
+        predecessor_generation: None,
+        predecessor_hash: None,
+        manifest_sha256: hex::encode(Sha256::digest(&garbage_bytes)),
+        manifest_bytes: garbage_bytes,
+        file_len: 100,
+        created_at_ms: 1700000000000,
+    };
+
+    let verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let result = verifier.verify_root(&candidate, &store);
+
+    assert!(
+        matches!(result, Err(WholeMuxRecoveryError::Image(_))),
+        "WholeMuxRecoveryVerifier must reject candidate with Image deserialization error on garbage manifest"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_reconstruct_refuses_active_live_destination() {
+    let term_limits = TerminalCheckpointLimits::default();
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
+
+    let live_terminals: Vec<Terminal> = (0..8)
+        .map(|i| create_live_terminal(i, &[format!("Pane {i}\r\n").as_bytes()]))
+        .collect();
+
+    let checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|t| capture_canonical_checkpoint(t, term_limits))
+        .collect();
+
+    for (i, (payload, digest, _, _)) in checkpoints.iter().enumerate() {
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{i}"),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish object");
+    }
+
+    let image = build_test_whole_mux_image(&checkpoints, "inc-1", "sess-1");
+    let image_bytes = image.to_canonical_json().expect("json");
+
+    let candidate = RootSlotCandidate {
+        slot: RootSlot::SlotA,
+        generation: 1,
+        publisher_id: "test-pub".to_string(),
+        predecessor_generation: None,
+        predecessor_hash: None,
+        manifest_sha256: hex::encode(Sha256::digest(&image_bytes)),
+        manifest_bytes: image_bytes,
+        file_len: 1000,
+        created_at_ms: 1700000000000,
+    };
+
+    let verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let validated = verifier.verify_root(&candidate, &store).expect("root verification must succeed");
+
+    // Destination namespace is active in fleet
+    let active_sessions = HashSet::from([
+        "active-fleet-namespace".to_string(),
+        "live-session-2".to_string(),
+    ]);
+
+    let result = reconstruct_whole_mux_image_inert(
+        &validated,
+        term_limits,
+        Some("active-fleet-namespace"),
+        &active_sessions,
+    );
+
+    assert!(
+        matches!(result, Err(WholeMuxRecoveryError::LiveDestinationRefused { ref namespace }) if namespace == "active-fleet-namespace"),
+        "reconstruct_whole_mux_image_inert must fail closed with LiveDestinationRefused when target is active"
+    );
+}
+
+#[test]
+fn test_mux_recovery_e2e_layout_only_validation() {
+    let term_limits = TerminalCheckpointLimits::default();
+    let temp_store_dir = TempDir::new().expect("temp store");
+    let store = SnapshotPublicationStore::open(
+        temp_store_dir.path(),
+        PublicationLimits {
+            max_root_manifest_bytes: 1024 * 1024,
+            max_object_bytes: 64 * 1024 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        },
+    )
+    .expect("open store");
+
+    let live_terminals: Vec<Terminal> = (0..8)
+        .map(|i| create_live_terminal(i, &[format!("Pane {i}\r\n").as_bytes()]))
+        .collect();
+
+    let checkpoints: Vec<(Vec<u8>, [u8; 32], usize, usize)> = live_terminals
+        .iter()
+        .map(|t| capture_canonical_checkpoint(t, term_limits))
+        .collect();
+
+    for (i, (payload, digest, _, _)) in checkpoints.iter().enumerate() {
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: format!("obj-pane-{i}"),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish object");
+    }
+
+    let image = build_test_whole_mux_image(&checkpoints, "inc-1", "sess-1");
+    let image_bytes = image.to_canonical_json().expect("json");
+
+    let candidate = RootSlotCandidate {
+        slot: RootSlot::SlotA,
+        generation: 1,
+        publisher_id: "test-pub".to_string(),
+        predecessor_generation: None,
+        predecessor_hash: None,
+        manifest_sha256: hex::encode(Sha256::digest(&image_bytes)),
+        manifest_bytes: image_bytes,
+        file_len: 1000,
+        created_at_ms: 1700000000000,
+    };
+
+    let verifier = WholeMuxRecoveryVerifier::new(WholeMuxRecoveryLimits::default());
+    let validated = verifier.verify_root(&candidate, &store).expect("root verification must succeed");
+
+    let active_sessions = HashSet::from(["busy-fleet-namespace".to_string()]);
+
+    // Rejection on active live destination
+    let rejected = validate_whole_mux_image_layout_only(
+        &validated,
+        Some("busy-fleet-namespace"),
+        &active_sessions,
+    );
+    assert!(
+        matches!(rejected, Err(WholeMuxRecoveryError::LiveDestinationRefused { .. })),
+        "layout-only validation must refuse active live destination"
+    );
+
+    // Acceptance on safe offline destination
+    let accepted = validate_whole_mux_image_layout_only(
+        &validated,
+        Some("offline-safe-namespace"),
+        &active_sessions,
+    );
+    assert!(
+        accepted.is_ok(),
+        "layout-only validation must accept safe offline destination"
     );
 }

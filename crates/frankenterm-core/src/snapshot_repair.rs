@@ -37,18 +37,26 @@
 //!   corrupted state.
 //! - **Admission Control & Cancellation**: Bounded concurrency and memory via
 //!   [`RepairAdmissionController`], with periodic `cx.checkpoint()` cancellation gates.
+//!   Because RaptorQ systematic matrix inversion and inactivation elimination are
+//!   synchronous, compute-bound algorithms that cannot be preempted mid-matrix-solve,
+//!   latency is strictly bounded by construction through $K \le \text{MAX\_CHUNK\_SOURCE\_SYMBOLS}$
+//!   ($K \le 2,048$, keeping synchronous solve times in single-digit milliseconds).
+//!   Hard interruption during solve is not claimed; instead, `cx.checkpoint()` is verified
+//!   immediately AFTER solve and digest verification before returning success, ensuring that
+//!   cancellation during solve fails closed.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::cx::Cx;
 use crate::runtime_async::raptorq::{
-    InactivationDecoder, RankStatus, ReceivedSymbol, SystematicEncoder, SystematicParams,
+    InactivationDecoder, ReceivedSymbol, SystematicEncoder, SystematicParams,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -188,6 +196,32 @@ impl RepairProtectionClass {
             } => *repair_symbol_count,
         }
     }
+
+    /// Return canonical byte representation for HMAC domain authentication.
+    /// Format: 1-byte discriminant tag (0=Standard, 1=High, 2=Maximum, 3=Custom),
+    /// followed by 8-byte little-endian repair symbol count.
+    #[must_use]
+    pub fn to_canonical_bytes(&self) -> [u8; 9] {
+        let mut buf = [0u8; 9];
+        match self {
+            Self::Standard => {
+                buf[0] = 0;
+            }
+            Self::High => {
+                buf[0] = 1;
+            }
+            Self::Maximum => {
+                buf[0] = 2;
+            }
+            Self::Custom {
+                repair_symbol_count,
+            } => {
+                buf[0] = 3;
+                buf[1..9].copy_from_slice(&(*repair_symbol_count as u64).to_le_bytes());
+            }
+        }
+        buf
+    }
 }
 
 /// External authenticated manifest describing the repair geometry and representation ID.
@@ -224,6 +258,44 @@ pub struct EncodedRepairBundle {
     pub symbols: Vec<AuthenticatedRepairSymbol>,
 }
 
+/// Mandatory expected identity assertion tuple for recovery operations.
+/// Prevents replay of stale generations or substitution of foreign authentic objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedRecoveryIdentity {
+    /// Expected SHA-256 digest of the serialized encrypted representation envelope.
+    pub representation_id: [u8; 32],
+    /// Expected semantic recovery object identifier.
+    pub object_id: [u8; 32],
+    /// Expected monotonic generation.
+    pub generation: u64,
+}
+
+impl ExpectedRecoveryIdentity {
+    /// Create a new expected identity assertion tuple.
+    #[must_use]
+    pub const fn new(
+        representation_id: [u8; 32],
+        object_id: [u8; 32],
+        generation: u64,
+    ) -> Self {
+        Self {
+            representation_id,
+            object_id,
+            generation,
+        }
+    }
+
+    /// Derive expected identity directly from an authenticated manifest.
+    #[must_use]
+    pub const fn from_manifest(manifest: &RepairManifest) -> Self {
+        Self {
+            representation_id: manifest.representation_id,
+            object_id: manifest.object_id,
+            generation: manifest.generation,
+        }
+    }
+}
+
 /// Diagnostic equation rank details returned upon decode evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankStatusDiagnostic {
@@ -249,14 +321,32 @@ pub struct RepairStats {
 }
 
 /// Output of a successful repair decode operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepairResult {
+/// Holds the active budget permit so returned buffers do not outlive the permit
+/// and aggregate process-wide memory bounds remain strictly enforced.
+#[derive(Debug)]
+pub struct RepairResult<'a> {
     /// Bit-for-bit recovered serialized encrypted envelope.
     pub reconstructed_envelope: Vec<u8>,
     /// Verified representation digest (matches `SHA256(reconstructed_envelope)`).
     pub representation_id: [u8; 32],
     /// Decode and symbol accounting statistics.
     pub stats: RepairStats,
+    /// Active admission permit holding budget reservation for the retained buffer.
+    pub permit: RepairPermit<'a>,
+}
+
+impl<'a> RepairResult<'a> {
+    /// Consume the result, yielding the reconstructed envelope and the active budget permit.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, RepairPermit<'a>) {
+        (self.reconstructed_envelope, self.permit)
+    }
+
+    /// Consume the result, releasing the permit immediately and yielding only the envelope bytes.
+    #[must_use]
+    pub fn into_envelope(self) -> Vec<u8> {
+        self.reconstructed_envelope
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +427,14 @@ pub enum RepairError {
 // Admission Control (FCP Pattern)
 // ---------------------------------------------------------------------------
 
+static SHARED_ADMISSION_CONTROLLER: OnceLock<RepairAdmissionController> = OnceLock::new();
+
+/// Global shared admission controller enforcing system-wide concurrency and memory limits.
+#[must_use]
+pub fn shared_admission_controller() -> &'static RepairAdmissionController {
+    SHARED_ADMISSION_CONTROLLER.get_or_init(RepairAdmissionController::default_production)
+}
+
 /// Bounded resource admission controller for snapshot repair operations.
 #[derive(Debug)]
 pub struct RepairAdmissionController {
@@ -370,35 +468,79 @@ impl RepairAdmissionController {
     }
 
     /// Try to acquire an operational permit reserving memory and concurrency.
+    /// Employs checked CAS loops to prevent arithmetic wrapping before bounds verification.
     pub fn acquire(&self, estimated_bytes: usize) -> Result<RepairPermit<'_>, RepairError> {
-        let current_ops = self.active_operations.fetch_add(1, Ordering::SeqCst);
-        if current_ops >= self.max_concurrent {
-            self.active_operations.fetch_sub(1, Ordering::SeqCst);
-            return Err(RepairError::AdmissionExceeded(format!(
-                "concurrency limit reached ({current_ops}/{})",
-                self.max_concurrent
-            )));
+        // Concurrency reservation via checked CAS loop
+        let mut current_ops = self.active_operations.load(Ordering::Acquire);
+        loop {
+            if current_ops >= self.max_concurrent {
+                return Err(RepairError::AdmissionExceeded(format!(
+                    "concurrency limit reached ({current_ops}/{})",
+                    self.max_concurrent
+                )));
+            }
+            let next_ops = current_ops.checked_add(1).ok_or_else(|| {
+                RepairError::AdmissionExceeded("concurrency counter overflow".to_string())
+            })?;
+            match self.active_operations.compare_exchange_weak(
+                current_ops,
+                next_ops,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current_ops = actual,
+            }
         }
 
-        let current_mem = self
-            .allocated_memory_bytes
-            .fetch_add(estimated_bytes, Ordering::SeqCst);
-        if current_mem.checked_add(estimated_bytes).is_none()
-            || current_mem + estimated_bytes > self.max_memory_bytes
-        {
-            self.allocated_memory_bytes
-                .fetch_sub(estimated_bytes, Ordering::SeqCst);
-            self.active_operations.fetch_sub(1, Ordering::SeqCst);
-            return Err(RepairError::AdmissionExceeded(format!(
-                "memory limit exceeded (requested {estimated_bytes} bytes, current {current_mem}, max {})",
-                self.max_memory_bytes
-            )));
+        // Memory reservation via checked CAS loop
+        let mut current_mem = self.allocated_memory_bytes.load(Ordering::Acquire);
+        loop {
+            let next_mem = match current_mem.checked_add(estimated_bytes) {
+                Some(m) if m <= self.max_memory_bytes => m,
+                Some(m) => {
+                    self.active_operations.fetch_sub(1, Ordering::Release);
+                    return Err(RepairError::AdmissionExceeded(format!(
+                        "memory limit exceeded (requested {estimated_bytes} bytes, current {current_mem}, needed {m}, max {})",
+                        self.max_memory_bytes
+                    )));
+                }
+                None => {
+                    self.active_operations.fetch_sub(1, Ordering::Release);
+                    return Err(RepairError::AdmissionExceeded(format!(
+                        "memory allocation counter overflow (current {current_mem}, requested {estimated_bytes})"
+                    )));
+                }
+            };
+
+            match self.allocated_memory_bytes.compare_exchange_weak(
+                current_mem,
+                next_mem,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current_mem = actual,
+            }
         }
 
         Ok(RepairPermit {
             controller: self,
             allocated_bytes: estimated_bytes,
+            released: false,
         })
+    }
+
+    /// Current number of active operations holding permits.
+    #[must_use]
+    pub fn active_operations(&self) -> usize {
+        self.active_operations.load(Ordering::Acquire)
+    }
+
+    /// Current number of aggregate memory bytes allocated across active permits.
+    #[must_use]
+    pub fn allocated_memory_bytes(&self) -> usize {
+        self.allocated_memory_bytes.load(Ordering::Acquire)
     }
 }
 
@@ -406,16 +548,58 @@ impl RepairAdmissionController {
 pub struct RepairPermit<'a> {
     controller: &'a RepairAdmissionController,
     allocated_bytes: usize,
+    released: bool,
+}
+
+impl<'a> RepairPermit<'a> {
+    /// Adjust the allocated bytes down to the retained buffer size.
+    /// Releases the difference back to the admission controller while retaining
+    /// the charge for the surviving buffer.
+    pub fn shrink_to(&mut self, retained_bytes: usize) {
+        if self.released {
+            return;
+        }
+        if retained_bytes < self.allocated_bytes {
+            let diff = self.allocated_bytes - retained_bytes;
+            self.controller
+                .allocated_memory_bytes
+                .fetch_sub(diff, Ordering::Release);
+            self.allocated_bytes = retained_bytes;
+        }
+    }
+
+    /// Explicitly release the permit, returning reserved memory and concurrency to the controller.
+    pub fn release(&mut self) {
+        if !self.released {
+            self.controller
+                .allocated_memory_bytes
+                .fetch_sub(self.allocated_bytes, Ordering::Release);
+            self.controller
+                .active_operations
+                .fetch_sub(1, Ordering::Release);
+            self.released = true;
+        }
+    }
+
+    /// Number of bytes currently held by this permit.
+    #[must_use]
+    pub const fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes
+    }
 }
 
 impl Drop for RepairPermit<'_> {
     fn drop(&mut self) {
-        self.controller
-            .allocated_memory_bytes
-            .fetch_sub(self.allocated_bytes, Ordering::SeqCst);
-        self.controller
-            .active_operations
-            .fetch_sub(1, Ordering::SeqCst);
+        self.release();
+    }
+}
+
+impl std::fmt::Debug for RepairPermit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepairPermit")
+            .field("allocated_bytes", &self.allocated_bytes)
+            .field("released", &self.released)
+            .finish()
     }
 }
 
@@ -425,6 +609,29 @@ impl Drop for RepairPermit<'_> {
 
 /// Estimate comprehensive memory consumption for decoder initialization,
 /// equation matrix storage, dense inactivation solve, and intermediate symbols.
+///
+/// Accounts for:
+/// 1. Total matrix rows: matrix_rows = received_symbol_count + S + H + (K' - K).
+/// 2. Dense rank evaluation & inactivation matrices:
+///    - dense_rows in rank profiling: matrix_rows * L in GF(256)
+///    - flat dense matrix A in inactivate_and_solve: matrix_rows * L in GF(256)
+///    - dense submatrix clone / factor cache during elimination: matrix_rows * L in GF(256)
+///    - rank basis vectors in coefficient_rank_profile: L * L in GF(256)
+///    Charged as: 3 * (matrix_rows * L) + (L * L).
+/// 3. HDPC and dense equations having up to L terms (8-byte column index + 1-byte GF256 coeff = 9 bytes),
+///    vector/struct allocation headers (~128 bytes), and RHS symbol buffers (symbol_size).
+///    Solver clones equation and RHS rows while original equation list is held:
+///    Charged as: 2 * matrix_rows * (L * 9 + 128 + symbol_size).
+/// 4. Full decoder state symbol payload buffers:
+///    - intermediate symbols (L * symbol_size)
+///    - solved array in DecoderState (L * symbol_size)
+///    - source symbols (K * symbol_size)
+///    - output reconstructed envelope (K * symbol_size)
+///    - received symbol data (received_symbol_count * symbol_size)
+///    Charged as: (2L + 2K + received_symbol_count) * symbol_size.
+/// 5. Full state auxiliary vector overhead:
+///    - column_states (L * 1)
+///    - dense_rows indices, unsolved indices, stats tracking overhead (~64 bytes/row).
 fn calculate_decoder_memory_budget(
     params: &SystematicParams,
     received_symbol_count: usize,
@@ -437,47 +644,76 @@ fn calculate_decoder_memory_budget(
     let k_prime = params.k_prime;
 
     // 1. Symbol payload buffers (checked)
-    // Intermediate symbols (l) + source symbols (k) + received symbols (received_symbol_count) + output assembly (k)
+    // Intermediate symbols (L) + solved array (L) + source symbols (K) + output assembly (K) + received symbols (received_symbol_count)
     let total_symbol_slots = l
-        .checked_add(k)
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(k.checked_mul(2)?))
         .and_then(|v| v.checked_add(received_symbol_count))
-        .and_then(|v| v.checked_add(k))
         .ok_or_else(|| RepairError::AdmissionExceeded("symbol buffer count overflow".to_string()))?;
 
     let symbol_payload_bytes = total_symbol_slots
         .checked_mul(symbol_size)
         .ok_or_else(|| RepairError::AdmissionExceeded("symbol payload bytes overflow".to_string()))?;
 
-    // 2. Dense inactivation matrix: L * L in GF(256) (conservative worst-case dense submatrix)
-    let dense_matrix_bytes = l
-        .checked_mul(l)
-        .ok_or_else(|| RepairError::AdmissionExceeded("dense matrix bytes overflow".to_string()))?;
-
-    // 3. Equation structures and RHS
-    // Base constraints: S + H
-    // Implicit padding rows: K' - K
-    // Received symbol equations: received_symbol_count
+    // 2. Total matrix rows: received symbols + base constraints (S + H) + padding rows (K' - K)
     let padding_rows = k_prime.saturating_sub(k);
-    let total_equations = s
+    let matrix_rows = s
         .checked_add(h)
         .and_then(|v| v.checked_add(padding_rows))
         .and_then(|v| v.checked_add(received_symbol_count))
-        .ok_or_else(|| RepairError::AdmissionExceeded("equation count overflow".to_string()))?;
+        .ok_or_else(|| RepairError::AdmissionExceeded("equation row count overflow".to_string()))?;
 
-    // Conservative equation structure overhead: 64 bytes struct + up to 64 non-zero terms (9 bytes each)
-    const ESTIMATED_EQUATION_STRUCT_OVERHEAD: usize = 640;
-    let equation_slot_bytes = ESTIMATED_EQUATION_STRUCT_OVERHEAD
-        .checked_add(symbol_size)
+    // 3. Dense matrices and rank evaluation basis:
+    // - dense_rows in rank profiling: matrix_rows * L
+    // - flat dense matrix A in inactivate_and_solve: matrix_rows * L
+    // - solver submatrix clone / factor cache: matrix_rows * L
+    // - coefficient_rank_profile basis: L * L
+    let matrix_cells = matrix_rows
+        .checked_mul(l)
+        .ok_or_else(|| RepairError::AdmissionExceeded("dense matrix cells overflow".to_string()))?;
+
+    let dense_matrix_bytes = matrix_cells
+        .checked_mul(3)
+        .ok_or_else(|| RepairError::AdmissionExceeded("dense matrix bytes overflow".to_string()))?;
+
+    let basis_bytes = l
+        .checked_mul(l)
+        .ok_or_else(|| RepairError::AdmissionExceeded("rank basis bytes overflow".to_string()))?;
+
+    let total_matrix_bytes = dense_matrix_bytes
+        .checked_add(basis_bytes)
+        .ok_or_else(|| RepairError::AdmissionExceeded("total dense matrix bytes overflow".to_string()))?;
+
+    // 4. Equation structures and RHS
+    // HDPC equations and dense rows can have up to L non-zero terms (8-byte column index + 1-byte GF256 coeff = 9 bytes).
+    // Plus vector/struct allocation headers (~128 bytes) + RHS symbol payload (symbol_size).
+    let term_bytes = l
+        .checked_mul(9)
+        .ok_or_else(|| RepairError::AdmissionExceeded("equation term bytes overflow".to_string()))?;
+
+    const STRUCT_AND_VEC_HEADER_OVERHEAD: usize = 128;
+    let single_equation_slot_bytes = term_bytes
+        .checked_add(STRUCT_AND_VEC_HEADER_OVERHEAD)
+        .and_then(|v| v.checked_add(symbol_size))
         .ok_or_else(|| RepairError::AdmissionExceeded("equation slot size overflow".to_string()))?;
 
-    let equation_bytes = total_equations
-        .checked_mul(equation_slot_bytes)
+    // The solver clones equation and RHS rows while original equation list is held; charge 2x.
+    let equation_bytes = matrix_rows
+        .checked_mul(single_equation_slot_bytes)
+        .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| RepairError::AdmissionExceeded("equation memory overflow".to_string()))?;
+
+    // 5. Full state overhead: auxiliary vectors (column_states, dense_rows, unsolved, stats)
+    let auxiliary_overhead = matrix_rows
+        .checked_mul(64)
+        .and_then(|v| v.checked_add(l.checked_mul(32)?))
+        .ok_or_else(|| RepairError::AdmissionExceeded("auxiliary state overhead overflow".to_string()))?;
 
     // Sum all components safely
     let total_memory = symbol_payload_bytes
-        .checked_add(dense_matrix_bytes)
+        .checked_add(total_matrix_bytes)
         .and_then(|v| v.checked_add(equation_bytes))
+        .and_then(|v| v.checked_add(auxiliary_overhead))
         .ok_or_else(|| RepairError::AdmissionExceeded("total decoder memory budget overflow".to_string()))?;
 
     Ok(total_memory)
@@ -485,6 +721,7 @@ fn calculate_decoder_memory_budget(
 
 /// Estimate comprehensive memory consumption for encoder intermediate symbol
 /// solve and repair symbol generation.
+/// Accounts for Systematic solve cloning matrix and RHS while originals are alive.
 fn calculate_encoder_memory_budget(
     params: &SystematicParams,
     total_symbols: usize,
@@ -512,12 +749,27 @@ fn calculate_encoder_memory_budget(
         .and_then(|v| v.checked_add(k_prime))
         .ok_or_else(|| RepairError::AdmissionExceeded("encoder matrix rows overflow".to_string()))?;
 
-    let matrix_bytes = matrix_rows
+    let single_matrix_bytes = matrix_rows
         .checked_mul(l)
         .ok_or_else(|| RepairError::AdmissionExceeded("encoder matrix bytes overflow".to_string()))?;
 
+    // Solver clones the constraint matrix; charge 2x
+    let matrix_bytes = single_matrix_bytes
+        .checked_mul(2)
+        .ok_or_else(|| RepairError::AdmissionExceeded("encoder matrix clone bytes overflow".to_string()))?;
+
+    // Solver clones the RHS values: matrix_rows * symbol_size; charge 2x
+    let single_rhs_bytes = matrix_rows
+        .checked_mul(symbol_size)
+        .ok_or_else(|| RepairError::AdmissionExceeded("encoder rhs bytes overflow".to_string()))?;
+
+    let rhs_bytes = single_rhs_bytes
+        .checked_mul(2)
+        .ok_or_else(|| RepairError::AdmissionExceeded("encoder rhs clone bytes overflow".to_string()))?;
+
     let total_memory = symbol_payload_bytes
         .checked_add(matrix_bytes)
+        .and_then(|v| v.checked_add(rhs_bytes))
         .ok_or_else(|| RepairError::AdmissionExceeded("encoder total memory budget overflow".to_string()))?;
 
     Ok(total_memory)
@@ -528,11 +780,13 @@ fn calculate_encoder_memory_budget(
 // ---------------------------------------------------------------------------
 
 /// Compute HMAC-SHA256 for a repair manifest using the standard `hmac` crate.
+/// Authenticates geometry, representation identity, object identity, and protection policy.
 pub fn compute_manifest_mac(
     key: &[u8],
     representation_id: &[u8; 32],
     object_id: &[u8; 32],
     generation: u64,
+    protection_class: RepairProtectionClass,
     sbn: u8,
     k: u32,
     symbol_size: u32,
@@ -550,6 +804,7 @@ pub fn compute_manifest_mac(
     mac.update(representation_id);
     mac.update(object_id);
     mac.update(&generation.to_le_bytes());
+    mac.update(&protection_class.to_canonical_bytes());
     mac.update(&[sbn]);
     mac.update(&k.to_le_bytes());
     mac.update(&symbol_size.to_le_bytes());
@@ -577,6 +832,7 @@ pub fn verify_manifest_mac(key: &[u8], manifest: &RepairManifest) -> bool {
     mac.update(&manifest.representation_id);
     mac.update(&manifest.object_id);
     mac.update(&manifest.generation.to_le_bytes());
+    mac.update(&manifest.protection_class.to_canonical_bytes());
     mac.update(&[manifest.sbn]);
     mac.update(&manifest.k.to_le_bytes());
     mac.update(&manifest.symbol_size.to_le_bytes());
@@ -826,6 +1082,7 @@ pub fn encode_repair_envelope(
         &representation_id,
         &object_id,
         generation,
+        protection,
         sbn,
         k as u32,
         symbol_size as u32,
@@ -846,13 +1103,18 @@ pub fn encode_repair_envelope(
         manifest_mac,
     };
 
+    // Final cancellation checkpoint before returning encoded bundle
+    if cx.checkpoint().is_err() {
+        return Err(RepairError::Cancelled);
+    }
+
     Ok(EncodedRepairBundle {
         manifest,
         symbols: output_symbols,
     })
 }
 
-/// Convenience encoder using default symbol size (1 KiB) and default production admission controller.
+/// Convenience encoder using default symbol size (1 KiB) and global shared admission controller.
 pub fn encode_repair_envelope_default(
     cx: &Cx,
     envelope_bytes: &[u8],
@@ -861,7 +1123,6 @@ pub fn encode_repair_envelope_default(
     auth_key: &[u8],
     protection: RepairProtectionClass,
 ) -> Result<EncodedRepairBundle, RepairError> {
-    let admission = RepairAdmissionController::default_production();
     encode_repair_envelope(
         cx,
         envelope_bytes,
@@ -870,7 +1131,7 @@ pub fn encode_repair_envelope_default(
         auth_key,
         DEFAULT_SYMBOL_SIZE,
         protection,
-        &admission,
+        shared_admission_controller(),
     )
 }
 
@@ -879,28 +1140,27 @@ pub fn encode_repair_envelope_default(
 // ---------------------------------------------------------------------------
 
 /// Decode and reconstruct the exact serialized encrypted envelope from received symbols,
-/// with optional caller assertions on expected identity.
+/// requiring caller assertions on expected recovery identity.
 ///
 /// # Invariants Enforced
 /// 1. Manifest HMAC authentication must verify before any symbol inspection.
-/// 2. Optional expected representation_id, object_id, and generation must match manifest.
+/// 2. Mandatory `expected` identity tuple (representation_id, object_id, generation) must match manifest,
+///    preventing replay of stale generation or substitution of foreign authentic object.
 /// 3. Pre-allocation check on `symbols.len() <= admission.max_symbols_buffered`.
-/// 4. Comprehensive memory charging (symbol payloads, intermediate symbols, $L \times L$ dense matrix, equations).
+/// 4. Comprehensive memory charging (symbol payloads, intermediate symbols, dense matrix, equations, and solver clones).
 /// 5. Every accepted symbol must match the manifest's geometry and pass individual HMAC verification.
 /// 6. Duplicate symbols with identical payloads are deduplicated without inflating rank.
 /// 7. Conflicting duplicate symbols (same ESI, divergent payload) trigger immediate rejection.
 /// 8. Equation rank is checked prior to solving; deficits return structured diagnostic error.
 /// 9. Reconstructed bytes must match `manifest.representation_id` before returning.
-pub fn decode_repair_symbols_with_expected(
+pub fn decode_repair_symbols<'a>(
     cx: &Cx,
     manifest: &RepairManifest,
     symbols: &[AuthenticatedRepairSymbol],
-    expected_representation_id: Option<&[u8; 32]>,
-    expected_object_id: Option<&[u8; 32]>,
-    expected_generation: Option<u64>,
+    expected: &ExpectedRecoveryIdentity,
     auth_key: &[u8],
-    admission: &RepairAdmissionController,
-) -> Result<RepairResult, RepairError> {
+    admission: &'a RepairAdmissionController,
+) -> Result<RepairResult<'a>, RepairError> {
     if cx.checkpoint().is_err() {
         return Err(RepairError::Cancelled);
     }
@@ -916,32 +1176,27 @@ pub fn decode_repair_symbols_with_expected(
         return Err(RepairError::ManifestAuthenticationFailed);
     }
 
-    // 2. Validate expected context if supplied by caller
-    if let Some(expected_rep) = expected_representation_id {
-        if expected_rep != &manifest.representation_id {
-            return Err(RepairError::ForeignRepresentationId {
-                expected: *expected_rep,
-                got: manifest.representation_id,
-            });
-        }
+    // 2. Mandatory validation of expected recovery identity:
+    // Prevents replay of stale generation or substitution of foreign authentic object.
+    if expected.representation_id != manifest.representation_id {
+        return Err(RepairError::ForeignRepresentationId {
+            expected: expected.representation_id,
+            got: manifest.representation_id,
+        });
     }
 
-    if let Some(expected_obj) = expected_object_id {
-        if expected_obj != &manifest.object_id {
-            return Err(RepairError::ForeignObjectId {
-                expected: *expected_obj,
-                got: manifest.object_id,
-            });
-        }
+    if expected.object_id != manifest.object_id {
+        return Err(RepairError::ForeignObjectId {
+            expected: expected.object_id,
+            got: manifest.object_id,
+        });
     }
 
-    if let Some(expected_gen) = expected_generation {
-        if expected_gen != manifest.generation {
-            return Err(RepairError::ForeignGeneration {
-                expected: expected_gen,
-                got: manifest.generation,
-            });
-        }
+    if expected.generation != manifest.generation {
+        return Err(RepairError::ForeignGeneration {
+            expected: expected.generation,
+            got: manifest.generation,
+        });
     }
 
     // 3. Validate geometry bounds
@@ -971,6 +1226,26 @@ pub fn decode_repair_symbols_with_expected(
         });
     }
 
+    // Framing geometry invariant: payload_len.div_ceil(symbol_size) must match manifest.k
+    let expected_k = payload_len.div_ceil(symbol_size);
+    if expected_k != k {
+        return Err(RepairError::InvalidGeometry {
+            reason: format!(
+                "payload_len {payload_len} with symbol_size {symbol_size} requires K {expected_k}, but manifest specifies K {k}"
+            ),
+        });
+    }
+
+    // Manifest geometry invariant: total_symbols_generated must be >= K
+    let total_symbols_manifest = manifest.total_symbols_generated as usize;
+    if total_symbols_manifest < k {
+        return Err(RepairError::InvalidGeometry {
+            reason: format!(
+                "manifest total_symbols_generated {total_symbols_manifest} < K {k}"
+            ),
+        });
+    }
+
     // 4. Pre-allocation buffering guard: enforce max_symbols_buffered BEFORE vector allocation
     if symbols.len() > admission.max_symbols_buffered {
         return Err(RepairError::AdmissionExceeded(format!(
@@ -988,7 +1263,7 @@ pub fn decode_repair_symbols_with_expected(
     })?;
 
     let estimated_memory = calculate_decoder_memory_budget(&params, symbols.len(), symbol_size)?;
-    let _permit = admission.acquire(estimated_memory)?;
+    let mut permit = admission.acquire(estimated_memory)?;
 
     // 6. Initialize InactivationDecoder
     let seed = derive_raptorq_seed(&manifest.representation_id, manifest.sbn);
@@ -1059,9 +1334,18 @@ pub fn decode_repair_symbols_with_expected(
                 validated_source.push((sym.esi, sym.payload.clone()));
             }
             RepairSymbolKind::Repair => {
-                if (sym.esi as usize) < k {
+                let esi = sym.esi as usize;
+                if esi < k {
                     return Err(RepairError::InvalidGeometry {
                         reason: format!("repair symbol ESI {} < K {}", sym.esi, k),
+                    });
+                }
+                if esi >= total_symbols_manifest {
+                    return Err(RepairError::InvalidGeometry {
+                        reason: format!(
+                            "repair symbol ESI {} >= total_symbols_generated {}",
+                            sym.esi, total_symbols_manifest
+                        ),
                     });
                 }
                 validated_repair.push((sym.esi, sym.payload.clone()));
@@ -1088,6 +1372,15 @@ pub fn decode_repair_symbols_with_expected(
             });
         }
 
+        // Final cancellation checkpoint before returning fast-path result
+        if cx.checkpoint().is_err() {
+            return Err(RepairError::Cancelled);
+        }
+
+        // Shrink permit from temporary decode budget down to exact retained buffer length
+        // so returned buffers do not outlive the permit and aggregate bounds remain strictly true.
+        permit.shrink_to(reconstructed.len());
+
         let l = decoder.params().l;
         return Ok(RepairResult {
             reconstructed_envelope: reconstructed,
@@ -1102,6 +1395,7 @@ pub fn decode_repair_symbols_with_expected(
                     deficit: 0,
                 },
             },
+            permit,
         });
     }
 
@@ -1168,6 +1462,16 @@ pub fn decode_repair_symbols_with_expected(
         });
     }
 
+    // Cancellation checkpoint immediately AFTER solve and digest verification, before successful return:
+    // Ensures that cancellation occurring during the uninterruptible synchronous solve cannot report success.
+    if cx.checkpoint().is_err() {
+        return Err(RepairError::Cancelled);
+    }
+
+    // Shrink permit from temporary solver scratchpad down to exact retained buffer length
+    // so returned buffers do not outlive the permit and aggregate bounds remain strictly true.
+    permit.shrink_to(reconstructed.len());
+
     Ok(RepairResult {
         reconstructed_envelope: reconstructed,
         representation_id: manifest.representation_id,
@@ -1181,31 +1485,76 @@ pub fn decode_repair_symbols_with_expected(
                 deficit: rank_profile.deficit,
             },
         },
+        permit,
     })
 }
 
-/// Decode and reconstruct the exact serialized encrypted envelope from received symbols.
-pub fn decode_repair_symbols(
-    cx: &Cx,
-    manifest: &RepairManifest,
-    symbols: &[AuthenticatedRepairSymbol],
-    auth_key: &[u8],
-    admission: &RepairAdmissionController,
-) -> Result<RepairResult, RepairError> {
-    decode_repair_symbols_with_expected(
-        cx, manifest, symbols, None, None, None, auth_key, admission,
-    )
-}
-
-/// Convenience decoder using default production admission controller.
+/// Convenience decoder using global shared admission controller and mandatory expected identity.
 pub fn decode_repair_symbols_default(
     cx: &Cx,
     manifest: &RepairManifest,
     symbols: &[AuthenticatedRepairSymbol],
+    expected: &ExpectedRecoveryIdentity,
     auth_key: &[u8],
-) -> Result<RepairResult, RepairError> {
-    let admission = RepairAdmissionController::default_production();
-    decode_repair_symbols(cx, manifest, symbols, auth_key, &admission)
+) -> Result<RepairResult<'static>, RepairError> {
+    decode_repair_symbols(
+        cx,
+        manifest,
+        symbols,
+        expected,
+        auth_key,
+        shared_admission_controller(),
+    )
+}
+
+/// Backward-compatible decode helper with expected identity tuple.
+#[inline]
+pub fn decode_repair_symbols_with_expected<'a>(
+    cx: &Cx,
+    manifest: &RepairManifest,
+    symbols: &[AuthenticatedRepairSymbol],
+    expected: &ExpectedRecoveryIdentity,
+    auth_key: &[u8],
+    admission: &'a RepairAdmissionController,
+) -> Result<RepairResult<'a>, RepairError> {
+    decode_repair_symbols(cx, manifest, symbols, expected, auth_key, admission)
+}
+
+/// Test-only convenience decoder asserting identity derived directly from manifest for callers
+/// that do not supply an independent expected identity assertion.
+/// Strictly gated to test compilation to prevent production bypass of expected identity verification.
+#[cfg(test)]
+#[must_use = "decoding produces reconstructed envelope bytes"]
+pub fn decode_repair_symbols_unasserted<'a>(
+    cx: &Cx,
+    manifest: &RepairManifest,
+    symbols: &[AuthenticatedRepairSymbol],
+    auth_key: &[u8],
+    admission: &'a RepairAdmissionController,
+) -> Result<RepairResult<'a>, RepairError> {
+    let expected = ExpectedRecoveryIdentity::from_manifest(manifest);
+    decode_repair_symbols(cx, manifest, symbols, &expected, auth_key, admission)
+}
+
+/// Test-only convenience decoder using global shared admission controller and identity derived from manifest.
+/// Strictly gated to test compilation to prevent production bypass of expected identity verification.
+#[cfg(test)]
+#[must_use = "decoding produces reconstructed envelope bytes"]
+pub fn decode_repair_symbols_unasserted_default(
+    cx: &Cx,
+    manifest: &RepairManifest,
+    symbols: &[AuthenticatedRepairSymbol],
+    auth_key: &[u8],
+) -> Result<RepairResult<'static>, RepairError> {
+    let expected = ExpectedRecoveryIdentity::from_manifest(manifest);
+    decode_repair_symbols(
+        cx,
+        manifest,
+        symbols,
+        &expected,
+        auth_key,
+        shared_admission_controller(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,7 +1604,8 @@ mod tests {
         )
         .expect("encode failed");
 
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &bundle.symbols, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(&cx, &bundle.manifest, &bundle.symbols, &expected, key, &admission)
             .expect("decode failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
@@ -1292,7 +1642,8 @@ mod tests {
             received.push(sym.clone());
         }
 
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
             .expect("decode repair failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
@@ -1330,7 +1681,8 @@ mod tests {
             received.push(sym.clone());
         }
 
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
             .expect("decode repair 50% failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
@@ -1365,7 +1717,8 @@ mod tests {
             .cloned()
             .collect();
 
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
             .expect("burst loss repair failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
@@ -1400,7 +1753,8 @@ mod tests {
             .cloned()
             .collect();
 
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
             .expect("odd-sized decode failed");
 
         assert_eq!(result.reconstructed_envelope.len(), 1337);
@@ -1430,7 +1784,8 @@ mod tests {
         // Provide only 3 symbols total (out of 10 needed)
         let received: Vec<_> = bundle.symbols.iter().take(3).cloned().collect();
 
-        let err = decode_repair_symbols(&cx, &bundle.manifest, &received, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let err = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
             .expect_err("insufficient rank must fail");
 
         match err {
@@ -1470,7 +1825,8 @@ mod tests {
         // Flip one byte in symbol 0 payload
         tampered_symbols[0].payload[10] ^= 0xFF;
 
-        let err = decode_repair_symbols(&cx, &bundle.manifest, &tampered_symbols, key, &admission)
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let err = decode_repair_symbols(&cx, &bundle.manifest, &tampered_symbols, &expected, key, &admission)
             .expect_err("tampered symbol must fail");
 
         match err {
@@ -1504,8 +1860,9 @@ mod tests {
         let mut tampered_manifest = bundle.manifest.clone();
         tampered_manifest.manifest_mac[5] ^= 0xAA; // Corrupt MAC
 
+        let expected = ExpectedRecoveryIdentity::from_manifest(&tampered_manifest);
         let err =
-            decode_repair_symbols(&cx, &tampered_manifest, &bundle.symbols, key, &admission)
+            decode_repair_symbols(&cx, &tampered_manifest, &bundle.symbols, &expected, key, &admission)
                 .expect_err("tampered manifest must fail");
 
         assert_eq!(err, RepairError::ManifestAuthenticationFailed);
@@ -1532,10 +1889,12 @@ mod tests {
         )
         .expect("encode failed");
 
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
         let err = decode_repair_symbols(
             &cx,
             &bundle.manifest,
             &bundle.symbols,
+            &expected,
             wrong_key,
             &admission,
         )
@@ -1591,8 +1950,9 @@ mod tests {
         symbols_with_dupes.push(bundle.symbols[0].clone());
         symbols_with_dupes.push(bundle.symbols[0].clone());
 
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
         let result =
-            decode_repair_symbols(&cx, &bundle.manifest, &symbols_with_dupes, key, &admission)
+            decode_repair_symbols(&cx, &bundle.manifest, &symbols_with_dupes, &expected, key, &admission)
                 .expect("benign duplicates should be discarded gracefully");
 
         assert_eq!(result.reconstructed_envelope, payload);
@@ -1637,8 +1997,9 @@ mod tests {
         let mut symbols_with_conflict = bundle.symbols.clone();
         symbols_with_conflict.push(conflicting_sym);
 
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
         let err =
-            decode_repair_symbols(&cx, &bundle.manifest, &symbols_with_conflict, key, &admission)
+            decode_repair_symbols(&cx, &bundle.manifest, &symbols_with_conflict, &expected, key, &admission)
                 .expect_err("conflicting duplicate must fail");
 
         match err {
@@ -1671,13 +2032,16 @@ mod tests {
 
         // Foreign expected representation ID
         let foreign_rep = [0xEEu8; 32];
-        let err = decode_repair_symbols_with_expected(
+        let expected_wrong_rep = ExpectedRecoveryIdentity::new(
+            foreign_rep,
+            bundle.manifest.object_id,
+            bundle.manifest.generation,
+        );
+        let err = decode_repair_symbols(
             &cx,
             &bundle.manifest,
             &bundle.symbols,
-            Some(&foreign_rep),
-            None,
-            None,
+            &expected_wrong_rep,
             key,
             &admission,
         )
@@ -1693,13 +2057,16 @@ mod tests {
 
         // Foreign expected object ID
         let foreign_obj = sample_object_id(99);
-        let err2 = decode_repair_symbols_with_expected(
+        let expected_wrong_obj = ExpectedRecoveryIdentity::new(
+            bundle.manifest.representation_id,
+            foreign_obj,
+            bundle.manifest.generation,
+        );
+        let err2 = decode_repair_symbols(
             &cx,
             &bundle.manifest,
             &bundle.symbols,
-            None,
-            Some(&foreign_obj),
-            None,
+            &expected_wrong_obj,
             key,
             &admission,
         )
@@ -1714,13 +2081,16 @@ mod tests {
         );
 
         // Foreign expected generation
-        let err3 = decode_repair_symbols_with_expected(
+        let expected_wrong_gen = ExpectedRecoveryIdentity::new(
+            bundle.manifest.representation_id,
+            bundle.manifest.object_id,
+            999,
+        );
+        let err3 = decode_repair_symbols(
             &cx,
             &bundle.manifest,
             &bundle.symbols,
-            None,
-            None,
-            Some(999),
+            &expected_wrong_gen,
             key,
             &admission,
         )
@@ -1762,6 +2132,7 @@ mod tests {
             &multiblock_manifest.representation_id,
             &multiblock_manifest.object_id,
             multiblock_manifest.generation,
+            multiblock_manifest.protection_class,
             multiblock_manifest.sbn,
             multiblock_manifest.k,
             multiblock_manifest.symbol_size,
@@ -1770,10 +2141,12 @@ mod tests {
         )
         .expect("compute mac");
 
+        let expected = ExpectedRecoveryIdentity::from_manifest(&multiblock_manifest);
         let err = decode_repair_symbols(
             &cx,
             &multiblock_manifest,
             &bundle.symbols,
+            &expected,
             key,
             &admission,
         )
@@ -1887,5 +2260,457 @@ mod tests {
         }
         drop(permit1);
         let _permit3 = admission.acquire(2000).expect("succeeds after drop");
+    }
+
+    #[test]
+    fn test_tampered_protection_class_rejected() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let payload = sample_envelope(5_000);
+        let obj_id = sample_object_id(17);
+        let key = b"test-secret-key-32-bytes-long!!";
+
+        let bundle = encode_repair_envelope(
+            &cx,
+            &payload,
+            obj_id,
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .expect("encode failed");
+
+        // Tamper with protection_class in manifest without updating manifest_mac
+        let mut tampered_manifest = bundle.manifest.clone();
+        tampered_manifest.protection_class = RepairProtectionClass::Maximum;
+
+        assert!(!verify_manifest_mac(key, &tampered_manifest));
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&tampered_manifest);
+        let err = decode_repair_symbols(
+            &cx,
+            &tampered_manifest,
+            &bundle.symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("tampered protection_class must fail manifest authentication");
+
+        assert_eq!(err, RepairError::ManifestAuthenticationFailed);
+    }
+
+    #[test]
+    fn test_shared_admission_controller_aggregate_limit() {
+        let shared = shared_admission_controller();
+        // Record starting active operations
+        let initial_ops = shared.active_operations();
+
+        // Acquire a permit from shared controller
+        let permit = shared.acquire(1024).expect("permit from shared controller succeeds");
+        assert_eq!(shared.active_operations(), initial_ops + 1);
+
+        drop(permit);
+        assert_eq!(shared.active_operations(), initial_ops);
+    }
+
+    #[test]
+    fn test_checked_cas_concurrency_and_memory_overflow() {
+        let admission = RepairAdmissionController::new(2, 5_000, 100);
+
+        // 1. Acquire up to max concurrency
+        let p1 = admission.acquire(1_000).expect("permit 1 succeeds");
+        let p2 = admission.acquire(1_000).expect("permit 2 succeeds");
+
+        // Concurrency limit exceeded
+        let err_conc = admission.acquire(1_000).expect_err("permit 3 must exceed concurrency");
+        match err_conc {
+            RepairError::AdmissionExceeded(msg) => assert!(msg.contains("concurrency limit")),
+            other => panic!("expected AdmissionExceeded, got {other:?}"),
+        }
+
+        drop(p2);
+
+        // 2. Memory limit exceeded (4001 + 1000 = 5001 > 5000)
+        let err_mem = admission.acquire(4001).expect_err("exceeds memory limit");
+        match err_mem {
+            RepairError::AdmissionExceeded(msg) => assert!(msg.contains("memory limit")),
+            other => panic!("expected AdmissionExceeded, got {other:?}"),
+        }
+
+        // 3. Counter overflow protection with usize::MAX
+        let err_overflow = admission.acquire(usize::MAX).expect_err("overflow must be rejected");
+        match err_overflow {
+            RepairError::AdmissionExceeded(msg) => assert!(msg.contains("limit") || msg.contains("overflow")),
+            other => panic!("expected AdmissionExceeded, got {other:?}"),
+        }
+
+        drop(p1);
+        assert_eq!(admission.active_operations(), 0);
+        assert_eq!(admission.allocated_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn test_invalid_payload_len_k_mismatch_rejected() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let key = b"test-secret-key-32-bytes-long!!";
+        let obj_id = sample_object_id(18);
+        let rep_id = [42u8; 32];
+        let symbol_size = 1024u32;
+        let payload_len = 5000u64; // div_ceil(1024) is 5
+        let invalid_k = 10u32; // mismatch! 10 != 5
+        let total_symbols = 15u32;
+
+        let mac = compute_manifest_mac(
+            key,
+            &rep_id,
+            &obj_id,
+            1,
+            RepairProtectionClass::Standard,
+            0,
+            invalid_k,
+            symbol_size,
+            payload_len,
+            total_symbols,
+        )
+        .expect("compute mac");
+
+        let manifest = RepairManifest {
+            representation_id: rep_id,
+            object_id: obj_id,
+            generation: 1,
+            sbn: 0,
+            k: invalid_k,
+            symbol_size,
+            payload_len,
+            total_symbols_generated: total_symbols,
+            protection_class: RepairProtectionClass::Standard,
+            manifest_mac: mac,
+        };
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&manifest);
+        let err = decode_repair_symbols(
+            &cx,
+            &manifest,
+            &[],
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("k mismatch must fail");
+
+        match err {
+            RepairError::InvalidGeometry { reason } => {
+                assert!(reason.contains("requires K 5, but manifest specifies K 10"));
+            }
+            other => panic!("expected InvalidGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_manifest_total_symbols_less_than_k_rejected() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let key = b"test-secret-key-32-bytes-long!!";
+        let obj_id = sample_object_id(19);
+        let rep_id = [43u8; 32];
+        let symbol_size = 1024u32;
+        let payload_len = 5120u64; // div_ceil(1024) is 5
+        let k = 5u32;
+        let invalid_total_symbols = 4u32; // < 5
+
+        let mac = compute_manifest_mac(
+            key,
+            &rep_id,
+            &obj_id,
+            1,
+            RepairProtectionClass::Standard,
+            0,
+            k,
+            symbol_size,
+            payload_len,
+            invalid_total_symbols,
+        )
+        .expect("compute mac");
+
+        let manifest = RepairManifest {
+            representation_id: rep_id,
+            object_id: obj_id,
+            generation: 1,
+            sbn: 0,
+            k,
+            symbol_size,
+            payload_len,
+            total_symbols_generated: invalid_total_symbols,
+            protection_class: RepairProtectionClass::Standard,
+            manifest_mac: mac,
+        };
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&manifest);
+        let err = decode_repair_symbols(
+            &cx,
+            &manifest,
+            &[],
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("total_symbols < k must fail");
+
+        match err {
+            RepairError::InvalidGeometry { reason } => {
+                assert!(reason.contains("total_symbols_generated 4 < K 5"));
+            }
+            other => panic!("expected InvalidGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_repair_symbol_esi_out_of_range_rejected() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let payload = sample_envelope(3000);
+        let obj_id = sample_object_id(20);
+        let key = b"test-secret-key-32-bytes-long!!";
+
+        let bundle = encode_repair_envelope(
+            &cx,
+            &payload,
+            obj_id,
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .expect("encode");
+
+        let total_gen = bundle.manifest.total_symbols_generated;
+        let out_of_bounds_esi = total_gen + 10;
+        let dummy_payload = vec![0x55u8; DEFAULT_SYMBOL_SIZE];
+        let tag = compute_symbol_mac(
+            key,
+            &bundle.manifest.representation_id,
+            &bundle.manifest.object_id,
+            bundle.manifest.generation,
+            bundle.manifest.sbn,
+            RepairSymbolKind::Repair,
+            out_of_bounds_esi,
+            &dummy_payload,
+        )
+        .expect("compute tag");
+
+        let bad_symbol = AuthenticatedRepairSymbol {
+            kind: RepairSymbolKind::Repair,
+            sbn: bundle.manifest.sbn,
+            esi: out_of_bounds_esi,
+            payload: dummy_payload,
+            tag,
+        };
+
+        let mut symbols = bundle.symbols.clone();
+        symbols.push(bad_symbol);
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let err = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("out of bounds repair ESI must fail");
+
+        match err {
+            RepairError::InvalidGeometry { reason } => {
+                assert!(reason.contains("repair symbol ESI"));
+                assert!(reason.contains(">= total_symbols_generated"));
+            }
+            other => panic!("expected InvalidGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_cancellation_fails_closed() {
+        let mut cx = test_cx();
+        cx.cancel(); // Pre-cancel context
+        let admission = RepairAdmissionController::default_production();
+        let payload = sample_envelope(4000);
+        let obj_id = sample_object_id(21);
+        let key = b"test-secret-key-32-bytes-long!!";
+
+        let live_cx = test_cx();
+        let bundle = encode_repair_envelope(
+            &live_cx,
+            &payload,
+            obj_id,
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .expect("encode");
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+
+        // Cancelled decode on fast path (all source symbols)
+        let err_fast = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &bundle.symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("cancelled decode must fail");
+        assert_eq!(err_fast, RepairError::Cancelled);
+
+        // Cancelled decode on general path (drop first source symbol, keep repair symbols)
+        let repair_only: Vec<_> = bundle.symbols.iter().skip(1).cloned().collect();
+        let err_general = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &repair_only,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("cancelled general decode must fail");
+        assert_eq!(err_general, RepairError::Cancelled);
+    }
+
+    #[test]
+    fn test_returned_buffer_permit_retention_and_shrink() {
+        let cx = test_cx();
+        // Memory cap: 60,000 bytes, concurrency 2
+        let admission = RepairAdmissionController::new(2, 60_000, 100);
+        let payload = sample_envelope(3_500);
+        let obj_id = sample_object_id(22);
+        let key = b"test-secret-key-32-bytes-long!!";
+
+        let live_cx = test_cx();
+        let bundle = encode_repair_envelope(
+            &live_cx,
+            &payload,
+            obj_id,
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .expect("encode");
+
+        // After encode bundle returned, its temporary permit dropped
+        assert_eq!(admission.allocated_memory_bytes(), 0);
+        assert_eq!(admission.active_operations(), 0);
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &bundle.symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect("decode");
+
+        // The returned buffer (3,500 bytes) retains its permit charge, shrunk from scratchpad!
+        assert_eq!(result.reconstructed_envelope.len(), 3_500);
+        assert_eq!(result.permit.allocated_bytes(), 3_500);
+        assert_eq!(admission.allocated_memory_bytes(), 3_500);
+        assert_eq!(admission.active_operations(), 1);
+
+        // Another acquisition exceeding remaining memory (60,000 - 3,500 = 56,500) fails
+        let err = admission.acquire(56_501).expect_err("must exceed remaining memory");
+        match err {
+            RepairError::AdmissionExceeded(msg) => assert!(msg.contains("memory limit")),
+            other => panic!("expected AdmissionExceeded, got {other:?}"),
+        }
+
+        // Dropping result releases the permit and frees the memory back to the controller
+        drop(result);
+        assert_eq!(admission.allocated_memory_bytes(), 0);
+        assert_eq!(admission.active_operations(), 0);
+
+        // Now full 60,000 reservation succeeds
+        let _permit = admission.acquire(60_000).expect("full reservation succeeds after drop");
+    }
+
+    #[test]
+    fn test_permit_into_envelope_releases_permit() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let payload = sample_envelope(2_000);
+        let obj_id = sample_object_id(23);
+        let key = b"test-secret-key-32-bytes-long!!";
+
+        let bundle = encode_repair_envelope(
+            &cx,
+            &payload,
+            obj_id,
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .expect("encode");
+
+        let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
+        let result = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &bundle.symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect("decode");
+
+        assert_eq!(admission.allocated_memory_bytes(), 2_000);
+        let envelope = result.into_envelope();
+        assert_eq!(envelope, payload);
+        // into_envelope dropped the permit
+        assert_eq!(admission.allocated_memory_bytes(), 0);
+        assert_eq!(admission.active_operations(), 0);
+    }
+
+    #[test]
+    fn test_unasserted_decode_test_only_wrapper() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let payload = sample_envelope(1_500);
+        let obj_id = sample_object_id(24);
+        let key = b"test-secret-key-32-bytes-long!!";
+
+        let bundle = encode_repair_envelope(
+            &cx,
+            &payload,
+            obj_id,
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .expect("encode");
+
+        let result = decode_repair_symbols_unasserted(
+            &cx,
+            &bundle.manifest,
+            &bundle.symbols,
+            key,
+            &admission,
+        )
+        .expect("unasserted decode in test succeeds");
+
+        assert_eq!(result.reconstructed_envelope, payload);
     }
 }

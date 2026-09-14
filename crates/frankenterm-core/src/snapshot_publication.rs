@@ -36,7 +36,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -191,6 +191,16 @@ pub enum PublicationError {
         generation: u64,
         reason: String,
     },
+
+    #[error("Generation {generation} is already published with conflicting content (expected {expected}, found {existing})")]
+    GenerationConflict {
+        generation: u64,
+        expected: String,
+        existing: String,
+    },
+
+    #[error("Target file '{path}' already exists")]
+    AlreadyExists { path: PathBuf },
 
     #[error("No verified root available")]
     NoVerifiedRoot,
@@ -470,7 +480,13 @@ fn generate_stage_name(sha256_prefix: &str) -> String {
 
 /// RAII guard representing an exclusive, descriptor-bound cross-process publication lock.
 pub struct PublicationLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for PublicationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 /// Verify that a directory has private permissions (0700) and is owned by the current process.
@@ -568,6 +584,52 @@ fn ensure_directory_hierarchy_nofollow(path: &Path) -> Result<Dir, PublicationEr
 
 
 // =============================================================================
+// Bounded File Reading Guarding Against File Growth
+// =============================================================================
+
+/// Reads a file with bounds enforcement guarding against concurrent file growth.
+///
+/// Limits read to `max_bytes + 1` via `Read::take`, preventing unbounded allocation.
+/// Verifies that the total bytes read does not exceed `max_bytes` and exactly matches `expected_len`.
+fn read_file_bounded_exact<R: Read>(
+    reader: &mut R,
+    expected_len: u64,
+    max_bytes: u64,
+    path: &Path,
+) -> Result<Vec<u8>, PublicationError> {
+    if expected_len > max_bytes {
+        return Err(PublicationError::OversizedPayload {
+            max_bytes,
+            actual_bytes: expected_len,
+        });
+    }
+
+    let read_limit = max_bytes.saturating_add(1);
+    let mut limited = reader.take(read_limit);
+    let mut buffer = Vec::with_capacity(expected_len as usize);
+    limited
+        .read_to_end(&mut buffer)
+        .map_err(|e| PublicationError::io(path, e))?;
+
+    let actual_len = buffer.len() as u64;
+    if actual_len > max_bytes {
+        return Err(PublicationError::OversizedPayload {
+            max_bytes,
+            actual_bytes: actual_len,
+        });
+    }
+    if actual_len != expected_len {
+        return Err(PublicationError::FileLengthChanged {
+            path: path.to_path_buf(),
+            expected: expected_len,
+            actual: actual_len,
+        });
+    }
+
+    Ok(buffer)
+}
+
+// =============================================================================
 // Envelope Encoding / Decoding
 // =============================================================================
 
@@ -592,6 +654,13 @@ fn encode_root_envelope(
             reason: format!("failed to serialize envelope header: {e}"),
         }
     })?;
+
+    if (header_json.len() as u64) > MAX_ENVELOPE_HEADER_BYTES {
+        return Err(PublicationError::OversizedPayload {
+            max_bytes: MAX_ENVELOPE_HEADER_BYTES,
+            actual_bytes: header_json.len() as u64,
+        });
+    }
 
     let header_len = u32::try_from(header_json.len()).map_err(|_| {
         PublicationError::OversizedPayload {
@@ -623,11 +692,12 @@ fn encode_root_envelope(
 fn decode_root_envelope(
     slot: RootSlot,
     bytes: &[u8],
-    max_bytes: u64,
+    max_envelope_bytes: u64,
+    max_manifest_bytes: u64,
 ) -> Result<RootSlotCandidate, PublicationError> {
-    if (bytes.len() as u64) > max_bytes {
+    if (bytes.len() as u64) > max_envelope_bytes {
         return Err(PublicationError::OversizedPayload {
-            max_bytes,
+            max_bytes: max_envelope_bytes,
             actual_bytes: bytes.len() as u64,
         });
     }
@@ -664,6 +734,15 @@ fn decode_root_envelope(
     header_len_bytes.copy_from_slice(&bytes[ENVELOPE_MAGIC.len()..ENVELOPE_MAGIC.len() + 4]);
     let header_len = u32::from_le_bytes(header_len_bytes) as usize;
 
+    if (header_len as u64) > MAX_ENVELOPE_HEADER_BYTES {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: format!(
+                "envelope header length {header_len} exceeds maximum allowed header size of {MAX_ENVELOPE_HEADER_BYTES}"
+            ),
+        });
+    }
+
     let header_start = ENVELOPE_MAGIC.len() + 4;
     let header_end = header_start + header_len;
     if header_end > content_len {
@@ -688,6 +767,13 @@ fn decode_root_envelope(
                 header.manifest_len,
                 manifest_bytes.len()
             ),
+        });
+    }
+
+    if (manifest_bytes.len() as u64) > max_manifest_bytes {
+        return Err(PublicationError::OversizedPayload {
+            max_bytes: max_manifest_bytes,
+            actual_bytes: manifest_bytes.len() as u64,
         });
     }
 
@@ -888,6 +974,9 @@ impl SnapshotPublicationStore {
     }
 
     /// Acquires an exclusive, descriptor-bound cross-process publication lock on `.publication.lock`.
+    ///
+    /// Revalidates the named lock inode after acquiring the blocking lock to eliminate lock domain
+    /// splitting if the file was replaced while blocking.
     pub fn acquire_publication_lock(&self) -> Result<PublicationLock, PublicationError> {
         let lock_leaf = ".publication.lock";
         let lock_path = self.root_path.join(lock_leaf);
@@ -901,20 +990,102 @@ impl SnapshotPublicationStore {
             opts.mode(0o600);
         }
 
-        let cap_file = self
-            .root_dir
-            .open_with(lock_leaf, &opts)
-            .map_err(|e| PublicationError::io(&lock_path, e))?;
+        loop {
+            let cap_file = self
+                .root_dir
+                .open_with(lock_leaf, &opts)
+                .map_err(|e| PublicationError::io(&lock_path, e))?;
 
-        check_opened_file_security(&cap_file, &lock_path)?;
+            check_opened_file_security(&cap_file, &lock_path)?;
 
-        let std_file = cap_file.into_std();
-        std_file
-            .lock_exclusive()
-            .map_err(|e| PublicationError::io(&lock_path, e))?;
+            let std_file = cap_file.into_std();
+            std_file
+                .lock_exclusive()
+                .map_err(|e| PublicationError::io(&lock_path, e))?;
 
-        Ok(PublicationLock { _file: std_file })
+            // Revalidate named lock inode after blocking lock acquired
+            let opened_meta = std_file
+                .metadata()
+                .map_err(|e| PublicationError::io(&lock_path, e))?;
+
+            let named_meta = match self.root_dir.symlink_metadata(lock_leaf) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    drop(std_file);
+                    continue;
+                }
+                Err(e) => return Err(PublicationError::io(&lock_path, e)),
+            };
+
+            if named_meta.file_type().is_symlink() || !named_meta.is_file() {
+                return Err(PublicationError::InsecurePermissions {
+                    path: lock_path.clone(),
+                    reason: "named lock path is not a regular file or is a symlink".to_string(),
+                });
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if opened_meta.dev() != named_meta.dev() || opened_meta.ino() != named_meta.ino() {
+                    // Lock file was replaced while blocking! Unlock old inode and retry on new inode.
+                    drop(std_file);
+                    continue;
+                }
+            }
+
+            return Ok(PublicationLock { file: std_file });
+        }
     }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_object_noreplace(
+    objects_dir: &Dir,
+    stage_name: &str,
+    target_name: &str,
+) -> Result<(), PublicationError> {
+    use rustix::fs::{renameat_with, RenameFlags};
+
+    let parent_file = objects_dir
+        .open(".")
+        .map_err(|e| PublicationError::io(target_name, e))?
+        .into_std();
+
+    match renameat_with(
+        &parent_file,
+        stage_name,
+        &parent_file,
+        target_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            Err(PublicationError::AlreadyExists {
+                path: PathBuf::from(target_name),
+            })
+        }
+        Err(error) => Err(PublicationError::io(
+            target_name,
+            std::io::Error::from_raw_os_error(error.raw_os_error()),
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_object_noreplace(
+    objects_dir: &Dir,
+    stage_name: &str,
+    target_name: &str,
+) -> Result<(), PublicationError> {
+    if objects_dir.symlink_metadata(target_name).is_ok() {
+        return Err(PublicationError::AlreadyExists {
+            path: PathBuf::from(target_name),
+        });
+    }
+    objects_dir
+        .rename(stage_name, objects_dir, target_name)
+        .map_err(|e| PublicationError::io(target_name, e))
+}
 
     // -------------------------------------------------------------------------
     // Object Storage (Immutable, No-Clobber)
@@ -970,11 +1141,13 @@ impl SnapshotPublicationStore {
                         existing: format!("conflicting length ({actual_len} bytes)"),
                     });
                 }
-                let mut existing_bytes = Vec::with_capacity(actual_len as usize);
                 let mut reader = existing_file;
-                reader
-                    .read_to_end(&mut existing_bytes)
-                    .map_err(|e| PublicationError::io(&target_full_path, e))?;
+                let existing_bytes = read_file_bounded_exact(
+                    &mut reader,
+                    actual_len,
+                    self.limits.max_object_bytes,
+                    &target_full_path,
+                )?;
                 let existing_sha256 = sha256_hex(&existing_bytes);
                 if existing_sha256 != computed_sha256 {
                     return Err(PublicationError::ObjectConflict {
@@ -1024,59 +1197,108 @@ impl SnapshotPublicationStore {
             .sync_all()
             .map_err(|e| PublicationError::io(&stage_path, e))?;
 
+        // Reread and verify stage descriptor bytes before publication
+        let stage_len = check_opened_file_security(&stage_file, &stage_path)?;
+        if stage_len != payload_len {
+            return Err(PublicationError::FileLengthChanged {
+                path: stage_path.clone(),
+                expected: payload_len,
+                actual: stage_len,
+            });
+        }
+        stage_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+        let read_bytes = read_file_bounded_exact(
+            &mut stage_file,
+            stage_len,
+            self.limits.max_object_bytes,
+            &stage_path,
+        )?;
+        if read_bytes != object.ciphertext_bytes {
+            return Err(PublicationError::ObjectConflict {
+                object_id: object.object_id.clone(),
+                expected: computed_sha256,
+                existing: sha256_hex(&read_bytes),
+            });
+        }
+
+        // Revalidate stage binding before atomic publication
+        let stage_named_meta = self
+            .objects_dir
+            .symlink_metadata(&stage_name)
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+        let stage_fd_meta = stage_file
+            .metadata()
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if stage_named_meta.dev() != stage_fd_meta.dev()
+                || stage_named_meta.ino() != stage_fd_meta.ino()
+            {
+                return Err(PublicationError::InsecurePermissions {
+                    path: stage_path.clone(),
+                    reason: "staging object file inode changed before publish".to_string(),
+                });
+            }
+        }
         drop(stage_file);
 
-        // Pre-rename recheck: under publication lock, ensure target is not present or identical
-        match self.objects_dir.open_with(&target_name, &open_opts) {
-            Ok(existing_file) => {
-                let actual_len = check_opened_file_security(&existing_file, &target_full_path)?;
-                let mut existing_bytes = Vec::with_capacity(actual_len as usize);
-                let mut reader = existing_file;
-                reader
-                    .read_to_end(&mut existing_bytes)
+        // Atomic no-clobber publication + exact-existing adoption
+        match publish_object_noreplace(&self.objects_dir, &stage_name, &target_name) {
+            Ok(()) => {
+                // Fsync parent objects directory
+                let dir_sync_file = self
+                    .objects_dir
+                    .open(".")
+                    .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
+                dir_sync_file
+                    .sync_all()
+                    .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
+
+                Ok(ObjectPublicationReceipt {
+                    object_id: object.object_id.clone(),
+                    sha256: computed_sha256,
+                    byte_len: payload_len,
+                    path: target_full_path,
+                    was_already_present: false,
+                })
+            }
+            Err(PublicationError::AlreadyExists { .. }) => {
+                // Target already exists: no-clobber primitive prevented overwrite.
+                // Adopt exact existing target if content matches.
+                let existing_file = self
+                    .objects_dir
+                    .open_with(&target_name, &open_opts)
                     .map_err(|e| PublicationError::io(&target_full_path, e))?;
+                let actual_len = check_opened_file_security(&existing_file, &target_full_path)?;
+                let mut reader = existing_file;
+                let existing_bytes = read_file_bounded_exact(
+                    &mut reader,
+                    actual_len,
+                    self.limits.max_object_bytes,
+                    &target_full_path,
+                )?;
                 let existing_sha256 = sha256_hex(&existing_bytes);
                 if existing_sha256 == computed_sha256 && actual_len == payload_len {
-                    return Ok(ObjectPublicationReceipt {
+                    Ok(ObjectPublicationReceipt {
                         object_id: object.object_id.clone(),
                         sha256: computed_sha256,
                         byte_len: payload_len,
                         path: target_full_path,
                         was_already_present: true,
-                    });
+                    })
                 } else {
-                    return Err(PublicationError::ObjectConflict {
+                    Err(PublicationError::ObjectConflict {
                         object_id: object.object_id.clone(),
                         expected: computed_sha256,
                         existing: existing_sha256,
-                    });
+                    })
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(PublicationError::io(&target_full_path, e)),
+            Err(e) => Err(e),
         }
-
-        // Atomic rename into target name
-        self.objects_dir
-            .rename(&stage_name, &target_name)
-            .map_err(|e| PublicationError::io(&target_full_path, e))?;
-
-        // Fsync parent objects directory
-        let dir_sync_file = self
-            .objects_dir
-            .open(".")
-            .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
-        dir_sync_file
-            .sync_all()
-            .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
-
-        Ok(ObjectPublicationReceipt {
-            object_id: object.object_id.clone(),
-            sha256: computed_sha256,
-            byte_len: payload_len,
-            path: target_full_path,
-            was_already_present: false,
-        })
     }
 
     /// Reads an immutable recovery object by its unique ID.
@@ -1094,16 +1316,13 @@ impl SnapshotPublicationStore {
             .map_err(|e| PublicationError::io(&target_path, e))?;
 
         let file_len = check_opened_file_security(&file, &target_path)?;
-        if file_len > self.limits.max_object_bytes {
-            return Err(PublicationError::OversizedPayload {
-                max_bytes: self.limits.max_object_bytes,
-                actual_bytes: file_len,
-            });
-        }
-
-        let mut bytes = Vec::with_capacity(file_len as usize);
-        file.read_to_end(&mut bytes)
-            .map_err(|e| PublicationError::io(&target_path, e))?;
+        let mut reader = file;
+        let bytes = read_file_bounded_exact(
+            &mut reader,
+            file_len,
+            self.limits.max_object_bytes,
+            &target_path,
+        )?;
 
         Ok(bytes)
     }
@@ -1192,29 +1411,41 @@ impl SnapshotPublicationStore {
                         }
                     };
 
-                    if file_len > self.limits.max_root_manifest_bytes {
+                    let max_envelope_bytes = self.limits.max_root_envelope_bytes();
+                    if file_len > max_envelope_bytes {
                         diagnostics.push(TornRootDiagnostic {
                             slot,
                             generation: None,
                             reason: format!(
-                                "slot file length {file_len} exceeds limit of {}",
-                                self.limits.max_root_manifest_bytes
+                                "slot file length {file_len} exceeds envelope limit of {max_envelope_bytes}"
                             ),
                         });
                         continue;
                     }
 
-                    let mut bytes = Vec::with_capacity(file_len as usize);
-                    if let Err(e) = file.read_to_end(&mut bytes) {
-                        diagnostics.push(TornRootDiagnostic {
-                            slot,
-                            generation: None,
-                            reason: format!("failed to read slot file: {e}"),
-                        });
-                        continue;
-                    }
+                    let bytes = match read_file_bounded_exact(
+                        &mut file,
+                        file_len,
+                        max_envelope_bytes,
+                        &slot_path,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            diagnostics.push(TornRootDiagnostic {
+                                slot,
+                                generation: None,
+                                reason: format!("failed to read slot file: {e}"),
+                            });
+                            continue;
+                        }
+                    };
 
-                    match decode_root_envelope(slot, &bytes, self.limits.max_root_manifest_bytes) {
+                    match decode_root_envelope(
+                        slot,
+                        &bytes,
+                        max_envelope_bytes,
+                        self.limits.max_root_manifest_bytes,
+                    ) {
                         Ok(candidate) => candidates.push(candidate),
                         Err(e) => diagnostics.push(TornRootDiagnostic {
                             slot,
@@ -1330,7 +1561,49 @@ impl SnapshotPublicationStore {
         verified_candidates.sort_by(|a, b| b.generation.cmp(&a.generation));
         let active_candidate = verified_candidates.first().copied();
 
-        // 3. Validate generation ordering and predecessor linkage
+        let manifest_sha256 = sha256_hex(&request.manifest_bytes);
+
+        // 3. Lost-reply retry reconciliation:
+        // If ANY verified root in the store has the same generation as the request,
+        // check for exact identity match. If identical: reconcile idempotently BEFORE
+        // stale predecessor rejection!
+        for candidate in &verified_candidates {
+            if candidate.generation == request.generation {
+                let expected_pred_gen = request.predecessor.as_ref().map(|p| p.expected_generation);
+                let expected_pred_hash = request.predecessor.as_ref().map(|p| p.expected_hash.as_str());
+                let actual_pred_hash = candidate.predecessor_hash.as_deref();
+
+                if candidate.manifest_sha256 == manifest_sha256
+                    && candidate.publisher_id == request.publisher_id
+                    && candidate.predecessor_generation == expected_pred_gen
+                    && actual_pred_hash == expected_pred_hash
+                    && candidate.manifest_bytes == request.manifest_bytes
+                {
+                    return Ok(GenerationPublicationReceipt {
+                        generation: request.generation,
+                        publisher_id: request.publisher_id.clone(),
+                        slot: candidate.slot,
+                        sha256: manifest_sha256,
+                        byte_len: candidate.file_len,
+                        path: self.root_path.join(ROOTS_DIR_NAME).join(candidate.slot.filename()),
+                    });
+                } else {
+                    return Err(PublicationError::GenerationConflict {
+                        generation: request.generation,
+                        expected: format!(
+                            "publisher={}, hash={manifest_sha256}",
+                            request.publisher_id
+                        ),
+                        existing: format!(
+                            "publisher={}, hash={}",
+                            candidate.publisher_id, candidate.manifest_sha256
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 4. Validate generation ordering and predecessor linkage
         if request.generation <= 1 {
             if request.predecessor.is_some() {
                 return Err(PublicationError::InitialGenerationWithPredecessor {
@@ -1383,21 +1656,28 @@ impl SnapshotPublicationStore {
             }
         }
 
-        // 4. Select the INACTIVE slot to publish to
+        // 5. Select the INACTIVE slot to publish to
         let target_slot = match active_candidate {
             Some(active) => active.slot.other(),
             None => RootSlot::SlotA,
         };
 
-        let manifest_sha256 = sha256_hex(&request.manifest_bytes);
         let envelope_bytes = encode_root_envelope(request, &manifest_sha256)?;
+        let max_envelope_bytes = self.limits.max_root_envelope_bytes();
+        if (envelope_bytes.len() as u64) > max_envelope_bytes {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: max_envelope_bytes,
+                actual_bytes: envelope_bytes.len() as u64,
+            });
+        }
 
-        // 5. Stage file in roots directory
+        // 6. Stage file in roots directory
         let stage_name = generate_stage_name(&manifest_sha256[..8]);
         let stage_path = self.root_path.join(ROOTS_DIR_NAME).join(&stage_name);
 
         let mut stage_opts = OpenOptions::new();
         stage_opts
+            .read(true)
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
@@ -1421,39 +1701,114 @@ impl SnapshotPublicationStore {
             .sync_all()
             .map_err(|e| PublicationError::io(&stage_path, e))?;
 
-        drop(stage_file);
-
-        // 6. VERIFY CANDIDATE + FULL OBJECT CLOSURE IN STAGING BEFORE REPLACING INACTIVE SELECTOR!
-        // If verification fails: do NOT rename! Both active and inactive slots are 100% preserved.
-        let staged_candidate = RootSlotCandidate {
-            slot: target_slot,
-            generation: request.generation,
-            publisher_id: request.publisher_id.clone(),
-            predecessor_generation: request.predecessor.as_ref().map(|p| p.expected_generation),
-            predecessor_hash: request.predecessor.as_ref().map(|p| p.expected_hash.clone()),
-            manifest_sha256: manifest_sha256.clone(),
-            manifest_bytes: request.manifest_bytes.clone(),
-            file_len: envelope_bytes.len() as u64,
-            created_at_ms: request.created_at_ms,
-        };
-
-        if let Err(e) = verifier.verify_root(&staged_candidate, self) {
-            return Err(PublicationError::VerificationRejected {
-                slot: target_slot,
-                generation: request.generation,
-                reason: format!("proposal failed caller verification in staging (both slots preserved): {e}"),
+        // 7. Reread and decode bounded retained stage descriptor, verify actual candidate
+        let file_len = check_opened_file_security(&stage_file, &stage_path)?;
+        if file_len != envelope_bytes.len() as u64 {
+            return Err(PublicationError::FileLengthChanged {
+                path: stage_path.clone(),
+                expected: envelope_bytes.len() as u64,
+                actual: file_len,
             });
         }
 
-        // 7. Atomic rename stage file into target slot
+        stage_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        let actual_envelope_bytes = read_file_bounded_exact(
+            &mut stage_file,
+            file_len,
+            max_envelope_bytes,
+            &stage_path,
+        )?;
+
+        let actual_candidate = decode_root_envelope(
+            target_slot,
+            &actual_envelope_bytes,
+            max_envelope_bytes,
+            self.limits.max_root_manifest_bytes,
+        )?;
+
+        // Identity check: actual candidate read from descriptor must match request
+        if actual_candidate.generation != request.generation
+            || actual_candidate.publisher_id != request.publisher_id
+            || actual_candidate.manifest_sha256 != manifest_sha256
+            || actual_candidate.manifest_bytes != request.manifest_bytes
+            || actual_candidate.predecessor_generation != request.predecessor.as_ref().map(|p| p.expected_generation)
+            || actual_candidate.predecessor_hash != request.predecessor.as_ref().map(|p| p.expected_hash.clone())
+        {
+            return Err(PublicationError::InvalidEnvelope {
+                slot: target_slot,
+                reason: "stage descriptor read-back does not match requested envelope parameters".to_string(),
+            });
+        }
+
+        // Verify actual candidate read from disk
+        if let Err(e) = verifier.verify_root(&actual_candidate, self) {
+            return Err(PublicationError::VerificationRejected {
+                slot: target_slot,
+                generation: request.generation,
+                reason: format!("actual candidate failed caller verification in staging (both slots preserved): {e}"),
+            });
+        }
+
+        // 8. Revalidate stage binding before atomic rename
+        let stage_named_meta = self
+            .roots_dir
+            .symlink_metadata(&stage_name)
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+        let stage_fd_meta = stage_file
+            .metadata()
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        if stage_named_meta.file_type().is_symlink() || !stage_named_meta.is_file() {
+            return Err(PublicationError::InsecurePermissions {
+                path: stage_path.clone(),
+                reason: "stage file on disk is not a regular file or is a symlink".to_string(),
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if stage_named_meta.dev() != stage_fd_meta.dev()
+                || stage_named_meta.ino() != stage_fd_meta.ino()
+            {
+                return Err(PublicationError::InsecurePermissions {
+                    path: stage_path.clone(),
+                    reason: "stage file inode changed before rename (stage file was replaced)".to_string(),
+                });
+            }
+        }
+
+        // 9. Atomic rename stage file into target slot
         let target_filename = target_slot.filename();
         let target_full_path = self.root_path.join(ROOTS_DIR_NAME).join(target_filename);
 
         self.roots_dir
-            .rename(&stage_name, target_filename)
+            .rename(&stage_name, &self.roots_dir, target_filename)
             .map_err(|e| PublicationError::io(&target_full_path, e))?;
 
-        // 8. Fsync roots parent directory
+        // Revalidate target binding after rename
+        let target_meta = self
+            .roots_dir
+            .symlink_metadata(target_filename)
+            .map_err(|e| PublicationError::io(&target_full_path, e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if target_meta.dev() != stage_fd_meta.dev()
+                || target_meta.ino() != stage_fd_meta.ino()
+            {
+                return Err(PublicationError::InsecurePermissions {
+                    path: target_full_path.clone(),
+                    reason: "target slot inode does not match verified staging inode after rename".to_string(),
+                });
+            }
+        }
+
+        // 10. Fsync roots parent directory
         let dir_sync_file = self
             .roots_dir
             .open(".")
@@ -1462,12 +1817,14 @@ impl SnapshotPublicationStore {
             .sync_all()
             .map_err(|e| PublicationError::io(self.root_path.join(ROOTS_DIR_NAME), e))?;
 
+        drop(stage_file);
+
         Ok(GenerationPublicationReceipt {
-            generation: request.generation,
-            publisher_id: request.publisher_id.clone(),
+            generation: actual_candidate.generation,
+            publisher_id: actual_candidate.publisher_id,
             slot: target_slot,
             sha256: manifest_sha256,
-            byte_len: envelope_bytes.len() as u64,
+            byte_len: actual_candidate.file_len,
             path: target_full_path,
         })
     }
@@ -2240,6 +2597,244 @@ mod tests {
             let meta = std::fs::metadata(&untrusted_dir).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o777);
         }
+    }
+
+    #[test]
+    fn test_near_limit_manifest_publication_and_read_admitted() {
+        let temp = TempDir::new().unwrap();
+        // Set a small manifest limit to easily test near-limit and over-limit
+        let limits = PublicationLimits {
+            max_root_manifest_bytes: 4096,
+            max_object_bytes: 64 * 1024,
+            max_dir_entries: 1024,
+            max_error_records: 64,
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // Exactly at max_root_manifest_bytes (4096 bytes)
+        let exact_manifest = vec![0xabu8; 4096];
+        let req = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "pub-limit".to_string(),
+            predecessor: None,
+            manifest_bytes: exact_manifest.clone(),
+            created_at_ms: 1000,
+        };
+
+        // Must succeed! Envelope size will be 4096 + framing overhead > 4096.
+        let receipt = store.publish_generation_root(&req, &verifier).unwrap();
+        assert_eq!(receipt.generation, 1);
+        assert!(receipt.byte_len > 4096);
+
+        // Crucial verification: inspect and select MUST admit and decode the envelope!
+        let (candidates, diags) = store.inspect_root_candidates().unwrap();
+        assert!(diags.is_empty(), "diags should be empty but found: {diags:?}");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].manifest_bytes, exact_manifest);
+
+        let selection = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(selection.current.unwrap().manifest_bytes, exact_manifest);
+
+        // One byte over max_root_manifest_bytes (4097 bytes) must be rejected
+        let over_manifest = vec![0xabu8; 4097];
+        let over_req = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "pub-over".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: receipt.sha256,
+            }),
+            manifest_bytes: over_manifest,
+            created_at_ms: 2000,
+        };
+        let err = store.publish_generation_root(&over_req, &verifier).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::OversizedPayload {
+                max_bytes: 4096,
+                actual_bytes: 4097
+            }
+        ));
+    }
+
+    #[test]
+    fn test_bounded_read_prevents_filegrowth_memory_exhaustion() {
+        use std::io::Cursor;
+
+        // 1. File grew concurrently beyond expected length (within max_bytes)
+        let data = vec![42u8; 100];
+        let mut cursor = Cursor::new(data);
+        let err = read_file_bounded_exact(&mut cursor, 50, 200, Path::new("/test/growing.obj")).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::FileLengthChanged {
+                expected: 50,
+                actual: 100,
+                ..
+            }
+        ));
+
+        // 2. File shrank concurrently below expected length
+        let data = vec![42u8; 30];
+        let mut cursor = Cursor::new(data);
+        let err = read_file_bounded_exact(&mut cursor, 50, 200, Path::new("/test/shrinking.obj")).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::FileLengthChanged {
+                expected: 50,
+                actual: 30,
+                ..
+            }
+        ));
+
+        // 3. File grew beyond max_bytes: limiter stops reading at max_bytes + 1
+        let huge_data = vec![7u8; 10_000];
+        let mut cursor = Cursor::new(huge_data);
+        let err = read_file_bounded_exact(&mut cursor, 50, 100, Path::new("/test/huge.obj")).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::OversizedPayload {
+                max_bytes: 100,
+                actual_bytes: 101,
+            }
+        ));
+
+        // 4. Expected length itself exceeds max_bytes before read
+        let data = vec![1u8; 50];
+        let mut cursor = Cursor::new(data);
+        let err = read_file_bounded_exact(&mut cursor, 500, 100, Path::new("/test/oversized.obj")).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::OversizedPayload {
+                max_bytes: 100,
+                actual_bytes: 500,
+            }
+        ));
+
+        // 5. Exact match succeeds
+        let data = vec![99u8; 64];
+        let mut cursor = Cursor::new(data);
+        let res = read_file_bounded_exact(&mut cursor, 64, 100, Path::new("/test/exact.obj")).unwrap();
+        assert_eq!(res.len(), 64);
+    }
+
+    #[test]
+    fn test_lost_reply_retry_reconciles_idempotently_before_stale_predecessor_rejection() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // Publish Gen 1
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "pub-1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"gen-1-data".to_vec(),
+            created_at_ms: 1000,
+        };
+        let r1 = store.publish_generation_root(&req1, &verifier).unwrap();
+
+        // Publish Gen 2 pointing to Gen 1
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "pub-1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: r1.sha256.clone(),
+            }),
+            manifest_bytes: b"gen-2-data".to_vec(),
+            created_at_ms: 2000,
+        };
+        let r2 = store.publish_generation_root(&req2, &verifier).unwrap();
+        assert_eq!(r2.generation, 2);
+        assert_eq!(r2.slot, RootSlot::SlotB);
+
+        // Simulate lost-reply retry: publisher retries exact same request for Gen 2
+        // Even though active root on disk is now Gen 2 (not Gen 1), it must reconcile
+        // idempotently BEFORE stale predecessor rejection!
+        let r2_retry = store.publish_generation_root(&req2, &verifier).unwrap();
+        assert_eq!(r2_retry.generation, 2);
+        assert_eq!(r2_retry.slot, RootSlot::SlotB);
+        assert_eq!(r2_retry.sha256, r2.sha256);
+
+        // However, a retry with conflicting manifest content must be rejected!
+        let mut conflicting_req2 = req2.clone();
+        conflicting_req2.manifest_bytes = b"gen-2-CONFLICTING-data".to_vec();
+        let err = store.publish_generation_root(&conflicting_req2, &verifier).unwrap_err();
+        assert!(matches!(err, PublicationError::GenerationConflict { .. }));
+
+        // Both roots remain intact and verified
+        let sel = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(sel.current.as_ref().unwrap().generation, 2);
+        assert_eq!(sel.previous.as_ref().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn test_object_publish_noreplace_and_exact_existing_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        let payload = b"immutable-blob-content".to_vec();
+        let obj = RecoveryObjectPayload {
+            object_id: "obj-noreplace-01".to_string(),
+            expected_sha256: sha256_hex(&payload),
+            ciphertext_bytes: payload.clone(),
+        };
+
+        // 1. Initial publication
+        let r1 = store.publish_object(&obj).unwrap();
+        assert!(!r1.was_already_present);
+
+        // 2. Second publication with identical payload: adopted idempotently without overwrite
+        let r2 = store.publish_object(&obj).unwrap();
+        assert!(r2.was_already_present);
+        assert_eq!(r2.sha256, r1.sha256);
+
+        // 3. Third publication with conflicting payload: fails closed with ObjectConflict
+        let conflicting_payload = b"evil-replacement-content".to_vec();
+        let conflicting_obj = RecoveryObjectPayload {
+            object_id: "obj-noreplace-01".to_string(),
+            expected_sha256: sha256_hex(&conflicting_payload),
+            ciphertext_bytes: conflicting_payload,
+        };
+        let err = store.publish_object(&conflicting_obj).unwrap_err();
+        assert!(matches!(err, PublicationError::ObjectConflict { .. }));
+
+        // 4. Verify original content was never overwritten
+        let read_back = store.read_object("obj-noreplace-01").unwrap();
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn test_lock_inode_revalidation_detects_replaced_file() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        // Acquire lock
+        let lock1 = store.acquire_publication_lock().unwrap();
+
+        // Simulate lock file replacement while lock was held/blocking
+        let lock_path = temp.path().join(".publication.lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta1 = std::fs::metadata(&lock_path).unwrap();
+
+            // Atomically replace lock file with new inode (tests inode change without file deletion)
+            let replacement_path = temp.path().join(".publication.lock.replacement");
+            let _ = std::fs::File::create(&replacement_path).unwrap();
+            std::fs::rename(&replacement_path, &lock_path).unwrap();
+            let meta2 = std::fs::metadata(&lock_path).unwrap();
+            assert_ne!(meta1.ino(), meta2.ino(), "new file should have different inode");
+        }
+
+        // Release lock1
+        drop(lock1);
+
+        // Next acquire must succeed and bind to current inode
+        let lock2 = store.acquire_publication_lock().unwrap();
+        drop(lock2);
     }
 }
 

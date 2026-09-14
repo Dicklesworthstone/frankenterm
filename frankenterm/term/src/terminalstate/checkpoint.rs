@@ -2031,34 +2031,6 @@ impl CheckpointReplayConfigV2 {
         PendingReplayConfigV2::capture(config, limits)?.matches_checkpoint(self, tables)
     }
 
-    pub(crate) fn into_configuration(
-        &self,
-        tables: &[Arc<HashMap<u32, u8>>],
-    ) -> Result<Arc<dyn TerminalConfiguration>, TerminalCheckpointError> {
-        let unicode_version = self.unicode_version.into_live(tables)?;
-        let color_palette = self.color_palette.into_live()?;
-        Ok(Arc::new(ReplayTerminalConfiguration {
-            scrollback_size: usize_from_u64(self.scrollback_size, "replay.scrollback_size")?,
-            color_palette,
-            enable_kitty_keyboard: self.enable_kitty_keyboard,
-            max_user_vars: usize_from_u64(self.max_user_vars, "replay.max_user_vars")?,
-            max_unicode_version_stack_depth: usize_from_u64(
-                self.max_unicode_version_stack_depth,
-                "replay.max_unicode_version_stack_depth",
-            )?,
-            max_accumulating_title_len: usize_from_u64(
-                self.max_accumulating_title_len,
-                "replay.max_accumulating_title_len",
-            )?,
-            max_color_map_entries: usize_from_u64(
-                self.max_color_map_entries,
-                "replay.max_color_map_entries",
-            )?,
-            unicode_version,
-            normalize_output_to_unicode_nfc: self.normalize_output_to_unicode_nfc,
-            bidi_mode: self.bidi_mode.into_live(),
-        }))
-    }
 }
 
 struct ReplayTerminalConfiguration {
@@ -2905,21 +2877,86 @@ impl std::fmt::Debug for TerminalCheckpointV2 {
 
 /// Bounded hot terminal state captured under the terminal lock.
 /// The cold-history snapshot generation and interval are pinned under lock,
-/// while materialization of cold rows from the spill sink is deferred
+/// while materialization of cold rows and fragments from the spill sink is deferred
 /// outside the lock.
 #[derive(Debug)]
 pub struct StagedHotCheckpoint {
-    pub checkpoint: TerminalCheckpointV2,
-    pub sink: Option<Arc<dyn crate::config::ScrollbackSpillSink>>,
-    pub pinned_interval: Option<crate::config::ScrollbackIntervalCapture>,
-    pub expected_newest_exclusive: usize,
+    pub staged_primary: crate::screen::StagedScreenCheckpoint,
+    pub alternate_screen: CheckpointScreen,
+    pub alternate_screen_active: bool,
+    pub pen: CheckpointCellAttributes,
+    pub cursor: CheckpointCursorPosition,
+    pub wrap_next: bool,
+    pub clear_semantic_attribute_on_newline: bool,
+    pub last_semantic_command_status: Option<i32>,
+    pub insert: bool,
+    pub dec_auto_wrap: bool,
+    pub saved_dec_private_modes: BTreeMap<CheckpointSavedDecMode, bool>,
+    pub reverse_wraparound_mode: bool,
+    pub reverse_video_mode: bool,
+    pub synchronized_output: bool,
+    pub dec_origin_mode: bool,
+    pub top_margin: VisibleRowIndex,
+    pub bottom_margin: VisibleRowIndex,
+    pub left_margin: u64,
+    pub right_margin: u64,
+    pub left_and_right_margin_mode: bool,
+    pub application_cursor_keys: bool,
+    pub modify_other_keys: Option<i64>,
+    pub dec_ansi_mode: bool,
+    pub sixel_display_mode: bool,
+    pub use_private_color_registers_for_each_graphic: bool,
+    pub color_map: BTreeMap<u16, CheckpointRgbColor>,
+    pub application_keypad: bool,
+    pub bracketed_paste: bool,
+    pub any_event_mouse: bool,
+    pub focus_tracking: bool,
+    pub mouse_encoding: CheckpointMouseEncoding,
+    pub mouse_tracking: bool,
+    pub button_event_mouse: bool,
+    pub current_mouse_buttons: Vec<CheckpointMouseButton>,
+    pub last_mouse_move: Option<CheckpointMouseEvent>,
+    pub cursor_visible: bool,
+    pub keyboard_encoding: CheckpointKeyboardEncoding,
+    pub g0_charset: CheckpointCharSet,
+    pub g1_charset: CheckpointCharSet,
+    pub shift_out: bool,
+    pub newline_mode: bool,
+    pub tab_stops: Vec<bool>,
+    pub tab_width: u64,
+    pub title: String,
+    pub icon_title: Option<String>,
+    pub progress: Progress,
+    pub palette: Option<CheckpointColorPalette>,
+    pub pixel_width: u64,
+    pub pixel_height: u64,
+    pub dpi: u32,
+    pub current_dir: Option<String>,
+    pub term_program: String,
+    pub term_version: String,
+    pub sixel_scrolls_right: bool,
+    pub user_vars: BTreeMap<String, String>,
+    pub kitty_max_image_id: u32,
+    pub seqno: u64,
+    pub unicode_version: CheckpointUnicodeVersion,
+    pub unicode_version_stack: Vec<CheckpointUnicodeVersionStackEntry>,
+    pub enable_conpty_quirks: bool,
+    pub suppress_initial_title_change: bool,
+    pub accumulating_title: Option<String>,
+    pub lost_focus_seqno: u64,
+    pub lost_focus_alerted_seqno: u64,
+    pub focused: bool,
+    pub bidi_enabled: Option<bool>,
+    pub bidi_hint: Option<CheckpointBidiHint>,
+    pub custom_cell_width_maps: Vec<CheckpointCustomCellWidthMap>,
+    pub replay_config: CheckpointReplayConfigV2,
     pub screen_limits: crate::screen::ScreenCheckpointLimits,
     pub screen_usage: crate::screen::ScreenCheckpointUsage,
     pub limits: TerminalCheckpointLimits,
 }
 
 impl StagedHotCheckpoint {
-    /// Materialize cold-history rows from the spill sink outside the terminal lock,
+    /// Materialize cold-history rows and fragments from the spill sink outside the terminal lock,
     /// revalidate generation against the pinned generation (failing if stale),
     /// and assemble the canonical `TerminalCheckpointV2`.
     pub fn materialize_cold_history(
@@ -2928,113 +2965,114 @@ impl StagedHotCheckpoint {
     ) -> Result<TerminalCheckpointV2, TerminalCheckpointError> {
         limits.validate_policy()?;
 
-        if let Some(sink) = self.sink.take() {
-            let expected_newest_exclusive =
-                StableRowIndex::try_from(self.expected_newest_exclusive)
-                    .map_err(|_| TerminalCheckpointError::ColdScrollbackMetadataInconsistent)?;
-            let max_cold_bytes =
-                u64::try_from(self.screen_limits.max_cold_scrollback_bytes).map_err(|_| {
-                    TerminalCheckpointError::ArithmeticOverflow("cold_scrollback_bytes")
-                })?;
-
-            let snapshot = sink
-                .snapshot_scrollback(
-                    expected_newest_exclusive,
-                    crate::config::ScrollbackSnapshotLimits {
-                        max_rows: self
-                            .screen_limits
-                            .max_total_lines
-                            .saturating_sub(self.screen_usage.lines),
-                        max_stored_bytes: max_cold_bytes,
-                        max_decoded_bytes: self
-                            .screen_limits
-                            .max_retained_capture_bytes
-                            .saturating_sub(self.screen_usage.retained_capture_bytes),
-                        max_physical_bytes: max_cold_bytes,
-                    },
-                )
-                .map_err(TerminalCheckpointError::ColdScrollbackSnapshot)?;
-
-            if !snapshot.rows().is_empty()
-                && snapshot.fidelity() != crate::config::ScrollbackSnapshotFidelity::ExactSemantic
-            {
-                return Err(TerminalCheckpointError::ColdScrollbackNotRecoveryGrade);
-            }
-            if snapshot.newest_stable_row_exclusive() != expected_newest_exclusive
-                || snapshot.stored_bytes() > max_cold_bytes
-                || snapshot.decoded_bytes()
-                    > self
-                        .screen_limits
-                        .max_retained_capture_bytes
-                        .saturating_sub(self.screen_usage.retained_capture_bytes)
-            {
-                return Err(TerminalCheckpointError::ColdScrollbackMetadataInconsistent);
-            }
-
-            let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
-                (None, true) => self.expected_newest_exclusive,
-                (Some(oldest), false) => usize::try_from(oldest)
-                    .map_err(|_| TerminalCheckpointError::ColdScrollbackMetadataInconsistent)?,
-                _ => {
-                    return Err(TerminalCheckpointError::ColdScrollbackMetadataInconsistent);
+        let parts = self
+            .staged_primary
+            .materialize(&self.screen_limits, &mut self.screen_usage)
+            .map_err(|err| match err {
+                crate::screen::ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent => {
+                    TerminalCheckpointError::StaleColdGeneration
                 }
-            };
-            if oldest > self.expected_newest_exclusive
-                || self.expected_newest_exclusive.checked_sub(oldest) != Some(snapshot.rows().len())
-            {
-                return Err(TerminalCheckpointError::ColdScrollbackMetadataInconsistent);
-            }
-
-            // Verify generation lineage against the interval pinned under lock
-            let current_interval = sink.try_capture_scrollback_interval();
-            match (&self.pinned_interval, &current_interval) {
-                (
-                    Some(crate::config::ScrollbackIntervalCapture::Ready(before)),
-                    crate::config::ScrollbackIntervalCapture::Ready(after),
-                ) => {
-                    if !after.same_lineage(before) {
-                        return Err(TerminalCheckpointError::StaleColdGeneration);
-                    }
-                    if !snapshot.rows().is_empty()
-                        && !after.retains(
-                            before,
-                            oldest as StableRowIndex..expected_newest_exclusive,
-                        )
-                    {
-                        return Err(TerminalCheckpointError::StaleColdGeneration);
-                    }
+                crate::screen::ScreenCheckpointCaptureError::ColdScrollbackSnapshot(s) => {
+                    TerminalCheckpointError::ColdScrollbackSnapshot(s)
                 }
-                (Some(crate::config::ScrollbackIntervalCapture::Ready(_)), _) => {
-                    return Err(TerminalCheckpointError::StaleColdGeneration);
+                crate::screen::ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade => {
+                    TerminalCheckpointError::ColdScrollbackNotRecoveryGrade
                 }
-                _ => {}
-            }
+                _ => TerminalCheckpointError::InvalidField {
+                    field: "primary_screen",
+                    reason: "screen checkpoint capture failed",
+                },
+            })?;
 
-            let generation = snapshot.generation();
-            let cold_prefix_line_count = snapshot.rows().len();
+        let primary_screen = CheckpointScreen::capture(parts)?;
+        let checkpoint = TerminalCheckpointV2 {
+            version: TERMINAL_CHECKPOINT_VERSION,
+            custom_cell_width_maps: self.custom_cell_width_maps,
+            replay_config: self.replay_config,
+            primary_screen,
+            alternate_screen: self.alternate_screen,
+            alternate_screen_active: self.alternate_screen_active,
+            pen: self.pen,
+            cursor: self.cursor,
+            wrap_next: self.wrap_next,
+            clear_semantic_attribute_on_newline: self.clear_semantic_attribute_on_newline,
+            last_semantic_command_status: self.last_semantic_command_status,
+            insert: self.insert,
+            dec_auto_wrap: self.dec_auto_wrap,
+            saved_dec_private_modes: self.saved_dec_private_modes,
+            reverse_wraparound_mode: self.reverse_wraparound_mode,
+            reverse_video_mode: self.reverse_video_mode,
+            synchronized_output: self.synchronized_output,
+            dec_origin_mode: self.dec_origin_mode,
+            top_margin: self.top_margin,
+            bottom_margin: self.bottom_margin,
+            left_margin: self.left_margin,
+            right_margin: self.right_margin,
+            left_and_right_margin_mode: self.left_and_right_margin_mode,
+            application_cursor_keys: self.application_cursor_keys,
+            modify_other_keys: self.modify_other_keys,
+            dec_ansi_mode: self.dec_ansi_mode,
+            sixel_display_mode: self.sixel_display_mode,
+            use_private_color_registers_for_each_graphic: self
+                .use_private_color_registers_for_each_graphic,
+            color_map: self.color_map,
+            application_keypad: self.application_keypad,
+            bracketed_paste: self.bracketed_paste,
+            any_event_mouse: self.any_event_mouse,
+            focus_tracking: self.focus_tracking,
+            mouse_encoding: self.mouse_encoding,
+            mouse_tracking: self.mouse_tracking,
+            button_event_mouse: self.button_event_mouse,
+            current_mouse_buttons: self.current_mouse_buttons,
+            last_mouse_move: self.last_mouse_move,
+            cursor_visible: self.cursor_visible,
+            keyboard_encoding: self.keyboard_encoding,
+            g0_charset: self.g0_charset,
+            g1_charset: self.g1_charset,
+            shift_out: self.shift_out,
+            newline_mode: self.newline_mode,
+            tab_stops: self.tab_stops,
+            tab_width: self.tab_width,
+            title: self.title,
+            icon_title: self.icon_title,
+            progress: self.progress,
+            palette: self.palette,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
+            dpi: self.dpi,
+            current_dir: self.current_dir,
+            term_program: self.term_program,
+            term_version: self.term_version,
+            sixel_scrolls_right: self.sixel_scrolls_right,
+            user_vars: self.user_vars,
+            kitty_max_image_id: self.kitty_max_image_id,
+            seqno: self.seqno,
+            unicode_version: self.unicode_version,
+            unicode_version_stack: self.unicode_version_stack,
+            enable_conpty_quirks: self.enable_conpty_quirks,
+            suppress_initial_title_change: self.suppress_initial_title_change,
+            accumulating_title: self.accumulating_title,
+            lost_focus_seqno: self.lost_focus_seqno,
+            lost_focus_alerted_seqno: self.lost_focus_alerted_seqno,
+            focused: self.focused,
+            bidi_enabled: self.bidi_enabled,
+            bidi_hint: self.bidi_hint,
+        };
 
-            let cold_rows = snapshot.into_rows();
-            let mut cold_lines = Vec::new();
-            cold_lines
-                .try_reserve_exact(cold_rows.len())
-                .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.cold_lines"))?;
-            for line in &cold_rows {
-                let cl = CheckpointLine::capture(line)?;
-                cl.validate(&self.screen_limits, &mut self.screen_usage)?;
-                cold_lines.push(cl);
-            }
+        checkpoint.validate(limits)?;
+        Ok(checkpoint)
+    }
 
-            if cold_prefix_line_count > 0 {
-                cold_lines.append(&mut self.checkpoint.primary_screen.lines);
-                self.checkpoint.primary_screen.lines = cold_lines;
-                self.checkpoint.primary_screen.stable_row_index_offset = oldest as u64;
-                self.checkpoint.primary_screen.cold_snapshot_generation = Some(generation);
-                self.checkpoint.primary_screen.cold_prefix_line_count = cold_prefix_line_count;
-            }
-        }
+    /// Number of physical rows in the primary screen.
+    #[must_use]
+    pub fn primary_rows(&self) -> usize {
+        self.staged_primary.physical_rows
+    }
 
-        self.checkpoint.validate(limits)?;
-        Ok(self.checkpoint)
+    /// Number of physical columns in the primary screen.
+    #[must_use]
+    pub fn primary_cols(&self) -> usize {
+        self.staged_primary.physical_cols
     }
 }
 
@@ -3495,67 +3533,25 @@ impl TerminalCheckpointV2 {
             .alt_screen
             .checkpoint_parts(&screen_limits, &mut screen_usage)?;
 
-        let sink = terminal.config.scrollback_spill_sink();
-        let (primary_screen, pinned_interval, expected_newest_exclusive) = if sink.is_some() {
-            terminal
-                .screen
-                .screen
-                .preflight_resident_checkpoint_usage(&screen_limits, &mut screen_usage)?;
-            let resident_lines = terminal.screen.screen.lines_in_phys_range(0..usize::MAX);
-            let resident_oldest = terminal.screen.screen.phys_to_stable_row_index(0);
-            let mut primary_lines = Vec::new();
-            primary_lines
-                .try_reserve_exact(resident_lines.len())
-                .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
-            for line in &resident_lines {
-                primary_lines.push(CheckpointLine::capture(line)?);
-            }
-            let mut keyboard_stack = Vec::new();
-            keyboard_stack
-                .try_reserve_exact(terminal.screen.screen.keyboard_stack.len())
-                .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.keyboard_stack"))?;
-            for encoding in &terminal.screen.screen.keyboard_stack {
-                keyboard_stack.push(CheckpointKeyboardEncoding::from(*encoding));
-            }
-            let primary_screen = CheckpointScreen {
-                lines: primary_lines,
-                stable_row_index_offset: resident_oldest as u64,
-                cold_snapshot_generation: None,
-                cold_prefix_line_count: 0,
-                allow_scrollback: true,
-                keyboard_stack,
-                physical_rows: u32::try_from(terminal.screen.screen.physical_rows).map_err(|_| {
-                    TerminalCheckpointError::InvalidField {
-                        field: "screen.physical_rows",
-                        reason: "value does not fit the checkpoint wire type",
-                    }
-                })?,
-                physical_cols: u32::try_from(terminal.screen.screen.physical_cols).map_err(|_| {
-                    TerminalCheckpointError::InvalidField {
-                        field: "screen.physical_cols",
-                        reason: "value does not fit the checkpoint wire type",
-                    }
-                })?,
-                dpi: terminal.screen.screen.dpi,
-                saved_cursor: terminal
-                    .screen
-                    .screen
-                    .saved_cursor
-                    .as_ref()
-                    .map(CheckpointSavedCursor::capture)
-                    .transpose()?,
-            };
-            let pinned_interval = sink.as_ref().map(|s| s.try_capture_scrollback_interval());
-            (primary_screen, pinned_interval, resident_oldest)
-        } else {
-            let primary_parts = terminal
-                .screen
-                .screen
-                .checkpoint_parts(&screen_limits, &mut screen_usage)?;
-            let primary_screen = CheckpointScreen::capture(primary_parts)?;
-            let oldest = primary_screen.stable_row_index_offset as usize;
-            (primary_screen, None, oldest)
-        };
+        let staged_primary = terminal
+            .screen
+            .screen
+            .checkpoint_parts_staged(&screen_limits, &mut screen_usage)
+            .map_err(|err| match err {
+                crate::screen::ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent => {
+                    TerminalCheckpointError::StaleColdGeneration
+                }
+                crate::screen::ScreenCheckpointCaptureError::ColdScrollbackSnapshot(s) => {
+                    TerminalCheckpointError::ColdScrollbackSnapshot(s)
+                }
+                crate::screen::ScreenCheckpointCaptureError::ColdScrollbackNotRecoveryGrade => {
+                    TerminalCheckpointError::ColdScrollbackNotRecoveryGrade
+                }
+                _ => TerminalCheckpointError::InvalidField {
+                    field: "primary_screen",
+                    reason: "screen checkpoint capture failed",
+                },
+            })?;
 
         let checkpoint_unicode_version =
             CheckpointUnicodeVersion::capture(&terminal.unicode_version, &custom_cell_width_maps)?;
@@ -3570,11 +3566,8 @@ impl TerminalCheckpointV2 {
             });
         }
 
-        let checkpoint = Self {
-            version: TERMINAL_CHECKPOINT_VERSION,
-            custom_cell_width_maps,
-            replay_config,
-            primary_screen,
+        Ok(StagedHotCheckpoint {
+            staged_primary,
             alternate_screen: CheckpointScreen::capture(alternate_screen)?,
             alternate_screen_active: terminal.screen.alt_screen_is_active,
             pen: CheckpointCellAttributes::capture(&terminal.pen)?,
@@ -3669,13 +3662,8 @@ impl TerminalCheckpointV2 {
             focused: terminal.focused,
             bidi_enabled: terminal.bidi_enabled,
             bidi_hint: terminal.bidi_hint.map(CheckpointBidiHint::from),
-        };
-
-        Ok(StagedHotCheckpoint {
-            checkpoint,
-            sink,
-            pinned_interval,
-            expected_newest_exclusive,
+            custom_cell_width_maps,
+            replay_config,
             screen_limits,
             screen_usage,
             limits,
@@ -4123,28 +4111,125 @@ impl TerminalCheckpointV2 {
         ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<crate::RecoveryTerminalCheckpointV2, TerminalCheckpointError> {
-        let tables = decode_custom_cell_width_maps(&self.custom_cell_width_maps)?;
-        let config = self.replay_config.into_configuration(&tables)?;
-        let validated = self.validate_into(limits)?;
-        let inert = validated.restore_inert(config)?;
-        let isolated = inert
-            .into_live(Box::new(Vec::<u8>::new()))
-            .map_err(|_| TerminalCheckpointError::Serialization)?;
-        isolated
-            .capture_recovery_checkpoint_at_external_parser_ground(ground, limits)
-            .map_err(|e| match e {
-                crate::terminal::RecoveryTerminalCheckpointError::ParserNotRecoveryGround => {
-                    TerminalCheckpointError::InvalidField {
-                        field: "parser",
-                        reason: "parser is not at recovery ground",
-                    }
-                }
-                crate::terminal::RecoveryTerminalCheckpointError::Checkpoint(err) => err,
-            })
+        let rows = self.primary_rows();
+        let cols = self.primary_cols();
+        let canonical_payload = self.to_canonical_json(limits)?;
+        Ok(crate::RecoveryTerminalCheckpointV2::from_canonical_parts(
+            canonical_payload,
+            rows,
+            cols,
+            ground.stream_bytes(),
+        ))
+    }
+
+    /// Number of physical rows in the primary screen.
+    #[must_use]
+    pub fn primary_rows(&self) -> usize {
+        self.primary_screen.physical_rows as usize
+    }
+
+    /// Number of physical columns in the primary screen.
+    #[must_use]
+    pub fn primary_cols(&self) -> usize {
+        self.primary_screen.physical_cols as usize
+    }
+
+    /// Number of lines in the primary screen buffer (including cold scrollback prefix rows).
+    #[must_use]
+    pub fn primary_lines_count(&self) -> usize {
+        self.primary_screen.lines.len()
+    }
+
+    /// Number of cold scrollback prefix rows prepended to the primary screen buffer.
+    #[must_use]
+    pub fn primary_cold_prefix_lines(&self) -> u64 {
+        self.primary_screen.cold_prefix_line_count
+    }
+
+    /// Number of lines in the alternate screen buffer.
+    #[must_use]
+    pub fn alternate_lines_count(&self) -> usize {
+        self.alternate_screen.lines.len()
+    }
+
+    /// Whether the alternate screen buffer is currently active.
+    #[must_use]
+    pub fn is_alternate_screen_active(&self) -> bool {
+        self.alternate_screen_active
+    }
+
+    /// Whether bracketed paste mode is enabled.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Cursor position as `(row, col)`.
+    #[must_use]
+    pub fn cursor_position(&self) -> (VisibleRowIndex, usize) {
+        (self.cursor.y, self.cursor.x)
+    }
+
+    /// Whether the cursor is visible.
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
+    /// Text of the cell at `(row, col)` in the primary screen.
+    #[must_use]
+    pub fn primary_cell_text(&self, row: usize, col: usize) -> Option<&str> {
+        self.primary_screen
+            .lines
+            .get(row)
+            .and_then(|line| line.cells.get(col))
+            .map(|cell| cell.text.as_str())
+    }
+
+    /// Text of the cell at `(row, col)` in the alternate screen.
+    #[must_use]
+    pub fn alternate_cell_text(&self, row: usize, col: usize) -> Option<&str> {
+        self.alternate_screen
+            .lines
+            .get(row)
+            .and_then(|line| line.cells.get(col))
+            .map(|cell| cell.text.as_str())
+    }
+
+    /// Intensity attribute of the cell at `(row, col)` in the primary screen.
+    #[must_use]
+    pub fn primary_cell_intensity(&self, row: usize, col: usize) -> Option<Intensity> {
+        self.primary_screen
+            .lines
+            .get(row)
+            .and_then(|line| line.cells.get(col))
+            .map(|cell| cell.attributes.intensity)
+    }
+
+    /// Underline attribute of the cell at `(row, col)` in the alternate screen.
+    #[must_use]
+    pub fn alternate_cell_underline(&self, row: usize, col: usize) -> Option<Underline> {
+        self.alternate_screen
+            .lines
+            .get(row)
+            .and_then(|line| line.cells.get(col))
+            .map(|cell| cell.attributes.underline)
     }
 }
 
 impl ValidatedTerminalCheckpointV2 {
+    /// Reference to the underlying validated `TerminalCheckpointV2`.
+    #[must_use]
+    pub fn checkpoint(&self) -> &TerminalCheckpointV2 {
+        &self.checkpoint
+    }
+
+    /// Consume the wrapper and return the validated `TerminalCheckpointV2`.
+    #[must_use]
+    pub fn into_checkpoint(self) -> TerminalCheckpointV2 {
+        self.checkpoint
+    }
+
     /// Canonical physical row count proven equal across both screens during
     /// checkpoint validation.
     #[must_use]

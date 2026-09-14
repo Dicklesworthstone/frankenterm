@@ -117,6 +117,9 @@ pub enum RepresentationError {
     #[error("compression failed: {reason}")]
     CompressionFailed { reason: String },
 
+    #[error("unable to allocate bounded {operation} buffer")]
+    AllocationFailed { operation: &'static str },
+
     #[error("decompression failed: {reason}")]
     DecompressionFailed { reason: String },
 
@@ -906,13 +909,17 @@ impl BoundedWriter {
 
 impl std::io::Write for BoundedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.buffer.len().saturating_add(buf.len()) > self.limit {
+        let new_len = self.buffer.len().checked_add(buf.len());
+        if new_len.is_none_or(|len| len > self.limit) {
             self.exceeded = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "compressed output exceeded budget limit while producing",
             ));
         }
+        // Avoid Vec's geometric capacity growth beyond the admitted output size.
+        self.buffer
+            .try_reserve_exact(buf.len())
+            .map_err(std::io::Error::other)?;
         self.buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -936,16 +943,28 @@ fn compress_bounded(
     if let Err(e) = encoder.write_all(plaintext) {
         if encoder.get_ref().exceeded {
             return Err(RepresentationError::CompressedLimitExceeded {
-                size: limit + 1,
+                size: limit.saturating_add(1),
                 limit,
             });
         }
         return Err(RepresentationError::CompressionFailed { reason: e.to_string() });
     }
 
-    let writer = encoder.finish().map_err(|e| {
-        RepresentationError::CompressionFailed { reason: e.to_string() }
-    })?;
+    // Keep ownership of the writer when final frame emission fails: otherwise a
+    // limit hit in finish() becomes indistinguishable from a codec failure.
+    let writer = match encoder.try_finish() {
+        Ok(writer) => writer,
+        Err((encoder, error)) => {
+            return Err(if encoder.get_ref().exceeded {
+                RepresentationError::CompressedLimitExceeded {
+                    size: limit.saturating_add(1),
+                    limit,
+                }
+            } else {
+                RepresentationError::CompressionFailed { reason: error.to_string() }
+            });
+        }
+    };
 
     if writer.exceeded || writer.buffer.len() > limit {
         return Err(RepresentationError::CompressedLimitExceeded {
@@ -1260,8 +1279,19 @@ pub fn decode_recovery_object(
     }
 
     // 9. Decompress up to exact expected uncompressed length
-    let decompressed = zstd::bulk::decompress(&compressed, expected_uncompressed)
+    // Decode directly into owned, zeroizing storage. The convenience bulk API
+    // allocates an ordinary Vec internally and can drop partial plaintext on an
+    // error before the caller has a chance to wrap it.
+    let mut decompressed = Zeroizing::new(Vec::new());
+    decompressed.try_reserve_exact(expected_uncompressed).map_err(|_| {
+        RepresentationError::AllocationFailed { operation: "decompression" }
+    })?;
+    decompressed.resize(expected_uncompressed, 0);
+    let mut decoder = zstd::bulk::Decompressor::new()
         .map_err(|e| RepresentationError::DecompressionFailed { reason: e.to_string() })?;
+    let decoded_len = decoder.decompress_to_buffer(&compressed, decompressed.as_mut_slice())
+        .map_err(|e| RepresentationError::DecompressionFailed { reason: e.to_string() })?;
+    decompressed.truncate(decoded_len);
 
     if decompressed.len() != expected_uncompressed {
         return Err(RepresentationError::DecompressedLengthMismatch {
@@ -1281,7 +1311,7 @@ pub fn decode_recovery_object(
     }
 
     Ok(DecodedRepresentation {
-        plaintext: Zeroizing::new(decompressed),
+        plaintext: decompressed,
         context: object.header.context.clone(),
     })
 }
@@ -1303,6 +1333,24 @@ pub fn decode_recovery_object_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_frame_emission_preserves_compression_limit_error() {
+        assert!(matches!(
+            compress_bounded(b"x", DEFAULT_ZSTD_LEVEL, 0),
+            Err(RepresentationError::CompressedLimitExceeded { limit: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_writer_rejects_growth_without_appending_partial_output() {
+        let mut writer = BoundedWriter::new(3);
+        writer.write_all(b"ab").expect("first write fits");
+        assert!(writer.write_all(b"cd").is_err());
+        assert!(writer.exceeded);
+        assert_eq!(writer.buffer.as_slice(), b"ab");
+        assert!(writer.buffer.capacity() <= 3);
+    }
 
     fn sample_metadata(object_id_byte: u8, generation: u64) -> ObjectMetadata {
         let mut object_id = [0u8; 32];
