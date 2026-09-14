@@ -131,19 +131,19 @@
       "classification_summary": {
         "docs": 1,
         "feat": 2,
-        "fix": 4,
-        "other": 2,
+        "fix": 5,
+        "other": 3,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 18,
+      "fork_side_commit_count": 20,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-13T02:51:32-04:00",
-        "sha": "53c1375f44b9a8747803b12221667a50105e0c94",
-        "subject": "fix(runtime): isolate explicit timers from ambient cancellation"
+        "committed_at": "2026-09-14T17:26:55-04:00",
+        "sha": "0aa9343d9cd156f453c7f3a895e78d424a10803a",
+        "subject": "fix(char-props): preserve generated emoji table hash contract"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2591,
-  "generated_at": "2026-09-14T21:16:58.366607Z",
+  "fork_side_commit_total": 2593,
+  "generated_at": "2026-09-14T21:28:03.295100Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
