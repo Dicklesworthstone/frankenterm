@@ -609,7 +609,10 @@ impl EvidenceStream for VecEvidenceStream {
 }
 
 /// Canonical proof-gate decisions consumed by Robot Mode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialization validates every recognized numeric field, even if the
+/// selected variant does not use it. Unknown extension fields remain ignored.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GateDecision {
     /// The claim is accepted under the gate's current evidence and threshold.
@@ -651,6 +654,75 @@ pub enum GateDecision {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
     },
+}
+
+struct FiniteGateNumber(f64);
+
+impl<'de> Deserialize<'de> for FiniteGateNumber {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        if !value.is_finite() {
+            return Err(serde::de::Error::custom("expected a finite gate number"));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for GateDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Kind {
+            Accept,
+            Reject,
+            Continue,
+            RegimeShift,
+            LowConfidence,
+        }
+
+        // Read typed numbers directly from the wire. Internally tagged enum
+        // buffering turns arbitrary_precision JSON floats into private maps;
+        // accepting those maps via Number would also accept forged objects.
+        // An ordinary struct avoids both the buffering and that ambiguity.
+        #[derive(Deserialize)]
+        struct Fields {
+            kind: Kind,
+            reason: String,
+            #[serde(default)]
+            confidence: Option<FiniteGateNumber>,
+            #[serde(default)]
+            needed_samples: Option<u64>,
+            #[serde(default)]
+            divergence: Option<FiniteGateNumber>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        Ok(match fields.kind {
+            Kind::Accept => Self::Accept {
+                reason: fields.reason,
+                confidence: fields.confidence.map(|value| value.0),
+            },
+            Kind::Reject => Self::Reject {
+                reason: fields.reason,
+                confidence: fields.confidence.map(|value| value.0),
+            },
+            Kind::Continue => Self::Continue {
+                reason: fields.reason,
+                needed_samples: fields.needed_samples,
+            },
+            Kind::RegimeShift => Self::RegimeShift {
+                reason: fields.reason,
+                divergence: fields
+                    .divergence
+                    .ok_or_else(|| <D::Error as serde::de::Error>::missing_field("divergence"))?
+                    .0,
+            },
+            Kind::LowConfidence => Self::LowConfidence {
+                reason: fields.reason,
+                confidence: fields.confidence.map(|value| value.0),
+            },
+        })
+    }
 }
 
 impl GateDecision {
@@ -737,6 +809,171 @@ pub struct GateMetricEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_decision_json_roundtrips_every_variant_with_typed_numbers() {
+        // Workspace feature unification enables serde_json/arbitrary_precision:
+        // fastmcp_rust 180a7c88890705217bb8e202d19555adabf24187 declares it for
+        // serde_json =1.0.151. Run this same test with and without that feature.
+        // The tag is deliberately last so decoding cannot rely on key order.
+        for (json, expected) in [
+            (
+                r#"{"confidence":0.52,"reason":"test","kind":"accept"}"#,
+                GateDecision::Accept {
+                    reason: "test".into(),
+                    confidence: Some(0.52),
+                },
+            ),
+            (
+                r#"{"confidence":0.25,"reason":"test","kind":"reject"}"#,
+                GateDecision::Reject {
+                    reason: "test".into(),
+                    confidence: Some(0.25),
+                },
+            ),
+            (
+                r#"{"needed_samples":18446744073709551615,"reason":"test","kind":"continue"}"#,
+                GateDecision::Continue {
+                    reason: "test".into(),
+                    needed_samples: Some(u64::MAX),
+                },
+            ),
+            (
+                r#"{"divergence":0.52,"reason":"test","kind":"regime_shift"}"#,
+                GateDecision::RegimeShift {
+                    reason: "test".into(),
+                    divergence: 0.52,
+                },
+            ),
+            (
+                r#"{"confidence":0.125,"reason":"test","kind":"low_confidence"}"#,
+                GateDecision::LowConfidence {
+                    reason: "test".into(),
+                    confidence: Some(0.125),
+                },
+            ),
+        ] {
+            let decoded: GateDecision = serde_json::from_str(json).unwrap();
+            assert_eq!(decoded, expected);
+            let encoded = serde_json::to_string(&decoded).unwrap();
+            assert_eq!(
+                serde_json::from_str::<GateDecision>(&encoded).unwrap(),
+                expected
+            );
+            let value = serde_json::to_value(&decoded).unwrap();
+            for field in ["confidence", "divergence", "needed_samples"] {
+                if let Some(number) = value.get(field) {
+                    assert!(number.is_number(), "{field} must remain a JSON number");
+                }
+            }
+            assert_eq!(
+                serde_json::from_value::<GateDecision>(value).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn gate_decision_optional_numbers_accept_missing_and_null() {
+        for kind in ["accept", "reject", "low_confidence", "continue"] {
+            let field = if kind == "continue" {
+                "needed_samples"
+            } else {
+                "confidence"
+            };
+            for suffix in [String::new(), format!(",\"{field}\":null")] {
+                let json = format!("{{\"kind\":\"{kind}\",\"reason\":\"test\"{suffix}}}");
+                let decoded: GateDecision = serde_json::from_str(&json).unwrap();
+                let encoded = serde_json::to_value(&decoded).unwrap();
+                assert_eq!(decoded.kind(), kind);
+                assert!(encoded.get(field).is_none());
+            }
+        }
+        for json in [
+            r#"{"kind":"regime_shift","reason":"test"}"#,
+            r#"{"kind":"regime_shift","reason":"test","divergence":null}"#,
+        ] {
+            assert!(serde_json::from_str::<GateDecision>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn gate_decision_rejects_non_numeric_and_overflowed_wire_values() {
+        for (kind, field) in [
+            ("accept", "confidence"),
+            ("reject", "confidence"),
+            ("low_confidence", "confidence"),
+            ("regime_shift", "divergence"),
+        ] {
+            for invalid in [
+                r#""0.52""#,
+                "true",
+                "[]",
+                "{}",
+                r#"{"$serde_json::private::Number":"0.52"}"#,
+                "1e400",
+                "-1e400",
+                "NaN",
+                "Infinity",
+            ] {
+                let json =
+                    format!("{{\"kind\":\"{kind}\",\"reason\":\"test\",\"{field}\":{invalid}}}");
+                assert!(
+                    serde_json::from_str::<GateDecision>(&json).is_err(),
+                    "accepted invalid numeric wire value: {json}"
+                );
+            }
+        }
+        assert!(
+            serde_json::from_str::<GateDecision>(
+                r#"{"kind":"continue","reason":"test","needed_samples":18446744073709551616}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gate_decision_rejects_unknown_kinds_duplicates_and_invalid_recognized_fields() {
+        for json in [
+            r#"{"kind":"unknown","reason":"test"}"#,
+            r#"{"kind":"accept","kind":"reject","reason":"test"}"#,
+            r#"{"kind":"accept","reason":"first","reason":"second"}"#,
+            r#"{"kind":"accept","reason":"test","confidence":null,"confidence":0.52}"#,
+            r#"{"kind":"continue","reason":"test","needed_samples":1,"needed_samples":2}"#,
+            r#"{"kind":"regime_shift","reason":"test","divergence":0.1,"divergence":0.2}"#,
+            // Recognized fields retain their wire types even when unused by
+            // this variant; unrelated extension fields are still ignored.
+            r#"{"kind":"continue","reason":"test","confidence":"0.52"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GateDecision>(json).is_err(),
+                "{json}"
+            );
+        }
+        let extended: GateDecision = serde_json::from_str(
+            r#"{"kind":"continue","reason":"test","extension":{"any":[true,null]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extended,
+            GateDecision::Continue {
+                reason: "test".into(),
+                needed_samples: None,
+            }
+        );
+    }
+
+    #[test]
+    fn finite_gate_number_rejects_nonfinite_deserializer_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let deserializer =
+                serde::de::value::F64Deserializer::<serde::de::value::Error>::new(value);
+            assert!(FiniteGateNumber::deserialize(deserializer).is_err());
+        }
+        let deserializer = serde::de::value::F64Deserializer::<serde::de::value::Error>::new(0.52);
+        let number = FiniteGateNumber::deserialize(deserializer).unwrap();
+        assert_eq!(number.0.to_bits(), 0.52_f64.to_bits());
+    }
 
     #[test]
     fn evidence_sample_validates_required_fields() {
