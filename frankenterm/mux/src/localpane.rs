@@ -54,6 +54,13 @@ use crossbeam::queue::ArrayQueue;
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 const LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+type LineLayoutObservation = Mutex<
+    Option<(
+        frankenterm_term::screen::ScreenCoordinateWitness,
+        SequenceNo,
+    )>,
+>;
+
 /// Owned native paint input. Terminal metadata, damage and resident rows are
 /// captured under one nonblocking terminal acquisition. Rendering never holds
 /// that lock, and must retain damage if capture returns `None`.
@@ -1150,12 +1157,7 @@ pub struct LocalPane {
     cold_viewport_pending: Arc<Mutex<Option<ColdViewportPending>>>,
     cold_viewport_retry: Arc<AtomicBool>,
     cold_viewport_failure: Arc<Mutex<Option<ColdViewportFailure>>>,
-    line_layout_observation: Mutex<
-        Option<(
-            frankenterm_term::screen::ScreenCoordinateWitness,
-            SequenceNo,
-        )>,
-    >,
+    line_layout_observation: Arc<LineLayoutObservation>,
     // Serializes complete producer batches, including deferred persistence,
     // without preventing GUI readers or resize workers from taking terminal.
     output_application: Mutex<()>,
@@ -1467,7 +1469,7 @@ impl Pane for LocalPane {
 
     fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
         let mut term = self.terminal.try_lock()?;
-        let floor = self.refresh_line_layout_floor(&mut term)?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
         Some((floor, terminal_get_dimensions(&mut term)))
     }
 
@@ -1481,7 +1483,8 @@ impl Pane for LocalPane {
         let Some(mut term) = self.terminal.try_lock() else {
             return false;
         };
-        let Some(floor) = self.refresh_line_layout_floor(&mut term) else {
+        let Some(floor) = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+        else {
             return false;
         };
         if expected_seqno == SequenceNo::MAX
@@ -2699,8 +2702,11 @@ impl LocalPane {
         title
     }
 
-    fn refresh_line_layout_floor(&self, term: &mut Terminal) -> Option<SequenceNo> {
-        let mut observation = self.line_layout_observation.try_lock()?;
+    fn refresh_line_layout_floor(
+        observation: &LineLayoutObservation,
+        term: &mut Terminal,
+    ) -> Option<SequenceNo> {
+        let mut observation = observation.try_lock()?;
         let source_changed = term.screen_mut().refresh_cold_source_observation()?;
         let screen_changed = observation
             .as_ref()
@@ -2723,13 +2729,49 @@ impl LocalPane {
         Some(floor)
     }
 
+    /// Finalize the same layout authority used by frame capture before exposing
+    /// a resize source. The caller holds both terminal and resize-intent guards;
+    /// otherwise the first reader could advance a stale coordinate observation
+    /// after the receipt and make the actual frame impossible to bind to it.
+    fn publish_resize_source(
+        pane_id: PaneId,
+        observation: &LineLayoutObservation,
+        term: &mut Terminal,
+        token: ResizeCancellationToken,
+        commit_id: u64,
+        phase: &'static str,
+    ) -> bool {
+        if Self::refresh_line_layout_floor(observation, term).is_none() {
+            // Busy storage/observation and saturated sequences are not proof of
+            // an unchanged source. Keep the resize but publish no false receipt.
+            metrics::counter!(
+                "mux.localpane.resize.source_unavailable",
+                "phase" => phase,
+            )
+            .increment(1);
+            return false;
+        }
+        let size = term.get_size();
+        log::trace!(
+            "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase={}",
+            pane_id,
+            token.seq,
+            commit_id,
+            term.current_seqno(),
+            size.cols,
+            size.rows,
+            phase,
+        );
+        true
+    }
+
     /// One nonblocking observation for a GUI frame's coordinate authority.
     /// Do not split this into blocking sequence/dimension getters on the UI.
     pub fn selection_source_snapshot(
         &self,
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions)> {
         let mut term = self.terminal.try_lock()?;
-        let floor = self.refresh_line_layout_floor(&mut term)?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
         Some((
             floor,
             term.current_seqno(),
@@ -2761,7 +2803,8 @@ impl LocalPane {
         }
         #[cfg(not(unix))]
         let _ = detect_password_input;
-        let layout_floor = self.refresh_line_layout_floor(&mut term)?;
+        let layout_floor =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
         let dimensions = terminal_get_dimensions(&mut term);
         // Scrollback eviction and clearing can invalidate a stored viewport
         // without a GUI scroll event. Normalize against this same observation;
@@ -3284,6 +3327,7 @@ impl LocalPane {
             Self::spawn_resize_worker(
                 self.pane_id,
                 Arc::clone(&self.terminal),
+                Arc::clone(&self.line_layout_observation),
                 #[cfg(feature = "disruptor-pane-io")]
                 Arc::clone(&self.action_ring),
                 Arc::clone(&self.pty),
@@ -3298,12 +3342,14 @@ impl LocalPane {
     fn spawn_resize_worker(
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
+        line_layout_observation: Arc<LineLayoutObservation>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
     ) {
         let worker_terminal = Arc::clone(&terminal);
+        let worker_line_layout_observation = Arc::clone(&line_layout_observation);
         #[cfg(feature = "disruptor-pane-io")]
         let worker_action_ring = Arc::clone(&action_ring);
         let worker_pty = Arc::clone(&pty);
@@ -3315,6 +3361,7 @@ impl LocalPane {
                 Self::run_resize_worker(
                     pane_id,
                     worker_terminal,
+                    worker_line_layout_observation,
                     #[cfg(feature = "disruptor-pane-io")]
                     worker_action_ring,
                     worker_pty,
@@ -3340,6 +3387,7 @@ impl LocalPane {
             Self::run_resize_worker(
                 pane_id,
                 terminal,
+                line_layout_observation,
                 #[cfg(feature = "disruptor-pane-io")]
                 action_ring,
                 pty,
@@ -3353,6 +3401,7 @@ impl LocalPane {
     fn run_resize_worker(
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
+        line_layout_observation: Arc<LineLayoutObservation>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
@@ -3371,6 +3420,7 @@ impl LocalPane {
                 Self::apply_resize_sync(
                     pane_id,
                     terminal.as_ref(),
+                    line_layout_observation.as_ref(),
                     #[cfg(feature = "disruptor-pane-io")]
                     action_ring.as_ref(),
                     pty.as_ref(),
@@ -3390,6 +3440,7 @@ impl LocalPane {
                     Self::prepare_cold_layout_after_resize(
                         pane_id,
                         &terminal,
+                        &line_layout_observation,
                         &resize_queue,
                         token,
                         registration,
@@ -3534,6 +3585,7 @@ impl LocalPane {
     fn prepare_cold_layout_after_resize(
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
+        line_layout_observation: &LineLayoutObservation,
         resize_queue: &Mutex<ResizeQueueState>,
         token: ResizeCancellationToken,
         registration: PaneRegistrationHandle,
@@ -3575,15 +3627,13 @@ impl LocalPane {
                                             // Same terminal/token authority as
                                             // the primary resize, before readers
                                             // can capture this newer cold source.
-                                            let size = term.get_size();
-                                            log::trace!(
-                                                "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase=cold_seam",
+                                            Self::publish_resize_source(
                                                 pane_id,
+                                                line_layout_observation,
+                                                &mut term,
+                                                token,
                                                 token.seq,
-                                                token.seq,
-                                                term.current_seqno(),
-                                                size.cols,
-                                                size.rows,
+                                                "cold_seam",
                                             );
                                         }
                                         installed
@@ -3641,15 +3691,13 @@ impl LocalPane {
                             // Validation, install and witness share the terminal
                             // and resize-token guards; no newer intent can be
                             // mistaken for this cold index source.
-                            let size = term.get_size();
-                            log::trace!(
-                                "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase=cold_index",
+                            Self::publish_resize_source(
                                 pane_id,
+                                line_layout_observation,
+                                &mut term,
+                                token,
                                 token.seq,
-                                token.seq,
-                                term.current_seqno(),
-                                size.cols,
-                                size.rows,
+                                "cold_index",
                             );
                             true
                         });
@@ -3707,6 +3755,7 @@ impl LocalPane {
     fn apply_resize_sync(
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
+        line_layout_observation: &LineLayoutObservation,
         #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<Vec<Action>>,
         pty: &Mutex<Box<dyn MasterPty>>,
         resize_queue: &Mutex<ResizeQueueState>,
@@ -3920,14 +3969,13 @@ impl LocalPane {
                 // a newer intent and GUI frame capture. Worker completion below
                 // includes off-lock retirement/cold preparation and can follow
                 // presentation; it is not the frame's causal commit boundary.
-                log::trace!(
-                    "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase=primary",
+                Self::publish_resize_source(
                     pane_id,
-                    token.seq,
+                    line_layout_observation,
+                    &mut terminal,
+                    token,
                     commit_id,
-                    terminal.current_seqno(),
-                    size.cols,
-                    size.rows,
+                    "primary",
                 );
                 terminal_resize_elapsed
             });
@@ -4110,7 +4158,7 @@ impl LocalPane {
             cold_viewport_pending: Arc::new(Mutex::new(None)),
             cold_viewport_retry: Arc::new(AtomicBool::new(false)),
             cold_viewport_failure: Arc::new(Mutex::new(None)),
-            line_layout_observation: Mutex::new(None),
+            line_layout_observation: Arc::new(Mutex::new(None)),
             output_application: Mutex::new(()),
             scrollback_flush_sink: Mutex::new(scrollback_flush_sink),
             process: Arc::clone(&process),
@@ -5131,7 +5179,180 @@ mod tests {
     }
 
     #[test]
-    fn native_render_frame_does_not_wait_for_terminal_pty_or_tmux_locks() {
+    fn native_resize_finalizes_source_before_first_frame_and_preserves_later_changes() {
+        let pane = LocalPane::new(
+            703,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x73; 16],
+            "native-resize-source".to_string(),
+        );
+        pane.terminal.lock().advance_bytes("original 界".as_bytes());
+        let mut previous = pane
+            .try_capture_render_frame(None, 0, 0, &[], false)
+            .unwrap();
+        for cols in [123, 80] {
+            let size = term_size(cols, 24);
+            let pty_size = pty_size(cols as u16, 24);
+            let pending = {
+                let mut queue = pane.resize_queue.lock();
+                queue.enqueue(size, pty_size, Instant::now());
+                queue.dequeue_for_worker().unwrap()
+            };
+            let metrics = LocalPane::apply_resize_sync(
+                pane.pane_id,
+                &pane.terminal,
+                &pane.line_layout_observation,
+                #[cfg(feature = "disruptor-pane-io")]
+                &pane.action_ring,
+                &pane.pty,
+                &pane.resize_queue,
+                pending.seq,
+                size,
+                pty_size,
+                ResizeCancellationToken::new(pending.seq),
+            )
+            .unwrap();
+            assert!(!metrics.cancelled && !metrics.noop);
+            // Observe the worker's committed source before any reader can
+            // perform the lazy floor refresh that caused the native failure.
+            let committed_source = pane.terminal.lock().current_seqno();
+            assert!(committed_source > previous.source_sequence);
+            for _ in 0..3 {
+                let frame = pane
+                    .try_capture_render_frame(None, 0, 0, &[], false)
+                    .unwrap();
+                assert_eq!(frame.source_sequence, committed_source);
+                assert_eq!(frame.layout_floor, committed_source);
+                assert_eq!(frame.dimensions.cols, cols);
+                assert!(frame.lines[0].as_str().starts_with("original 界"));
+                assert_eq!(
+                    pane.selection_source_snapshot().unwrap().1,
+                    committed_source
+                );
+                previous = frame;
+            }
+        }
+
+        // Genuine later content must remain distinguishable from the resize
+        // receipt, even when its coordinates and layout floor did not change.
+        let committed_source = previous.source_sequence;
+        pane.terminal.lock().advance_bytes(b" changed");
+        let later = pane
+            .try_capture_render_frame(None, 0, 0, &[], false)
+            .unwrap();
+        assert!(later.source_sequence > committed_source);
+        assert_eq!(later.layout_floor, previous.layout_floor);
+        assert!(later.lines[0].as_str().contains("changed"));
+        pane.terminal
+            .lock()
+            .advance_bytes(b"\x1b[?1049h\x1b[?1049l");
+        let after_aba = pane
+            .try_capture_render_frame(None, 0, 0, &[], false)
+            .unwrap();
+        assert!(after_aba.layout_floor > later.source_sequence);
+
+        // Causal negative: bypass only the worker's observation publication.
+        // The real terminal resize still changes geometry, and the first
+        // reader must advance the unfinalized source rather than bless it.
+        let unfinalized_source = {
+            let mut term = pane.terminal.lock();
+            term.resize(term_size(123, 24));
+            term.current_seqno()
+        };
+        let first = pane
+            .try_capture_render_frame(None, 0, 0, &[], false)
+            .unwrap();
+        assert!(first.source_sequence > unfinalized_source);
+        assert_eq!(first.dimensions.cols, 123);
+    }
+
+    #[test]
+    fn native_resize_source_publication_defers_busy_observation_in_every_phase() {
+        for phase in ["primary", "cold_seam", "cold_index"] {
+            let mut term = guardian_lifetime_test_terminal();
+            let observation = Mutex::new(None);
+            LocalPane::refresh_line_layout_floor(&observation, &mut term).unwrap();
+            term.resize(term_size(123, 24));
+            let before = term.current_seqno();
+            let busy = observation.lock();
+            assert!(!LocalPane::publish_resize_source(
+                703,
+                &observation,
+                &mut term,
+                ResizeCancellationToken::new(1),
+                1,
+                phase,
+            ));
+            assert_eq!(term.current_seqno(), before);
+            drop(busy);
+            assert!(LocalPane::publish_resize_source(
+                703,
+                &observation,
+                &mut term,
+                ResizeCancellationToken::new(1),
+                1,
+                phase,
+            ));
+            let published = term.current_seqno();
+            assert!(published > before);
+            assert_eq!(
+                LocalPane::refresh_line_layout_floor(&observation, &mut term),
+                Some(published)
+            );
+            assert_eq!(term.current_seqno(), published);
+        }
+    }
+
+    #[test]
+    fn native_resize_source_publication_rejects_sequence_saturation() {
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2;
+
+        // Restore an otherwise valid real model near the sequence boundary;
+        // no test-only setter or replacement terminal implementation is needed.
+        let limits = TerminalCheckpointLimits::default();
+        let checkpoint = guardian_lifetime_test_terminal()
+            .capture_recovery_checkpoint(limits)
+            .unwrap();
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(checkpoint.canonical_payload()).unwrap();
+        payload["seqno"] = serde_json::json!(SequenceNo::MAX - 2);
+        let checkpoint: TerminalCheckpointV2 = serde_json::from_value(payload).unwrap();
+        let encoded = checkpoint.to_canonical_json(limits).unwrap();
+        let mut term = TerminalCheckpointV2::decode_canonical_json(&encoded, limits)
+            .unwrap()
+            .restore_inert(Arc::new(GuardianLifetimeTestTermConfig))
+            .unwrap()
+            .into_live(Box::new(Vec::<u8>::new()))
+            .unwrap();
+        let observation = Mutex::new(None);
+        assert_eq!(
+            LocalPane::refresh_line_layout_floor(&observation, &mut term),
+            Some(SequenceNo::MAX - 2)
+        );
+        term.resize(term_size(123, 24));
+        assert_eq!(term.current_seqno(), SequenceNo::MAX - 1);
+        for phase in ["primary", "cold_seam", "cold_index"] {
+            assert!(!LocalPane::publish_resize_source(
+                703,
+                &observation,
+                &mut term,
+                ResizeCancellationToken::new(1),
+                1,
+                phase,
+            ));
+            assert_eq!(term.current_seqno(), SequenceNo::MAX);
+            assert!(LocalPane::refresh_line_layout_floor(&observation, &mut term).is_none());
+        }
+    }
+
+    #[test]
+    fn native_render_frame_does_not_wait_for_terminal_pty_tmux_or_layout_locks() {
         let pane = LocalPane::new(
             702,
             guardian_lifetime_test_terminal(),
@@ -5144,7 +5365,7 @@ mod tests {
             [0x72; 16],
             "native-render-busy".to_string(),
         );
-        for lock in [0, 1, 2] {
+        for lock in [0, 1, 2, 3] {
             if lock == 1 && !cfg!(unix) {
                 continue;
             }
@@ -5166,8 +5387,12 @@ mod tests {
                             let _guard = pane.pty.lock();
                             wait()
                         }
-                        _ => {
+                        2 => {
                             let _guard = pane.tmux_domain.lock();
+                            wait()
+                        }
+                        _ => {
+                            let _guard = pane.line_layout_observation.lock();
                             wait()
                         }
                     }
@@ -7039,6 +7264,7 @@ mod disruptor_ring_keep_gate {
         let metrics = LocalPane::apply_resize_sync(
             7,
             &terminal,
+            &Mutex::new(None),
             &ring,
             &pty,
             &resize_queue,
