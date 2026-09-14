@@ -612,6 +612,15 @@ impl Clone for ClusteredLine {
 }
 
 impl ClusteredLine {
+    /// Image presence belongs to attributes, which are constant across each
+    /// cluster. Do not decode every grapheme to inspect the same attributes.
+    #[cfg(feature = "use_image")]
+    pub(crate) fn has_image_attachments(&self) -> bool {
+        self.clusters
+            .iter()
+            .any(|cluster| cluster.attrs.has_image_attachments())
+    }
+
     pub(crate) fn snapshot_clone_cost(&self, max_clusters: usize) -> Option<(usize, usize)> {
         if self.clusters.len() > max_clusters {
             return None;
@@ -690,6 +699,28 @@ mod test {
     }
     use super::*;
     use alloc::string::ToString;
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn wide_mask_wire_omits_unused_trailing_extent() {
+        let source = crate::line::Line::from_text("a界 ", &CellAttributes::blank(), 1, None);
+        let line = ClusteredLine::from_cell_vec(source.len(), source.visible_cells());
+        let wire = serde_json::to_value(&line).unwrap();
+        let restored: ClusteredLine = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(line.is_double_wide.as_ref().unwrap().len(), 4);
+        assert_eq!(restored.is_double_wide.as_ref().unwrap().len(), 2);
+        assert_ne!(
+            line, restored,
+            "derived equality retains exact bitset extent"
+        );
+        assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
+        assert_eq!(line.to_cell_vec(), restored.to_cell_vec());
+        assert_eq!(line.len(), restored.len());
+        assert_eq!(
+            line.last_cell_was_wrapped(),
+            restored.last_cell_was_wrapped()
+        );
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

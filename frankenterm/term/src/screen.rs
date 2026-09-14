@@ -24,6 +24,8 @@ use termwiz::input::KeyboardEncoding;
 #[cfg(test)]
 std::thread_local! {
     static REFLOW_SOURCE_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_FULL_LAYOUT_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_ROW_PREFIX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_CACHED_RESERVED_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1843,10 +1845,30 @@ struct CachedWrappedLine {
 #[derive(Debug, Clone)]
 struct CachedResizeLines {
     lines: Arc<[Arc<[Line]>]>,
+    row_prefix: Arc<std::sync::OnceLock<Arc<[usize]>>>,
     layout_signature: Option<u64>,
     has_images: bool,
     scorecard: Option<ResizeWrapScorecard>,
     gate_payload: Option<String>,
+}
+
+impl CachedResizeLines {
+    fn row_prefix(&self) -> &Arc<[usize]> {
+        self.row_prefix.get_or_init(|| {
+            // Counts belong to these immutable chunks, independent of cell
+            // seqnos, hyperlink scan state and mutable image payloads.
+            #[cfg(test)]
+            REFLOW_ROW_PREFIX_BUILDS.with(|count| count.set(count.get() + 1));
+            let mut prefix = Vec::with_capacity(self.lines.len().saturating_add(1));
+            prefix.push(0);
+            let mut total_rows = 0usize;
+            for lines in self.lines.iter() {
+                total_rows = total_rows.saturating_add(lines.len());
+                prefix.push(total_rows);
+            }
+            Arc::from(prefix)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1941,6 +1963,9 @@ impl ScreenReflowPreparation {
                     wrapped.lines.iter().flat_map(|chunk| chunk.iter()),
                 ));
             }
+            // Populate once on this worker. A direct uncached resize keeps
+            // using its existing scratch prefix, without paying a second pass.
+            wrapped.row_prefix();
         }
         self.ready = !is_cancelled();
         self.ready
@@ -2201,6 +2226,7 @@ impl LogicalLineWrapCache {
             key,
             CachedResizeLines {
                 lines: Arc::from(wrapped),
+                row_prefix: Arc::new(std::sync::OnceLock::new()),
                 layout_signature: None,
                 has_images,
                 scorecard,
@@ -4295,6 +4321,8 @@ impl Screen {
     }
 
     fn compute_layout_signature(&self) -> u64 {
+        #[cfg(test)]
+        REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.set(count.get() + 1));
         Self::compute_layout_signature_for_lines(self.lines.iter())
     }
 
@@ -4598,20 +4626,9 @@ impl Screen {
         wrapped
     }
 
-    fn rebuild_rewrap_row_prefix_scratch(&mut self, wrapped: &[Arc<[Line]>]) {
-        self.rewrap_row_prefix_scratch.clear();
-        self.rewrap_row_prefix_scratch
-            .reserve(wrapped.len().saturating_add(1));
-        self.rewrap_row_prefix_scratch.push(0);
-
-        let mut total_rows = 0usize;
-        for lines in wrapped {
-            total_rows = total_rows.saturating_add(lines.len());
-            self.rewrap_row_prefix_scratch.push(total_rows);
-        }
-    }
-
     fn rebuild_rewrap_row_prefix_scratch_from_slots(&mut self, logical_count: usize) {
+        #[cfg(test)]
+        REFLOW_ROW_PREFIX_BUILDS.with(|count| count.set(count.get() + 1));
         self.rewrap_row_prefix_scratch.clear();
         self.rewrap_row_prefix_scratch
             .reserve(logical_count.saturating_add(1));
@@ -5116,18 +5133,21 @@ impl Screen {
                     .expect("synchronous reflow cannot be cancelled")
             };
         let wraps_elapsed = profile_start.map(|start| start.elapsed());
-        let cached_layout_signature = match &wrapped {
-            WrappedResizeLines::Cached(wrapped) => {
-                self.rebuild_rewrap_row_prefix_scratch(&wrapped.lines);
-                wrapped.layout_signature
-            }
+        let (cached_layout_signature, cached_row_prefix) = match &wrapped {
+            WrappedResizeLines::Cached(wrapped) => (
+                wrapped.layout_signature,
+                Some(Arc::clone(wrapped.row_prefix())),
+            ),
             WrappedResizeLines::Scratch { logical_count } => {
                 self.rebuild_rewrap_row_prefix_scratch_from_slots(*logical_count);
-                None
+                (None, None)
             }
         };
+        let row_prefix = cached_row_prefix
+            .as_deref()
+            .unwrap_or(&self.rewrap_row_prefix_scratch);
         let mut adjusted_cursor = (cursor_x, cursor_y);
-        let wrapped_count = self.rewrap_row_prefix_scratch.last().copied().unwrap_or(0);
+        let wrapped_count = row_prefix.last().copied().unwrap_or(0);
         let prefix_elapsed = profile_start.map(|start| start.elapsed());
 
         let required_capacity = wrapped_count.max(physical_rows);
@@ -5209,8 +5229,8 @@ impl Screen {
         // A trailing virtual column remains on the last row of its record.
         if let Some((logical_idx, mut remaining)) = logical_cursor {
             if let (Some(&start), Some(&end)) = (
-                self.rewrap_row_prefix_scratch.get(logical_idx),
-                self.rewrap_row_prefix_scratch.get(logical_idx + 1),
+                row_prefix.get(logical_idx),
+                row_prefix.get(logical_idx + 1),
             ) {
                 for row in start..end {
                     let row_len = self.lines[row].len();
@@ -8914,6 +8934,10 @@ pub(crate) mod tests {
             dpi: 96,
         };
         let before_order = before.wrap_key_order.clone();
+        assert!(
+            before.wrapped_by_key[&old_key].row_prefix.get().is_none(),
+            "uncached synchronous reflow must not build a second prefix"
+        );
         let mut prepared = screen
             .capture_reflow_preparation(test_size(3, 5, 96), cursor)
             .unwrap();
@@ -8925,12 +8949,27 @@ pub(crate) mod tests {
             &before.wrapped_by_key[&old_key].lines,
             &after.wrapped_by_key[&old_key].lines,
         ));
+        assert!(Arc::ptr_eq(
+            &before.wrapped_by_key[&old_key].row_prefix,
+            &after.wrapped_by_key[&old_key].row_prefix,
+        ));
         assert_eq!(before.wrap_key_order, before_order);
         assert_eq!(before.wrapped_by_key.len(), 1);
         assert_eq!(after.wrapped_by_key.len(), 2);
 
         let mut cache = after.as_ref().clone();
         let hit = cache.get_wrapped(old_key).unwrap();
+        let prefix_builds_before = REFLOW_ROW_PREFIX_BUILDS.with(|count| count.get());
+        let hit_prefix = Arc::clone(hit.row_prefix());
+        assert!(Arc::ptr_eq(
+            &hit_prefix,
+            before.wrapped_by_key[&old_key].row_prefix(),
+        ));
+        assert_eq!(
+            REFLOW_ROW_PREFIX_BUILDS.with(|count| count.get()),
+            prefix_builds_before + 1,
+            "all snapshots must reuse the first initialized target prefix"
+        );
         assert!(Arc::ptr_eq(
             &hit.lines,
             &before.wrapped_by_key[&old_key].lines,
@@ -9182,6 +9221,30 @@ pub(crate) mod tests {
             let size = test_size(3, 7, 96);
             let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
             assert!(prepared.prepare(|| false));
+            let key = WrapCacheKey {
+                physical_cols: size.cols,
+                dpi: size.dpi,
+            };
+            let prepared_target =
+                &prepared.snapshot.rewrap_cache.as_ref().unwrap().wrapped_by_key[&key];
+            let prepared_prefix = Arc::clone(
+                prepared_target
+                    .row_prefix
+                    .get()
+                    .expect("worker must initialize the target prefix before commit"),
+            );
+            let mut expected_prefix = vec![0];
+            for chunk in prepared_target.lines.iter() {
+                expected_prefix.push(expected_prefix.last().unwrap() + chunk.len());
+            }
+            assert_eq!(prepared_prefix.as_ref(), expected_prefix.as_slice());
+            assert_eq!(
+                prepared_target.layout_signature,
+                Some(Screen::compute_layout_signature_for_lines(
+                    prepared_target.lines.iter().flat_map(|chunk| chunk.iter()),
+                )),
+                "the worker must compute the exact target signature before commit"
+            );
             if stale {
                 // Keep the sequence unchanged: only exact source validation
                 // protects this mutation from an old prepared target.
@@ -9192,14 +9255,28 @@ pub(crate) mod tests {
             assert!(expected.last_resize_wrap_scorecard.is_some());
             assert!(expected.last_resize_wrap_gate_payload.is_some());
             REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.set(0));
+            REFLOW_ROW_PREFIX_BUILDS.with(|count| count.set(0));
             let actual_cursor =
                 screen.resize_with_prepared_reflow(size, cursor, 2, false, Some(&mut prepared));
             let scans = REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get());
+            let full_scans = REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.get());
+            let prefix_builds = REFLOW_ROW_PREFIX_BUILDS.with(|count| count.get());
             assert_eq!(prepared.was_applied(), !stale);
             if stale {
                 assert!(scans > 0, "stale work must use the source-hashing fallback");
+                assert!(prefix_builds > 0, "stale rows require a fresh target prefix");
             } else {
                 assert_eq!(scans, 0, "validated commit must not hash the source again");
+                assert_eq!(full_scans, 0, "target hashing must also stay on the worker");
+                assert_eq!(
+                    prefix_builds, 0,
+                    "commit must not rebuild the prepared prefix"
+                );
+                assert!(Arc::ptr_eq(
+                    &prepared_prefix,
+                    screen.rewrap_cache.as_ref().unwrap().wrapped_by_key[&key].row_prefix(),
+                ));
             }
             assert_eq!(actual_cursor, expected_cursor);
             assert_eq!(screen.lines, expected.lines);

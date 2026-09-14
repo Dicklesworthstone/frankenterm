@@ -207,8 +207,9 @@ impl PartialEq for Line {
 
 impl Line {
     /// Bounded UI snapshot. Vector cells share their immutable allocation even
-    /// in the eager-clone profiling mode; clustered rows precharge every owned
-    /// clone buffer and bound metadata visits. Payload serialization is never
+    /// in the eager-clone profiling mode; clustered rows also share immutable
+    /// storage, retaining conservative payload charges and metadata visit caps.
+    /// Payload serialization is never
     /// used for admission. Appdata is an optional weak cache, not source data.
     pub fn try_clone_for_snapshot(
         &self,
@@ -340,7 +341,7 @@ impl Line {
     pub fn new(seqno: SequenceNo) -> Self {
         Self {
             bits: LineBits::NONE,
-            cells: CellStorage::C(ClusteredLine::new()),
+            cells: CellStorage::C(Arc::new(ClusteredLine::new())),
             seqno,
             zones: vec![],
             #[cfg(feature = "appdata")]
@@ -646,7 +647,7 @@ impl Line {
     pub fn has_image_attachments(&self) -> bool {
         match &self.cells {
             CellStorage::V(cells) => cells.has_image_attachments(),
-            CellStorage::C(line) => line.iter().any(|cell| cell.attrs().has_image_attachments()),
+            CellStorage::C(line) => line.has_image_attachments(),
         }
     }
 
@@ -1260,10 +1261,10 @@ impl Line {
             while cl.len() < idx {
                 // Fill out any implied blanks until we can append
                 // their intended cell content
-                cl.append_grapheme(" ", 1, CellAttributes::blank());
+                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
             }
             if idx == cl.len() {
-                cl.append_grapheme(text, width, attr);
+                Arc::make_mut(cl).append_grapheme(text, width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
                 self.update_last_change_seqno(seqno);
@@ -1306,7 +1307,7 @@ impl Line {
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
-        cl.append_ascii_run(text, attr);
+        Arc::make_mut(cl).append_ascii_run(text, attr);
         self.invalidate_implicit_hyperlinks(seqno);
         self.invalidate_zones();
         self.update_last_change_seqno(seqno);
@@ -1355,10 +1356,10 @@ impl Line {
             while cl.len() < idx {
                 // Fill out any implied blanks until we can append
                 // their intended cell content
-                cl.append_grapheme(" ", 1, CellAttributes::blank());
+                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
             }
             if idx == cl.len() {
-                cl.append(cell);
+                Arc::make_mut(cl).append(cell);
                 return;
             }
             /*
@@ -1520,7 +1521,10 @@ impl Line {
 
     pub fn prune_trailing_blanks(&mut self, seqno: SequenceNo) {
         if let CellStorage::C(cl) = &mut self.cells {
-            if cl.prune_trailing_blanks() {
+            if !cl.text.ends_with(' ') {
+                return;
+            }
+            if Arc::make_mut(cl).prune_trailing_blanks() {
                 self.update_last_change_seqno(seqno);
                 self.invalidate_zones();
             }
@@ -1690,7 +1694,7 @@ impl Line {
             CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
             CellStorage::C(_) => return,
         };
-        self.cells = CellStorage::C(cv);
+        self.cells = CellStorage::C(Arc::new(cv));
     }
 
     pub fn cells_mut(&mut self) -> &mut [Cell] {
@@ -1731,9 +1735,9 @@ impl Line {
                 }
                 // Need to mark that implicit space as wrapped, so
                 // explicitly add it
-                cl.append(Cell::blank());
+                Arc::make_mut(cl).append(Cell::blank());
             }
-            cl.set_last_cell_was_wrapped(wrapped);
+            Arc::make_mut(cl).set_last_cell_was_wrapped(wrapped);
             return;
         }
 
@@ -1764,6 +1768,7 @@ impl Line {
                 }
             }
             CellStorage::C(cl) => {
+                let cl = Arc::make_mut(cl);
                 for cell in other.visible_cells() {
                     cl.append(cell.as_cell());
                 }
@@ -2944,6 +2949,153 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn clustered_snapshots_share_payload_and_isolate_same_seqno_mutations() {
+        let mutations: &[fn(&mut Line)] = &[
+            |line| line.set_cell_grapheme(4, "界", 2, CellAttributes::blank(), 1),
+            |line| assert!(line.append_ascii_cell_run(4, "tail", CellAttributes::blank(), 1)),
+            |line| line.set_cell(4, Cell::new('x', CellAttributes::blank()), 1),
+            |line| line.set_cell(0, Cell::new('x', CellAttributes::blank()), 1),
+            |line| line.prune_trailing_blanks(1),
+            |line| line.set_last_cell_was_wrapped(true, 1),
+            |line| {
+                line.append_line(
+                    Line::from_text("tail", &CellAttributes::blank(), 1, None),
+                    1,
+                )
+            },
+            |line| line.cells_mut()[0] = Cell::new('x', CellAttributes::blank()),
+        ];
+        for mutate in mutations {
+            let mut line = Line::from_text("abc ", &CellAttributes::blank(), 1, None);
+            line.compress_for_scrollback();
+            let mut bytes = usize::MAX;
+            let mut work = usize::MAX;
+            let frozen = line.try_clone_for_snapshot(&mut bytes, &mut work).unwrap();
+            let ordinary_clone = line.clone();
+            match (&line.cells, &frozen.cells, &ordinary_clone.cells) {
+                (CellStorage::C(live), CellStorage::C(snapshot), CellStorage::C(cloned)) => {
+                    assert!(Arc::ptr_eq(live, snapshot));
+                    assert!(Arc::ptr_eq(live, cloned));
+                    assert_eq!(live.text.as_ptr(), snapshot.text.as_ptr());
+                }
+                _ => panic!("clustered clones must retain clustered shared storage"),
+            }
+            assert_eq!(line, frozen);
+            assert!(line.is_same_reflow_source(&frozen));
+            mutate(&mut line);
+            assert_eq!(
+                line.seqno, frozen.seqno,
+                "sequence number is deliberately unchanged"
+            );
+            assert_ne!(
+                line, frozen,
+                "exact validation must detect same-seqno edits"
+            );
+            assert!(!line.is_same_reflow_source(&frozen));
+            assert_eq!(frozen.as_str(), "abc ");
+            assert!(!frozen.last_cell_was_wrapped());
+            assert_eq!(frozen, ordinary_clone);
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn clustered_sharing_preserves_existing_wire_representation() {
+        let mut line = Line::from_text("a界 ", &CellAttributes::blank(), 1, None);
+        line.compress_for_scrollback();
+        let payload = match &line.cells {
+            CellStorage::C(payload) => payload,
+            _ => panic!("expected clustered payload"),
+        };
+        // Arc serialization must remain the original enum payload, without
+        // pointer identity, reference counts, or a new wrapper field.
+        let expected = serde_json::json!({"C": payload.as_ref()});
+        assert_eq!(serde_json::to_value(&line.cells).unwrap(), expected);
+        let distinct = CellStorage::C(Arc::new(payload.as_ref().clone()));
+        if let CellStorage::C(other) = &distinct {
+            assert!(!Arc::ptr_eq(payload, other));
+        }
+        assert_eq!(
+            line.cells, distinct,
+            "distinct deep clones use exact equality"
+        );
+        let restored: CellStorage = serde_json::from_value(expected.clone()).unwrap();
+        if let CellStorage::C(other) = &restored {
+            assert!(!Arc::ptr_eq(payload, other));
+            assert_eq!(payload.text, other.text);
+            assert_eq!(payload.len(), other.len());
+            assert_eq!(
+                payload.last_cell_was_wrapped(),
+                other.last_cell_was_wrapped()
+            );
+            let visible = |row: &ClusteredLine| {
+                row.iter()
+                    .map(|cell| (cell.cell_index(), cell.width(), cell.as_cell()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(visible(payload), visible(other));
+        } else {
+            panic!("wire round trip must retain clustered storage");
+        }
+        // The existing bitset wire representation preserves set indices,
+        // not trailing zero capacity; do not confuse that with clone identity.
+        assert_eq!(serde_json::to_value(&restored).unwrap(), expected);
+        let frozen = line.clone();
+        let original_wire = serde_json::to_value(&frozen).unwrap();
+        line.set_last_cell_was_wrapped(true, 1);
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), original_wire);
+        assert_ne!(serde_json::to_value(&line).unwrap(), original_wire);
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn clustered_image_clones_share_cells_but_refuse_immutable_reflow_identity() {
+        use frankenterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        )));
+        let mut attrs = CellAttributes::blank();
+        attrs.set_image(alloc::boxed::Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            image,
+        )));
+        let mut line = Line::from_text("image", &attrs, 1, None);
+        line.compress_for_scrollback();
+        let frozen = line.clone();
+        match (&line.cells, &frozen.cells) {
+            (CellStorage::C(left), CellStorage::C(right)) => assert!(Arc::ptr_eq(left, right)),
+            _ => panic!("expected clustered image storage"),
+        }
+        assert!(line.has_image_attachments());
+        assert!(frozen.has_image_attachments());
+        assert!(!line.is_same_reflow_source(&frozen));
+
+        // Compare the cluster scan with the prior visible-cell oracle across
+        // empty, image-free, and mixed attribute clusters, including wide text.
+        let plain = CellAttributes::blank();
+        for cells in [
+            vec![],
+            vec![Cell::new('x', plain.clone())],
+            vec![Cell::new('界', attrs.clone())],
+            vec![
+                Cell::new('a', plain.clone()),
+                Cell::new('b', attrs.clone()),
+                Cell::new('c', plain.clone()),
+            ],
+        ] {
+            let mut row = Line::from_cells(cells, 1);
+            row.compress_for_scrollback();
+            let expected = row
+                .visible_cells()
+                .any(|cell| cell.attrs().has_image_attachments());
+            assert_eq!(row.has_image_attachments(), expected);
+        }
+    }
 
     #[test]
     fn bounded_snapshot_charges_clustered_text_before_clone() {
