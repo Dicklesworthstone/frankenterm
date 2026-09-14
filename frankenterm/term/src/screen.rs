@@ -8566,6 +8566,11 @@ pub(crate) mod tests {
                 &originals[row]
             };
             let mut output = source.clone();
+            if row == 1 {
+                // The fixture's aligned cold seam continues into its resident
+                // head. Its final canonical row must retain that wrap bit.
+                output.set_last_cell_was_wrapped(true, 1);
+            }
             let _ = output.cells_mut_for_attr_changes_only();
             let exact = serde_json::to_vec(&originals[row]).unwrap().len()
                 + if row == 1 {
@@ -8579,7 +8584,7 @@ pub(crate) mod tests {
             captured.layout = Some(Arc::clone(&layout));
             let ready = captured
                 .hydrate_with_payload_limit(exact, || false)
-                .unwrap();
+                .unwrap_or_else(|error| panic!("row={row} exact={exact}: {error:#}"));
             assert_eq!(ready.payload_bytes(), exact);
             assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), vec![output]);
             assert!(screen.validates_line_read(&ready));
