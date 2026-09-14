@@ -851,19 +851,19 @@
         "cosmetic": 7,
         "feat": 14,
         "fix": 35,
-        "other": 25,
+        "other": 26,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 110,
+      "fork_side_commit_count": 111,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-13T21:59:43-04:00",
-        "sha": "42180138e2a1091f329d79b9c8af96d91b74b884",
-        "subject": "perf(term): skip unused cold prepared-source hash"
+        "committed_at": "2026-09-14T01:35:54-04:00",
+        "sha": "3106b936b65d6b0ae195f33355c4b826024ad589",
+        "subject": "perf(surface): retain shared token ranges during reflow"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -897,19 +897,19 @@
         "docs": 1,
         "feat": 53,
         "fix": 94,
-        "other": 43,
+        "other": 44,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 47
       },
-      "fork_side_commit_count": 269,
+      "fork_side_commit_count": 270,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T00:59:48-04:00",
-        "sha": "4d3f3d073c9839d4bdd129767cd919a09decf739",
-        "subject": "fix(mux): log committed cold-seam and cold-index resize sources"
+        "classification": "other",
+        "committed_at": "2026-09-14T01:35:54-04:00",
+        "sha": "3106b936b65d6b0ae195f33355c4b826024ad589",
+        "subject": "perf(surface): retain shared token ranges during reflow"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2540,
-  "generated_at": "2026-09-14T05:13:30.922742Z",
+  "fork_side_commit_total": 2542,
+  "generated_at": "2026-09-14T05:38:21.369412Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
