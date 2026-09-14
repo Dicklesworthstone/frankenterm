@@ -1410,12 +1410,28 @@ impl WebGpuState {
         // so consumers know the gamut is the modal expected value
         // rather than a measured one.
         let gamut = classify_surface_color_space(format);
+        // Compare latency/throughput on one exact native binary. wgpu maps
+        // this hint to Metal's drawable count; one can reduce queueing but
+        // also removes CPU/GPU overlap. Keep the established default until
+        // foreground presentation measurements qualify a different policy.
+        let desired_maximum_frame_latency =
+            match std::env::var_os("FT_PROFILE_WEBGPU_FRAME_LATENCY") {
+                None => 2,
+                Some(value) if value == "1" => 1,
+                Some(value) if value == "2" => 2,
+                Some(value) if value == "3" => 3,
+                Some(_) => {
+                    log::warn!("FT_PROFILE_WEBGPU_FRAME_LATENCY must be 1, 2 or 3; using 2");
+                    2
+                }
+            };
         log::info!(
             "webgpu surface configured: format={format:?} \
-             color_space={:?} wide_gamut_unverified={} hdr_capable={}",
+             color_space={:?} wide_gamut_unverified={} hdr_capable={} frame_latency={}",
             gamut.color_space,
             gamut.wide_gamut_unverified,
             gamut.hdr_capable,
+            desired_maximum_frame_latency,
         );
 
         let config = wgpu::SurfaceConfiguration {
@@ -1427,7 +1443,7 @@ impl WebGpuState {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: select_composite_alpha_mode(&caps.alpha_modes),
             view_formats,
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency,
         };
         surface.configure(&device, &config);
 
