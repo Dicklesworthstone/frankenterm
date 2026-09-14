@@ -440,28 +440,63 @@ impl XWindowInner {
                     }
                 }
 
+                let paint_started = std::time::Instant::now();
                 self.events.dispatch(WindowEvent::NeedRepaint);
 
                 self.paint_throttled = true;
                 let window_id = self.window_id;
-                let max_fps = self.config.max_fps;
+                let interval = config::frame_interval_for_max_fps(self.config.max_fps);
+                let connection = self.conn.clone();
+                let original_window = connection
+                    .upgrade()
+                    .and_then(|connection| connection.window_by_id(window_id))
+                    .map(|window| Arc::downgrade(&window));
                 if let Ok(reservation) = crate::reserve_window_main_thread(
                     promise::spawn::MainThreadServiceClass::Render,
                     4 * 1024,
                     "X11 repaint throttle",
                 ) {
                     reservation
-                        .spawn_local(async move {
-                            promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps))
-                                .await;
-                            XConnection::with_window_inner(window_id, move |inner| {
+                        .spawn_local(crate::complete_repaint_after_interval(
+                            paint_started,
+                            interval,
+                            move || {
+                                let Some(connection) = connection.upgrade() else {
+                                    return;
+                                };
+                                let Some(current) = Connection::get() else {
+                                    return;
+                                };
+                                let active = match current.as_ref() {
+                                    Connection::X11(active) => active,
+                                    #[cfg(feature = "wayland")]
+                                    Connection::Wayland(_) => return,
+                                };
+                                if !Rc::ptr_eq(&connection, active) {
+                                    return;
+                                }
+                                let Some(original_window) =
+                                    original_window.and_then(|weak| weak.upgrade())
+                                else {
+                                    return;
+                                };
+                                let Some(window) = connection.window_by_id(window_id) else {
+                                    return;
+                                };
+                                if !Arc::ptr_eq(&window, &original_window) {
+                                    return;
+                                }
+                                let mut inner =
+                                    lock_window_inner(&window, "completing X11 repaint");
+                                if inner.window_id != window_id || window_id.resource_id() == 0 {
+                                    return;
+                                }
                                 inner.paint_throttled = false;
                                 if inner.invalidated {
                                     inner.invalidate();
                                 }
-                                Ok(())
-                            });
-                        })
+                            },
+                        ))
                         .detach();
                 } else {
                     self.paint_throttled = false;

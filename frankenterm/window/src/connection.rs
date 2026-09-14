@@ -8,7 +8,7 @@ use promise::{Future, Promise};
 use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::Rc;
-#[cfg(any(test, target_os = "macos", feature = "wayland"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows", feature = "wayland"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -49,7 +49,7 @@ pub(crate) fn fail_window_op_for_destroyed_window<T>(
 }
 
 #[track_caller]
-#[cfg(any(test, target_os = "macos", feature = "wayland"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows", feature = "wayland"))]
 pub(crate) fn next_unique_window_id(counter: &AtomicUsize) -> Fallible<usize> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {

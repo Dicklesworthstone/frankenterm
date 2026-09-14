@@ -1,5 +1,5 @@
 use super::*;
-use crate::connection::ConnectionOps;
+use crate::connection::{next_unique_window_id, ConnectionOps};
 use crate::parameters::{self, Parameters};
 use crate::{
     Appearance, Clipboard, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Modifiers,
@@ -19,7 +19,7 @@ use raw_window_handle::{
 };
 use shared_library::shared_library;
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Error as IoError};
@@ -27,14 +27,17 @@ use std::num::NonZeroIsize;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
+use std::time::Instant;
 use wezterm_color_types::LinearRgba;
 use wezterm_input_types::KeyboardLedStatus;
 use winapi::shared::minwindef::*;
 use winapi::shared::ntdef::*;
 use winapi::shared::windef::*;
 use winapi::shared::winerror::S_OK;
+use winapi::um::errhandlingapi::{GetLastError, SetLastError};
 use winapi::um::imm::*;
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::shellapi::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
@@ -111,9 +114,38 @@ fn lock_title_font_cache(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub(crate) struct HWindow(HWND);
+pub(crate) struct HWindow(HWND, usize);
 unsafe impl Send for HWindow {}
 unsafe impl Sync for HWindow {}
+
+static NEXT_WINDOW_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Default)]
+struct RepaintState {
+    throttled: Cell<bool>,
+    invalidated: Cell<bool>,
+}
+
+/// The admitted Render task owns this latch even before its first poll.
+/// Cancellation must release it just as normal timer completion does.
+struct RepaintThrottle {
+    window: HWindow,
+    owner: Weak<RefCell<WindowInner>>,
+    state: Rc<RepaintState>,
+}
+
+impl Drop for RepaintThrottle {
+    fn drop(&mut self) {
+        self.state.throttled.set(false);
+        if self.state.invalidated.get() {
+            if let Some(owner) = self.owner.upgrade() {
+                if hwnd_still_owned_by(self.window, &owner) {
+                    unsafe { InvalidateRect(self.window.0, null(), 0) };
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 enum BackendImpl {
@@ -160,8 +192,7 @@ pub(crate) struct WindowInner {
     appearance: Appearance,
 
     config: ConfigHandle,
-    paint_throttled: bool,
-    invalidated: bool,
+    repaint: Rc<RepaintState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -199,6 +230,17 @@ fn adjust_client_to_window_dimensions(
 fn rc_to_pointer(arc: &Rc<RefCell<WindowInner>>) -> LPVOID {
     let cloned = Rc::clone(arc);
     Rc::into_raw(cloned) as LPVOID
+}
+
+/// Only compare userdata against an already-owned allocation. Never recover an
+/// Rc from a delayed bare HWND: Windows can reuse that handle for another window.
+pub(crate) fn hwnd_still_owned_by(hwnd: HWindow, owner: &Rc<RefCell<WindowInner>>) -> bool {
+    !hwnd.0.is_null()
+        && unsafe { GetWindowLongPtrW(hwnd.0, GWLP_USERDATA) } == Rc::as_ptr(owner) as isize
+}
+
+fn current_window_owner(hwnd: HWindow) -> Option<Rc<RefCell<WindowInner>>> {
+    Connection::get()?.get_window(hwnd)
 }
 
 fn rc_from_pointer(lparam: LPVOID) -> Rc<RefCell<WindowInner>> {
@@ -258,6 +300,31 @@ impl HasWindowHandle for WindowInner {
 }
 
 impl WindowInner {
+    fn new(
+        config: ConfigHandle,
+        appearance: Appearance,
+        events: WindowEventSender,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            hwnd: HWindow(null_mut(), next_unique_window_id(&NEXT_WINDOW_ID)?),
+            appearance,
+            events,
+            gl_context_pair: None,
+            vscroll_remainder: 0,
+            hscroll_remainder: 0,
+            keyboard_info: KeyboardLayoutInfo::new(),
+            last_size: None,
+            in_size_move: false,
+            dead_pending: None,
+            saved_placement: None,
+            track_mouse_leave: false,
+            window_drag_position: None,
+            maximize_button_position: None,
+            config,
+            repaint: Rc::new(RepaintState::default()),
+        })
+    }
+
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let Some(conn) = Connection::get() else {
             bail!("Windows connection is unavailable");
@@ -395,12 +462,11 @@ impl WindowInner {
     }
 
     fn apply_decoration(&mut self) {
-        let hwnd = self.hwnd.0;
-        schedule_apply_decoration(hwnd, self.config.window_decorations);
+        schedule_apply_decoration(self.hwnd, self.config.window_decorations);
     }
 }
 
-fn schedule_apply_decoration(hwnd: HWND, decorations: WindowDecorations) {
+fn schedule_apply_decoration(hwnd: HWindow, decorations: WindowDecorations) {
     if let Ok(reservation) = crate::reserve_window_main_thread(
         promise::spawn::MainThreadServiceClass::Topology,
         4 * 1024,
@@ -408,28 +474,32 @@ fn schedule_apply_decoration(hwnd: HWND, decorations: WindowDecorations) {
     ) {
         reservation
             .spawn_local(async move {
-                apply_decoration_immediate(hwnd, decorations);
+                if let Some(owner) = current_window_owner(hwnd) {
+                    apply_decoration_immediate(hwnd, &owner, decorations);
+                }
             })
             .detach();
     }
 }
 
-fn apply_decoration_immediate(hwnd: HWND, decorations: WindowDecorations) {
-    match rc_from_hwnd(hwnd) {
-        Some(inner) => {
-            if inner.borrow().saved_placement.is_some() {
-                // We are full screen; ignore it for now
-                return;
-            }
-        }
-        None => return,
-    };
+fn apply_decoration_immediate(
+    window: HWindow,
+    owner: &Rc<RefCell<WindowInner>>,
+    decorations: WindowDecorations,
+) {
+    if !hwnd_still_owned_by(window, owner) || owner.borrow().saved_placement.is_some() {
+        return;
+    }
+    let hwnd = window.0;
 
     unsafe {
         let orig_style = GetWindowLongW(hwnd, GWL_STYLE);
         let style = decorations_to_style(decorations);
         let new_style = (orig_style & !(WS_OVERLAPPEDWINDOW as i32)) | style as i32;
         SetWindowLongW(hwnd, GWL_STYLE, new_style);
+        if !hwnd_still_owned_by(window, owner) {
+            return;
+        }
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
@@ -444,7 +514,9 @@ fn apply_decoration_immediate(hwnd: HWND, decorations: WindowDecorations) {
                 | SWP_NOOWNERZORDER
                 | SWP_FRAMECHANGED,
         );
-        apply_theme(hwnd);
+        if hwnd_still_owned_by(window, owner) {
+            apply_theme(hwnd);
+        }
     }
 }
 
@@ -477,7 +549,7 @@ impl Window {
         class_name: &str,
         name: &str,
         geometry: ResolvedGeometry,
-        lparam: LPVOID,
+        inner: &Rc<RefCell<WindowInner>>,
     ) -> anyhow::Result<HWND> {
         let class_name = wide_string(class_name);
         let h_inst = unsafe { GetModuleHandleW(null()) };
@@ -555,7 +627,9 @@ impl Window {
                 null_mut(),
                 null_mut(),
                 null_mut(),
-                lparam,
+                // CreateWindowExW consumes this borrowed parameter synchronously.
+                // Only WM_NCCREATE creates the window-owned strong reference.
+                inner as *const Rc<RefCell<WindowInner>> as LPVOID,
             )
         };
 
@@ -563,10 +637,6 @@ impl Window {
             let err = IoError::last_os_error();
             bail!("CreateWindowExW: {}", err);
         }
-
-        // We have to re-apply the styles otherwise they don't
-        // completely stick
-        schedule_apply_decoration(hwnd, decorations);
 
         Ok(hwnd)
     }
@@ -590,42 +660,24 @@ impl Window {
         };
         let appearance = get_appearance();
 
-        let inner = Rc::new(RefCell::new(WindowInner {
-            hwnd: HWindow(null_mut()),
+        let inner = Rc::new(RefCell::new(WindowInner::new(
+            config.clone(),
             appearance,
             events,
-            gl_context_pair: None,
-            vscroll_remainder: 0,
-            hscroll_remainder: 0,
-            keyboard_info: KeyboardLayoutInfo::new(),
-            last_size: None,
-            in_size_move: false,
-            dead_pending: None,
-            saved_placement: None,
-            track_mouse_leave: false,
-            window_drag_position: None,
-            maximize_button_position: None,
-            config: config.clone(),
-            paint_throttled: false,
-            invalidated: true,
-        }));
+        )?));
 
         let conn = Connection::get().ok_or_else(|| {
             anyhow!("new_window must be called after Connection::init has succeeded")
         })?;
 
-        // Careful: `raw` owns a ref to inner, but there is no Drop impl
-        let raw = rc_to_pointer(&inner);
         let geometry = conn.resolve_geometry(geometry);
 
-        let hwnd = match Self::create_window(config, class_name, name, geometry, raw) {
-            Ok(hwnd) => HWindow(hwnd),
-            Err(err) => {
-                // Ensure that we drop the extra ref to raw before we return
-                drop(take_rc_from_pointer(raw));
-                return Err(err);
-            }
-        };
+        Self::create_window(config.clone(), class_name, name, geometry, &inner)?;
+        let hwnd = inner.borrow().hwnd;
+        anyhow::ensure!(
+            hwnd_still_owned_by(hwnd, &inner),
+            "window destroyed during creation"
+        );
         let window_handle = Window(hwnd);
         inner
             .borrow_mut()
@@ -633,16 +685,29 @@ impl Window {
             .assign_window(window_handle.clone());
 
         apply_theme(hwnd.0);
+        anyhow::ensure!(
+            hwnd_still_owned_by(hwnd, &inner),
+            "window destroyed during theme setup"
+        );
         enable_blur_behind(hwnd.0);
+        anyhow::ensure!(
+            hwnd_still_owned_by(hwnd, &inner),
+            "window destroyed during blur setup"
+        );
 
         // Make window capable of accepting drag and drop
         unsafe {
             DragAcceptFiles(hwnd.0, winapi::shared::minwindef::TRUE);
         }
+        anyhow::ensure!(
+            hwnd_still_owned_by(hwnd, &inner),
+            "window destroyed during drag setup"
+        );
 
-        conn.windows
-            .borrow_mut()
-            .insert(hwnd.clone(), Rc::clone(&inner));
+        conn.windows.borrow_mut().insert(hwnd, Rc::clone(&inner));
+
+        // Reapply styles after publishing the exact owner for the delayed task.
+        schedule_apply_decoration(hwnd, config.window_decorations);
 
         Ok(window_handle)
     }
@@ -666,6 +731,9 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
     ) {
         reservation
             .spawn_local(async move {
+                let Some(_owner) = current_window_owner(hwnd) else {
+                    return;
+                };
                 unsafe {
                     log::trace!("applying ShowWindowCommand {show:?}");
                     ShowWindow(
@@ -692,6 +760,9 @@ impl WindowInner {
         ) {
             reservation
                 .spawn_local(async move {
+                    let Some(_owner) = current_window_owner(hwnd) else {
+                        return;
+                    };
                     unsafe {
                         DestroyWindow(hwnd.0);
                     }
@@ -705,7 +776,7 @@ impl WindowInner {
     }
 
     fn set_window_position(&self, coords: ScreenPoint) {
-        let hwnd = self.hwnd.0;
+        let window = self.hwnd;
         log::trace!("set_window_position wants {coords:?}");
         if let Ok(reservation) = crate::reserve_window_main_thread(
             promise::spawn::MainThreadServiceClass::Topology,
@@ -714,6 +785,10 @@ impl WindowInner {
         ) {
             reservation
                 .spawn_local(async move {
+                    let Some(_owner) = current_window_owner(window) else {
+                        return;
+                    };
+                    let hwnd = window.0;
                     log::trace!("set_window_position apply {coords:?}");
                     let mut rect = RECT {
                         left: 0,
@@ -767,70 +842,85 @@ impl WindowInner {
     }
 
     fn toggle_fullscreen(&mut self) {
-        unsafe {
-            let hwnd = self.hwnd.0;
-            let style = GetWindowLongW(hwnd, GWL_STYLE);
-            let config = self.config.clone();
-            if let Some(placement) = self.saved_placement.take() {
-                if let Ok(reservation) = crate::reserve_window_main_thread(
-                    promise::spawn::MainThreadServiceClass::Topology,
-                    4 * 1024,
-                    "windows leave fullscreen",
-                ) {
-                    reservation
-                        .spawn_local(async move {
-                            let style = decorations_to_style(config.window_decorations);
-                            SetWindowLongW(hwnd, GWL_STYLE, style as i32);
-                            SetWindowPlacement(hwnd, &placement);
-                            SetWindowPos(
-                                hwnd,
-                                std::ptr::null_mut(),
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE
-                                    | SWP_NOSIZE
-                                    | SWP_NOZORDER
-                                    | SWP_NOOWNERZORDER
-                                    | SWP_FRAMECHANGED,
-                            );
-                        })
-                        .detach();
-                }
-            } else {
-                let mut placement = WINDOWPLACEMENT::default();
-                placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as _;
-                GetWindowPlacement(hwnd, &mut placement);
+        let window = self.hwnd;
+        if let Ok(reservation) = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+            "windows toggle fullscreen",
+        ) {
+            reservation
+                .spawn_local(async move {
+                    let Some(owner) = current_window_owner(window) else {
+                        return;
+                    };
+                    apply_fullscreen_toggle(window, &owner);
+                })
+                .detach();
+        }
+    }
+}
 
-                self.saved_placement.replace(placement);
-                if let Ok(reservation) = crate::reserve_window_main_thread(
-                    promise::spawn::MainThreadServiceClass::Topology,
-                    4 * 1024,
-                    "windows enter fullscreen",
-                ) {
-                    reservation
-                        .spawn_local(async move {
-                            let mut mi = MONITORINFO::default();
-                            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-                            GetMonitorInfoW(
-                                MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY),
-                                &mut mi,
-                            );
-                            SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as i32));
-                            SetWindowPos(
-                                hwnd,
-                                HWND_TOP,
-                                mi.rcMonitor.left,
-                                mi.rcMonitor.top,
-                                mi.rcMonitor.right - mi.rcMonitor.left,
-                                mi.rcMonitor.bottom - mi.rcMonitor.top,
-                                SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
-                            );
-                        })
-                        .detach();
-                }
+fn apply_fullscreen_toggle(window: HWindow, owner: &Rc<RefCell<WindowInner>>) {
+    if !hwnd_still_owned_by(window, owner) {
+        return;
+    }
+    let hwnd = window.0;
+    // Update logical state only after the operation has been admitted. Release
+    // the RefCell borrow before APIs that synchronously dispatch window events.
+    let (saved, decorations) = {
+        let inner = owner.borrow();
+        (inner.saved_placement, inner.config.window_decorations)
+    };
+    unsafe {
+        if let Some(placement) = saved {
+            owner.borrow_mut().saved_placement = None;
+            SetWindowLongW(hwnd, GWL_STYLE, decorations_to_style(decorations) as i32);
+            if !hwnd_still_owned_by(window, owner) {
+                return;
             }
+            SetWindowPlacement(hwnd, &placement);
+            if !hwnd_still_owned_by(window, owner) {
+                return;
+            }
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
+        } else {
+            let mut placement = WINDOWPLACEMENT::default();
+            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as _;
+            if GetWindowPlacement(hwnd, &mut placement) == 0 {
+                return;
+            }
+            let mut monitor = MONITORINFO::default();
+            monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY),
+                &mut monitor,
+            ) == 0
+            {
+                return;
+            }
+            owner.borrow_mut().saved_placement = Some(placement);
+            let style = GetWindowLongW(hwnd, GWL_STYLE);
+            SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as i32));
+            if !hwnd_still_owned_by(window, owner) {
+                return;
+            }
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                monitor.rcMonitor.left,
+                monitor.rcMonitor.top,
+                monitor.rcMonitor.right - monitor.rcMonitor.left,
+                monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
         }
     }
 }
@@ -924,6 +1014,9 @@ impl WindowOps for Window {
         ) {
             reservation
                 .spawn_local(async move {
+                    let Some(owner) = current_window_owner(window) else {
+                        return;
+                    };
                     // In some situation, calling SetForegroundWindow could not bring up the window,
                     // This is a little hack which can "steal" the foreground window permission
                     // We only call this function in the window creation, so it should be fine.
@@ -963,7 +1056,9 @@ impl WindowOps for Window {
                             std::mem::size_of::<INPUT>() as i32,
                         );
 
-                        SetForegroundWindow(handle);
+                        if hwnd_still_owned_by(window, &owner) {
+                            SetForegroundWindow(handle);
+                        }
                     }
                 })
                 .detach();
@@ -986,10 +1081,14 @@ impl WindowOps for Window {
     }
 
     fn invalidate(&self) {
-        let hwnd = self.0 .0;
         log::trace!("WindowOps::invalidate calling InvalidateRect");
-        unsafe {
-            InvalidateRect(hwnd, null(), 0);
+        if let Some(_owner) = current_window_owner(self.0) {
+            unsafe { InvalidateRect(self.0 .0, null(), 0) };
+        } else if Connection::get().is_none() {
+            Connection::with_window_inner(self.0, |inner| {
+                unsafe { InvalidateRect(inner.hwnd.0, null(), 0) };
+                Ok(())
+            });
         }
     }
 
@@ -1034,6 +1133,9 @@ impl WindowOps for Window {
             ) {
                 reservation
                     .spawn_local(async move {
+                        let Some(owner) = current_window_owner(hwnd) else {
+                            return;
+                        };
                         log::trace!("set_inner_size called with {width}x{height}");
                         let frame_dpi = unsafe { GetDpiForWindow(hwnd.0) };
                         let (width, height) = adjust_client_to_window_dimensions(
@@ -1057,9 +1159,12 @@ impl WindowOps for Window {
                                     height,
                                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
                                 );
+                                if !hwnd_still_owned_by(hwnd, &owner) {
+                                    return;
+                                }
                                 wm_paint(hwnd.0, 0, 0, 0);
-                                if let Some(inner) = rc_from_hwnd(hwnd.0) {
-                                    let mut inner = inner.borrow_mut();
+                                if hwnd_still_owned_by(hwnd, &owner) {
+                                    let mut inner = owner.borrow_mut();
                                     inner.events.dispatch(WindowEvent::SetInnerSizeCompleted);
                                 }
                             }
@@ -1228,9 +1333,20 @@ unsafe fn update_title_font(hwnd: HWND) {
 /// WindowInner.hwnd -> hwnd
 unsafe fn wm_nccreate(hwnd: HWND, _msg: UINT, _wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let create: &CREATESTRUCTW = &*(lparam as *const CREATESTRUCTW);
-    let inner = rc_from_pointer(create.lpCreateParams);
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as _);
-    inner.borrow_mut().hwnd = HWindow(hwnd);
+    if create.lpCreateParams.is_null() {
+        return Some(0);
+    }
+    // The creator keeps this Rc alive across CreateWindowExW. This clone is
+    // transferred exactly once to userdata; creation failure after this point
+    // is released by WM_NCDESTROY, never by the creator's error branch.
+    let inner = &*create.lpCreateParams.cast::<Rc<RefCell<WindowInner>>>();
+    let raw = rc_to_pointer(inner);
+    SetLastError(0);
+    if SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as _) == 0 && GetLastError() != 0 {
+        drop(take_rc_from_pointer(raw));
+        return Some(0);
+    }
+    inner.borrow_mut().hwnd.0 = hwnd;
 
     None
 }
@@ -1244,13 +1360,28 @@ unsafe fn wm_ncdestroy(
     _wparam: WPARAM,
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
-    let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as LPVOID;
+    // Revoke native lookup before dropping the owned reference or invoking
+    // callbacks, including callbacks that reenter window destruction.
+    let raw = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as LPVOID;
     if !raw.is_null() {
-        let inner = take_rc_from_pointer(raw);
-        let mut inner = inner.borrow_mut();
-        inner.events.dispatch(WindowEvent::Destroyed);
-        inner.hwnd = HWindow(null_mut());
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        let owner = take_rc_from_pointer(raw);
+        let window = {
+            let mut inner = owner.borrow_mut();
+            let window = inner.hwnd;
+            inner.hwnd.0 = null_mut();
+            inner.repaint.throttled.set(false);
+            window
+        };
+        if let Some(connection) = Connection::get() {
+            let mut windows = connection.windows.borrow_mut();
+            if windows
+                .get(&window)
+                .is_some_and(|stored| Rc::ptr_eq(stored, &owner))
+            {
+                windows.remove(&window);
+            }
+        }
+        owner.borrow_mut().events.dispatch(WindowEvent::Destroyed);
     }
 
     None
@@ -1743,13 +1874,8 @@ unsafe fn wm_kill_focus(
 }
 
 unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
-    let inner = rc_from_hwnd(hwnd)?;
-    let mut inner = inner.borrow_mut();
-
-    if inner.paint_throttled {
-        inner.invalidated = true;
-        return Some(0);
-    }
+    let owner = rc_from_hwnd(hwnd)?;
+    let paint_started = Instant::now();
 
     let mut ps = PAINTSTRUCT {
         fErase: 0,
@@ -1765,16 +1891,29 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
         rgbReserved: [0; 32],
     };
     let _ = BeginPaint(hwnd, &mut ps);
-    // Do nothing right now
+    // Validate the region even when throttled. Otherwise Windows repeatedly
+    // sends WM_PAINT for the same region while the Render timer is pending.
     EndPaint(hwnd, &mut ps);
 
-    inner.invalidated = false;
-    // Ask the app to repaint in a bit
-    inner.events.dispatch(WindowEvent::NeedRepaint);
+    let (window, state, max_fps) = {
+        let inner = owner.borrow();
+        (inner.hwnd, Rc::clone(&inner.repaint), inner.config.max_fps)
+    };
+    if !hwnd_still_owned_by(window, &owner) {
+        return Some(0);
+    }
+    if state.throttled.replace(true) {
+        state.invalidated.set(true);
+        return Some(0);
+    }
+    state.invalidated.set(false);
+    let throttle = RepaintThrottle {
+        window,
+        owner: Rc::downgrade(&owner),
+        state,
+    };
+    owner.borrow_mut().events.dispatch(WindowEvent::NeedRepaint);
 
-    inner.paint_throttled = true;
-    let window_id = inner.hwnd;
-    let max_fps = inner.config.max_fps;
     if let Ok(reservation) = crate::reserve_window_main_thread(
         promise::spawn::MainThreadServiceClass::Render,
         4 * 1024,
@@ -1782,18 +1921,16 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     ) {
         reservation
             .spawn_local(async move {
-                promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
-                Connection::with_window_inner(window_id, move |inner| {
-                    inner.paint_throttled = false;
-                    if inner.invalidated {
-                        InvalidateRect(inner.hwnd.0, null(), 0);
-                    }
-                    Ok(())
-                });
+                crate::complete_repaint_after_interval(
+                    paint_started,
+                    config::frame_interval_for_max_fps(max_fps),
+                    move || drop(throttle),
+                )
+                .await;
             })
             .detach();
     } else {
-        inner.paint_throttled = false;
+        drop(throttle);
     }
 
     Some(0)
@@ -3148,6 +3285,401 @@ unsafe extern "system" fn wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestWindowClass {
+        name: Vec<u16>,
+        instance: HINSTANCE,
+    }
+
+    impl TestWindowClass {
+        fn new(proc: WNDPROC) -> Self {
+            let name = wide_string(&format!(
+                "FrankenTermOwnershipTest{}",
+                next_unique_window_id(&NEXT_WINDOW_ID).unwrap()
+            ));
+            let instance = unsafe { GetModuleHandleW(null()) };
+            let class = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: proc,
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: instance,
+                hIcon: null_mut(),
+                hCursor: null_mut(),
+                hbrBackground: null_mut(),
+                lpszMenuName: null(),
+                lpszClassName: name.as_ptr(),
+            };
+            assert_ne!(
+                unsafe { RegisterClassW(&class) },
+                0,
+                "{}",
+                IoError::last_os_error()
+            );
+            Self { name, instance }
+        }
+
+        fn create(&self, owner: &Rc<RefCell<WindowInner>>) -> HWND {
+            unsafe {
+                CreateWindowExW(
+                    0,
+                    self.name.as_ptr(),
+                    self.name.as_ptr(),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    160,
+                    100,
+                    null_mut(),
+                    null_mut(),
+                    self.instance,
+                    owner as *const Rc<RefCell<WindowInner>> as LPVOID,
+                )
+            }
+        }
+    }
+
+    impl Drop for TestWindowClass {
+        fn drop(&mut self) {
+            unsafe { UnregisterClassW(self.name.as_ptr(), self.instance) };
+        }
+    }
+
+    /// Only the fixture's hidden native window may be destroyed during unwind.
+    struct TestWindow {
+        owner: Rc<RefCell<WindowInner>>,
+        window: HWindow,
+        _class: TestWindowClass,
+    }
+
+    impl TestWindow {
+        fn new(events: WindowEventSender) -> Self {
+            let class = TestWindowClass::new(Some(ownership_test_proc));
+            let owner = test_window_owner(events);
+            let hwnd = class.create(&owner);
+            assert!(!hwnd.is_null(), "{}", IoError::last_os_error());
+            let window = owner.borrow().hwnd;
+            owner.borrow_mut().events.assign_window(Window(window));
+            Self {
+                owner,
+                window,
+                _class: class,
+            }
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            if hwnd_still_owned_by(self.window, &self.owner) {
+                unsafe { DestroyWindow(self.window.0) };
+            }
+        }
+    }
+
+    struct TestConnection(Rc<Connection>);
+
+    impl TestConnection {
+        fn new() -> Self {
+            assert!(Connection::get().is_none());
+            Self(Connection::init().unwrap())
+        }
+
+        fn register(&self, window: &TestWindow) {
+            self.0
+                .windows
+                .borrow_mut()
+                .insert(window.window, Rc::clone(&window.owner));
+        }
+    }
+
+    impl Drop for TestConnection {
+        fn drop(&mut self) {
+            crate::connection::shutdown();
+        }
+    }
+
+    fn test_window_owner(events: WindowEventSender) -> Rc<RefCell<WindowInner>> {
+        Rc::new(RefCell::new(
+            WindowInner::new(ConfigHandle::default_config(), Appearance::Light, events).unwrap(),
+        ))
+    }
+
+    unsafe extern "system" fn ownership_test_proc(
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let result = match msg {
+            WM_NCCREATE => wm_nccreate(hwnd, msg, wparam, lparam),
+            WM_NCDESTROY => wm_ncdestroy(hwnd, msg, wparam, lparam),
+            _ => None,
+        };
+        result.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
+    }
+
+    unsafe extern "system" fn fail_create_test_proc(
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_CREATE {
+            -1
+        } else {
+            ownership_test_proc(hwnd, msg, wparam, lparam)
+        }
+    }
+
+    unsafe extern "system" fn fail_nccreate_test_proc(
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_NCCREATE {
+            wm_nccreate(hwnd, msg, wparam, lparam);
+            0
+        } else {
+            ownership_test_proc(hwnd, msg, wparam, lparam)
+        }
+    }
+
+    #[test]
+    fn windows_creation_failure_releases_only_transferred_reference() {
+        let owner = test_window_owner(WindowEventSender::new(|_, _| {}));
+        let unregistered = TestWindowClass {
+            name: wide_string(&format!("FrankenTermMissingClass{}", owner.borrow().hwnd.1)),
+            instance: unsafe { GetModuleHandleW(null()) },
+        };
+        assert!(unregistered.create(&owner).is_null());
+        assert_eq!(Rc::strong_count(&owner), 1);
+
+        let procedures: [WNDPROC; 2] = [Some(fail_create_test_proc), Some(fail_nccreate_test_proc)];
+        for proc in procedures {
+            let class = TestWindowClass::new(proc);
+            assert!(class.create(&owner).is_null());
+            assert_eq!(
+                Rc::strong_count(&owner),
+                1,
+                "WM_NCDESTROY must release exactly its own clone"
+            );
+            assert!(owner.borrow().hwnd.0.is_null());
+        }
+    }
+
+    #[test]
+    fn windows_failed_userdata_install_does_not_transfer_reference() {
+        let owner = test_window_owner(WindowEventSender::new(|_, _| {}));
+        let create = CREATESTRUCTW {
+            lpCreateParams: &owner as *const Rc<RefCell<WindowInner>> as LPVOID,
+            ..CREATESTRUCTW::default()
+        };
+        let result =
+            unsafe { wm_nccreate(null_mut(), WM_NCCREATE, 0, &create as *const _ as LPARAM) };
+        assert_eq!(result, Some(0));
+        assert_eq!(Rc::strong_count(&owner), 1);
+        assert!(owner.borrow().hwnd.0.is_null());
+    }
+
+    #[test]
+    fn windows_destroy_revokes_lookup_before_reentrant_callback() {
+        let _lock = crate::REPAINT_SCHEDULER_TEST_LOCK.lock().unwrap();
+        let connection = TestConnection::new();
+        let observations = Rc::new(Cell::new((0, false, false)));
+        let observed = Rc::clone(&observations);
+        let window = TestWindow::new(WindowEventSender::new(move |event, window| {
+            if matches!(event, WindowEvent::Destroyed) {
+                let revoked = unsafe { GetWindowLongPtrW(window.0 .0, GWLP_USERDATA) } == 0;
+                let absent = current_window_owner(window.0).is_none();
+                observed.set((observed.get().0 + 1, revoked, absent));
+                unsafe {
+                    wm_ncdestroy(window.0 .0, WM_NCDESTROY, 0, 0);
+                }
+            }
+        }));
+        connection.register(&window);
+        assert_eq!(Rc::strong_count(&window.owner), 3);
+        let destroyed = unsafe { DestroyWindow(window.window.0) };
+        assert_ne!(destroyed, 0);
+        assert_eq!(observations.get(), (1, true, true));
+        assert!(window.owner.borrow().hwnd.0.is_null());
+        assert_eq!(Rc::strong_count(&window.owner), 1);
+        assert!(connection.0.windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn windows_queued_decoration_refuses_reused_handle_generation() {
+        let _lock = crate::REPAINT_SCHEDULER_TEST_LOCK.lock().unwrap();
+        let connection = TestConnection::new();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let previous = test_window_owner(WindowEventSender::new(|_, _| {}));
+        let window = TestWindow::new(WindowEventSender::new(|_, _| {}));
+        connection.register(&window);
+        // The same native value now belongs to a different logical window. No
+        // reliance on Windows choosing to recycle a particular numeric handle.
+        let stale = HWindow(window.window.0, previous.borrow().hwnd.1);
+        assert!(connection.0.get_window(stale).is_none());
+        assert!(!hwnd_still_owned_by(stale, &previous));
+        let before = unsafe { GetWindowLongW(window.window.0, GWL_STYLE) };
+        schedule_apply_decoration(stale, WindowDecorations::NONE);
+        assert!(executor.try_tick().unwrap());
+        assert_eq!(
+            unsafe { GetWindowLongW(window.window.0, GWL_STYLE) },
+            before
+        );
+        schedule_apply_decoration(window.window, WindowDecorations::NONE);
+        assert!(executor.try_tick().unwrap());
+        assert_ne!(
+            unsafe { GetWindowLongW(window.window.0, GWL_STYLE) },
+            before
+        );
+    }
+
+    #[test]
+    fn windows_throttled_paint_validates_region_then_requeues_once() {
+        let window = TestWindow::new(WindowEventSender::new(|_, _| {}));
+        let state = Rc::clone(&window.owner.borrow().repaint);
+        state.throttled.set(true);
+        unsafe {
+            InvalidateRect(window.window.0, null(), 0);
+        }
+        assert_ne!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+        assert_eq!(
+            unsafe { wm_paint(window.window.0, WM_PAINT, 0, 0) },
+            Some(0)
+        );
+        assert_eq!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+        assert!(state.invalidated.get());
+        let throttle = RepaintThrottle {
+            window: window.window,
+            owner: Rc::downgrade(&window.owner),
+            state: Rc::clone(&state),
+        };
+        let _borrow = window.owner.borrow_mut();
+        drop(throttle);
+        assert!(
+            !state.throttled.get(),
+            "completion cannot require borrowing WindowInner"
+        );
+        assert_ne!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+    }
+
+    #[test]
+    fn windows_unpolled_repaint_cancellation_releases_latch() {
+        let window = TestWindow::new(WindowEventSender::new(|_, _| {}));
+        let state = Rc::clone(&window.owner.borrow().repaint);
+        state.throttled.set(true);
+        state.invalidated.set(true);
+        let throttle = RepaintThrottle {
+            window: window.window,
+            owner: Rc::downgrade(&window.owner),
+            state: Rc::clone(&state),
+        };
+        let pending = crate::complete_repaint_after_interval(
+            Instant::now(),
+            std::time::Duration::from_secs(60),
+            move || drop(throttle),
+        );
+        drop(pending);
+        assert!(!state.throttled.get());
+        assert_ne!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+    }
+
+    #[test]
+    fn windows_retired_render_task_releases_actual_paint_latch() {
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor,
+        };
+        let _lock = crate::REPAINT_SCHEDULER_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 16 * 1024, 1, 8 * 1024).unwrap(),
+        )
+        .unwrap();
+        let paints = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&paints);
+        let window = TestWindow::new(WindowEventSender::new(move |event, _| {
+            if matches!(event, WindowEvent::NeedRepaint) {
+                observed.set(observed.get() + 1);
+            }
+        }));
+        let state = Rc::clone(&window.owner.borrow().repaint);
+        unsafe {
+            InvalidateRect(window.window.0, null(), 0);
+            wm_paint(window.window.0, WM_PAINT, 0, 0);
+        }
+        assert_eq!(paints.get(), 1);
+        assert!(state.throttled.get());
+        assert!(matches!(
+            promise::spawn::try_reserve_main_thread(MainThreadServiceClass::Interactive, 4 * 1024),
+            MainThreadReservationOutcome::RetryableFull(_)
+        ));
+        unsafe {
+            InvalidateRect(window.window.0, null(), 0);
+            wm_paint(window.window.0, WM_PAINT, 0, 0);
+        }
+        assert_eq!(paints.get(), 1, "throttled paint must not dispatch again");
+        assert_eq!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+        drop(executor); // Retire the actual detached, still-unpolled Render future.
+        assert!(!state.throttled.get());
+        assert_ne!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+    }
+
+    #[test]
+    fn windows_repaint_cancellation_refuses_foreign_window_owner() {
+        let window = TestWindow::new(WindowEventSender::new(|_, _| {}));
+        let previous = test_window_owner(WindowEventSender::new(|_, _| {}));
+        let state = Rc::clone(&previous.borrow().repaint);
+        state.throttled.set(true);
+        state.invalidated.set(true);
+        unsafe {
+            ValidateRect(window.window.0, null());
+        }
+        drop(RepaintThrottle {
+            window: HWindow(window.window.0, previous.borrow().hwnd.1),
+            owner: Rc::downgrade(&previous),
+            state: Rc::clone(&state),
+        });
+        assert!(!state.throttled.get());
+        assert_eq!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+    }
+
+    #[test]
+    fn windows_rejected_fullscreen_admission_preserves_placement() {
+        use promise::spawn::{MainThreadAdmissionLimits, MainThreadServiceClass, SimpleExecutor};
+        let _lock = crate::REPAINT_SCHEDULER_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 4 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let _occupied = crate::reserve_window_main_thread(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            "fullscreen capacity regression",
+        )
+        .unwrap();
+        let owner = test_window_owner(WindowEventSender::new(|_, _| {}));
+        owner.borrow_mut().toggle_fullscreen();
+        assert!(owner.borrow().saved_placement.is_none());
+        let mut saved = WINDOWPLACEMENT::default();
+        saved.rcNormalPosition.left = 37;
+        owner.borrow_mut().saved_placement = Some(saved);
+        owner.borrow_mut().toggle_fullscreen();
+        assert_eq!(
+            owner
+                .borrow()
+                .saved_placement
+                .unwrap()
+                .rcNormalPosition
+                .left,
+            37
+        );
+        assert!(
+            !executor.try_tick().unwrap(),
+            "rejected operation must not create a task"
+        );
+    }
 
     #[test]
     fn mods_and_buttons_maps_xbutton_state_flags() {

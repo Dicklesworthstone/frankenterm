@@ -1,5 +1,5 @@
 //! The connection to the GUI subsystem
-use super::{HWindow, WindowInner};
+use super::{hwnd_still_owned_by, HWindow, WindowInner};
 use crate::connection::{
     fail_window_op_for_destroyed_window, new_window_op_promise, ConnectionOps,
 };
@@ -141,7 +141,11 @@ impl Connection {
     }
 
     pub(crate) fn get_window(&self, handle: HWindow) -> Option<Rc<RefCell<WindowInner>>> {
-        self.windows.borrow().get(&handle).map(Rc::clone)
+        self.windows
+            .borrow()
+            .get(&handle)
+            .filter(|owner| hwnd_still_owned_by(handle, owner))
+            .map(Rc::clone)
     }
 
     pub(crate) fn with_window_inner<

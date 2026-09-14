@@ -65,6 +65,26 @@ pub(crate) fn reserve_window_main_thread(
 
 mod egl;
 
+// Tests that install a promise main-thread scheduler share process-global
+// state even when their native windows/connections are otherwise isolated.
+#[cfg(test)]
+pub(crate) static REPAINT_SCHEDULER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Finish in the already admitted Render task. Re-admitting completion as a
+/// window operation can strand the repaint latch when the general pool is full.
+/// Paint time and time queued before the first poll both count toward the cap.
+pub(crate) async fn complete_repaint_after_interval(
+    paint_started: std::time::Instant,
+    interval: std::time::Duration,
+    complete: impl FnOnce(),
+) {
+    let remaining = interval.saturating_sub(paint_started.elapsed());
+    if !remaining.is_zero() {
+        promise::spawn::sleep(remaining).await;
+    }
+    complete();
+}
+
 pub use bitmaps::{BitmapImage, Image};
 pub use connection::*;
 pub use glium;
@@ -462,6 +482,84 @@ impl ResizeIncrement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overdue_repaint_completes_with_no_free_general_admission() {
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor,
+        };
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        let _scheduler_guard = REPAINT_SCHEDULER_TEST_LOCK.lock().unwrap();
+
+        // One general slot is occupied by the Render timer itself; the other
+        // slot is reserved for critical input/topology and cannot admit the old
+        // Interactive completion. Run the real timer future in that condition.
+        let limits = MainThreadAdmissionLimits::new(2, 16 * 1024, 1, 8 * 1024).unwrap();
+        let executor = SimpleExecutor::try_with_limits(limits).unwrap();
+        let reservation = reserve_window_main_thread(
+            MainThreadServiceClass::Render,
+            4 * 1024,
+            "repaint saturation regression",
+        )
+        .unwrap();
+        let throttled = Rc::new(Cell::new(true));
+        let completion = Rc::clone(&throttled);
+        let started = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        reservation
+            .spawn_local(complete_repaint_after_interval(
+                started,
+                Duration::from_millis(33),
+                move || {
+                    assert!(matches!(
+                        promise::spawn::try_reserve_main_thread(
+                            MainThreadServiceClass::Interactive,
+                            4 * 1024,
+                        ),
+                        MainThreadReservationOutcome::RetryableFull(_)
+                    ));
+                    completion.set(false);
+                },
+            ))
+            .detach();
+
+        assert!(executor.try_tick().unwrap());
+        assert!(
+            !throttled.get(),
+            "an overdue repaint must finish on its first poll without a new admission or timer"
+        );
+        assert!(!executor.try_tick().unwrap());
+        // Completion must also release its original permit.
+        assert!(reserve_window_main_thread(
+            MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "repaint completion capacity returned",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn repaint_completion_waits_when_its_interval_has_not_elapsed() {
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use std::time::{Duration, Instant};
+
+        let completed = Cell::new(false);
+        // Poll only once and then cancel; no wall-clock sleep is needed to
+        // prove that a fresh timer cannot immediately release the frame cap.
+        let mut timer = Box::pin(complete_repaint_after_interval(
+            Instant::now(),
+            Duration::from_secs(3600),
+            || completed.set(true),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(timer.as_mut().poll(&mut context), Poll::Pending));
+        drop(timer);
+        assert!(!completed.get());
+    }
 
     #[test]
     fn font_menu_candidates_follow_live_remaps_and_preserve_modifiers() {

@@ -3231,36 +3231,63 @@ impl WindowView {
             if inner.paint_throttled {
                 inner.invalidated = true;
             } else {
+                let paint_started = Instant::now();
                 inner.events.dispatch(WindowEvent::NeedRepaint);
                 inner.invalidated = false;
                 inner.paint_throttled = true;
 
                 let window_id = inner.window_id;
-                let max_fps = inner.config.max_fps;
+                let interval = config::frame_interval_for_max_fps(inner.config.max_fps);
+                let connection = Connection::get().map(|connection| Rc::downgrade(&connection));
+                let original_state = Rc::downgrade(&this.inner);
                 if let Ok(reservation) = crate::reserve_window_main_thread(
                     promise::spawn::MainThreadServiceClass::Render,
                     4 * 1024,
                     "macOS repaint throttle",
                 ) {
                     reservation
-                        .spawn_local(async move {
-                            promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps))
-                                .await;
-                            Connection::with_window_inner(window_id, move |inner| {
-                                if let Some(window_view) =
-                                    WindowView::get_this(unsafe { &**inner.view })
-                                {
-                                    let mut state = window_view.inner.borrow_mut();
+                        .spawn_local(crate::complete_repaint_after_interval(
+                            paint_started,
+                            interval,
+                            move || {
+                                let Some(connection) = connection.and_then(|weak| weak.upgrade())
+                                else {
+                                    return;
+                                };
+                                let Some(current) = Connection::get() else {
+                                    return;
+                                };
+                                if !Rc::ptr_eq(&connection, &current) {
+                                    return;
+                                }
+                                let Some(original_state) = original_state.upgrade() else {
+                                    return;
+                                };
+                                let Some(handle) = connection.window_by_id(window_id) else {
+                                    return;
+                                };
+                                // Retain the native view only after the timer wakes, and release
+                                // every RefCell guard before reentrant AppKit invalidation.
+                                let view = handle.borrow().view.clone();
+                                let Some(window_view) = WindowView::get_this(unsafe { &**view })
+                                else {
+                                    return;
+                                };
+                                if !Rc::ptr_eq(&window_view.inner, &original_state) {
+                                    return;
+                                }
+                                let invalidated = {
+                                    let mut state = original_state.borrow_mut();
                                     state.paint_throttled = false;
-                                    if state.invalidated {
-                                        unsafe {
-                                            let () = msg_send![*inner.view, setNeedsDisplay: YES];
-                                        }
+                                    state.invalidated
+                                };
+                                if invalidated {
+                                    unsafe {
+                                        let () = msg_send![*view, setNeedsDisplay: YES];
                                     }
                                 }
-                                Ok(())
-                            });
-                        })
+                            },
+                        ))
                         .detach();
                 } else {
                     inner.paint_throttled = false;
