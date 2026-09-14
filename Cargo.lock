@@ -3854,6 +3854,7 @@ dependencies = [
  "futures",
  "half",
  "hex",
+ "hmac",
  "hostname",
  "insta",
  "jsonschema",
@@ -3899,6 +3900,7 @@ dependencies = [
  "url",
  "x509-parser",
  "xattr",
+ "zeroize",
  "zstd 0.14.0",
 ]
 

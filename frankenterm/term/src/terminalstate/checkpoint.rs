@@ -2030,6 +2030,35 @@ impl CheckpointReplayConfigV2 {
     ) -> Result<bool, TerminalCheckpointError> {
         PendingReplayConfigV2::capture(config, limits)?.matches_checkpoint(self, tables)
     }
+
+    pub(crate) fn into_configuration(
+        &self,
+        tables: &[Arc<HashMap<u32, u8>>],
+    ) -> Result<Arc<dyn TerminalConfiguration>, TerminalCheckpointError> {
+        let unicode_version = self.unicode_version.into_live(tables)?;
+        let color_palette = self.color_palette.into_live()?;
+        Ok(Arc::new(ReplayTerminalConfiguration {
+            scrollback_size: usize_from_u64(self.scrollback_size, "replay.scrollback_size")?,
+            color_palette,
+            enable_kitty_keyboard: self.enable_kitty_keyboard,
+            max_user_vars: usize_from_u64(self.max_user_vars, "replay.max_user_vars")?,
+            max_unicode_version_stack_depth: usize_from_u64(
+                self.max_unicode_version_stack_depth,
+                "replay.max_unicode_version_stack_depth",
+            )?,
+            max_accumulating_title_len: usize_from_u64(
+                self.max_accumulating_title_len,
+                "replay.max_accumulating_title_len",
+            )?,
+            max_color_map_entries: usize_from_u64(
+                self.max_color_map_entries,
+                "replay.max_color_map_entries",
+            )?,
+            unicode_version,
+            normalize_output_to_unicode_nfc: self.normalize_output_to_unicode_nfc,
+            bidi_mode: self.bidi_mode.into_live(),
+        }))
+    }
 }
 
 struct ReplayTerminalConfiguration {
@@ -2874,6 +2903,141 @@ impl std::fmt::Debug for TerminalCheckpointV2 {
     }
 }
 
+/// Bounded hot terminal state captured under the terminal lock.
+/// The cold-history snapshot generation and interval are pinned under lock,
+/// while materialization of cold rows from the spill sink is deferred
+/// outside the lock.
+#[derive(Debug)]
+pub struct StagedHotCheckpoint {
+    pub checkpoint: TerminalCheckpointV2,
+    pub sink: Option<Arc<dyn crate::config::ScrollbackSpillSink>>,
+    pub pinned_interval: Option<crate::config::ScrollbackIntervalCapture>,
+    pub expected_newest_exclusive: usize,
+    pub screen_limits: crate::screen::ScreenCheckpointLimits,
+    pub screen_usage: crate::screen::ScreenCheckpointUsage,
+    pub limits: TerminalCheckpointLimits,
+}
+
+impl StagedHotCheckpoint {
+    /// Materialize cold-history rows from the spill sink outside the terminal lock,
+    /// revalidate generation against the pinned generation (failing if stale),
+    /// and assemble the canonical `TerminalCheckpointV2`.
+    pub fn materialize_cold_history(
+        mut self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<TerminalCheckpointV2, TerminalCheckpointError> {
+        limits.validate_policy()?;
+
+        if let Some(sink) = self.sink.take() {
+            let expected_newest_exclusive =
+                StableRowIndex::try_from(self.expected_newest_exclusive)
+                    .map_err(|_| TerminalCheckpointError::ColdScrollbackMetadataInconsistent)?;
+            let max_cold_bytes =
+                u64::try_from(self.screen_limits.max_cold_scrollback_bytes).map_err(|_| {
+                    TerminalCheckpointError::ArithmeticOverflow("cold_scrollback_bytes")
+                })?;
+
+            let snapshot = sink
+                .snapshot_scrollback(
+                    expected_newest_exclusive,
+                    crate::config::ScrollbackSnapshotLimits {
+                        max_rows: self
+                            .screen_limits
+                            .max_total_lines
+                            .saturating_sub(self.screen_usage.lines),
+                        max_stored_bytes: max_cold_bytes,
+                        max_decoded_bytes: self
+                            .screen_limits
+                            .max_retained_capture_bytes
+                            .saturating_sub(self.screen_usage.retained_capture_bytes),
+                        max_physical_bytes: max_cold_bytes,
+                    },
+                )
+                .map_err(TerminalCheckpointError::ColdScrollbackSnapshot)?;
+
+            if !snapshot.rows().is_empty()
+                && snapshot.fidelity() != crate::config::ScrollbackSnapshotFidelity::ExactSemantic
+            {
+                return Err(TerminalCheckpointError::ColdScrollbackNotRecoveryGrade);
+            }
+            if snapshot.newest_stable_row_exclusive() != expected_newest_exclusive
+                || snapshot.stored_bytes() > max_cold_bytes
+                || snapshot.decoded_bytes()
+                    > self
+                        .screen_limits
+                        .max_retained_capture_bytes
+                        .saturating_sub(self.screen_usage.retained_capture_bytes)
+            {
+                return Err(TerminalCheckpointError::ColdScrollbackMetadataInconsistent);
+            }
+
+            let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
+                (None, true) => self.expected_newest_exclusive,
+                (Some(oldest), false) => usize::try_from(oldest)
+                    .map_err(|_| TerminalCheckpointError::ColdScrollbackMetadataInconsistent)?,
+                _ => {
+                    return Err(TerminalCheckpointError::ColdScrollbackMetadataInconsistent);
+                }
+            };
+            if oldest > self.expected_newest_exclusive
+                || self.expected_newest_exclusive.checked_sub(oldest) != Some(snapshot.rows().len())
+            {
+                return Err(TerminalCheckpointError::ColdScrollbackMetadataInconsistent);
+            }
+
+            // Verify generation lineage against the interval pinned under lock
+            let current_interval = sink.try_capture_scrollback_interval();
+            match (&self.pinned_interval, &current_interval) {
+                (
+                    Some(crate::config::ScrollbackIntervalCapture::Ready(before)),
+                    crate::config::ScrollbackIntervalCapture::Ready(after),
+                ) => {
+                    if !after.same_lineage(before) {
+                        return Err(TerminalCheckpointError::StaleColdGeneration);
+                    }
+                    if !snapshot.rows().is_empty()
+                        && !after.retains(
+                            before,
+                            oldest as StableRowIndex..expected_newest_exclusive,
+                        )
+                    {
+                        return Err(TerminalCheckpointError::StaleColdGeneration);
+                    }
+                }
+                (Some(crate::config::ScrollbackIntervalCapture::Ready(_)), _) => {
+                    return Err(TerminalCheckpointError::StaleColdGeneration);
+                }
+                _ => {}
+            }
+
+            let generation = snapshot.generation();
+            let cold_prefix_line_count = snapshot.rows().len();
+
+            let cold_rows = snapshot.into_rows();
+            let mut cold_lines = Vec::new();
+            cold_lines
+                .try_reserve_exact(cold_rows.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.cold_lines"))?;
+            for line in &cold_rows {
+                let cl = CheckpointLine::capture(line)?;
+                cl.validate(&self.screen_limits, &mut self.screen_usage)?;
+                cold_lines.push(cl);
+            }
+
+            if cold_prefix_line_count > 0 {
+                cold_lines.append(&mut self.checkpoint.primary_screen.lines);
+                self.checkpoint.primary_screen.lines = cold_lines;
+                self.checkpoint.primary_screen.stable_row_index_offset = oldest as u64;
+                self.checkpoint.primary_screen.cold_snapshot_generation = Some(generation);
+                self.checkpoint.primary_screen.cold_prefix_line_count = cold_prefix_line_count;
+            }
+        }
+
+        self.checkpoint.validate(limits)?;
+        Ok(self.checkpoint)
+    }
+}
+
 impl TerminalCheckpointV2 {
     fn preflight_checkpoint_attributes(
         attributes: &CellAttributes,
@@ -3331,57 +3495,67 @@ impl TerminalCheckpointV2 {
             .alt_screen
             .checkpoint_parts(&screen_limits, &mut screen_usage)?;
 
-        // Primary screen: preflight resident lines and capture resident lines in memory without calling sink
-        terminal.screen.screen.preflight_resident_checkpoint_usage(&screen_limits, &mut screen_usage)?;
-        let resident_lines = terminal.screen.screen.lines_in_phys_range(0..usize::MAX);
-        let resident_oldest = terminal.screen.screen.phys_to_stable_row_index(0);
-        let mut primary_lines = Vec::new();
-        primary_lines
-            .try_reserve_exact(resident_lines.len())
-            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
-        for line in &resident_lines {
-            primary_lines.push(CheckpointLine::capture(line)?);
-        }
-        let mut keyboard_stack = Vec::new();
-        keyboard_stack
-            .try_reserve_exact(terminal.screen.screen.keyboard_stack.len())
-            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.keyboard_stack"))?;
-        for encoding in &terminal.screen.screen.keyboard_stack {
-            keyboard_stack.push(CheckpointKeyboardEncoding::from(*encoding));
-        }
-        let primary_screen = CheckpointScreen {
-            lines: primary_lines,
-            stable_row_index_offset: resident_oldest as u64,
-            cold_snapshot_generation: None,
-            cold_prefix_line_count: 0,
-            allow_scrollback: true,
-            keyboard_stack,
-            physical_rows: u32::try_from(terminal.screen.screen.physical_rows).map_err(|_| {
-                TerminalCheckpointError::InvalidField {
-                    field: "screen.physical_rows",
-                    reason: "value does not fit the checkpoint wire type",
-                }
-            })?,
-            physical_cols: u32::try_from(terminal.screen.screen.physical_cols).map_err(|_| {
-                TerminalCheckpointError::InvalidField {
-                    field: "screen.physical_cols",
-                    reason: "value does not fit the checkpoint wire type",
-                }
-            })?,
-            dpi: terminal.screen.screen.dpi,
-            saved_cursor: terminal
-                .screen
-                .screen
-                .saved_cursor
-                .as_ref()
-                .map(CheckpointSavedCursor::capture)
-                .transpose()?,
-        };
-
-        // Pin cold history generation from sink
         let sink = terminal.config.scrollback_spill_sink();
-        let pinned_interval = sink.as_ref().map(|s| s.try_capture_scrollback_interval());
-        let expected_newest_exclusive = resident_oldest;
+        let (primary_screen, pinned_interval, expected_newest_exclusive) = if sink.is_some() {
+            terminal
+                .screen
+                .screen
+                .preflight_resident_checkpoint_usage(&screen_limits, &mut screen_usage)?;
+            let resident_lines = terminal.screen.screen.lines_in_phys_range(0..usize::MAX);
+            let resident_oldest = terminal.screen.screen.phys_to_stable_row_index(0);
+            let mut primary_lines = Vec::new();
+            primary_lines
+                .try_reserve_exact(resident_lines.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
+            for line in &resident_lines {
+                primary_lines.push(CheckpointLine::capture(line)?);
+            }
+            let mut keyboard_stack = Vec::new();
+            keyboard_stack
+                .try_reserve_exact(terminal.screen.screen.keyboard_stack.len())
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.keyboard_stack"))?;
+            for encoding in &terminal.screen.screen.keyboard_stack {
+                keyboard_stack.push(CheckpointKeyboardEncoding::from(*encoding));
+            }
+            let primary_screen = CheckpointScreen {
+                lines: primary_lines,
+                stable_row_index_offset: resident_oldest as u64,
+                cold_snapshot_generation: None,
+                cold_prefix_line_count: 0,
+                allow_scrollback: true,
+                keyboard_stack,
+                physical_rows: u32::try_from(terminal.screen.screen.physical_rows).map_err(|_| {
+                    TerminalCheckpointError::InvalidField {
+                        field: "screen.physical_rows",
+                        reason: "value does not fit the checkpoint wire type",
+                    }
+                })?,
+                physical_cols: u32::try_from(terminal.screen.screen.physical_cols).map_err(|_| {
+                    TerminalCheckpointError::InvalidField {
+                        field: "screen.physical_cols",
+                        reason: "value does not fit the checkpoint wire type",
+                    }
+                })?,
+                dpi: terminal.screen.screen.dpi,
+                saved_cursor: terminal
+                    .screen
+                    .screen
+                    .saved_cursor
+                    .as_ref()
+                    .map(CheckpointSavedCursor::capture)
+                    .transpose()?,
+            };
+            let pinned_interval = sink.as_ref().map(|s| s.try_capture_scrollback_interval());
+            (primary_screen, pinned_interval, resident_oldest)
+        } else {
+            let primary_parts = terminal
+                .screen
+                .screen
+                .checkpoint_parts(&screen_limits, &mut screen_usage)?;
+            let primary_screen = CheckpointScreen::capture(primary_parts)?;
+            let oldest = primary_screen.stable_row_index_offset as usize;
+            (primary_screen, None, oldest)
+        };
 
         let checkpoint_unicode_version =
             CheckpointUnicodeVersion::capture(&terminal.unicode_version, &custom_cell_width_maps)?;
@@ -3931,6 +4105,42 @@ impl TerminalCheckpointV2 {
     #[must_use]
     pub const fn version(&self) -> u32 {
         self.version
+    }
+
+    pub fn validate_into(
+        self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<ValidatedTerminalCheckpointV2, TerminalCheckpointError> {
+        self.validate(limits)?;
+        Ok(ValidatedTerminalCheckpointV2 {
+            checkpoint: self,
+            limits,
+        })
+    }
+
+    pub fn into_recovery_checkpoint_at_external_parser_ground(
+        self,
+        ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<crate::RecoveryTerminalCheckpointV2, TerminalCheckpointError> {
+        let tables = decode_custom_cell_width_maps(&self.custom_cell_width_maps)?;
+        let config = self.replay_config.into_configuration(&tables)?;
+        let validated = self.validate_into(limits)?;
+        let inert = validated.restore_inert(config)?;
+        let isolated = inert
+            .into_live(Box::new(Vec::<u8>::new()))
+            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        isolated
+            .capture_recovery_checkpoint_at_external_parser_ground(ground, limits)
+            .map_err(|e| match e {
+                crate::terminal::RecoveryTerminalCheckpointError::ParserNotRecoveryGround => {
+                    TerminalCheckpointError::InvalidField {
+                        field: "parser",
+                        reason: "parser is not at recovery ground",
+                    }
+                }
+                crate::terminal::RecoveryTerminalCheckpointError::Checkpoint(err) => err,
+            })
     }
 }
 
@@ -5368,6 +5578,250 @@ mod tests {
                 .to_canonical_json(limits)
                 .expect("encode restored lowered-config terminal"),
             canonical,
+        );
+    }
+
+    #[derive(Debug)]
+    struct StagedCaptureTestSink {
+        identity: std::sync::Mutex<crate::config::ScrollbackIntervalIdentity>,
+        rows: std::sync::Mutex<Vec<(StableRowIndex, Line)>>,
+        generation: std::sync::Mutex<crate::config::ScrollbackSnapshotGeneration>,
+    }
+
+    impl StagedCaptureTestSink {
+        fn new() -> Self {
+            Self {
+                identity: std::sync::Mutex::new(
+                    crate::config::ScrollbackIntervalIdentity::default(),
+                ),
+                rows: std::sync::Mutex::new(Vec::new()),
+                generation: std::sync::Mutex::new(crate::config::ScrollbackSnapshotGeneration::new(
+                    [1; 16], 1,
+                )),
+            }
+        }
+
+        fn add_row(&self, row: StableRowIndex, line: Line) {
+            self.rows.lock().unwrap().push((row, line));
+        }
+
+        fn advance_identity(&self) {
+            *self.identity.lock().unwrap() =
+                crate::config::ScrollbackIntervalIdentity::default();
+        }
+    }
+
+    impl crate::config::ScrollbackSpillSink for StagedCaptureTestSink {
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            self.rows.lock().unwrap().push((stable_row, line.clone()));
+            true
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(r, _)| *r == stable_row)
+                .map(|(_, l)| l.clone())
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows.lock().unwrap().first().map(|(r, _)| *r)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.rows.lock().unwrap().len() * 80
+        }
+
+        fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
+            let rows = self.rows.lock().unwrap();
+            let range = if rows.is_empty() {
+                None
+            } else {
+                let first = rows.first().unwrap().0;
+                let last = rows.last().unwrap().0;
+                Some(first..last + 1)
+            };
+            self.identity.lock().unwrap().capture(range)
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            expected_newest_exclusive: StableRowIndex,
+            _limits: crate::config::ScrollbackSnapshotLimits,
+        ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError> {
+            let rows = self.rows.lock().unwrap();
+            let filtered: Vec<Line> = rows
+                .iter()
+                .filter(|(idx, _)| *idx < expected_newest_exclusive)
+                .map(|(_, line)| line.clone())
+                .collect();
+            let oldest = if filtered.is_empty() {
+                None
+            } else {
+                filtered.first().and_then(|_| rows.first().map(|(idx, _)| *idx))
+            };
+            let gen = *self.generation.lock().unwrap();
+            let count = filtered.len();
+            crate::config::ScrollbackSnapshot::from_contiguous_rows(
+                gen,
+                crate::config::ScrollbackSnapshotFidelity::ExactSemantic,
+                oldest,
+                expected_newest_exclusive,
+                (count * 80) as u64,
+                count * 80,
+                filtered,
+            )
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<crate::config::ScrollbackSnapshotGeneration>,
+            _prefix: crate::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError> {
+            Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StagedCaptureTestConfig {
+        sink: Arc<StagedCaptureTestSink>,
+    }
+
+    impl TerminalConfiguration for StagedCaptureTestConfig {
+        fn scrollback_size(&self) -> usize {
+            1000
+        }
+
+        fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
+            crate::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 5,
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn scrollback_spill_sink(&self) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
+            Some(Arc::clone(&self.sink) as Arc<dyn crate::config::ScrollbackSpillSink>)
+        }
+    }
+
+    #[test]
+    fn test_two_phase_staged_hot_capture_and_cold_materialization() {
+        let sink = Arc::new(StagedCaptureTestSink::new());
+        let line0 = Line::from_text("cold row 0", &CellAttributes::blank(), 1, None);
+        sink.add_row(0, line0);
+
+        let mut bold_attr = CellAttributes::blank();
+        bold_attr.set_intensity(crate::color::Intensity::Bold);
+        let line1 = Line::from_text("cold row 1 bold", &bold_attr, 1, None);
+        sink.add_row(1, line1);
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(StagedCaptureTestConfig {
+            sink: Arc::clone(&sink),
+        });
+
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 10,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "FrankenTerm",
+            "staged-test",
+            Box::new(Vec::<u8>::new()),
+        );
+
+        terminal.screen.screen.stable_row_index_offset = 2;
+        terminal.advance_bytes("\x1b[1;31mHello \u{1F980}\x1b[0m\r\n".as_bytes());
+        terminal.advance_bytes("\x1b[?2004h".as_bytes());
+        terminal.cursor = CursorPosition { x: 5, y: 3 };
+
+        let limits = TerminalCheckpointLimits::default();
+
+        // Phase 1: Under terminal lock
+        let staged = TerminalCheckpointV2::capture_staged(&terminal, limits)
+            .expect("capture_staged must succeed under lock");
+
+        // Release terminal lock immediately
+        drop(terminal);
+
+        // Phase 2: Outside terminal lock
+        let checkpoint = staged
+            .materialize_cold_history(limits)
+            .expect("materialize_cold_history must succeed outside lock");
+
+        assert_eq!(checkpoint.primary_screen.cold_prefix_line_count, 2);
+        assert!(checkpoint.primary_screen.cold_snapshot_generation.is_some());
+        assert_eq!(checkpoint.primary_screen.stable_row_index_offset, 0);
+        assert!(checkpoint.bracketed_paste);
+        assert_eq!(checkpoint.cursor.x, 5);
+        assert_eq!(checkpoint.cursor.y, 3);
+
+        // Roundtrip fidelity verification
+        let canonical = checkpoint
+            .to_canonical_json(limits)
+            .expect("encode canonical");
+        let decoded = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+            .expect("decode canonical");
+        assert_eq!(decoded.checkpoint.primary_screen.cold_prefix_line_count, 2);
+        assert_eq!(
+            decoded.checkpoint.primary_screen.lines.len(),
+            checkpoint.primary_screen.lines.len()
+        );
+        assert!(decoded.checkpoint.bracketed_paste);
+    }
+
+    #[test]
+    fn test_two_phase_staged_capture_rejects_stale_cold_generation() {
+        let sink = Arc::new(StagedCaptureTestSink::new());
+        let line0 = Line::from_text("cold row", &CellAttributes::blank(), 1, None);
+        sink.add_row(0, line0);
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(StagedCaptureTestConfig {
+            sink: Arc::clone(&sink),
+        });
+
+        let mut terminal = Terminal::new(
+            TerminalSize::default(),
+            config,
+            "FrankenTerm",
+            "stale-gen-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.screen.screen.stable_row_index_offset = 1;
+        terminal.advance_bytes("resident\r\n".as_bytes());
+
+        let limits = TerminalCheckpointLimits::default();
+
+        // Phase 1: Capture staged (pins generation)
+        let staged = TerminalCheckpointV2::capture_staged(&terminal, limits)
+            .expect("staged capture succeeds");
+        drop(terminal);
+
+        // Simulate concurrent destructive change / rotation in the cold spill sink
+        sink.advance_identity();
+
+        // Phase 2: Materialize outside lock must detect the stale generation
+        let result = staged.materialize_cold_history(limits);
+        assert_eq!(
+            result.err(),
+            Some(TerminalCheckpointError::StaleColdGeneration),
+            "materialize_cold_history must reject stale cold generation"
         );
     }
 }

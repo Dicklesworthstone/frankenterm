@@ -48,12 +48,13 @@ use crate::mux_recovery_image::{
     CheckpointAuthority, MuxRecoveryImage, MuxRecoveryImageError, PaneCheckpointBinding,
     ParserCaptureIdentity, RecoveryDomain, RecoveryFloatingPane, RecoveryImageHeader,
     RecoveryObjectRef, RecoveryPane, RecoverySplitNode, RecoveryTab, RecoveryTopology,
-    RecoveryWindow, SplitDirection as MuxSplitDirection, SplitDirectionAndSize,
-    TerminalSize as RecoveryTerminalSize,
+    RecoveryWindow, SplitDirection as MuxSplitDirection, SplitDirectionAndSize, TerminalSize,
+    MUX_RECOVERY_IMAGE_MAGIC, MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
 };
 use crate::snapshot_publication::{
-    PublicationError, RootSlot, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
-    TornRootDiagnostic, VerifiedRoot, VerifiedRootSelection,
+    sha256_hex, GenerationRootPublishRequest, PredecessorBinding, PublicationError,
+    RecoveryObjectPayload, RootSlot, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
+    TornRootDiagnostic, VerifiedRootSelection,
 };
 #[cfg(feature = "frankenterm-deps")]
 use frankenterm_term::color::ColorPalette;
@@ -6455,10 +6456,6 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
 // Whole-Mux Recovery Integration (ft-interactive-swarm-product-convergence-7xqz4.8.14.3.4)
 // =============================================================================
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 /// Error during whole-mux recovery root verification, planning, or reconstruction.
 #[derive(Debug, thiserror::Error)]
 pub enum WholeMuxRecoveryError {
@@ -6570,27 +6567,24 @@ impl WholeMuxRecoveryVerifier {
 }
 
 impl RootVerifier for WholeMuxRecoveryVerifier {
-    type ValidatedRoot = ValidatedWholeMuxRecovery;
     type Error = WholeMuxRecoveryError;
+    type Verified = ValidatedWholeMuxRecovery;
 
     fn verify_root(
         &self,
         candidate: &RootSlotCandidate,
         store: &SnapshotPublicationStore,
-    ) -> Result<Self::ValidatedRoot, Self::Error> {
-        if candidate.root_payload.len() > self.limits.max_image_bytes {
+    ) -> Result<Self::Verified, Self::Error> {
+        if candidate.manifest_bytes.len() > self.limits.max_image_bytes {
             return Err(WholeMuxRecoveryError::TopologyValidation(format!(
-                "root payload exceeds limit ({} > {})",
-                candidate.root_payload.len(),
+                "root manifest payload exceeds limit ({} > {})",
+                candidate.manifest_bytes.len(),
                 self.limits.max_image_bytes
             )));
         }
 
-        // 1. Decode canonical image slice
-        let image = MuxRecoveryImage::from_json_slice(&candidate.root_payload)?;
-
-        // 2. Validate image invariants (header, schema version, topology tree, duplicate panes)
-        image.validate()?;
+        // 1. Decode and structurally validate canonical image slice
+        let image = MuxRecoveryImage::from_json_slice(&candidate.manifest_bytes)?;
 
         if image.panes.len() > self.limits.max_panes {
             return Err(WholeMuxRecoveryError::TopologyValidation(format!(
@@ -6600,29 +6594,29 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
             )));
         }
 
-        // 3. Verify complete object graph closure:
+        // 2. Verify complete object graph closure:
         // Every referenced pane checkpoint must exist in the publication store and match its digest.
         let mut checkpoint_payloads = BTreeMap::new();
         let mut total_bytes: usize = 0;
 
         for pane in &image.panes {
-            let binding = &pane.checkpoint_binding;
+            let binding = &pane.checkpoint;
             let obj_ref = &binding.checkpoint_ref;
 
             // Enforce authority policy: reject invalid or spoofed guardian claims
-            if binding.authority == CheckpointAuthority::GuardianReplicated
-                && binding.capture_identity.stream_watermark == 0
+            if matches!(binding.authority, CheckpointAuthority::Guardian { .. })
+                && binding.parser_capture.watermark_bytes == 0
             {
                 return Err(WholeMuxRecoveryError::FakeGuardianAuthority {
-                    pane_id: pane.pane_id,
+                    pane_id: pane.pane_id as u64,
                 });
             }
 
-            if obj_ref.byte_len > self.limits.max_per_pane_checkpoint_bytes as u64 {
+            if obj_ref.byte_length > self.limits.max_per_pane_checkpoint_bytes as u64 {
                 return Err(WholeMuxRecoveryError::CheckpointSizeMismatch {
                     object_id: obj_ref.object_id.clone(),
                     expected: self.limits.max_per_pane_checkpoint_bytes as u64,
-                    actual: obj_ref.byte_len,
+                    actual: obj_ref.byte_length,
                 });
             }
 
@@ -6631,21 +6625,21 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
                 .read_object(&obj_ref.object_id)
                 .map_err(|_| WholeMuxRecoveryError::MissingCheckpointObject(obj_ref.object_id.clone()))?;
 
-            if payload.len() as u64 != obj_ref.byte_len {
+            if payload.len() as u64 != obj_ref.byte_length {
                 return Err(WholeMuxRecoveryError::CheckpointSizeMismatch {
                     object_id: obj_ref.object_id.clone(),
-                    expected: obj_ref.byte_len,
+                    expected: obj_ref.byte_length,
                     actual: payload.len() as u64,
                 });
             }
 
             // Verify SHA-256 payload digest
-            let computed_digest = sha256_hex(&payload);
-            if !computed_digest.eq_ignore_ascii_case(&obj_ref.payload_digest) {
+            let computed_digest: [u8; 32] = Sha256::digest(&payload).into();
+            if computed_digest != obj_ref.payload_digest {
                 return Err(WholeMuxRecoveryError::CheckpointDigestMismatch {
                     object_id: obj_ref.object_id.clone(),
-                    expected: obj_ref.payload_digest.clone(),
-                    computed: computed_digest,
+                    expected: hex::encode(obj_ref.payload_digest),
+                    computed: hex::encode(computed_digest),
                 });
             }
 
@@ -6655,7 +6649,7 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
                 let term_limits = TerminalCheckpointLimits::default();
                 TerminalCheckpointV2::decode_canonical_json(&payload, term_limits)
                     .map_err(|source| WholeMuxRecoveryError::TerminalCheckpointDecode {
-                        pane_id: pane.pane_id,
+                        pane_id: pane.pane_id as u64,
                         source,
                     })?;
             }
@@ -6732,10 +6726,27 @@ pub fn reconstruct_whole_mux_image_inert(
     }
 
     let config: Arc<dyn TerminalConfiguration> = Arc::new(InertRecoveryConfiguration);
+    let mut domain_name_to_id = HashMap::new();
+    for d in &validated.image.topology.domains {
+        domain_name_to_id.insert(d.domain_name.as_str(), d.incarnation_domain_id as u64);
+    }
+    let mut pane_to_tab = HashMap::new();
+    for w in &validated.image.topology.windows {
+        for t in &w.tabs {
+            if let Some(ref root_split) = t.root_split {
+                for (pane_id, _) in root_split.leaves() {
+                    pane_to_tab.insert(pane_id, t.tab_id as u64);
+                }
+            }
+            for fp in &t.floating_panes {
+                pane_to_tab.insert(fp.pane_id, t.tab_id as u64);
+            }
+        }
+    }
     let mut pane_terminals = BTreeMap::new();
 
     for pane in &validated.image.panes {
-        let obj_ref = &pane.checkpoint_binding.checkpoint_ref;
+        let obj_ref = &pane.checkpoint.checkpoint_ref;
         let payload = validated
             .checkpoint_payloads
             .get(&obj_ref.object_id)
@@ -6747,7 +6758,7 @@ pub fn reconstruct_whole_mux_image_inert(
         let validated_checkpoint =
             TerminalCheckpointV2::decode_canonical_json(payload, terminal_limits).map_err(
                 |source| WholeMuxRecoveryError::TerminalCheckpointDecode {
-                    pane_id: pane.pane_id,
+                    pane_id: pane.pane_id as u64,
                     source,
                 },
             )?;
@@ -6759,16 +6770,19 @@ pub fn reconstruct_whole_mux_image_inert(
         let inert_terminal = validated_checkpoint
             .restore_inert(Arc::clone(&config))
             .map_err(|source| WholeMuxRecoveryError::InertTerminalRestore {
-                pane_id: pane.pane_id,
+                pane_id: pane.pane_id as u64,
                 source,
             })?;
 
+        let tab_id = pane_to_tab.get(&pane.pane_id).copied().unwrap_or(0);
+        let domain_id = domain_name_to_id.get(pane.domain_name.as_str()).copied().unwrap_or(0);
+
         pane_terminals.insert(
-            pane.pane_id,
+            pane.pane_id as u64,
             ReconstructedPaneTerminal {
-                pane_id: pane.pane_id,
-                tab_id: pane.tab_id,
-                domain_id: pane.domain_id,
+                pane_id: pane.pane_id as u64,
+                tab_id,
+                domain_id,
                 terminal: inert_terminal,
                 rows,
                 cols,
@@ -12482,7 +12496,7 @@ mod tests {
         text: &[u8],
         rows: usize,
         cols: usize,
-    ) -> (Vec<u8>, String) {
+    ) -> (Vec<u8>, [u8; 32]) {
         let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(WholeMuxTestConfig);
         let mut term = Terminal::new(
             TermSize {
@@ -12505,7 +12519,7 @@ mod tests {
             .to_canonical_json(limits)
             .expect("canonical json encoding")
             .to_vec();
-        let digest = sha256_hex(&canonical_bytes);
+        let digest: [u8; 32] = Sha256::digest(&canonical_bytes).into();
         (canonical_bytes, digest)
     }
 
@@ -12524,57 +12538,106 @@ mod tests {
         let obj1_id = "obj-pane-100".to_string();
         let obj2_id = "obj-pane-101".to_string();
 
-        store.publish_object(&obj1_id, &payload1).expect("publish obj1");
-        store.publish_object(&obj2_id, &payload2).expect("publish obj2");
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: obj1_id.clone(),
+                expected_sha256: hex::encode(digest1),
+                ciphertext_bytes: payload1.clone(),
+            })
+            .expect("publish obj1");
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: obj2_id.clone(),
+                expected_sha256: hex::encode(digest2),
+                ciphertext_bytes: payload2.clone(),
+            })
+            .expect("publish obj2");
 
+        let inc_id = "inc-offline-test".to_string();
         let header = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
-            mux_incarnation_id: "inc-offline-test".to_string(),
-            active_window_id: Some(1),
-            active_domain: Some("local".to_string()),
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-offline-test".to_string(),
+        };
+
+        let term_size1 = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let term_size2 = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+            dpi: 96,
         };
 
         let panes = vec![
             RecoveryPane {
                 pane_id: 100,
-                tab_id: 10,
-                domain_id: 1,
-                title: Some("editor".to_string()),
-                working_directory: Some("/app".to_string()),
-                command_line: Some(vec!["nvim".to_string()]),
-                checkpoint_binding: PaneCheckpointBinding {
+                pane_uuid: "uuid-pane-100".to_string(),
+                domain_name: "local".to_string(),
+                title: "editor".to_string(),
+                cwd: Some("/app".to_string()),
+                size: term_size1,
+                cursor_position: (0, 0),
+                alt_screen_active: false,
+                checkpoint: PaneCheckpointBinding {
+                    topology_incarnation_id: inc_id.clone(),
+                    pane_uuid: "uuid-pane-100".to_string(),
+                    registration_generation: 1,
+                    parser_capture: ParserCaptureIdentity {
+                        watermark_bytes: 512,
+                        segment_id: 1,
+                        parser_seqno: 1,
+                    },
                     checkpoint_ref: RecoveryObjectRef {
                         object_id: obj1_id,
-                        payload_digest: digest1.clone(),
-                        byte_len: payload1.len() as u64,
+                        byte_length: payload1.len() as u64,
+                        payload_digest: digest1,
+                        schema_version: 1,
                     },
-                    authority: CheckpointAuthority::ModelParserGround,
-                    capture_identity: ParserCaptureIdentity {
-                        stream_watermark: 512,
-                        capture_unix_ms: 1700000000000,
+                    authority: CheckpointAuthority::ModelOnly {
+                        captured_at_epoch_ms: 1700000000000,
+                        parser_seqno: 1,
                     },
                 },
             },
             RecoveryPane {
                 pane_id: 101,
-                tab_id: 10,
-                domain_id: 1,
-                title: Some("logs".to_string()),
-                working_directory: Some("/app/logs".to_string()),
-                command_line: Some(vec!["tail".to_string(), "-f".to_string()]),
-                checkpoint_binding: PaneCheckpointBinding {
+                pane_uuid: "uuid-pane-101".to_string(),
+                domain_name: "local".to_string(),
+                title: "logs".to_string(),
+                cwd: Some("/app/logs".to_string()),
+                size: term_size2,
+                cursor_position: (0, 0),
+                alt_screen_active: false,
+                checkpoint: PaneCheckpointBinding {
+                    topology_incarnation_id: inc_id.clone(),
+                    pane_uuid: "uuid-pane-101".to_string(),
+                    registration_generation: 1,
+                    parser_capture: ParserCaptureIdentity {
+                        watermark_bytes: 1024,
+                        segment_id: 1,
+                        parser_seqno: 2,
+                    },
                     checkpoint_ref: RecoveryObjectRef {
                         object_id: obj2_id,
-                        payload_digest: digest2.clone(),
-                        byte_len: payload2.len() as u64,
+                        byte_length: payload2.len() as u64,
+                        payload_digest: digest2,
+                        schema_version: 1,
                     },
-                    authority: CheckpointAuthority::ModelParserGround,
-                    capture_identity: ParserCaptureIdentity {
-                        stream_watermark: 1024,
-                        capture_unix_ms: 1700000000000,
+                    authority: CheckpointAuthority::ModelOnly {
+                        captured_at_epoch_ms: 1700000000000,
+                        parser_seqno: 2,
                     },
                 },
             },
@@ -12582,60 +12645,68 @@ mod tests {
 
         let topology = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: Some("main".to_string()),
-                position: Some((0, 0)),
-                size: Some((1200, 800)),
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 1,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 10,
-                    title: Some("dev".to_string()),
+                    stable_tab_id: "tab-10".to_string(),
+                    title: "dev".to_string(),
+                    working_dir: Some("/app".to_string()),
+                    size: term_size1,
+                    size_before_zoom: term_size1,
+                    zoomed_pane_id: None,
                     root_split: Some(RecoverySplitNode::Split {
-                        direction: SplitDirectionAndSize {
-                            direction: MuxSplitDirection::Horizontal,
-                            sizes: vec![0.5, 0.5],
+                        split: SplitDirectionAndSize {
+                            direction: crate::mux_recovery_image::SplitDirection::Horizontal,
+                            first: term_size1,
+                            second: term_size2,
                         },
-                        children: vec![
-                            RecoverySplitNode::Leaf { pane_id: 100 },
-                            RecoverySplitNode::Leaf { pane_id: 101 },
-                        ],
+                        left: Box::new(RecoverySplitNode::Leaf {
+                            pane_id: 100,
+                            pane_uuid: "uuid-pane-100".to_string(),
+                        }),
+                        right: Box::new(RecoverySplitNode::Leaf {
+                            pane_id: 101,
+                            pane_uuid: "uuid-pane-101".to_string(),
+                        }),
                     }),
-                    floating_panes: vec![RecoveryFloatingPane {
-                        pane_id: 100,
-                        rect: crate::mux_recovery_image::FloatingPaneRect {
-                            x: 10.0,
-                            y: 10.0,
-                            width: 80.0,
-                            height: 24.0,
-                        },
-                        z_index: 1,
-                    }],
+                    floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 100,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let image_digest =
-            MuxRecoveryImage::compute_digest(&header, &topology, &panes).expect("digest");
-        let image = MuxRecoveryImage {
+        let mut image = MuxRecoveryImage {
             header,
             topology,
             panes,
-            image_digest,
+            image_digest: [0u8; 32],
         };
+        image.image_digest = image.compute_digest().expect("digest");
 
         let image_bytes = image.to_canonical_json().expect("canonical json image");
         let candidate = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: image_bytes.clone(),
-            payload_digest: sha256_hex(&image_bytes),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&image_bytes),
+            manifest_bytes: image_bytes.clone(),
+            file_len: image_bytes.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let verifier = WholeMuxRecoveryVerifier::default();
@@ -12681,77 +12752,118 @@ mod tests {
         );
 
         let obj_id = "obj-single-pane".to_string();
-        store.publish_object(&obj_id, &payload).expect("publish object");
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: obj_id.clone(),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish object");
 
+        let inc_id = "inc-single".to_string();
         let header = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
-            mux_incarnation_id: "inc-single".to_string(),
-            active_window_id: Some(1),
-            active_domain: Some("local".to_string()),
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-single".to_string(),
+        };
+
+        let term_size = TerminalSize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 500,
+            dpi: 96,
         };
 
         let panes = vec![RecoveryPane {
             pane_id: 42,
-            tab_id: 1,
-            domain_id: 1,
-            title: Some("shell".to_string()),
-            working_directory: None,
-            command_line: None,
-            checkpoint_binding: PaneCheckpointBinding {
+            pane_uuid: "uuid-pane-42".to_string(),
+            domain_name: "local".to_string(),
+            title: "shell".to_string(),
+            cwd: None,
+            size: term_size,
+            cursor_position: (0, 0),
+            alt_screen_active: false,
+            checkpoint: PaneCheckpointBinding {
+                topology_incarnation_id: inc_id.clone(),
+                pane_uuid: "uuid-pane-42".to_string(),
+                registration_generation: 1,
+                parser_capture: ParserCaptureIdentity {
+                    watermark_bytes: 100,
+                    segment_id: 1,
+                    parser_seqno: 1,
+                },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id,
+                    byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    byte_len: payload.len() as u64,
+                    schema_version: 1,
                 },
-                authority: CheckpointAuthority::ModelParserGround,
-                capture_identity: ParserCaptureIdentity {
-                    stream_watermark: 100,
-                    capture_unix_ms: 1700000000000,
+                authority: CheckpointAuthority::ModelOnly {
+                    captured_at_epoch_ms: 1700000000000,
+                    parser_seqno: 1,
                 },
             },
         }];
 
         let topology = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: None,
-                position: None,
-                size: None,
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 1,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    title: None,
-                    root_split: Some(RecoverySplitNode::Leaf { pane_id: 42 }),
+                    stable_tab_id: "tab-1".to_string(),
+                    title: "main".to_string(),
+                    working_dir: None,
+                    size: term_size,
+                    size_before_zoom: term_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 42,
+                        pane_uuid: "uuid-pane-42".to_string(),
+                    }),
                     floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 42,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let image_digest =
-            MuxRecoveryImage::compute_digest(&header, &topology, &panes).expect("digest");
-        let image = MuxRecoveryImage {
+        let mut image = MuxRecoveryImage {
             header,
             topology,
             panes,
-            image_digest,
+            image_digest: [0u8; 32],
         };
+        image.image_digest = image.compute_digest().expect("digest");
 
         let image_bytes = image.to_canonical_json().expect("canonical json image");
         let candidate = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: image_bytes.clone(),
-            payload_digest: sha256_hex(&image_bytes),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&image_bytes),
+            manifest_bytes: image_bytes.clone(),
+            file_len: image_bytes.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let verifier = WholeMuxRecoveryVerifier::default();
@@ -12795,69 +12907,106 @@ mod tests {
         let (payload, digest) =
             create_test_terminal_checkpoint_payload(b"gen 1 content\r\n", 24, 80);
         let obj_id = "obj-gen-1".to_string();
-        store.publish_object(&obj_id, &payload).expect("publish obj");
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: obj_id.clone(),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: payload.clone(),
+            })
+            .expect("publish obj");
 
+        let inc_id = "inc-gen".to_string();
         let header1 = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
-            mux_incarnation_id: "inc-gen".to_string(),
-            active_window_id: Some(1),
-            active_domain: Some("local".to_string()),
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-gen".to_string(),
+        };
+
+        let term_size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
         };
 
         let panes1 = vec![RecoveryPane {
             pane_id: 1,
-            tab_id: 1,
-            domain_id: 1,
-            title: Some("p1".to_string()),
-            working_directory: None,
-            command_line: None,
-            checkpoint_binding: PaneCheckpointBinding {
+            pane_uuid: "uuid-pane-1".to_string(),
+            domain_name: "local".to_string(),
+            title: "p1".to_string(),
+            cwd: None,
+            size: term_size,
+            cursor_position: (0, 0),
+            alt_screen_active: false,
+            checkpoint: PaneCheckpointBinding {
+                topology_incarnation_id: inc_id.clone(),
+                pane_uuid: "uuid-pane-1".to_string(),
+                registration_generation: 1,
+                parser_capture: ParserCaptureIdentity {
+                    watermark_bytes: 100,
+                    segment_id: 1,
+                    parser_seqno: 1,
+                },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id,
+                    byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    byte_len: payload.len() as u64,
+                    schema_version: 1,
                 },
-                authority: CheckpointAuthority::ModelParserGround,
-                capture_identity: ParserCaptureIdentity {
-                    stream_watermark: 100,
-                    capture_unix_ms: 1700000000000,
+                authority: CheckpointAuthority::ModelOnly {
+                    captured_at_epoch_ms: 1700000000000,
+                    parser_seqno: 1,
                 },
             },
         }];
 
         let topology1 = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: None,
-                position: None,
-                size: None,
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 1,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    title: None,
-                    root_split: Some(RecoverySplitNode::Leaf { pane_id: 1 }),
+                    stable_tab_id: "tab-1".to_string(),
+                    title: "tab-1".to_string(),
+                    working_dir: None,
+                    size: term_size,
+                    size_before_zoom: term_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 1,
+                        pane_uuid: "uuid-pane-1".to_string(),
+                    }),
                     floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 1,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let digest1 =
-            MuxRecoveryImage::compute_digest(&header1, &topology1, &panes1).expect("digest");
-        let image1 = MuxRecoveryImage {
+        let mut image1 = MuxRecoveryImage {
             header: header1,
             topology: topology1,
             panes: panes1,
-            image_digest: digest1,
+            image_digest: [0u8; 32],
         };
+        image1.image_digest = image1.compute_digest().expect("digest");
 
         let image1_bytes = image1.to_canonical_json().expect("image 1 bytes");
 
@@ -12866,86 +13015,115 @@ mod tests {
         // Publish generation 1 to store
         store
             .publish_generation_root(
-                crate::snapshot_publication::RootPublishRequest {
+                &GenerationRootPublishRequest {
                     generation: 1,
-                    root_payload: image1_bytes,
+                    publisher_id: "pub-1".to_string(),
+                    predecessor: None,
+                    manifest_bytes: image1_bytes.clone(),
+                    created_at_ms: 1700000000000,
                 },
                 &verifier,
             )
             .expect("publish generation 1");
 
-        // Now create generation 2 referencing a missing object "obj-missing"
+        // Now create generation 2 referencing a missing object "obj-missing-gen-2"
         let header2 = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 2,
-            created_at_unix_ms: 1700000001000,
-            mux_incarnation_id: "inc-gen".to_string(),
-            active_window_id: Some(1),
-            active_domain: Some("local".to_string()),
+            predecessor_digest: Some(image1.image_digest),
+            created_at_epoch_ms: 1700000001000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-gen".to_string(),
         };
 
         let panes2 = vec![RecoveryPane {
             pane_id: 1,
-            tab_id: 1,
-            domain_id: 1,
-            title: Some("p1".to_string()),
-            working_directory: None,
-            command_line: None,
-            checkpoint_binding: PaneCheckpointBinding {
+            pane_uuid: "uuid-pane-1".to_string(),
+            domain_name: "local".to_string(),
+            title: "p1".to_string(),
+            cwd: None,
+            size: term_size,
+            cursor_position: (0, 0),
+            alt_screen_active: false,
+            checkpoint: PaneCheckpointBinding {
+                topology_incarnation_id: inc_id.clone(),
+                pane_uuid: "uuid-pane-1".to_string(),
+                registration_generation: 2,
+                parser_capture: ParserCaptureIdentity {
+                    watermark_bytes: 200,
+                    segment_id: 1,
+                    parser_seqno: 2,
+                },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: "obj-missing-gen-2".to_string(),
-                    payload_digest:
-                        "0000000000000000000000000000000000000000000000000000000000000000"
-                            .to_string(),
-                    byte_len: 128,
+                    payload_digest: [0x55u8; 32],
+                    byte_length: 128,
+                    schema_version: 1,
                 },
-                authority: CheckpointAuthority::ModelParserGround,
-                capture_identity: ParserCaptureIdentity {
-                    stream_watermark: 200,
-                    capture_unix_ms: 1700000001000,
+                authority: CheckpointAuthority::ModelOnly {
+                    captured_at_epoch_ms: 1700000001000,
+                    parser_seqno: 2,
                 },
             },
         }];
 
         let topology2 = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: None,
-                position: None,
-                size: None,
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 2,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    title: None,
-                    root_split: Some(RecoverySplitNode::Leaf { pane_id: 1 }),
+                    stable_tab_id: "tab-1".to_string(),
+                    title: "tab-1".to_string(),
+                    working_dir: None,
+                    size: term_size,
+                    size_before_zoom: term_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 1,
+                        pane_uuid: "uuid-pane-1".to_string(),
+                    }),
                     floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 1,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let digest2 =
-            MuxRecoveryImage::compute_digest(&header2, &topology2, &panes2).expect("digest");
-        let image2 = MuxRecoveryImage {
+        let mut image2 = MuxRecoveryImage {
             header: header2,
             topology: topology2,
             panes: panes2,
-            image_digest: digest2,
+            image_digest: [0u8; 32],
         };
+        image2.image_digest = image2.compute_digest().expect("digest");
 
         let image2_bytes = image2.to_canonical_json().expect("image 2 bytes");
 
         // Verify that publish_generation_root fails closed because obj-missing-gen-2 is missing
         let publish_result = store.publish_generation_root(
-            crate::snapshot_publication::RootPublishRequest {
+            &GenerationRootPublishRequest {
                 generation: 2,
-                root_payload: image2_bytes,
+                publisher_id: "pub-2".to_string(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: sha256_hex(&image1_bytes),
+                }),
+                manifest_bytes: image2_bytes,
+                created_at_ms: 1700000001000,
             },
             &verifier,
         );
@@ -12959,7 +13137,7 @@ mod tests {
         assert!(selection.current.is_some(), "current root must exist");
         let current = selection.current.unwrap();
         assert_eq!(
-            current.generation, 1,
+            current.image.header.generation, 1,
             "generation 1 must be selected as current"
         );
     }
@@ -12973,49 +13151,61 @@ mod tests {
         // Corrupted magic bytes
         let header_corrupt_magic = RecoveryImageHeader {
             magic: *b"FTXX",
-            schema_version: 1,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
             mux_incarnation_id: "inc-1".to_string(),
-            active_window_id: None,
-            active_domain: None,
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-1".to_string(),
         };
 
         let topology = RecoveryTopology {
             domains: vec![],
             windows: vec![],
+            focused_window_id: None,
+            client_workspace: None,
         };
 
         let image = MuxRecoveryImage {
             header: header_corrupt_magic,
             topology,
             panes: vec![],
-            image_digest:
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            image_digest: [0u8; 32],
         };
 
         let raw_json = serde_json::to_vec(&image).expect("serde json");
         let candidate = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: raw_json.clone(),
-            payload_digest: sha256_hex(&raw_json),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&raw_json),
+            manifest_bytes: raw_json.clone(),
+            file_len: raw_json.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let verifier = WholeMuxRecoveryVerifier::default();
         let result = verifier.verify_root(&candidate, &store);
-        assert!(result.is_err(), "must reject corrupt magic");
+        assert!(matches!(
+            result,
+            Err(WholeMuxRecoveryError::Image(
+                MuxRecoveryImageError::InvalidMagic { .. }
+            ))
+        ));
 
         // Unsupported schema version
         let header_unsupported_version = RecoveryImageHeader {
-            magic: *b"FTMR",
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
             schema_version: 999,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
             mux_incarnation_id: "inc-1".to_string(),
-            active_window_id: None,
-            active_domain: None,
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-1".to_string(),
         };
 
         let image2 = MuxRecoveryImage {
@@ -13023,23 +13213,33 @@ mod tests {
             topology: RecoveryTopology {
                 domains: vec![],
                 windows: vec![],
+                focused_window_id: None,
+                client_workspace: None,
             },
             panes: vec![],
-            image_digest:
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            image_digest: [0u8; 32],
         };
 
         let raw_json2 = serde_json::to_vec(&image2).expect("serde json");
         let candidate2 = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: raw_json2.clone(),
-            payload_digest: sha256_hex(&raw_json2),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&raw_json2),
+            manifest_bytes: raw_json2.clone(),
+            file_len: raw_json2.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let result2 = verifier.verify_root(&candidate2, &store);
-        assert!(result2.is_err(), "must reject unsupported schema version");
+        assert!(matches!(
+            result2,
+            Err(WholeMuxRecoveryError::Image(
+                MuxRecoveryImageError::UnsupportedSchemaVersion(999)
+            ))
+        ));
     }
 
     #[test]
@@ -13048,77 +13248,110 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
+        let inc_id = "inc-test".to_string();
         let header = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
-            mux_incarnation_id: "inc-test".to_string(),
-            active_window_id: None,
-            active_domain: None,
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-test".to_string(),
+        };
+
+        let term_size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
         };
 
         let panes = vec![RecoveryPane {
             pane_id: 1,
-            tab_id: 1,
-            domain_id: 1,
-            title: None,
-            working_directory: None,
-            command_line: None,
-            checkpoint_binding: PaneCheckpointBinding {
+            pane_uuid: "uuid-pane-1".to_string(),
+            domain_name: "local".to_string(),
+            title: "shell".to_string(),
+            cwd: None,
+            size: term_size,
+            cursor_position: (0, 0),
+            alt_screen_active: false,
+            checkpoint: PaneCheckpointBinding {
+                topology_incarnation_id: inc_id.clone(),
+                pane_uuid: "uuid-pane-1".to_string(),
+                registration_generation: 1,
+                parser_capture: ParserCaptureIdentity {
+                    watermark_bytes: 100,
+                    segment_id: 1,
+                    parser_seqno: 1,
+                },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: "obj-never-published".to_string(),
-                    payload_digest:
-                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                            .to_string(),
-                    byte_len: 64,
+                    byte_length: 64,
+                    payload_digest: [0xAAu8; 32],
+                    schema_version: 1,
                 },
-                authority: CheckpointAuthority::ModelParserGround,
-                capture_identity: ParserCaptureIdentity {
-                    stream_watermark: 100,
-                    capture_unix_ms: 1700000000000,
+                authority: CheckpointAuthority::ModelOnly {
+                    captured_at_epoch_ms: 1700000000000,
+                    parser_seqno: 1,
                 },
             },
         }];
 
         let topology = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: None,
-                position: None,
-                size: None,
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 1,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    title: None,
-                    root_split: Some(RecoverySplitNode::Leaf { pane_id: 1 }),
+                    stable_tab_id: "tab-1".to_string(),
+                    title: "tab-1".to_string(),
+                    working_dir: None,
+                    size: term_size,
+                    size_before_zoom: term_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 1,
+                        pane_uuid: "uuid-pane-1".to_string(),
+                    }),
                     floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 1,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let image_digest =
-            MuxRecoveryImage::compute_digest(&header, &topology, &panes).expect("digest");
-        let image = MuxRecoveryImage {
+        let mut image = MuxRecoveryImage {
             header,
             topology,
             panes,
-            image_digest,
+            image_digest: [0u8; 32],
         };
+        image.image_digest = image.compute_digest().expect("digest");
 
         let image_bytes = image.to_canonical_json().expect("canonical json image");
         let candidate = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: image_bytes.clone(),
-            payload_digest: sha256_hex(&image_bytes),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&image_bytes),
+            manifest_bytes: image_bytes.clone(),
+            file_len: image_bytes.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let verifier = WholeMuxRecoveryVerifier::default();
@@ -13138,85 +13371,125 @@ mod tests {
             .expect("open publication store");
 
         let valid_payload = b"{\"version\":2,\"valid\":true}";
-        let valid_digest = sha256_hex(valid_payload);
+        let valid_digest: [u8; 32] = Sha256::digest(valid_payload).into();
 
         let mut tampered_payload = valid_payload.to_vec();
         tampered_payload[0] = b'X'; // tamper 1 byte
+        let tampered_digest = sha256_hex(&tampered_payload);
 
         let obj_id = "obj-tampered".to_string();
         store
-            .publish_object(&obj_id, &tampered_payload)
+            .publish_object(&RecoveryObjectPayload {
+                object_id: obj_id.clone(),
+                expected_sha256: tampered_digest,
+                ciphertext_bytes: tampered_payload.clone(),
+            })
             .expect("publish tampered obj");
 
+        let inc_id = "inc-test".to_string();
         let header = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
-            mux_incarnation_id: "inc-test".to_string(),
-            active_window_id: None,
-            active_domain: None,
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-test".to_string(),
+        };
+
+        let term_size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
         };
 
         let panes = vec![RecoveryPane {
             pane_id: 1,
-            tab_id: 1,
-            domain_id: 1,
-            title: None,
-            working_directory: None,
-            command_line: None,
-            checkpoint_binding: PaneCheckpointBinding {
+            pane_uuid: "uuid-pane-1".to_string(),
+            domain_name: "local".to_string(),
+            title: "shell".to_string(),
+            cwd: None,
+            size: term_size,
+            cursor_position: (0, 0),
+            alt_screen_active: false,
+            checkpoint: PaneCheckpointBinding {
+                topology_incarnation_id: inc_id.clone(),
+                pane_uuid: "uuid-pane-1".to_string(),
+                registration_generation: 1,
+                parser_capture: ParserCaptureIdentity {
+                    watermark_bytes: 100,
+                    segment_id: 1,
+                    parser_seqno: 1,
+                },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id.clone(),
+                    byte_length: tampered_payload.len() as u64,
                     payload_digest: valid_digest, // expected digest is for untampered
-                    byte_len: valid_payload.len() as u64,
+                    schema_version: 1,
                 },
-                authority: CheckpointAuthority::ModelParserGround,
-                capture_identity: ParserCaptureIdentity {
-                    stream_watermark: 100,
-                    capture_unix_ms: 1700000000000,
+                authority: CheckpointAuthority::ModelOnly {
+                    captured_at_epoch_ms: 1700000000000,
+                    parser_seqno: 1,
                 },
             },
         }];
 
         let topology = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: None,
-                position: None,
-                size: None,
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 1,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    title: None,
-                    root_split: Some(RecoverySplitNode::Leaf { pane_id: 1 }),
+                    stable_tab_id: "tab-1".to_string(),
+                    title: "tab-1".to_string(),
+                    working_dir: None,
+                    size: term_size,
+                    size_before_zoom: term_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 1,
+                        pane_uuid: "uuid-pane-1".to_string(),
+                    }),
                     floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 1,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let image_digest =
-            MuxRecoveryImage::compute_digest(&header, &topology, &panes).expect("digest");
-        let image = MuxRecoveryImage {
+        let mut image = MuxRecoveryImage {
             header,
             topology,
             panes,
-            image_digest,
+            image_digest: [0u8; 32],
         };
+        image.image_digest = image.compute_digest().expect("digest");
 
         let image_bytes = image.to_canonical_json().expect("canonical json image");
         let candidate = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: image_bytes.clone(),
-            payload_digest: sha256_hex(&image_bytes),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&image_bytes),
+            manifest_bytes: image_bytes.clone(),
+            file_len: image_bytes.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let verifier = WholeMuxRecoveryVerifier::default();
@@ -13232,28 +13505,30 @@ mod tests {
     #[test]
     fn test_whole_mux_recovery_refuses_active_live_session_destination() {
         let header = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
             mux_incarnation_id: "inc-live".to_string(),
-            active_window_id: None,
-            active_domain: None,
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-live".to_string(),
         };
 
         let topology = RecoveryTopology {
             domains: vec![],
             windows: vec![],
+            focused_window_id: None,
+            client_workspace: None,
         };
 
-        let image_digest =
-            MuxRecoveryImage::compute_digest(&header, &topology, &[]).expect("digest");
-        let image = MuxRecoveryImage {
+        let mut image = MuxRecoveryImage {
             header,
             topology,
             panes: vec![],
-            image_digest,
+            image_digest: [0u8; 32],
         };
+        image.image_digest = image.compute_digest().expect("digest");
 
         let validated = ValidatedWholeMuxRecovery {
             image,
@@ -13275,6 +13550,20 @@ mod tests {
             }
             other => panic!("expected LiveDestinationRefused error, got {other:?}"),
         }
+
+        #[cfg(feature = "frankenterm-deps")]
+        {
+            let reconstruct_result = reconstruct_whole_mux_image_inert(
+                &validated,
+                TerminalCheckpointLimits::default(),
+                Some("active-fleet-session-42"),
+                &active_sessions,
+            );
+            assert!(matches!(
+                reconstruct_result,
+                Err(WholeMuxRecoveryError::LiveDestinationRefused { .. })
+            ));
+        }
     }
 
     #[test]
@@ -13283,81 +13572,112 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let payload = b"{\"version\":2}";
-        let digest = sha256_hex(payload);
-        let obj_id = "obj-fake-guardian".to_string();
-        store.publish_object(&obj_id, payload).expect("publish");
-
+        let inc_id = "inc-fake".to_string();
         let header = RecoveryImageHeader {
-            magic: *b"FTMR",
-            schema_version: 1,
+            magic: MUX_RECOVERY_IMAGE_MAGIC,
+            schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
             generation: 1,
-            created_at_unix_ms: 1700000000000,
-            mux_incarnation_id: "inc-fake".to_string(),
-            active_window_id: None,
-            active_domain: None,
+            predecessor_digest: None,
+            created_at_epoch_ms: 1700000000000,
+            mux_incarnation_id: inc_id.clone(),
+            ft_version: "0.1.0".to_string(),
+            session_id: "sess-fake".to_string(),
         };
 
-        // Fake guardian authority: claims GuardianReplicated but has 0 watermark
+        let term_size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+
+        // Fake guardian authority: claims Guardian but has 0 watermark
         let panes = vec![RecoveryPane {
             pane_id: 99,
-            tab_id: 1,
-            domain_id: 1,
-            title: None,
-            working_directory: None,
-            command_line: None,
-            checkpoint_binding: PaneCheckpointBinding {
-                checkpoint_ref: RecoveryObjectRef {
-                    object_id: obj_id,
-                    payload_digest: digest,
-                    byte_len: payload.len() as u64,
+            pane_uuid: "uuid-pane-99".to_string(),
+            domain_name: "local".to_string(),
+            title: "fake".to_string(),
+            cwd: None,
+            size: term_size,
+            cursor_position: (0, 0),
+            alt_screen_active: false,
+            checkpoint: PaneCheckpointBinding {
+                topology_incarnation_id: inc_id.clone(),
+                pane_uuid: "uuid-pane-99".to_string(),
+                registration_generation: 1,
+                parser_capture: ParserCaptureIdentity {
+                    watermark_bytes: 0, // invalid: 0 watermark for guardian
+                    segment_id: 1,
+                    parser_seqno: 1,
                 },
-                authority: CheckpointAuthority::GuardianReplicated,
-                capture_identity: ParserCaptureIdentity {
-                    stream_watermark: 0, // invalid: 0 watermark for replicated guardian
-                    capture_unix_ms: 1700000000000,
+                checkpoint_ref: RecoveryObjectRef {
+                    object_id: "obj-fake-guardian".to_string(),
+                    payload_digest: [0x77u8; 32],
+                    byte_length: 64,
+                    schema_version: 1,
+                },
+                authority: CheckpointAuthority::Guardian {
+                    guardian_generation: 1,
+                    lease_verifier: "lease-v1".to_string(),
+                    catalog_generation: 1,
                 },
             },
         }];
 
         let topology = RecoveryTopology {
             domains: vec![RecoveryDomain {
-                domain_id: 1,
-                name: "local".to_string(),
-                domain_type: "local".to_string(),
+                incarnation_domain_id: 1,
+                domain_name: "local".to_string(),
+                is_attached: true,
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                name: None,
-                position: None,
-                size: None,
+                stable_window_id: "win-1".to_string(),
+                workspace: "default".to_string(),
+                order_revision: 1,
+                gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    title: None,
-                    root_split: Some(RecoverySplitNode::Leaf { pane_id: 99 }),
+                    stable_tab_id: "tab-1".to_string(),
+                    title: "tab-1".to_string(),
+                    working_dir: None,
+                    size: term_size,
+                    size_before_zoom: term_size,
+                    zoomed_pane_id: None,
+                    root_split: Some(RecoverySplitNode::Leaf {
+                        pane_id: 99,
+                        pane_uuid: "uuid-pane-99".to_string(),
+                    }),
                     floating_panes: vec![],
+                    floating_focus: None,
                     active_pane_id: 99,
                 }],
                 active_tab_index: 0,
             }],
+            focused_window_id: Some(1),
+            client_workspace: None,
         };
 
-        let image_digest =
-            MuxRecoveryImage::compute_digest(&header, &topology, &panes).expect("digest");
-        let image = MuxRecoveryImage {
+        let mut image = MuxRecoveryImage {
             header,
             topology,
             panes,
-            image_digest,
+            image_digest: [0u8; 32],
         };
+        image.image_digest = image.compute_digest().expect("digest");
 
         let image_bytes = image.to_canonical_json().expect("canonical json image");
         let candidate = RootSlotCandidate {
-            slot: RootSlot::Slot0,
+            slot: RootSlot::SlotA,
             generation: 1,
-            root_payload: image_bytes.clone(),
-            payload_digest: sha256_hex(&image_bytes),
-            written_at_unix_ms: 1700000000000,
+            publisher_id: "test-publisher".to_string(),
+            predecessor_generation: None,
+            predecessor_hash: None,
+            manifest_sha256: sha256_hex(&image_bytes),
+            manifest_bytes: image_bytes.clone(),
+            file_len: image_bytes.len() as u64,
+            created_at_ms: 1700000000000,
         };
 
         let verifier = WholeMuxRecoveryVerifier::default();

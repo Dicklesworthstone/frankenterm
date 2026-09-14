@@ -21,11 +21,13 @@ use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+use frankenterm_term::terminalstate::checkpoint::{
+    TerminalCheckpointError, TerminalCheckpointLimits, TerminalCheckpointV2,
+};
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
-    RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration,
-    TerminalSize,
+    RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex,
+    Terminal, TerminalConfiguration, TerminalSize,
 };
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
@@ -327,6 +329,47 @@ struct GuardianPaneOwnership {
     identity: GuardianPaneLeaseIdentity,
     control: Arc<dyn GuardianPaneLeaseControl>,
     disposition: Mutex<GuardianLeaseDisposition>,
+}
+
+/// Authority token for model-only legacy pane checkpoint capture.
+/// This authority is strictly distinct from guardian capture authority:
+/// legacy panes never participate in guardian output journal replication
+/// and must never manufacture or use fake guardian output receipts.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelParserCaptureAuthority {
+    _private: (),
+}
+
+impl ModelParserCaptureAuthority {
+    /// Issue model-only capture authority for legacy mux-owned pane checkpoints.
+    pub fn issue() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Policy for handling pending parser actions during legacy terminal checkpoint capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingActionDrainPolicy {
+    /// Drain and apply all pending actions to the terminal model before capture.
+    DrainAndApply,
+    /// Require that all pending actions have already been drained.
+    /// If any actions remain, capture fails immediately with `PendingActionsRemain`.
+    RequireEmpty,
+}
+
+/// Errors occurring during legacy mux-owned terminal checkpoint capture.
+#[derive(Debug, thiserror::Error)]
+pub enum LegacyTerminalCaptureError {
+    #[error("parser is not at recovery ground")]
+    ParserNotRecoveryGround,
+    #[error("pending parser actions remain unapplied: {0} actions pending")]
+    PendingActionsRemain(usize),
+    #[error("cold scrollback snapshot generation is stale")]
+    StaleColdGeneration,
+    #[error("terminal checkpoint error: {0}")]
+    Terminal(#[from] RecoveryTerminalCheckpointError),
+    #[error("cannot use legacy model capture on guardian-owned pane: false guardian authority rejected")]
+    FalseGuardianAuthority,
 }
 
 enum LocalPaneOwnership {
@@ -1841,14 +1884,26 @@ impl Pane for LocalPane {
         limits: TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
         let _output_application = self.output_application.lock();
-        // `locked_terminal` drains the optional disruptor ring before it
-        // returns. Apply this parser's still-local actions under the same lock,
-        // then retain the lock through model serialization so no observer can
-        // splice a newer model onto the parser witness.
-        let mut terminal = self.locked_terminal();
-        terminal.perform_actions(std::mem::take(pending_actions));
-        terminal
-            .capture_recovery_checkpoint_at_external_parser_ground(ground, limits)
+        // `locked_terminal` drains the optional disruptor ring before it returns.
+        // Apply this parser's still-local actions and capture staged hot state
+        // under the terminal lock, then release the lock immediately so cold-history
+        // materialization and serialization do not block the terminal mutex.
+        let staged = {
+            let mut terminal = self.locked_terminal();
+            terminal.perform_actions(std::mem::take(pending_actions));
+            TerminalCheckpointV2::capture_staged(&terminal, limits)
+                .map_err(RecoveryTerminalCheckpointError::Checkpoint)
+                .map_err(LiveParserPaneCaptureError::Terminal)?
+        };
+
+        let checkpoint = staged
+            .materialize_cold_history(limits)
+            .map_err(RecoveryTerminalCheckpointError::Checkpoint)
+            .map_err(LiveParserPaneCaptureError::Terminal)?;
+
+        checkpoint
+            .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
+            .map_err(RecoveryTerminalCheckpointError::Checkpoint)
             .map_err(LiveParserPaneCaptureError::Terminal)
     }
 
@@ -2732,6 +2787,112 @@ fn split_child(
 }
 
 impl LocalPane {
+    /// Capture a legacy mux-owned pane terminal checkpoint using distinct model-only authority.
+    ///
+    /// The capture separates hot-state capture from cold-history materialization:
+    /// 1. Under terminal lock: drain/verify pending actions, capture bounded hot state, and pin
+    ///    cold-history generation from the scrollback spill sink.
+    /// 2. Release terminal lock immediately.
+    /// 3. Outside terminal lock: materialize cold-history rows from the spill sink, revalidate
+    ///    generation freshness, and assemble canonical `RecoveryTerminalCheckpointV2`.
+    pub fn capture_legacy_terminal_checkpoint(
+        &self,
+        authority: ModelParserCaptureAuthority,
+        pending_actions: &mut Vec<Action>,
+        ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV2, LegacyTerminalCaptureError> {
+        self.capture_legacy_terminal_checkpoint_with_policy(
+            authority,
+            pending_actions,
+            ground,
+            limits,
+            PendingActionDrainPolicy::DrainAndApply,
+        )
+    }
+
+    /// Capture legacy terminal checkpoint with explicit pending-action handling policy.
+    pub fn capture_legacy_terminal_checkpoint_with_policy(
+        &self,
+        _authority: ModelParserCaptureAuthority,
+        pending_actions: &mut Vec<Action>,
+        ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
+        limits: TerminalCheckpointLimits,
+        policy: PendingActionDrainPolicy,
+    ) -> Result<RecoveryTerminalCheckpointV2, LegacyTerminalCaptureError> {
+        // Enforce distinct model-only authority: fail closed if guardian-owned
+        if matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
+            return Err(LegacyTerminalCaptureError::FalseGuardianAuthority);
+        }
+
+        match policy {
+            PendingActionDrainPolicy::RequireEmpty => {
+                if !pending_actions.is_empty() {
+                    return Err(LegacyTerminalCaptureError::PendingActionsRemain(
+                        pending_actions.len(),
+                    ));
+                }
+            }
+            PendingActionDrainPolicy::DrainAndApply => {}
+        }
+
+        let _output_application = self.output_application.lock();
+
+        // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
+        let staged = {
+            let mut terminal = self.locked_terminal();
+            if policy == PendingActionDrainPolicy::DrainAndApply {
+                terminal.perform_actions(std::mem::take(pending_actions));
+            }
+            TerminalCheckpointV2::capture_staged(&terminal, limits).map_err(|e| match e {
+                TerminalCheckpointError::StaleColdGeneration => {
+                    LegacyTerminalCaptureError::StaleColdGeneration
+                }
+                other => LegacyTerminalCaptureError::Terminal(
+                    RecoveryTerminalCheckpointError::Checkpoint(other),
+                ),
+            })?
+        }; // Terminal mutex is released immediately here!
+
+        // 2. Outside terminal lock: materialize cold history rows
+        let checkpoint = staged
+            .materialize_cold_history(limits)
+            .map_err(|e| match e {
+                TerminalCheckpointError::StaleColdGeneration => {
+                    LegacyTerminalCaptureError::StaleColdGeneration
+                }
+                other => LegacyTerminalCaptureError::Terminal(
+                    RecoveryTerminalCheckpointError::Checkpoint(other),
+                ),
+            })?;
+
+        // 3. Assemble canonical RecoveryTerminalCheckpointV2 outside terminal lock
+        checkpoint
+            .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
+            .map_err(|e| match e {
+                TerminalCheckpointError::StaleColdGeneration => {
+                    LegacyTerminalCaptureError::StaleColdGeneration
+                }
+                other => LegacyTerminalCaptureError::Terminal(
+                    RecoveryTerminalCheckpointError::Checkpoint(other),
+                ),
+            })
+    }
+
+    /// Convenience capture for legacy mux-owned panes when no pending actions or custom parser ground are needed.
+    pub fn capture_legacy_terminal_checkpoint_simple(
+        &self,
+        authority: ModelParserCaptureAuthority,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV2, LegacyTerminalCaptureError> {
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let ground = parser
+            .recovery_ground_boundary()
+            .ok_or(LegacyTerminalCaptureError::ParserNotRecoveryGround)?;
+        let mut pending = Vec::new();
+        self.capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits)
+    }
+
     fn capture_title_metadata(terminal: &Terminal) -> PaneTitleMetadata {
         PaneTitleMetadata {
             is_stale: false,

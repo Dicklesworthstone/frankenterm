@@ -715,6 +715,7 @@ pub mod snap_back_fuzz;
 pub mod snapshot_divergence;
 pub mod snapshot_engine;
 pub mod snapshot_publication;
+pub mod snapshot_repair;
 pub mod snapshot_representation;
 pub mod soak_confidence_gate;
 pub mod sparse_table;

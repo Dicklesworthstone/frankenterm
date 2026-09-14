@@ -1,0 +1,2245 @@
+//! Crash-safe on-disk layout and publication based on the FrankenFS generation pattern.
+//!
+//! # Architecture & Guarantees
+//!
+//! - **Dual Root Slots (`slot_a.root` / `slot_b.root`)**: Alternating root slots ensure that the sole
+//!   verified root generation is never overwritten. New roots are written into the inactive slot only
+//!   after the full generation independently verifies.
+//! - **Descriptor-Bound Cross-Process Publication Lock**: An exclusive OS-level advisory lock on
+//!   `.publication.lock` serializes all root inspection, CAS, verification, and slot replacement,
+//!   as well as object checks and publishing. This prevents concurrent publishers from advancing
+//!   slots twice and clobbering active or fallback roots.
+//! - **In-Staging Candidate Verification**: Candidate envelopes and their full object closures are
+//!   authenticated and validated via the caller's [`RootVerifier`] *in staging before* replacing the
+//!   inactive slot selector. Bad proposals are rejected without touching or destroying valid fallback roots.
+//! - **Decoupled Verification**: Readable files and SHA-256 checksums only yield a [`RootSlotCandidate`].
+//!   Promotion to a verified root requires an independent caller-provided [`RootVerifier`] that
+//!   authenticates signatures, checks object graph completeness, and verifies predecessor identity.
+//! - **Predecessor Binding**: Root publication is explicitly predecessor-bound; publication fails closed
+//!   if the active root does not match the expected predecessor generation and manifest digest.
+//! - **Immutable Objects (`objects/<id>.obj`)**: Content-addressed recovery objects are published
+//!   with no-clobber semantics under the publication lock. Existing identical objects are adopted idempotently;
+//!   conflicting residue fails closed with an error.
+//! - **No File Deletion**: Incomplete staging files or torn generation roots are strictly preserved on
+//!   disk for post-incident forensics.
+//! - **Fail-Closed Fallback**: If the newest root slot is torn or fails verifier inspection, readers
+//!   seamlessly fall back to the intact predecessor root.
+//! - **No-Follow & No-Chmod Root Admission**: Opening a publication store strictly rejects symlinks
+//!   anywhere in the hierarchy. Existing roots are admitted only if they already possess owner-private
+//!   permissions (0700); untrusted existing directories are never silently `chmod`'d.
+//! - **Bounded Resource Allocation**: All directory entries, error records, root manifests, and objects
+//!   are bounded before memory allocation.
+//! - **Descriptor-Relative & Capability-Audited I/O**: Directory handles ([`cap_std::fs::Dir`]) with
+//!   symlink-following disabled (`FollowSymlinks::No` / `O_NOFOLLOW`) prevent TOCTOU and link-traversal attacks.
+//! - **Fsync Ordering**: File payloads are flushed (`sync_all`) before atomic rename, followed by directory sync.
+
+#![forbid(unsafe_code)]
+
+use std::fmt;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::fs::{Dir, File, OpenOptions};
+use fs2::FileExt as _;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+// =============================================================================
+// Constants & Limits
+// =============================================================================
+
+/// 16-byte magic header identifying a valid generation root envelope.
+pub const ENVELOPE_MAGIC: &[u8; 16] = b"FTRECROOTv1\0\0\0\0\0";
+
+/// Canonical filename for root slot A.
+pub const ROOT_SLOT_A_NAME: &str = "slot_a.root";
+/// Canonical filename for root slot B.
+pub const ROOT_SLOT_B_NAME: &str = "slot_b.root";
+
+/// Subdirectory name for immutable objects.
+pub const OBJECTS_DIR_NAME: &str = "objects";
+/// Subdirectory name for dual root slots.
+pub const ROOTS_DIR_NAME: &str = "roots";
+/// Subdirectory name for generation metadata.
+pub const GENERATIONS_DIR_NAME: &str = "generations";
+
+/// Staging file prefix for atomic publication.
+pub const STAGE_PREFIX: &str = ".stage.";
+
+/// Default ceiling on root manifest byte size (1 MiB).
+pub const DEFAULT_MAX_ROOT_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Default ceiling on individual object byte size (64 MiB).
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+/// Default ceiling on directory entries examined in a single scan.
+pub const DEFAULT_MAX_DIR_ENTRIES: usize = 1024;
+/// Default ceiling on diagnostic error records retained.
+pub const DEFAULT_MAX_ERROR_RECORDS: usize = 64;
+
+/// Maximum allowed byte size for the serialized envelope JSON header (64 KiB).
+pub const MAX_ENVELOPE_HEADER_BYTES: u64 = 64 * 1024;
+
+/// Total framing overhead for an envelope: magic (16) + header length (4) + header JSON (64 KiB) + trailer SHA-256 (32).
+pub const MAX_ENVELOPE_OVERHEAD_BYTES: u64 = 16 + 4 + MAX_ENVELOPE_HEADER_BYTES + 32;
+
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+// =============================================================================
+// Configuration & Limits
+// =============================================================================
+
+/// Resource bounds enforced during publication and read operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationLimits {
+    /// Maximum allowed bytes for a root manifest envelope payload.
+    pub max_root_manifest_bytes: u64,
+    /// Maximum allowed bytes for an individual recovery object.
+    pub max_object_bytes: u64,
+    /// Maximum directory entries scanned in a single operation.
+    pub max_dir_entries: usize,
+    /// Maximum number of diagnostic error records collected.
+    pub max_error_records: usize,
+}
+
+impl PublicationLimits {
+    /// Maximum allowed bytes for the serialized on-disk root envelope,
+    /// accounting for framing overhead (magic, headers, trailer checksum)
+    /// plus the root manifest payload bound.
+    #[must_use]
+    pub fn max_root_envelope_bytes(&self) -> u64 {
+        self.max_root_manifest_bytes
+            .saturating_add(MAX_ENVELOPE_OVERHEAD_BYTES)
+    }
+}
+
+impl Default for PublicationLimits {
+    fn default() -> Self {
+        Self {
+            max_root_manifest_bytes: DEFAULT_MAX_ROOT_MANIFEST_BYTES,
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+            max_dir_entries: DEFAULT_MAX_DIR_ENTRIES,
+            max_error_records: DEFAULT_MAX_ERROR_RECORDS,
+        }
+    }
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
+
+/// Errors that can occur during recovery snapshot publication or selection.
+#[derive(Debug, Error)]
+pub enum PublicationError {
+    #[error("I/O error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Invalid object ID '{object_id}': {reason}")]
+    InvalidObjectId { object_id: String, reason: String },
+
+    #[error("Payload exceeds maximum permitted size of {max_bytes} bytes (found {actual_bytes})")]
+    OversizedPayload { max_bytes: u64, actual_bytes: u64 },
+
+    #[error("Directory scan exceeded maximum bound of {max_entries} entries")]
+    ExcessiveDirectoryEntries { max_entries: usize },
+
+    #[error("Immutable object '{object_id}' already exists with conflicting SHA-256 (expected {expected}, found {existing})")]
+    ObjectConflict {
+        object_id: String,
+        expected: String,
+        existing: String,
+    },
+
+    #[error("Corrupted or invalid root envelope in slot {slot:?}: {reason}")]
+    InvalidEnvelope { slot: RootSlot, reason: String },
+
+    #[error("Predecessor mismatch for generation {generation}: expected gen {expected_gen} ({expected_hash}), active root was {actual:?}")]
+    PredecessorMismatch {
+        generation: u64,
+        expected_gen: u64,
+        expected_hash: String,
+        actual: Option<(u64, String)>,
+    },
+
+    #[error("Initial generation (gen {generation}) cannot specify a predecessor binding")]
+    InitialGenerationWithPredecessor { generation: u64 },
+
+    #[error("Subsequent generation (gen {generation}) requires an explicit predecessor binding")]
+    MissingPredecessorBinding { generation: u64 },
+
+    #[error("Non-monotonic generation number: candidate gen {candidate} <= active gen {active}")]
+    NonMonotonicGeneration { candidate: u64, active: u64 },
+
+    #[error("Target file {path} has invalid security attributes: {reason}")]
+    InsecurePermissions { path: PathBuf, reason: String },
+
+    #[error("File length changed concurrently during read of {path}: expected {expected} bytes from metadata, read {actual} bytes")]
+    FileLengthChanged {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error("Independent caller verification rejected root generation {generation} in slot {slot:?}: {reason}")]
+    VerificationRejected {
+        slot: RootSlot,
+        generation: u64,
+        reason: String,
+    },
+
+    #[error("No verified root available")]
+    NoVerifiedRoot,
+}
+
+impl PublicationError {
+    pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+// =============================================================================
+// Envelope & Identifiers
+// =============================================================================
+
+/// Identified root slot in dual-slot publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RootSlot {
+    SlotA,
+    SlotB,
+}
+
+impl RootSlot {
+    /// Canonical filename in the `roots/` subdirectory.
+    #[must_use]
+    pub fn filename(self) -> &'static str {
+        match self {
+            Self::SlotA => ROOT_SLOT_A_NAME,
+            Self::SlotB => ROOT_SLOT_B_NAME,
+        }
+    }
+
+    /// Alternate inactive slot.
+    #[must_use]
+    pub fn other(self) -> Self {
+        match self {
+            Self::SlotA => Self::SlotB,
+            Self::SlotB => Self::SlotA,
+        }
+    }
+}
+
+impl fmt::Display for RootSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SlotA => write!(f, "SlotA"),
+            Self::SlotB => write!(f, "SlotB"),
+        }
+    }
+}
+
+/// Predecessor constraint required when publishing a new generation root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredecessorBinding {
+    pub expected_generation: u64,
+    pub expected_hash: String,
+}
+
+/// Metadata header stored inside the root envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationEnvelopeHeader {
+    pub generation: u64,
+    pub publisher_id: String,
+    pub predecessor_generation: Option<u64>,
+    pub predecessor_hash: Option<String>,
+    pub manifest_sha256: String,
+    pub manifest_len: u64,
+    pub created_at_ms: u64,
+}
+
+/// Raw candidate root read from one of the dual slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootSlotCandidate {
+    pub slot: RootSlot,
+    pub generation: u64,
+    pub publisher_id: String,
+    pub predecessor_generation: Option<u64>,
+    pub predecessor_hash: Option<String>,
+    pub manifest_sha256: String,
+    pub manifest_bytes: Vec<u8>,
+    pub file_len: u64,
+    pub created_at_ms: u64,
+}
+
+/// Request to publish a new generation root manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRootPublishRequest {
+    pub generation: u64,
+    pub publisher_id: String,
+    pub predecessor: Option<PredecessorBinding>,
+    pub manifest_bytes: Vec<u8>,
+    pub created_at_ms: u64,
+}
+
+/// Receipt returned upon successful publication of a generation root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationPublicationReceipt {
+    pub generation: u64,
+    pub publisher_id: String,
+    pub slot: RootSlot,
+    pub sha256: String,
+    pub byte_len: u64,
+    pub path: PathBuf,
+}
+
+/// Descriptor for an immutable recovery object to be stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryObjectPayload {
+    pub object_id: String,
+    pub expected_sha256: String,
+    pub ciphertext_bytes: Vec<u8>,
+}
+
+/// Receipt returned upon successful publication of an immutable object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectPublicationReceipt {
+    pub object_id: String,
+    pub sha256: String,
+    pub byte_len: u64,
+    pub path: PathBuf,
+    pub was_already_present: bool,
+}
+
+/// Diagnostic for a root slot candidate that was torn, corrupted, or rejected by verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TornRootDiagnostic {
+    pub slot: RootSlot,
+    pub generation: Option<u64>,
+    pub reason: String,
+}
+
+/// Result of evaluating root slot candidates with an independent verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRootSelection<T> {
+    /// Highest fully verified generation root.
+    pub current: Option<T>,
+    /// Predecessor verified generation root (last-known-good).
+    pub previous: Option<T>,
+    /// Candidates that were torn, corrupted, or failed verifier inspection.
+    pub torn_or_rejected: Vec<TornRootDiagnostic>,
+}
+
+// =============================================================================
+// Verifier Trait
+// =============================================================================
+
+/// Independent caller-provided verifier required to validate root authenticity.
+///
+/// Implementations must check cryptographic signatures, confirm that all required
+/// objects referenced by the root manifest exist and validate, and verify that
+/// the predecessor lineage is unbroken.
+pub trait RootVerifier {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type Verified: Clone + Send + Sync;
+
+    /// Validates the root candidate.
+    fn verify_root(
+        &self,
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Result<Self::Verified, Self::Error>;
+}
+
+impl<F, T, E> RootVerifier for F
+where
+    F: Fn(&RootSlotCandidate, &SnapshotPublicationStore) -> Result<T, E>,
+    E: std::error::Error + Send + Sync + 'static,
+    T: Clone + Send + Sync,
+{
+    type Error = E;
+    type Verified = T;
+
+    fn verify_root(
+        &self,
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Result<Self::Verified, Self::Error> {
+        self(candidate, store)
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Compute hex-encoded SHA-256 digest.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Validate object ID format (alphanumeric, dashes, underscores, dots; no paths).
+fn validate_object_id(id: &str) -> Result<(), PublicationError> {
+    if id.is_empty() || id.len() > 255 {
+        return Err(PublicationError::InvalidObjectId {
+            object_id: id.to_string(),
+            reason: "ID length must be between 1 and 255 bytes".to_string(),
+        });
+    }
+    if id.starts_with('.') || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(PublicationError::InvalidObjectId {
+            object_id: id.to_string(),
+            reason: "ID must not start with '.' or contain path separators or '..'".to_string(),
+        });
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(PublicationError::InvalidObjectId {
+            object_id: id.to_string(),
+            reason: "ID contains invalid characters (allowed: ASCII alphanumeric, '-', '_', '.')"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Check security attributes on opened file handle.
+fn check_opened_file_security(file: &File, path: &Path) -> Result<u64, PublicationError> {
+    let metadata = file
+        .metadata()
+        .map_err(|e| PublicationError::io(path, e))?;
+
+    if !metadata.is_file() {
+        return Err(PublicationError::InsecurePermissions {
+            path: path.to_path_buf(),
+            reason: "target is not a regular file".to_string(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: format!("file mode {mode:#o} is not private (expected 0600)"),
+            });
+        }
+        let current_uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != current_uid {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "file owner UID {} does not match current process UID {current_uid}",
+                    metadata.uid()
+                ),
+            });
+        }
+        if metadata.nlink() != 1 {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "file hard link count {} is greater than 1",
+                    metadata.nlink()
+                ),
+            });
+        }
+    }
+
+    Ok(metadata.len())
+}
+
+/// Generate unique stage filename.
+fn generate_stage_name(sha256_prefix: &str) -> String {
+    let pid = std::process::id();
+    let nonce = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{STAGE_PREFIX}{pid}.{nonce}.{sha256_prefix}.tmp")
+}
+
+/// RAII guard representing an exclusive, descriptor-bound cross-process publication lock.
+pub struct PublicationLock {
+    _file: std::fs::File,
+}
+
+/// Verify that a directory has private permissions (0700) and is owned by the current process.
+/// Does NOT mutate or chmod the directory.
+fn verify_directory_security(dir: &Dir, path: &Path) -> Result<(), PublicationError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let std_file = dir
+            .try_clone()
+            .map_err(|e| PublicationError::io(path, e))?
+            .into_std_file();
+        let metadata = std_file
+            .metadata()
+            .map_err(|e| PublicationError::io(path, e))?;
+
+        if !metadata.is_dir() {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "path is not a directory".to_string(),
+            });
+        }
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "directory permissions {mode:#o} are too broad (group/other permissions must be 0)"
+                ),
+            });
+        }
+
+        let current_uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != current_uid {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "directory owner UID {} does not match current process UID {current_uid}",
+                    metadata.uid()
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, path);
+    }
+    Ok(())
+}
+
+/// Recursively ensures ancestor directories exist without following symlinks.
+fn ensure_directory_hierarchy_nofollow(path: &Path) -> Result<Dir, PublicationError> {
+    if path.as_os_str().is_empty() || path == Path::new(".") {
+        return Dir::open_ambient_dir(".", cap_std::ambient_authority())
+            .map_err(|e| PublicationError::io(path, e));
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(PublicationError::InsecurePermissions {
+                    path: path.to_path_buf(),
+                    reason: "directory component is a symlink (symlinks forbidden)".to_string(),
+                });
+            }
+            Dir::open_ambient_dir(path, cap_std::ambient_authority())
+                .map_err(|e| PublicationError::io(path, e))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent_dir = ensure_directory_hierarchy_nofollow(parent)?;
+            let leaf = path.file_name().ok_or_else(|| PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "path has no leaf component".to_string(),
+            })?;
+            let mut builder = cap_std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use cap_std::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            parent_dir
+                .create_dir_with(leaf, &builder)
+                .map_err(|e| PublicationError::io(path, e))?;
+            parent_dir
+                .open_dir_nofollow(leaf)
+                .map_err(|e| PublicationError::io(path, e))
+        }
+        Err(e) => Err(PublicationError::io(path, e)),
+    }
+}
+
+
+// =============================================================================
+// Envelope Encoding / Decoding
+// =============================================================================
+
+/// Encode a root manifest into a framed, checksummed binary envelope.
+fn encode_root_envelope(
+    request: &GenerationRootPublishRequest,
+    manifest_sha256: &str,
+) -> Result<Vec<u8>, PublicationError> {
+    let header = GenerationEnvelopeHeader {
+        generation: request.generation,
+        publisher_id: request.publisher_id.clone(),
+        predecessor_generation: request.predecessor.as_ref().map(|p| p.expected_generation),
+        predecessor_hash: request.predecessor.as_ref().map(|p| p.expected_hash.clone()),
+        manifest_sha256: manifest_sha256.to_string(),
+        manifest_len: request.manifest_bytes.len() as u64,
+        created_at_ms: request.created_at_ms,
+    };
+
+    let header_json = serde_json::to_vec(&header).map_err(|e| {
+        PublicationError::InvalidEnvelope {
+            slot: RootSlot::SlotA, // context set by caller
+            reason: format!("failed to serialize envelope header: {e}"),
+        }
+    })?;
+
+    let header_len = u32::try_from(header_json.len()).map_err(|_| {
+        PublicationError::OversizedPayload {
+            max_bytes: u32::MAX as u64,
+            actual_bytes: header_json.len() as u64,
+        }
+    })?;
+
+    let total_capacity = ENVELOPE_MAGIC.len()
+        + 4
+        + header_json.len()
+        + request.manifest_bytes.len()
+        + 32; // 32 bytes for SHA-256 trailer
+
+    let mut buffer = Vec::with_capacity(total_capacity);
+    buffer.extend_from_slice(ENVELOPE_MAGIC);
+    buffer.extend_from_slice(&header_len.to_le_bytes());
+    buffer.extend_from_slice(&header_json);
+    buffer.extend_from_slice(&request.manifest_bytes);
+
+    // Compute trailer checksum over all preceding bytes
+    let trailer_hash = Sha256::digest(&buffer);
+    buffer.extend_from_slice(&trailer_hash);
+
+    Ok(buffer)
+}
+
+/// Decode and validate a root envelope read from a slot.
+fn decode_root_envelope(
+    slot: RootSlot,
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Result<RootSlotCandidate, PublicationError> {
+    if (bytes.len() as u64) > max_bytes {
+        return Err(PublicationError::OversizedPayload {
+            max_bytes,
+            actual_bytes: bytes.len() as u64,
+        });
+    }
+
+    let min_envelope_len = ENVELOPE_MAGIC.len() + 4 + 32;
+    if bytes.len() < min_envelope_len {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: format!(
+                "envelope is too short: {} bytes (minimum required: {min_envelope_len})",
+                bytes.len()
+            ),
+        });
+    }
+
+    if &bytes[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: "invalid magic header".to_string(),
+        });
+    }
+
+    let content_len = bytes.len() - 32;
+    let expected_trailer = &bytes[content_len..];
+    let actual_trailer = Sha256::digest(&bytes[..content_len]);
+    if expected_trailer != actual_trailer.as_slice() {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: "trailer SHA-256 checksum mismatch (corrupted or torn payload)".to_string(),
+        });
+    }
+
+    let mut header_len_bytes = [0u8; 4];
+    header_len_bytes.copy_from_slice(&bytes[ENVELOPE_MAGIC.len()..ENVELOPE_MAGIC.len() + 4]);
+    let header_len = u32::from_le_bytes(header_len_bytes) as usize;
+
+    let header_start = ENVELOPE_MAGIC.len() + 4;
+    let header_end = header_start + header_len;
+    if header_end > content_len {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: "envelope header length extends past payload boundary".to_string(),
+        });
+    }
+
+    let header: GenerationEnvelopeHeader = serde_json::from_slice(&bytes[header_start..header_end])
+        .map_err(|e| PublicationError::InvalidEnvelope {
+            slot,
+            reason: format!("malformed envelope header JSON: {e}"),
+        })?;
+
+    let manifest_bytes = bytes[header_end..content_len].to_vec();
+    if (manifest_bytes.len() as u64) != header.manifest_len {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: format!(
+                "manifest length mismatch: header says {} bytes, found {}",
+                header.manifest_len,
+                manifest_bytes.len()
+            ),
+        });
+    }
+
+    let actual_manifest_hash = sha256_hex(&manifest_bytes);
+    if actual_manifest_hash != header.manifest_sha256 {
+        return Err(PublicationError::InvalidEnvelope {
+            slot,
+            reason: format!(
+                "manifest content SHA-256 mismatch: header says {}, actual is {actual_manifest_hash}",
+                header.manifest_sha256
+            ),
+        });
+    }
+
+    Ok(RootSlotCandidate {
+        slot,
+        generation: header.generation,
+        publisher_id: header.publisher_id,
+        predecessor_generation: header.predecessor_generation,
+        predecessor_hash: header.predecessor_hash,
+        manifest_sha256: header.manifest_sha256,
+        manifest_bytes,
+        file_len: bytes.len() as u64,
+        created_at_ms: header.created_at_ms,
+    })
+}
+
+// =============================================================================
+// Publication Store
+// =============================================================================
+
+/// Descriptor-relative store managing immutable object and root publication.
+pub struct SnapshotPublicationStore {
+    root_path: PathBuf,
+    root_dir: Dir,
+    objects_dir: Dir,
+    roots_dir: Dir,
+    #[allow(dead_code)]
+    generations_dir: Dir,
+    limits: PublicationLimits,
+}
+
+impl SnapshotPublicationStore {
+    /// Opens or initializes a snapshot publication store at the designated root path.
+    ///
+    /// # Security & Symlink Invariants
+    /// - Rejects any symlinks in the path hierarchy without following them.
+    /// - If the root directory exists, verifies owner-private permissions (0700) and UID;
+    ///   does NOT chmod untrusted existing directories.
+    /// - If creating new directories, creates them with 0700 permissions by construction.
+    pub fn open(
+        root_path: impl Into<PathBuf>,
+        limits: PublicationLimits,
+    ) -> Result<Self, PublicationError> {
+        let root_path = root_path.into();
+
+        if root_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(PublicationError::InsecurePermissions {
+                path: root_path.clone(),
+                reason: "root path contains parent directory component ('..')".to_string(),
+            });
+        }
+
+        // Check symlink_metadata on root_path
+        let root_exists = match std::fs::symlink_metadata(&root_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(PublicationError::InsecurePermissions {
+                        path: root_path.clone(),
+                        reason: "root path is a symlink (symlinks are forbidden)".to_string(),
+                    });
+                }
+                if !meta.is_dir() {
+                    return Err(PublicationError::InsecurePermissions {
+                        path: root_path.clone(),
+                        reason: "root path exists but is not a directory".to_string(),
+                    });
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(PublicationError::io(&root_path, e)),
+        };
+
+        let root_dir = if root_exists {
+            // Existing directory: open and verify security WITHOUT mutating permissions (no chmod)
+            let dir = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
+                .map_err(|e| PublicationError::io(&root_path, e))?;
+            verify_directory_security(&dir, &root_path)?;
+            dir
+        } else {
+            // New directory: create parent hierarchy if needed and create leaf with 0700
+            let parent_path = root_path.parent().unwrap_or_else(|| Path::new("."));
+            let leaf = root_path.file_name().ok_or_else(|| PublicationError::InsecurePermissions {
+                path: root_path.clone(),
+                reason: "root path has no leaf name".to_string(),
+            })?;
+
+            // Ensure parent directory exists without symlinks
+            let parent_dir = ensure_directory_hierarchy_nofollow(parent_path)?;
+
+            let mut builder = cap_std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use cap_std::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            parent_dir
+                .create_dir_with(leaf, &builder)
+                .map_err(|e| PublicationError::io(&root_path, e))?;
+
+            let dir = parent_dir
+                .open_dir_nofollow(leaf)
+                .map_err(|e| PublicationError::io(&root_path, e))?;
+            verify_directory_security(&dir, &root_path)?;
+            dir
+        };
+
+        let objects_dir = Self::ensure_private_child_dir(&root_dir, OBJECTS_DIR_NAME, &root_path)?;
+        let roots_dir = Self::ensure_private_child_dir(&root_dir, ROOTS_DIR_NAME, &root_path)?;
+        let generations_dir =
+            Self::ensure_private_child_dir(&root_dir, GENERATIONS_DIR_NAME, &root_path)?;
+
+        Ok(Self {
+            root_path,
+            root_dir,
+            objects_dir,
+            roots_dir,
+            generations_dir,
+            limits,
+        })
+    }
+
+    /// Root filesystem path of the publication store.
+    #[must_use]
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    /// Configured resource limits.
+    #[must_use]
+    pub fn limits(&self) -> &PublicationLimits {
+        &self.limits
+    }
+
+    fn ensure_private_child_dir(
+        parent: &Dir,
+        name: &str,
+        base_path: &Path,
+    ) -> Result<Dir, PublicationError> {
+        let child_path = base_path.join(name);
+
+        let exists = match parent.symlink_metadata(name) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(PublicationError::InsecurePermissions {
+                        path: child_path,
+                        reason: format!("child directory '{name}' is a symlink (symlinks forbidden)"),
+                    });
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(PublicationError::io(&child_path, e)),
+        };
+
+        if exists {
+            let child_dir = parent
+                .open_dir_nofollow(name)
+                .map_err(|e| PublicationError::io(&child_path, e))?;
+            verify_directory_security(&child_dir, &child_path)?;
+            Ok(child_dir)
+        } else {
+            let mut builder = cap_std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use cap_std::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            parent
+                .create_dir_with(name, &builder)
+                .map_err(|e| PublicationError::io(&child_path, e))?;
+            let child_dir = parent
+                .open_dir_nofollow(name)
+                .map_err(|e| PublicationError::io(&child_path, e))?;
+            verify_directory_security(&child_dir, &child_path)?;
+
+            // Sync parent directory after creating child
+            let parent_sync = parent
+                .open(".")
+                .map_err(|e| PublicationError::io(base_path, e))?;
+            parent_sync
+                .sync_all()
+                .map_err(|e| PublicationError::io(base_path, e))?;
+
+            Ok(child_dir)
+        }
+    }
+
+    /// Acquires an exclusive, descriptor-bound cross-process publication lock on `.publication.lock`.
+    pub fn acquire_publication_lock(&self) -> Result<PublicationLock, PublicationError> {
+        let lock_leaf = ".publication.lock";
+        let lock_path = self.root_path.join(lock_leaf);
+
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).follow(FollowSymlinks::No);
+
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+
+        let cap_file = self
+            .root_dir
+            .open_with(lock_leaf, &opts)
+            .map_err(|e| PublicationError::io(&lock_path, e))?;
+
+        check_opened_file_security(&cap_file, &lock_path)?;
+
+        let std_file = cap_file.into_std();
+        std_file
+            .lock_exclusive()
+            .map_err(|e| PublicationError::io(&lock_path, e))?;
+
+        Ok(PublicationLock { _file: std_file })
+    }
+
+    // -------------------------------------------------------------------------
+    // Object Storage (Immutable, No-Clobber)
+    // -------------------------------------------------------------------------
+
+    /// Publishes an immutable recovery object into `objects/<object_id>.obj`.
+    ///
+    /// # Invariants
+    /// - Checks whether `<object_id>.obj` already exists.
+    /// - If existing file matches exact SHA-256 and byte length, adopts it idempotently (`was_already_present = true`).
+    /// - If existing file has conflicting contents, fails closed with [`PublicationError::ObjectConflict`].
+    /// - Never overwrites or deletes existing files.
+    /// - Stages write to a private temporary file, calls `sync_all()`, then atomic renames and syncs directory.
+    pub fn publish_object(
+        &self,
+        object: &RecoveryObjectPayload,
+    ) -> Result<ObjectPublicationReceipt, PublicationError> {
+        validate_object_id(&object.object_id)?;
+
+        let payload_len = object.ciphertext_bytes.len() as u64;
+        if payload_len > self.limits.max_object_bytes {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: self.limits.max_object_bytes,
+                actual_bytes: payload_len,
+            });
+        }
+
+        let computed_sha256 = sha256_hex(&object.ciphertext_bytes);
+        if computed_sha256 != object.expected_sha256 {
+            return Err(PublicationError::ObjectConflict {
+                object_id: object.object_id.clone(),
+                expected: object.expected_sha256.clone(),
+                existing: computed_sha256,
+            });
+        }
+
+        let target_name = format!("{}.obj", object.object_id);
+        let target_full_path = self.root_path.join(OBJECTS_DIR_NAME).join(&target_name);
+
+        // Acquire descriptor-bound cross-process publication lock covering check, stage, and rename
+        let _publication_lock = self.acquire_publication_lock()?;
+
+        // Check if object already exists
+        let mut open_opts = OpenOptions::new();
+        open_opts.read(true).follow(FollowSymlinks::No);
+        match self.objects_dir.open_with(&target_name, &open_opts) {
+            Ok(existing_file) => {
+                let actual_len = check_opened_file_security(&existing_file, &target_full_path)?;
+                if actual_len != payload_len {
+                    return Err(PublicationError::ObjectConflict {
+                        object_id: object.object_id.clone(),
+                        expected: format!("{computed_sha256} ({payload_len} bytes)"),
+                        existing: format!("conflicting length ({actual_len} bytes)"),
+                    });
+                }
+                let mut existing_bytes = Vec::with_capacity(actual_len as usize);
+                let mut reader = existing_file;
+                reader
+                    .read_to_end(&mut existing_bytes)
+                    .map_err(|e| PublicationError::io(&target_full_path, e))?;
+                let existing_sha256 = sha256_hex(&existing_bytes);
+                if existing_sha256 != computed_sha256 {
+                    return Err(PublicationError::ObjectConflict {
+                        object_id: object.object_id.clone(),
+                        expected: computed_sha256,
+                        existing: existing_sha256,
+                    });
+                }
+                return Ok(ObjectPublicationReceipt {
+                    object_id: object.object_id.clone(),
+                    sha256: computed_sha256,
+                    byte_len: payload_len,
+                    path: target_full_path,
+                    was_already_present: true,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PublicationError::io(&target_full_path, e)),
+        }
+
+        // Object does not exist. Write to a new staging file.
+        let stage_name = generate_stage_name(&computed_sha256[..8]);
+        let stage_path = self.root_path.join(OBJECTS_DIR_NAME).join(&stage_name);
+
+        let mut stage_opts = OpenOptions::new();
+        stage_opts
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            stage_opts.mode(0o600);
+        }
+
+        let mut stage_file = self
+            .objects_dir
+            .open_with(&stage_name, &stage_opts)
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        stage_file
+            .write_all(&object.ciphertext_bytes)
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        stage_file
+            .sync_all()
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        drop(stage_file);
+
+        // Pre-rename recheck: under publication lock, ensure target is not present or identical
+        match self.objects_dir.open_with(&target_name, &open_opts) {
+            Ok(existing_file) => {
+                let actual_len = check_opened_file_security(&existing_file, &target_full_path)?;
+                let mut existing_bytes = Vec::with_capacity(actual_len as usize);
+                let mut reader = existing_file;
+                reader
+                    .read_to_end(&mut existing_bytes)
+                    .map_err(|e| PublicationError::io(&target_full_path, e))?;
+                let existing_sha256 = sha256_hex(&existing_bytes);
+                if existing_sha256 == computed_sha256 && actual_len == payload_len {
+                    return Ok(ObjectPublicationReceipt {
+                        object_id: object.object_id.clone(),
+                        sha256: computed_sha256,
+                        byte_len: payload_len,
+                        path: target_full_path,
+                        was_already_present: true,
+                    });
+                } else {
+                    return Err(PublicationError::ObjectConflict {
+                        object_id: object.object_id.clone(),
+                        expected: computed_sha256,
+                        existing: existing_sha256,
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PublicationError::io(&target_full_path, e)),
+        }
+
+        // Atomic rename into target name
+        self.objects_dir
+            .rename(&stage_name, &target_name)
+            .map_err(|e| PublicationError::io(&target_full_path, e))?;
+
+        // Fsync parent objects directory
+        let dir_sync_file = self
+            .objects_dir
+            .open(".")
+            .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
+        dir_sync_file
+            .sync_all()
+            .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
+
+        Ok(ObjectPublicationReceipt {
+            object_id: object.object_id.clone(),
+            sha256: computed_sha256,
+            byte_len: payload_len,
+            path: target_full_path,
+            was_already_present: false,
+        })
+    }
+
+    /// Reads an immutable recovery object by its unique ID.
+    pub fn read_object(&self, object_id: &str) -> Result<Vec<u8>, PublicationError> {
+        validate_object_id(object_id)?;
+        let target_name = format!("{object_id}.obj");
+        let target_path = self.root_path.join(OBJECTS_DIR_NAME).join(&target_name);
+
+        let mut opts = OpenOptions::new();
+        opts.read(true).follow(FollowSymlinks::No);
+
+        let mut file = self
+            .objects_dir
+            .open_with(&target_name, &opts)
+            .map_err(|e| PublicationError::io(&target_path, e))?;
+
+        let file_len = check_opened_file_security(&file, &target_path)?;
+        if file_len > self.limits.max_object_bytes {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: self.limits.max_object_bytes,
+                actual_bytes: file_len,
+            });
+        }
+
+        let mut bytes = Vec::with_capacity(file_len as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| PublicationError::io(&target_path, e))?;
+
+        Ok(bytes)
+    }
+
+    /// Checks whether an immutable recovery object exists and has valid permissions.
+    pub fn has_object(&self, object_id: &str) -> Result<bool, PublicationError> {
+        validate_object_id(object_id)?;
+        let target_name = format!("{object_id}.obj");
+        let target_path = self.root_path.join(OBJECTS_DIR_NAME).join(&target_name);
+
+        let mut opts = OpenOptions::new();
+        opts.read(true).follow(FollowSymlinks::No);
+
+        match self.objects_dir.open_with(&target_name, &opts) {
+            Ok(file) => {
+                check_opened_file_security(&file, &target_path)?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(PublicationError::io(&target_path, e)),
+        }
+    }
+
+    /// Lists all immutable object IDs present in the store, bounded by `max_dir_entries`.
+    pub fn list_object_ids(&self) -> Result<Vec<String>, PublicationError> {
+        let mut object_ids = Vec::new();
+        let entries = self
+            .objects_dir
+            .entries()
+            .map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
+
+        for entry in entries {
+            if object_ids.len() >= self.limits.max_dir_entries {
+                return Err(PublicationError::ExcessiveDirectoryEntries {
+                    max_entries: self.limits.max_dir_entries,
+                });
+            }
+            let entry =
+                entry.map_err(|e| PublicationError::io(self.root_path.join(OBJECTS_DIR_NAME), e))?;
+            let name = entry.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(obj_id) = name_str.strip_suffix(".obj") {
+                if !name_str.starts_with('.') && validate_object_id(obj_id).is_ok() {
+                    object_ids.push(obj_id.to_string());
+                }
+            }
+        }
+        object_ids.sort();
+        Ok(object_ids)
+    }
+
+    // -------------------------------------------------------------------------
+    // Root Candidate Inspection
+    // -------------------------------------------------------------------------
+
+    /// Inspects dual root slots and returns all readable candidate envelopes without validation.
+    pub fn inspect_root_candidates(
+        &self,
+    ) -> Result<(Vec<RootSlotCandidate>, Vec<TornRootDiagnostic>), PublicationError> {
+        let mut candidates = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for slot in [RootSlot::SlotA, RootSlot::SlotB] {
+            let slot_filename = slot.filename();
+            let slot_path = self.root_path.join(ROOTS_DIR_NAME).join(slot_filename);
+
+            let mut opts = OpenOptions::new();
+            opts.read(true).follow(FollowSymlinks::No);
+
+            let file_result = self.roots_dir.open_with(slot_filename, &opts);
+            match file_result {
+                Ok(mut file) => {
+                    let security_check = check_opened_file_security(&file, &slot_path);
+                    let file_len = match security_check {
+                        Ok(len) => len,
+                        Err(e) => {
+                            diagnostics.push(TornRootDiagnostic {
+                                slot,
+                                generation: None,
+                                reason: format!("security validation failed: {e}"),
+                            });
+                            continue;
+                        }
+                    };
+
+                    if file_len > self.limits.max_root_manifest_bytes {
+                        diagnostics.push(TornRootDiagnostic {
+                            slot,
+                            generation: None,
+                            reason: format!(
+                                "slot file length {file_len} exceeds limit of {}",
+                                self.limits.max_root_manifest_bytes
+                            ),
+                        });
+                        continue;
+                    }
+
+                    let mut bytes = Vec::with_capacity(file_len as usize);
+                    if let Err(e) = file.read_to_end(&mut bytes) {
+                        diagnostics.push(TornRootDiagnostic {
+                            slot,
+                            generation: None,
+                            reason: format!("failed to read slot file: {e}"),
+                        });
+                        continue;
+                    }
+
+                    match decode_root_envelope(slot, &bytes, self.limits.max_root_manifest_bytes) {
+                        Ok(candidate) => candidates.push(candidate),
+                        Err(e) => diagnostics.push(TornRootDiagnostic {
+                            slot,
+                            generation: None,
+                            reason: format!("corrupt envelope: {e}"),
+                        }),
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Empty slot is normal and expected on initial runs
+                }
+                Err(e) => {
+                    diagnostics.push(TornRootDiagnostic {
+                        slot,
+                        generation: None,
+                        reason: format!("failed to open root slot: {e}"),
+                    });
+                }
+            }
+        }
+
+        Ok((candidates, diagnostics))
+    }
+
+    // -------------------------------------------------------------------------
+    // Dual Root Selection with Caller Verifier
+    // -------------------------------------------------------------------------
+
+    /// Evaluates candidate root slots using an independent caller-provided [`RootVerifier`].
+    ///
+    /// Returns the highest verified generation as `current` and the preceding verified generation
+    /// as `previous`. If the newest slot is torn or fails verification, the store automatically
+    /// falls back to the intact predecessor root.
+    pub fn select_verified_roots<V: RootVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<VerifiedRootSelection<V::Verified>, PublicationError> {
+        let (candidates, mut diagnostics) = self.inspect_root_candidates()?;
+
+        let mut verified_entries: Vec<(u64, RootSlot, V::Verified)> = Vec::new();
+
+        for candidate in &candidates {
+            match verifier.verify_root(candidate, self) {
+                Ok(verified) => {
+                    verified_entries.push((candidate.generation, candidate.slot, verified));
+                }
+                Err(e) => {
+                    diagnostics.push(TornRootDiagnostic {
+                        slot: candidate.slot,
+                        generation: Some(candidate.generation),
+                        reason: format!("independent verifier rejected candidate: {e}"),
+                    });
+                }
+            }
+        }
+
+        // Sort descending by generation
+        verified_entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let current = verified_entries.first().map(|e| e.2.clone());
+        let previous = verified_entries.get(1).map(|e| e.2.clone());
+
+        if diagnostics.len() > self.limits.max_error_records {
+            diagnostics.truncate(self.limits.max_error_records);
+        }
+
+        Ok(VerifiedRootSelection {
+            current,
+            previous,
+            torn_or_rejected: diagnostics,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Predecessor-Bound Root Publication
+    // -------------------------------------------------------------------------
+
+    /// Publishes a new generation root manifest into the inactive root slot.
+    ///
+    /// # Safety & Preconditions
+    /// 1. Validates that `request.generation` is strictly monotonic.
+    /// 2. If $N > 1$, requires an explicit [`PredecessorBinding`] and validates that the currently
+    ///    active verified root exactly matches the expected predecessor generation and manifest digest.
+    /// 3. Writes candidate into the inactive slot (protecting the active root from in-place corruption).
+    /// 4. Flushes the staging file (`sync_all`), renames into slot, and flushes directory.
+    /// 5. Validates the newly published root in-process via the caller's verifier before reporting success.
+    pub fn publish_generation_root<V: RootVerifier>(
+        &self,
+        request: &GenerationRootPublishRequest,
+        verifier: &V,
+    ) -> Result<GenerationPublicationReceipt, PublicationError> {
+        let manifest_len = request.manifest_bytes.len() as u64;
+        if manifest_len > self.limits.max_root_manifest_bytes {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: self.limits.max_root_manifest_bytes,
+                actual_bytes: manifest_len,
+            });
+        }
+
+        // 1. Acquire descriptor-bound cross-process publication lock covering inspect/CAS/verify/commit
+        let _publication_lock = self.acquire_publication_lock()?;
+
+        // 2. Re-inspect existing candidates and determine verified active root
+        //    (inside publication lock to avoid races with concurrent publishers)
+        let (candidates, _) = self.inspect_root_candidates()?;
+
+        let mut verified_candidates = Vec::new();
+        for candidate in &candidates {
+            if verifier.verify_root(candidate, self).is_ok() {
+                verified_candidates.push(candidate);
+            }
+        }
+        verified_candidates.sort_by(|a, b| b.generation.cmp(&a.generation));
+        let active_candidate = verified_candidates.first().copied();
+
+        // 3. Validate generation ordering and predecessor linkage
+        if request.generation <= 1 {
+            if request.predecessor.is_some() {
+                return Err(PublicationError::InitialGenerationWithPredecessor {
+                    generation: request.generation,
+                });
+            }
+            if let Some(active) = active_candidate {
+                return Err(PublicationError::NonMonotonicGeneration {
+                    candidate: request.generation,
+                    active: active.generation,
+                });
+            }
+        } else {
+            let Some(binding) = &request.predecessor else {
+                return Err(PublicationError::MissingPredecessorBinding {
+                    generation: request.generation,
+                });
+            };
+
+            let actual_active_tuple =
+                active_candidate.map(|c| (c.generation, c.manifest_sha256.clone()));
+
+            match active_candidate {
+                Some(active) => {
+                    if active.generation != binding.expected_generation
+                        || active.manifest_sha256 != binding.expected_hash
+                    {
+                        return Err(PublicationError::PredecessorMismatch {
+                            generation: request.generation,
+                            expected_gen: binding.expected_generation,
+                            expected_hash: binding.expected_hash.clone(),
+                            actual: actual_active_tuple,
+                        });
+                    }
+                    if request.generation <= active.generation {
+                        return Err(PublicationError::NonMonotonicGeneration {
+                            candidate: request.generation,
+                            active: active.generation,
+                        });
+                    }
+                }
+                None => {
+                    return Err(PublicationError::PredecessorMismatch {
+                        generation: request.generation,
+                        expected_gen: binding.expected_generation,
+                        expected_hash: binding.expected_hash.clone(),
+                        actual: None,
+                    });
+                }
+            }
+        }
+
+        // 4. Select the INACTIVE slot to publish to
+        let target_slot = match active_candidate {
+            Some(active) => active.slot.other(),
+            None => RootSlot::SlotA,
+        };
+
+        let manifest_sha256 = sha256_hex(&request.manifest_bytes);
+        let envelope_bytes = encode_root_envelope(request, &manifest_sha256)?;
+
+        // 5. Stage file in roots directory
+        let stage_name = generate_stage_name(&manifest_sha256[..8]);
+        let stage_path = self.root_path.join(ROOTS_DIR_NAME).join(&stage_name);
+
+        let mut stage_opts = OpenOptions::new();
+        stage_opts
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            stage_opts.mode(0o600);
+        }
+
+        let mut stage_file = self
+            .roots_dir
+            .open_with(&stage_name, &stage_opts)
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        stage_file
+            .write_all(&envelope_bytes)
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        stage_file
+            .sync_all()
+            .map_err(|e| PublicationError::io(&stage_path, e))?;
+
+        drop(stage_file);
+
+        // 6. VERIFY CANDIDATE + FULL OBJECT CLOSURE IN STAGING BEFORE REPLACING INACTIVE SELECTOR!
+        // If verification fails: do NOT rename! Both active and inactive slots are 100% preserved.
+        let staged_candidate = RootSlotCandidate {
+            slot: target_slot,
+            generation: request.generation,
+            publisher_id: request.publisher_id.clone(),
+            predecessor_generation: request.predecessor.as_ref().map(|p| p.expected_generation),
+            predecessor_hash: request.predecessor.as_ref().map(|p| p.expected_hash.clone()),
+            manifest_sha256: manifest_sha256.clone(),
+            manifest_bytes: request.manifest_bytes.clone(),
+            file_len: envelope_bytes.len() as u64,
+            created_at_ms: request.created_at_ms,
+        };
+
+        if let Err(e) = verifier.verify_root(&staged_candidate, self) {
+            return Err(PublicationError::VerificationRejected {
+                slot: target_slot,
+                generation: request.generation,
+                reason: format!("proposal failed caller verification in staging (both slots preserved): {e}"),
+            });
+        }
+
+        // 7. Atomic rename stage file into target slot
+        let target_filename = target_slot.filename();
+        let target_full_path = self.root_path.join(ROOTS_DIR_NAME).join(target_filename);
+
+        self.roots_dir
+            .rename(&stage_name, target_filename)
+            .map_err(|e| PublicationError::io(&target_full_path, e))?;
+
+        // 8. Fsync roots parent directory
+        let dir_sync_file = self
+            .roots_dir
+            .open(".")
+            .map_err(|e| PublicationError::io(self.root_path.join(ROOTS_DIR_NAME), e))?;
+        dir_sync_file
+            .sync_all()
+            .map_err(|e| PublicationError::io(self.root_path.join(ROOTS_DIR_NAME), e))?;
+
+        Ok(GenerationPublicationReceipt {
+            generation: request.generation,
+            publisher_id: request.publisher_id.clone(),
+            slot: target_slot,
+            sha256: manifest_sha256,
+            byte_len: envelope_bytes.len() as u64,
+            path: target_full_path,
+        })
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Trivial verifier that accepts all structurally valid candidates.
+    struct AcceptAllVerifier;
+    impl RootVerifier for AcceptAllVerifier {
+        type Error = std::io::Error;
+        type Verified = RootSlotCandidate;
+
+        fn verify_root(
+            &self,
+            candidate: &RootSlotCandidate,
+            _store: &SnapshotPublicationStore,
+        ) -> Result<Self::Verified, Self::Error> {
+            Ok(candidate.clone())
+        }
+    }
+
+    /// Verifier that requires specific objects to exist in the store.
+    struct ObjectRequiringVerifier {
+        required_objects: Vec<String>,
+    }
+    impl RootVerifier for ObjectRequiringVerifier {
+        type Error = std::io::Error;
+        type Verified = RootSlotCandidate;
+
+        fn verify_root(
+            &self,
+            candidate: &RootSlotCandidate,
+            store: &SnapshotPublicationStore,
+        ) -> Result<Self::Verified, Self::Error> {
+            for obj_id in &self.required_objects {
+                if store.read_object(obj_id).is_err() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("required object {obj_id} missing"),
+                    ));
+                }
+            }
+            Ok(candidate.clone())
+        }
+    }
+
+    #[test]
+    fn test_object_publish_and_read_roundtrip() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        let payload_bytes = b"encrypted-recovery-payload-bytes-12345".to_vec();
+        let sha = sha256_hex(&payload_bytes);
+        let obj = RecoveryObjectPayload {
+            object_id: "obj-001".to_string(),
+            expected_sha256: sha.clone(),
+            ciphertext_bytes: payload_bytes.clone(),
+        };
+
+        let receipt = store.publish_object(&obj).unwrap();
+        assert_eq!(receipt.object_id, "obj-001");
+        assert_eq!(receipt.sha256, sha);
+        assert!(!receipt.was_already_present);
+
+        let read_back = store.read_object("obj-001").unwrap();
+        assert_eq!(read_back, payload_bytes);
+    }
+
+    #[test]
+    fn test_object_publish_idempotent_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        let payload = b"identical-payload-for-adoption".to_vec();
+        let sha = sha256_hex(&payload);
+        let obj = RecoveryObjectPayload {
+            object_id: "idempotent-obj".to_string(),
+            expected_sha256: sha.clone(),
+            ciphertext_bytes: payload,
+        };
+
+        let r1 = store.publish_object(&obj).unwrap();
+        assert!(!r1.was_already_present);
+
+        let r2 = store.publish_object(&obj).unwrap();
+        assert!(r2.was_already_present);
+        assert_eq!(r1.sha256, r2.sha256);
+    }
+
+    #[test]
+    fn test_object_publish_conflict_rejected() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        let p1 = b"original-content".to_vec();
+        let obj1 = RecoveryObjectPayload {
+            object_id: "conflicting-obj".to_string(),
+            expected_sha256: sha256_hex(&p1),
+            ciphertext_bytes: p1,
+        };
+        store.publish_object(&obj1).unwrap();
+
+        let p2 = b"conflicting-content".to_vec();
+        let obj2 = RecoveryObjectPayload {
+            object_id: "conflicting-obj".to_string(),
+            expected_sha256: sha256_hex(&p2),
+            ciphertext_bytes: p2,
+        };
+        let err = store.publish_object(&obj2).unwrap_err();
+        match err {
+            PublicationError::ObjectConflict { object_id, .. } => {
+                assert_eq!(object_id, "conflicting-obj");
+            }
+            other => panic!("expected ObjectConflict, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_object_path_traversal_rejected() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        let obj = RecoveryObjectPayload {
+            object_id: "../escape".to_string(),
+            expected_sha256: sha256_hex(b"abc"),
+            ciphertext_bytes: b"abc".to_vec(),
+        };
+        assert!(matches!(
+            store.publish_object(&obj).unwrap_err(),
+            PublicationError::InvalidObjectId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_dual_slot_progression_and_selection() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // 1. Initial generation (gen 1) publishes to Slot A
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"manifest-gen-1".to_vec(),
+            created_at_ms: 1000,
+        };
+        let r1 = store.publish_generation_root(&req1, &verifier).unwrap();
+        assert_eq!(r1.generation, 1);
+        assert_eq!(r1.slot, RootSlot::SlotA);
+
+        let sel1 = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(sel1.current.as_ref().unwrap().generation, 1);
+        assert!(sel1.previous.is_none());
+
+        // 2. Next generation (gen 2) publishes to Slot B, alternating
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: r1.sha256.clone(),
+            }),
+            manifest_bytes: b"manifest-gen-2".to_vec(),
+            created_at_ms: 2000,
+        };
+        let r2 = store.publish_generation_root(&req2, &verifier).unwrap();
+        assert_eq!(r2.generation, 2);
+        assert_eq!(r2.slot, RootSlot::SlotB);
+
+        let sel2 = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(sel2.current.as_ref().unwrap().generation, 2);
+        assert_eq!(sel2.previous.as_ref().unwrap().generation, 1);
+
+        // 3. Next generation (gen 3) publishes back to Slot A
+        let req3 = GenerationRootPublishRequest {
+            generation: 3,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 2,
+                expected_hash: r2.sha256.clone(),
+            }),
+            manifest_bytes: b"manifest-gen-3".to_vec(),
+            created_at_ms: 3000,
+        };
+        let r3 = store.publish_generation_root(&req3, &verifier).unwrap();
+        assert_eq!(r3.generation, 3);
+        assert_eq!(r3.slot, RootSlot::SlotA);
+
+        let sel3 = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(sel3.current.as_ref().unwrap().generation, 3);
+        assert_eq!(sel3.previous.as_ref().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn test_predecessor_mismatch_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"manifest-gen-1".to_vec(),
+            created_at_ms: 1000,
+        };
+        store.publish_generation_root(&req1, &verifier).unwrap();
+
+        // Attempt gen 2 with wrong predecessor hash
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: "wrong-sha256-digest".to_string(),
+            }),
+            manifest_bytes: b"manifest-gen-2".to_vec(),
+            created_at_ms: 2000,
+        };
+        let err = store.publish_generation_root(&req2, &verifier).unwrap_err();
+        assert!(matches!(err, PublicationError::PredecessorMismatch { .. }));
+    }
+
+    #[test]
+    fn test_torn_newest_root_falls_back_to_intact_predecessor() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // Publish gen 1 into Slot A
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"manifest-gen-1".to_vec(),
+            created_at_ms: 1000,
+        };
+        store.publish_generation_root(&req1, &verifier).unwrap();
+
+        // Publish gen 2 into Slot B
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: sha256_hex(b"manifest-gen-1"),
+            }),
+            manifest_bytes: b"manifest-gen-2".to_vec(),
+            created_at_ms: 2000,
+        };
+        store.publish_generation_root(&req2, &verifier).unwrap();
+
+        // Simulate a torn / interrupted write in Slot B (overwrite with truncated junk)
+        let slot_b_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_B_NAME);
+        std::fs::write(&slot_b_path, b"FTRECROOTv1\0\0\0\0\0torn-partial-write").unwrap();
+
+        // Selection must safely reject Slot B and fall back to Slot A (Gen 1)
+        let sel = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(sel.current.as_ref().unwrap().generation, 1);
+        assert!(sel.previous.is_none());
+        assert!(!sel.torn_or_rejected.is_empty());
+        assert_eq!(sel.torn_or_rejected[0].slot, RootSlot::SlotB);
+
+        // Verify that the torn file was NOT deleted (no deletion policy)
+        assert!(slot_b_path.exists());
+    }
+
+    #[test]
+    fn test_verifier_rejection_falls_back_to_prior_generation() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        // Publish required object for Gen 1
+        let obj_payload = b"obj-data-for-gen1".to_vec();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: "required-obj-1".to_string(),
+                expected_sha256: sha256_hex(&obj_payload),
+                ciphertext_bytes: obj_payload,
+            })
+            .unwrap();
+
+        let v_accept = AcceptAllVerifier;
+        // Gen 1
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"manifest-gen-1".to_vec(),
+            created_at_ms: 1000,
+        };
+        store.publish_generation_root(&req1, &v_accept).unwrap();
+
+        // Gen 2 references missing object
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: sha256_hex(b"manifest-gen-1"),
+            }),
+            manifest_bytes: b"manifest-gen-2-needs-missing-obj".to_vec(),
+            created_at_ms: 2000,
+        };
+        store.publish_generation_root(&req2, &v_accept).unwrap();
+
+        // Now run selector with verifier that requires missing object
+        let strict_verifier = ObjectRequiringVerifier {
+            required_objects: vec!["missing-nonexistent-object".to_string()],
+        };
+
+        let sel = store.select_verified_roots(&strict_verifier).unwrap();
+        // Since missing object is not present, both roots fail verification
+        assert!(sel.current.is_none());
+        assert_eq!(sel.torn_or_rejected.len(), 2);
+    }
+
+    #[test]
+    fn test_has_object_and_list_objects() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        assert!(!store.has_object("obj-alpha").unwrap());
+
+        let p1 = b"alpha".to_vec();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: "obj-alpha".to_string(),
+                expected_sha256: sha256_hex(&p1),
+                ciphertext_bytes: p1,
+            })
+            .unwrap();
+
+        assert!(store.has_object("obj-alpha").unwrap());
+        assert!(!store.has_object("obj-beta").unwrap());
+
+        let p2 = b"beta".to_vec();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: "obj-beta".to_string(),
+                expected_sha256: sha256_hex(&p2),
+                ciphertext_bytes: p2,
+            })
+            .unwrap();
+
+        let list = store.list_object_ids().unwrap();
+        assert_eq!(list, vec!["obj-alpha".to_string(), "obj-beta".to_string()]);
+    }
+
+    #[test]
+    fn test_verifier_rejection_of_newest_falls_back_to_valid_predecessor() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+
+        // Publish object for Gen 1
+        let obj_payload = b"obj-data-for-gen1".to_vec();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: "obj-gen-1".to_string(),
+                expected_sha256: sha256_hex(&obj_payload),
+                ciphertext_bytes: obj_payload,
+            })
+            .unwrap();
+
+        let v_accept = AcceptAllVerifier;
+        // Gen 1
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"manifest-gen-1:obj-gen-1".to_vec(),
+            created_at_ms: 1000,
+        };
+        store.publish_generation_root(&req1, &v_accept).unwrap();
+
+        // Gen 2
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: sha256_hex(b"manifest-gen-1:obj-gen-1"),
+            }),
+            manifest_bytes: b"manifest-gen-2:missing-obj-2".to_vec(),
+            created_at_ms: 2000,
+        };
+        store.publish_generation_root(&req2, &v_accept).unwrap();
+
+        // Verifier checks manifest contents: parses "manifest-gen-X:<obj-id>" and checks if obj exists
+        struct ManifestObjectVerifier;
+        impl RootVerifier for ManifestObjectVerifier {
+            type Error = std::io::Error;
+            type Verified = u64;
+
+            fn verify_root(
+                &self,
+                candidate: &RootSlotCandidate,
+                store: &SnapshotPublicationStore,
+            ) -> Result<Self::Verified, Self::Error> {
+                let s = String::from_utf8_lossy(&candidate.manifest_bytes);
+                let parts: Vec<&str> = s.split(':').collect();
+                if parts.len() == 2 {
+                    let obj_id = parts[1];
+                    store.read_object(obj_id)?;
+                }
+                Ok(candidate.generation)
+            }
+        }
+
+        let sel = store.select_verified_roots(&ManifestObjectVerifier).unwrap();
+        // Gen 2 failed verification because missing-obj-2 was not found.
+        // Gen 1 succeeded because obj-gen-1 exists!
+        assert_eq!(sel.current, Some(1));
+        assert!(sel.previous.is_none());
+        assert_eq!(sel.torn_or_rejected.len(), 1);
+        assert_eq!(sel.torn_or_rejected[0].generation, Some(2));
+        assert_eq!(sel.torn_or_rejected[0].slot, RootSlot::SlotB);
+    }
+
+    #[test]
+    fn test_negative_no_half_published_root_accepted_and_last_good_never_overwritten() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // 1. Publish Gen 1 into Slot A
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "publisher-primary".to_string(),
+            predecessor: None,
+            manifest_bytes: b"clean-gen-1-content".to_vec(),
+            created_at_ms: 1000,
+        };
+        let r1 = store.publish_generation_root(&req1, &verifier).unwrap();
+        assert_eq!(r1.slot, RootSlot::SlotA);
+
+        let slot_a_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_A_NAME);
+        let slot_a_bytes_before = std::fs::read(&slot_a_path).unwrap();
+
+        // 2. Simulate an aborted / interrupted / half-published write into Slot B
+        // Write a truncated envelope missing the trailer SHA-256 and trailing payload bytes
+        let slot_b_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_B_NAME);
+        let mut half_written_envelope = Vec::new();
+        half_written_envelope.extend_from_slice(ENVELOPE_MAGIC);
+        half_written_envelope.extend_from_slice(&10u32.to_le_bytes()); // header len claims 10 bytes
+        half_written_envelope.extend_from_slice(b"incomplete"); // cut off before valid JSON & trailer
+        std::fs::write(&slot_b_path, &half_written_envelope).unwrap();
+
+        // Prove: half-published root in Slot B is NOT accepted as current or previous
+        let sel = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(
+            sel.current.as_ref().unwrap().generation,
+            1,
+            "intact Gen 1 must remain active current root"
+        );
+        assert!(sel.previous.is_none());
+        assert_eq!(sel.torn_or_rejected.len(), 1);
+        assert_eq!(sel.torn_or_rejected[0].slot, RootSlot::SlotB);
+
+        // Prove: last-good root (Slot A) was NEVER overwritten or altered
+        let slot_a_bytes_after = std::fs::read(&slot_a_path).unwrap();
+        assert_eq!(
+            slot_a_bytes_before, slot_a_bytes_after,
+            "last good root in Slot A must be bit-for-bit identical"
+        );
+
+        // Prove: incomplete / half-published file in Slot B is preserved on disk (no deletion)
+        assert!(
+            slot_b_path.exists(),
+            "torn/half-published slot must be preserved on disk for forensics"
+        );
+    }
+
+    #[test]
+    fn test_non_monotonic_generation_rejected() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        let req1 = GenerationRootPublishRequest {
+            generation: 5,
+            publisher_id: "pub-1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"gen-5".to_vec(),
+            created_at_ms: 1000,
+        };
+        store.publish_generation_root(&req1, &verifier).unwrap();
+
+        // Attempt publishing gen 4 (less than active 5)
+        let req_stale = GenerationRootPublishRequest {
+            generation: 4,
+            publisher_id: "pub-1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 5,
+                expected_hash: sha256_hex(b"gen-5"),
+            }),
+            manifest_bytes: b"gen-4".to_vec(),
+            created_at_ms: 2000,
+        };
+        let err = store.publish_generation_root(&req_stale, &verifier).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::NonMonotonicGeneration { candidate: 4, active: 5 }
+        ));
+    }
+
+    #[test]
+    fn test_missing_predecessor_binding_rejected() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // Gen 2 without predecessor binding
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "pub-1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"gen-2".to_vec(),
+            created_at_ms: 1000,
+        };
+        let err = store.publish_generation_root(&req2, &verifier).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::MissingPredecessorBinding { generation: 2 }
+        ));
+    }
+
+    #[test]
+    fn test_invalid_proposal_preserves_both_roots() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let v_accept = AcceptAllVerifier;
+
+        // 1. Publish Gen 1 into Slot A
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: None,
+            manifest_bytes: b"gen-1-valid-manifest".to_vec(),
+            created_at_ms: 1000,
+        };
+        let r1 = store.publish_generation_root(&req1, &v_accept).unwrap();
+        assert_eq!(r1.slot, RootSlot::SlotA);
+
+        // 2. Publish Gen 2 into Slot B
+        let req2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: r1.sha256.clone(),
+            }),
+            manifest_bytes: b"gen-2-valid-manifest".to_vec(),
+            created_at_ms: 2000,
+        };
+        let r2 = store.publish_generation_root(&req2, &v_accept).unwrap();
+        assert_eq!(r2.slot, RootSlot::SlotB);
+
+        // Snapshot bytes of both slots
+        let slot_a_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_A_NAME);
+        let slot_b_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_B_NAME);
+        let slot_a_bytes_before = std::fs::read(&slot_a_path).unwrap();
+        let slot_b_bytes_before = std::fs::read(&slot_b_path).unwrap();
+
+        // 3. Propose Gen 3 targeting inactive Slot A, but with a verifier that rejects it!
+        struct RejectingVerifier;
+        impl RootVerifier for RejectingVerifier {
+            type Error = std::io::Error;
+            type Verified = RootSlotCandidate;
+            fn verify_root(
+                &self,
+                candidate: &RootSlotCandidate,
+                _store: &SnapshotPublicationStore,
+            ) -> Result<Self::Verified, Self::Error> {
+                if candidate.generation == 3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "signature verification failed or missing object closure",
+                    ));
+                }
+                Ok(candidate.clone())
+            }
+        }
+
+        let req3 = GenerationRootPublishRequest {
+            generation: 3,
+            publisher_id: "host:pid:1".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 2,
+                expected_hash: r2.sha256.clone(),
+            }),
+            manifest_bytes: b"gen-3-invalid-payload".to_vec(),
+            created_at_ms: 3000,
+        };
+
+        let err = store.publish_generation_root(&req3, &RejectingVerifier).unwrap_err();
+        assert!(matches!(err, PublicationError::VerificationRejected { .. }));
+
+        // Prove: neither Slot A nor Slot B was modified! Both roots remain intact!
+        let slot_a_bytes_after = std::fs::read(&slot_a_path).unwrap();
+        let slot_b_bytes_after = std::fs::read(&slot_b_path).unwrap();
+        assert_eq!(
+            slot_a_bytes_before, slot_a_bytes_after,
+            "Slot A (valid fallback Gen 1) must not be clobbered by bad candidate"
+        );
+        assert_eq!(
+            slot_b_bytes_before, slot_b_bytes_after,
+            "Slot B (active Gen 2) must remain intact"
+        );
+
+        // Prove: reader still selects Gen 2 as current and Gen 1 as previous
+        let sel = store.select_verified_roots(&v_accept).unwrap();
+        assert_eq!(sel.current.as_ref().unwrap().generation, 2);
+        assert_eq!(sel.previous.as_ref().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn test_concurrent_publishers_and_lock_serialization() {
+        use std::sync::Arc;
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap());
+
+        // Concurrent object publication with identical content
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store_clone = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let p = b"concurrent-identical-payload".to_vec();
+                let obj = RecoveryObjectPayload {
+                    object_id: "shared-obj".to_string(),
+                    expected_sha256: sha256_hex(&p),
+                    ciphertext_bytes: p,
+                };
+                store_clone.publish_object(&obj)
+            }));
+        }
+
+        let mut already_present_count = 0;
+        let mut newly_published_count = 0;
+        for h in handles {
+            let receipt = h.join().unwrap().unwrap();
+            if receipt.was_already_present {
+                already_present_count += 1;
+            } else {
+                newly_published_count += 1;
+            }
+        }
+        assert_eq!(newly_published_count, 1, "exactly one publisher should create the object");
+        assert_eq!(already_present_count, 3, "other publishers should adopt idempotently");
+
+        let read_back = store.read_object("shared-obj").unwrap();
+        assert_eq!(read_back, b"concurrent-identical-payload");
+    }
+
+    #[test]
+    fn test_concurrent_publisher_double_advance_race_prevented() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let verifier = AcceptAllVerifier;
+
+        // Gen 1 published in Slot A
+        let req1 = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "pub-A".to_string(),
+            predecessor: None,
+            manifest_bytes: b"gen-1".to_vec(),
+            created_at_ms: 1000,
+        };
+        let r1 = store.publish_generation_root(&req1, &verifier).unwrap();
+
+        // Stale Publisher A prepares Gen 2 proposal based on Gen 1
+        let stale_req_gen2 = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "pub-A".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: r1.sha256.clone(),
+            }),
+            manifest_bytes: b"gen-2-from-stale-pub-A".to_vec(),
+            created_at_ms: 2000,
+        };
+
+        // Another Publisher B advances twice: Gen 2 (Slot B) then Gen 3 (Slot A)
+        let req2_b = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "pub-B".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: r1.sha256.clone(),
+            }),
+            manifest_bytes: b"gen-2-pub-B".to_vec(),
+            created_at_ms: 2000,
+        };
+        let r2_b = store.publish_generation_root(&req2_b, &verifier).unwrap();
+
+        let req3_b = GenerationRootPublishRequest {
+            generation: 3,
+            publisher_id: "pub-B".to_string(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 2,
+                expected_hash: r2_b.sha256.clone(),
+            }),
+            manifest_bytes: b"gen-3-pub-B".to_vec(),
+            created_at_ms: 3000,
+        };
+        store.publish_generation_root(&req3_b, &verifier).unwrap();
+
+        // Now active root is Gen 3 (Slot A), predecessor is Gen 2 (Slot B).
+        // Stale Publisher A now tries to publish stale_req_gen2:
+        // Inside publication lock, CAS / predecessor check detects active is Gen 3, NOT Gen 1!
+        let err = store.publish_generation_root(&stale_req_gen2, &verifier).unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::PredecessorMismatch { .. }
+                | PublicationError::NonMonotonicGeneration { .. }
+        ));
+
+        // Both Slot A (Gen 3) and Slot B (Gen 2) remain untouched!
+        let sel = store.select_verified_roots(&verifier).unwrap();
+        assert_eq!(sel.current.as_ref().unwrap().generation, 3);
+        assert_eq!(sel.previous.as_ref().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn test_symlink_root_rejected_without_following_or_mutating() {
+        let temp = TempDir::new().unwrap();
+        let target_dir = temp.path().join("real_target_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let symlink_path = temp.path().join("symlink_to_target");
+            std::os::unix::fs::symlink(&target_dir, &symlink_path).unwrap();
+
+            let err = SnapshotPublicationStore::open(&symlink_path, PublicationLimits::default()).unwrap_err();
+            assert!(matches!(err, PublicationError::InsecurePermissions { .. }));
+
+            // Prove: real target directory permissions were NOT modified (never chmod'd)
+            let meta = std::fs::metadata(&target_dir).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        }
+    }
+
+    #[test]
+    fn test_untrusted_permissions_rejected_without_chmod() {
+        let temp = TempDir::new().unwrap();
+        let untrusted_dir = temp.path().join("untrusted_dir");
+        std::fs::create_dir_all(&untrusted_dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&untrusted_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+            let err = SnapshotPublicationStore::open(&untrusted_dir, PublicationLimits::default()).unwrap_err();
+            assert!(matches!(err, PublicationError::InsecurePermissions { .. }));
+
+            // Prove: untrusted directory was NOT chmod'd to 0700; stays 0777
+            let meta = std::fs::metadata(&untrusted_dir).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o777);
+        }
+    }
+}
+
