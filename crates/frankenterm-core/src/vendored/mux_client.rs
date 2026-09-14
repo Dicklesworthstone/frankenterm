@@ -6546,10 +6546,16 @@ mod tests {
                 let mut buffered = StreamingPduBuffer::new();
                 'connection: loop {
                     let mut bytes = [0; 4096];
-                    let count = unix_stream_read(&mut stream, &mut bytes)
-                        .await
-                        .expect("read text request");
+                    let count = match unix_stream_read(&mut stream, &mut bytes).await {
+                        Ok(count) => count,
+                        Err(error) if is_disconnected_io_kind(error.kind()) => {
+                            assert!(buffered.is_empty(), "truncated text request on teardown");
+                            break;
+                        }
+                        Err(error) => panic!("read text request: {error}"),
+                    };
                     if count == 0 {
+                        assert!(buffered.is_empty(), "truncated text request on EOF");
                         break;
                     }
                     buffered.extend_from_slice(&bytes[..count]);
@@ -6592,10 +6598,14 @@ mod tests {
                                 .encode(&mut encoded, 0)
                                 .expect("encode following sideband");
                         }
-                        if stream.write_all(&encoded).await.is_err() {
-                            // Cancellation may retire the client before this
-                            // complete fixture response reaches its socket.
-                            break 'connection;
+                        match stream.write_all(&encoded).await {
+                            Ok(()) => {}
+                            Err(error) if is_disconnected_io_kind(error.kind()) => {
+                                // Cancellation may retire the client before
+                                // its complete fixture response reaches the socket.
+                                break 'connection;
+                            }
+                            Err(error) => panic!("write text response: {error}"),
                         }
                     }
                 }
@@ -16757,6 +16767,152 @@ mod tests {
         assert_eq!(format!("{delta:?}"), format!("{cloned:?}"));
     }
 
+    // Match push_pane_changes_with_observation: changed output has a serial-0
+    // delivery and a correlated observation of the same state. A correlated
+    // response alone is not a subscription output event.
+    fn encode_subscription_poll_fixture(response: &Pdu, serial: u64) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        if matches!(response, Pdu::GetPaneRenderChangesResponse(changes)
+            if !changes.dirty_lines.is_empty() || changes.bonus_lines.line_count() != 0)
+        {
+            response
+                .encode(&mut encoded, 0)
+                .expect("encode output delta");
+        }
+        response
+            .encode(&mut encoded, serial)
+            .expect("encode correlated observation");
+        encoded
+    }
+
+    #[test]
+    fn subscription_delivers_each_delta_once_when_observation_overtakes_bulk() {
+        for delayed_bulk in [false, true] {
+            run_async_test(async move {
+                const UPDATES: usize = 4;
+                let cx = crate::cx::for_testing();
+                let polls = Arc::new(AtomicUsize::new(0));
+                let seen_polls = Arc::clone(&polls);
+                let (_dir, path, server) = render_read_server(1, move |_, request| {
+                    let Pdu::GetPaneRenderChanges(request) = request else {
+                        panic!("unexpected subscription request {request:?}");
+                    };
+                    assert_eq!(request.pane_id, 9);
+                    let poll = seen_polls.fetch_add(1, Ordering::SeqCst);
+                    if poll == UPDATES + 2 {
+                        return (
+                            Vec::new(),
+                            Some(Pdu::LivenessResponse(LivenessResponse {
+                                pane_id: 9,
+                                is_alive: false,
+                            })),
+                            Vec::new(),
+                        );
+                    }
+                    assert!(poll < UPDATES + 2, "subscription retried a removed pane");
+                    let mut latest = test_render_change(9, 4, "delta-3");
+                    if poll == 0 {
+                        let deltas = (0..UPDATES)
+                            .map(|index| {
+                                // Same-source-sequence updates are distinct
+                                // deliveries, and a later source jump is not a gap.
+                                let seqno = if index < 2 { 1 } else { 4 };
+                                let mut delta =
+                                    test_render_change(9, seqno, &format!("delta-{index}"));
+                                delta.bonus_lines =
+                                    test_bonus_lines(&[&format!("output-{index} 界")]);
+                                Pdu::GetPaneRenderChangesResponse(delta)
+                            })
+                            .collect::<Vec<_>>();
+                        latest.bonus_lines = test_bonus_lines(&["output-3 界"]);
+                        let observation = Some(Pdu::GetPaneRenderChangesResponse(latest));
+                        if delayed_bulk {
+                            (Vec::new(), observation, deltas)
+                        } else {
+                            (deltas, observation, Vec::new())
+                        }
+                    } else {
+                        // Idle correlated observations must neither replay
+                        // their old content nor discard queued older deltas.
+                        latest.dirty_lines.clear();
+                        (
+                            Vec::new(),
+                            Some(Pdu::GetPaneRenderChangesResponse(latest)),
+                            Vec::new(),
+                        )
+                    }
+                })
+                .await;
+                let mut config = direct_mux_client_config(path);
+                config.max_pending_render_changes = UPDATES;
+                let client = DirectMuxClient::connect_with_cx(&cx, config).await.unwrap();
+                let mut subscription = subscribe_pane_output_with_inherited_cx(
+                    &cx,
+                    client,
+                    9,
+                    SubscriptionConfig {
+                        poll_interval: Duration::from_millis(10),
+                        min_poll_interval: Duration::from_millis(5),
+                        channel_capacity: UPDATES + 1,
+                    },
+                );
+                let mut delivered = Vec::new();
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        match subscription
+                            .next_with_cx(&cx)
+                            .await
+                            .expect("subscription event")
+                        {
+                            PaneDelta::Output {
+                                pane_id,
+                                seqno,
+                                delta_text,
+                                title,
+                                dirty_range_count,
+                                dirty_row_count,
+                            } => delivered.push((
+                                pane_id,
+                                seqno,
+                                delta_text,
+                                title,
+                                dirty_range_count,
+                                dirty_row_count,
+                            )),
+                            PaneDelta::Ended { pane_id, .. } => {
+                                assert_eq!(pane_id, 9);
+                                break;
+                            }
+                            other => panic!("unexpected subscription event {other:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("complete ordered delivery and terminal event");
+                assert_eq!(
+                    delivered,
+                    (0..UPDATES)
+                        .map(|index| (
+                            9,
+                            if index < 2 { 1 } else { 4 },
+                            format!("output-{index} 界"),
+                            format!("delta-{index}"),
+                            1,
+                            1,
+                        ))
+                        .collect::<Vec<_>>(),
+                    "each serial-0 delta must be delivered exactly once in wire order"
+                );
+                assert_eq!(polls.load(Ordering::SeqCst), UPDATES + 3);
+                subscription.shutdown().await;
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
     #[test]
     fn subscription_output_delta_reports_dirty_counts() {
         run_async_test(async {
@@ -16825,8 +16981,7 @@ mod tests {
                             }
                             _ => continue,
                         };
-                        let mut out = Vec::new();
-                        response.encode(&mut out, decoded.serial).expect("encode");
+                        let out = encode_subscription_poll_fixture(&response, decoded.serial);
                         stream.write_all(&out).await.expect("write");
                     }
                 }
@@ -16944,8 +17099,7 @@ mod tests {
                             }
                             _ => continue,
                         };
-                        let mut out = Vec::new();
-                        response.encode(&mut out, decoded.serial).expect("encode");
+                        let out = encode_subscription_poll_fixture(&response, decoded.serial);
                         stream.write_all(&out).await.expect("write");
                     }
                 }
@@ -17062,8 +17216,7 @@ mod tests {
                             }
                             _ => continue,
                         };
-                        let mut out = Vec::new();
-                        response.encode(&mut out, decoded.serial).expect("encode");
+                        let out = encode_subscription_poll_fixture(&response, decoded.serial);
                         stream.write_all(&out).await.expect("write");
                     }
                 }
@@ -17327,8 +17480,8 @@ mod tests {
                                         }
                                         _ => continue,
                                     };
-                                    let mut out = Vec::new();
-                                    response.encode(&mut out, decoded.serial).expect("encode");
+                                    let out =
+                                        encode_subscription_poll_fixture(&response, decoded.serial);
                                     stream.write_all(&out).await.expect("write");
                                 }
                             }
@@ -17472,8 +17625,7 @@ mod tests {
                             }
                             _ => continue,
                         };
-                        let mut out = Vec::new();
-                        response.encode(&mut out, decoded.serial).expect("encode");
+                        let out = encode_subscription_poll_fixture(&response, decoded.serial);
                         stream.write_all(&out).await.expect("write");
                     }
                 }
