@@ -29,6 +29,8 @@ std::thread_local! {
     static REFLOW_CURSOR_PREFIX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_ROW_PREFIX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_CACHED_RESERVED_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_RETAINED_SOURCE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_RETAINED_REPLAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn logical_len_exceeds_limit(current: usize, additional: usize, limit: usize) -> bool {
@@ -3041,13 +3043,12 @@ impl Screen {
     }
 
     #[cfg(feature = "use_serde")]
-    fn capture_stored_physical_layout(
+    fn admitted_stored_physical_layout(
         &self,
         sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
         interval: &crate::config::ScrollbackInterval,
         frontier: StableRowIndex,
-        budget: &mut LineReadCaptureBudget,
-    ) -> Option<Arc<ColdVisualLayout>> {
+    ) -> Option<&StoredPhysicalLayout> {
         let stored = self.stored_physical_layout.as_ref()?;
         let retained = interval.rows()?;
         if self.cold_row_fragments.is_some()
@@ -3062,6 +3063,19 @@ impl Screen {
         {
             return None;
         }
+        Some(stored)
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn capture_stored_physical_layout(
+        &self,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: &crate::config::ScrollbackInterval,
+        frontier: StableRowIndex,
+        budget: &mut LineReadCaptureBudget,
+    ) -> Option<Arc<ColdVisualLayout>> {
+        let stored = self.admitted_stored_physical_layout(sink, interval, frontier)?;
+        let retained = interval.rows()?;
         if let Some(layout) = self.cold_visual_layout.as_ref().filter(|layout| {
             layout.stored_physical()
                 && layout.source == (retained.start..frontier)
@@ -3116,14 +3130,40 @@ impl Screen {
             return false;
         }
         if read.first < read.resident_first || read.layout.is_some() {
+            if read.layout.as_ref().is_some_and(|layout| {
+                matches!(
+                    layout.kind,
+                    ColdVisualLayoutKind::StoredPhysical { open_tail: true }
+                ) && layout.resident_frontier < self.phys_to_stable_row_index(0)
+                    && read
+                        .cold_context
+                        .as_ref()
+                        .is_some_and(|context| context.end == layout.source.end)
+            }) {
+                // The old bytes are retained, but this cached logical context
+                // ended at an open seam. Newly spilled rows may continue or
+                // close that same logical group; never certify its old end.
+                return false;
+            }
             if read.layout_seqno != self.cold_visual_seqno {
                 // Another worker may have published while this read was in
                 // flight. Identical or prefix-extending mappings are safe;
                 // shifted coordinates must never roll the live map backwards.
+                // An old physical layout still identifies closed prefix rows
+                // even when its open tail is no longer current. The check
+                // above rejects that tail, and source retention is checked
+                // below before the cached bytes can be reused.
+                let current = self.current_cold_visual_layout().or_else(|| {
+                    self.cold_visual_layout.as_deref().filter(|layout| {
+                        layout.stored_physical()
+                            && self.matches_coordinate_witness(&layout.witness)
+                            && layout.resident_frontier <= self.phys_to_stable_row_index(0)
+                    })
+                });
                 let compatible = read
                     .layout
                     .as_ref()
-                    .zip(self.current_cold_visual_layout())
+                    .zip(current)
                     .is_some_and(|(before, now)| {
                         std::ptr::eq(before.as_ref(), now)
                             || before.extends(now)
@@ -3264,36 +3304,70 @@ impl Screen {
         &self,
         requested: Range<StableRowIndex>,
     ) -> Range<StableRowIndex> {
-        let Some(layout) = self.current_cold_visual_layout() else {
-            return requested;
-        };
         if requested.start >= requested.end {
             return requested;
         }
-        let first = layout
-            .groups
-            .partition_point(|(_, visual)| visual.end <= requested.start);
-        let end = layout
-            .groups
-            .partition_point(|(_, visual)| visual.start < requested.end);
-        if first >= end {
-            return requested;
-        }
-        let start = layout.groups[first].1.start.min(requested.start);
-        let mut stop = layout.groups[end - 1].1.end.max(requested.end);
-        if matches!(
-            layout.kind,
-            ColdVisualLayoutKind::StoredPhysical { open_tail: true }
-        ) && end == layout.groups.len()
-            && layout.resident_frontier == self.phys_to_stable_row_index(0)
-        {
+        let frontier = self.phys_to_stable_row_index(0);
+        let admitted = self.config.scrollback_spill_sink().and_then(|sink| {
+            let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+                sink.try_capture_scrollback_interval()
+            else {
+                return None;
+            };
+            let retained = interval.rows()?;
+            self.admitted_stored_physical_layout(&sink, &interval, frontier)
+                .map(|stored| (stored, retained))
+        });
+        let (start, mut stop, open_tail) = if let Some((stored, retained)) = admitted {
+            // The published layout can lag ordinary append. Consult the
+            // atomically admitted groups without copying or decoding them so
+            // a formerly resident continuation is included after it spills.
+            let first = stored
+                .groups
+                .partition_point(|source| source.end <= requested.start.max(retained.start));
+            let end = stored
+                .groups
+                .partition_point(|source| source.start < requested.end);
+            if first >= end {
+                return requested;
+            }
+            (
+                stored.groups[first]
+                    .start
+                    .max(retained.start)
+                    .min(requested.start),
+                stored.groups[end - 1].end.max(requested.end),
+                stored.open_tail && end == stored.groups.len(),
+            )
+        } else {
+            let Some(layout) = self.current_cold_visual_layout() else {
+                return requested;
+            };
+            let first = layout
+                .groups
+                .partition_point(|(_, visual)| visual.end <= requested.start);
+            let end = layout
+                .groups
+                .partition_point(|(_, visual)| visual.start < requested.end);
+            if first >= end {
+                return requested;
+            }
+            (
+                layout.groups[first].1.start.min(requested.start),
+                layout.groups[end - 1].1.end.max(requested.end),
+                matches!(
+                    layout.kind,
+                    ColdVisualLayoutKind::StoredPhysical { open_tail: true }
+                ) && end == layout.groups.len()
+                    && layout.resident_frontier == frontier,
+            )
+        };
+        if open_tail {
             // The spill frontier may split a logical group. Its resident tail
             // is already decoded; inspect only bounded wrap bits, never reflow
             // or cold IO under the terminal lock.
             for (offset, line) in self.lines.iter().enumerate().take(ScreenLineRead::MAX_ROWS) {
-                let row_end = layout
-                    .resident_frontier
-                    .saturating_add(offset as StableRowIndex + 1);
+                let row_end = frontier.saturating_add(offset as StableRowIndex + 1);
                 if row_end.saturating_sub(start) as usize > ScreenLineRead::MAX_ROWS {
                     break;
                 }
@@ -3309,8 +3383,13 @@ impl Screen {
     #[cfg(feature = "use_serde")]
     fn current_cold_visual_layout(&self) -> Option<&ColdVisualLayout> {
         let layout = self.cold_visual_layout.as_deref()?;
+        let frontier = self.phys_to_stable_row_index(0);
         if !self.matches_coordinate_witness(&layout.witness)
-            || layout.resident_frontier > self.phys_to_stable_row_index(0)
+            || layout.resident_frontier > frontier
+            || (matches!(
+                layout.kind,
+                ColdVisualLayoutKind::StoredPhysical { open_tail: true }
+            ) && layout.resident_frontier < frontier)
         {
             return None;
         }
@@ -4521,16 +4600,34 @@ impl Screen {
         }
 
         if let Some(retained) = logical_line.retained_wrap_source() {
+            let mut initialized_for_request = false;
             let source = retained.get_or_init(|| {
-                line.clone()
+                #[cfg(test)]
+                REFLOW_RETAINED_SOURCE_BUILDS.with(|count| count.set(count.get() + 1));
+                let layout = line
+                    .clone()
                     .plan_wrap_with_width_prefix_scratch(
                         physical_cols,
                         policy.kp_cost_model,
                         width_prefix_scratch,
                     )
-                    .retain_width_prefix()
+                    .retain_width_prefix();
+                initialized_for_request = true;
+                layout
             });
-            let layout = source.replan(physical_cols, policy.kp_cost_model, width_prefix_scratch);
+            // Only the caller whose initializer ran knows that this layout
+            // already matches its width and cost policy. A concurrent caller
+            // that waited for the same source must still plan its own request.
+            let replanned;
+            let layout = if initialized_for_request {
+                source
+            } else {
+                #[cfg(test)]
+                REFLOW_RETAINED_REPLAN_CALLS.with(|count| count.set(count.get() + 1));
+                replanned =
+                    source.replan(physical_cols, policy.kp_cost_model, width_prefix_scratch);
+                &replanned
+            };
             let scorecard = policy.scorecard_enabled.then(|| layout.scorecard());
             return (
                 RewrapScratch::Lines(layout.deferred_rows(0..layout.row_count(), seqno)),
@@ -9130,6 +9227,138 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn stored_physical_spilled_open_tail_refreshes_logical_context() {
+        let (mut screen, sink) = stored_physical_fixture(8, 32);
+        let closed_prefix = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let truncated = screen
+            .capture_line_read(6..8)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        screen.install_line_read_layout(&truncated, 2);
+        assert_eq!(screen.expand_cold_logical_range(7..8), 6..9);
+        let tail = screen.lines.pop_front().unwrap();
+        assert!(!tail.last_cell_was_wrapped());
+        assert!(screen.record_scrollback_spill(8, &tail, 3));
+        screen.advance_stable_row_index_offset(1);
+        screen.lines.push_back(Line::new(3));
+        assert!(screen.current_cold_visual_layout().is_none());
+        assert_eq!(screen.expand_cold_logical_range(7..8), 6..9);
+        assert!(!screen.validates_line_read(&truncated));
+        assert!(screen.validates_line_read(&closed_prefix));
+
+        let expected: Vec<_> = (6..9)
+            .map(|row| sink.load_scrollback_line(row).unwrap())
+            .collect();
+        let replacement = screen
+            .capture_line_read(screen.expand_cold_logical_range(7..8))
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(replacement.cold_context, Some(6..9));
+        assert_eq!(replacement.cached_lines(6..9).unwrap().1, expected);
+        assert!(screen.validates_line_read(&replacement));
+        screen.install_line_read_layout(&replacement, 3);
+        assert!(screen.validates_line_read(&closed_prefix));
+        assert!(!screen.validates_line_read(&truncated));
+        assert_eq!(screen.expand_cold_logical_range(7..8), 6..9);
+        let raw = screen
+            .capture_line_read(7..8)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(raw.lines().cloned().collect::<Vec<_>>(), expected[1..2]);
+        assert!(screen.validates_line_read(&raw));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_spilled_continuation_still_includes_the_resident_tail() {
+        let (mut screen, _) = stored_physical_fixture(8, 32);
+        screen.lines[0].set_last_cell_was_wrapped(true, 1);
+        screen.lines[1] = Line::from_text("logical end", &CellAttributes::blank(), 1, None);
+        let truncated = screen
+            .capture_line_read(6..8)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        screen.install_line_read_layout(&truncated, 2);
+        assert_eq!(screen.expand_cold_logical_range(7..8), 6..10);
+        let continuation = screen.lines.pop_front().unwrap();
+        assert!(screen.record_scrollback_spill(8, &continuation, 3));
+        screen.advance_stable_row_index_offset(1);
+        screen.lines.push_back(Line::new(3));
+        assert_eq!(screen.expand_cold_logical_range(7..8), 6..10);
+        assert!(!screen.validates_line_read(&truncated));
+        let replacement = screen
+            .capture_line_read(6..10)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&replacement));
+        assert_eq!(replacement.row_count(), 4);
+        assert_eq!(replacement.lines().last().unwrap().as_str(), "logical end");
+        screen.lines[0] = Line::from_text("changed end", &CellAttributes::blank(), 1, None);
+        assert!(!screen.validates_line_read(&replacement));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_closed_group_stays_valid_when_a_new_group_spills() {
+        let (mut screen, _) = stored_physical_fixture(6, 32);
+        let closed = screen
+            .capture_line_read(3..6)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        screen.install_line_read_layout(&closed, 2);
+        let mut new_group = screen.lines.pop_front().unwrap();
+        new_group.set_last_cell_was_wrapped(true, 3);
+        assert!(screen.record_scrollback_spill(6, &new_group, 3));
+        screen.advance_stable_row_index_offset(1);
+        screen.lines.push_back(Line::new(3));
+        assert!(screen.validates_line_read(&closed));
+        assert_eq!(screen.expand_cold_logical_range(4..5), 3..6);
+        assert_eq!(screen.expand_cold_logical_range(6..7), 6..8);
+        assert!(screen
+            .capture_line_read(6..8)
+            .unwrap()
+            .hydrate_with_payload_limit(1, || false)
+            .is_err());
+        assert!(screen
+            .capture_line_read(6..8)
+            .unwrap()
+            .hydrate(|| true)
+            .is_err());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_unwitnessed_tail_cannot_reuse_an_old_open_layout() {
+        let (mut screen, sink) = stored_physical_fixture(8, 32);
+        let old = screen
+            .capture_line_read(6..8)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        screen.install_line_read_layout(&old, 2);
+        sink.omit_admission_receipt.store(true, Ordering::Relaxed);
+        let tail = screen.lines.pop_front().unwrap();
+        assert!(screen.record_scrollback_spill(8, &tail, 3));
+        screen.advance_stable_row_index_offset(1);
+        screen.lines.push_back(Line::new(3));
+        assert!(screen.stored_physical_layout.is_none());
+        assert!(screen.current_cold_visual_layout().is_none());
+        assert!(!screen.validates_line_read(&old));
+        assert!(screen.capture_line_read(7..8).unwrap().layout.is_none());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn stored_physical_geometry_aba_and_configuration_invalidate_admission_metadata() {
         for size in [
             test_size(4, 21, 96),
@@ -9848,20 +10077,36 @@ pub(crate) mod tests {
         let snapshot = logical.clone();
         let physical = VecDeque::new();
         let mut scratch = LineWrapWidthPrefixScratch::default();
-        for cols in [8, 13, 5, 21] {
+        for (request, cols) in [8, 8, 13, 5, 21].iter().copied().enumerate() {
+            let seqno = 2 + request as SequenceNo;
+            let mut policy = screen.resize_wrap_policy;
+            policy.scorecard_enabled = request != 4;
+            policy.kp_cost_model.badness_scale += request as u64 * 997;
+            let builds_before = REFLOW_RETAINED_SOURCE_BUILDS.with(|count| count.get());
+            let replans_before = REFLOW_RETAINED_REPLAN_CALLS.with(|count| count.get());
             let (actual, scorecard) = Screen::wrap_logical_line_source_for_resize(
                 &snapshot,
                 &physical,
                 cols,
-                2,
-                screen.resize_wrap_policy,
+                seqno,
+                policy,
                 &mut scratch,
+            );
+            assert_eq!(
+                REFLOW_RETAINED_SOURCE_BUILDS.with(|count| count.get()) - builds_before,
+                usize::from(request == 0),
+                "only the first request extracts the retained source"
+            );
+            assert_eq!(
+                REFLOW_RETAINED_REPLAN_CALLS.with(|count| count.get()) - replans_before,
+                usize::from(request != 0),
+                "the initializing request must consume its existing plan"
             );
             let (expected, expected_scorecard) = Screen::wrap_single_logical_line_for_resize(
                 logical.line.clone(),
                 cols,
-                2,
-                screen.resize_wrap_policy,
+                seqno,
+                policy,
                 &mut scratch,
             );
             let RewrapScratch::Lines(actual) = actual else {
@@ -9869,12 +10114,78 @@ pub(crate) mod tests {
             };
             assert_eq!(actual, expected);
             assert_eq!(scorecard, expected_scorecard);
+            assert_eq!(scorecard.is_some(), policy.scorecard_enabled);
+            assert!(actual.iter().all(|line| line.current_seqno() == seqno));
             assert!(logical.wrap_source.as_ref().unwrap().get().is_some());
             assert!(std::ptr::eq(
                 logical.wrap_source.as_ref().unwrap().get().unwrap(),
                 snapshot.wrap_source.as_ref().unwrap().get().unwrap(),
             ));
         }
+    }
+
+    #[test]
+    fn retained_wrap_concurrent_requests_plan_once_each_for_their_own_policy() {
+        let logical = CachedLogicalLine {
+            line: Line::from_text(
+                &"界面 e\u{301} ffi => 🚀 ".repeat(64),
+                &CellAttributes::blank(),
+                1,
+                None,
+            ),
+            wrap_source: Some(Arc::new(std::sync::OnceLock::new())),
+        };
+        let mut tuned_policy = ResizeWrapPolicy::default();
+        tuned_policy.kp_cost_model.badness_scale = 42_000;
+        tuned_policy.kp_cost_model.forced_break_penalty = 7_500;
+        tuned_policy.kp_cost_model.lookahead_limit = 24;
+        tuned_policy.kp_cost_model.max_dp_states = 2_048;
+        let requests = [(8, 7, ResizeWrapPolicy::default()), (13, 11, tuned_policy)];
+        let start = std::sync::Barrier::new(requests.len());
+        let counts = std::thread::scope(|scope| {
+            let workers = requests.map(|(cols, seqno, policy)| {
+                let logical = &logical;
+                let start = &start;
+                scope.spawn(move || {
+                    let builds_before = REFLOW_RETAINED_SOURCE_BUILDS.with(|count| count.get());
+                    let replans_before = REFLOW_RETAINED_REPLAN_CALLS.with(|count| count.get());
+                    let mut scratch = LineWrapWidthPrefixScratch::default();
+                    start.wait();
+                    let (actual, scorecard) = Screen::wrap_logical_line_source_for_resize(
+                        logical,
+                        &VecDeque::new(),
+                        cols,
+                        seqno,
+                        policy,
+                        &mut scratch,
+                    );
+                    let builds =
+                        REFLOW_RETAINED_SOURCE_BUILDS.with(|count| count.get()) - builds_before;
+                    let replans =
+                        REFLOW_RETAINED_REPLAN_CALLS.with(|count| count.get()) - replans_before;
+                    let (expected, expected_scorecard) =
+                        Screen::wrap_single_logical_line_for_resize(
+                            logical.line.clone(),
+                            cols,
+                            seqno,
+                            policy,
+                            &mut scratch,
+                        );
+                    let RewrapScratch::Lines(actual) = actual else {
+                        panic!("expected wrapped rows")
+                    };
+                    assert_eq!(actual, expected);
+                    assert_eq!(scorecard, expected_scorecard);
+                    assert!(actual.iter().all(|line| line.current_seqno() == seqno));
+                    assert_eq!(builds + replans, 1, "one plan per caller");
+                    (builds, replans)
+                })
+            });
+            workers.map(|worker| worker.join().expect("retained wrap request must complete"))
+        });
+        assert_eq!(counts.iter().map(|(builds, _)| builds).sum::<usize>(), 1);
+        assert_eq!(counts.iter().map(|(_, replans)| replans).sum::<usize>(), 1);
+        assert!(logical.wrap_source.as_ref().unwrap().get().is_some());
     }
 
     #[test]
