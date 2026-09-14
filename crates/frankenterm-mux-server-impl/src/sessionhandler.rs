@@ -5,6 +5,8 @@ use crate::dispatch::EstablishedOrderedWindowAuthority;
 use crate::dispatch::established_ordered_window_authority_for_test;
 use anyhow::{Context, anyhow};
 use codec::GetLinesAtLayout;
+#[cfg(test)]
+use codec::ReliablePaneWriteV1;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CoherentPaneSnapshot, CreateFloatingPane,
     CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
@@ -17,7 +19,7 @@ use codec::{
     ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
     MovePaneToNewTab, MovePaneToNewTabResponse, MuxErrorCode, MuxErrorEffect, MuxErrorObject,
     MuxErrorObjectKind, MuxErrorRetry, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
-    PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, PduWireRole, Ping, Pong,
+    PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, PduWireIdent, PduWireRole, Ping, Pong,
     ReliableInputSchedulerPressureV1, ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1,
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventTracedV1,
     ReliableKeyEventV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
@@ -30,8 +32,6 @@ use codec::{
     ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
-#[cfg(test)]
-use codec::{PduWireIdent, ReliablePaneWriteV1};
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
     RecorderEpochId, RecorderMode, RecorderSamplerAlgorithm, RecorderSamplerConfigV1,
     SampledTraceContextV1,
