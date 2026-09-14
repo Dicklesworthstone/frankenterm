@@ -56,6 +56,7 @@ pub struct WholeMuxPublicationIdentity {
     pub mux_incarnation_id: String,
     pub root_object_id: [u8; 32],
     pub publisher_id: String,
+    pub ft_version: String,
     /// Ciphertext root identity used by the publication store's compare-and-swap.
     pub predecessor: Option<crate::snapshot_publication::PredecessorBinding>,
     /// Semantic image digest, distinct from the predecessor ciphertext hash.
@@ -67,9 +68,9 @@ pub struct WholeMuxPublicationIdentity {
 /// prepared publication requires retaining its exact ciphertext bytes.
 #[cfg(feature = "frankenterm-deps")]
 pub struct WholeMuxPanePublication<'a> {
-    pub pane_uuid: &'a str,
+    pub pane_id: usize,
     pub object_id: &'a str,
-    pub checkpoint: &'a frankenterm_term::RecoveryTerminalCheckpointV2,
+    pub ack: &'a mux::ModelParserCheckpointAck,
 }
 
 /// Publish a complete encrypted model-only recovery generation.
@@ -84,12 +85,14 @@ pub struct WholeMuxPanePublication<'a> {
 pub fn publish_whole_mux_recovery(
     cx: &crate::cx::Cx,
     store: &crate::snapshot_publication::SnapshotPublicationStore,
-    mut image: crate::mux_recovery_image::MuxRecoveryImage,
+    captured: &mux::MuxCapturedTopology,
     checkpoints: &[WholeMuxPanePublication<'_>],
     key: Arc<crate::snapshot_representation::RecoveryKey>,
     expected: &WholeMuxPublicationIdentity,
 ) -> anyhow::Result<crate::snapshot_publication::GenerationPublicationReceipt> {
-    use crate::mux_recovery_image::{CheckpointAuthority, RecoveryObjectRef};
+    use crate::mux_recovery_image::{
+        MuxRecoveryImage, RecoveryImageGenerationMeta, RecoveryObjectRef,
+    };
     use crate::session_restore::{
         WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig, semantic_object_id_from_str,
     };
@@ -106,10 +109,7 @@ pub fn publish_whole_mux_recovery(
 
     snapshot_cx_checkpoint(cx)?;
     anyhow::ensure!(
-        image.header.generation == expected.generation
-            && image.header.session_id == expected.session_id
-            && image.header.mux_incarnation_id == expected.mux_incarnation_id
-            && image.header.predecessor_digest == expected.predecessor_image_digest,
+        hex::encode(captured.session_incarnation.as_bytes()) == expected.mux_incarnation_id,
         "whole-mux publication identity mismatch"
     );
     anyhow::ensure!(
@@ -120,22 +120,23 @@ pub fn publish_whole_mux_recovery(
                 .is_none_or(|p| p.expected_generation < expected.generation),
         "whole-mux publication predecessor mismatch"
     );
-    image.validate()?;
     let trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
         .with_session_id(expected.session_id.clone())
         .with_mux_incarnation_id(expected.mux_incarnation_id.clone());
     let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), trusted);
     anyhow::ensure!(
-        checkpoints.len() == image.panes.len() && checkpoints.len() <= verifier.limits().max_panes,
+        checkpoints.len() == captured.pane_bindings.len()
+            && checkpoints.len() <= verifier.limits().max_panes,
         "whole-mux checkpoint set mismatch or limit exceeded"
     );
-    let mut by_uuid = HashMap::new();
+    let mut by_pane = HashMap::new();
+    let mut acks = HashMap::new();
     let mut object_ids = HashSet::new();
     let mut total_bytes = 0usize;
     for input in checkpoints {
         snapshot_cx_checkpoint(cx)?;
         anyhow::ensure!(
-            by_uuid.insert(input.pane_uuid, input).is_none()
+            by_pane.insert(input.pane_id, input).is_none()
                 && object_ids.insert(input.object_id)
                 && !input.object_id.is_empty()
                 && input.object_id.len() <= 255,
@@ -145,7 +146,7 @@ pub fn publish_whole_mux_recovery(
             !store.has_object(input.object_id)?,
             "new whole-mux encryption attempt requires an unused object name"
         );
-        let payload = input.checkpoint.canonical_payload();
+        let payload = input.ack.terminal_checkpoint.canonical_payload();
         total_bytes = total_bytes
             .checked_add(payload.len())
             .ok_or_else(|| anyhow::anyhow!("whole-mux checkpoint size overflow"))?;
@@ -155,57 +156,79 @@ pub fn publish_whole_mux_recovery(
             "whole-mux checkpoint byte limit exceeded"
         );
         TerminalCheckpointV2::decode_canonical_json(payload, TerminalCheckpointLimits::default())?;
+        acks.insert(input.pane_id, input.ack);
     }
     // Complete identity preflight before the first immutable-object write.
-    for pane in &image.panes {
-        let input = by_uuid
-            .get(pane.pane_uuid.as_str())
+    for pane in &captured.pane_bindings {
+        let input = by_pane
+            .get(&pane.pane_id)
             .ok_or_else(|| anyhow::anyhow!("missing whole-mux checkpoint"))?;
         anyhow::ensure!(
-            matches!(
-                pane.checkpoint.authority,
-                CheckpointAuthority::ModelOnly { .. }
-            ) && pane.size.rows == input.checkpoint.rows()
-                && pane.size.cols == input.checkpoint.cols()
-                && pane.checkpoint.parser_capture.watermark_bytes
-                    == input.checkpoint.parser_stream_bytes(),
+            pane.pane_uuid == input.ack.durable_pane_id.to_string()
+                && pane.registration_wire_identity == input.ack.registration_wire_identity
+                && input.ack.registration_wire_identity != [0; 16]
+                && pane.size.rows == input.ack.terminal_checkpoint.rows()
+                && pane.size.cols == input.ack.terminal_checkpoint.cols()
+                && input.ack.parser_stream_bytes
+                    == input.ack.terminal_checkpoint.parser_stream_bytes(),
             "whole-mux checkpoint capture binding mismatch"
         );
     }
-    for pane in &mut image.panes {
+    let mut prepared_objects = Vec::new();
+    let mut refs = HashMap::new();
+    let mut encrypted_bytes = 0usize;
+    for input in checkpoints {
         snapshot_cx_checkpoint(cx)?;
-        let input = by_uuid
-            .get(pane.pane_uuid.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing whole-mux checkpoint"))?;
         let envelope = encode_recovery_object(
-            input.checkpoint.canonical_payload(),
+            input.ack.terminal_checkpoint.canonical_payload(),
             ObjectMetadata::single(
                 semantic_object_id_from_str(input.object_id),
                 RecoveryObjectKind::TerminalCheckpoint,
                 expected.generation,
                 None,
-                image.header.created_at_epoch_ms,
+                captured.captured_at_epoch_ms,
             ),
             &key,
             None,
         )?
         .to_bytes()?;
         let payload_digest = representation_id_from_envelope_bytes(&envelope);
-        snapshot_cx_checkpoint(cx)?;
-        let receipt = store.publish_object(&RecoveryObjectPayload {
+        encrypted_bytes = encrypted_bytes
+            .checked_add(envelope.len())
+            .ok_or_else(|| anyhow::anyhow!("whole-mux encrypted byte size overflow"))?;
+        anyhow::ensure!(
+            envelope.len() as u64 <= store.limits().max_object_bytes
+                && encrypted_bytes <= verifier.limits().max_total_checkpoint_bytes,
+            "whole-mux encrypted byte limit exceeded"
+        );
+        refs.insert(
+            input.pane_id,
+            RecoveryObjectRef {
+                object_id: input.object_id.to_owned(),
+                byte_length: envelope.len() as u64,
+                payload_digest,
+                schema_version: TERMINAL_CHECKPOINT_VERSION,
+            },
+        );
+        prepared_objects.push(RecoveryObjectPayload {
             object_id: input.object_id.to_owned(),
             expected_sha256: sha256_hex(&envelope),
             ciphertext_bytes: envelope,
-        })?;
-        pane.checkpoint.checkpoint_ref = RecoveryObjectRef {
-            object_id: receipt.object_id,
-            byte_length: receipt.byte_len,
-            payload_digest,
-            schema_version: TERMINAL_CHECKPOINT_VERSION,
-        };
+        });
     }
     snapshot_cx_checkpoint(cx)?;
-    image.image_digest = image.compute_digest()?;
+    let image = MuxRecoveryImage::from_mux_captured(
+        RecoveryImageGenerationMeta {
+            generation: expected.generation,
+            predecessor_digest: expected.predecessor_image_digest,
+            created_at_epoch_ms: captured.captured_at_epoch_ms,
+            ft_version: expected.ft_version.clone(),
+            session_id: expected.session_id.clone(),
+        },
+        captured,
+        &acks,
+        &refs,
+    )?;
     let plaintext = zeroize::Zeroizing::new(image.to_canonical_json()?);
     let manifest_bytes = encode_recovery_object(
         &plaintext,
@@ -220,6 +243,14 @@ pub fn publish_whole_mux_recovery(
         None,
     )?
     .to_bytes()?;
+    anyhow::ensure!(
+        manifest_bytes.len() as u64 <= store.limits().max_root_manifest_bytes,
+        "whole-mux root envelope byte limit exceeded"
+    );
+    for object in prepared_objects {
+        snapshot_cx_checkpoint(cx)?;
+        store.publish_object(&object)?;
+    }
     snapshot_cx_checkpoint(cx)?;
     // RootVerifier's closure adapter retains the caller's actual Cx throughout
     // graph validation; no fresh root context or permissive verifier is involved.
@@ -12329,6 +12360,199 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
+
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn whole_mux_publication_rejects_swapped_equal_size_equal_watermark_captures() {
+        use crate::snapshot_publication::SnapshotPublicationStore;
+        use crate::snapshot_representation::RecoveryKey;
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+        use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+
+        #[derive(Debug)]
+        struct Config;
+        impl TerminalConfiguration for Config {
+            fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+                frankenterm_term::color::ColorPalette::default()
+            }
+        }
+        let make_ack = |id: u128, text: &[u8]| {
+            let mut terminal = Terminal::new(
+                TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 640,
+                    pixel_height: 384,
+                    dpi: 96,
+                },
+                Arc::new(Config),
+                "FrankenTerm",
+                "publication-test",
+                Box::new(Vec::<u8>::new()),
+            );
+            terminal.advance_bytes(text);
+            let terminal_checkpoint = terminal
+                .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+                .unwrap();
+            mux::ModelParserCheckpointAck {
+                registration_wire_identity: id.to_be_bytes(),
+                durable_pane_id: uuid::Uuid::from_u128(id),
+                parser_stream_bytes: terminal_checkpoint.parser_stream_bytes(),
+                terminal_checkpoint,
+            }
+        };
+        let acks = [make_ack(1, b"pane-A"), make_ack(2, b"pane-B")];
+        assert_eq!(acks[0].parser_stream_bytes, acks[1].parser_stream_bytes);
+        assert_ne!(
+            acks[0].terminal_checkpoint.canonical_payload(),
+            acks[1].terminal_checkpoint.canonical_payload()
+        );
+        let uuids = acks.each_ref().map(|ack| ack.durable_pane_id.to_string());
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        let panes = acks
+            .iter()
+            .enumerate()
+            .map(|(index, ack)| mux::MuxCapturedPaneBinding {
+                pane_id: index,
+                pane_uuid: uuids[index].clone(),
+                registration_wire_identity: ack.registration_wire_identity,
+                domain_id: 0,
+                domain_name: "local".into(),
+                window_id: 0,
+                tab_id: index,
+                lane: mux::MuxCapturedPaneLane::Tiled,
+                title: String::new(),
+                cwd: None,
+                size,
+                alt_screen_active: false,
+                cursor_pos: (0, 6),
+                is_active_in_tab: true,
+                is_zoomed_in_tab: false,
+            })
+            .collect();
+        let tabs = (0..2)
+            .map(|index| mux::MuxCapturedTab {
+                tab_id: index,
+                window_id: 0,
+                title: String::new(),
+                size,
+                size_before_zoom: size,
+                active_pane_id: Some(index),
+                zoomed_pane_id: None,
+                split_tree: mux::tab::PaneNode::Leaf(mux::tab::PaneEntry {
+                    window_id: 0,
+                    tab_id: index,
+                    pane_id: index,
+                    title: String::new(),
+                    size,
+                    working_dir: None,
+                    alt_screen_active: false,
+                    is_active_pane: true,
+                    is_zoomed_pane: false,
+                    workspace: "default".into(),
+                    cursor_pos: Default::default(),
+                    physical_top: 0,
+                    top_row: 0,
+                    left_col: 0,
+                    tty_name: None,
+                }),
+                floating_panes: vec![],
+                floating_focus: None,
+                pane_stacks: vec![],
+            })
+            .collect();
+        let captured = mux::MuxCapturedTopology {
+            session_incarnation: mux::MuxSessionIncarnation::from_bytes([3; 16]),
+            topology_revision: mux::TopologyRevision::new(1),
+            captured_at_epoch_ms: 1,
+            client_workspace: None,
+            default_workspace: "default".into(),
+            workspaces: vec![mux::MuxCapturedWorkspace {
+                name: "default".into(),
+                window_ids: vec![0],
+                active_window_id: Some(0),
+                pane_count: 2,
+            }],
+            windows: vec![mux::MuxCapturedWindow {
+                window_id: 0,
+                workspace: "default".into(),
+                title: String::new(),
+                order_revision: mux::window::WindowOrderRevision::new(1),
+                ordered_tab_ids: vec![0, 1],
+                active_tab_id: Some(0),
+                active_tab_index: Some(0),
+                position: None,
+                structural_pane_count: 2,
+            }],
+            tabs,
+            pane_bindings: panes,
+        };
+        let expected = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "session".into(),
+            mux_incarnation_id: hex::encode([3; 16]),
+            root_object_id: [9; 32],
+            publisher_id: "publisher".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), Default::default()).unwrap();
+        let key = Arc::new(RecoveryKey::from_bytes([7; 32]).unwrap());
+        let cx = crate::cx::Cx::for_testing();
+        let inputs = |swapped: bool| {
+            [0, 1].map(|index| WholeMuxPanePublication {
+                pane_id: index,
+                object_id: if index == 0 { "pane-a" } else { "pane-b" },
+                ack: &acks[if swapped { 1 - index } else { index }],
+            })
+        };
+        let error = publish_whole_mux_recovery(
+            &cx,
+            &store,
+            &captured,
+            &inputs(true),
+            Arc::clone(&key),
+            &expected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("capture binding mismatch"));
+        assert!(store.list_object_ids().unwrap().is_empty());
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        // The first eight registration bytes deliberately agree. Comparing a
+        // truncated u64 would accept this different registration incarnation.
+        assert_eq!(
+            acks[0].registration_wire_identity[..8],
+            acks[1].registration_wire_identity[..8]
+        );
+        let mut wrong_registration = captured.clone();
+        wrong_registration.pane_bindings[0].registration_wire_identity =
+            acks[1].registration_wire_identity;
+        let error = publish_whole_mux_recovery(
+            &cx,
+            &store,
+            &wrong_registration,
+            &inputs(false),
+            Arc::clone(&key),
+            &expected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("capture binding mismatch"));
+        assert!(store.list_object_ids().unwrap().is_empty());
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        let receipt =
+            publish_whole_mux_recovery(&cx, &store, &captured, &inputs(false), key, &expected)
+                .unwrap();
+        assert_eq!(receipt.generation, 1);
+        assert_eq!(store.list_object_ids().unwrap().len(), 2);
+    }
 
     type TestPaneProviderFuture = std::pin::Pin<
         Box<

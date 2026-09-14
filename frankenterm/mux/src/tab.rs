@@ -3119,6 +3119,7 @@ fn pane_tree(
             left_col,
             top_row,
         )),
+    }
 }
 
 fn check_pane_tree_depth(tree: &Tree, depth: usize, max_depth: usize) -> anyhow::Result<()> {
@@ -5326,6 +5327,9 @@ impl Tab {
                         })
                         .collect();
 
+                    if let Some(tree) = &inner.pane {
+                        check_pane_tree_depth(tree, 1, 64)?;
+                    }
                     let mut pane_stacks: Vec<MuxCapturedPaneStack> = inner
                         .pane_stacks
                         .iter()
@@ -5333,15 +5337,21 @@ impl Tab {
                             let stack_pane_ids: Vec<PaneId> = stack
                                 .panes()
                                 .iter()
-                                .filter_map(|pane| pane_ids.get(&pane_identity(pane)).copied())
-                                .collect();
-                            MuxCapturedPaneStack {
+                                .map(|pane| {
+                                    pane_ids.get(&pane_identity(pane)).copied()
+                                        .ok_or_else(|| anyhow::anyhow!("stack member missing from capture census"))
+                                })
+                                .collect::<anyhow::Result<_>>()?;
+                            if stack.active_index() >= stack_pane_ids.len() {
+                                anyhow::bail!("stack active index is outside captured membership");
+                            }
+                            Ok(MuxCapturedPaneStack {
                                 slot_index,
                                 pane_ids: stack_pane_ids,
                                 active_index: stack.active_index(),
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<anyhow::Result<_>>()?;
                     pane_stacks.sort_by_key(|stack| stack.slot_index);
 
                     Some((
@@ -23289,4 +23299,3 @@ mod test {
         }
     }
 }
-

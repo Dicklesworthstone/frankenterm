@@ -40,7 +40,7 @@
 //!   Because RaptorQ systematic matrix inversion and inactivation elimination are
 //!   synchronous, compute-bound algorithms that cannot be preempted mid-matrix-solve,
 //!   latency is strictly bounded by construction through $K \le \text{MAX\_CHUNK\_SOURCE\_SYMBOLS}$
-//!   ($K \le 2,048$, keeping synchronous solve times in single-digit milliseconds).
+//!   ($K \le 2,048$). This bounds geometry; solve latency requires measurement.
 //!   Hard interruption during solve is not claimed; instead, `cx.checkpoint()` is verified
 //!   immediately AFTER solve and digest verification before returning success, ensuring that
 //!   cancellation during solve fails closed.
@@ -49,7 +49,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -285,7 +285,8 @@ impl ExpectedRecoveryIdentity {
         }
     }
 
-    /// Derive expected identity directly from an authenticated manifest.
+    /// Build fixture expectations; production callers supply independent identities.
+    #[cfg(test)]
     #[must_use]
     pub const fn from_manifest(manifest: &RepairManifest) -> Self {
         Self {
@@ -322,7 +323,7 @@ pub struct RepairStats {
 
 /// Output of a successful repair decode operation.
 /// Holds the active budget permit so returned buffers do not outlive the permit
-/// and aggregate process-wide memory bounds remain strictly enforced.
+/// for the returned repair buffer. Other caller-owned buffers have separate budgets.
 #[derive(Debug)]
 pub struct RepairResult<'a> {
     /// Bit-for-bit recovered serialized encrypted envelope.
@@ -342,11 +343,6 @@ impl<'a> RepairResult<'a> {
         (self.reconstructed_envelope, self.permit)
     }
 
-    /// Consume the result, releasing the permit immediately and yielding only the envelope bytes.
-    #[must_use]
-    pub fn into_envelope(self) -> Vec<u8> {
-        self.reconstructed_envelope
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,10 +681,10 @@ fn calculate_decoder_memory_budget(
         .ok_or_else(|| RepairError::AdmissionExceeded("total dense matrix bytes overflow".to_string()))?;
 
     // 4. Equation structures and RHS
-    // HDPC equations and dense rows can have up to L non-zero terms (8-byte column index + 1-byte GF256 coeff = 9 bytes).
+    // Account for tuple alignment, not just the sum of index and GF256 field widths.
     // Plus vector/struct allocation headers (~128 bytes) + RHS symbol payload (symbol_size).
     let term_bytes = l
-        .checked_mul(9)
+        .checked_mul(std::mem::size_of::<(usize, u8)>())
         .ok_or_else(|| RepairError::AdmissionExceeded("equation term bytes overflow".to_string()))?;
 
     const STRUCT_AND_VEC_HEADER_OVERHEAD: usize = 128;
@@ -1357,9 +1353,10 @@ pub fn decode_repair_symbols<'a>(
     if validated_source.len() == k {
         // Sort by ESI to ensure canonical byte order
         validated_source.sort_by_key(|(esi, _)| *esi);
-        let mut reconstructed = Vec::with_capacity(k * symbol_size);
+        let mut reconstructed = Vec::with_capacity(payload_len);
         for (_, sym_data) in &validated_source {
-            reconstructed.extend_from_slice(sym_data);
+            let take = sym_data.len().min(payload_len - reconstructed.len());
+            reconstructed.extend_from_slice(&sym_data[..take]);
         }
         reconstructed.truncate(payload_len);
 
@@ -1379,7 +1376,7 @@ pub fn decode_repair_symbols<'a>(
 
         // Shrink permit from temporary decode budget down to exact retained buffer length
         // so returned buffers do not outlive the permit and aggregate bounds remain strictly true.
-        permit.shrink_to(reconstructed.len());
+        permit.shrink_to(reconstructed.capacity());
 
         let l = decoder.params().l;
         return Ok(RepairResult {
@@ -1447,9 +1444,10 @@ pub fn decode_repair_symbols<'a>(
     }
 
     // Assemble reconstructed envelope
-    let mut reconstructed = Vec::with_capacity(k * symbol_size);
+    let mut reconstructed = Vec::with_capacity(payload_len);
     for sym in decode_result.source.iter().take(k) {
-        reconstructed.extend_from_slice(sym);
+        let take = sym.len().min(payload_len - reconstructed.len());
+        reconstructed.extend_from_slice(&sym[..take]);
     }
     reconstructed.truncate(payload_len);
 
@@ -1470,7 +1468,7 @@ pub fn decode_repair_symbols<'a>(
 
     // Shrink permit from temporary solver scratchpad down to exact retained buffer length
     // so returned buffers do not outlive the permit and aggregate bounds remain strictly true.
-    permit.shrink_to(reconstructed.len());
+    permit.shrink_to(reconstructed.capacity());
 
     Ok(RepairResult {
         reconstructed_envelope: reconstructed,
@@ -2644,7 +2642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_permit_into_envelope_releases_permit() {
+    fn test_permit_into_parts_retains_reservation() {
         let cx = test_cx();
         let admission = RepairAdmissionController::default_production();
         let payload = sample_envelope(2_000);
@@ -2675,9 +2673,12 @@ mod tests {
         .expect("decode");
 
         assert_eq!(admission.allocated_memory_bytes(), 2_000);
-        let envelope = result.into_envelope();
+        let (envelope, permit) = result.into_parts();
         assert_eq!(envelope, payload);
-        // into_envelope dropped the permit
+        assert_eq!(admission.allocated_memory_bytes(), 2_000);
+        assert_eq!(admission.active_operations(), 1);
+        drop(envelope);
+        drop(permit);
         assert_eq!(admission.allocated_memory_bytes(), 0);
         assert_eq!(admission.active_operations(), 0);
     }

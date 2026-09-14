@@ -474,7 +474,7 @@ impl RecoveryTerminalCheckpointV2 {
     /// Construct canonical recovery checkpoint from pre-serialized canonical payload,
     /// dimensions, and stream byte watermark.
     #[must_use]
-    pub fn from_canonical_parts(
+    pub(crate) fn from_canonical_parts(
         canonical_payload: Zeroizing<Vec<u8>>,
         rows: usize,
         cols: usize,

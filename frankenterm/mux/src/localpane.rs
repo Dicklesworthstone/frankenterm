@@ -342,7 +342,7 @@ pub struct ModelParserCaptureAuthority {
 
 impl ModelParserCaptureAuthority {
     /// Issue model-only capture authority for legacy mux-owned pane checkpoints.
-    pub fn issue() -> Self {
+    pub(crate) fn issue() -> Self {
         Self { _private: () }
     }
 }
@@ -1888,15 +1888,12 @@ impl Pane for LocalPane {
         // Apply this parser's still-local actions and capture staged hot state
         // under the terminal lock, then release the lock immediately so cold-history
         // materialization and serialization do not block the terminal mutex.
-        let (staged, rows, cols) = {
+        let staged = {
             let mut terminal = self.locked_terminal();
             terminal.perform_actions(std::mem::take(pending_actions));
-            let rows = terminal.get_size().rows;
-            let cols = terminal.get_size().cols;
-            let staged = terminal
+            terminal
                 .capture_staged(limits)
-                .map_err(LiveParserPaneCaptureError::Terminal)?;
-            (staged, rows, cols)
+                .map_err(LiveParserPaneCaptureError::Terminal)?
         };
 
         let checkpoint = staged
@@ -1904,17 +1901,10 @@ impl Pane for LocalPane {
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
             .map_err(LiveParserPaneCaptureError::Terminal)?;
 
-        let canonical_payload = checkpoint
-            .to_canonical_json(limits)
+        checkpoint
+            .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
-            .map_err(LiveParserPaneCaptureError::Terminal)?;
-
-        Ok(RecoveryTerminalCheckpointV2::from_canonical_parts(
-            canonical_payload,
-            rows,
-            cols,
-            ground.stream_bytes(),
-        ))
+            .map_err(LiveParserPaneCaptureError::Terminal)
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -2849,20 +2839,17 @@ impl LocalPane {
         let _output_application = self.output_application.lock();
 
         // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
-        let (staged, rows, cols) = {
+        let staged = {
             let mut terminal = self.locked_terminal();
             if policy == PendingActionDrainPolicy::DrainAndApply {
                 terminal.perform_actions(std::mem::take(pending_actions));
             }
-            let rows = terminal.get_size().rows;
-            let cols = terminal.get_size().cols;
-            let staged = terminal.capture_staged(limits).map_err(|e| match e {
+            terminal.capture_staged(limits).map_err(|e| match e {
                 RecoveryTerminalCheckpointError::Checkpoint(TerminalCheckpointError::StaleColdGeneration) => {
                     LegacyTerminalCaptureError::StaleColdGeneration
                 }
                 other => LegacyTerminalCaptureError::Terminal(other),
-            })?;
-            (staged, rows, cols)
+            })?
         }; // Terminal mutex is released immediately here!
 
         // 2. Outside terminal lock: materialize cold history rows
@@ -2878,8 +2865,8 @@ impl LocalPane {
             })?;
 
         // 3. Serialize canonical payload and assemble RecoveryTerminalCheckpointV2 outside terminal lock
-        let canonical_payload = checkpoint
-            .to_canonical_json(limits)
+        checkpoint
+            .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
             .map_err(|e| match e {
                 TerminalCheckpointError::StaleColdGeneration => {
                     LegacyTerminalCaptureError::StaleColdGeneration
@@ -2887,14 +2874,7 @@ impl LocalPane {
                 other => LegacyTerminalCaptureError::Terminal(
                     RecoveryTerminalCheckpointError::Checkpoint(other),
                 ),
-            })?;
-
-        Ok(RecoveryTerminalCheckpointV2::from_canonical_parts(
-            canonical_payload,
-            rows,
-            cols,
-            ground.stream_bytes(),
-        ))
+            })
     }
 
     /// Convenience capture for legacy mux-owned panes when no pending actions or custom parser ground are needed.
@@ -8709,7 +8689,7 @@ mod disruptor_ring_keep_gate {
         terminal.advance_bytes(b"\x1b[?2004h");
         terminal.advance_bytes(b"\x1b[6;11H");
 
-        terminal.advance_bytes(b"\x1b[?1049h\x1b[4;32mAlternate \u{26A1} HighVolt\x1b[0m");
+        terminal.advance_bytes("\x1b[?1049h\x1b[4;32mAlternate \u{26A1} HighVolt\x1b[0m".as_bytes());
 
         let pane = make_legacy_test_pane(777, terminal);
 
@@ -9013,4 +8993,3 @@ mod disruptor_ring_keep_gate {
         assert_eq!(checkpoint.primary_cell_text(0, 2), Some("f"));
     }
 }
-

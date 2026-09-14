@@ -81,7 +81,8 @@ pub use crate::tab::{MuxCapturedFloatingPane, MuxCapturedPaneStack, MuxCapturedT
 use crate::tmux::TmuxDomain;
 use crate::window::{
     FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowPaneCount, PreparedWindowState,
-    Window, WindowId, WindowOrderRevision, WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
+    Window, WindowId, WindowOrderMirror, WindowOrderRevision, WindowOrderSnapshotError,
+    MAX_TABS_PER_ORDERED_WINDOW,
 };
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
@@ -3387,6 +3388,7 @@ impl LiveParserCheckpointControl {
 
     pub(crate) fn begin_model_capture(&self) -> Option<ModelParserCaptureRequest> {
         let mut state = self.state.lock();
+        let registration_wire_identity = state.registration_wire_identity;
         let pending = state.pending_model.as_mut()?;
         if pending.cancelled || pending.capturing {
             return None;
@@ -3396,7 +3398,7 @@ impl LiveParserCheckpointControl {
             request_id: pending.request_id,
             durable_pane_id: pending.durable_pane_id,
             limits: pending.limits,
-            registration_wire_identity: state.registration_wire_identity,
+            registration_wire_identity,
             expected_pane: pending.expected_pane.clone(),
             expected_generation: pending.expected_generation.clone(),
         })
@@ -10130,6 +10132,15 @@ fn attempt_live_parser_checkpoint(
             );
             return LiveParserAttemptOutcome::Completed;
         };
+        if !request.expected_pane.ptr_eq(&Arc::downgrade(&pane))
+            || !request.expected_generation.ptr_eq(&Arc::downgrade(generation))
+        {
+            control.complete_model_capture(
+                request.request_id,
+                Err(LiveParserCheckpointError::StaleRegistration),
+            );
+            return LiveParserAttemptOutcome::Completed;
+        }
         if pane
             .durable_pane_id()
             .map(uuid::Uuid::from_bytes)
@@ -10177,8 +10188,11 @@ fn attempt_live_parser_checkpoint(
         let capture = catch_recoverable(
             RecoverablePanicSite::MuxPaneCallback,
             std::panic::AssertUnwindSafe(|| {
-                pane.capture_live_parser_checkpoint(
-                    crate::guardian_checkpoint::LiveParserCaptureAuthority::issue(),
+                let local = pane
+                    .downcast_ref::<crate::localpane::LocalPane>()
+                    .ok_or(crate::localpane::LegacyTerminalCaptureError::FalseGuardianAuthority)?;
+                local.capture_legacy_terminal_checkpoint(
+                    crate::localpane::ModelParserCaptureAuthority::issue(),
                     actions,
                     ground,
                     request.limits,
@@ -18093,6 +18107,65 @@ impl Mux {
         changed
     }
 
+    /// Apply complete local mirror permutations in one window transaction.
+    ///
+    /// Every baseline revision and exact tab allocation is validated before
+    /// any window changes. This operation cannot attach, detach, or recreate
+    /// tabs. Remote identity/generation validation belongs to the client that
+    /// resolves the mirrors; this method supplies the atomic local commit.
+    /// Subscribers run only after the complete batch has committed.
+    pub fn apply_window_order_mirrors(
+        &self,
+        mirrors: Vec<WindowOrderMirror>,
+    ) -> anyhow::Result<Vec<FrozenWindowOrder>> {
+        const MAX_WINDOWS: usize = 4_096;
+        const MAX_TOTAL_TABS: usize = 65_536;
+        anyhow::ensure!(mirrors.len() <= MAX_WINDOWS, "too many mirrored windows");
+        let mut total_tabs = 0usize;
+        for mirror in &mirrors {
+            total_tabs = total_tabs.checked_add(mirror.ordered_tabs.len())
+                .ok_or_else(|| anyhow!("mirrored tab count overflow"))?;
+            anyhow::ensure!(total_tabs <= MAX_TOTAL_TABS, "too many mirrored tabs");
+        }
+        let mut prepared = Vec::new();
+        prepared.try_reserve_exact(mirrors.len())?;
+        let mut results = Vec::new();
+        results.try_reserve_exact(mirrors.len())?;
+        let mut seen = HashSet::new();
+        seen.try_reserve(mirrors.len())?;
+        {
+            let tabs = self.tabs.read();
+            let mut windows = self.windows.write();
+            for mirror in mirrors {
+                let window_id = mirror.expected.window_id();
+                anyhow::ensure!(seen.insert(window_id), "duplicate mirrored window {window_id}");
+                let window = windows.get(&window_id)
+                    .ok_or_else(|| anyhow!("mirrored window {window_id} no longer exists"))?;
+                for tab in mirror.expected.ordered_tabs() {
+                    anyhow::ensure!(
+                        tabs.get(&tab.tab_id()).is_some_and(|live| Arc::ptr_eq(live, tab)),
+                        "mirrored tab {} is not the exact registered allocation", tab.tab_id(),
+                    );
+                }
+                let unchanged = mirror.expected.clone();
+                match window.prepare_mirror_order(mirror)? {
+                    Some(state) => {
+                        results.push(state.frozen().clone());
+                        prepared.push((window_id, state));
+                    }
+                    None => results.push(unchanged),
+                }
+            }
+            if !prepared.is_empty() {
+                self.commit_prepared_window_states_locked(
+                    &mut windows, prepared, Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                )?;
+            }
+        }
+        self.flush_window_notifications();
+        Ok(results)
+    }
+
     /// Freeze one window's exact ordered tab pointers and active identity.
     pub fn window_order_snapshot(
         &self,
@@ -18219,8 +18292,21 @@ impl Mux {
 
             // Build pane bindings with strict fail-closed validation:
             // No zero UUIDs, no default/fabricated domains, real pane state for floating/stacked panes.
-            let panes_guard = self.panes.read();
-            let domains_guard = self.domains.read();
+            struct CapturedRegistration {
+                pane: Arc<dyn Pane>,
+                generation: Arc<PaneRegistrationGeneration>,
+                domain_id: DomainId,
+            }
+            // Only clone handles under registry locks. Pane and domain callbacks
+            // may re-enter the mux; never invoke them through registry guards.
+            let panes_guard: HashMap<_, _> = self.panes.read().iter().map(|(&id, reg)| {
+                (id, CapturedRegistration {
+                    pane: Arc::clone(&reg.pane),
+                    generation: Arc::clone(&reg.generation),
+                    domain_id: reg.domain_id,
+                })
+            }).collect();
+            let domains_guard = self.domains.read().clone();
 
             let mut pane_bindings = Vec::new();
             for tab in &captured_tabs {
@@ -18437,8 +18523,16 @@ impl Mux {
                 }
             }
 
-            drop(domains_guard);
-            drop(panes_guard);
+            let registrations_current = {
+                let live = self.panes.read();
+                pane_bindings.iter().all(|binding| {
+                    live.get(&binding.pane_id).zip(panes_guard.get(&binding.pane_id))
+                        .is_some_and(|(current, captured)| {
+                            Arc::ptr_eq(&current.pane, &captured.pane)
+                                && Arc::ptr_eq(&current.generation, &captured.generation)
+                        })
+                })
+            };
 
             // Build workspaces with real client focus binding (no invented focus with first())
             let mut workspaces_map: HashMap<String, (Vec<WindowId>, usize)> = HashMap::new();
@@ -18450,19 +18544,10 @@ impl Mux {
                 entry.1 += win.structural_pane_count;
             }
 
-            let client_ids: Vec<Arc<ClientId>> = {
-                let mut ids = Vec::new();
-                if let Some(ident) = self.identity.read().clone() {
-                    ids.push(ident);
-                }
-                let clients = self.clients.read();
-                for client in clients.values() {
-                    if !ids.iter().any(|id| Arc::ptr_eq(id, &client.client_id)) {
-                        ids.push(Arc::clone(&client.client_id));
-                    }
-                }
-                ids
-            };
+            // Focus is per-client. Other clients cannot supply an arbitrary
+            // workspace focus for the identity bound to this capture.
+            let capture_identity = self.identity.read().clone();
+            let client_ids: Vec<Arc<ClientId>> = capture_identity.iter().cloned().collect();
 
             let mut client_focused_windows: HashMap<String, WindowId> = HashMap::new();
             for client_id in client_ids {
@@ -18488,10 +18573,7 @@ impl Mux {
             workspaces.sort_by(|a, b| a.name.cmp(&b.name));
 
             // Client workspace binding (per-client identity)
-            let client_workspace = self
-                .identity
-                .read()
-                .clone()
+            let client_workspace = capture_identity
                 .and_then(|ident| {
                     self.active_workspace_for_client_if_same(&ident)
                         .map(|active| MuxCapturedClientWorkspaceBinding {
@@ -18508,7 +18590,7 @@ impl Mux {
                     .map_err(|_| MuxTopologyCaptureError::AuthorityExhausted)?
             };
 
-            if initial_stamp == final_stamp {
+            if initial_stamp == final_stamp && registrations_current {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -36958,7 +37040,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_model_parser_checkpoint_preserves_stream_bytes_and_registration() {
+    fn capture_model_parser_checkpoint_rejects_non_local_pane_even_with_parser_ground() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
@@ -36971,30 +37053,21 @@ mod tests {
         harness.write(payload).expect("write to test parser");
         harness.wait_until_parsed(payload.len() as u64);
 
-        let ack = harness
+        let error = harness
             .capture_model(Duration::from_secs(5))
-            .expect("model checkpoint capture must succeed");
-
-        assert_eq!(ack.parser_stream_bytes, payload.len() as u64);
-        assert_eq!(ack.durable_pane_id, durable_id);
-        assert_eq!(ack.registration_wire_identity, harness.generation.wire_identity);
-        assert_eq!(ack.terminal_checkpoint.rows, 24);
-        assert_eq!(ack.terminal_checkpoint.cols, 80);
-        assert!(!ack.terminal_checkpoint.canonical_payload.is_empty());
+            .expect_err("generic pane callbacks cannot authorize legacy model capture");
+        assert_eq!(error, LiveParserCheckpointError::CaptureAndBind);
 
         // Also test routing via Mux::capture_pane_model_checkpoint
-        let mux_ack = harness
+        let error = harness
             .mux
             .capture_pane_model_checkpoint(
                 pane_id,
                 TerminalCheckpointLimits::default(),
                 Duration::from_secs(5),
             )
-            .expect("mux routing for model checkpoint capture must succeed");
-
-        assert_eq!(mux_ack.parser_stream_bytes, payload.len() as u64);
-        assert_eq!(mux_ack.durable_pane_id, durable_id);
-        assert_eq!(mux_ack.registration_wire_identity, harness.generation.wire_identity);
+            .expect_err("mux routing must preserve the legacy ownership boundary");
+        assert_eq!(error, LiveParserCheckpointError::CaptureAndBind);
     }
 
     #[test]

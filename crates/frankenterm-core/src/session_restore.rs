@@ -58,7 +58,7 @@ use crate::snapshot_publication::{
 };
 use crate::snapshot_repair::{
     AuthenticatedRepairSymbol, EncodedRepairBundle, ExpectedRecoveryIdentity,
-    RepairAdmissionController, RepairError, RepairManifest, RepairProtectionClass,
+    RepairAdmissionController, RepairError, RepairManifest, RepairProtectionClass, RepairPermit,
 };
 use crate::cx::Cx;
 use crate::snapshot_representation::{
@@ -6522,14 +6522,14 @@ pub enum WholeMuxRecoveryError {
     AeadRequired(String),
 
     #[cfg(feature = "frankenterm-deps")]
-    #[error("terminal checkpoint decode error for pane {pane_id}: {0}")]
+    #[error("terminal checkpoint decode error for pane {pane_id}: {source}")]
     TerminalCheckpointDecode {
         pane_id: u64,
         source: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointError,
     },
 
     #[cfg(feature = "frankenterm-deps")]
-    #[error("inert terminal restore error for pane {pane_id}: {0}")]
+    #[error("inert terminal restore error for pane {pane_id}: {source}")]
     InertTerminalRestore {
         pane_id: u64,
         source: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointError,
@@ -6552,28 +6552,14 @@ pub enum WholeMuxRecoveryError {
 
 /// Helper to convert an identifier string to a deterministic 32-byte semantic object ID.
 ///
-/// If `s` is a 64-character hex string, it is decoded as 32 bytes.
-/// If `s` is <= 32 bytes ASCII/UTF-8, it is zero-padded to 32 bytes.
-/// Otherwise, its SHA-256 hash is used.
+/// Hashes every spelling under one domain, avoiding aliases between hex IDs,
+/// short zero-padded names, and arbitrary long names.
 #[must_use]
 pub fn semantic_object_id_from_str(s: &str) -> [u8; 32] {
-    if s.len() == 64 {
-        if let Ok(bytes) = hex::decode(s) {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                return arr;
-            }
-        }
-    }
-    let bytes = s.as_bytes();
-    let mut arr = [0u8; 32];
-    if bytes.len() <= 32 {
-        arr[..bytes.len()].copy_from_slice(bytes);
-    } else {
-        return Sha256::digest(bytes).into();
-    }
-    arr
+    let mut digest = Sha256::new();
+    digest.update(b"frankenterm-recovery-object-name-v1\0");
+    digest.update(s.as_bytes());
+    digest.finalize().into()
 }
 
 /// Bounded resource limits enforced during whole-mux recovery root verification.
@@ -6839,9 +6825,40 @@ impl WholeMuxRecoveryVerifier {
         self
     }
 
-    pub fn register_repair_bundle(&mut self, bundle: EncodedRepairBundle) {
+    /// Retains caller-owned symbols only within this verifier's aggregate budget.
+    /// Codec scratch space is admitted separately during repair.
+    pub fn register_repair_bundle(
+        &mut self,
+        bundle: EncodedRepairBundle,
+    ) -> Result<(), WholeMuxRecoveryError> {
+        let representation_id = bundle.manifest.representation_id;
+        let is_replacement = self.repair_bundles.contains_key(&representation_id);
+        if !is_replacement && self.repair_bundles.len() >= self.limits.max_panes.saturating_add(1) {
+            return Err(WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(
+                "retained repair bundle count exceeds recovery limit".to_string(),
+            )));
+        }
+        let retained_bytes = |bundle: &EncodedRepairBundle| -> Option<usize> {
+            let headers = bundle.symbols.capacity().checked_mul(
+                std::mem::size_of::<AuthenticatedRepairSymbol>(),
+            )?;
+            bundle.symbols.iter().try_fold(headers, |total, symbol| {
+                total.checked_add(symbol.payload.capacity())
+            })
+        };
+        let total = self.repair_bundles.iter()
+            .filter(|(id, _)| **id != representation_id)
+            .map(|(_, existing)| existing)
+            .chain(std::iter::once(&bundle))
+            .try_fold(0usize, |total, item| total.checked_add(retained_bytes(item)?));
+        if total.is_none_or(|bytes| bytes > self.limits.max_total_checkpoint_bytes) {
+            return Err(WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(
+                "retained repair symbols exceed recovery byte budget".to_string(),
+            )));
+        }
         self.repair_bundles
             .insert(bundle.manifest.representation_id, bundle);
+        Ok(())
     }
 
     #[must_use]
@@ -6858,16 +6875,12 @@ impl WholeMuxRecoveryVerifier {
         &self,
         cx: &Cx,
         expected_representation_id: &[u8; 32],
+        expected_object_id: [u8; 32],
         expected_generation: u64,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>, WholeMuxRecoveryError> {
+    ) -> Result<Option<(Zeroizing<Vec<u8>>, RepairPermit<'_>)>, WholeMuxRecoveryError> {
         let bundle = self
             .repair_bundles
-            .get(expected_representation_id)
-            .or_else(|| {
-                self.repair_bundles
-                    .values()
-                    .find(|b| b.manifest.generation == expected_generation)
-            });
+            .get(expected_representation_id);
         let Some(bundle) = bundle else {
             return Ok(None);
         };
@@ -6877,7 +6890,7 @@ impl WholeMuxRecoveryVerifier {
 
         let expected = ExpectedRecoveryIdentity::new(
             *expected_representation_id,
-            bundle.manifest.object_id,
+            expected_object_id,
             expected_generation,
         );
         let repair_result = crate::snapshot_repair::decode_repair_symbols(
@@ -6890,7 +6903,8 @@ impl WholeMuxRecoveryVerifier {
         )
         .map_err(WholeMuxRecoveryError::Repair)?;
 
-        Ok(Some(Zeroizing::new(repair_result.reconstructed_envelope)))
+        let (bytes, permit) = repair_result.into_parts();
+        Ok(Some((Zeroizing::new(bytes), permit)))
     }
 
     fn decode_and_verify_manifest_payload(
@@ -6905,12 +6919,14 @@ impl WholeMuxRecoveryVerifier {
             }
         }
 
+        let mut repair_permit = None;
         let wire_bytes: Zeroizing<Vec<u8>> = if candidate.manifest_bytes.starts_with(&RECOVERY_OBJECT_MAGIC) {
             Zeroizing::new(candidate.manifest_bytes.clone())
         } else {
-            if let Some(reconstructed) =
-                self.attempt_raptorq_repair(cx, &expected_rep_id, candidate.generation)?
+            if let Some((reconstructed, permit)) =
+                self.attempt_raptorq_repair(cx, &expected_rep_id, self.trusted_identity.expected_root_object_id, candidate.generation)?
             {
+                repair_permit = Some(permit);
                 reconstructed
             } else {
                 return Err(WholeMuxRecoveryError::AeadRequired(
@@ -6923,9 +6939,10 @@ impl WholeMuxRecoveryVerifier {
         let enc_obj = match EncryptedRecoveryObject::from_bytes(wire_bytes.as_slice()) {
             Ok(obj) => obj,
             Err(parse_err) => {
-                if let Some(reconstructed) =
-                    self.attempt_raptorq_repair(cx, &expected_rep_id, candidate.generation)?
+                if let Some((reconstructed, permit)) =
+                    self.attempt_raptorq_repair(cx, &expected_rep_id, self.trusted_identity.expected_root_object_id, candidate.generation)?
                 {
+                    repair_permit = Some(permit);
                     EncryptedRecoveryObject::from_bytes(reconstructed.as_slice())
                         .map_err(WholeMuxRecoveryError::Representation)?
                 } else {
@@ -6949,6 +6966,9 @@ impl WholeMuxRecoveryVerifier {
         )
         .map_err(WholeMuxRecoveryError::Representation)?;
 
+        drop(wire_bytes);
+        drop(enc_obj);
+        drop(repair_permit);
         Ok((decoded.into_plaintext(), candidate.generation))
     }
 
@@ -7060,19 +7080,11 @@ impl WholeMuxRecoveryVerifier {
                 CheckpointAuthority::ModelOnly { .. } => {
                     // Valid for offline inert reconstruction
                 }
-                CheckpointAuthority::Guardian {
-                    guardian_generation,
-                    ref lease_verifier,
-                    catalog_generation,
-                } => {
-                    if lease_verifier.is_empty()
-                        || guardian_generation == 0
-                        || catalog_generation == 0
-                    {
-                        return Err(WholeMuxRecoveryError::FakeGuardianAuthority {
-                            pane_id: pane.pane_id as u64,
-                        });
-                    }
+                CheckpointAuthority::Guardian { .. } => {
+                    return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                        pane_id: pane.pane_id as u64,
+                        reason: "no guardian lease verifier is installed".to_string(),
+                    });
                 }
             }
 
@@ -7087,13 +7099,16 @@ impl WholeMuxRecoveryVerifier {
             // Read object from immutable publication store, attempting RaptorQ repair using
             // the authenticated representation digest if needed
             let read_result = store.read_object(&obj_ref.object_id);
+            let mut repair_permit = None;
+            let expected_object_id = semantic_object_id_from_str(&obj_ref.object_id);
             let payload: Zeroizing<Vec<u8>> = match read_result {
                 Ok(bytes) => {
                     let computed: [u8; 32] = Sha256::digest(&bytes).into();
                     if computed != obj_ref.payload_digest {
-                        if let Some(repaired) =
-                            self.attempt_raptorq_repair(cx, &obj_ref.payload_digest, image_generation)?
+                        if let Some((repaired, permit)) =
+                            self.attempt_raptorq_repair(cx, &obj_ref.payload_digest, expected_object_id, image_generation)?
                         {
+                            repair_permit = Some(permit);
                             repaired
                         } else {
                             Zeroizing::new(bytes)
@@ -7103,9 +7118,10 @@ impl WholeMuxRecoveryVerifier {
                     }
                 }
                 Err(_) => {
-                    if let Some(repaired) =
-                        self.attempt_raptorq_repair(cx, &obj_ref.payload_digest, image_generation)?
+                    if let Some((repaired, permit)) =
+                        self.attempt_raptorq_repair(cx, &obj_ref.payload_digest, expected_object_id, image_generation)?
                     {
+                        repair_permit = Some(permit);
                         repaired
                     } else {
                         return Err(WholeMuxRecoveryError::MissingCheckpointObject(
@@ -7137,6 +7153,8 @@ impl WholeMuxRecoveryVerifier {
             // (semantic ID from authenticated image ref, generation from image generation)
             let decoded_json =
                 self.decode_and_verify_checkpoint_payload(payload.as_slice(), pane, image_generation)?;
+            drop(payload);
+            drop(repair_permit);
 
             // Verify canonical terminal checkpoint decoding if dependencies are active
             #[cfg(feature = "frankenterm-deps")]
@@ -7400,8 +7418,8 @@ pub fn reconstruct_whole_mux_image_inert(
 
 /// Reconstruct a verified whole-mux recovery image into offline inert terminals,
 /// optionally supplying an explicit live terminal configuration. If `intended_live_config`
-/// is `None`, the matching replay configuration is probed directly from the checkpoint
-/// to ensure `matches_stable` passes without losing non-default state.
+/// is `None`, the complete validated replay configuration is reconstructed by
+/// the terminal checkpoint implementation.
 #[cfg(feature = "frankenterm-deps")]
 pub fn reconstruct_whole_mux_image_inert_with_config(
     validated: &ValidatedWholeMuxRecovery,
@@ -7461,11 +7479,12 @@ pub fn reconstruct_whole_mux_image_inert_with_config(
         // 3. Resolve configuration matching checkpoint replay config
         let live_config: Arc<dyn TerminalConfiguration> = match intended_live_config {
             Some(ref cfg) => Arc::clone(cfg),
-            None => {
-                let probed = InertRecoveryConfiguration::probe_from_checkpoint_json(payload)
-                    .unwrap_or_default();
-                Arc::new(probed)
-            }
+            None => validated_checkpoint.replay_configuration().map_err(|source| {
+                WholeMuxRecoveryError::InertTerminalRestore {
+                    pane_id: pane.pane_id as u64,
+                    source,
+                }
+            })?,
         };
 
         // 4. Rebuild off-topology inert terminal (no writer thread, callbacks, or spill capability)
@@ -7555,6 +7574,14 @@ mod tests {
         MockWezterm, MoveDirection, SplitDirection, WeztermFuture, WeztermInterface,
     };
     use rusqlite::params;
+
+    #[test]
+    fn recovery_object_names_do_not_alias_hex_or_zero_padding() {
+        let short = semantic_object_id_from_str("pane");
+        assert_ne!(short, semantic_object_id_from_str("pane\0"));
+        assert_ne!(short, semantic_object_id_from_str(&hex::encode(short)));
+        assert_eq!(short, semantic_object_id_from_str("pane"));
+    }
 
     fn test_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
         crate::Error::RuntimeOperation {
@@ -15044,7 +15071,7 @@ mod tests {
 
         let mut verifier = WholeMuxRecoveryVerifier::new_production(recovery_key)
             .with_repair_key(repair_key);
-        verifier.register_repair_bundle(bundle);
+        verifier.register_repair_bundle(bundle).expect("bounded repair bundle");
 
         let validated = verifier
             .verify_root(&damaged_candidate, &store)
@@ -15432,4 +15459,3 @@ mod tests {
         assert!(matches!(err, WholeMuxRecoveryError::TopologyValidation(_)));
     }
 }
-

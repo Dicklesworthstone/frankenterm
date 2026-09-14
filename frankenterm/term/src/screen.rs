@@ -2185,7 +2185,7 @@ pub(crate) struct StagedColdSource {
     pub(crate) before_interval: crate::config::ScrollbackInterval,
     pub(crate) expected_newest_exclusive: StableRowIndex,
     pub(crate) max_cold_bytes: u64,
-    pub(crate) fragments: Option<Arc<ColdRowFragments>>,
+    fragments: Option<Arc<ColdRowFragments>>,
 }
 
 #[cfg(feature = "use_serde")]

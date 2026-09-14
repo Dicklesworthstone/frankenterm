@@ -2881,78 +2881,78 @@ impl std::fmt::Debug for TerminalCheckpointV2 {
 /// outside the lock.
 #[derive(Debug)]
 pub struct StagedHotCheckpoint {
-    pub staged_primary: crate::screen::StagedScreenCheckpoint,
-    pub alternate_screen: CheckpointScreen,
-    pub alternate_screen_active: bool,
-    pub pen: CheckpointCellAttributes,
-    pub cursor: CheckpointCursorPosition,
-    pub wrap_next: bool,
-    pub clear_semantic_attribute_on_newline: bool,
-    pub last_semantic_command_status: Option<i32>,
-    pub insert: bool,
-    pub dec_auto_wrap: bool,
-    pub saved_dec_private_modes: BTreeMap<CheckpointSavedDecMode, bool>,
-    pub reverse_wraparound_mode: bool,
-    pub reverse_video_mode: bool,
-    pub synchronized_output: bool,
-    pub dec_origin_mode: bool,
-    pub top_margin: VisibleRowIndex,
-    pub bottom_margin: VisibleRowIndex,
-    pub left_margin: u64,
-    pub right_margin: u64,
-    pub left_and_right_margin_mode: bool,
-    pub application_cursor_keys: bool,
-    pub modify_other_keys: Option<i64>,
-    pub dec_ansi_mode: bool,
-    pub sixel_display_mode: bool,
-    pub use_private_color_registers_for_each_graphic: bool,
-    pub color_map: BTreeMap<u16, CheckpointRgbColor>,
-    pub application_keypad: bool,
-    pub bracketed_paste: bool,
-    pub any_event_mouse: bool,
-    pub focus_tracking: bool,
-    pub mouse_encoding: CheckpointMouseEncoding,
-    pub mouse_tracking: bool,
-    pub button_event_mouse: bool,
-    pub current_mouse_buttons: Vec<CheckpointMouseButton>,
-    pub last_mouse_move: Option<CheckpointMouseEvent>,
-    pub cursor_visible: bool,
-    pub keyboard_encoding: CheckpointKeyboardEncoding,
-    pub g0_charset: CheckpointCharSet,
-    pub g1_charset: CheckpointCharSet,
-    pub shift_out: bool,
-    pub newline_mode: bool,
-    pub tab_stops: Vec<bool>,
-    pub tab_width: u64,
-    pub title: String,
-    pub icon_title: Option<String>,
-    pub progress: Progress,
-    pub palette: Option<CheckpointColorPalette>,
-    pub pixel_width: u64,
-    pub pixel_height: u64,
-    pub dpi: u32,
-    pub current_dir: Option<String>,
-    pub term_program: String,
-    pub term_version: String,
-    pub sixel_scrolls_right: bool,
-    pub user_vars: BTreeMap<String, String>,
-    pub kitty_max_image_id: u32,
-    pub seqno: u64,
-    pub unicode_version: CheckpointUnicodeVersion,
-    pub unicode_version_stack: Vec<CheckpointUnicodeVersionStackEntry>,
-    pub enable_conpty_quirks: bool,
-    pub suppress_initial_title_change: bool,
-    pub accumulating_title: Option<String>,
-    pub lost_focus_seqno: u64,
-    pub lost_focus_alerted_seqno: u64,
-    pub focused: bool,
-    pub bidi_enabled: Option<bool>,
-    pub bidi_hint: Option<CheckpointBidiHint>,
-    pub custom_cell_width_maps: Vec<CheckpointCustomCellWidthMap>,
-    pub replay_config: CheckpointReplayConfigV2,
-    pub screen_limits: crate::screen::ScreenCheckpointLimits,
-    pub screen_usage: crate::screen::ScreenCheckpointUsage,
-    pub limits: TerminalCheckpointLimits,
+    staged_primary: crate::screen::StagedScreenCheckpoint,
+    alternate_screen: CheckpointScreen,
+    alternate_screen_active: bool,
+    pen: CheckpointCellAttributes,
+    cursor: CheckpointCursorPosition,
+    wrap_next: bool,
+    clear_semantic_attribute_on_newline: bool,
+    last_semantic_command_status: Option<i32>,
+    insert: bool,
+    dec_auto_wrap: bool,
+    saved_dec_private_modes: BTreeMap<CheckpointSavedDecMode, bool>,
+    reverse_wraparound_mode: bool,
+    reverse_video_mode: bool,
+    synchronized_output: bool,
+    dec_origin_mode: bool,
+    top_margin: VisibleRowIndex,
+    bottom_margin: VisibleRowIndex,
+    left_margin: u64,
+    right_margin: u64,
+    left_and_right_margin_mode: bool,
+    application_cursor_keys: bool,
+    modify_other_keys: Option<i64>,
+    dec_ansi_mode: bool,
+    sixel_display_mode: bool,
+    use_private_color_registers_for_each_graphic: bool,
+    color_map: BTreeMap<u16, CheckpointRgbColor>,
+    application_keypad: bool,
+    bracketed_paste: bool,
+    any_event_mouse: bool,
+    focus_tracking: bool,
+    mouse_encoding: CheckpointMouseEncoding,
+    mouse_tracking: bool,
+    button_event_mouse: bool,
+    current_mouse_buttons: Vec<CheckpointMouseButton>,
+    last_mouse_move: Option<CheckpointMouseEvent>,
+    cursor_visible: bool,
+    keyboard_encoding: CheckpointKeyboardEncoding,
+    g0_charset: CheckpointCharSet,
+    g1_charset: CheckpointCharSet,
+    shift_out: bool,
+    newline_mode: bool,
+    tab_stops: Vec<bool>,
+    tab_width: u64,
+    title: String,
+    icon_title: Option<String>,
+    progress: Progress,
+    palette: Option<CheckpointColorPalette>,
+    pixel_width: u64,
+    pixel_height: u64,
+    dpi: u32,
+    current_dir: Option<String>,
+    term_program: String,
+    term_version: String,
+    sixel_scrolls_right: bool,
+    user_vars: BTreeMap<String, String>,
+    kitty_max_image_id: u32,
+    seqno: u64,
+    unicode_version: CheckpointUnicodeVersion,
+    unicode_version_stack: Vec<CheckpointUnicodeVersionStackEntry>,
+    enable_conpty_quirks: bool,
+    suppress_initial_title_change: bool,
+    accumulating_title: Option<String>,
+    lost_focus_seqno: u64,
+    lost_focus_alerted_seqno: u64,
+    focused: bool,
+    bidi_enabled: Option<bool>,
+    bidi_hint: Option<CheckpointBidiHint>,
+    custom_cell_width_maps: Vec<CheckpointCustomCellWidthMap>,
+    replay_config: CheckpointReplayConfigV2,
+    screen_limits: crate::screen::ScreenCheckpointLimits,
+    screen_usage: crate::screen::ScreenCheckpointUsage,
+    limits: TerminalCheckpointLimits,
 }
 
 impl StagedHotCheckpoint {
@@ -3059,6 +3059,7 @@ impl StagedHotCheckpoint {
             bidi_hint: self.bidi_hint,
         };
 
+        checkpoint.validate(self.limits)?;
         checkpoint.validate(limits)?;
         Ok(checkpoint)
     }
@@ -4111,8 +4112,13 @@ impl TerminalCheckpointV2 {
         ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<crate::RecoveryTerminalCheckpointV2, TerminalCheckpointError> {
-        let rows = self.primary_rows();
-        let cols = self.primary_cols();
+        let active_screen = if self.alternate_screen_active {
+            &self.alternate_screen
+        } else {
+            &self.primary_screen
+        };
+        let rows = active_screen.physical_rows as usize;
+        let cols = active_screen.physical_cols as usize;
         let canonical_payload = self.to_canonical_json(limits)?;
         Ok(crate::RecoveryTerminalCheckpointV2::from_canonical_parts(
             canonical_payload,
@@ -4218,6 +4224,18 @@ impl TerminalCheckpointV2 {
 }
 
 impl ValidatedTerminalCheckpointV2 {
+    /// Reconstruct the complete immutable replay configuration without live
+    /// writer, callback, or spill capabilities.
+    pub fn replay_configuration(
+        &self,
+    ) -> Result<Arc<dyn TerminalConfiguration>, TerminalCheckpointError> {
+        let maps = decode_custom_cell_width_maps(&self.checkpoint.custom_cell_width_maps)?;
+        Ok(Arc::new(self.checkpoint.replay_config.to_replay_configuration(
+            self.limits,
+            &maps,
+        )?))
+    }
+
     /// Reference to the underlying validated `TerminalCheckpointV2`.
     #[must_use]
     pub fn checkpoint(&self) -> &TerminalCheckpointV2 {

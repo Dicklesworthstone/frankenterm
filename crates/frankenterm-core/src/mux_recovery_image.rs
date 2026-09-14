@@ -135,7 +135,9 @@ pub enum MuxRecoveryImageError {
     #[error("duplicate pane placement in topology: pane id {0} placed multiple times")]
     DuplicatePanePlacement(usize),
 
-    #[error("orphan pane in catalog: pane id {0} is never placed in any tab split tree, stack, or floating list")]
+    #[error(
+        "orphan pane in catalog: pane id {0} is never placed in any tab split tree, stack, or floating list"
+    )]
     OrphanCatalogPane(usize),
 
     #[error("duplicate domain name '{0}'")]
@@ -147,10 +149,14 @@ pub enum MuxRecoveryImageError {
     #[error("referenced domain '{0}' not found in image domain catalog")]
     MissingDomain(String),
 
-    #[error("pane id {0} referenced in tab split tree, stack, or floating list not found in pane catalog")]
+    #[error(
+        "pane id {0} referenced in tab split tree, stack, or floating list not found in pane catalog"
+    )]
     MissingPane(usize),
 
-    #[error("placed pane {pane_id} uuid '{placed_uuid}' does not match catalog uuid '{catalog_uuid}'")]
+    #[error(
+        "placed pane {pane_id} uuid '{placed_uuid}' does not match catalog uuid '{catalog_uuid}'"
+    )]
     PaneUuidMismatchCatalog {
         pane_id: usize,
         catalog_uuid: String,
@@ -164,7 +170,9 @@ pub enum MuxRecoveryImageError {
         count: usize,
     },
 
-    #[error("tab {tab_id} active pane id {pane_id} not found in split tree, stacks, or floating panes")]
+    #[error(
+        "tab {tab_id} active pane id {pane_id} not found in split tree, stacks, or floating panes"
+    )]
     InvalidActivePaneId { tab_id: usize, pane_id: usize },
 
     #[error("tab {tab_id} floating focus pane id {pane_id} not found in tab floating panes")]
@@ -176,22 +184,23 @@ pub enum MuxRecoveryImageError {
     #[error("focused window id {0} not found in window catalog")]
     InvalidFocusedWindowId(usize),
 
-    #[error("checkpoint binding for pane {pane_id} has mismatched incarnation: expected '{expected}', found '{found}'")]
+    #[error(
+        "checkpoint binding for pane {pane_id} has mismatched incarnation: expected '{expected}', found '{found}'"
+    )]
     IncarnationMismatch {
         pane_id: usize,
         expected: String,
         found: String,
     },
 
-    #[error("checkpoint binding for pane {pane_id} has mismatched pane uuid: expected '{expected}', found '{found}'")]
+    #[error(
+        "checkpoint binding for pane {pane_id} has mismatched pane uuid: expected '{expected}', found '{found}'"
+    )]
     PaneUuidMismatch {
         pane_id: usize,
         expected: String,
         found: String,
     },
-
-    #[error("pane {0} has invalid registration generation: must be greater than zero")]
-    InvalidRegistrationGeneration(usize),
 
     #[error("checkpoint ref for pane {pane_id} is invalid: {reason}")]
     InvalidCheckpointRef {
@@ -217,13 +226,19 @@ pub enum MuxRecoveryImageError {
     #[error("conversion error: pane {0} missing from checkpoint object refs")]
     MissingCheckpointObjectRef(usize),
 
-    #[error("conversion error: extraneous checkpoint ack for pane {0} not in captured pane bindings")]
+    #[error(
+        "conversion error: extraneous checkpoint ack for pane {0} not in captured pane bindings"
+    )]
     ExtraneousCheckpointAck(usize),
 
-    #[error("conversion error: extraneous checkpoint object ref for pane {0} not in captured pane bindings")]
+    #[error(
+        "conversion error: extraneous checkpoint object ref for pane {0} not in captured pane bindings"
+    )]
     ExtraneousCheckpointObjectRef(usize),
 
-    #[error("conversion error: pane {pane_id} registration wire identity mismatch: captured {captured:?}, ack {ack:?}")]
+    #[error(
+        "conversion error: pane {pane_id} registration wire identity mismatch: captured {captured:?}, ack {ack:?}"
+    )]
     RegistrationWireIdentityMismatch {
         pane_id: usize,
         captured: [u8; 16],
@@ -236,15 +251,14 @@ pub enum MuxRecoveryImageError {
     #[error("conversion error: pane {0} has nil durable pane id")]
     NilDurablePaneId(usize),
 
-    #[error("conversion error: pane {pane_id} durable uuid mismatch: captured '{captured}', ack '{ack}'")]
+    #[error(
+        "conversion error: pane {pane_id} durable uuid mismatch: captured '{captured}', ack '{ack}'"
+    )]
     DurablePaneUuidMismatch {
         pane_id: usize,
         captured: String,
         ack: String,
     },
-
-    #[error("conversion error: pane {0} has zero parser stream bytes watermark")]
-    ZeroParserStreamBytes(usize),
 
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -641,7 +655,10 @@ impl fmt::Debug for RecoveryPane {
             .field("size", &self.size)
             .field("cursor", &self.cursor_position)
             .field("alt_screen", &self.alt_screen_active)
-            .field("checkpoint_obj_id", &self.checkpoint.checkpoint_ref.object_id)
+            .field(
+                "checkpoint_obj_id",
+                &self.checkpoint.checkpoint_ref.object_id,
+            )
             .finish()
     }
 }
@@ -652,7 +669,7 @@ impl fmt::Debug for RecoveryPane {
 pub struct PaneCheckpointBinding {
     pub topology_incarnation_id: String,
     pub pane_uuid: String,
-    pub registration_generation: u64,
+    pub registration_wire_identity: [u8; 16],
     pub parser_capture: ParserCaptureIdentity,
     pub checkpoint_ref: RecoveryObjectRef,
     pub authority: CheckpointAuthority,
@@ -662,8 +679,11 @@ pub struct PaneCheckpointBinding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParserCaptureIdentity {
     pub watermark_bytes: u64,
-    pub segment_id: u64,
-    pub parser_seqno: u64,
+    /// Absent for a model-only capture that has no guardian journal receipt.
+    pub segment_id: Option<u64>,
+    /// A true parser sequence identity, when supplied by the capture authority.
+    /// A byte watermark is never substituted for this value.
+    pub parser_seqno: Option<u64>,
 }
 
 /// Reference to a stored, content-addressed, encrypted/RaptorQ-encoded checkpoint object.
@@ -684,7 +704,7 @@ pub enum CheckpointAuthority {
     /// Model-only capture executed directly at external parser ground.
     ModelOnly {
         captured_at_epoch_ms: u64,
-        parser_seqno: u64,
+        parser_seqno: Option<u64>,
     },
     /// Cryptographically signed or verified under guardian lease and catalog protocol.
     Guardian {
@@ -712,15 +732,6 @@ pub struct RecoveryImageGenerationMeta {
     pub created_at_epoch_ms: u64,
     pub ft_version: String,
     pub session_id: String,
-}
-
-/// Optional per-pane boundary context provided by the caller.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneCaptureContext {
-    pub registration_generation: u64,
-    pub segment_id: u64,
-    pub parser_seqno: u64,
-    pub authority: Option<CheckpointAuthority>,
 }
 
 // =============================================================================
@@ -764,13 +775,19 @@ impl MuxRecoveryImage {
     /// Looks up a window by its numeric incarnation ID.
     #[must_use]
     pub fn find_window(&self, window_id: usize) -> Option<&RecoveryWindow> {
-        self.topology.windows.iter().find(|w| w.window_id == window_id)
+        self.topology
+            .windows
+            .iter()
+            .find(|w| w.window_id == window_id)
     }
 
     /// Looks up a window by its stable window ID.
     #[must_use]
     pub fn find_window_by_stable_id(&self, stable_id: &str) -> Option<&RecoveryWindow> {
-        self.topology.windows.iter().find(|w| w.stable_window_id == stable_id)
+        self.topology
+            .windows
+            .iter()
+            .find(|w| w.stable_window_id == stable_id)
     }
 
     /// Looks up a tab by its numeric incarnation ID across all windows.
@@ -908,11 +925,7 @@ impl MuxRecoveryImage {
             }
 
             for tab in &window.tabs {
-                validate_string_len(
-                    "tab.stable_tab_id",
-                    &tab.stable_tab_id,
-                    MAX_ID_STRING_BYTES,
-                )?;
+                validate_string_len("tab.stable_tab_id", &tab.stable_tab_id, MAX_ID_STRING_BYTES)?;
                 validate_string_len("tab.title", &tab.title, MAX_STRING_BYTES)?;
                 if let Some(ref cwd) = tab.working_dir {
                     validate_string_len("tab.working_dir", cwd, MAX_STRING_BYTES)?;
@@ -1043,7 +1056,9 @@ impl MuxRecoveryImage {
                 });
             }
             if !known_domain_names.contains(&pane.domain_name) {
-                return Err(MuxRecoveryImageError::MissingDomain(pane.domain_name.clone()));
+                return Err(MuxRecoveryImageError::MissingDomain(
+                    pane.domain_name.clone(),
+                ));
             }
             if !catalog_pane_ids.insert(pane.pane_id) {
                 return Err(MuxRecoveryImageError::DuplicatePaneId(pane.pane_id));
@@ -1072,8 +1087,8 @@ impl MuxRecoveryImage {
             }
 
             // Checkpoint binding field validation
-            if pane.checkpoint.registration_generation == 0 {
-                return Err(MuxRecoveryImageError::InvalidRegistrationGeneration(
+            if pane.checkpoint.registration_wire_identity == [0; 16] {
+                return Err(MuxRecoveryImageError::ZeroRegistrationWireIdentity(
                     pane.pane_id,
                 ));
             }
@@ -1120,12 +1135,6 @@ impl MuxRecoveryImage {
                         return Err(MuxRecoveryImageError::InvalidAuthority {
                             pane_id: pane.pane_id,
                             reason: "captured_at_epoch_ms must be greater than zero",
-                        });
-                    }
-                    if *parser_seqno == 0 {
-                        return Err(MuxRecoveryImageError::InvalidAuthority {
-                            pane_id: pane.pane_id,
-                            reason: "parser_seqno must be greater than zero",
                         });
                     }
                     if pane.checkpoint.parser_capture.parser_seqno != *parser_seqno {
@@ -1235,14 +1244,20 @@ impl MuxRecoveryImage {
                 // Validate pane stacks
                 for stack in &tab.pane_stacks {
                     if stack.pane_ids.is_empty() {
-                        return Err(MuxRecoveryImageError::MalformedSplit("pane stack must not be empty"));
+                        return Err(MuxRecoveryImageError::MalformedSplit(
+                            "pane stack must not be empty",
+                        ));
                     }
                     if stack.active_index >= stack.pane_ids.len() {
-                        return Err(MuxRecoveryImageError::MalformedSplit("pane stack active index out of bounds"));
+                        return Err(MuxRecoveryImageError::MalformedSplit(
+                            "pane stack active index out of bounds",
+                        ));
                     }
                     let active_id = stack.pane_ids[stack.active_index];
                     if !tab_panes.contains(&active_id) {
-                        return Err(MuxRecoveryImageError::MalformedSplit("pane stack active pane must be present in tab split tree"));
+                        return Err(MuxRecoveryImageError::MalformedSplit(
+                            "pane stack active pane must be present in tab split tree",
+                        ));
                     }
                     for (idx, &pane_id) in stack.pane_ids.iter().enumerate() {
                         if idx == stack.active_index {
@@ -1440,17 +1455,15 @@ impl MuxRecoveryImage {
     /// - Registration wire identity match: `binding.registration_wire_identity == ack.registration_wire_identity`.
     /// - Registration wire identity non-zero: rejects all-zero registration wire identities.
     /// - Durable UUID match: `binding.pane_uuid == ack.durable_pane_id.to_string()`, rejects nil UUIDs.
-    /// - Non-zero parser stream bytes watermark.
+    /// - Preserves the actual parser stream watermark, including an empty stream.
     /// - Preserves `pane_stacks` (hidden stack panes) and verifies exact membership.
     /// - Binds live topology incarnation without fabricated or default identifiers.
     /// - Computes canonical SHA-256 digest and validates the resulting image before returning.
     pub fn from_mux_captured(
         meta: RecoveryImageGenerationMeta,
         captured: &mux::MuxCapturedTopology,
-        checkpoint_acks: &HashMap<usize, mux::ModelParserCheckpointAck>,
+        checkpoint_acks: &HashMap<usize, &mux::ModelParserCheckpointAck>,
         checkpoint_object_refs: &HashMap<usize, RecoveryObjectRef>,
-        pane_stacks: Option<&HashMap<usize, Vec<RecoveryPaneStack>>>,
-        pane_capture_contexts: Option<&HashMap<usize, PaneCaptureContext>>,
     ) -> Result<Self, MuxRecoveryImageError> {
         // 1. Metadata validation
         if meta.generation == 0 {
@@ -1484,11 +1497,8 @@ impl MuxRecoveryImage {
         let topology_incarnation_id = hex::encode(incarnation_bytes);
 
         // 3. Exact membership bijection
-        let captured_pane_ids: HashSet<usize> = captured
-            .pane_bindings
-            .iter()
-            .map(|b| b.pane_id)
-            .collect();
+        let captured_pane_ids: HashSet<usize> =
+            captured.pane_bindings.iter().map(|b| b.pane_id).collect();
 
         for &pane_id in checkpoint_acks.keys() {
             if !captured_pane_ids.contains(&pane_id) {
@@ -1497,7 +1507,9 @@ impl MuxRecoveryImage {
         }
         for &pane_id in checkpoint_object_refs.keys() {
             if !captured_pane_ids.contains(&pane_id) {
-                return Err(MuxRecoveryImageError::ExtraneousCheckpointObjectRef(pane_id));
+                return Err(MuxRecoveryImageError::ExtraneousCheckpointObjectRef(
+                    pane_id,
+                ));
             }
         }
         for &pane_id in &captured_pane_ids {
@@ -1538,57 +1550,13 @@ impl MuxRecoveryImage {
                     ack: ack_uuid,
                 });
             }
-            if ack.parser_stream_bytes == 0 {
-                return Err(MuxRecoveryImageError::ZeroParserStreamBytes(
-                    binding.pane_id,
-                ));
-            }
-
-            let chk_ref = checkpoint_object_refs.get(&binding.pane_id).unwrap().clone();
-
-            let (reg_gen, segment_id, parser_seqno, authority) = if let Some(ctx) =
-                pane_capture_contexts.and_then(|m| m.get(&binding.pane_id))
-            {
-                if ctx.registration_generation == 0 {
-                    return Err(MuxRecoveryImageError::InvalidRegistrationGeneration(
-                        binding.pane_id,
-                    ));
-                }
-                if ctx.parser_seqno == 0 {
-                    return Err(MuxRecoveryImageError::InvalidAuthority {
-                        pane_id: binding.pane_id,
-                        reason: "parser_seqno must be greater than zero",
-                    });
-                }
-                let auth = ctx.authority.clone().unwrap_or_else(|| {
-                    CheckpointAuthority::ModelOnly {
-                        captured_at_epoch_ms: captured.captured_at_epoch_ms,
-                        parser_seqno: ctx.parser_seqno,
-                    }
-                });
-                (
-                    ctx.registration_generation,
-                    ctx.segment_id,
-                    ctx.parser_seqno,
-                    auth,
-                )
-            } else {
-                let wire_u64 = u64::from_be_bytes(
-                    binding.registration_wire_identity[0..8]
-                        .try_into()
-                        .unwrap(),
-                );
-                let reg_gen = if wire_u64 == 0 { 1 } else { wire_u64 };
-                let seqno = ack.parser_stream_bytes.max(1);
-                (
-                    reg_gen,
-                    1,
-                    seqno,
-                    CheckpointAuthority::ModelOnly {
-                        captured_at_epoch_ms: captured.captured_at_epoch_ms,
-                        parser_seqno: seqno,
-                    },
-                )
+            let chk_ref = checkpoint_object_refs
+                .get(&binding.pane_id)
+                .unwrap()
+                .clone();
+            let authority = CheckpointAuthority::ModelOnly {
+                captured_at_epoch_ms: captured.captured_at_epoch_ms,
+                parser_seqno: None,
             };
 
             pane_uuid_map.insert(binding.pane_id, binding.pane_uuid.clone());
@@ -1611,11 +1579,11 @@ impl MuxRecoveryImage {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: topology_incarnation_id.clone(),
                     pane_uuid: binding.pane_uuid.clone(),
-                    registration_generation: reg_gen,
+                    registration_wire_identity: binding.registration_wire_identity,
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: ack.parser_stream_bytes,
-                        segment_id,
-                        parser_seqno,
+                        segment_id: None,
+                        parser_seqno: None,
                     },
                     checkpoint_ref: chk_ref,
                     authority,
@@ -1675,21 +1643,15 @@ impl MuxRecoveryImage {
                         })
                         .collect::<Result<Vec<_>, MuxRecoveryImageError>>()?;
 
-                    let tab_stacks = if !tab.pane_stacks.is_empty() {
-                        tab.pane_stacks
-                            .iter()
-                            .map(|s| RecoveryPaneStack {
-                                slot_index: s.slot_index,
-                                pane_ids: s.pane_ids.clone(),
-                                active_index: s.active_index,
-                            })
-                            .collect()
-                    } else {
-                        pane_stacks
-                            .and_then(|m| m.get(&tab.tab_id))
-                            .cloned()
-                            .unwrap_or_default()
-                    };
+                    let tab_stacks = tab
+                        .pane_stacks
+                        .iter()
+                        .map(|s| RecoveryPaneStack {
+                            slot_index: s.slot_index,
+                            pane_ids: s.pane_ids.clone(),
+                            active_index: s.active_index,
+                        })
+                        .collect();
 
                     let active_pane_id = match tab.active_pane_id {
                         Some(id) => id,
@@ -1756,12 +1718,14 @@ impl MuxRecoveryImage {
             .and_then(|w| w.active_window_id)
             .or_else(|| captured.windows.first().map(|w| w.window_id));
 
-        let client_workspace = captured.client_workspace.as_ref().map(|cw| {
-            ClientWorkspaceBinding {
-                client_id: cw.client_id.clone(),
-                active_workspace: cw.active_workspace.clone(),
-            }
-        });
+        let client_workspace =
+            captured
+                .client_workspace
+                .as_ref()
+                .map(|cw| ClientWorkspaceBinding {
+                    client_id: cw.client_id.clone(),
+                    active_workspace: cw.active_workspace.clone(),
+                });
 
         let topology = RecoveryTopology {
             domains,
@@ -1794,23 +1758,6 @@ impl MuxRecoveryImage {
         image.validate()?;
         Ok(image)
     }
-
-    /// Convenience wrapper for [`from_mux_captured`] with default empty stacks and contexts.
-    pub fn from_mux_captured_simple(
-        meta: RecoveryImageGenerationMeta,
-        captured: &mux::MuxCapturedTopology,
-        checkpoint_acks: &HashMap<usize, mux::ModelParserCheckpointAck>,
-        checkpoint_object_refs: &HashMap<usize, RecoveryObjectRef>,
-    ) -> Result<Self, MuxRecoveryImageError> {
-        Self::from_mux_captured(
-            meta,
-            captured,
-            checkpoint_acks,
-            checkpoint_object_refs,
-            None,
-            None,
-        )
-    }
 }
 
 #[cfg(feature = "frankenterm-deps")]
@@ -1831,10 +1778,12 @@ fn convert_mux_pane_node(
             }))
         }
         mux::tab::PaneNode::Split { left, right, node } => {
-            let left_conv = convert_mux_pane_node(left, pane_uuid_map)?
-                .ok_or(MuxRecoveryImageError::MalformedSplit("left split child is empty"))?;
-            let right_conv = convert_mux_pane_node(right, pane_uuid_map)?
-                .ok_or(MuxRecoveryImageError::MalformedSplit("right split child is empty"))?;
+            let left_conv = convert_mux_pane_node(left, pane_uuid_map)?.ok_or(
+                MuxRecoveryImageError::MalformedSplit("left split child is empty"),
+            )?;
+            let right_conv = convert_mux_pane_node(right, pane_uuid_map)?.ok_or(
+                MuxRecoveryImageError::MalformedSplit("right split child is empty"),
+            )?;
             let direction = match node.direction {
                 mux::tab::SplitDirection::Horizontal => SplitDirection::Horizontal,
                 mux::tab::SplitDirection::Vertical => SplitDirection::Vertical,
@@ -1999,11 +1948,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: incarnation_id.to_string(),
                 pane_uuid: pane_uuid.to_string(),
-                registration_generation: 1,
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 1024,
-                    segment_id: 1,
-                    parser_seqno: 42,
+                    segment_id: None,
+                    parser_seqno: Some(42),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: format!("obj_{pane_id}"),
@@ -2013,7 +1962,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1747371642000,
-                    parser_seqno: 42,
+                    parser_seqno: Some(42),
                 },
             },
         }
@@ -2220,11 +2169,13 @@ mod tests {
         // Add pane 4 as hidden stack member sharing slot with pane 1
         let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
         image.panes.push(pane4);
-        image.topology.windows[0].tabs[0].pane_stacks.push(RecoveryPaneStack {
-            slot_index: 0,
-            pane_ids: vec![1, 4],
-            active_index: 0,
-        });
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
         image.image_digest = image.compute_digest().unwrap();
 
         assert!(image.validate().is_ok());
@@ -2236,11 +2187,13 @@ mod tests {
     fn test_negative_pane_stack_missing_active_in_tree() {
         let mut image = make_valid_test_image();
         // Pane stack active pane is 99, which is not in split tree
-        image.topology.windows[0].tabs[0].pane_stacks.push(RecoveryPaneStack {
-            slot_index: 0,
-            pane_ids: vec![99, 1],
-            active_index: 0,
-        });
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![99, 1],
+                active_index: 0,
+            });
         image.image_digest = image.compute_digest().unwrap();
 
         let err = image.validate().unwrap_err();
@@ -2251,11 +2204,13 @@ mod tests {
     fn test_negative_pane_stack_hidden_pane_also_in_tree() {
         let mut image = make_valid_test_image();
         // Hidden stack pane is pane 2, which already occupies a split leaf
-        image.topology.windows[0].tabs[0].pane_stacks.push(RecoveryPaneStack {
-            slot_index: 0,
-            pane_ids: vec![1, 2],
-            active_index: 0,
-        });
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 2],
+                active_index: 0,
+            });
         image.image_digest = image.compute_digest().unwrap();
 
         let err = image.validate().unwrap_err();
@@ -2299,8 +2254,7 @@ mod tests {
     #[test]
     fn test_negative_placed_floating_uuid_mismatch_vs_catalog() {
         let mut image = make_valid_test_image();
-        image.topology.windows[0].tabs[0].floating_panes[0].pane_uuid =
-            "uuid-swapped".to_string();
+        image.topology.windows[0].tabs[0].floating_panes[0].pane_uuid = "uuid-swapped".to_string();
         image.image_digest = image.compute_digest().unwrap();
 
         let err = image.validate().unwrap_err();
@@ -2382,16 +2336,13 @@ mod tests {
     // --- Paired Tests: Registration & Authority Fields ---
 
     #[test]
-    fn test_negative_registration_generation_zero() {
+    fn test_negative_registration_wire_identity_zero() {
         let mut image = make_valid_test_image();
-        image.panes[0].checkpoint.registration_generation = 0;
+        image.panes[0].checkpoint.registration_wire_identity = [0; 16];
         image.image_digest = image.compute_digest().unwrap();
 
         let err = image.validate().unwrap_err();
-        assert_eq!(
-            err,
-            MuxRecoveryImageError::InvalidRegistrationGeneration(1)
-        );
+        assert_eq!(err, MuxRecoveryImageError::ZeroRegistrationWireIdentity(1));
     }
 
     #[test]
@@ -2447,7 +2398,7 @@ mod tests {
         let mut image = make_valid_test_image();
         image.panes[0].checkpoint.authority = CheckpointAuthority::ModelOnly {
             captured_at_epoch_ms: 0,
-            parser_seqno: 42,
+            parser_seqno: Some(42),
         };
         image.image_digest = image.compute_digest().unwrap();
 
@@ -2462,31 +2413,26 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_model_only_zero_seqno() {
+    fn test_model_only_zero_seqno_and_empty_stream() {
         let mut image = make_valid_test_image();
+        image.panes[0].checkpoint.parser_capture.parser_seqno = Some(0);
+        image.panes[0].checkpoint.parser_capture.watermark_bytes = 0;
         image.panes[0].checkpoint.authority = CheckpointAuthority::ModelOnly {
             captured_at_epoch_ms: 1747371642000,
-            parser_seqno: 0,
+            parser_seqno: Some(0),
         };
         image.image_digest = image.compute_digest().unwrap();
 
-        let err = image.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            MuxRecoveryImageError::InvalidAuthority {
-                pane_id: 1,
-                reason: "parser_seqno must be greater than zero"
-            }
-        ));
+        image.validate().unwrap();
     }
 
     #[test]
     fn test_negative_model_only_parser_seqno_mismatch() {
         let mut image = make_valid_test_image();
-        image.panes[0].checkpoint.parser_capture.parser_seqno = 99;
+        image.panes[0].checkpoint.parser_capture.parser_seqno = Some(99);
         image.panes[0].checkpoint.authority = CheckpointAuthority::ModelOnly {
             captured_at_epoch_ms: 1747371642000,
-            parser_seqno: 42,
+            parser_seqno: Some(42),
         };
         image.image_digest = image.compute_digest().unwrap();
 
@@ -2812,10 +2758,7 @@ mod tests {
         image.image_digest = [99u8; 32];
 
         let err = image.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            MuxRecoveryImageError::DigestMismatch { .. }
-        ));
+        assert!(matches!(err, MuxRecoveryImageError::DigestMismatch { .. }));
     }
 
     #[test]
@@ -2861,10 +2804,7 @@ mod tests {
         image.image_digest = image.compute_digest().unwrap();
 
         let err = image.validate().unwrap_err();
-        assert_eq!(
-            err,
-            MuxRecoveryImageError::UnsupportedSchemaVersion(999)
-        );
+        assert_eq!(err, MuxRecoveryImageError::UnsupportedSchemaVersion(999));
     }
 
     #[test]
@@ -2894,6 +2834,12 @@ mod converter_tests {
     use frankenterm_term::{Terminal, TerminalSize as TermTerminalSize};
     use std::sync::Arc;
 
+    fn borrowed_acks(
+        acks: &HashMap<usize, mux::ModelParserCheckpointAck>,
+    ) -> HashMap<usize, &mux::ModelParserCheckpointAck> {
+        acks.iter().map(|(&pane_id, ack)| (pane_id, ack)).collect()
+    }
+
     struct TestConfig;
     impl TerminalConfiguration for TestConfig {
         fn color_palette(&self) -> ColorPalette {
@@ -2901,7 +2847,10 @@ mod converter_tests {
         }
     }
 
-    fn make_test_checkpoint(rows: usize, cols: usize) -> frankenterm_term::RecoveryTerminalCheckpointV2 {
+    fn make_test_checkpoint(
+        rows: usize,
+        cols: usize,
+    ) -> frankenterm_term::RecoveryTerminalCheckpointV2 {
         let size = TermTerminalSize {
             rows,
             cols,
@@ -3084,6 +3033,7 @@ mod converter_tests {
             split_tree,
             floating_panes: vec![],
             floating_focus: None,
+            pane_stacks: vec![],
         };
 
         let window = mux::MuxCapturedWindow {
@@ -3161,11 +3111,15 @@ mod converter_tests {
     #[test]
     fn test_converter_positive_full_happy_path() {
         let (meta, captured, acks, refs) = make_test_fixture();
-        let image = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .expect("must convert live captured topology successfully");
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .expect("must convert live captured topology successfully");
 
         assert_eq!(image.pane_count(), 2);
-        assert_eq!(image.header.mux_incarnation_id, hex::encode(captured.session_incarnation.as_bytes()));
+        assert_eq!(
+            image.header.mux_incarnation_id,
+            hex::encode(captured.session_incarnation.as_bytes())
+        );
         assert_eq!(image.header.generation, 1);
         assert_eq!(image.topology.windows.len(), 1);
         assert_eq!(image.topology.windows[0].tabs.len(), 1);
@@ -3227,25 +3181,15 @@ mod converter_tests {
             },
         );
 
-        let mut pane_stacks = HashMap::new();
-        pane_stacks.insert(
-            20,
-            vec![RecoveryPaneStack {
-                slot_index: 0,
-                pane_ids: vec![101, 103],
-                active_index: 0,
-            }],
-        );
+        captured.tabs[0].pane_stacks = vec![mux::MuxCapturedPaneStack {
+            slot_index: 0,
+            pane_ids: vec![101, 103],
+            active_index: 0,
+        }];
 
-        let image = MuxRecoveryImage::from_mux_captured(
-            meta,
-            &captured,
-            &acks,
-            &refs,
-            Some(&pane_stacks),
-            None,
-        )
-        .expect("must convert topology with pane stacks");
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .expect("must convert topology with pane stacks");
 
         assert_eq!(image.pane_count(), 3);
         let tab = &image.topology.windows[0].tabs[0];
@@ -3259,8 +3203,9 @@ mod converter_tests {
         // Mutate ack wire identity
         acks.get_mut(&101).unwrap().registration_wire_identity = [0x99u8; 16];
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert!(matches!(
             err,
             MuxRecoveryImageError::RegistrationWireIdentityMismatch { pane_id: 101, .. }
@@ -3273,8 +3218,9 @@ mod converter_tests {
         // Mutate ack durable uuid
         acks.get_mut(&101).unwrap().durable_pane_id = uuid::Uuid::new_v4();
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert!(matches!(
             err,
             MuxRecoveryImageError::DurablePaneUuidMismatch { pane_id: 101, .. }
@@ -3286,8 +3232,9 @@ mod converter_tests {
         let (meta, captured, mut acks, refs) = make_test_fixture();
         acks.remove(&102);
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert_eq!(err, MuxRecoveryImageError::MissingCheckpointAck(102));
     }
 
@@ -3304,8 +3251,9 @@ mod converter_tests {
             },
         );
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert_eq!(err, MuxRecoveryImageError::ExtraneousCheckpointAck(999));
     }
 
@@ -3314,8 +3262,9 @@ mod converter_tests {
         let (meta, captured, acks, mut refs) = make_test_fixture();
         refs.remove(&101);
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert_eq!(err, MuxRecoveryImageError::MissingCheckpointObjectRef(101));
     }
 
@@ -3332,9 +3281,13 @@ mod converter_tests {
             },
         );
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
-        assert_eq!(err, MuxRecoveryImageError::ExtraneousCheckpointObjectRef(999));
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::ExtraneousCheckpointObjectRef(999)
+        );
     }
 
     #[test]
@@ -3342,8 +3295,9 @@ mod converter_tests {
         let (meta, mut captured, acks, refs) = make_test_fixture();
         captured.pane_bindings[0].registration_wire_identity = [0u8; 16];
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert_eq!(
             err,
             MuxRecoveryImageError::ZeroRegistrationWireIdentity(101)
@@ -3355,18 +3309,57 @@ mod converter_tests {
         let (meta, captured, mut acks, refs) = make_test_fixture();
         acks.get_mut(&101).unwrap().durable_pane_id = uuid::Uuid::nil();
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
+        let err =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
         assert_eq!(err, MuxRecoveryImageError::NilDurablePaneId(101));
     }
 
     #[test]
-    fn test_converter_negative_zero_parser_stream_bytes() {
+    fn test_converter_preserves_zero_parser_stream_bytes_without_invented_receipts() {
         let (meta, captured, mut acks, refs) = make_test_fixture();
         acks.get_mut(&101).unwrap().parser_stream_bytes = 0;
 
-        let err = MuxRecoveryImage::from_mux_captured(meta, &captured, &acks, &refs, None, None)
-            .unwrap_err();
-        assert_eq!(err, MuxRecoveryImageError::ZeroParserStreamBytes(101));
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap();
+        let binding = &image
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == 101)
+            .unwrap()
+            .checkpoint;
+        assert_eq!(binding.parser_capture.watermark_bytes, 0);
+        assert_eq!(binding.parser_capture.segment_id, None);
+        assert_eq!(binding.parser_capture.parser_seqno, None);
+        assert!(matches!(
+            binding.authority,
+            CheckpointAuthority::ModelOnly {
+                parser_seqno: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_converter_preserves_all_registration_identity_bits() {
+        let (meta, mut captured, mut acks, refs) = make_test_fixture();
+        let mut wire_identity = [0; 16];
+        wire_identity[15] = 7;
+        captured.pane_bindings[0].registration_wire_identity = wire_identity;
+        acks.get_mut(&101).unwrap().registration_wire_identity = wire_identity;
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap();
+        assert_eq!(
+            image
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == 101)
+                .unwrap()
+                .checkpoint
+                .registration_wire_identity,
+            wire_identity
+        );
     }
 }

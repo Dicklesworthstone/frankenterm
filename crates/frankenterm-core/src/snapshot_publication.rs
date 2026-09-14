@@ -204,6 +204,9 @@ pub enum PublicationError {
 
     #[error("No verified root available")]
     NoVerifiedRoot,
+
+    #[error("Publication lock is contended or changed repeatedly")]
+    PublicationBusy,
 }
 
 impl PublicationError {
@@ -975,8 +978,8 @@ impl SnapshotPublicationStore {
 
     /// Acquires an exclusive, descriptor-bound cross-process publication lock on `.publication.lock`.
     ///
-    /// Revalidates the named lock inode after acquiring the blocking lock to eliminate lock domain
-    /// splitting if the file was replaced while blocking.
+    /// Revalidates the named lock inode after nonblocking acquisition. Contention
+    /// and repeated inode changes return immediately to the caller for retry.
     pub fn acquire_publication_lock(&self) -> Result<PublicationLock, PublicationError> {
         let lock_leaf = ".publication.lock";
         let lock_path = self.root_path.join(lock_leaf);
@@ -990,7 +993,7 @@ impl SnapshotPublicationStore {
             opts.mode(0o600);
         }
 
-        loop {
+        for _ in 0..4 {
             let cap_file = self
                 .root_dir
                 .open_with(lock_leaf, &opts)
@@ -999,9 +1002,13 @@ impl SnapshotPublicationStore {
             check_opened_file_security(&cap_file, &lock_path)?;
 
             let std_file = cap_file.into_std();
-            std_file
-                .lock_exclusive()
-                .map_err(|e| PublicationError::io(&lock_path, e))?;
+            fs2::FileExt::try_lock_exclusive(&std_file).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    PublicationError::PublicationBusy
+                } else {
+                    PublicationError::io(&lock_path, e)
+                }
+            })?;
 
             // Revalidate named lock inode after blocking lock acquired
             let opened_meta = std_file
@@ -1026,6 +1033,7 @@ impl SnapshotPublicationStore {
 
             #[cfg(unix)]
             {
+                use cap_std::fs::MetadataExt as _;
                 use std::os::unix::fs::MetadataExt as _;
                 if opened_meta.dev() != named_meta.dev() || opened_meta.ino() != named_meta.ino() {
                     // Lock file was replaced while blocking! Unlock old inode and retry on new inode.
@@ -1036,6 +1044,7 @@ impl SnapshotPublicationStore {
 
             return Ok(PublicationLock { file: std_file });
         }
+        Err(PublicationError::PublicationBusy)
     }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1073,18 +1082,14 @@ fn publish_object_noreplace(
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn publish_object_noreplace(
-    objects_dir: &Dir,
-    stage_name: &str,
+    _objects_dir: &Dir,
+    _stage_name: &str,
     target_name: &str,
 ) -> Result<(), PublicationError> {
-    if objects_dir.symlink_metadata(target_name).is_ok() {
-        return Err(PublicationError::AlreadyExists {
-            path: PathBuf::from(target_name),
-        });
-    }
-    objects_dir
-        .rename(stage_name, objects_dir, target_name)
-        .map_err(|e| PublicationError::io(target_name, e))
+    Err(PublicationError::io(target_name, std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace publication is unavailable on this platform",
+    )))
 }
 
     // -------------------------------------------------------------------------
@@ -1246,7 +1251,7 @@ fn publish_object_noreplace(
         drop(stage_file);
 
         // Atomic no-clobber publication + exact-existing adoption
-        match publish_object_noreplace(&self.objects_dir, &stage_name, &target_name) {
+        match Self::publish_object_noreplace(&self.objects_dir, &stage_name, &target_name) {
             Ok(()) => {
                 // Fsync parent objects directory
                 let dir_sync_file = self
@@ -2807,6 +2812,19 @@ mod tests {
     }
 
     #[test]
+    fn publication_lock_contention_returns_without_waiting() {
+        let temp = TempDir::new().unwrap();
+        let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let first = store.acquire_publication_lock().unwrap();
+        assert!(matches!(
+            store.acquire_publication_lock(),
+            Err(PublicationError::PublicationBusy)
+        ));
+        drop(first);
+        let _next = store.acquire_publication_lock().unwrap();
+    }
+
+    #[test]
     fn test_lock_inode_revalidation_detects_replaced_file() {
         let temp = TempDir::new().unwrap();
         let store = SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
@@ -2837,4 +2855,3 @@ mod tests {
         drop(lock2);
     }
 }
-
