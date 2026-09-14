@@ -179,7 +179,7 @@ impl fmt::Display for AtomicComponentMarkerField {
 }
 
 /// Fail-closed errors for marker construction, parsing, and sealing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtomicComponentIdentityError {
     /// A build ID was not a non-zero value encoded as exactly 64 lowercase
     /// hexadecimal characters.
@@ -202,7 +202,7 @@ pub enum AtomicComponentIdentityError {
     /// A Cargo build-script input was not valid Unicode.
     EnvironmentNotUnicode(&'static str),
     /// A sealed build supplied an override not bound by its source identity.
-    UnboundCargoProfileOverride(String),
+    UnboundCargoProfileOverride,
 }
 
 impl fmt::Display for AtomicComponentIdentityError {
@@ -231,9 +231,9 @@ impl fmt::Display for AtomicComponentIdentityError {
             Self::EnvironmentNotUnicode(variable) => {
                 write!(formatter, "{variable} must be valid UTF-8")
             }
-            Self::UnboundCargoProfileOverride(variable) => write!(
+            Self::UnboundCargoProfileOverride => write!(
                 formatter,
-                "sealed FrankenTerm build forbids profile override {variable}; change committed Cargo.toml instead"
+                "sealed FrankenTerm build forbids profile overrides; change committed Cargo.toml instead"
             ),
         }
     }
@@ -468,13 +468,12 @@ pub fn emit_cargo_atomic_component_marker(
         for (variable, _) in std::env::vars_os() {
             let variable = variable.to_string_lossy();
             if variable.to_ascii_uppercase().starts_with("CARGO_PROFILE_") {
-                let error = AtomicComponentIdentityError::UnboundCargoProfileOverride(
-                    variable.into_owned(),
-                );
                 // Cargo reports build-script Result errors with Debug, so
                 // also print the actionable remedy without the input value.
-                eprintln!("{error}");
-                return Err(error);
+                eprintln!(
+                    "sealed FrankenTerm build forbids profile override {variable}; change committed Cargo.toml instead"
+                );
+                return Err(AtomicComponentIdentityError::UnboundCargoProfileOverride);
             }
         }
     }
