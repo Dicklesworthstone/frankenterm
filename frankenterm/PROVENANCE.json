@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 88,
+        "fix": 89,
         "other": 13,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 141,
+      "fork_side_commit_count": 142,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T11:53:29-04:00",
-        "sha": "e5ac537af571e7ee99df81bb12dcd09c4f131346",
-        "subject": "fix(window): complete overdue repaint in the admitted Render task"
+        "committed_at": "2026-09-14T15:33:29-04:00",
+        "sha": "7ee596a0cf9aa34b2b8ddd6ebe9f084c6b956a7e",
+        "subject": "fix(window): compile X11 active-connection check without the wayland feature"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2586,
-  "generated_at": "2026-09-14T16:15:30.635271Z",
+  "fork_side_commit_total": 2587,
+  "generated_at": "2026-09-14T19:34:31.766032Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
