@@ -57,12 +57,13 @@ fn reflow_compute_pool() -> Option<&'static ReflowComputePool> {
         let available = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1))
             .unwrap_or(0);
-        // Process-start diagnostic override supports same-binary scalar and
-        // worker-count comparisons. Never consume all reported CPUs.
+        // Use the bounded compute capacity by default, leaving one reported
+        // CPU for interactive work. The process-start override supports
+        // same-binary scalar and worker-count comparisons.
         let requested = std::env::var("FT_REFLOW_COMPUTE_WORKERS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4);
+            .unwrap_or(available);
         let workers = requested.min(available).min(8);
         if workers < 2 {
             return None;
