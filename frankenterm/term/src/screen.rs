@@ -9289,7 +9289,7 @@ pub(crate) mod tests {
             self.metadata_probes.fetch_add(1, Ordering::Relaxed);
             if self
                 .metadata_probe_budget
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| match left {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| match left {
                     u64::MAX => Some(left),
                     0 => None,
                     _ => Some(left - 1),
@@ -12955,8 +12955,14 @@ pub(crate) mod tests {
             Line::new(1),
             Line::new(1),
         ]);
-        let cursor =
-            screen.rewrap_lines(3, 1, 0, 0, 2, None, &mut SelectionAnchorRegistry::default());
+        let cursor = screen.rewrap_lines(
+            3,
+            1,
+            (0, 0),
+            2,
+            None,
+            &mut SelectionAnchorRegistry::default(),
+        );
         assert_eq!(cursor, (0, 0));
         assert_eq!(screen.lines.len(), 4, "two trailing blank rows were pruned");
         assert!(
@@ -14102,8 +14108,7 @@ pub(crate) mod tests {
                 cursor = screen.rewrap_lines(
                     cols,
                     1,
-                    cursor.0,
-                    cursor.1,
+                    cursor,
                     2,
                     None,
                     &mut SelectionAnchorRegistry::default(),
@@ -14139,8 +14144,7 @@ pub(crate) mod tests {
             cursor = screen.rewrap_lines(
                 cols,
                 1,
-                cursor.0,
-                cursor.1,
+                cursor,
                 2,
                 None,
                 &mut SelectionAnchorRegistry::default(),
