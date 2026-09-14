@@ -8126,7 +8126,10 @@ pub(crate) mod tests {
             .hydrate(|| false)
             .unwrap();
         assert_eq!(read.row_count(), 2);
-        assert_eq!(*sink.requests.lock().unwrap(), [18..20]);
+        assert_eq!(
+            sink.requests.lock().unwrap().as_slice(),
+            std::slice::from_ref(&(18..20))
+        );
         sink.requests.lock().unwrap().clear();
         let error = screen
             .capture_line_read(18..21)
@@ -8149,7 +8152,10 @@ pub(crate) mod tests {
         assert!(error
             .to_string()
             .contains("cold logical context unavailable"));
-        assert_eq!(*sink.requests.lock().unwrap(), [0..2]);
+        assert_eq!(
+            sink.requests.lock().unwrap().as_slice(),
+            std::slice::from_ref(&(0..2))
+        );
     }
 
     #[cfg(feature = "use_serde")]
@@ -8170,7 +8176,10 @@ pub(crate) mod tests {
             .err()
             .expect("cancellation during the first batch must stop continuation");
         assert!(error.to_string().contains("cold read cancelled"));
-        assert_eq!(*sink.requests.lock().unwrap(), [0..32]);
+        assert_eq!(
+            sink.requests.lock().unwrap().as_slice(),
+            std::slice::from_ref(&(0..32))
+        );
     }
 
     #[cfg(feature = "use_serde")]
