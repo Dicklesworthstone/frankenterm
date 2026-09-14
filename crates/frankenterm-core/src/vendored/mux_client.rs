@@ -6678,11 +6678,12 @@ mod tests {
                         test_render_change(9, 1 + index.min(UPDATES - 1) / 2, "ordinary poll");
                     if index < UPDATES {
                         payload.bonus_lines = test_bonus_lines(&[&format!("delta-{index} 界")]);
+                        let unilateral = Pdu::GetPaneRenderChangesResponse(payload.clone());
                         let response = Pdu::GetPaneRenderChangesResponse(payload);
                         if delayed_bulk {
-                            (Vec::new(), Some(response.clone()), vec![response])
+                            (Vec::new(), Some(response), vec![unilateral])
                         } else {
-                            (vec![response.clone()], Some(response), Vec::new())
+                            (vec![unilateral], Some(response), Vec::new())
                         }
                     } else {
                         (
