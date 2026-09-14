@@ -422,19 +422,20 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
         target_name.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
 
         let result = unsafe { DisplayConfigGetDeviceInfo(&mut target_name.header) };
-        if result != ERROR_SUCCESS as i32 {
-            return Err(std::io::Error::last_os_error())
+        if result != ERROR_SUCCESS.0 as i32 {
+            return Err(std::io::Error::from_raw_os_error(result))
                 .context("DisplayConfigGetDeviceInfo DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME");
         }
 
         let mut source_name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-        source_name.header.adapterId = path.targetInfo.adapterId;
+        source_name.header.adapterId = path.sourceInfo.adapterId;
+        source_name.header.id = path.sourceInfo.id;
         source_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         source_name.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
 
         let result = unsafe { DisplayConfigGetDeviceInfo(&mut source_name.header) };
-        if result != ERROR_SUCCESS as i32 {
-            return Err(std::io::Error::last_os_error())
+        if result != ERROR_SUCCESS.0 as i32 {
+            return Err(std::io::Error::from_raw_os_error(result))
                 .context("DisplayConfigGetDeviceInfo DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME");
         }
 
