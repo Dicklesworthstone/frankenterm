@@ -128,12 +128,43 @@ impl Drop for CancelLineReadOnDrop {
     }
 }
 
+fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
+    if error
+        .downcast_ref::<wezterm_term::screen::ColdReadPayloadLimit>()
+        .is_some()
+    {
+        "payload_limit"
+    } else if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<wezterm_term::screen::ColdReadGeometryUnavailable>()
+            .is_some()
+    }) {
+        "geometry_unavailable"
+    } else {
+        "other"
+    }
+}
+
+fn record_line_read_failure(stage: &'static str, error: &anyhow::Error) {
+    let reason = line_read_failure_reason(error);
+    metrics::counter!("mux.server.line_read_failure", "stage" => stage, "reason" => reason)
+        .increment(1);
+    // Arbitrary anyhow text may contain terminal content or storage paths.
+    // Keep those off both the wire and the local failure diagnostic.
+    log::warn!("owned line read failed stage={stage} reason={reason}");
+}
+
 fn complete_owned_line_read(
     result: anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>,
     permit: mux::pane::LineReadPermit,
     cancelled: impl Fn() -> bool,
     complete: impl FnOnce(anyhow::Result<OwnedLineReply>),
 ) {
+    let failure_stage = if result.is_err() {
+        "hydrate"
+    } else {
+        "reply_prepare"
+    };
     let (retirement, retired) = std::sync::mpsc::sync_channel(1);
     let mut retained_cells = Vec::new();
     let result = result.and_then(|plans| {
@@ -178,6 +209,9 @@ fn complete_owned_line_read(
             retirement,
         })
     });
+    if let Err(error) = &result {
+        record_line_read_failure(failure_stage, error);
+    }
     complete(result);
     drop(retired.recv());
     drop(retained_cells);
@@ -8517,6 +8551,7 @@ impl SessionHandler {
                                 return;
                             }
                             Err(error) => {
+                                record_line_read_failure("capture", &error);
                                 cancelled.store(true, Ordering::Release);
                                 worker.submit(plans);
                                 send_response(Err(error));
@@ -8574,7 +8609,11 @@ impl SessionHandler {
                                     })
                                 });
                                 if !response_attempted && !matches!(published, Ok(true)) {
-                                    send_response(Err(anyhow!("cold read source changed or busy")));
+                                    let error = published.err().unwrap_or_else(|| {
+                                        anyhow!("cold read source changed or busy")
+                                    });
+                                    record_line_read_failure("publish", &error);
+                                    send_response(Err(error));
                                 }
                             }
                         }
@@ -9451,6 +9490,150 @@ mod tests {
             }
             assert!(!token.abandoned.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn tiered_native_unicode_corpus_completes_two_thousand_row_reply() {
+        use wezterm_term::config::{ScrollbackSpillSink, ScrollbackTierConfig};
+
+        #[derive(Debug)]
+        struct Config(Arc<dyn ScrollbackSpillSink>);
+        impl wezterm_term::TerminalConfiguration for Config {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                wezterm_term::color::ColorPalette::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                100_000
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1_000,
+                    warm_max_bytes: 50 * 1024 * 1024,
+                }
+            }
+            fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        // Match the default-tiering native profile's 173-column pane and
+        // 10,000-line Unicode corpus. Drain only between bounded parser inputs,
+        // through the real deferred queue and authenticated durable store.
+        let (_dir, backing, deferred) = crate::tests::deferred_test_sink();
+        let mut term = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 45,
+                cols: 173,
+                pixel_width: 2768,
+                pixel_height: 1620,
+                dpi: 144,
+            },
+            Arc::new(Config(deferred.clone())),
+            "FrankenTerm",
+            "native-cold-reply-regression",
+            Box::new(Vec::<u8>::new()),
+        );
+        let paragraph = "Text reflow: ASCII ligatures ffi =>, 界面, e\u{301}, 🚀. ".repeat(9);
+        for row in 0..10_000 {
+            // The native PTY's ONLCR performs this newline translation.
+            term.advance_bytes(format!("{row:05} {paragraph}\r\n").as_bytes());
+            if row % 64 == 63 {
+                deferred.flush_scrollback().unwrap();
+            }
+        }
+        term.advance_bytes(b"FRANKENTERM_PROFILE_READY\r\n");
+        deferred.flush_scrollback().unwrap();
+        assert!(backing.retained_scrollback_rows() > 2_000);
+        assert_eq!(backing.oldest_scrollback_row(), Some(0));
+
+        let plan = term.screen().capture_line_read(0..2_000).unwrap();
+        let ready = plan.hydrate(|| false).unwrap();
+        assert_eq!(ready.row_count(), 2_000);
+        assert!(term.screen().validates_line_read(&ready));
+        let limit = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+        assert!(ready.payload_bytes() <= limit);
+        assert!(
+            ready.payload_bytes() > limit / 2,
+            "charging these preserved rows twice must exceed the unchanged limit"
+        );
+        eprintln!(
+            "NATIVE_COLD_REPLY source_rows={} requested_rows=2000 payload_bytes={} limit={limit}",
+            backing.retained_scrollback_rows(),
+            ready.payload_bytes(),
+        );
+        let expected: Vec<_> = ready
+            .lines()
+            .map(|line| {
+                (
+                    line.as_str().into_owned(),
+                    line.len(),
+                    line.last_cell_was_wrapped(),
+                )
+            })
+            .collect();
+        assert!(expected[0].0.starts_with("00000 Text reflow:"));
+        let mut outcome = None;
+        complete_owned_line_read(
+            Ok(vec![ready]),
+            line_read_test_permit(),
+            || false,
+            |result| {
+                outcome = Some(result.map(|reply| {
+                    assert!(term.screen().validates_line_read(&reply.plans[0]));
+                    let payload = reply.payload.as_ref().unwrap();
+                    assert_eq!(payload.validate_structure().unwrap().lines, 2_000);
+                    let observed: Vec<_> = payload
+                        .lines()
+                        .enumerate()
+                        .map(|(index, (row, line))| {
+                            assert_eq!(*row, index as StableRowIndex);
+                            (
+                                line.as_str().into_owned(),
+                                line.len(),
+                                line.last_cell_was_wrapped(),
+                            )
+                        })
+                        .collect();
+                    drop(reply);
+                    observed
+                }));
+            },
+        );
+        assert_eq!(outcome.unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn line_read_failure_diagnostics_use_only_finite_content_free_reasons() {
+        let serialized_overflow = line_read_test_plan()
+            .hydrate_with_payload_limit(1, || false)
+            .err()
+            .expect("the real hydration writer must overflow");
+        assert!(
+            serialized_overflow
+                .downcast_ref::<serde_json::Error>()
+                .is_some()
+        );
+        assert_eq!(
+            line_read_failure_reason(&serialized_overflow),
+            "payload_limit"
+        );
+        assert_eq!(
+            line_read_failure_reason(&anyhow::Error::new(
+                wezterm_term::screen::ColdReadPayloadLimit
+            )),
+            "payload_limit"
+        );
+        assert_eq!(
+            line_read_failure_reason(&anyhow::Error::new(
+                wezterm_term::screen::ColdReadGeometryUnavailable
+            )),
+            "geometry_unavailable"
+        );
+        assert_eq!(
+            line_read_failure_reason(&anyhow!("private terminal text")),
+            "other"
+        );
     }
 
     #[test]

@@ -384,10 +384,40 @@ pub struct ColdSeamReflow {
 }
 
 #[cfg(feature = "use_serde")]
+#[derive(Debug)]
+pub struct ColdReadPayloadLimit;
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for ColdReadPayloadLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cold read payload limit")
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for ColdReadPayloadLimit {}
+
+#[cfg(feature = "use_serde")]
 struct ColdReadCharge {
     used: usize,
     limit: usize,
     index_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdReadCharge {
+    fn serialize_line(&mut self, line: &Line) -> anyhow::Result<()> {
+        serde_json::to_writer(self, line).map_err(|error| {
+            // This writer performs no IO: its only IO error is its byte cap.
+            // Preserve a typed context explicitly; serde_json and io::Error
+            // may forward source() past the custom writer error itself.
+            if error.is_io() {
+                anyhow::Error::new(error).context(ColdReadPayloadLimit)
+            } else {
+                error.into()
+            }
+        })
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -401,7 +431,7 @@ impl std::io::Write for ColdReadCharge {
                 if let Some(failed) = &self.index_failure {
                     failed.store(true, std::sync::atomic::Ordering::Release);
                 }
-                std::io::Error::other("cold read payload limit")
+                std::io::Error::other(ColdReadPayloadLimit)
             })?;
         Ok(bytes.len())
     }
@@ -664,10 +694,10 @@ impl ScreenLineRead {
             for original in batch {
                 anyhow::ensure!(!cancelled(), "cold index cancelled");
                 let before_bytes = charge.used;
-                serde_json::to_writer(&mut charge, &original)?;
+                charge.serialize_line(&original)?;
                 let mut line = cold_row_with_fragment(self.fragments.as_deref(), row, original);
                 if self.fragments.is_some() {
-                    serde_json::to_writer(&mut charge, &line)?;
+                    charge.serialize_line(&line)?;
                 }
                 source_bytes = source_bytes
                     .checked_add(charge.used - before_bytes)
@@ -906,12 +936,36 @@ impl ScreenLineRead {
                     self.wrap_policy,
                 )
             });
+        fn materialize_physical_row(
+            line: &mut Line,
+            charge: &mut ColdReadCharge,
+            cancelled: &impl Fn() -> bool,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(!cancelled(), "cold read cancelled");
+            let before = charge.used;
+            let cells = line
+                .len()
+                .checked_mul(std::mem::size_of::<Cell>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Line>()))
+                .and_then(|bytes| before.checked_add(bytes))
+                .filter(|bytes| *bytes <= charge.limit)
+                .ok_or(ColdReadPayloadLimit)?;
+            // Materialize on the worker, after bounding cell-array growth.
+            // This is the final raw-row representation: its complete fields
+            // are charged once, including all attributes and image payloads.
+            let _ = line.cells_mut_for_attr_changes_only();
+            charge.serialize_line(line)?;
+            charge.used = charge.used.max(cells);
+            anyhow::ensure!(!cancelled(), "cold read cancelled");
+            Ok(())
+        }
         fn context_batch(
             sink: &dyn crate::config::ScrollbackSpillSink,
             mut range: Range<StableRowIndex>,
             charge: &mut ColdReadCharge,
             cancelled: &impl Fn() -> bool,
             fragments: Option<&ColdRowFragments>,
+            stored_physical: bool,
         ) -> anyhow::Result<Vec<Line>> {
             let mut result = Vec::new();
             while range.start < range.end {
@@ -921,12 +975,19 @@ impl ScreenLineRead {
                     !batch.is_empty() && batch.len() <= (range.end - range.start) as usize,
                     "cold logical context unavailable"
                 );
-                for line in batch {
+                for mut line in batch {
                     anyhow::ensure!(!cancelled(), "cold read cancelled");
-                    serde_json::to_writer(&mut *charge, &line)?;
+                    if stored_physical {
+                        anyhow::ensure!(fragments.is_none(), ColdReadGeometryUnavailable);
+                        materialize_physical_row(&mut line, charge, cancelled)?;
+                        result.push(line);
+                        range.start += 1;
+                        continue;
+                    }
+                    charge.serialize_line(&line)?;
                     let line = cold_row_with_fragment(fragments, range.start, line);
                     if fragments.is_some() {
-                        serde_json::to_writer(&mut *charge, &line)?;
+                        charge.serialize_line(&line)?;
                     }
                     result.push(line);
                     range.start += 1;
@@ -993,6 +1054,7 @@ impl ScreenLineRead {
                             &mut charge,
                             &cancelled,
                             self.fragments.as_deref(),
+                            layout.stored_physical(),
                         )?
                         .into_iter();
                     }
@@ -1055,11 +1117,22 @@ impl ScreenLineRead {
                 context_first.get_or_insert(visual.start);
                 visible.extend(wrapped);
             }
-            visible.extend(self.resident.iter().cloned());
-            for line in &mut visible {
-                anyhow::ensure!(!cancelled(), "cold read cancelled");
-                let _ = line.cells_mut_for_attr_changes_only();
-                serde_json::to_writer(&mut charge, line)?;
+            if layout.stored_physical() {
+                // Prefetched physical rows already own their final charged
+                // cells. Charging them again rejects an ordinary 2,000-row
+                // reply even when its complete payload fits the hard limit.
+                for source in &self.resident {
+                    let mut line = source.clone();
+                    materialize_physical_row(&mut line, &mut charge, &cancelled)?;
+                    visible.push(line);
+                }
+            } else {
+                visible.extend(self.resident.iter().cloned());
+                for line in &mut visible {
+                    anyhow::ensure!(!cancelled(), "cold read cancelled");
+                    let _ = line.cells_mut_for_attr_changes_only();
+                    charge.serialize_line(line)?;
+                }
             }
             let context_first = context_first.unwrap_or(self.resident_first);
             let selected: Vec<_> = visible
@@ -1123,10 +1196,10 @@ impl ScreenLineRead {
             );
             for line in batch {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
-                serde_json::to_writer(&mut charge, &line)?;
+                charge.serialize_line(&line)?;
                 let line = cold_row_with_fragment(self.fragments.as_deref(), row, line);
                 if self.fragments.is_some() {
-                    serde_json::to_writer(&mut charge, &line)?;
+                    charge.serialize_line(&line)?;
                 }
                 self.hydrated.push(line);
                 row += 1;
@@ -1134,7 +1207,7 @@ impl ScreenLineRead {
         }
         for line in &self.resident {
             anyhow::ensure!(!cancelled(), "cold read cancelled");
-            serde_json::to_writer(&mut charge, line)?;
+            charge.serialize_line(line)?;
         }
         if !self.hydrated.is_empty() {
             let (sink, interval) = self
@@ -1167,6 +1240,7 @@ impl ScreenLineRead {
                     &mut charge,
                     &cancelled,
                     self.fragments.as_deref(),
+                    false,
                 )?;
                 let mut found_start = false;
                 for line in batch.into_iter().rev() {
@@ -1212,6 +1286,7 @@ impl ScreenLineRead {
                     &mut charge,
                     &cancelled,
                     self.fragments.as_deref(),
+                    false,
                 )?;
                 for line in batch {
                     let wrapped = line.last_cell_was_wrapped();
@@ -1358,7 +1433,7 @@ impl ScreenLineRead {
             for line in &mut output {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
                 let _ = line.cells_mut_for_attr_changes_only();
-                serde_json::to_writer(&mut charge, line)?;
+                charge.serialize_line(line)?;
             }
             let visible: Vec<Line> = output
                 .iter()
@@ -9406,6 +9481,78 @@ pub(crate) mod tests {
             .hydrate(|| calls.fetch_add(1, Ordering::Relaxed) >= 5);
         assert!(result.is_err());
         assert!(sink.batch_reads.load(Ordering::Relaxed) < 15);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_payload_charges_final_context_once_at_exact_boundary() {
+        let (mut screen, sink) = stored_physical_fixture(8, 32);
+        // The same logical context may contain durable vector rows and a
+        // resident compressed tail. Both must become fully charged worker
+        // rows, without changing text, attributes, or wrapped boundaries.
+        screen.lines[0].compress_for_scrollback();
+        let mut expected: Vec<_> = (6..8)
+            .map(|row| sink.load_scrollback_line(row).unwrap())
+            .chain(std::iter::once(screen.lines[0].clone()))
+            .collect();
+        let captured = screen.capture_line_read(6..9).unwrap();
+        let layout = captured.layout.as_ref().unwrap();
+        let metadata_bytes = std::mem::size_of::<ColdVisualLayout>()
+            + 2 * std::mem::size_of::<usize>()
+            + layout.groups.capacity()
+                * std::mem::size_of::<(Range<StableRowIndex>, Range<StableRowIndex>)>();
+        let mut exact = metadata_bytes;
+        for line in &mut expected {
+            let _ = line.cells_mut_for_attr_changes_only();
+            exact += serde_json::to_vec(line)
+                .unwrap()
+                .len()
+                .max(line.len() * std::mem::size_of::<Cell>() + std::mem::size_of::<Line>());
+        }
+        let ready = captured
+            .hydrate_with_payload_limit(exact, || false)
+            .unwrap();
+        assert_eq!(ready.payload_bytes(), exact);
+        assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), expected);
+        assert!(screen.validates_line_read(&ready));
+        let rejected = screen
+            .capture_line_read(6..9)
+            .unwrap()
+            .hydrate_with_payload_limit(exact - 1, || false)
+            .err()
+            .expect("one byte below the complete context must fail");
+        assert!(rejected.downcast_ref::<ColdReadPayloadLimit>().is_some());
+        assert!(screen.validates_line_read(&ready));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_payload_keeps_hyperlink_attributes_in_the_charge() {
+        let (mut screen, _) = stored_physical_fixture(0, 32);
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::new(termwiz::hyperlink::Hyperlink::new(format!(
+            "https://example.invalid/{}",
+            "a".repeat(8_192)
+        )))));
+        attrs.set_italic(true);
+        let line = Line::from_text("linked", &attrs, 1, None);
+        assert!(screen.record_scrollback_spill(0, &line, 1));
+        screen.advance_stable_row_index_offset(1);
+        let rejected = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate_with_payload_limit(4_096, || false)
+            .err()
+            .expect("small text must not hide a large attribute payload");
+        assert!(rejected.downcast_ref::<ColdReadPayloadLimit>().is_some());
+        let ready = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(ready.lines().next().unwrap(), &line);
+        assert!(ready.payload_bytes() > 8_192);
+        assert!(screen.validates_line_read(&ready));
     }
 
     #[cfg(feature = "use_serde")]
