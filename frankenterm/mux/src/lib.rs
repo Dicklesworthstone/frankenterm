@@ -30845,7 +30845,7 @@ mod tests {
     fn scheduled_pane_output_drain_does_not_retain_destroyed_mux() {
         let _guard = global_test_lock();
         Mux::shutdown();
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _pane = register_test_pane(&mux, 7);
         let pane_outputs = Arc::new(Mutex::new(Vec::new()));
@@ -30870,9 +30870,20 @@ mod tests {
             weak_mux.upgrade().is_none(),
             "pane registrations and deferred drain state must not form a strong mux cycle",
         );
-        executor
-            .tick()
-            .expect("scheduled pane-output drain should run");
+        // The same-priority FIFO sentinel follows the already-enqueued drain;
+        // no notification after one unrelated tick would not prove execution.
+        let drain_processed = Arc::new(AtomicBool::new(false));
+        let observed_drain = Arc::clone(&drain_processed);
+        assert!(schedule_mux_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            "test destroyed mux drain completion",
+            move || async move {
+                observed_drain.store(true, Ordering::Release);
+            },
+        ));
+        executor.run_until(Duration::from_secs(5), || {
+            drain_processed.load(Ordering::Acquire)
+        });
 
         assert!(
             pane_outputs.lock().is_empty(),
@@ -31048,7 +31059,7 @@ mod tests {
     fn remove_pane_preserves_already_accepted_output_before_removed() {
         let _guard = global_test_lock();
         Mux::shutdown();
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         Mux::set_mux(&mux);
         let _pane = register_test_pane(&mux, 7);
@@ -31079,9 +31090,20 @@ mod tests {
         assert_eq!(&*pane_outputs.lock(), &[7]);
 
         mux.flush_pending_pane_output_notifications();
-        executor
-            .tick()
-            .expect("scheduled pane-output drain should run");
+        // The synchronous flush has already sealed this batch. Exercise the
+        // queued drain too before asserting that it cannot publish a duplicate.
+        let drain_processed = Arc::new(AtomicBool::new(false));
+        let observed_drain = Arc::clone(&drain_processed);
+        assert!(schedule_mux_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            "test removed pane drain completion",
+            move || async move {
+                observed_drain.store(true, Ordering::Release);
+            },
+        ));
+        executor.run_until(Duration::from_secs(5), || {
+            drain_processed.load(Ordering::Acquire)
+        });
         assert_eq!(
             pane_outputs.lock().as_slice(),
             [7],
