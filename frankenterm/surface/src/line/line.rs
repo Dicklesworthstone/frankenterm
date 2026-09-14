@@ -355,7 +355,7 @@ impl Line {
     /// content of the line.
     ///
     /// Line doesn't implement Hash in terms of this function as compute_shape_hash
-    /// doesn't every possible bit of internal state, and we don't want to
+    /// doesn't include every possible bit of internal state, and we don't want to
     /// encourage using Line directly as a hash key.
     pub fn compute_shape_hash(&self) -> [u8; 16] {
         #[cfg(feature = "std")]

@@ -1874,7 +1874,10 @@ impl CachedResizeLines {
 
 #[derive(Debug, Clone)]
 struct LogicalLineWrapCache {
-    source_signature: u64,
+    // Cold preparation relies on exact source-row validation at publication.
+    // Until then, None cannot authorize a generic cache lookup. Publication
+    // replaces it with the complete target-layout signature.
+    source_signature: Option<u64>,
     logical_lines: Arc<[CachedLogicalLine]>,
     wrapped_by_key: HashMap<WrapCacheKey, CachedResizeLines>,
     wrap_key_order: VecDeque<WrapCacheKey>,
@@ -1951,6 +1954,7 @@ impl ScreenReflowPreparation {
             .logical_wraps_for_resize(
                 self.target.cols.max(1),
                 self.source_cursor.seqno,
+                false,
                 &is_cancelled,
             )
             .is_some();
@@ -2150,7 +2154,7 @@ impl ColdScrollbackReflowWorker {
 }
 
 impl LogicalLineWrapCache {
-    fn new(source_signature: u64, logical_lines: Vec<Line>) -> Self {
+    fn new(source_signature: Option<u64>, logical_lines: Vec<Line>) -> Self {
         Self::with_token_budget(
             source_signature,
             logical_lines,
@@ -2159,7 +2163,7 @@ impl LogicalLineWrapCache {
     }
 
     fn with_token_budget(
-        source_signature: u64,
+        source_signature: Option<u64>,
         logical_lines: Vec<Line>,
         mut remaining: usize,
     ) -> Self {
@@ -4656,10 +4660,14 @@ impl Screen {
         }
     }
 
+    // Direct resizing retains a source signature for subsequent cache lookup.
+    // Preparation can omit its first source hash because exact source rows
+    // authorize publication, which installs the target signature instead.
     fn logical_wraps_for_resize(
         &mut self,
         physical_cols: usize,
         seqno: SequenceNo,
+        retain_source_signature: bool,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Option<(WrappedResizeLines, usize, bool, bool, usize)> {
         if is_cancelled() {
@@ -4672,7 +4680,10 @@ impl Screen {
         let mut logical_cache_hit = false;
         let mut wrap_cache_hit = false;
         let mut cache = self.rewrap_cache.take();
-        let source_signature = if cache.is_some() {
+        let source_signature = if cache
+            .as_ref()
+            .is_some_and(|entry| entry.source_signature.is_some())
+        {
             #[cfg(test)]
             REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(count.get() + 1));
             Some(self.compute_layout_signature())
@@ -4681,7 +4692,7 @@ impl Screen {
         };
 
         if let (Some(entry), Some(source_signature)) = (cache.as_mut(), source_signature) {
-            if entry.source_signature == source_signature {
+            if entry.source_signature == Some(source_signature) {
                 let entry = Arc::make_mut(entry);
                 logical_cache_hit = true;
                 let logical_count = entry.logical_lines.len();
@@ -4729,14 +4740,16 @@ impl Screen {
             }
         }
 
-        let (logical_lines, source_signature, logical_ranges) = match source_signature {
-            Some(source_signature) => {
+        let (logical_lines, source_signature, logical_ranges) =
+            if source_signature.is_some() || !retain_source_signature {
                 let (logical_lines, logical_ranges) =
                     self.rebuild_logical_lines_from_physical_with_ranges(seqno);
                 (logical_lines, source_signature, logical_ranges)
-            }
-            None => self.rebuild_logical_lines_from_physical_with_signature_and_ranges(seqno),
-        };
+            } else {
+                let (logical_lines, source_signature, logical_ranges) =
+                    self.rebuild_logical_lines_from_physical_with_signature_and_ranges(seqno);
+                (logical_lines, Some(source_signature), logical_ranges)
+            };
         let logical_count = logical_lines.len();
         let reflow_plan =
             self.build_viewport_reflow_plan_for_logical_ranges(&logical_ranges, logical_count);
@@ -5143,7 +5156,7 @@ impl Screen {
                     verified.cache_entries,
                 )
             } else {
-                self.logical_wraps_for_resize(physical_cols, seqno, &|| false)
+                self.logical_wraps_for_resize(physical_cols, seqno, true, &|| false)
                     .expect("synchronous reflow cannot be cancelled")
             };
         let wraps_elapsed = profile_start.map(|start| start.elapsed());
@@ -5279,7 +5292,7 @@ impl Screen {
                 cached_layout_signature.unwrap_or_else(|| self.compute_layout_signature());
             if let Some(cache) = self.rewrap_cache.as_mut() {
                 let cache = Arc::make_mut(cache);
-                cache.source_signature = layout_signature;
+                cache.source_signature = Some(layout_signature);
                 let key = WrapCacheKey {
                     physical_cols,
                     dpi: self.dpi,
@@ -9031,7 +9044,7 @@ pub(crate) mod tests {
             + std::mem::size_of::<LineWrapWidthPrefixScratch>()
             + std::mem::size_of::<u128>();
         let cache = LogicalLineWrapCache::with_token_budget(
-            0,
+            None,
             vec![first.clone(), last.clone()],
             one_line_budget,
         );
@@ -9236,8 +9249,25 @@ pub(crate) mod tests {
                 .collect();
             let cursor = test_cursor(0, 2, 1);
             let size = test_size(3, 7, 96);
+            assert!(screen.rewrap_cache.is_none());
             let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
             assert!(prepared.prepare(|| false));
+            assert_eq!(
+                REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()),
+                0,
+                "cold preparation must not hash the initial source"
+            );
+            assert_eq!(
+                prepared
+                    .snapshot
+                    .rewrap_cache
+                    .as_ref()
+                    .unwrap()
+                    .source_signature,
+                None,
+                "prepared source rows have not authorized a generic cache lookup"
+            );
             let key = WrapCacheKey {
                 physical_cols: size.cols,
                 dpi: size.dpi,
@@ -9272,7 +9302,13 @@ pub(crate) mod tests {
                 screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 1);
             }
             let mut expected = screen.clone();
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
             let expected_cursor = expected.resize(size, cursor, 2, false);
+            assert_eq!(
+                REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()),
+                1,
+                "direct cold resizing must retain its initial source hash"
+            );
             assert!(expected.last_resize_wrap_scorecard.is_some());
             assert!(expected.last_resize_wrap_gate_payload.is_some());
             REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
@@ -9312,6 +9348,97 @@ pub(crate) mod tests {
                     screen.rewrap_cache.as_ref().unwrap().wrapped_by_key[&key].row_prefix(),
                 ));
             }
+            assert_eq!(
+                screen.rewrap_cache.as_ref().unwrap().source_signature,
+                Some(screen.compute_layout_signature()),
+                "publication must install the complete target signature"
+            );
+            assert_eq!(actual_cursor, expected_cursor);
+            assert_eq!(screen.lines, expected.lines);
+            assert_eq!(screen.physical_cols, expected.physical_cols);
+            assert_eq!(screen.physical_rows, expected.physical_rows);
+            assert_eq!(
+                screen.stable_row_index_offset,
+                expected.stable_row_index_offset
+            );
+            assert_eq!(
+                screen.last_resize_wrap_scorecard,
+                expected.last_resize_wrap_scorecard
+            );
+            assert_eq!(
+                screen.last_resize_wrap_gate_payload,
+                expected.last_resize_wrap_gate_payload
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_prepared_cache_cannot_authorize_direct_reuse() {
+        for mutate_source in [false, true] {
+            let mut screen = test_screen_with_scorecard(3, 20);
+            screen.lines = (0..12)
+                .map(|index| {
+                    Line::from_text(
+                        &format!("{index:02} 界👩‍💻e\u{301} אב abcdefghijklmnop"),
+                        &CellAttributes::blank(),
+                        1,
+                        None,
+                    )
+                })
+                .collect();
+            let cursor = test_cursor(0, 2, 1);
+            let size = test_size(3, 7, 96);
+            let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+            assert!(prepared.prepare(|| false));
+            assert_eq!(
+                prepared
+                    .snapshot
+                    .rewrap_cache
+                    .as_ref()
+                    .unwrap()
+                    .source_signature,
+                None
+            );
+            // Exercise an unsigned cache reaching the generic lookup without
+            // the exact-source publication guard, including a same-seqno edit.
+            screen.rewrap_cache = prepared.snapshot.rewrap_cache.clone();
+            if mutate_source {
+                screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 1);
+            }
+            let mut expected = screen.clone();
+            expected.rewrap_cache = None;
+            let source_signature = screen.compute_layout_signature();
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            let (_, _, logical_hit, wrapped_hit, _) = screen
+                .logical_wraps_for_resize(size.cols, 2, true, &|| false)
+                .unwrap();
+            assert!(!logical_hit, "None must never match a source signature");
+            assert!(!wrapped_hit, "unsigned prepared rows cannot be reused");
+            assert_eq!(
+                REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()),
+                1,
+                "direct reconstruction must compute a real source signature"
+            );
+            assert_eq!(
+                screen.rewrap_cache.as_ref().unwrap().source_signature,
+                Some(source_signature)
+            );
+
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            let (_, _, logical_hit, wrapped_hit, _) = screen
+                .logical_wraps_for_resize(size.cols, 2, true, &|| false)
+                .unwrap();
+            assert!(
+                logical_hit && wrapped_hit,
+                "signed direct caches remain reusable"
+            );
+            assert_eq!(
+                REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()),
+                1,
+                "a warm hit still validates the complete current source"
+            );
+            let actual_cursor = screen.resize(size, cursor, 2, false);
+            let expected_cursor = expected.resize(size, cursor, 2, false);
             assert_eq!(actual_cursor, expected_cursor);
             assert_eq!(screen.lines, expected.lines);
             assert_eq!(screen.physical_cols, expected.physical_cols);
@@ -9576,7 +9703,7 @@ pub(crate) mod tests {
                 );
                 let full_hash = screen.compute_layout_signature();
                 let cache = screen.rewrap_cache.as_ref().unwrap();
-                assert_eq!(cache.source_signature, full_hash);
+                assert_eq!(cache.source_signature, Some(full_hash));
                 assert_eq!(cache.wrapped_by_key[&key].layout_signature, Some(full_hash));
             }
             assert!(reused >= 4, "must exercise repeated target signatures");
@@ -9614,7 +9741,10 @@ pub(crate) mod tests {
         for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
             let cache = screen.rewrap_cache.as_ref().unwrap();
-            assert_eq!(cache.source_signature, screen.compute_layout_signature());
+            assert_eq!(
+                cache.source_signature,
+                Some(screen.compute_layout_signature())
+            );
             assert!(cache
                 .wrapped_by_key
                 .values()
@@ -9631,7 +9761,10 @@ pub(crate) mod tests {
         assert_ne!(screen.compute_layout_signature(), before);
         let _ = screen.resize(test_size(3, 5, 96), cursor, 5, false);
         let cache = screen.rewrap_cache.as_ref().unwrap();
-        assert_eq!(cache.source_signature, screen.compute_layout_signature());
+        assert_eq!(
+            cache.source_signature,
+            Some(screen.compute_layout_signature())
+        );
         assert_eq!(
             cache.wrapped_by_key.len(),
             1,
@@ -10160,9 +10293,9 @@ pub(crate) mod tests {
                 .map(|_| Line::from_text("abcdefgh", &attrs, 0, None))
                 .collect::<Vec<_>>(),
         );
-        let _ = screen.logical_wraps_for_resize(4, 2, &|| false);
+        let _ = screen.logical_wraps_for_resize(4, 2, true, &|| false);
         let (_, _, _, wrap_cache_hit, _) =
-            screen.logical_wraps_for_resize(4, 2, &|| false).unwrap();
+            screen.logical_wraps_for_resize(4, 2, true, &|| false).unwrap();
         assert!(wrap_cache_hit, "exercise an actual cached wrap");
         screen.last_viewport_first_reflow_us = u64::MAX;
         screen.resize(test_size(4, 4, 96), test_cursor(0, 3, 1), 2, false);
@@ -11607,14 +11740,14 @@ pub(crate) mod tests {
         for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
         }
-        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, &|| false).unwrap();
+        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, true, &|| false).unwrap();
         assert!(cached, "exercise a previously cached target width");
         assert!(screen.last_resize_wrap_scorecard.is_none());
 
         // Installing the same policy must keep useful whole-line wraps.
         let unchanged = Arc::clone(&screen.config);
         screen.set_config(&unchanged);
-        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, &|| false).unwrap();
+        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, true, &|| false).unwrap();
         assert!(cached, "unchanged policy should retain cached wraps");
 
         let scored: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
