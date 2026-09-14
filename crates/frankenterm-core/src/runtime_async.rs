@@ -642,8 +642,12 @@ fn scheduler_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
 
 /// Remove the asupersync `RuntimeHandle` from thread-local storage.
 pub fn clear_runtime_handle() {
-    ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
-    ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.replace(None));
+    // Remove both authorities before running either destructor: dropping the
+    // final runtime handle can panic while retiring runtime-owned futures.
+    // Such a failure must not leave the shutdown token installed in TLS.
+    let handle = ASUPERSYNC_HANDLE.with(|cell| cell.take());
+    let shutdown_token = ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.take());
+    drop((handle, shutdown_token));
 }
 
 /// Project-owned error surface for fallible mutex and rwlock acquisition.
@@ -9375,6 +9379,177 @@ mod tests {
             current_runtime_handle().is_none(),
             "run_async_test should clear the ambient runtime handle after the test body finishes"
         );
+        assert!(ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.borrow().is_none()));
+    }
+
+    struct RuntimeTeardownProbe {
+        body_finished: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    struct RuntimeTlsCleanupProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    impl Drop for RuntimeTlsCleanupProbe {
+        fn drop(&mut self) {
+            let handle_clear = ASUPERSYNC_HANDLE
+                .try_with(|cell| cell.borrow().is_none())
+                .unwrap_or(false);
+            let token_clear = ASUPERSYNC_SHUTDOWN_TOKEN
+                .try_with(|cell| cell.borrow().is_none())
+                .unwrap_or(false);
+            self.0.store(
+                handle_clear && token_clear,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    std::thread_local! {
+        // Initialized after both runtime slots, so this destructor observes
+        // their values on the isolated child before those slots are destroyed.
+        static RUNTIME_TLS_CLEANUP_PROBE: std::cell::RefCell<Option<RuntimeTlsCleanupProbe>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    impl Drop for RuntimeTeardownProbe {
+        fn drop(&mut self) {
+            assert!(
+                self.body_finished
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+            panic!("runtime-owned teardown failure");
+        }
+    }
+
+    async fn park_runtime_teardown_probe(
+        body_finished: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        clear_before_drop: bool,
+        fail_body: bool,
+    ) {
+        let probe = RuntimeTeardownProbe {
+            body_finished: Arc::clone(&body_finished),
+            dropped,
+        };
+        let local_marker = std::rc::Rc::new(());
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let handle = current_runtime_handle().expect("body must have runtime authority");
+        let task = handle
+            .try_spawn_local(async move {
+                let _probe = probe;
+                let _local_marker = local_marker;
+                ready_tx
+                    .send(())
+                    .expect("root must wait for the parked task");
+                std::future::pending::<()>().await;
+            })
+            .expect("current-thread body must own the local lane");
+        drop(task);
+        drop(handle);
+        oneshot_recv(ready_rx)
+            .await
+            .expect("local task must reach its pending state");
+        body_finished.store(true, std::sync::atomic::Ordering::Release);
+        if clear_before_drop {
+            // Remove the wrapper's extra strong handle so Runtime::drop,
+            // rather than the later TLS clear, owns final destruction.
+            clear_runtime_handle();
+        }
+        assert!(!fail_body, "original test-body failure");
+    }
+
+    fn assert_runtime_teardown_failure(isolated: bool, clear_before_drop: bool, fail_body: bool) {
+        clear_runtime_handle();
+        let body_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_tls_cleared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(all(feature = "asupersync-runtime", unix))]
+        let child_tls_probe = Arc::clone(&child_tls_cleared);
+        let body_probe = Arc::clone(&body_finished);
+        let drop_probe = Arc::clone(&dropped);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            if isolated {
+                #[cfg(all(feature = "asupersync-runtime", unix))]
+                run_async_test_isolated(move || {
+                    ASUPERSYNC_HANDLE.with(|_| {});
+                    ASUPERSYNC_SHUTDOWN_TOKEN.with(|_| {});
+                    RUNTIME_TLS_CLEANUP_PROBE.with(|cell| {
+                        *cell.borrow_mut() = Some(RuntimeTlsCleanupProbe(child_tls_probe));
+                    });
+                    park_runtime_teardown_probe(
+                        body_probe,
+                        drop_probe,
+                        clear_before_drop,
+                        fail_body,
+                    )
+                });
+            } else {
+                run_async_test(park_runtime_teardown_probe(
+                    body_probe,
+                    drop_probe,
+                    clear_before_drop,
+                    fail_body,
+                ));
+            }
+        }));
+        assert!(body_finished.load(std::sync::atomic::Ordering::Acquire));
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(current_runtime_handle().is_none());
+        assert!(ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.borrow().is_none()));
+        if isolated {
+            assert!(child_tls_cleared.load(std::sync::atomic::Ordering::Acquire));
+        }
+        let payload = result.expect_err("runtime-owned teardown must never pass silently");
+        let expected = if fail_body {
+            "original test-body failure"
+        } else {
+            "runtime-owned teardown failure"
+        };
+        assert_eq!(payload.downcast_ref::<&str>().copied(), Some(expected));
+    }
+
+    #[test]
+    fn runtime_teardown_failure_is_propagated() {
+        assert_runtime_teardown_failure(false, true, false);
+        assert_runtime_teardown_failure(false, false, false);
+    }
+
+    #[test]
+    fn runtime_teardown_failure_preserves_body_failure_and_clears_tls() {
+        assert_runtime_teardown_failure(false, false, true);
+        assert_runtime_teardown_failure(false, true, true);
+    }
+
+    #[test]
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    fn runtime_teardown_failure_is_propagated_from_isolated_helper() {
+        assert_runtime_teardown_failure(true, true, false);
+        assert_runtime_teardown_failure(true, false, false);
+    }
+
+    #[test]
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    fn runtime_teardown_failure_preserves_isolated_body_failure() {
+        assert_runtime_teardown_failure(true, false, true);
+        assert_runtime_teardown_failure(true, true, true);
+    }
+
+    #[test]
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    fn runtime_teardown_normal_isolated_factory_keeps_context_contract() {
+        let factory_thread = std::thread::current().id();
+        run_async_test_isolated(move || {
+            assert_ne!(std::thread::current().id(), factory_thread);
+            assert!(current_runtime_handle().is_none());
+            async {
+                assert!(current_runtime_handle().is_some());
+            }
+        });
     }
 
     #[test]
@@ -9476,18 +9651,39 @@ mod tests {
         let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        clear_runtime_handle();
-        if let Err(payload) = test_result {
+        finish_async_test(runtime, test_result);
+    }
+
+    fn finish_async_test(runtime: Runtime, test_result: std::thread::Result<()>) {
+        // These are test failure boundaries, not production recovery: every
+        // failure must still fail the test, after both cleanup steps run.
+        let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_runtime_handle));
+        let mut first_failure = None;
+        for payload in [test_result, teardown, cleanup]
+            .into_iter()
+            .filter_map(Result::err)
+        {
+            if first_failure.is_none() {
+                first_failure = Some(payload);
+            } else {
+                // The test already fails with the earlier payload. Even
+                // a secondary payload's destructor must not replace that
+                // failure or abort a resumed unwind.
+                let _ = frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                    std::panic::AssertUnwindSafe(|| drop(payload)),
+                );
+            }
+        }
+        if let Some(payload) = first_failure {
             std::panic::resume_unwind(payload);
         }
     }
 
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
-    /// a pristine TLS state. Prevents interference when 25 000+ tests run
-    /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
+    /// pristine TLS state, independent of earlier tests that used the same
+    /// harness thread. Different threads do not share `ASUPERSYNC_HANDLE`.
     #[cfg(all(feature = "asupersync-runtime", unix))]
     fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
     where
@@ -9502,13 +9698,7 @@ mod tests {
                 let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(f());
                 }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(runtime);
-                }));
-                clear_runtime_handle();
-                if let Err(payload) = test_result {
-                    std::panic::resume_unwind(payload);
-                }
+                finish_async_test(runtime, test_result);
             })
             .expect("failed to spawn isolated test thread")
             .join();
