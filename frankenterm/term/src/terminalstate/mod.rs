@@ -117,7 +117,10 @@ fn last_row_for_height(rows: usize) -> i64 {
 }
 
 fn next_sequence_no(seqno: SequenceNo) -> SequenceNo {
-    seqno.saturating_add(1)
+    // MAX is a permanent exhausted sentinel, never a valid recovery witness.
+    // Keep rendering operational after exhaustion; checkpoint capture and its
+    // final validation reject this sentinel instead of reusing its identity.
+    seqno.checked_add(1).unwrap_or(SequenceNo::MAX)
 }
 
 impl TabStop {
@@ -882,6 +885,7 @@ impl TerminalState {
         prepared_config: PreparedRecoveryConfiguration,
         prepared_writer: PreparedTerminalWriter,
     ) -> Result<(), crate::config::ScrollbackActivationError> {
+        self.increment_seqno();
         self.screen
             .activate_recovered_scrollback(&prepared_config.config)?;
         self.screen
@@ -905,6 +909,7 @@ impl TerminalState {
     }
 
     pub fn enable_conpty_quirks(&mut self) {
+        self.increment_seqno();
         self.enable_conpty_quirks = true;
         self.suppress_initial_title_change = true;
     }
@@ -918,6 +923,7 @@ impl TerminalState {
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
+        self.increment_seqno();
         self.osc52_prompt.replace(None);
         let previous_unicode_version = self.config.unicode_version();
         let should_refresh_unicode_version = self.unicode_version_stack.is_empty()
@@ -1004,6 +1010,7 @@ impl TerminalState {
     /// Will make a copy of the palette from the config file if this
     /// is the first of these escapes we've seen.
     pub fn palette_mut(&mut self) -> &mut ColorPalette {
+        self.increment_seqno();
         if self.palette.is_none() {
             self.palette.replace(self.config.color_palette());
         }
@@ -1021,6 +1028,7 @@ impl TerminalState {
             .map(|p| *p == self.config.color_palette())
             .unwrap_or(false)
         {
+            self.increment_seqno();
             self.palette.take();
         }
     }
@@ -1034,6 +1042,7 @@ impl TerminalState {
     /// Returns a mutable reference to the active screen (either the primary or
     /// the alternate screen).
     pub fn screen_mut(&mut self) -> &mut Screen {
+        self.increment_seqno();
         &mut self.screen
     }
 
@@ -1041,7 +1050,11 @@ impl TerminalState {
     /// alternate screen is active. The caller drains its sink outside the
     /// terminal mutex between attempts.
     pub fn trim_deferred_scrollback(&mut self) -> Option<bool> {
-        self.screen.screen.trim_deferred_scrollback(self.seqno)
+        let result = self.screen.screen.trim_deferred_scrollback(self.seqno);
+        if result == Some(true) {
+            self.increment_seqno();
+        }
+        result
     }
 
     fn set_clipboard_contents(
@@ -1115,6 +1128,7 @@ impl TerminalState {
         if focused == self.focused {
             return;
         }
+        self.increment_seqno();
         if !focused {
             // notify app of release of buttons
             let buttons = self.current_mouse_buttons.clone();
@@ -1154,6 +1168,7 @@ impl TerminalState {
             // we have lost the focus more recently than the last
             // time we notified about it
             if self.lost_focus_seqno > self.lost_focus_alerted_seqno {
+                self.increment_seqno();
                 self.lost_focus_alerted_seqno = self.seqno;
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::OutputSinceFocusLost);
@@ -1308,8 +1323,9 @@ impl TerminalState {
 
     /// When dealing with selection, mark a range of lines as dirty
     pub fn make_all_lines_dirty(&mut self) {
+        self.increment_seqno();
         let seqno = self.seqno;
-        let screen = self.screen_mut();
+        let screen = &mut self.screen;
         screen.for_each_phys_line_mut(|_, line| {
             line.update_last_change_seqno(seqno);
         });
@@ -3175,7 +3191,9 @@ impl TerminalState {
     /// By default, all screen data is of type Output.  The shell needs to
     /// employ OSC 133 escapes to markup its output.
     pub fn get_semantic_zones(&mut self) -> anyhow::Result<Vec<SemanticZone>> {
-        let screen = self.screen_mut();
+        // Only memoized zone ranges change; querying them does not mutate the
+        // canonical terminal model or consume a recovery generation.
+        let screen = &mut self.screen;
 
         let mut current_zone: Option<SemanticZone> = None;
         let mut zones = vec![];
@@ -3554,9 +3572,56 @@ mod tests {
     }
 
     #[test]
-    fn next_sequence_no_saturates_at_usize_max() {
+    fn next_sequence_no_exhaustion_never_reuses_a_valid_witness() {
         assert_eq!(next_sequence_no(0), 1);
+        assert_eq!(next_sequence_no(usize::MAX - 1), usize::MAX);
         assert_eq!(next_sequence_no(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn semantic_generation_rejects_config_focus_and_mouse_aba() {
+        let (mut terminal, _output) = terminal_state_with_capture(false);
+        let initial_config = terminal.get_config();
+        let original_version = terminal.unicode_version;
+        let before_config = terminal.current_seqno();
+        terminal.set_config(Arc::new(TestTermConfig {
+            kitty_budget: 2048,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: true,
+            checksum_rectangular_area: false,
+        }));
+        terminal.set_config(initial_config);
+        assert_eq!(terminal.unicode_version, original_version);
+        assert!(terminal.current_seqno() > before_config);
+
+        let original_focus = terminal.focused;
+        let before_focus = terminal.current_seqno();
+        terminal.focus_changed(!original_focus);
+        terminal.focus_changed(original_focus);
+        assert_eq!(terminal.focused, original_focus);
+        assert!(terminal.current_seqno() > before_focus);
+
+        let before_input = terminal.current_seqno();
+        let event = MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            modifiers: KeyModifiers::NONE,
+            x: 0,
+            y: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        };
+        assert!(terminal.current_mouse_buttons.is_empty());
+        terminal.mouse_event(event).unwrap();
+        assert_eq!(terminal.current_mouse_buttons, vec![MouseButton::Left]);
+        terminal
+            .mouse_event(MouseEvent {
+                kind: MouseEventKind::Release,
+                ..event
+            })
+            .unwrap();
+        assert!(terminal.current_mouse_buttons.is_empty());
+        assert!(terminal.current_seqno() > before_input);
     }
 
     /// Per ft-mv27v (cont of ft-d1pv3): TerminalConfiguration test

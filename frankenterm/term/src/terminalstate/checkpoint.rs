@@ -2954,7 +2954,48 @@ pub struct StagedHotCheckpoint {
     limits: TerminalCheckpointLimits,
 }
 
+/// Immutable hot state bound to the actual external parser boundary before
+/// materialization leaves the reader thread.
+pub struct StagedRecoveryCheckpoint {
+    hot: StagedHotCheckpoint,
+    stream_bytes: u64,
+    limits: TerminalCheckpointLimits,
+}
+
+impl StagedRecoveryCheckpoint {
+    pub fn semantic_generation(&self) -> u64 {
+        self.hot.seqno
+    }
+
+    pub fn materialize(
+        self,
+    ) -> Result<crate::RecoveryTerminalCheckpointV2, TerminalCheckpointError> {
+        let checkpoint = self.hot.materialize_cold_history(self.limits)?;
+        let rows = checkpoint.primary_rows();
+        let cols = checkpoint.primary_cols();
+        let payload = checkpoint.to_canonical_json(self.limits)?;
+        Ok(crate::RecoveryTerminalCheckpointV2::from_canonical_parts(
+            payload,
+            rows,
+            cols,
+            self.stream_bytes,
+        ))
+    }
+}
+
 impl StagedHotCheckpoint {
+    pub fn bind_external_parser_ground(
+        self,
+        ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
+    ) -> StagedRecoveryCheckpoint {
+        let limits = self.limits;
+        StagedRecoveryCheckpoint {
+            hot: self,
+            stream_bytes: ground.stream_bytes(),
+            limits,
+        }
+    }
+
     /// Materialize cold-history rows and fragments from the spill sink outside the terminal lock,
     /// revalidate generation against the pinned generation (failing if stale),
     /// and assemble the canonical `TerminalCheckpointV2`.
@@ -3483,6 +3524,12 @@ impl TerminalCheckpointV2 {
         limits: TerminalCheckpointLimits,
     ) -> Result<StagedHotCheckpoint, TerminalCheckpointError> {
         limits.validate_policy()?;
+        if terminal.current_seqno() == usize::MAX {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "seqno",
+                reason: "terminal semantic generation exhausted",
+            });
+        }
         let lease_config = Arc::clone(&terminal.config);
         let _config_lease = lease_config.acquire_recovery_activation_lease();
         let pending_replay_config =
@@ -4155,6 +4202,28 @@ impl TerminalCheckpointV2 {
     #[must_use]
     pub fn alternate_lines_count(&self) -> usize {
         self.alternate_screen.lines.len()
+    }
+
+    /// Parser-observed title from this exact semantic checkpoint.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Parser-observed current-directory URL, without a live process fallback.
+    #[must_use]
+    pub fn current_directory(&self) -> Option<&str> {
+        self.current_dir.as_deref()
+    }
+
+    #[must_use]
+    pub fn semantic_generation(&self) -> u64 {
+        self.seqno
+    }
+
+    #[must_use]
+    pub fn pixel_dimensions_and_dpi(&self) -> (u64, u64, u32) {
+        (self.pixel_width, self.pixel_height, self.dpi)
     }
 
     /// Whether the alternate screen buffer is currently active.

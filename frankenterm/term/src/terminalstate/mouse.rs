@@ -166,6 +166,7 @@ impl TerminalState {
 
     fn mouse_button_press(&mut self, event: MouseEvent) -> anyhow::Result<()> {
         let (button, event_button) = self.mouse_report_button_number(&event);
+        self.increment_seqno();
         self.current_mouse_buttons.retain(|&b| b != event_button);
         self.current_mouse_buttons.push(event_button);
 
@@ -193,6 +194,7 @@ impl TerminalState {
     fn mouse_button_release(&mut self, event: MouseEvent) -> anyhow::Result<()> {
         let (release_button, button) = self.mouse_report_button_number(&event);
         if !self.current_mouse_buttons.is_empty() {
+            self.increment_seqno();
             self.current_mouse_buttons.retain(|&b| b != button);
             if self.mouse_tracking || self.button_event_mouse || self.any_event_mouse {
                 if self.mouse_encoding == MouseEncoding::SGR {
@@ -236,6 +238,7 @@ impl TerminalState {
                 }
                 _ => {}
             }
+            self.increment_seqno();
             self.last_mouse_move.replace(event);
 
             let (button, _button) = self.mouse_report_button_number(&event);

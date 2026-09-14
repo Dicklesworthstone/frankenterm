@@ -1885,12 +1885,12 @@ impl Pane for LocalPane {
         ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
-        let _output_application = self.output_application.lock();
         // `locked_terminal` drains the optional disruptor ring before it returns.
         // Apply this parser's still-local actions and capture staged hot state
         // under the terminal lock, then release the lock immediately so cold-history
         // materialization and serialization do not block the terminal mutex.
         let staged = {
+            let _output_application = self.output_application.lock();
             let mut terminal = self.locked_terminal();
             terminal.perform_actions(std::mem::take(pending_actions));
             terminal
@@ -2797,6 +2797,40 @@ impl LocalPane {
     /// 2. Release terminal lock immediately.
     /// 3. Outside terminal lock: materialize cold-history rows from the spill sink, revalidate
     ///    generation freshness, and assemble canonical `RecoveryTerminalCheckpointV2`.
+    pub(crate) fn current_model_semantic_generation(&self) -> Option<u64> {
+        if matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
+            return None;
+        }
+        let terminal = self.terminal.try_lock()?;
+        let seqno = terminal.current_seqno();
+        if seqno == usize::MAX {
+            return None;
+        }
+        u64::try_from(seqno).ok()
+    }
+
+    pub(crate) fn stage_legacy_terminal_checkpoint(
+        &self,
+        _authority: ModelParserCaptureAuthority,
+        pending_actions: &mut Vec<Action>,
+        ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<
+        frankenterm_term::terminalstate::checkpoint::StagedRecoveryCheckpoint,
+        LegacyTerminalCaptureError,
+    > {
+        if matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
+            return Err(LegacyTerminalCaptureError::FalseGuardianAuthority);
+        }
+        let _output_application = self.output_application.lock();
+        let mut terminal = self.locked_terminal();
+        if !pending_actions.is_empty() {
+            terminal.perform_actions(std::mem::take(pending_actions));
+        }
+        let staged = terminal.capture_staged(limits)?;
+        Ok(staged.bind_external_parser_ground(ground))
+    }
+
     pub fn capture_legacy_terminal_checkpoint(
         &self,
         authority: ModelParserCaptureAuthority,
@@ -2838,10 +2872,9 @@ impl LocalPane {
             PendingActionDrainPolicy::DrainAndApply => {}
         }
 
-        let _output_application = self.output_application.lock();
-
         // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
         let staged = {
+            let _output_application = self.output_application.lock();
             let mut terminal = self.locked_terminal();
             if policy == PendingActionDrainPolicy::DrainAndApply {
                 terminal.perform_actions(std::mem::take(pending_actions));
@@ -8898,11 +8931,12 @@ mod disruptor_ring_keep_gate {
         // Install a probe into the spill sink that executes during `snapshot_scrollback`.
         // If the terminal mutex is dropped before cold materialization occurs,
         // `pane.terminal.try_lock()` will succeed (return Some) inside the probe!
-        let pane_clone = Arc::clone(&pane);
+        let pane_weak = Arc::downgrade(&pane);
         let lock_acquired_during_snapshot = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe_flag = Arc::clone(&lock_acquired_during_snapshot);
         *sink.snapshot_probe.lock().unwrap() = Some(Arc::new(move || {
-            if pane_clone.terminal.try_lock().is_some() {
+            let pane = pane_weak.upgrade().expect("capture keeps pane alive");
+            if pane.terminal.try_lock().is_some() && pane.output_application.try_lock().is_some() {
                 probe_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }));
@@ -8921,7 +8955,7 @@ mod disruptor_ring_keep_gate {
         assert!(result.is_ok(), "capture must succeed: {:?}", result.err());
         assert!(
             lock_acquired_during_snapshot.load(std::sync::atomic::Ordering::SeqCst),
-            "terminal mutex must NOT be held during cold scrollback snapshot materialization"
+            "terminal and output-application mutexes must be free during cold materialization"
         );
     }
 

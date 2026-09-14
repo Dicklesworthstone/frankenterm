@@ -1094,7 +1094,7 @@ impl Terminal {
             aligned_source_start: 0,
             cols: screen.physical_cols,
             dpi: screen.dpi,
-            policy: screen.resize_wrap_policy,
+            policy: screen.resize_wrap_policy(),
         }));
     }
 
@@ -1175,6 +1175,9 @@ impl Terminal {
     }
 
     pub fn perform_actions(&mut self, actions: Vec<frankenterm_escape_parser::Action>) {
+        if actions.is_empty() {
+            return;
+        }
         self.state.increment_seqno();
         {
             let mut performer = Performer::new(&mut self.state);
@@ -1193,6 +1196,28 @@ mod tests {
     use crate::{CellAttributes, CursorPosition, Line};
     use proptest::prelude::*;
     use std::sync::Arc;
+
+    #[test]
+    fn empty_action_flush_preserves_semantic_generation() {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 2,
+                cols: 8,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::new(PropTermConfig),
+            "test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let before = terminal.current_seqno();
+        terminal.perform_actions(Vec::new());
+        assert_eq!(terminal.current_seqno(), before);
+        terminal.perform_actions(vec![frankenterm_escape_parser::Action::Print('x')]);
+        assert!(terminal.current_seqno() > before);
+    }
 
     #[derive(Debug)]
     struct ConsentConfig;

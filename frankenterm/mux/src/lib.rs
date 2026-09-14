@@ -385,6 +385,7 @@ pub struct ModelParserCheckpointAck {
     pub registration_wire_identity: [u8; 16],
     pub durable_pane_id: uuid::Uuid,
     pub parser_stream_bytes: u64,
+    pub semantic_generation: u64,
     pub terminal_checkpoint: frankenterm_term::RecoveryTerminalCheckpointV2,
 }
 
@@ -10089,6 +10090,41 @@ fn drain_live_parser_checkpoint_wake(
     }
 }
 
+#[derive(Default)]
+struct ModelCheckpointWorker(Option<std::thread::JoinHandle<()>>);
+
+impl ModelCheckpointWorker {
+    fn reap(&mut self) -> bool {
+        if self.0.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return false;
+        }
+        if let Some(worker) = self.0.take() {
+            if let Err(payload) = worker.join() {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+                log::error!("model checkpoint worker panicked");
+            }
+        }
+        true
+    }
+}
+
+impl Drop for ModelCheckpointWorker {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            if let Err(payload) = worker.join() {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+                log::error!("model checkpoint worker panicked during reader teardown");
+            }
+        }
+    }
+}
+
 fn attempt_live_parser_checkpoint(
     pane: &Weak<dyn Pane>,
     generation: &Arc<PaneRegistrationGeneration>,
@@ -10096,10 +10132,14 @@ fn attempt_live_parser_checkpoint(
     parser: &termwiz::escape::parser::Parser,
     actions: &mut Vec<Action>,
     hold: &SynchronizedOutputHold,
+    worker: &mut ModelCheckpointWorker,
 ) -> LiveParserAttemptOutcome {
     let control = &generation.live_parser_checkpoint;
 
     if control.has_ready_model_checkpoint() {
+        if !worker.reap() {
+            return LiveParserAttemptOutcome::NoRequest;
+        }
         if hold.is_holding() {
             control.reject_model_checkpoint(LiveParserCheckpointError::SynchronizedOutputHold);
             return LiveParserAttemptOutcome::Completed;
@@ -10146,7 +10186,7 @@ fn attempt_live_parser_checkpoint(
             );
             return LiveParserAttemptOutcome::Completed;
         };
-        let Some(_capture_operation) = generation.try_acquire() else {
+        let Some(capture_operation) = generation.try_acquire() else {
             control.complete_model_capture(
                 request.request_id,
                 Err(LiveParserCheckpointError::StaleRegistration),
@@ -10178,7 +10218,7 @@ fn attempt_live_parser_checkpoint(
                 let local = pane
                     .downcast_ref::<crate::localpane::LocalPane>()
                     .ok_or(crate::localpane::LegacyTerminalCaptureError::FalseGuardianAuthority)?;
-                local.capture_legacy_terminal_checkpoint(
+                local.stage_legacy_terminal_checkpoint(
                     crate::localpane::ModelParserCaptureAuthority::issue(),
                     actions,
                     ground,
@@ -10189,7 +10229,7 @@ fn attempt_live_parser_checkpoint(
         if let Some(output) = output {
             output.finish();
         }
-        let terminal_checkpoint = match capture {
+        let staged = match capture {
             Err(_) => {
                 control.poison("pane checkpoint callback panicked");
                 dead.store(true, Ordering::Release);
@@ -10202,32 +10242,71 @@ fn attempt_live_parser_checkpoint(
                 );
                 return LiveParserAttemptOutcome::Completed;
             }
-            Ok(Ok(terminal_checkpoint)) => terminal_checkpoint,
+            Ok(Ok(staged)) => staged,
         };
-        let remains_current = {
-            let _registration = mux.pane_registration.lock();
-            mux.panes
-                .read()
-                .get(&generation.pane_id)
-                .is_some_and(|registered| {
-                    Arc::ptr_eq(&registered.pane, &pane)
-                        && Arc::ptr_eq(&registered.generation, generation)
-                })
-        };
-        if !remains_current {
-            control.complete_model_capture(
-                request.request_id,
-                Err(LiveParserCheckpointError::StaleRegistration),
-            );
-            return LiveParserAttemptOutcome::Completed;
+        let stream_bytes = ground.stream_bytes();
+        let semantic_generation = staged.semantic_generation();
+        let worker_generation = Arc::clone(generation);
+        let request_id = request.request_id;
+        let spawn = thread::Builder::new()
+            .name(format!("mux-model-checkpoint-{}", generation.pane_id))
+            .spawn(move || {
+                let _capture_operation = capture_operation;
+                let control = &worker_generation.live_parser_checkpoint;
+                let cancelled = || {
+                    let state = control.state.lock();
+                    state.dead
+                        || state.pending_model.as_ref().is_none_or(|pending| {
+                            pending.request_id != request_id || pending.cancelled
+                        })
+                };
+                if cancelled() {
+                    control.complete_model_capture(
+                        request_id,
+                        Err(LiveParserCheckpointError::StaleRegistration),
+                    );
+                    return;
+                }
+                let capture = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| staged.materialize()),
+                );
+                let remains_current = {
+                    let _registration = mux.pane_registration.lock();
+                    mux.panes
+                        .read()
+                        .get(&worker_generation.pane_id)
+                        .is_some_and(|registered| {
+                            Arc::ptr_eq(&registered.pane, &pane)
+                                && Arc::ptr_eq(&registered.generation, &worker_generation)
+                        })
+                };
+                let model_current = pane
+                    .downcast_ref::<crate::localpane::LocalPane>()
+                    .and_then(|local| local.current_model_semantic_generation())
+                    == Some(semantic_generation);
+                let result = if !remains_current || !model_current || cancelled() {
+                    Err(LiveParserCheckpointError::StaleRegistration)
+                } else {
+                    match capture {
+                        Ok(Ok(terminal_checkpoint)) => Ok(ModelParserCheckpointAck {
+                            registration_wire_identity: request.registration_wire_identity,
+                            durable_pane_id: request.durable_pane_id,
+                            parser_stream_bytes: stream_bytes,
+                            semantic_generation,
+                            terminal_checkpoint,
+                        }),
+                        Ok(Err(_)) | Err(_) => Err(LiveParserCheckpointError::CaptureAndBind),
+                    }
+                };
+                control.complete_model_capture(request_id, result);
+                control.wake_parser();
+            });
+        match spawn {
+            Ok(handle) => worker.0 = Some(handle),
+            Err(_) => control
+                .complete_model_capture(request_id, Err(LiveParserCheckpointError::CaptureAndBind)),
         }
-        let ack = ModelParserCheckpointAck {
-            registration_wire_identity: request.registration_wire_identity,
-            durable_pane_id: request.durable_pane_id,
-            parser_stream_bytes: ground.stream_bytes(),
-            terminal_checkpoint,
-        };
-        control.complete_model_capture(request.request_id, Ok(ack));
         return LiveParserAttemptOutcome::Completed;
     }
 
@@ -10384,10 +10463,18 @@ fn parse_buffered_data(
     let mut action_size: usize = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline: Option<Instant> = None;
+    let mut checkpoint_worker = ModelCheckpointWorker::default();
 
     loop {
-        match attempt_live_parser_checkpoint(&pane, &generation, dead, &parser, &mut actions, &hold)
-        {
+        match attempt_live_parser_checkpoint(
+            &pane,
+            &generation,
+            dead,
+            &parser,
+            &mut actions,
+            &hold,
+            &mut checkpoint_worker,
+        ) {
             LiveParserAttemptOutcome::Fatal => break,
             LiveParserAttemptOutcome::Completed if actions.is_empty() => {
                 action_size = 0;
@@ -10396,11 +10483,22 @@ fn parse_buffered_data(
             LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
         }
 
-        let poll_delay = if !actions.is_empty() && !hold.is_holding() {
+        let mut poll_delay = if !actions.is_empty() && !hold.is_holding() {
             deadline.and_then(|target| target.checked_duration_since(Instant::now()))
         } else {
             None
         };
+        // A new request can arrive after its predecessor publishes the ACK but
+        // before the owned worker exits. Reap without blocking parser progress,
+        // even if the predecessor's final wake was already consumed.
+        if checkpoint_worker.0.is_some()
+            && generation
+                .live_parser_checkpoint
+                .has_ready_model_checkpoint()
+        {
+            let reap_delay = Duration::from_millis(10);
+            poll_delay = Some(poll_delay.map_or(reap_delay, |delay| delay.min(reap_delay)));
+        }
         let mut readiness = [
             pollfd {
                 fd: rx.as_socket_descriptor(),
@@ -10445,6 +10543,7 @@ fn parse_buffered_data(
                 &parser,
                 &mut actions,
                 &hold,
+                &mut checkpoint_worker,
             ) {
                 LiveParserAttemptOutcome::Fatal => break,
                 LiveParserAttemptOutcome::Completed if actions.is_empty() => {
@@ -10494,6 +10593,7 @@ fn parse_buffered_data(
                     &parser,
                     &mut actions,
                     &hold,
+                    &mut checkpoint_worker,
                 );
                 dead.store(true, Ordering::Release);
                 generation.live_parser_checkpoint.mark_dead();
@@ -10596,6 +10696,7 @@ fn parse_buffered_data(
                     &parser,
                     &mut actions,
                     &hold,
+                    &mut checkpoint_worker,
                 ) {
                     LiveParserAttemptOutcome::Fatal => break,
                     LiveParserAttemptOutcome::Completed if actions.is_empty() => {
@@ -18660,6 +18761,41 @@ impl Mux {
             .load()
             .ok_or(LiveParserCheckpointError::StaleRegistration)?;
         registration.capture_model_parser_checkpoint(limits, timeout)
+    }
+
+    /// Recheck an exact model contribution without mutating the terminal or
+    /// blocking behind terminal I/O. Busy, retired, and exhausted sources retry.
+    pub fn model_checkpoint_is_current(
+        &self,
+        pane_id: PaneId,
+        ack: &ModelParserCheckpointAck,
+    ) -> bool {
+        let registered = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            if registered.generation.wire_identity != ack.registration_wire_identity {
+                return false;
+            }
+            (
+                Arc::clone(&registered.pane),
+                Arc::clone(&registered.generation),
+            )
+        };
+        if registered.0.durable_pane_id() != Some(*ack.durable_pane_id.as_bytes())
+            || registered
+                .0
+                .downcast_ref::<crate::localpane::LocalPane>()
+                .and_then(|local| local.current_model_semantic_generation())
+                != Some(ack.semantic_generation)
+        {
+            return false;
+        }
+        self.panes.read().get(&pane_id).is_some_and(|current| {
+            Arc::ptr_eq(&current.pane, &registered.0)
+                && Arc::ptr_eq(&current.generation, &registered.1)
+        })
     }
 
     /// Atomically compare-and-set one complete same-window tab permutation.
@@ -34643,7 +34779,8 @@ mod tests {
                     bad,
                 ])
                 .is_err(),
-                "bad case {bad_case} must reject the entire batch"
+                "bad case {} must reject the entire batch",
+                bad_case
             );
             assert_eq!(
                 mux.topology_snapshot_authority().expect("topology"),
