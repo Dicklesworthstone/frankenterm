@@ -106,6 +106,15 @@ impl fmt::Debug for FrozenWindowOrder {
     }
 }
 
+/// One local window projection from an exact previously observed state.
+/// Remote identifiers must be resolved to the existing local allocations by
+/// the client before submitting this to the owning mux.
+pub struct WindowOrderMirror {
+    pub expected: FrozenWindowOrder,
+    pub ordered_tabs: Vec<Arc<Tab>>,
+    pub active_tab: Option<Arc<Tab>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum WindowOrderSnapshotError {
     #[error("window {window_id} has {count} tabs, exceeding ordered-window limit {max}")]
@@ -775,26 +784,90 @@ impl Window {
         let mut tabs = self.tabs.clone();
         let tab = tabs.remove(source_index);
         tabs.insert(destination_index, tab);
-        let active = if self.active == source_index {
-            destination_index
+        self.prepare_ordered_state(tabs, self.get_active().cloned())
+    }
+
+    /// Prepare a complete permutation and active identity without changing
+    /// membership. The mux commits every affected window together; neither
+    /// preparation nor a rejected stale projection publishes callbacks.
+    pub(crate) fn prepare_mirror_order(
+        &self,
+        mirror: WindowOrderMirror,
+    ) -> anyhow::Result<Option<PreparedWindowState>> {
+        anyhow::ensure!(
+            mirror.expected.window_id == self.id
+                && mirror.expected.order_revision == self.order_revision,
+            "window {} changed before ordered mirror preparation",
+            self.id,
+        );
+        anyhow::ensure!(
+            self.tabs.len() == mirror.expected.ordered_tabs.len()
+                && self
+                    .tabs
+                    .iter()
+                    .zip(mirror.expected.ordered_tabs.iter())
+                    .all(|(live, expected)| Arc::ptr_eq(live, expected))
+                && self.get_active().map(Arc::as_ptr)
+                    == mirror.expected.active_tab.as_ref().map(Arc::as_ptr),
+            "window {} changed exact tab identity before ordered mirror preparation",
+            self.id,
+        );
+        anyhow::ensure!(
+            mirror.ordered_tabs.len() == self.tabs.len(),
+            "window {} ordered mirror must preserve membership",
+            self.id,
+        );
+        self.prepare_ordered_state(mirror.ordered_tabs, mirror.active_tab)
+    }
+
+    fn prepare_ordered_state(
+        &self,
+        tabs: Vec<Arc<Tab>>,
+        active_tab: Option<Arc<Tab>>,
+    ) -> anyhow::Result<Option<PreparedWindowState>> {
+        let active = match active_tab.as_ref() {
+            Some(active) => tabs
+                .iter()
+                .position(|tab| Arc::ptr_eq(tab, active))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "window {} ordered mirror active tab is not an exact member",
+                        self.id
+                    )
+                })?,
+            None if tabs.is_empty() => 0,
+            None => anyhow::bail!(
+                "window {} ordered mirror is missing its active tab",
+                self.id
+            ),
+        };
+        let active_changed =
+            self.get_active().map(Arc::as_ptr) != active_tab.as_ref().map(Arc::as_ptr);
+        if tabs.len() == self.tabs.len()
+            && !active_changed
+            && self
+                .tabs
+                .iter()
+                .zip(&tabs)
+                .all(|(live, desired)| Arc::ptr_eq(live, desired))
+        {
+            return Ok(None);
+        }
+        let (last_active, focus_lost) = if active_changed {
+            (
+                self.get_active().map(|tab| tab.tab_id()),
+                self.get_active()
+                    .and_then(|tab| tab.get_active_pane_callback_free()),
+            )
         } else {
-            let shifted = if source_index < self.active {
-                self.active.saturating_sub(1)
-            } else {
-                self.active
-            };
-            if destination_index <= shifted {
-                shifted.saturating_add(1)
-            } else {
-                shifted
-            }
+            (self.last_active, None)
         };
         self.prepare_complete_state(
             tabs,
             active,
-            self.last_active,
+            last_active,
             self.tab_stacks.clone(),
-            None,
+            focus_lost,
             false,
         )
         .map(Some)
@@ -2774,6 +2847,68 @@ mod tests {
         assert!(window
             .get_active()
             .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+    }
+
+    #[test]
+    fn mirror_order_preserves_stacks_and_rejects_exhausted_revision() {
+        let first = test_tab();
+        let second = test_tab();
+        let mut window = Window::new(None, None);
+        window.push(&first).expect("first tab");
+        window.push(&second).expect("second tab");
+        window
+            .create_tab_stack(TabStackId(43), vec![first.tab_id(), second.tab_id()])
+            .expect("tab stack");
+        let stacks = window.tab_stack_entries();
+        let before = window.order_snapshot().expect("original order");
+        let state = window
+            .prepare_mirror_order(WindowOrderMirror {
+                expected: before,
+                ordered_tabs: vec![Arc::clone(&second), Arc::clone(&first)],
+                active_tab: Some(Arc::clone(&second)),
+            })
+            .expect("complete permutation and active identity")
+            .expect("changed order");
+        assert!(!state.membership_changed());
+        window.commit_prepared_state(state);
+        assert_eq!(window.tab_stack_entries(), stacks);
+        assert_eq!(window.get_last_active_idx(), Some(1));
+        assert!(Arc::ptr_eq(
+            window.get_active().expect("active tab"),
+            &second
+        ));
+
+        window.set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let before = window.order_snapshot().expect("exhausted but valid order");
+        assert!(window
+            .prepare_mirror_order(WindowOrderMirror {
+                expected: before.clone(),
+                ordered_tabs: before.ordered_tabs().to_vec(),
+                active_tab: before.active_tab().cloned(),
+            })
+            .expect("no-op does not need a successor revision")
+            .is_none());
+        assert!(window
+            .prepare_mirror_order(WindowOrderMirror {
+                expected: before.clone(),
+                ordered_tabs: vec![Arc::clone(&first), Arc::clone(&second)],
+                active_tab: Some(Arc::clone(&first)),
+            })
+            .is_err());
+        assert_eq!(window.order_revision(), before.order_revision());
+        assert_eq!(window.tab_stack_entries(), stacks);
+        assert!(Arc::ptr_eq(
+            window.get_active().expect("unchanged active tab"),
+            &second
+        ));
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            before
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
