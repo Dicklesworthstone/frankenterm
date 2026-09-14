@@ -9784,11 +9784,14 @@ mod tests {
             let task = runtime.handle().spawn(async move {
                 let cx = crate::cx::Cx::current().expect("scheduler context");
                 let driver = cx.timer_driver().expect("scheduler timer driver");
+                // Registering the timer wakes the peer reactor immediately.
+                // Arm first: otherwise the peer can enter the five-second
+                // poll before arming and never announce that valid wait.
+                armed.store(true, std::sync::atomic::Ordering::Release);
                 let later = driver.register(
                     driver.now() + Duration::from_secs(5),
                     std::task::Waker::noop().clone(),
                 );
-                armed.store(true, std::sync::atomic::Ordering::Release);
                 // Intentionally hold this worker while its peer selects the
                 // long timer. This channel does not wake the reactor.
                 let released = release_rx.recv_timeout(Duration::from_secs(3));

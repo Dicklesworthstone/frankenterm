@@ -130,6 +130,9 @@ pub struct ScanProcessDiagnostic {
     pub exit_code: Option<i32>,
     pub spawned: bool,
     pub supervisor_settled: bool,
+    /// Content-free state from the typed cleanup error, bounded to the
+    /// diagnostic limit. Never contains command arguments or child output.
+    pub cleanup_failure: Option<String>,
     pub stdout_bytes: Option<usize>,
     pub stderr_bytes: Option<usize>,
     /// Bounded and redacted; never logged automatically.
@@ -979,6 +982,15 @@ async fn run_command(
         exit_code: None,
         spawned: report.spawned_pid.is_some(),
         supervisor_settled: report.supervisor_settled,
+        cleanup_failure: report.output.as_ref().err().and_then(|error| {
+            CommandProcessCleanupIncomplete::from_io_error(error).map(|cleanup| {
+                cleanup
+                    .to_string()
+                    .chars()
+                    .take(MAX_DIAGNOSTIC_CHARS)
+                    .collect()
+            })
+        }),
         stdout_bytes: None,
         stderr_bytes: None,
         stderr_excerpt: None,
@@ -997,6 +1009,7 @@ async fn run_command(
     }
     info!(stage = ?diagnostic.stage, exit_code = diagnostic.exit_code,
         spawned = diagnostic.spawned, supervisor_settled = diagnostic.supervisor_settled,
+        cleanup_failure = diagnostic.cleanup_failure.as_deref(),
         stdout_bytes = diagnostic.stdout_bytes, stderr_bytes = diagnostic.stderr_bytes,
         stdout_limit, stderr_limit = MAX_STDERR_BYTES, "code scan process settled");
     progress.diagnostics.push(diagnostic);
@@ -2166,7 +2179,7 @@ report 0"#,
                     )
                     .await
                     .unwrap_err();
-                assert_eq!(error.kind, ScanErrorKind::Timeout);
+                assert_eq!(error.kind, ScanErrorKind::Timeout, "{error:?}");
                 assert_eq!(error.stage, ScanStage::Admission);
                 assert!(error.diagnostics.is_empty());
                 assert!(error.retained_snapshot.is_none());
@@ -2191,7 +2204,7 @@ report 0"#,
                     )
                     .await
                     .unwrap_err();
-                assert_eq!(error.kind, ScanErrorKind::Timeout);
+                assert_eq!(error.kind, ScanErrorKind::Timeout, "{error:?}");
                 assert_eq!(error.stage, ScanStage::Scanner);
                 assert!(error.diagnostics.last().unwrap().supervisor_settled);
                 for (redirect, stream) in [("", "stdout"), (">&2", "stderr")] {
