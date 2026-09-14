@@ -1003,13 +1003,14 @@ pub struct SearchHit {
     pub pane_id: u64,
     pub seq: u64,
     pub captured_at: i64,
+    #[serde(deserialize_with = "crate::deserialize_finite_f64")]
     pub score: f64,
     #[serde(default)]
     pub snippet: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     /// Semantic similarity score (when using semantic/hybrid mode).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_optional_finite_f64")]
     pub semantic_score: Option<f64>,
     /// Fused rank position from RRF (when using hybrid mode).
     #[serde(default)]
@@ -1056,13 +1057,13 @@ pub struct SearchIndexStatsData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchScoringBreakdown {
     /// BM25 lexical score (if lexical/hybrid mode).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_optional_finite_f64")]
     pub bm25_score: Option<f64>,
     /// Matching terms from the lexical query (highlighted).
     #[serde(default)]
     pub matching_terms: Vec<String>,
     /// Semantic cosine similarity score (if semantic/hybrid mode).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_optional_finite_f64")]
     pub semantic_similarity: Option<f64>,
     /// Embedder tier that produced the semantic vector.
     #[serde(default)]
@@ -1071,12 +1072,13 @@ pub struct SearchScoringBreakdown {
     #[serde(default)]
     pub rrf_rank: Option<usize>,
     /// RRF fused score.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_optional_finite_f64")]
     pub rrf_score: Option<f64>,
     /// Cross-encoder reranker score (if quality tier completed).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::deserialize_optional_finite_f64")]
     pub reranker_score: Option<f64>,
     /// Final combined score used for ordering.
+    #[serde(deserialize_with = "crate::deserialize_finite_f64")]
     pub final_score: f64,
 }
 
@@ -3483,6 +3485,84 @@ pub fn parse_response_untyped(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn explained_search_scores_roundtrip_buffered_numbers() {
+        let value = json!({
+            "segment_id": 0, "pane_id": 0, "seq": 1, "captured_at": 123,
+            "score": 0.95, "semantic_score": 0.75,
+            "scoring": {"bm25_score": 1.5, "matching_terms": ["é界"],
+                "semantic_similarity": 0.75, "rrf_score": 0.125,
+                "reranker_score": 0.9, "final_score": 0.95}
+        });
+        let decoded: ExplainedSearchHit = serde_json::from_value(value.clone()).unwrap();
+        let canonical = serde_json::to_value(decoded).unwrap();
+        let from_text: ExplainedSearchHit = serde_json::from_str(&canonical.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(from_text).unwrap(), canonical);
+        for field in [
+            "semantic_score",
+            "bm25_score",
+            "semantic_similarity",
+            "rrf_score",
+            "reranker_score",
+        ] {
+            for absent in [true, false] {
+                let mut input = value.clone();
+                let object = if field == "semantic_score" {
+                    &mut input
+                } else {
+                    &mut input["scoring"]
+                };
+                if absent {
+                    object.as_object_mut().unwrap().remove(field);
+                } else {
+                    object[field] = serde_json::Value::Null;
+                }
+                for decoded in [
+                    serde_json::from_value::<ExplainedSearchHit>(input.clone()).unwrap(),
+                    serde_json::from_str::<ExplainedSearchHit>(&input.to_string()).unwrap(),
+                ] {
+                    let encoded = serde_json::to_value(decoded).unwrap();
+                    let actual = if field == "semantic_score" {
+                        &encoded[field]
+                    } else {
+                        &encoded["scoring"][field]
+                    };
+                    assert!(actual.is_null());
+                }
+            }
+        }
+        for field in [
+            "score",
+            "semantic_score",
+            "bm25_score",
+            "semantic_similarity",
+            "rrf_score",
+            "reranker_score",
+            "final_score",
+        ] {
+            for invalid in [json!("0.5"), json!(true), json!({}), json!([])] {
+                let mut input = value.clone();
+                let object = if matches!(field, "score" | "semantic_score") {
+                    &mut input
+                } else {
+                    &mut input["scoring"]
+                };
+                object[field] = invalid;
+                assert!(serde_json::from_str::<ExplainedSearchHit>(&input.to_string()).is_err());
+                assert!(serde_json::from_value::<ExplainedSearchHit>(input).is_err());
+            }
+        }
+        for invalid in ["1e400", "-1e400"] {
+            let text = value
+                .to_string()
+                .replace("\"score\":0.95", &format!("\"score\":{invalid}"));
+            assert!(serde_json::from_str::<ExplainedSearchHit>(&text).is_err());
+            if let Ok(input) = serde_json::from_str::<serde_json::Value>(&text) {
+                assert!(serde_json::from_value::<ExplainedSearchHit>(input).is_err());
+            }
+        }
+    }
 
     // -- Envelope parsing ---------------------------------------------------
 

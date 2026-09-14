@@ -142,7 +142,7 @@ pub enum EvidenceValue {
     /// A string value.
     String(String),
     /// A numeric value.
-    Number(f64),
+    Number(#[serde(deserialize_with = "frankenterm_core::deserialize_finite_f64")] f64),
     /// A boolean value.
     Bool(bool),
     /// A list of string values.
@@ -892,6 +892,9 @@ mod tests {
         let values = [
             EvidenceValue::String("test".to_string()),
             EvidenceValue::Number(42.0),
+            EvidenceValue::Number(0.0),
+            EvidenceValue::Number(-0.0),
+            EvidenceValue::Number(0.125),
             EvidenceValue::Bool(false),
             EvidenceValue::StringList(vec!["a".to_string(), "b".to_string()]),
         ];
@@ -899,7 +902,27 @@ mod tests {
             let json = serde_json::to_string(v).unwrap();
             let decoded: EvidenceValue = serde_json::from_str(&json).unwrap();
             assert_eq!(&decoded, v);
+            let value = serde_json::to_value(v).unwrap();
+            assert_eq!(serde_json::from_value::<EvidenceValue>(value).unwrap(), *v);
         }
+    }
+
+    #[test]
+    fn evidence_value_rejects_overflow_and_preserves_other_variants() {
+        for text in ["1e400", "-1e400", "null", "{\"value\":0.5}", "[0.5]"] {
+            assert!(serde_json::from_str::<EvidenceValue>(text).is_err());
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                assert!(serde_json::from_value::<EvidenceValue>(value).is_err());
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<EvidenceValue>("\"0.5\"").unwrap(),
+            EvidenceValue::String("0.5".to_string())
+        );
+        assert_eq!(
+            serde_json::from_str::<EvidenceValue>("true").unwrap(),
+            EvidenceValue::Bool(true)
+        );
     }
 
     #[test]

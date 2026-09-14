@@ -1964,11 +1964,73 @@ mod tests {
         assert_eq!(reparsed.verdict, ContractVerdict::Incompatible);
     }
 
+    fn doctor_slot_matches_qualification(
+        slot: &serde_json::Value,
+        artifact: &serde_json::Value,
+    ) -> bool {
+        if slot["produced_by_bead"] != "ft-7h5da.13.7" {
+            return false;
+        }
+        match artifact["contract"]["full_release_qualified"].as_bool() {
+            Some(false) => {
+                artifact["overall_status"] == "pending_final_qualification"
+                    && slot.get("path").is_some_and(serde_json::Value::is_null)
+                    && slot["deferred_to_bead"] == "ft-7h5da.13.7"
+                    && slot["deferred_reason"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.trim().is_empty())
+            }
+            Some(true) => {
+                artifact["overall_status"] == "pass_with_tracked_exceptions"
+                    && slot["path"] == "docs/attestations/proofs/robot-contract-doctor.json"
+                    && slot["deferred_to_bead"].is_null()
+                    && slot["deferred_reason"].is_null()
+            }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn contract_doctor_slot_rejects_premature_or_ambiguous_qualification() {
+        let artifact = serde_json::json!({
+            "overall_status": "pending_final_qualification",
+            "contract": { "full_release_qualified": false }
+        });
+        let slot = serde_json::json!({
+            "path": null,
+            "produced_by_bead": "ft-7h5da.13.7",
+            "deferred_to_bead": "ft-7h5da.13.7",
+            "deferred_reason": "Final signed bundle verification pending"
+        });
+        assert!(doctor_slot_matches_qualification(&slot, &artifact));
+        let mut premature = slot.clone();
+        premature["path"] =
+            serde_json::json!("docs/attestations/proofs/robot-contract-doctor.json");
+        assert!(!doctor_slot_matches_qualification(&premature, &artifact));
+        premature["deferred_to_bead"] = serde_json::Value::Null;
+        premature["deferred_reason"] = serde_json::Value::Null;
+        assert!(!doctor_slot_matches_qualification(&premature, &artifact));
+        let mut qualified = artifact.clone();
+        qualified["overall_status"] = serde_json::json!("pass_with_tracked_exceptions");
+        qualified["contract"]["full_release_qualified"] = serde_json::json!(true);
+        assert!(doctor_slot_matches_qualification(&premature, &qualified));
+        assert!(!doctor_slot_matches_qualification(&slot, &qualified));
+        qualified["contract"]["full_release_qualified"] = serde_json::Value::Null;
+        assert!(!doctor_slot_matches_qualification(&premature, &qualified));
+        let mut unowned = slot.clone();
+        unowned["deferred_to_bead"] = serde_json::Value::Null;
+        assert!(!doctor_slot_matches_qualification(&unowned, &artifact));
+        let mut unexplained = slot;
+        unexplained["deferred_reason"] = serde_json::json!(" ");
+        assert!(!doctor_slot_matches_qualification(&unexplained, &artifact));
+    }
+
     #[test]
     fn contract_doctor_attestation_slot_executes_static_oracle() {
         let root = workspace_root();
         let output = std::process::Command::new("bash")
             .arg("scripts/check-contract-doctor-coverage.sh")
+            .arg("--strict")
             .current_dir(&root)
             .output()
             .expect("run Contract Doctor static oracle");
@@ -2000,13 +2062,11 @@ mod tests {
                 slot["category"] == "proofs/robot-contracts"
                     && slot["produced_by_bead"] == artifact["produced_by_bead"]
             })
-            .expect("populated robot-contract-doctor manifest slot exists");
-        assert_eq!(
-            slot["path"],
-            "docs/attestations/proofs/robot-contract-doctor.json"
+            .expect("robot-contract-doctor manifest slot exists");
+        assert!(
+            doctor_slot_matches_qualification(slot, &artifact),
+            "Doctor slot must remain explicitly deferred until its artifact is release-qualified"
         );
-        assert!(slot["deferred_to_bead"].is_null());
-        assert!(slot["deferred_reason"].is_null());
         assert!(
             slot["proof_categories"]
                 .as_array()

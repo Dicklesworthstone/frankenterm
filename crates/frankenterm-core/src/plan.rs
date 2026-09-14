@@ -998,7 +998,11 @@ pub enum OnFailure {
         initial_delay_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_delay_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::deserialize_optional_finite_f64"
+        )]
         backoff_multiplier: Option<f64>,
     },
 
@@ -7928,6 +7932,48 @@ mod tests {
                 backoff_multiplier,
             } if max_delay_ms.is_none() && backoff_multiplier.is_none()
         ));
+    }
+
+    #[test]
+    fn retry_multiplier_buffered_json_preserves_optional_finite_values() {
+        for suffix in [
+            "",
+            ",\"backoff_multiplier\":null",
+            ",\"backoff_multiplier\":1.0",
+            ",\"backoff_multiplier\":0.125",
+        ] {
+            let text = format!(
+                "{{\"strategy\":\"retry\",\"max_attempts\":3,\"initial_delay_ms\":10{suffix}}}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let expected = value
+                .get("backoff_multiplier")
+                .and_then(serde_json::Value::as_f64);
+            for decoded in [
+                serde_json::from_str::<OnFailure>(&text).unwrap(),
+                serde_json::from_value::<OnFailure>(value).unwrap(),
+            ] {
+                let OnFailure::Retry {
+                    backoff_multiplier, ..
+                } = decoded
+                else {
+                    panic!("retry variant changed");
+                };
+                assert_eq!(
+                    backoff_multiplier.map(f64::to_bits),
+                    expected.map(f64::to_bits)
+                );
+            }
+        }
+        for invalid in ["1e400", "-1e400", "\"1.0\"", "true", "{}", "[]"] {
+            let text = format!(
+                "{{\"strategy\":\"retry\",\"max_attempts\":3,\"initial_delay_ms\":10,\"backoff_multiplier\":{invalid}}}"
+            );
+            assert!(serde_json::from_str::<OnFailure>(&text).is_err());
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                assert!(serde_json::from_value::<OnFailure>(value).is_err());
+            }
+        }
     }
 
     #[test]

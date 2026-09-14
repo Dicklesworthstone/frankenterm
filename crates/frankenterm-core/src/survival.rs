@@ -412,7 +412,10 @@ pub struct HazardReport {
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum RestartMode {
     /// Fully automatic scheduling; execute when score exceeds `min_score`.
-    Automatic { min_score: f64 },
+    Automatic {
+        #[serde(deserialize_with = "crate::deserialize_finite_f64")]
+        min_score: f64,
+    },
     /// Compute recommendations but do not execute.
     #[default]
     Advisory,
@@ -1188,6 +1191,43 @@ mod tests {
 
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn restart_mode_numeric_threshold_roundtrips_buffered_json() {
+        for min_score in [0.0_f64, -0.0, 0.125, 1.0] {
+            let mode = RestartMode::Automatic { min_score };
+            let value = serde_json::to_value(mode).unwrap();
+            for decoded in [
+                serde_json::from_value::<RestartMode>(value.clone()).unwrap(),
+                serde_json::from_str::<RestartMode>(&value.to_string()).unwrap(),
+            ] {
+                let RestartMode::Automatic { min_score: actual } = decoded else {
+                    panic!("restart mode variant changed");
+                };
+                assert_eq!(actual.to_bits(), min_score.to_bits());
+            }
+            let config = RestartSchedulerConfig {
+                mode,
+                ..RestartSchedulerConfig::default()
+            };
+            let value = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serde_json::from_value::<RestartSchedulerConfig>(value.clone()).unwrap(),
+                config
+            );
+            assert_eq!(
+                serde_json::from_str::<RestartSchedulerConfig>(&value.to_string()).unwrap(),
+                config
+            );
+        }
+        for invalid in ["null", "\"0.0\"", "true", "{}", "[]", "1e400", "-1e400"] {
+            let text = format!("{{\"mode\":\"automatic\",\"min_score\":{invalid}}}");
+            assert!(serde_json::from_str::<RestartMode>(&text).is_err());
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                assert!(serde_json::from_value::<RestartMode>(value).is_err());
+            }
+        }
+    }
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `SurvivalModel::run_cx` path exits cleanly under seed-locked

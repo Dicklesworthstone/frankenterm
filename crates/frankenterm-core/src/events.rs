@@ -4555,6 +4555,84 @@ mod tests {
     }
 
     #[test]
+    fn pattern_event_confidence_roundtrips_through_text_and_value() {
+        for confidence in [0.0_f64, -0.0, 0.125, 0.9, 1.0] {
+            let mut detection = make_detection(
+                "core.codex:confidence",
+                crate::patterns::Severity::Warning,
+                crate::patterns::AgentType::Codex,
+            );
+            detection.confidence = confidence;
+            detection.extracted = serde_json::json!({"nested": {"fraction": 0.125}, "text": "é界"});
+            let event = Event::PatternDetected {
+                pane_id: 42,
+                pane_uuid: Some("test-pane".to_string()),
+                detection,
+                event_id: Some(17),
+            };
+            let text = serde_json::to_string(&event).expect("serialize event");
+            let value = serde_json::to_value(&event).expect("serialize event value");
+            for restored in [
+                serde_json::from_str::<Event>(&text).expect("tagged event from JSON text"),
+                serde_json::from_value::<Event>(value.clone())
+                    .expect("tagged event from JSON Value"),
+            ] {
+                assert_eq!(serde_json::to_value(&restored).unwrap(), value);
+                let Event::PatternDetected { detection, .. } = restored else {
+                    panic!("pattern event variant changed");
+                };
+                assert_eq!(detection.confidence.to_bits(), confidence.to_bits());
+                assert_eq!(
+                    detection.span,
+                    (0, 0),
+                    "source span is intentionally skipped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_event_rejects_non_numeric_and_non_finite_confidence() {
+        let event = Event::PatternDetected {
+            pane_id: 42,
+            pane_uuid: None,
+            detection: make_detection(
+                "core.codex:confidence",
+                crate::patterns::Severity::Warning,
+                crate::patterns::AgentType::Codex,
+            ),
+            event_id: None,
+        };
+        let base = serde_json::to_value(event).unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("0.9"),
+            serde_json::json!("NaN"),
+            serde_json::json!("Infinity"),
+            serde_json::json!(false),
+            serde_json::json!({"value": 0.9}),
+            serde_json::json!([0.9]),
+        ] {
+            let mut value = base.clone();
+            value["detection"]["confidence"] = invalid;
+            assert!(serde_json::from_value::<Event>(value.clone()).is_err());
+            assert!(serde_json::from_str::<Event>(&value.to_string()).is_err());
+        }
+        // Valid arbitrary-precision JSON numbers may overflow f64. In a
+        // non-arbitrary-precision build the JSON parser itself rejects them.
+        let text = serde_json::to_string(&base).unwrap();
+        for invalid in ["1e400", "-1e400", "NaN", "Infinity", "-Infinity"] {
+            let invalid_text =
+                text.replace("\"confidence\":1.0", &format!("\"confidence\":{invalid}"));
+            assert_ne!(
+                invalid_text, text,
+                "fixture must replace the confidence field"
+            );
+            assert!(serde_json::from_str::<Event>(&invalid_text).is_err());
+        }
+    }
+
+    #[test]
     fn truncate_to_char_boundary_avoids_utf8_split_panics() {
         let mut value = format!("{}é", "a".repeat(119));
         assert_eq!(value.len(), 121);

@@ -265,6 +265,7 @@ pub struct Detection {
     /// Severity level
     pub severity: Severity,
     /// Confidence score 0.0-1.0
+    #[serde(deserialize_with = "crate::deserialize_finite_f64")]
     pub confidence: f64,
     /// Extracted structured data
     pub extracted: serde_json::Value,
