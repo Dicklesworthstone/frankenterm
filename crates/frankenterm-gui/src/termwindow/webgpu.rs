@@ -192,7 +192,7 @@ impl fmt::Display for WebGpuSurfaceTextureError {
 }
 
 impl std::error::Error for WebGpuSurfaceTextureError {}
-const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-29.0.3";
+const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-30.0.1";
 const WEBGPU_SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 
 // ft-6flqa: these presentation/scanout decision probes are kept compiled
@@ -1043,7 +1043,7 @@ fn sparse_adapter_info_blob(info: &wgpu::AdapterInfo) -> String {
 #[must_use]
 pub fn sparse_feature_query_from_limits(limits: &wgpu::Limits) -> SparseFeatureQuery {
     SparseFeatureQuery {
-        // wgpu 25 exposes texture-array limits, but not a portable
+        // wgpu exposes texture-array limits, but not a portable
         // sparse-residency capability bit or tile-commit API. Keep
         // Auto conservative so the substrate routes to the flat atlas
         // until a backend-specific sparse path is actually available.
@@ -1196,6 +1196,37 @@ impl WebGpuState {
         }
         let timestamp = self.adapter.get_presentation_timestamp();
         (!timestamp.is_invalid() && timestamp.0 > 0).then_some(timestamp.0)
+    }
+
+    /// Opt-in host-side brackets for drawable waits and submission overhead.
+    /// These timestamps never assert GPU completion or compositor visibility.
+    pub(crate) fn profile_native_stage<T>(
+        &self,
+        stage: &'static str,
+        work: impl FnOnce() -> T,
+    ) -> T {
+        let begin = if log::log_enabled!(
+            target: "frankenterm_gui::native_present_stages",
+            log::Level::Debug
+        ) {
+            self.native_submission_mach_ns()
+        } else {
+            None
+        };
+        let result = work();
+        if let Some(begin) = begin {
+            if let Some(end) = self.native_submission_mach_ns() {
+                log::debug!(
+                    target: "frankenterm_gui::native_present_stages",
+                    "native_present_stage stage={} begin_mach_ns={} end_mach_ns={} host_duration_ns={}",
+                    stage,
+                    begin,
+                    end,
+                    end.saturating_sub(begin),
+                );
+            }
+        }
+        result
     }
 
     pub async fn new(
@@ -1724,11 +1755,13 @@ impl WebGpuState {
         &self,
         dims: Dimensions,
     ) -> anyhow::Result<SurfaceConfigureOutcome> {
-        let outcome = self.configure_surface(dims, false)?;
-        if outcome == SurfaceConfigureOutcome::Ready && self.needs_force_configure.get() {
-            return self.configure_surface(dims, true);
-        }
-        Ok(outcome)
+        self.profile_native_stage("configure", || {
+            let outcome = self.configure_surface(dims, false)?;
+            if outcome == SurfaceConfigureOutcome::Ready && self.needs_force_configure.get() {
+                return self.configure_surface(dims, true);
+            }
+            Ok(outcome)
+        })
     }
 
     pub(crate) fn force_configure(
@@ -1803,10 +1836,10 @@ impl WebGpuState {
     pub(crate) fn acquire_surface_frame(
         &self,
     ) -> Result<AcquiredWebGpuFrame, WebGpuSurfaceTextureError> {
-        let current = {
+        let current = self.profile_native_stage("acquire", || {
             let surface = self.surface.borrow();
             surface.get_current_texture()
-        };
+        });
         match current {
             wgpu::CurrentSurfaceTexture::Success(texture) => Ok(AcquiredWebGpuFrame {
                 texture,
@@ -2158,7 +2191,31 @@ mod tests {
         assert_eq!(probe.version.ft_binary_hash, 0xfeed_cafe);
         assert!(probe.driver_label.contains("nvidia"));
         assert!(probe.driver_label.contains("535.154.05"));
-        assert!(probe.cache_filename.ends_with("-wgpu-29.0.3.bin"));
+        assert!(probe.cache_filename.ends_with("-wgpu-30.0.1.bin"));
+    }
+
+    #[test]
+    fn webgpu_pipeline_cache_version_matches_selected_dependency() {
+        let version = WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL
+            .strip_prefix("wgpu-")
+            .expect("pipeline cache version names its dependency");
+        let manifest = include_str!("../../../../Cargo.toml");
+        let declaration = format!("wgpu = {version:?}");
+        assert!(
+            manifest.lines().any(|line| line.trim() == declaration),
+            "update the diagnostic identity when the workspace WGPU version changes"
+        );
+        let lockfile = include_str!("../../../../Cargo.lock");
+        let selected_versions: Vec<_> = lockfile
+            .split("[[package]]")
+            .filter(|package| package.lines().any(|line| line == "name = \"wgpu\""))
+            .flat_map(|package| {
+                package
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("version = "))
+            })
+            .collect();
+        assert_eq!(selected_versions, vec![format!("{version:?}")]);
     }
 
     #[test]

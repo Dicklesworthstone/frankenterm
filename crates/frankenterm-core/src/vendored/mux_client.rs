@@ -6656,9 +6656,12 @@ mod tests {
     }
 
     fn text_read_expected(range: std::ops::Range<isize>, generation: &str) -> String {
-        range
-            .map(|row| format!("{}\n", text_read_row(row, generation)))
-            .collect()
+        let mut expected = String::new();
+        for row in range {
+            expected.push_str(&text_read_row(row, generation));
+            expected.push('\n');
+        }
+        expected
     }
 
     #[test]
@@ -16883,7 +16886,9 @@ mod tests {
                                 assert_eq!(pane_id, 9);
                                 break;
                             }
-                            other => panic!("unexpected subscription event {other:?}"),
+                            other @ PaneDelta::Gap { .. } => {
+                                panic!("unexpected subscription event {other:?}")
+                            }
                         }
                     }
                 })

@@ -215,8 +215,10 @@ impl crate::TermWindow {
         // are synchronously infallible. Device-loss errors reported later by
         // wgpu are outside this synchronous seam; a successful return does not
         // prove asynchronous GPU completion or visible scanout.
-        let _submission = webgpu.queue.submit(std::iter::once(encoder.finish()));
-        webgpu.queue.present(output);
+        let _submission = webgpu.profile_native_stage("submit", || {
+            webgpu.queue.submit(std::iter::once(encoder.finish()))
+        });
+        webgpu.profile_native_stage("present", || webgpu.queue.present(output));
 
         Ok(())
     }

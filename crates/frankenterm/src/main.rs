@@ -15758,6 +15758,7 @@ struct AgentConfigTransactionClaim {
     durability_contract: String,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AgentConfigTransactionOutcome {
@@ -82183,6 +82184,7 @@ struct MuxDumpVerificationReceipt {
     domain_pane_counts: BTreeMap<String, usize>,
     error_count: usize,
     content_bytes: usize,
+    #[cfg(unix)]
     compatible_client: Option<VerifiedCompatibleClientDumpContract>,
 }
 
@@ -86178,8 +86180,8 @@ fn verify_mux_dump_v2_payload(
     );
     compatible_client_derived_total_deadline_ms(
         content_targets.len(),
-        batch_size,
-        batch_timeout_ms,
+        compatible_client.batch_size,
+        compatible_client.batch_timeout_ms,
     )
     .context("Mux dump v2 limits describe an impossible producer deadline")?;
     let mut pane_ids = BTreeSet::new();
@@ -86553,6 +86555,7 @@ fn verify_mux_dump_v2_payload(
         domain_pane_counts,
         error_count: 0,
         content_bytes,
+        #[cfg(unix)]
         compatible_client: Some(compatible_client),
     })
 }
@@ -87570,6 +87573,7 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         domain_pane_counts,
         error_count: errors.len(),
         content_bytes,
+        #[cfg(unix)]
         compatible_client,
     })
 }
