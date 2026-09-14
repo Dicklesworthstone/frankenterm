@@ -641,21 +641,21 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 187,
-        "fix": 208,
+        "fix": 210,
         "other": 38,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 73
+        "test": 75
       },
-      "fork_side_commit_count": 574,
+      "fork_side_commit_count": 578,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T00:59:48-04:00",
-        "sha": "4d3f3d073c9839d4bdd129767cd919a09decf739",
-        "subject": "fix(mux): log committed cold-seam and cold-index resize sources"
+        "classification": "test",
+        "committed_at": "2026-09-14T03:50:44-04:00",
+        "sha": "8f1f7e8f6353394cc867504126718739d6fdfadb",
+        "subject": "test(mux): execute deferred drains before negative assertions"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -851,19 +851,19 @@
         "cosmetic": 7,
         "feat": 14,
         "fix": 35,
-        "other": 26,
+        "other": 27,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 111,
+      "fork_side_commit_count": 112,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-14T01:35:54-04:00",
-        "sha": "3106b936b65d6b0ae195f33355c4b826024ad589",
-        "subject": "perf(surface): retain shared token ranges during reflow"
+        "committed_at": "2026-09-14T03:38:35-04:00",
+        "sha": "eb8cc5cef8fa44d909c4fd64178d95f028383d76",
+        "subject": "perf(term): reuse published rows and index admitted cold history"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -897,19 +897,19 @@
         "docs": 1,
         "feat": 53,
         "fix": 94,
-        "other": 45,
+        "other": 46,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 47
       },
-      "fork_side_commit_count": 271,
+      "fork_side_commit_count": 272,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-14T02:02:41-04:00",
-        "sha": "de4dc54f90c111f20716491360320099cb5f3272",
-        "subject": "perf(reflow): use bounded available worker capacity by default"
+        "committed_at": "2026-09-14T03:38:35-04:00",
+        "sha": "eb8cc5cef8fa44d909c4fd64178d95f028383d76",
+        "subject": "perf(term): reuse published rows and index admitted cold history"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2543,
-  "generated_at": "2026-09-14T06:06:54.161741Z",
+  "fork_side_commit_total": 2549,
+  "generated_at": "2026-09-14T07:50:50.291483Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
