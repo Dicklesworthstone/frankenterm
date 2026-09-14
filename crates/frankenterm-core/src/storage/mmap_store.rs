@@ -129,6 +129,12 @@ pub enum MmapStoreError {
         limit: u64,
         observed: u64,
     },
+    #[error("pane append batch exceeds {limit_name} limit {limit}: observed {observed}")]
+    PaneAppendLimitExceeded {
+        limit_name: &'static str,
+        limit: u64,
+        observed: u64,
+    },
     #[error(
         "pane sequence journal capacity {limit} bytes would be exceeded: attempted {attempted} bytes"
     )]
@@ -148,12 +154,61 @@ const COLD_ERASURE_MAX_SHARD_BYTES: u64 = 512 * 1024 * 1024;
 const PANE_LOG_HEADER_PREFIX: &[u8] = b"\0FTMMAP1:";
 const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
 const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
+const PANE_APPEND_MAX_ROWS: usize = 256;
+const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(not(test))]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
 #[cfg(test)]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
+
+#[cfg(test)]
+std::thread_local! {
+    static PANE_APPEND_DATA_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PANE_APPEND_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn validate_append_batch(lines: &[&str]) -> Result<(), MmapStoreError> {
+    if lines.len() > PANE_APPEND_MAX_ROWS {
+        return Err(MmapStoreError::PaneAppendLimitExceeded {
+            limit_name: "rows",
+            limit: PANE_APPEND_MAX_ROWS as u64,
+            observed: u64::try_from(lines.len()).unwrap_or(u64::MAX),
+        });
+    }
+    let mut total = 0u64;
+    for line in lines {
+        if line
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            return Err(MmapStoreError::InvalidLineRecord);
+        }
+        let bytes = u64::try_from(line.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?
+            .checked_add(1)
+            .ok_or(MmapStoreError::NumericOverflow("line_len"))?;
+        if bytes > PANE_LOG_MAX_RECORD_BYTES {
+            return Err(MmapStoreError::PaneLogRecordTooLarge {
+                bytes,
+                max: PANE_LOG_MAX_RECORD_BYTES,
+            });
+        }
+        total = total
+            .checked_add(bytes)
+            .ok_or(MmapStoreError::NumericOverflow("append_bytes"))?;
+        if total > PANE_APPEND_MAX_BYTES {
+            return Err(MmapStoreError::PaneAppendLimitExceeded {
+                limit_name: "stored_bytes",
+                limit: PANE_APPEND_MAX_BYTES,
+                observed: total,
+            });
+        }
+    }
+    Ok(())
+}
 
 fn validate_read_range(
     range: &std::ops::Range<u64>,
@@ -1174,60 +1229,80 @@ impl PaneFile {
     }
 
     fn append_line(&mut self, line: &str) -> Result<u64, MmapStoreError> {
-        if self.file_len == 0 && line.as_bytes().starts_with(b"\0FTMMAP") {
+        self.append_lines(&[line])
+    }
+
+    fn append_lines(&mut self, lines: &[&str]) -> Result<u64, MmapStoreError> {
+        validate_append_batch(lines)?;
+        let seq = self.next_seq()?;
+        if lines.is_empty() {
+            return Ok(seq);
+        }
+        if self.file_len == 0 && lines[0].as_bytes().starts_with(b"\0FTMMAP") {
             return Err(MmapStoreError::InvalidPaneLogHeader(
                 "first record collides with the reserved pane header".to_string(),
             ));
         }
-        if line
-            .as_bytes()
-            .iter()
-            .any(|byte| matches!(byte, b'\n' | b'\r'))
-        {
-            return Err(MmapStoreError::InvalidLineRecord);
+        seq.checked_add(
+            u64::try_from(lines.len())
+                .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
+        )
+        .ok_or(MmapStoreError::NumericOverflow("seq"))?;
+        let physical_end = self.file.seek(SeekFrom::End(0))?;
+        let mut new_file_len = if self.trailing_partial {
+            self.file_len
+        } else {
+            physical_end
+        };
+        let mut offsets = Vec::with_capacity(lines.len());
+        for line in lines {
+            offsets.push(LineOffset(new_file_len));
+            new_file_len = new_file_len
+                .checked_add(
+                    u64::try_from(line.len())
+                        .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?,
+                )
+                .and_then(|len| len.checked_add(1))
+                .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
         }
-        let record_bytes = u64::try_from(line.len())
-            .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?
-            .checked_add(1)
-            .ok_or(MmapStoreError::NumericOverflow("line_len"))?;
-        if record_bytes > PANE_LOG_MAX_RECORD_BYTES {
-            return Err(MmapStoreError::PaneLogRecordTooLarge {
-                bytes: record_bytes,
-                max: PANE_LOG_MAX_RECORD_BYTES,
-            });
-        }
-        let mut physical_end = self.file.seek(SeekFrom::End(0))?;
+        self.line_offsets
+            .try_reserve(lines.len())
+            .map_err(|_| std::io::Error::other("cannot reserve bounded append row metadata"))?;
         if self.trailing_partial {
-            // The suffix after `file_len` was never newline-terminated and
-            // therefore was never acknowledged as a record. Remove exactly
-            // that uncommitted tail before appending; otherwise a later reopen
-            // would index the tail as a real line once a separator was added.
+            // The suffix after `file_len` was never acknowledged. A failed
+            // batch can leave complete records as well as a partial record.
+            // Remove exactly that uncommitted suffix before retrying so the
+            // next append cannot duplicate rows or join onto a partial record.
             self.file.set_len(self.file_len)?;
             self.file.sync_all()?;
-            physical_end = self.file_len;
+            self.file.seek(SeekFrom::Start(self.file_len))?;
             self.trailing_partial = false;
         }
-        let start = physical_end;
-        let seq = self
-            .base_seq
-            .checked_add(
-                u64::try_from(self.line_offsets.len())
-                    .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
-            )
-            .ok_or(MmapStoreError::NumericOverflow("seq"))?;
-        let new_file_len = start
-            .checked_add(
-                u64::try_from(line.len())
-                    .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?,
-            )
-            .and_then(|len| len.checked_add(1))
-            .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
         // Publish the interrupted-tail state before the first write. If any
         // write or durability operation fails, readers keep the prior
         // committed boundary and a later append starts on a fresh line.
         self.trailing_partial = true;
-        self.file.write_all(line.as_bytes())?;
-        self.file.write_all(b"\n")?;
+        for (index, line) in lines.iter().enumerate() {
+            #[cfg(test)]
+            if index == 0 && PANE_APPEND_FAULT.with(|fault| fault.get() == Some(0)) {
+                self.file.write_all(&line.as_bytes()[..line.len() / 2])?;
+                return Err(std::io::Error::other(
+                    "injected append failure during real record write",
+                )
+                .into());
+            }
+            self.file.write_all(line.as_bytes())?;
+            self.file.write_all(b"\n")?;
+            #[cfg(test)]
+            if PANE_APPEND_FAULT.with(|fault| fault.get() == Some(index + 1)) {
+                return Err(std::io::Error::other(
+                    "injected append failure after real record write",
+                )
+                .into());
+            }
+            #[cfg(not(test))]
+            let _ = index;
+        }
         // A successful spill is a crash-durability acknowledgement, not just
         // a userspace-buffer acknowledgement. `flush` alone can leave the
         // newest retained line entirely in the kernel page cache when the
@@ -1235,7 +1310,17 @@ impl PaneFile {
         // visible through the in-memory index and returning success.
         self.file.flush()?;
         self.file.sync_data()?;
-        self.line_offsets.push(LineOffset(start));
+        #[cfg(test)]
+        {
+            PANE_APPEND_DATA_SYNCS.with(|count| count.set(count.get() + 1));
+            if PANE_APPEND_FAULT.with(|fault| fault.get() == Some(usize::MAX)) {
+                return Err(std::io::Error::other(
+                    "injected append failure after real data synchronization",
+                )
+                .into());
+            }
+        }
+        self.line_offsets.extend(offsets);
         self.file_len = new_file_len;
         self.trailing_partial = false;
         Ok(seq)
@@ -1844,6 +1929,15 @@ impl SqliteFallbackStore {
     }
 
     fn append_line_auto_seq(&mut self, pane_id: PaneId, line: &str) -> Result<u64, MmapStoreError> {
+        self.append_lines_auto_seq(pane_id, &[line])
+    }
+
+    fn append_lines_auto_seq(
+        &mut self,
+        pane_id: PaneId,
+        lines: &[&str],
+    ) -> Result<u64, MmapStoreError> {
+        validate_append_batch(lines)?;
         let pane_id_i64 =
             i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
         let transaction = self.conn.transaction()?;
@@ -1862,14 +1956,24 @@ impl SqliteFallbackStore {
         let next_seq =
             u64::try_from(next_seq_i64).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
         let following_seq = next_seq
-            .checked_add(1)
+            .checked_add(
+                u64::try_from(lines.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
+            )
             .ok_or(MmapStoreError::NumericOverflow("seq"))?;
         let following_seq_i64 =
             i64::try_from(following_seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
-        transaction.execute(
-            "INSERT INTO mmap_scrollback_lines (pane_id, seq, content) VALUES (?1, ?2, ?3)",
-            params![pane_id_i64, next_seq_i64, line],
-        )?;
+        for (offset, line) in lines.iter().enumerate() {
+            let sequence = next_seq_i64
+                .checked_add(
+                    i64::try_from(offset).map_err(|_| MmapStoreError::NumericOverflow("seq"))?,
+                )
+                .ok_or(MmapStoreError::NumericOverflow("seq"))?;
+            transaction.execute(
+                "INSERT INTO mmap_scrollback_lines (pane_id, seq, content) VALUES (?1, ?2, ?3)",
+                params![pane_id_i64, sequence, line],
+            )?;
+        }
         let updated = transaction.execute(
             "UPDATE mmap_scrollback_fallback_panes
              SET next_seq = ?2
@@ -2528,7 +2632,7 @@ impl MmapScrollbackStore {
             // This file has no published manifest or in-memory index yet.
             // Preserve the record format while amortizing writes and issuing
             // one durability barrier for the entire replacement. Live appends
-            // still use append_line's per-record acknowledgement contract.
+            // acknowledge one record or bounded batch after its own data sync.
             let mut writer = BufWriter::with_capacity(64 * 1024, &mut pane.file);
             for record in records {
                 writer.write_all(record.as_bytes())?;
@@ -2715,6 +2819,27 @@ impl MmapScrollbackStore {
             .get_mut(&pane_id)
             .ok_or(MmapStoreError::UnknownPane(pane_id))?
             .append_line(line)
+    }
+
+    /// Append a bounded contiguous batch and return its first sequence.
+    /// File-backed rows enter the live index only after one data sync; SQLite
+    /// rows share one transaction. Failure can leave an unacknowledged file
+    /// prefix, so an authenticated caller must reconcile its retained WAL
+    /// before publishing a successor or retrying after reopen.
+    pub fn append_lines(&mut self, pane_id: PaneId, lines: &[&str]) -> Result<u64, MmapStoreError> {
+        validate_append_batch(lines)?;
+        self.ensure_pane(pane_id)?;
+        if self.fallback_panes.contains(&pane_id) {
+            return self
+                .sqlite_fallback
+                .as_mut()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .append_lines_auto_seq(pane_id, lines);
+        }
+        self.panes
+            .get_mut(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .append_lines(lines)
     }
 
     pub fn compact_pane_if_stale(
@@ -3057,6 +3182,107 @@ mod tests {
         let config =
             MmapStoreConfig::new(dir.to_path_buf()).with_sqlite_fallback(db_path.to_path_buf());
         MmapScrollbackStore::new(config).expect("create hybrid store")
+    }
+
+    #[test]
+    fn append_batch_real_backends_commit_exact_rows_once() {
+        for fallback in [false, true] {
+            let dir = temp_dir();
+            let db = dir.path().join("batch.sqlite");
+            let mut store = hybrid_store(dir.path(), &db);
+            if fallback {
+                store.activate_sqlite_fallback(7).unwrap();
+            }
+            PANE_APPEND_DATA_SYNCS.with(|count| count.set(0));
+            let lines = ["ASCII", "界e\u{301}", "👩‍💻"];
+            assert_eq!(store.append_lines(7, &lines).unwrap(), 0);
+            assert_eq!(store.next_seq(7).unwrap(), 3);
+            assert_eq!(store.tail_lines(7, 9).unwrap(), lines);
+            assert_eq!(
+                PANE_APPEND_DATA_SYNCS.with(|count| count.get()),
+                usize::from(!fallback)
+            );
+            assert_eq!(store.append_lines(7, &[]).unwrap(), 3);
+            assert_eq!(
+                PANE_APPEND_DATA_SYNCS.with(|count| count.get()),
+                usize::from(!fallback)
+            );
+            drop(store);
+            let mut reopened = hybrid_store(dir.path(), &db);
+            reopened.ensure_pane(7).unwrap();
+            assert_eq!(reopened.tail_lines(7, 9).unwrap(), lines);
+            assert_eq!(reopened.next_seq(7).unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn append_batch_preflight_rejects_invalid_rows_and_bytes_without_writes() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_line(7, "prior").unwrap();
+        let bytes = std::fs::metadata(dir.path().join("7.log")).unwrap().len();
+        assert!(matches!(
+            store.append_lines(7, &["valid", "bad\nrow"]),
+            Err(MmapStoreError::InvalidLineRecord)
+        ));
+        assert!(matches!(
+            store.append_lines(7, &vec!["x"; PANE_APPEND_MAX_ROWS + 1]),
+            Err(MmapStoreError::PaneAppendLimitExceeded {
+                limit_name: "rows",
+                ..
+            })
+        ));
+        let large = "x".repeat((PANE_APPEND_MAX_BYTES / 2) as usize);
+        assert!(matches!(
+            store.append_lines(7, &[large.as_str(), large.as_str()]),
+            Err(MmapStoreError::PaneAppendLimitExceeded {
+                limit_name: "stored_bytes",
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::metadata(dir.path().join("7.log")).unwrap().len(),
+            bytes
+        );
+        assert_eq!(store.tail_lines(7, 9).unwrap(), ["prior"]);
+        assert_eq!(store.next_seq(7).unwrap(), 1);
+    }
+
+    #[test]
+    fn append_batch_failures_keep_live_prefix_and_expose_exact_reopen_suffix() {
+        for (fault, complete_rows) in [(0, 0), (1, 1), (usize::MAX, 3)] {
+            let dir = temp_dir();
+            let mut store = file_only_store(dir.path());
+            store.append_line(7, "prior").unwrap();
+            let batch = ["abcdef", "界e\u{301}", "👩‍💻"];
+            PANE_APPEND_FAULT.with(|setting| setting.set(Some(fault)));
+            let result = store.append_lines(7, &batch);
+            PANE_APPEND_FAULT.with(|setting| setting.set(None));
+            assert!(result.is_err());
+            assert_eq!(store.next_seq(7).unwrap(), 1);
+            assert_eq!(store.tail_lines(7, 9).unwrap(), ["prior"]);
+            drop(store);
+            let mut reopened = file_only_store(dir.path());
+            reopened.ensure_pane(7).unwrap();
+            assert_eq!(reopened.next_seq(7).unwrap(), 1 + complete_rows as u64);
+            assert_eq!(
+                reopened.tail_lines(7, 9).unwrap(),
+                std::iter::once("prior")
+                    .chain(batch[..complete_rows].iter().copied())
+                    .collect::<Vec<_>>()
+            );
+            // This low-level repair has no publication authority. The native
+            // caller separately authenticates this exact prefix against WAL.
+            assert_eq!(
+                reopened.append_lines(7, &batch[complete_rows..]).unwrap(),
+                1 + complete_rows as u64
+            );
+            assert_eq!(
+                reopened.tail_lines(7, 9).unwrap(),
+                ["prior", "abcdef", "界e\u{301}", "👩‍💻"]
+            );
+            assert_eq!(reopened.next_seq(7).unwrap(), 4);
+        }
     }
 
     #[test]
