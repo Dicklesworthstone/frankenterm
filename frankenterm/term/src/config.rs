@@ -1047,6 +1047,26 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         max_retained_rows: usize,
     ) -> bool;
 
+    /// Store a contiguous prefix and return its durably acknowledged length.
+    /// The caller retains every row beyond that prefix, including on failure.
+    /// Implementations may accept fewer rows to honor transaction byte limits.
+    /// The default attempts just one row, so a partially successful loop never
+    /// hides which rows were acknowledged. A deferred queue must not implement
+    /// this method by treating memory admission as a durability receipt.
+    fn store_scrollback_lines(
+        &self,
+        first_stable_row: StableRowIndex,
+        lines: &[Line],
+        max_retained_rows: usize,
+    ) -> usize {
+        if self.requires_scrollback_flush() {
+            return 0;
+        }
+        usize::from(lines.first().is_some_and(|line| {
+            self.store_scrollback_line(first_stable_row, line, max_retained_rows)
+        }))
+    }
+
     /// Whether parser-side maintenance must drain this sink outside the
     /// terminal mutex before admitting another output batch.
     fn requires_scrollback_flush(&self) -> bool {

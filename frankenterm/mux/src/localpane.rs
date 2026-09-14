@@ -3388,6 +3388,7 @@ impl LocalPane {
             {
                 if let Some(registration) = pending_registration {
                     Self::prepare_cold_layout_after_resize(
+                        pane_id,
                         &terminal,
                         &resize_queue,
                         token,
@@ -3531,6 +3532,7 @@ impl LocalPane {
     /// thread-creation-failure fallback. Indexing is optional preparation;
     /// failure leaves the already-committed resident resize intact.
     fn prepare_cold_layout_after_resize(
+        pane_id: PaneId,
         terminal: &Mutex<Terminal>,
         resize_queue: &Mutex<ResizeQueueState>,
         token: ResizeCancellationToken,
@@ -3566,7 +3568,25 @@ impl LocalPane {
                                         }
                                         term.increment_seqno();
                                         let seqno = term.current_seqno();
-                                        term.screen_mut().install_cold_seam_reflow(&mut seam, seqno)
+                                        let installed = term
+                                            .screen_mut()
+                                            .install_cold_seam_reflow(&mut seam, seqno);
+                                        if installed {
+                                            // Same terminal/token authority as
+                                            // the primary resize, before readers
+                                            // can capture this newer cold source.
+                                            let size = term.get_size();
+                                            log::trace!(
+                                                "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase=cold_seam",
+                                                pane_id,
+                                                token.seq,
+                                                token.seq,
+                                                term.current_seqno(),
+                                                size.cols,
+                                                size.rows,
+                                            );
+                                        }
+                                        installed
                                     });
                                 seam_committed |=
                                     matches!(decision, ResizeCommitDecision::Committed(true));
@@ -3618,6 +3638,19 @@ impl LocalPane {
                             }
                             let seqno = term.current_seqno();
                             term.screen_mut().install_line_read_layout(&read, seqno);
+                            // Validation, install and witness share the terminal
+                            // and resize-token guards; no newer intent can be
+                            // mistaken for this cold index source.
+                            let size = term.get_size();
+                            log::trace!(
+                                "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase=cold_index",
+                                pane_id,
+                                token.seq,
+                                token.seq,
+                                term.current_seqno(),
+                                size.cols,
+                                size.rows,
+                            );
                             true
                         });
                         matches!(decision, ResizeCommitDecision::Committed(true))
@@ -3882,7 +3915,21 @@ impl LocalPane {
                 }
                 let terminal_resize_start = Instant::now();
                 terminal.resize_with_prepared_reflow(size, prepared_reflow.as_mut());
-                terminal_resize_start.elapsed()
+                let terminal_resize_elapsed = terminal_resize_start.elapsed();
+                // Publish the committed source while both guards still exclude
+                // a newer intent and GUI frame capture. Worker completion below
+                // includes off-lock retirement/cold preparation and can follow
+                // presentation; it is not the frame's causal commit boundary.
+                log::trace!(
+                    "LocalPane::resize committed_source pane_id={} seq={} commit_id={} source_sequence={} target={}x{} phase=primary",
+                    pane_id,
+                    token.seq,
+                    commit_id,
+                    terminal.current_seqno(),
+                    size.cols,
+                    size.rows,
+                );
+                terminal_resize_elapsed
             });
         drop(terminal);
         if let Some(prepared) = prepared_reflow.as_ref() {
