@@ -43,6 +43,21 @@ pub mod stream {
     pub use asupersync::stream::Stream;
 }
 
+/// RaptorQ primitives used by bounded recovery-object encoding and repair.
+///
+/// Recovery callers supply their existing `Cx` and own authentication,
+/// allocation limits, and durable publication. Codec success alone does not
+/// establish that a recovered object is authentic or safe to activate.
+pub mod raptorq {
+    pub use asupersync::RaptorQConfig;
+    pub use asupersync::raptorq::decoder::{InactivationDecoder, RankStatus, ReceivedSymbol};
+    pub use asupersync::raptorq::systematic::{SystematicEncoder, SystematicParams};
+    pub use asupersync::raptorq::{
+        RaptorQReceiver, RaptorQReceiverBuilder, RaptorQSender, RaptorQSenderBuilder,
+    };
+    pub use asupersync::types::{ObjectId, ObjectParams, Symbol, SymbolId, SymbolKind};
+}
+
 /// Historical quarantine inventory — kept for audit trail.
 ///
 /// The Tokio runtime builder fallback was removed in ft-xbnl0.2.5.
