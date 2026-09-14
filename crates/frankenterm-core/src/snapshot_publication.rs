@@ -46,9 +46,17 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::MetadataExt as _;
 use cap_std::fs::{Dir, File, OpenOptions};
 use fs2::FileExt as _;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::cx::Cx;
+use crate::snapshot_repair::{
+    DEFAULT_SYMBOL_SIZE, ExpectedRecoveryIdentity, RepairError, RepairObjectChunk,
+    RepairObjectDescriptor, RepairObjectLimits, RepairProtectionClass, encode_repair_object,
+    shared_admission_controller,
+};
 
 // =============================================================================
 // Constants & Limits
@@ -68,6 +76,10 @@ pub const OBJECTS_DIR_NAME: &str = "objects";
 pub const ROOTS_DIR_NAME: &str = "roots";
 /// Subdirectory name for generation metadata.
 pub const GENERATIONS_DIR_NAME: &str = "generations";
+const DISCOVERY_SLOT_A: &str = "slot_a.discovery";
+const DISCOVERY_SLOT_B: &str = "slot_b.discovery";
+const DISCOVERY_DOMAIN: &[u8] = b"frankenterm.snapshot-recovery.committed-root-discovery.v1\0";
+const MAX_DISCOVERY_BYTES: usize = 16 * 1024;
 
 /// Staging file prefix for atomic publication.
 pub const STAGE_PREFIX: &str = ".stage.";
@@ -226,6 +238,15 @@ pub enum PublicationError {
 
     #[error("Both verified root slots claim generation {generation}; root selection is ambiguous")]
     AmbiguousGeneration { generation: u64 },
+
+    #[error("Repair storage failed: {0}")]
+    Repair(#[from] RepairError),
+
+    #[error("Repair discovery validation failed: {0}")]
+    InvalidDiscovery(&'static str),
+
+    #[error("Publication cancelled")]
+    Cancelled,
 }
 
 impl PublicationError {
@@ -329,6 +350,41 @@ pub struct GenerationPublicationReceipt {
     pub sha256: String,
     pub byte_len: u64,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairDescriptorReference {
+    pub object_id: String,
+    pub sha256: String,
+    pub byte_len: u64,
+}
+
+/// Authenticated discovery is published only after the corresponding ordinary
+/// root commits. Its namespace and root identity must match caller-trusted values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootRepairDiscovery {
+    pub namespace: String,
+    pub root_object_id: [u8; 32],
+    pub generation: u64,
+    pub slot: RootSlot,
+    pub outer_envelope_sha256: [u8; 32],
+    pub outer_envelope_len: u64,
+    pub predecessor: Option<PredecessorBinding>,
+    pub repair: RepairDescriptorReference,
+}
+
+struct PreparedRootRepair<'a> {
+    cx: &'a Cx,
+    key: &'a [u8],
+    namespace: &'a str,
+    root_object_id: [u8; 32],
+    envelope_sha256: [u8; 32],
+    envelope_len: u64,
+    descriptor: RepairDescriptorReference,
+}
+
+pub fn repair_descriptor_object_id(representation_id: &[u8; 32]) -> String {
+    format!("repair-descriptor-{}", hex::encode(representation_id))
 }
 
 /// Descriptor for an immutable recovery object to be stored.
@@ -723,8 +779,14 @@ fn encode_root_envelope(
         manifest_len: request.manifest_bytes.len() as u64,
         created_at_ms: request.created_at_ms,
     };
+    encode_root_parts(&header, &request.manifest_bytes)
+}
 
-    let header_json = serde_json::to_vec(&header).map_err(|e| {
+fn encode_root_parts(
+    header: &GenerationEnvelopeHeader,
+    manifest_bytes: &[u8],
+) -> Result<Vec<u8>, PublicationError> {
+    let header_json = serde_json::to_vec(header).map_err(|e| {
         PublicationError::InvalidEnvelope {
             slot: RootSlot::SlotA, // context set by caller
             reason: format!("failed to serialize envelope header: {e}"),
@@ -744,14 +806,13 @@ fn encode_root_envelope(
             actual_bytes: header_json.len() as u64,
         })?;
 
-    let total_capacity =
-        ENVELOPE_MAGIC.len() + 4 + header_json.len() + request.manifest_bytes.len() + 32; // 32 bytes for SHA-256 trailer
+    let total_capacity = ENVELOPE_MAGIC.len() + 4 + header_json.len() + manifest_bytes.len() + 32; // 32 bytes for SHA-256 trailer
 
     let mut buffer = Vec::with_capacity(total_capacity);
     buffer.extend_from_slice(ENVELOPE_MAGIC);
     buffer.extend_from_slice(&header_len.to_le_bytes());
     buffer.extend_from_slice(&header_json);
-    buffer.extend_from_slice(&request.manifest_bytes);
+    buffer.extend_from_slice(manifest_bytes);
 
     // Compute trailer checksum over all preceding bytes
     let trailer_hash = Sha256::digest(&buffer);
@@ -1186,6 +1247,259 @@ impl SnapshotPublicationStore {
     // -------------------------------------------------------------------------
     // Object Storage (Immutable, No-Clobber)
     // -------------------------------------------------------------------------
+
+    fn checkpoint_publication(cx: &Cx) -> Result<(), PublicationError> {
+        cx.checkpoint().map_err(|_| PublicationError::Cancelled)
+    }
+
+    fn prepare_persisted_repair(
+        &self,
+        cx: &Cx,
+        envelope: &[u8],
+        semantic_id: [u8; 32],
+        generation: u64,
+        key: &[u8],
+        protection: RepairProtectionClass,
+    ) -> Result<RepairDescriptorReference, PublicationError> {
+        Self::checkpoint_publication(cx)?;
+        let limits = RepairObjectLimits::default();
+        let descriptor = encode_repair_object(
+            cx,
+            envelope,
+            semantic_id,
+            generation,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            protection,
+            shared_admission_controller(),
+            limits,
+            |_index, _manifest, records| {
+                cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+                let digest = sha256_hex(records);
+                let object_id = format!("repair-records-{digest}");
+                self.publish_object(&RecoveryObjectPayload {
+                    object_id: object_id.clone(),
+                    expected_sha256: digest,
+                    ciphertext_bytes: records.to_vec(),
+                })
+                .map_err(|error| RepairError::Storage(error.to_string()))?;
+                Ok(object_id)
+            },
+        )?;
+        let bytes = descriptor.to_authenticated_bytes(key, limits)?;
+        Self::checkpoint_publication(cx)?;
+        let representation_id: [u8; 32] = Sha256::digest(envelope).into();
+        let receipt = self.publish_object(&RecoveryObjectPayload {
+            object_id: repair_descriptor_object_id(&representation_id),
+            expected_sha256: sha256_hex(&bytes),
+            ciphertext_bytes: bytes,
+        })?;
+        Ok(RepairDescriptorReference {
+            object_id: receipt.object_id,
+            sha256: receipt.sha256,
+            byte_len: receipt.byte_len,
+        })
+    }
+
+    /// Persist a complete authenticated repair closure before publishing its
+    /// envelope. All records and the descriptor use immutable no-clobber writes.
+    pub fn publish_repair_protected_object(
+        &self,
+        cx: &Cx,
+        object: &RecoveryObjectPayload,
+        semantic_id: [u8; 32],
+        generation: u64,
+        key: &[u8],
+    ) -> Result<ObjectPublicationReceipt, PublicationError> {
+        Self::checkpoint_publication(cx)?;
+        validate_object_id(&object.object_id)?;
+        if generation == 0 {
+            return Err(PublicationError::InvalidGeneration);
+        }
+        if object.ciphertext_bytes.len() as u64 > self.limits.max_object_bytes {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: self.limits.max_object_bytes,
+                actual_bytes: object.ciphertext_bytes.len() as u64,
+            });
+        }
+        if sha256_hex(&object.ciphertext_bytes) != object.expected_sha256 {
+            return Err(PublicationError::InvalidDiscovery(
+                "object digest mismatch before repair publication",
+            ));
+        }
+        self.prepare_persisted_repair(
+            cx,
+            &object.ciphertext_bytes,
+            semantic_id,
+            generation,
+            key,
+            RepairProtectionClass::High,
+        )?;
+        Self::checkpoint_publication(cx)?;
+        self.publish_object(object)
+    }
+
+    pub fn publish_repair_protected_generation_root<V: RootVerifier>(
+        &self,
+        cx: &Cx,
+        request: &GenerationRootPublishRequest,
+        namespace: &str,
+        root_object_id: [u8; 32],
+        key: &[u8],
+        verifier: &V,
+    ) -> Result<GenerationPublicationReceipt, PublicationError> {
+        Self::checkpoint_publication(cx)?;
+        if request.generation == 0 {
+            return Err(PublicationError::InvalidGeneration);
+        }
+        if namespace.is_empty() || namespace.len() > 1024 || key.is_empty() {
+            return Err(PublicationError::InvalidDiscovery(
+                "invalid trusted namespace or key",
+            ));
+        }
+        if request.manifest_bytes.len() as u64 > self.limits.max_root_manifest_bytes {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: self.limits.max_root_manifest_bytes,
+                actual_bytes: request.manifest_bytes.len() as u64,
+            });
+        }
+        let envelope = encode_root_envelope(request, &sha256_hex(&request.manifest_bytes))?;
+        if envelope.len() as u64 > self.limits.max_root_envelope_bytes() {
+            return Err(PublicationError::OversizedPayload {
+                max_bytes: self.limits.max_root_envelope_bytes(),
+                actual_bytes: envelope.len() as u64,
+            });
+        }
+        let descriptor = self.prepare_persisted_repair(
+            cx,
+            &envelope,
+            root_object_id,
+            request.generation,
+            key,
+            RepairProtectionClass::Maximum,
+        )?;
+        let protection = PreparedRootRepair {
+            cx,
+            key,
+            namespace,
+            root_object_id,
+            envelope_sha256: Sha256::digest(&envelope).into(),
+            envelope_len: envelope.len() as u64,
+            descriptor,
+        };
+        Self::checkpoint_publication(cx)?;
+        self.publish_generation_root_inner(request, verifier, Some(&protection))
+    }
+
+    pub(crate) fn read_object_bounded(
+        &self,
+        object_id: &str,
+        bound: u64,
+    ) -> Result<Vec<u8>, PublicationError> {
+        validate_object_id(object_id)?;
+        let filename = format!("{object_id}.obj");
+        let path = self.root_path.join(OBJECTS_DIR_NAME).join(&filename);
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = self
+            .objects_dir
+            .open_with(&filename, &options)
+            .map_err(|error| PublicationError::io(&path, error))?;
+        let len = check_opened_file_security(&file, &path)?;
+        read_file_bounded_exact(
+            &mut file,
+            len,
+            bound.min(self.limits.max_object_bytes),
+            &path,
+        )
+    }
+
+    pub fn read_repair_descriptor(
+        &self,
+        expected: &ExpectedRecoveryIdentity,
+        key: &[u8],
+    ) -> Result<RepairObjectDescriptor, PublicationError> {
+        let limits = RepairObjectLimits::default();
+        let bytes = self.read_object_bounded(
+            &repair_descriptor_object_id(&expected.representation_id),
+            limits.max_descriptor_bytes as u64,
+        )?;
+        Ok(RepairObjectDescriptor::from_authenticated_bytes(
+            &bytes, expected, key, limits,
+        )?)
+    }
+
+    pub fn read_repair_descriptor_bytes(
+        &self,
+        reference: &RepairDescriptorReference,
+    ) -> Result<Vec<u8>, PublicationError> {
+        if reference.byte_len > RepairObjectLimits::default().max_descriptor_bytes as u64 {
+            return Err(PublicationError::InvalidDiscovery(
+                "descriptor exceeds limit",
+            ));
+        }
+        let bytes = self.read_object_bounded(&reference.object_id, reference.byte_len)?;
+        if bytes.len() as u64 != reference.byte_len || sha256_hex(&bytes) != reference.sha256 {
+            return Err(PublicationError::InvalidDiscovery(
+                "descriptor reference mismatch",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn read_repair_records(
+        &self,
+        chunk: &RepairObjectChunk,
+    ) -> Result<Vec<u8>, PublicationError> {
+        self.read_object_bounded(&chunk.records_object_id, chunk.record_bytes_len()? as u64)
+    }
+
+    pub fn decode_recovered_root(
+        &self,
+        slot: RootSlot,
+        bytes: &[u8],
+    ) -> Result<RootSlotCandidate, PublicationError> {
+        decode_root_envelope(
+            slot,
+            bytes,
+            self.limits.max_root_envelope_bytes(),
+            self.limits.max_root_manifest_bytes,
+        )
+    }
+
+    pub fn root_candidate_matches_discovery(
+        &self,
+        candidate: &RootSlotCandidate,
+        discovery: &RootRepairDiscovery,
+    ) -> Result<bool, PublicationError> {
+        let predecessor = candidate
+            .predecessor_generation
+            .map(|generation| PredecessorBinding {
+                expected_generation: generation,
+                expected_hash: candidate.predecessor_hash.clone().unwrap_or_default(),
+            });
+        if candidate.slot != discovery.slot
+            || candidate.generation != discovery.generation
+            || predecessor != discovery.predecessor
+            || candidate.file_len != discovery.outer_envelope_len
+            || candidate.manifest_bytes.len() as u64 > self.limits.max_root_manifest_bytes
+        {
+            return Ok(false);
+        }
+        let header = GenerationEnvelopeHeader {
+            generation: candidate.generation,
+            publisher_id: candidate.publisher_id.clone(),
+            predecessor_generation: candidate.predecessor_generation,
+            predecessor_hash: candidate.predecessor_hash.clone(),
+            manifest_sha256: candidate.manifest_sha256.clone(),
+            manifest_len: candidate.manifest_bytes.len() as u64,
+            created_at_ms: candidate.created_at_ms,
+        };
+        let bytes = encode_root_parts(&header, &candidate.manifest_bytes)?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        Ok(bytes.len() as u64 == discovery.outer_envelope_len
+            && digest == discovery.outer_envelope_sha256)
+    }
 
     /// Publishes an immutable recovery object into `objects/<object_id>.obj`.
     ///
@@ -1636,6 +1950,15 @@ impl SnapshotPublicationStore {
         request: &GenerationRootPublishRequest,
         verifier: &V,
     ) -> Result<GenerationPublicationReceipt, PublicationError> {
+        self.publish_generation_root_inner(request, verifier, None)
+    }
+
+    fn publish_generation_root_inner<V: RootVerifier>(
+        &self,
+        request: &GenerationRootPublishRequest,
+        verifier: &V,
+        protection: Option<&PreparedRootRepair<'_>>,
+    ) -> Result<GenerationPublicationReceipt, PublicationError> {
         if request.generation == 0 {
             return Err(PublicationError::InvalidGeneration);
         }
@@ -1652,7 +1975,81 @@ impl SnapshotPublicationStore {
 
         // 2. Re-inspect existing candidates and determine verified active root
         //    (inside publication lock to avoid races with concurrent publishers)
-        let (candidates, _) = self.inspect_root_candidates()?;
+        let (mut candidates, _) = self.inspect_root_candidates()?;
+        if let Some(protection) = protection {
+            let (discoveries, _) = self.inspect_repair_discovery(
+                protection.namespace,
+                &protection.root_object_id,
+                protection.key,
+            )?;
+            for discovery in discoveries {
+                Self::checkpoint_publication(protection.cx)?;
+                let ordinary = candidates.iter().find(|c| c.slot == discovery.slot);
+                if let Some(candidate) = ordinary {
+                    if self.root_candidate_matches_discovery(candidate, &discovery)?
+                        && verifier.verify_root(candidate, self).is_ok()
+                    {
+                        continue;
+                    }
+                }
+                let expected = ExpectedRecoveryIdentity::new(
+                    discovery.outer_envelope_sha256,
+                    protection.root_object_id,
+                    discovery.generation,
+                );
+                let limits = RepairObjectLimits {
+                    max_envelope_bytes: usize::try_from(self.limits.max_root_envelope_bytes())
+                        .unwrap_or(usize::MAX)
+                        .min(RepairObjectLimits::default().max_envelope_bytes),
+                    ..RepairObjectLimits::default()
+                };
+                let descriptor_bytes = self.read_repair_descriptor_bytes(&discovery.repair)?;
+                let descriptor = RepairObjectDescriptor::from_authenticated_bytes(
+                    &descriptor_bytes,
+                    &expected,
+                    protection.key,
+                    limits,
+                )?;
+                if descriptor.payload_len != discovery.outer_envelope_len {
+                    return Err(PublicationError::InvalidDiscovery(
+                        "committed repair length mismatch",
+                    ));
+                }
+                let repaired = crate::snapshot_repair::decode_repair_object(
+                    protection.cx,
+                    &descriptor,
+                    &expected,
+                    protection.key,
+                    shared_admission_controller(),
+                    limits,
+                    |chunk| {
+                        self.read_repair_records(chunk)
+                            .map_err(|error| RepairError::Storage(error.to_string()))
+                    },
+                )?;
+                let recovered =
+                    self.decode_recovered_root(discovery.slot, &repaired.reconstructed_envelope)?;
+                if !self.root_candidate_matches_discovery(&recovered, &discovery)?
+                    || verifier.verify_root(&recovered, self).is_err()
+                {
+                    return Err(PublicationError::InvalidDiscovery(
+                        "committed repair graph rejected",
+                    ));
+                }
+                // A newer ordinary root can be the durable commit of a publication
+                // whose discovery write failed. Otherwise the authenticated
+                // committed root is the authority for CAS and inactive-slot choice.
+                let retain_newer = ordinary.is_some_and(|candidate| {
+                    candidate.generation > recovered.generation
+                        && verifier.verify_root(candidate, self).is_ok()
+                });
+                if !retain_newer {
+                    candidates.retain(|candidate| candidate.slot != discovery.slot);
+                    candidates.push(recovered);
+                }
+            }
+            Self::checkpoint_publication(protection.cx)?;
+        }
 
         let mut verified_candidates = Vec::new();
         for candidate in &candidates {
@@ -1704,6 +2101,9 @@ impl SnapshotPublicationStore {
                         .map_err(|error| PublicationError::io(&candidate_path, error))?;
                     check_opened_file_security(&candidate_file, &candidate_path)?;
                     sync_adopted_file(&candidate_file, &self.roots_dir, &candidate_path)?;
+                    if let Some(protection) = protection {
+                        self.publish_committed_discovery(request, candidate.slot, protection)?;
+                    }
                     return Ok(GenerationPublicationReceipt {
                         generation: request.generation,
                         publisher_id: request.publisher_id.clone(),
@@ -1919,6 +2319,10 @@ impl SnapshotPublicationStore {
         let target_filename = target_slot.filename();
         let target_full_path = self.root_path.join(ROOTS_DIR_NAME).join(target_filename);
 
+        if let Some(protection) = protection {
+            Self::checkpoint_publication(protection.cx)?;
+        }
+
         self.roots_dir
             .rename(&stage_name, &self.roots_dir, target_filename)
             .map_err(|e| PublicationError::io(&target_full_path, e))?;
@@ -1947,6 +2351,10 @@ impl SnapshotPublicationStore {
 
         drop(stage_file);
 
+        if let Some(protection) = protection {
+            self.publish_committed_discovery(request, target_slot, protection)?;
+        }
+
         Ok(GenerationPublicationReceipt {
             generation: actual_candidate.generation,
             publisher_id: actual_candidate.publisher_id,
@@ -1955,6 +2363,287 @@ impl SnapshotPublicationStore {
             byte_len: actual_candidate.file_len,
             path: target_full_path,
         })
+    }
+
+    fn discovery_name(slot: RootSlot) -> &'static str {
+        match slot {
+            RootSlot::SlotA => DISCOVERY_SLOT_A,
+            RootSlot::SlotB => DISCOVERY_SLOT_B,
+        }
+    }
+
+    fn decode_discovery(
+        &self,
+        slot: RootSlot,
+        bytes: &[u8],
+        namespace: &str,
+        root_object_id: &[u8; 32],
+        key: &[u8],
+    ) -> Result<RootRepairDiscovery, PublicationError> {
+        if key.is_empty() || bytes.len() < 32 || bytes.len() > MAX_DISCOVERY_BYTES {
+            return Err(PublicationError::InvalidDiscovery(
+                "invalid discovery framing or key",
+            ));
+        }
+        let (payload, tag) = bytes.split_at(bytes.len() - 32);
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+            .map_err(|_| PublicationError::InvalidDiscovery("invalid discovery key"))?;
+        mac.update(DISCOVERY_DOMAIN);
+        mac.update(payload);
+        mac.verify_slice(tag)
+            .map_err(|_| PublicationError::InvalidDiscovery("discovery authentication failed"))?;
+        let discovery: RootRepairDiscovery = serde_json::from_slice(payload).map_err(|_| {
+            PublicationError::InvalidDiscovery("invalid authenticated discovery JSON")
+        })?;
+        if discovery.namespace != namespace
+            || &discovery.root_object_id != root_object_id
+            || discovery.slot != slot
+        {
+            return Err(PublicationError::InvalidDiscovery(
+                "discovery trusted identity mismatch",
+            ));
+        }
+        if discovery.generation == 0
+            || discovery.outer_envelope_len == 0
+            || discovery.outer_envelope_len > self.limits.max_root_envelope_bytes()
+            || discovery.repair.byte_len == 0
+            || discovery.repair.byte_len > RepairObjectLimits::default().max_descriptor_bytes as u64
+            || discovery.repair.object_id
+                != repair_descriptor_object_id(&discovery.outer_envelope_sha256)
+            || discovery.repair.sha256.len() != 64
+            || hex::decode(&discovery.repair.sha256).is_err()
+        {
+            return Err(PublicationError::InvalidDiscovery(
+                "invalid discovery geometry or descriptor binding",
+            ));
+        }
+        match &discovery.predecessor {
+            None if discovery.generation == 1 => {}
+            Some(predecessor)
+                if predecessor.expected_generation > 0
+                    && predecessor.expected_generation < discovery.generation
+                    && predecessor.expected_hash.len() == 64
+                    && hex::decode(&predecessor.expected_hash).is_ok() => {}
+            _ => {
+                return Err(PublicationError::InvalidDiscovery(
+                    "invalid discovery predecessor",
+                ));
+            }
+        }
+        Ok(discovery)
+    }
+
+    /// Read only the two fixed authenticated discovery slots. A damaged or
+    /// wrong-key slot becomes a diagnostic while an independently valid older
+    /// slot remains usable; directory enumeration never supplies authority.
+    pub fn inspect_repair_discovery(
+        &self,
+        namespace: &str,
+        root_object_id: &[u8; 32],
+        key: &[u8],
+    ) -> Result<(Vec<RootRepairDiscovery>, Vec<TornRootDiagnostic>), PublicationError> {
+        if namespace.is_empty() || namespace.len() > 1024 || key.is_empty() {
+            return Err(PublicationError::InvalidDiscovery(
+                "invalid trusted discovery identity or key",
+            ));
+        }
+        let mut discoveries = Vec::new();
+        let mut diagnostics = Vec::new();
+        for slot in [RootSlot::SlotA, RootSlot::SlotB] {
+            let name = Self::discovery_name(slot);
+            let path = self.root_path.join(GENERATIONS_DIR_NAME).join(name);
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let result = match self.generations_dir.open_with(name, &options) {
+                Ok(mut file) => check_opened_file_security(&file, &path)
+                    .and_then(|len| {
+                        read_file_bounded_exact(&mut file, len, MAX_DISCOVERY_BYTES as u64, &path)
+                    })
+                    .and_then(|bytes| {
+                        self.decode_discovery(slot, &bytes, namespace, root_object_id, key)
+                    }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => Err(PublicationError::io(&path, error)),
+            };
+            match result {
+                Ok(discovery) => discoveries.push(discovery),
+                Err(error) => diagnostics.push(TornRootDiagnostic {
+                    slot,
+                    generation: None,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        discoveries.sort_by(|a, b| b.generation.cmp(&a.generation));
+        if discoveries.len() == 2 && discoveries[0].generation == discoveries[1].generation {
+            return Err(PublicationError::AmbiguousGeneration {
+                generation: discoveries[0].generation,
+            });
+        }
+        diagnostics.truncate(self.limits.max_error_records);
+        Ok((discoveries, diagnostics))
+    }
+
+    /// Called only while the root publication lock is held and after its
+    /// ordinary root has passed verification, rename and directory sync.
+    fn publish_committed_discovery(
+        &self,
+        request: &GenerationRootPublishRequest,
+        slot: RootSlot,
+        protection: &PreparedRootRepair<'_>,
+    ) -> Result<(), PublicationError> {
+        Self::checkpoint_publication(protection.cx)?;
+        // Bind discovery to the exact committed outer bytes, including framing
+        // and predecessor header, rather than merely an equal generation.
+        let committed_path = self.root_path.join(ROOTS_DIR_NAME).join(slot.filename());
+        let mut committed_options = OpenOptions::new();
+        committed_options.read(true).follow(FollowSymlinks::No);
+        let mut committed_file = self
+            .roots_dir
+            .open_with(slot.filename(), &committed_options)
+            .map_err(|error| PublicationError::io(&committed_path, error))?;
+        let committed_len = check_opened_file_security(&committed_file, &committed_path)?;
+        let committed_bytes = read_file_bounded_exact(
+            &mut committed_file,
+            committed_len,
+            self.limits.max_root_envelope_bytes(),
+            &committed_path,
+        )?;
+        let committed_digest: [u8; 32] = Sha256::digest(&committed_bytes).into();
+        if committed_len != protection.envelope_len
+            || committed_digest != protection.envelope_sha256
+        {
+            return Err(PublicationError::InvalidDiscovery(
+                "committed outer root differs from repair representation",
+            ));
+        }
+        let discovery = RootRepairDiscovery {
+            namespace: protection.namespace.to_owned(),
+            root_object_id: protection.root_object_id,
+            generation: request.generation,
+            slot,
+            outer_envelope_sha256: protection.envelope_sha256,
+            outer_envelope_len: protection.envelope_len,
+            predecessor: request.predecessor.clone(),
+            repair: protection.descriptor.clone(),
+        };
+        let mut bytes = serde_json::to_vec(&discovery)
+            .map_err(|_| PublicationError::InvalidDiscovery("cannot encode discovery"))?;
+        if bytes.len() > MAX_DISCOVERY_BYTES - 32 {
+            return Err(PublicationError::InvalidDiscovery(
+                "discovery exceeds limit",
+            ));
+        }
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(protection.key)
+            .map_err(|_| PublicationError::InvalidDiscovery("invalid discovery key"))?;
+        mac.update(DISCOVERY_DOMAIN);
+        mac.update(&bytes);
+        bytes.extend_from_slice(&mac.finalize().into_bytes());
+        self.decode_discovery(
+            slot,
+            &bytes,
+            protection.namespace,
+            &protection.root_object_id,
+            protection.key,
+        )?;
+        let name = Self::discovery_name(slot);
+        let path = self.root_path.join(GENERATIONS_DIR_NAME).join(name);
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        match self.generations_dir.open_with(name, &options) {
+            Ok(mut existing) => {
+                let len = check_opened_file_security(&existing, &path)?;
+                if len <= MAX_DISCOVERY_BYTES as u64 {
+                    let old_bytes = read_file_bounded_exact(
+                        &mut existing,
+                        len,
+                        MAX_DISCOVERY_BYTES as u64,
+                        &path,
+                    )?;
+                    if old_bytes == bytes {
+                        return sync_adopted_file(&existing, &self.generations_dir, &path);
+                    }
+                    if let Ok(old) = self.decode_discovery(
+                        slot,
+                        &old_bytes,
+                        protection.namespace,
+                        &protection.root_object_id,
+                        protection.key,
+                    ) {
+                        if old.generation >= discovery.generation {
+                            return Err(PublicationError::InvalidDiscovery(
+                                "discovery retry conflicts with committed generation",
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(PublicationError::io(&path, error)),
+        }
+        Self::checkpoint_publication(protection.cx)?;
+        let stage_name = generate_stage_name("discovery");
+        let stage_path = self.root_path.join(GENERATIONS_DIR_NAME).join(&stage_name);
+        let mut stage_options = OpenOptions::new();
+        stage_options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            stage_options.mode(0o600);
+        }
+        let mut stage = self
+            .generations_dir
+            .open_with(&stage_name, &stage_options)
+            .map_err(|error| PublicationError::io(&stage_path, error))?;
+        stage
+            .write_all(&bytes)
+            .and_then(|_| stage.sync_all())
+            .map_err(|error| PublicationError::io(&stage_path, error))?;
+        stage
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| PublicationError::io(&stage_path, error))?;
+        let len = check_opened_file_security(&stage, &stage_path)?;
+        let readback =
+            read_file_bounded_exact(&mut stage, len, MAX_DISCOVERY_BYTES as u64, &stage_path)?;
+        if readback != bytes {
+            return Err(PublicationError::InvalidDiscovery(
+                "discovery staging readback differs",
+            ));
+        }
+        self.decode_discovery(
+            slot,
+            &readback,
+            protection.namespace,
+            &protection.root_object_id,
+            protection.key,
+        )?;
+        #[cfg(unix)]
+        {
+            let named = self
+                .generations_dir
+                .symlink_metadata(&stage_name)
+                .map_err(|error| PublicationError::io(&stage_path, error))?;
+            let opened = stage
+                .metadata()
+                .map_err(|error| PublicationError::io(&stage_path, error))?;
+            if named.dev() != opened.dev() || named.ino() != opened.ino() {
+                return Err(PublicationError::InvalidDiscovery(
+                    "discovery stage binding changed",
+                ));
+            }
+        }
+        Self::checkpoint_publication(protection.cx)?;
+        self.generations_dir
+            .rename(&stage_name, &self.generations_dir, name)
+            .map_err(|error| PublicationError::io(&path, error))?;
+        sync_directory(
+            &self.generations_dir,
+            &self.root_path.join(GENERATIONS_DIR_NAME),
+        )
     }
 }
 
@@ -2028,6 +2717,294 @@ mod tests {
 
         let read_back = store.read_object("obj-001").unwrap();
         assert_eq!(read_back, payload_bytes);
+    }
+
+    #[test]
+    fn protected_publication_reconciles_corrupt_committed_predecessor_before_cas() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let cx = Cx::for_testing();
+        let key = b"publication-reconciliation-key";
+        let root_id = [77; 32];
+        let mut request = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "publisher".into(),
+            predecessor: None,
+            manifest_bytes: b"first".to_vec(),
+            created_at_ms: 1000,
+        };
+        let publish = |request: &GenerationRootPublishRequest| {
+            store.publish_repair_protected_generation_root(
+                &cx,
+                request,
+                "namespace",
+                root_id,
+                key,
+                &AcceptAllVerifier,
+            )
+        };
+        let first = publish(&request).unwrap();
+        request.generation = 2;
+        request.predecessor = Some(PredecessorBinding {
+            expected_generation: 1,
+            expected_hash: first.sha256.clone(),
+        });
+        request.manifest_bytes = b"second".to_vec();
+        let second = publish(&request).unwrap();
+        let first_bytes = std::fs::read(&first.path).unwrap();
+        let discovery_path = temp
+            .path()
+            .join(GENERATIONS_DIR_NAME)
+            .join(DISCOVERY_SLOT_B);
+        let discovery_bytes = std::fs::read(&discovery_path).unwrap();
+        std::fs::write(&second.path, b"torn committed root").unwrap();
+        let torn_bytes = std::fs::read(&second.path).unwrap();
+
+        request.manifest_bytes = b"conflicting second".to_vec();
+        assert!(matches!(
+            publish(&request),
+            Err(PublicationError::GenerationConflict { generation: 2, .. })
+        ));
+        assert_eq!(std::fs::read(&second.path).unwrap(), torn_bytes);
+        assert_eq!(std::fs::read(&discovery_path).unwrap(), discovery_bytes);
+        assert_eq!(std::fs::read(&first.path).unwrap(), first_bytes);
+
+        request.generation = 3;
+        request.predecessor = Some(PredecessorBinding {
+            expected_generation: 2,
+            expected_hash: second.sha256,
+        });
+        request.manifest_bytes = b"third".to_vec();
+        let third = publish(&request).expect("recovered committed gen2 is the CAS predecessor");
+        assert_eq!(third.slot, first.slot);
+        assert_eq!(std::fs::read(&second.path).unwrap(), torn_bytes);
+        assert_eq!(std::fs::read(&discovery_path).unwrap(), discovery_bytes);
+        let (discoveries, diagnostics) = store
+            .inspect_repair_discovery("namespace", &root_id, key)
+            .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            discoveries.iter().map(|d| d.generation).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    #[test]
+    fn protected_root_discovery_repairs_corrupt_root_from_fresh_store() {
+        use crate::snapshot_repair::decode_repair_object;
+        let temp = TempDir::new().unwrap();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let cx = Cx::for_testing();
+        let key = b"independent-repair-key";
+        let root_id = [41; 32];
+        let request = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "publisher".to_owned(),
+            predecessor: None,
+            manifest_bytes: b"opaque authenticated root manifest".to_vec(),
+            created_at_ms: 1000,
+        };
+        let receipt = store
+            .publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "trusted-namespace",
+                root_id,
+                key,
+                &AcceptAllVerifier,
+            )
+            .unwrap();
+        let outer = std::fs::read(&receipt.path).unwrap();
+        let (discoveries, diagnostics) = store
+            .inspect_repair_discovery("trusted-namespace", &root_id, key)
+            .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(discoveries.len(), 1);
+        let discovery = &discoveries[0];
+        let candidate = store.decode_recovered_root(receipt.slot, &outer).unwrap();
+        assert!(
+            store
+                .root_candidate_matches_discovery(&candidate, discovery)
+                .unwrap()
+        );
+        let expected = ExpectedRecoveryIdentity::new(discovery.outer_envelope_sha256, root_id, 1);
+        let descriptor = store.read_repair_descriptor(&expected, key).unwrap();
+        let chunk = &descriptor.chunks[0];
+        let records_path = temp
+            .path()
+            .join(OBJECTS_DIR_NAME)
+            .join(format!("{}.obj", chunk.records_object_id));
+        let mut records = std::fs::read(&records_path).unwrap();
+        records[0] ^= 0xff;
+        std::fs::write(&records_path, records).unwrap();
+        std::fs::write(&receipt.path, b"corrupt root framing").unwrap();
+        drop(store);
+
+        let fresh =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let (discovered, _) = fresh
+            .inspect_repair_discovery("trusted-namespace", &root_id, key)
+            .unwrap();
+        let discovery = &discovered[0];
+        let descriptor_bytes = fresh
+            .read_repair_descriptor_bytes(&discovery.repair)
+            .unwrap();
+        let descriptor = RepairObjectDescriptor::from_authenticated_bytes(
+            &descriptor_bytes,
+            &expected,
+            key,
+            RepairObjectLimits::default(),
+        )
+        .unwrap();
+        let repaired = decode_repair_object(
+            &cx,
+            &descriptor,
+            &expected,
+            key,
+            shared_admission_controller(),
+            RepairObjectLimits::default(),
+            |chunk| {
+                fresh
+                    .read_repair_records(chunk)
+                    .map_err(|error| RepairError::Storage(error.to_string()))
+            },
+        )
+        .unwrap();
+        assert_eq!(repaired.reconstructed_envelope, outer);
+        let repaired_candidate = fresh
+            .decode_recovered_root(discovery.slot, &repaired.reconstructed_envelope)
+            .unwrap();
+        assert!(
+            fresh
+                .root_candidate_matches_discovery(&repaired_candidate, discovery)
+                .unwrap()
+        );
+        let (wrong_key, diagnostics) = fresh
+            .inspect_repair_discovery("trusted-namespace", &root_id, b"wrong-key")
+            .unwrap();
+        assert!(wrong_key.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn protected_discovery_retry_fsyncs_and_preserves_prior_slot() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let cx = Cx::for_testing();
+        let key = b"independent-repair-key";
+        let root_id = [42; 32];
+        let mut request = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "publisher".to_owned(),
+            predecessor: None,
+            manifest_bytes: b"first".to_vec(),
+            created_at_ms: 1000,
+        };
+        let first = store
+            .publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                &AcceptAllVerifier,
+            )
+            .unwrap();
+        let prior_path = temp
+            .path()
+            .join(GENERATIONS_DIR_NAME)
+            .join(DISCOVERY_SLOT_A);
+        let prior_bytes = std::fs::read(&prior_path).unwrap();
+        request.generation = 2;
+        request.predecessor = Some(PredecessorBinding {
+            expected_generation: 1,
+            expected_hash: first.sha256,
+        });
+        request.manifest_bytes = b"second".to_vec();
+        let directory = temp.path().join(GENERATIONS_DIR_NAME);
+        DIRECTORY_SYNC_FAILURE.with(|failure| *failure.borrow_mut() = Some(directory.clone()));
+        assert!(matches!(
+            store.publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                &AcceptAllVerifier
+            ),
+            Err(PublicationError::Io { .. })
+        ));
+        DIRECTORY_SYNC_FAILURE.with(|failure| *failure.borrow_mut() = Some(directory));
+        assert!(matches!(
+            store.publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                &AcceptAllVerifier
+            ),
+            Err(PublicationError::Io { .. })
+        ));
+        store
+            .publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                &AcceptAllVerifier,
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(prior_path).unwrap(), prior_bytes);
+        std::fs::write(
+            temp.path()
+                .join(GENERATIONS_DIR_NAME)
+                .join(DISCOVERY_SLOT_B),
+            b"torn discovery",
+        )
+        .unwrap();
+        let (discoveries, diagnostics) = store
+            .inspect_repair_discovery("namespace", &root_id, key)
+            .unwrap();
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].generation, 1);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn rejected_root_never_publishes_discovery() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let request = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "publisher".to_owned(),
+            predecessor: None,
+            manifest_bytes: b"uncommitted".to_vec(),
+            created_at_ms: 1000,
+        };
+        let verifier = ObjectRequiringVerifier {
+            required_objects: vec!["missing-required-object".to_owned()],
+        };
+        assert!(matches!(
+            store.publish_repair_protected_generation_root(
+                &Cx::for_testing(),
+                &request,
+                "namespace",
+                [43; 32],
+                b"repair-key",
+                &verifier
+            ),
+            Err(PublicationError::VerificationRejected { .. })
+        ));
+        let (discovery, _) = store
+            .inspect_repair_discovery("namespace", &[43; 32], b"repair-key")
+            .unwrap();
+        assert!(discovery.is_empty());
     }
 
     #[test]

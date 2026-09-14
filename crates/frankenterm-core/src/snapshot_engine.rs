@@ -89,7 +89,7 @@ pub enum WholeMuxCaptureError {
     CaptureDeadline,
     #[error("model capture exceeds the retained checkpoint byte limit")]
     CaptureByteLimit,
-    #[error("mux topology or pane registration changed during model capture")]
+    #[error("mux topology, pane registration, or terminal model changed during capture")]
     StaleCapture,
     #[error("capture capability context stopped")]
     Context(#[from] SnapshotError),
@@ -202,6 +202,15 @@ pub fn capture_and_publish_whole_mux_model(
     if Instant::now() >= deadline {
         return Err(WholeMuxCaptureError::CaptureDeadline);
     }
+    // Every ACK precedes every validation read. Unchanged monotonic model
+    // witnesses therefore establish a common cut between those two passes;
+    // equal visible state alone would incorrectly admit an A -> B -> A change.
+    for (pane, ack) in captured.pane_bindings.iter().zip(&acks) {
+        snapshot_cx_checkpoint(cx)?;
+        if !mux.model_checkpoint_is_current(pane.pane_id, ack) {
+            return Err(WholeMuxCaptureError::StaleCapture);
+        }
+    }
     let rechecked = mux.capture_topology_coherent(config)?;
     if captured.session_incarnation != rechecked.session_incarnation
         || captured.topology_revision != rechecked.topology_revision
@@ -215,6 +224,9 @@ pub fn capture_and_publish_whole_mux_model(
         return Err(WholeMuxCaptureError::StaleCapture);
     }
     snapshot_cx_checkpoint(cx)?;
+    if Instant::now() >= deadline {
+        return Err(WholeMuxCaptureError::CaptureDeadline);
+    }
     // Capture identity is caller-owned; storage names additionally include the
     // observed cut time so a failed encryption attempt is not blindly replayed.
     let names: Vec<_> = captured
@@ -269,6 +281,8 @@ pub fn capture_and_publish_whole_mux_model(
 /// Cancellation is checked between codec and filesystem operations. Failure can
 /// leave immutable orphan objects, but never intentionally installs an unchecked
 /// root. Once publication commits, its receipt wins over subsequent cancellation.
+/// Each complete encrypted envelope has a durable authenticated repair closure;
+/// success also requires the root's authenticated discovery slot to be durable.
 /// Guardian leases and writer authority are deliberately not manufactured here.
 #[cfg(feature = "frankenterm-deps")]
 #[allow(clippy::too_many_lines)] // Keep preflight, object writes, and root commit visibly ordered.
@@ -314,6 +328,8 @@ pub fn publish_whole_mux_recovery(
         .with_session_id(expected.session_id.clone())
         .with_mux_incarnation_id(expected.mux_incarnation_id.clone());
     let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), trusted);
+    let repair_key = key.derive_repair_authentication_key()?;
+    let repair_namespace = format!("whole-mux-{}", hex::encode(expected.root_object_id));
     anyhow::ensure!(
         checkpoints.len() == captured.pane_bindings.len()
             && checkpoints.len() <= verifier.limits().max_panes,
@@ -345,7 +361,16 @@ pub fn publish_whole_mux_recovery(
                 && total_bytes <= verifier.limits().max_total_checkpoint_bytes,
             "whole-mux checkpoint byte limit exceeded"
         );
-        TerminalCheckpointV2::decode_canonical_json(payload, TerminalCheckpointLimits::default())?;
+        let checkpoint = TerminalCheckpointV2::decode_canonical_json(
+            payload,
+            TerminalCheckpointLimits::default(),
+        )?;
+        anyhow::ensure!(
+            input.ack.semantic_generation == checkpoint.checkpoint().semantic_generation()
+                && usize::try_from(input.ack.semantic_generation)
+                    .is_ok_and(|generation| generation != usize::MAX),
+            "whole-mux checkpoint semantic generation mismatch or exhaustion"
+        );
         acks.insert(input.pane_id, input.ack);
     }
     // Complete identity preflight before the first immutable-object write.
@@ -439,7 +464,13 @@ pub fn publish_whole_mux_recovery(
     );
     for object in prepared_objects {
         snapshot_cx_checkpoint(cx)?;
-        store.publish_object(&object)?;
+        store.publish_repair_protected_object(
+            cx,
+            &object,
+            semantic_object_id_from_str(&object.object_id),
+            expected.generation,
+            repair_key.as_ref(),
+        )?;
     }
     snapshot_cx_checkpoint(cx)?;
     // RootVerifier's closure adapter retains the caller's actual Cx throughout
@@ -469,7 +500,8 @@ pub fn publish_whole_mux_recovery(
         snapshot_cx_checkpoint(cx)?;
         Ok(verified)
     };
-    Ok(store.publish_generation_root(
+    Ok(store.publish_repair_protected_generation_root(
+        cx,
         &GenerationRootPublishRequest {
             generation: expected.generation,
             publisher_id: expected.publisher_id.clone(),
@@ -477,6 +509,9 @@ pub fn publish_whole_mux_recovery(
             manifest_bytes,
             created_at_ms: image.header.created_at_epoch_ms,
         },
+        &repair_namespace,
+        expected.root_object_id,
+        repair_key.as_ref(),
         &verify,
     )?)
 }
@@ -12672,6 +12707,7 @@ mod tests {
                 registration_wire_identity: id.to_be_bytes(),
                 durable_pane_id: uuid::Uuid::from_u128(id),
                 parser_stream_bytes: terminal_checkpoint.parser_stream_bytes(),
+                semantic_generation: u64::try_from(terminal.current_seqno()).unwrap(),
                 terminal_checkpoint,
             }
         };
@@ -12821,11 +12857,33 @@ mod tests {
         assert!(error.to_string().contains("capture binding mismatch"));
         assert!(store.list_object_ids().unwrap().is_empty());
         assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        let mut wrong_generation = acks[0].clone();
+        wrong_generation.semantic_generation += 1;
+        let mut wrong_generation_inputs = inputs(false);
+        wrong_generation_inputs[0].ack = &wrong_generation;
+        let error = publish_whole_mux_recovery(
+            &cx,
+            &store,
+            &captured,
+            &wrong_generation_inputs,
+            Arc::clone(&key),
+            &expected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("semantic generation mismatch"));
+        assert!(store.list_object_ids().unwrap().is_empty());
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
         let receipt =
             publish_whole_mux_recovery(&cx, &store, &captured, &inputs(false), key, &expected)
                 .unwrap();
         assert_eq!(receipt.generation, 1);
-        assert_eq!(store.list_object_ids().unwrap().len(), 2);
+        let object_ids = store.list_object_ids().unwrap();
+        assert!(object_ids.iter().any(|id| id == "pane-a"));
+        assert!(object_ids.iter().any(|id| id == "pane-b"));
+        assert!(
+            object_ids.len() > 2,
+            "durable repair closure must accompany payloads"
+        );
     }
 
     type TestPaneProviderFuture = std::pin::Pin<

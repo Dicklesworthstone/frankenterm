@@ -88,6 +88,12 @@ pub const MAX_CHUNK_SOURCE_SYMBOLS: usize = 2048;
 /// Maximum allowable single-chunk envelope size (2 MiB with default 1024-byte symbols).
 pub const MAX_CHUNK_ENVELOPE_BYTES: usize = MAX_CHUNK_SOURCE_SYMBOLS * DEFAULT_SYMBOL_SIZE;
 
+/// Persisted objects retain the complete reconstructed output while decoding
+/// one block. Keep that block below the standalone codec ceiling so the default
+/// 128 MiB object and Maximum protection fit the shared 256 MiB admission budget.
+pub const MAX_PERSISTED_SOURCE_SYMBOLS: usize = 512;
+pub const MAX_PERSISTED_CHUNK_BYTES: usize = MAX_PERSISTED_SOURCE_SYMBOLS * DEFAULT_SYMBOL_SIZE;
+
 /// Domain separator for symbol HMAC calculation.
 const SYMBOL_MAC_DOMAIN: &[u8] = b"frankenterm-snapshot-repair-symbol-v1";
 
@@ -313,6 +319,8 @@ pub struct RepairStats {
     pub repair_symbols_used: usize,
     /// Number of duplicate symbols discarded.
     pub duplicates_discarded: usize,
+    /// Damaged or unauthenticated symbols excluded from the equation set.
+    pub corrupt_symbols_discarded: usize,
     /// Final rank status.
     pub rank_status: RankStatusDiagnostic,
 }
@@ -349,6 +357,10 @@ impl<'a> RepairResult<'a> {
 /// Exhaustive error enumeration for snapshot repair encoding and decoding.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RepairError {
+    #[error("Repair storage failed: {0}")]
+    Storage(String),
+    #[error("Repair persistence failed: {0}")]
+    Persistence(String),
     #[error("Envelope byte payload is empty")]
     EmptyPayload,
 
@@ -374,9 +386,6 @@ pub enum RepairError {
 
     #[error("Manifest HMAC authentication failed")]
     ManifestAuthenticationFailed,
-
-    #[error("Symbol HMAC authentication failed for ESI {esi} (kind: {kind:?})")]
-    SymbolAuthenticationFailed { esi: u32, kind: RepairSymbolKind },
 
     #[error("Foreign representation ID: expected {expected:?}, got {got:?}")]
     ForeignRepresentationId { got: [u8; 32], expected: [u8; 32] },
@@ -418,6 +427,417 @@ pub enum RepairError {
 
     #[error("Systematic encoder construction failed: singular constraint matrix")]
     EncoderSingularMatrix,
+}
+
+/// Bounds for one complete encrypted representation, independent of block geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct RepairObjectLimits {
+    pub max_envelope_bytes: usize,
+    pub max_chunks: usize,
+    pub max_descriptor_bytes: usize,
+}
+
+impl Default for RepairObjectLimits {
+    fn default() -> Self {
+        Self {
+            max_envelope_bytes: 128 * 1024 * 1024,
+            max_chunks: 4096,
+            max_descriptor_bytes: 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairObjectChunk {
+    pub offset: u64,
+    pub manifest: RepairManifest,
+    pub records_object_id: String,
+}
+
+impl RepairObjectChunk {
+    /// Exact fixed-stride file bound, derived only from authenticated geometry.
+    pub fn record_bytes_len(&self) -> Result<usize, RepairError> {
+        (self.manifest.symbol_size as usize)
+            .checked_add(38)
+            .and_then(|stride| stride.checked_mul(self.manifest.total_symbols_generated as usize))
+            .ok_or_else(|| RepairError::AdmissionExceeded("record file size overflow".into()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairObjectDescriptor {
+    pub identity: ExpectedRecoveryIdentity,
+    pub payload_len: u64,
+    pub chunks: Vec<RepairObjectChunk>,
+    #[serde(skip)]
+    authenticated_mac: [u8; 32],
+}
+
+const REPAIR_DESCRIPTOR_DOMAIN: &[u8] = b"frankenterm-repair-object-descriptor-v1";
+const REPAIR_DESCRIPTOR_MAGIC: &[u8; 8] = b"FTREPR01";
+
+fn repair_descriptor_mac(key: &[u8]) -> Result<HmacSha256, RepairError> {
+    if key.is_empty() {
+        return Err(RepairError::EmptyAuthenticationKey);
+    }
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|_| RepairError::ManifestAuthenticationFailed)?;
+    mac.update(REPAIR_DESCRIPTOR_DOMAIN);
+    Ok(mac)
+}
+
+fn repair_chunk_id(identity: &ExpectedRecoveryIdentity, index: usize) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"frankenterm-repair-object-chunk-v1");
+    hash.update(identity.representation_id);
+    hash.update(identity.object_id);
+    hash.update(identity.generation.to_le_bytes());
+    hash.update((index as u64).to_le_bytes());
+    hash.finalize().into()
+}
+
+impl RepairObjectDescriptor {
+    fn validate(
+        &self,
+        expected: &ExpectedRecoveryIdentity,
+        key: &[u8],
+        limits: RepairObjectLimits,
+    ) -> Result<(), RepairError> {
+        if self.identity.representation_id != expected.representation_id {
+            return Err(RepairError::ForeignRepresentationId {
+                got: self.identity.representation_id,
+                expected: expected.representation_id,
+            });
+        }
+        if self.identity.object_id != expected.object_id {
+            return Err(RepairError::ForeignObjectId {
+                got: self.identity.object_id,
+                expected: expected.object_id,
+            });
+        }
+        if self.identity.generation != expected.generation {
+            return Err(RepairError::ForeignGeneration {
+                got: self.identity.generation,
+                expected: expected.generation,
+            });
+        }
+        if self.payload_len == 0
+            || self.payload_len > limits.max_envelope_bytes as u64
+            || self.chunks.is_empty()
+            || self.chunks.len() > limits.max_chunks
+        {
+            return Err(RepairError::AdmissionExceeded(
+                "repair object bounds".into(),
+            ));
+        }
+        let mut offset = 0u64;
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let m = &chunk.manifest;
+            if !verify_manifest_mac(key, m) {
+                return Err(RepairError::ManifestAuthenticationFailed);
+            }
+            let size = m.symbol_size as usize;
+            if chunk.offset != offset
+                || m.object_id != repair_chunk_id(expected, index)
+                || m.generation != expected.generation
+                || m.sbn != 0
+                || m.k == 0
+                || m.k as usize > MAX_PERSISTED_SOURCE_SYMBOLS
+                || !(MIN_SYMBOL_SIZE..=MAX_SYMBOL_SIZE).contains(&size)
+                || m.payload_len == 0
+                || m.payload_len > MAX_PERSISTED_CHUNK_BYTES as u64
+                || m.payload_len.div_ceil(u64::from(m.symbol_size)) != u64::from(m.k)
+                || m.total_symbols_generated < m.k
+                || chunk.records_object_id.is_empty()
+                || chunk.records_object_id.len() > 128
+                || !chunk
+                    .records_object_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(RepairError::InvalidGeometry {
+                    reason: "invalid ordered repair chunk".into(),
+                });
+            }
+            offset = offset
+                .checked_add(m.payload_len)
+                .ok_or_else(|| RepairError::AdmissionExceeded("chunk offset overflow".into()))?;
+        }
+        if offset != self.payload_len {
+            return Err(RepairError::InvalidGeometry {
+                reason: "repair chunk coverage mismatch".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn to_authenticated_bytes(
+        &self,
+        key: &[u8],
+        limits: RepairObjectLimits,
+    ) -> Result<Vec<u8>, RepairError> {
+        self.validate(&self.identity, key, limits)?;
+        let payload =
+            serde_json::to_vec(self).map_err(|e| RepairError::Persistence(e.to_string()))?;
+        if payload.len().saturating_add(40) > limits.max_descriptor_bytes {
+            return Err(RepairError::AdmissionExceeded(
+                "repair descriptor bytes".into(),
+            ));
+        }
+        let mut mac = repair_descriptor_mac(key)?;
+        mac.update(REPAIR_DESCRIPTOR_MAGIC);
+        mac.update(&payload);
+        let mut bytes = Vec::with_capacity(payload.len() + 40);
+        bytes.extend_from_slice(REPAIR_DESCRIPTOR_MAGIC);
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&mac.finalize().into_bytes());
+        Ok(bytes)
+    }
+
+    pub fn from_authenticated_bytes(
+        bytes: &[u8],
+        expected: &ExpectedRecoveryIdentity,
+        key: &[u8],
+        limits: RepairObjectLimits,
+    ) -> Result<Self, RepairError> {
+        if bytes.len() < 40
+            || bytes.len() > limits.max_descriptor_bytes
+            || !bytes.starts_with(REPAIR_DESCRIPTOR_MAGIC)
+        {
+            return Err(RepairError::ManifestAuthenticationFailed);
+        }
+        let tag_at = bytes.len() - 32;
+        let mut mac = repair_descriptor_mac(key)?;
+        mac.update(&bytes[..tag_at]);
+        mac.verify_slice(&bytes[tag_at..])
+            .map_err(|_| RepairError::ManifestAuthenticationFailed)?;
+        let mut descriptor: Self = serde_json::from_slice(&bytes[8..tag_at])
+            .map_err(|e| RepairError::Persistence(e.to_string()))?;
+        descriptor
+            .authenticated_mac
+            .copy_from_slice(&bytes[tag_at..]);
+        descriptor.validate(expected, key, limits)?;
+        Ok(descriptor)
+    }
+}
+
+/// Encode one bounded block at a time and persist its fixed-stride records.
+/// The callback must durably retain the records before returning their immutable ID.
+pub fn encode_repair_object(
+    cx: &Cx,
+    envelope: &[u8],
+    object_id: [u8; 32],
+    generation: u64,
+    key: &[u8],
+    symbol_size: usize,
+    protection: RepairProtectionClass,
+    admission: &RepairAdmissionController,
+    limits: RepairObjectLimits,
+    mut persist: impl FnMut(usize, &RepairManifest, &[u8]) -> Result<String, RepairError>,
+) -> Result<RepairObjectDescriptor, RepairError> {
+    if envelope.is_empty() || envelope.len() > limits.max_envelope_bytes {
+        return Err(RepairError::AdmissionExceeded("repair object bytes".into()));
+    }
+    if !(MIN_SYMBOL_SIZE..=MAX_SYMBOL_SIZE).contains(&symbol_size) {
+        return Err(RepairError::InvalidSymbolSize {
+            size: symbol_size,
+            min: MIN_SYMBOL_SIZE,
+            max: MAX_SYMBOL_SIZE,
+        });
+    }
+    let chunk_size = MAX_PERSISTED_CHUNK_BYTES.min(symbol_size * MAX_PERSISTED_SOURCE_SYMBOLS);
+    let count = envelope.len().div_ceil(chunk_size);
+    if count > limits.max_chunks {
+        return Err(RepairError::AdmissionExceeded(
+            "repair object chunk count".into(),
+        ));
+    }
+    let identity =
+        ExpectedRecoveryIdentity::new(Sha256::digest(envelope).into(), object_id, generation);
+    let mut chunks = Vec::with_capacity(count);
+    for (index, bytes) in envelope.chunks(chunk_size).enumerate() {
+        cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+        let k = bytes.len().div_ceil(symbol_size);
+        let total = k
+            .checked_add(protection.repair_symbol_count(k))
+            .ok_or_else(|| RepairError::AdmissionExceeded("symbol count overflow".into()))?;
+        if total > admission.max_symbols_buffered {
+            return Err(RepairError::AdmissionExceeded("record symbol count".into()));
+        }
+        let retained = total
+            .checked_mul(2 * symbol_size + 38 + std::mem::size_of::<AuthenticatedRepairSymbol>())
+            .ok_or_else(|| RepairError::AdmissionExceeded("record bytes overflow".into()))?;
+        let _retained = admission.acquire(retained)?;
+        let bundle = encode_repair_envelope(
+            cx,
+            bytes,
+            repair_chunk_id(&identity, index),
+            generation,
+            key,
+            symbol_size,
+            protection,
+            admission,
+        )?;
+        let mut records = Vec::with_capacity(total * (symbol_size + 38));
+        for symbol in &bundle.symbols {
+            cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+            records.push(symbol.kind.to_byte());
+            records.push(symbol.sbn);
+            records.extend_from_slice(&symbol.esi.to_le_bytes());
+            records.extend_from_slice(&symbol.tag);
+            records.extend_from_slice(&symbol.payload);
+        }
+        cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+        let records_object_id = persist(index, &bundle.manifest, &records)?;
+        chunks.push(RepairObjectChunk {
+            offset: (index * chunk_size) as u64,
+            manifest: bundle.manifest,
+            records_object_id,
+        });
+    }
+    let mut descriptor = RepairObjectDescriptor {
+        identity,
+        payload_len: envelope.len() as u64,
+        chunks,
+        authenticated_mac: [0; 32],
+    };
+    descriptor.validate(&identity, key, limits)?;
+    let encoded = descriptor.to_authenticated_bytes(key, limits)?;
+    descriptor
+        .authenticated_mac
+        .copy_from_slice(&encoded[encoded.len() - 32..]);
+    Ok(descriptor)
+}
+
+/// Recover chunks lazily. The complete output remains admission-reserved until
+/// the caller drops the returned permit; input file buffers are per-chunk.
+pub fn decode_repair_object<'a>(
+    cx: &Cx,
+    descriptor: &RepairObjectDescriptor,
+    expected: &ExpectedRecoveryIdentity,
+    key: &[u8],
+    admission: &'a RepairAdmissionController,
+    limits: RepairObjectLimits,
+    mut load: impl FnMut(&RepairObjectChunk) -> Result<Vec<u8>, RepairError>,
+) -> Result<RepairResult<'a>, RepairError> {
+    cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+    descriptor.validate(expected, key, limits)?;
+    // Reauthenticate the complete ordered descriptor, including object locators,
+    // even if a caller has mutated its public projection since decoding it.
+    let encoded = descriptor.to_authenticated_bytes(key, limits)?;
+    let mut mac = repair_descriptor_mac(key)?;
+    mac.update(&encoded[..encoded.len() - 32]);
+    mac.verify_slice(&descriptor.authenticated_mac)
+        .map_err(|_| RepairError::ManifestAuthenticationFailed)?;
+    let output_len = usize::try_from(descriptor.payload_len)
+        .map_err(|_| RepairError::AdmissionExceeded("output length overflow".into()))?;
+    let permit = admission.acquire(output_len)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_len)
+        .map_err(|_| RepairError::AdmissionExceeded("output allocation".into()))?;
+    let mut stats = RepairStats {
+        source_symbols_used: 0,
+        repair_symbols_used: 0,
+        duplicates_discarded: 0,
+        corrupt_symbols_discarded: 0,
+        rank_status: RankStatusDiagnostic {
+            rank: 0,
+            columns: 0,
+            deficit: 0,
+        },
+    };
+    for chunk in &descriptor.chunks {
+        cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+        let maximum = chunk.record_bytes_len()?;
+        let count = chunk.manifest.total_symbols_generated as usize;
+        if count > admission.max_symbols_buffered {
+            return Err(RepairError::AdmissionExceeded("record symbol count".into()));
+        }
+        let retained = maximum
+            .checked_mul(2)
+            .and_then(|n| {
+                n.checked_add(count.checked_mul(std::mem::size_of::<AuthenticatedRepairSymbol>())?)
+            })
+            .ok_or_else(|| RepairError::AdmissionExceeded("record allocation overflow".into()))?;
+        let _records_permit = admission.acquire(retained)?;
+        let records = load(chunk)?;
+        if records.len() > maximum {
+            return Err(RepairError::AdmissionExceeded(
+                "record file too large".into(),
+            ));
+        }
+        let stride = chunk.manifest.symbol_size as usize + 38;
+        let mut symbols = Vec::with_capacity(records.len() / stride);
+        for record in records.chunks_exact(stride) {
+            cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+            let kind = match record[0] {
+                0 => RepairSymbolKind::Source,
+                1 => RepairSymbolKind::Repair,
+                _ => {
+                    stats.corrupt_symbols_discarded += 1;
+                    continue;
+                }
+            };
+            if record[1] != 0 {
+                stats.corrupt_symbols_discarded += 1;
+                continue;
+            }
+            let mut esi = [0; 4];
+            esi.copy_from_slice(&record[2..6]);
+            let mut tag = [0; 32];
+            tag.copy_from_slice(&record[6..38]);
+            let symbol = AuthenticatedRepairSymbol {
+                kind,
+                sbn: 0,
+                esi: u32::from_le_bytes(esi),
+                tag,
+                payload: record[38..].to_vec(),
+            };
+            if verify_symbol_mac(key, &chunk.manifest, &symbol) {
+                symbols.push(symbol);
+            } else {
+                stats.corrupt_symbols_discarded += 1;
+            }
+        }
+        if records.len() % stride != 0 {
+            stats.corrupt_symbols_discarded += 1;
+        }
+        let chunk_expected = ExpectedRecoveryIdentity::new(
+            chunk.manifest.representation_id,
+            chunk.manifest.object_id,
+            expected.generation,
+        );
+        let recovered = decode_repair_symbols(
+            cx,
+            &chunk.manifest,
+            &symbols,
+            &chunk_expected,
+            key,
+            admission,
+        )?;
+        stats.source_symbols_used += recovered.stats.source_symbols_used;
+        stats.repair_symbols_used += recovered.stats.repair_symbols_used;
+        stats.duplicates_discarded += recovered.stats.duplicates_discarded;
+        stats.corrupt_symbols_discarded += recovered.stats.corrupt_symbols_discarded;
+        stats.rank_status.rank += recovered.stats.rank_status.rank;
+        stats.rank_status.columns += recovered.stats.rank_status.columns;
+        output.extend_from_slice(&recovered.reconstructed_envelope);
+    }
+    cx.checkpoint().map_err(|_| RepairError::Cancelled)?;
+    let actual: [u8; 32] = Sha256::digest(&output).into();
+    if output.len() != output_len || actual != expected.representation_id {
+        return Err(RepairError::RepresentationDigestMismatch {
+            expected: expected.representation_id,
+            actual,
+        });
+    }
+    Ok(RepairResult {
+        reconstructed_envelope: output,
+        representation_id: actual,
+        stats,
+        permit,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,34 +1716,22 @@ pub fn decode_repair_symbols<'a>(
     let mut validated_source: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut validated_repair: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut duplicates_discarded = 0usize;
+    let mut corrupt_symbols_discarded = 0usize;
 
     for (idx, sym) in symbols.iter().enumerate() {
         if idx % 64 == 0 && cx.checkpoint().is_err() {
             return Err(RepairError::Cancelled);
         }
 
-        // Verify symbol SBN
+        // Corruption turns a symbol into an erasure. Never add unauthenticated
+        // bytes to the solver, but allow surviving authenticated redundancy to
+        // recover the envelope. Check size before hashing attacker-sized data.
+        if sym.payload.len() != symbol_size || !verify_symbol_mac(auth_key, manifest, sym) {
+            corrupt_symbols_discarded += 1;
+            continue;
+        }
         if sym.sbn != manifest.sbn {
             return Err(RepairError::MultiBlockUnsupported { sbn: sym.sbn });
-        }
-
-        // Verify symbol payload size matches manifest
-        if sym.payload.len() != symbol_size {
-            return Err(RepairError::InvalidGeometry {
-                reason: format!(
-                    "symbol payload size {} mismatch manifest {}",
-                    sym.payload.len(),
-                    symbol_size
-                ),
-            });
-        }
-
-        // Authenticate symbol MAC using vetted constant-time verify_slice
-        if !verify_symbol_mac(auth_key, manifest, sym) {
-            return Err(RepairError::SymbolAuthenticationFailed {
-                esi: sym.esi,
-                kind: sym.kind,
-            });
         }
 
         // Validate even duplicates: authentication does not make a source ESI
@@ -1427,6 +1835,7 @@ pub fn decode_repair_symbols<'a>(
                 source_symbols_used: k,
                 repair_symbols_used: 0,
                 duplicates_discarded,
+                corrupt_symbols_discarded,
                 rank_status: RankStatusDiagnostic {
                     rank: l,
                     columns: l,
@@ -1558,6 +1967,7 @@ pub fn decode_repair_symbols<'a>(
             source_symbols_used,
             repair_symbols_used,
             duplicates_discarded,
+            corrupt_symbols_discarded,
             rank_status: RankStatusDiagnostic {
                 rank: rank_profile.rank,
                 columns: rank_profile.columns,
@@ -1643,6 +2053,156 @@ pub fn decode_repair_symbols_unasserted_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_maximum_protection_fits_default_admission_with_maximum_output() {
+        let admission = RepairAdmissionController::default_production();
+        let output = admission
+            .acquire(RepairObjectLimits::default().max_envelope_bytes)
+            .unwrap();
+        let k = MAX_PERSISTED_SOURCE_SYMBOLS;
+        let size = DEFAULT_SYMBOL_SIZE;
+        let total = k + RepairProtectionClass::Maximum.repair_symbol_count(k);
+        let records_bytes = total * (size + 38);
+        let records = admission
+            .acquire(2 * records_bytes + total * std::mem::size_of::<AuthenticatedRepairSymbol>())
+            .unwrap();
+        let params = SystematicParams::try_for_source_block(k, size).unwrap();
+        let scratch = admission
+            .acquire(calculate_decoder_memory_budget(&params, total, size).unwrap())
+            .expect("maximum output, records, and decoder scratch fit simultaneously");
+        drop(scratch);
+        drop(records);
+        drop(output);
+
+        let old_k = MAX_CHUNK_SOURCE_SYMBOLS;
+        let old_params = SystematicParams::try_for_source_block(old_k, size).unwrap();
+        let old_scratch = calculate_decoder_memory_budget(&old_params, old_k * 2, size).unwrap();
+        assert!(admission.acquire(old_scratch).is_err());
+    }
+
+    #[test]
+    fn persisted_repair_object_chunks_authenticate_and_recover_independent_records() {
+        let cx = test_cx();
+        let key = [0x61; 32];
+        let limits = RepairObjectLimits::default();
+        let admission = RepairAdmissionController::default_production();
+        let envelope: Vec<u8> = (0..MAX_PERSISTED_CHUNK_BYTES + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let expected =
+            ExpectedRecoveryIdentity::new(Sha256::digest(&envelope).into(), [0x35; 32], 9);
+        let mut files = std::collections::HashMap::new();
+        let descriptor = encode_repair_object(
+            &cx,
+            &envelope,
+            expected.object_id,
+            expected.generation,
+            &key,
+            MAX_SYMBOL_SIZE,
+            RepairProtectionClass::Maximum,
+            &admission,
+            limits,
+            |index, _, records| {
+                let name = format!("chunk-{index}");
+                files.insert(name.clone(), records.to_vec());
+                Ok(name)
+            },
+        )
+        .expect("encode complete object in bounded chunks");
+        assert_eq!(descriptor.chunks.len(), 2);
+        let wire = descriptor.to_authenticated_bytes(&key, limits).unwrap();
+        let decoded =
+            RepairObjectDescriptor::from_authenticated_bytes(&wire, &expected, &key, limits)
+                .unwrap();
+        let repaired = decode_repair_object(
+            &cx,
+            &decoded,
+            &expected,
+            &key,
+            &admission,
+            limits,
+            |chunk| {
+                let mut records = files[&chunk.records_object_id].clone();
+                records[0] ^= 1;
+                Ok(records)
+            },
+        )
+        .expect("one damaged fixed record per chunk is an erasure");
+        assert_eq!(repaired.reconstructed_envelope, envelope);
+        assert_eq!(repaired.stats.corrupt_symbols_discarded, 2);
+        drop(repaired);
+
+        let truncated = decode_repair_object(
+            &cx,
+            &decoded,
+            &expected,
+            &key,
+            &admission,
+            limits,
+            |chunk| {
+                let mut records = files[&chunk.records_object_id].clone();
+                records.truncate(records.len() - 1);
+                Ok(records)
+            },
+        )
+        .expect("partial final repair record must not discard intact source records");
+        assert_eq!(truncated.reconstructed_envelope, envelope);
+        assert_eq!(truncated.stats.corrupt_symbols_discarded, 2);
+        drop(truncated);
+
+        let mut wrong = expected;
+        wrong.object_id[0] ^= 1;
+        assert!(matches!(
+            RepairObjectDescriptor::from_authenticated_bytes(&wire, &wrong, &key, limits),
+            Err(RepairError::ForeignObjectId { .. })
+        ));
+        wrong = expected;
+        wrong.representation_id[0] ^= 1;
+        assert!(matches!(
+            RepairObjectDescriptor::from_authenticated_bytes(&wire, &wrong, &key, limits),
+            Err(RepairError::ForeignRepresentationId { .. })
+        ));
+        wrong = expected;
+        wrong.generation += 1;
+        assert!(matches!(
+            RepairObjectDescriptor::from_authenticated_bytes(&wire, &wrong, &key, limits),
+            Err(RepairError::ForeignGeneration { .. })
+        ));
+        let mut reordered = decoded.clone();
+        reordered.chunks.swap(0, 1);
+        assert!(
+            decode_repair_object(
+                &cx,
+                &reordered,
+                &expected,
+                &key,
+                &admission,
+                limits,
+                |_| panic!("invalid descriptor must fail before reading records"),
+            )
+            .is_err()
+        );
+        let mut retargeted = decoded.clone();
+        retargeted.chunks[0].records_object_id = "foreign-records".into();
+        assert!(matches!(
+            decode_repair_object(
+                &cx,
+                &retargeted,
+                &expected,
+                &key,
+                &admission,
+                limits,
+                |_| panic!("modified locator must fail before reading records"),
+            ),
+            Err(RepairError::ManifestAuthenticationFailed)
+        ));
+        let missing =
+            decode_repair_object(&cx, &decoded, &expected, &key, &admission, limits, |_| {
+                Ok(Vec::new())
+            });
+        assert!(matches!(missing, Err(RepairError::InsufficientRank { .. })));
+    }
 
     fn test_cx() -> Cx {
         Cx::for_testing()
@@ -1893,7 +2453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tampered_symbol_payload_rejected() {
+    fn test_corrupt_symbol_is_erased_and_redundancy_recovers_exact_bytes() {
         let cx = test_cx();
         let admission = RepairAdmissionController::default_production();
         let payload = sample_envelope(5_000);
@@ -1917,7 +2477,7 @@ mod tests {
         tampered_symbols[0].payload[10] ^= 0xFF;
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let err = decode_repair_symbols(
+        let recovered = decode_repair_symbols(
             &cx,
             &bundle.manifest,
             &tampered_symbols,
@@ -1925,14 +2485,26 @@ mod tests {
             key,
             &admission,
         )
-        .expect_err("tampered symbol must fail");
+        .expect("authenticated redundancy repairs one corrupt source symbol");
+        assert_eq!(recovered.reconstructed_envelope, payload);
+        assert_eq!(recovered.stats.corrupt_symbols_discarded, 1);
+        drop(recovered);
 
-        match err {
-            RepairError::SymbolAuthenticationFailed { esi, .. } => {
-                assert_eq!(esi, tampered_symbols[0].esi);
-            }
-            other => panic!("expected SymbolAuthenticationFailed, got {other:?}"),
+        // Without sufficient authenticated redundancy, fail closed.
+        for symbol in &mut tampered_symbols {
+            symbol.tag[0] ^= 1;
         }
+        assert!(matches!(
+            decode_repair_symbols(
+                &cx,
+                &bundle.manifest,
+                &tampered_symbols,
+                &expected,
+                key,
+                &admission
+            ),
+            Err(RepairError::InsufficientRank { .. })
+        ));
     }
 
     #[test]

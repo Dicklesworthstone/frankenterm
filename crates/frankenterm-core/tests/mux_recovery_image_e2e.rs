@@ -13,18 +13,18 @@ use frankenterm_core::mux_recovery_image::{CheckpointAuthority, MuxRecoveryImage
 use frankenterm_core::session_restore::{
     ValidatedWholeMuxRecovery, WholeMuxRecoveryError, WholeMuxRecoveryVerifier,
     WholeMuxTrustedIdentityConfig, reconstruct_whole_mux_image_inert,
-    validate_whole_mux_image_layout_only,
+    select_verified_recovery_roots_with_cx, validate_whole_mux_image_layout_only,
 };
 use frankenterm_core::snapshot_engine::{
     WholeMuxPanePublication, WholeMuxPublicationIdentity, publish_whole_mux_recovery,
 };
 use frankenterm_core::snapshot_publication::{
     GenerationPublicationReceipt, PredecessorBinding, RootSlotCandidate, SnapshotPublicationStore,
-    sha256_hex,
+    repair_descriptor_object_id, sha256_hex,
 };
 use frankenterm_core::snapshot_repair::{
-    ExpectedRecoveryIdentity, RepairAdmissionController, RepairError, RepairProtectionClass,
-    decode_repair_symbols, encode_repair_envelope,
+    ExpectedRecoveryIdentity, RepairAdmissionController, RepairError, RepairObjectDescriptor,
+    RepairObjectLimits, RepairProtectionClass, decode_repair_symbols, encode_repair_envelope,
 };
 use frankenterm_core::snapshot_representation::{
     EncryptedRecoveryObject, ExpectedContext, ObjectMetadata, RecoveryKey, RecoveryObjectKind,
@@ -97,6 +97,7 @@ impl Fixture {
                     registration_wire_identity: (pane_id as u128 + 1).to_be_bytes(),
                     durable_pane_id: uuid::Uuid::from_u128(pane_id as u128 + 1),
                     parser_stream_bytes: terminal_checkpoint.parser_stream_bytes(),
+                    semantic_generation: u64::try_from(terminal.current_seqno()).unwrap(),
                     terminal_checkpoint,
                 }
             })
@@ -318,13 +319,12 @@ impl Fixture {
     }
 
     fn current(&self, cx: &Cx, store: &SnapshotPublicationStore) -> ValidatedWholeMuxRecovery {
+        // Reopen both consumers: success must come from the durable closure,
+        // never a retained decoder bundle or publisher-owned memory.
+        let reopened =
+            SnapshotPublicationStore::open(store.root_path(), Default::default()).unwrap();
         let verifier = self.verifier();
-        store
-            .select_verified_roots(
-                &|candidate: &RootSlotCandidate, store: &SnapshotPublicationStore| {
-                    verifier.verify_root_with_cx(cx, candidate, store)
-                },
-            )
+        select_verified_recovery_roots_with_cx(cx, &reopened, &verifier)
             .unwrap()
             .current
             .expect("verified current generation")
@@ -335,6 +335,55 @@ fn store() -> (tempfile::TempDir, SnapshotPublicationStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
     (directory, store)
+}
+
+fn persisted_repair_records(
+    store: &SnapshotPublicationStore,
+    fixture: &Fixture,
+    envelope: &[u8],
+    semantic_id: [u8; 32],
+    generation: u64,
+) -> (std::path::PathBuf, Vec<u8>) {
+    let expected = ExpectedRecoveryIdentity::new(
+        representation_id_from_envelope_bytes(envelope),
+        semantic_id,
+        generation,
+    );
+    let descriptor_bytes = store
+        .read_object(&repair_descriptor_object_id(&expected.representation_id))
+        .unwrap();
+    let key = fixture.key.derive_repair_authentication_key().unwrap();
+    let descriptor = RepairObjectDescriptor::from_authenticated_bytes(
+        &descriptor_bytes,
+        &expected,
+        key.as_ref(),
+        RepairObjectLimits::default(),
+    )
+    .unwrap();
+    let first = &descriptor.chunks[0];
+    assert!(first.manifest.total_symbols_generated > first.manifest.k);
+    let path = store
+        .root_path()
+        .join("objects")
+        .join(format!("{}.obj", first.records_object_id));
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), first.record_bytes_len().unwrap());
+    (path, bytes)
+}
+
+fn assert_exact_checkpoint_payloads(fixture: &Fixture, verified: &ValidatedWholeMuxRecovery) {
+    for pane in &verified.image().panes {
+        assert_eq!(
+            verified.checkpoint_payload(&pane.checkpoint.checkpoint_ref.object_id),
+            Some(
+                fixture.acks[pane.pane_id]
+                    .terminal_checkpoint
+                    .canonical_payload()
+            ),
+            "repaired pane {} must retain exact canonical state",
+            pane.pane_id
+        );
+    }
 }
 
 fn encrypted_candidate(image: &MuxRecoveryImage, key: &RecoveryKey) -> RootSlotCandidate {
@@ -430,18 +479,49 @@ fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
     assert_eq!(fixture.current(&cx, &store).generation(), 2);
     // Corrupt only the test-owned second root; retain both files and all objects.
     let original = std::fs::read(&second.path).unwrap();
+    // A recomputed outer checksum is not authentication. This remains a
+    // readable ordinary candidate but must not veto its authentic discovery.
+    let mut substituted = original.clone();
+    let publisher = b"integration-publisher";
+    let offset = substituted
+        .windows(publisher.len())
+        .position(|bytes| bytes == publisher)
+        .unwrap();
+    substituted[offset] = b'I';
+    let trailer_start = substituted.len() - 32;
+    let checksum = hex::decode(sha256_hex(&substituted[..trailer_start])).unwrap();
+    substituted[trailer_start..].copy_from_slice(&checksum);
+    std::fs::write(&second.path, &substituted).unwrap();
+    let parsed = store.inspect_root_candidates().unwrap().0;
+    assert!(parsed.iter().any(|candidate| {
+        candidate.generation == 2 && candidate.publisher_id == "Integration-publisher"
+    }));
+    let recovered = fixture.current(&cx, &store);
+    assert_eq!(recovered.generation(), 2);
+    assert_exact_checkpoint_payloads(&fixture, &recovered);
+    let (records_path, records) = persisted_repair_records(&store, &fixture, &original, ROOT_ID, 2);
     std::fs::write(&second.path, &original[..original.len() / 2]).unwrap();
+    let mut damaged_records = records.clone();
+    damaged_records[0] ^= 1;
+    std::fs::write(&records_path, &damaged_records).unwrap();
+    let recovered = fixture.current(&cx, &store);
+    assert_eq!(recovered.generation(), 2);
+    assert_exact_checkpoint_payloads(&fixture, &recovered);
+    // Destroy all authenticated symbols in one required chunk. Recovery must
+    // now fail for generation 2 and preserve the complete predecessor.
+    std::fs::write(&records_path, vec![0; records.len()]).unwrap();
     assert_eq!(fixture.current(&cx, &store).generation(), 1);
     assert!(first.path.exists());
     assert!(second.path.exists());
     // Restore the exact bytes to prove corruption, rather than an invalid gen2,
     // caused selection to fall back.
     std::fs::write(&second.path, &original).unwrap();
+    std::fs::write(&records_path, &records).unwrap();
     assert_eq!(fixture.current(&cx, &store).generation(), 2);
 }
 
 #[test]
-fn test_mux_recovery_e2e_production_verifier_rejects_tampered_object() {
+fn test_mux_recovery_e2e_production_verifier_repairs_tampered_object_from_disk() {
     let fixture = Fixture::new();
     let cx = frankenterm_core::cx::for_request();
     let (_directory, store) = store();
@@ -456,6 +536,13 @@ fn test_mux_recovery_e2e_production_verifier_rejects_tampered_object() {
         .join(format!("{}.obj", object.object_id));
     let mut bytes = std::fs::read(&path).unwrap();
     let original = bytes.clone();
+    let (records_path, records) = persisted_repair_records(
+        &store,
+        &fixture,
+        &original,
+        frankenterm_core::session_restore::semantic_object_id_from_str(&object.object_id),
+        2,
+    );
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
     std::fs::write(&path, &bytes).unwrap();
@@ -466,14 +553,19 @@ fn test_mux_recovery_e2e_production_verifier_rejects_tampered_object() {
         .into_iter()
         .find(|c| c.generation == 2)
         .unwrap();
-    assert!(matches!(
-        fixture
-            .verifier()
-            .verify_root_with_cx(&cx, &candidate, &store),
-        Err(WholeMuxRecoveryError::CheckpointDigestMismatch { .. })
-    ));
+    let mut damaged_records = records.clone();
+    damaged_records[0] ^= 1;
+    std::fs::write(&records_path, &damaged_records).unwrap();
+    let repaired = fixture
+        .verifier()
+        .verify_root_with_cx(&cx, &candidate, &store)
+        .expect("fresh verifier must load authenticated repair closure from disk");
+    assert_exact_checkpoint_payloads(&fixture, &repaired);
+    assert_eq!(fixture.current(&cx, &store).generation(), 2);
+    std::fs::write(&records_path, vec![0; records.len()]).unwrap();
     assert_eq!(fixture.current(&cx, &store).generation(), 1);
     std::fs::write(&path, original).unwrap();
+    std::fs::write(&records_path, records).unwrap();
     assert_eq!(fixture.current(&cx, &store).generation(), 2);
 }
 

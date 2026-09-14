@@ -272,6 +272,12 @@ pub enum MuxRecoveryImageError {
     #[error("invalid captured topology: {0}")]
     InvalidCapturedTopology(&'static str),
 
+    #[error("pane {pane_id} terminal checkpoint model is invalid: {reason}")]
+    InvalidCheckpointModel {
+        pane_id: usize,
+        reason: &'static str,
+    },
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -646,7 +652,10 @@ pub struct RecoveryWindow {
 pub struct RecoveryTab {
     pub tab_id: usize,
     pub stable_tab_id: String,
+    /// Mux-owned tab display title from the captured tab, not a pane process-title fallback.
     pub title: String,
+    /// Optional launch metadata, separate from checkpoint terminal directory state.
+    /// Live conversion leaves this absent rather than claiming an OS-process CWD cut.
     pub working_dir: Option<String>,
     pub size: TerminalSize,
     pub size_before_zoom: TerminalSize,
@@ -690,9 +699,12 @@ pub struct RecoveryPane {
     pub pane_id: usize,
     pub pane_uuid: String,
     pub domain_name: String,
+    /// Terminal-model title from the validated checkpoint; no process-title fallback.
     pub title: String,
+    /// Terminal-reported directory URL from the checkpoint, not sampled OS process CWD.
     pub cwd: Option<String>,
     pub size: TerminalSize,
+    /// Terminal cursor as (column, row).
     pub cursor_position: (usize, usize),
     pub alt_screen_active: bool,
     pub checkpoint: PaneCheckpointBinding,
@@ -1611,6 +1623,42 @@ impl MuxRecoveryImage {
                     checkpoint: ack.terminal_checkpoint.parser_stream_bytes(),
                 });
             }
+            let invalid_model = |reason| MuxRecoveryImageError::InvalidCheckpointModel {
+                pane_id: binding.pane_id,
+                reason,
+            };
+            let validated = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+                ack.terminal_checkpoint.canonical_payload(),
+                frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            ).map_err(|_| invalid_model("canonical checkpoint validation failed"))?;
+            let model = validated.checkpoint();
+            if model.semantic_generation() != ack.semantic_generation {
+                return Err(invalid_model("semantic generation differs from ACK"));
+            }
+            if model.primary_rows() != ack.terminal_checkpoint.rows()
+                || model.primary_cols() != ack.terminal_checkpoint.cols()
+            {
+                return Err(invalid_model(
+                    "checkpoint dimensions differ from ACK wrapper",
+                ));
+            }
+            let (pixel_width, pixel_height, dpi) = model.pixel_dimensions_and_dpi();
+            let (cursor_row, cursor_col) = model.cursor_position();
+            let size = TerminalSize {
+                rows: model.primary_rows(),
+                cols: model.primary_cols(),
+                pixel_width: usize::try_from(pixel_width)
+                    .map_err(|_| invalid_model("pixel width exceeds host address space"))?,
+                pixel_height: usize::try_from(pixel_height)
+                    .map_err(|_| invalid_model("pixel height exceeds host address space"))?,
+                dpi,
+            };
+            let cursor_position = (
+                usize::try_from(cursor_col)
+                    .map_err(|_| invalid_model("cursor column exceeds host address space"))?,
+                usize::try_from(cursor_row)
+                    .map_err(|_| invalid_model("cursor row is outside supported coordinates"))?,
+            );
             let chk_ref = checkpoint_object_refs
                 .get(&binding.pane_id)
                 .unwrap()
@@ -1626,17 +1674,11 @@ impl MuxRecoveryImage {
                 pane_id: binding.pane_id,
                 pane_uuid: binding.pane_uuid.clone(),
                 domain_name: binding.domain_name.clone(),
-                title: binding.title.clone(),
-                cwd: binding.cwd.clone(),
-                size: TerminalSize {
-                    rows: binding.size.rows,
-                    cols: binding.size.cols,
-                    pixel_width: binding.size.pixel_width,
-                    pixel_height: binding.size.pixel_height,
-                    dpi: binding.size.dpi,
-                },
-                cursor_position: binding.cursor_pos,
-                alt_screen_active: binding.alt_screen_active,
+                title: model.title().to_owned(),
+                cwd: model.current_directory().map(str::to_owned),
+                size,
+                cursor_position,
+                alt_screen_active: model.is_alternate_screen_active(),
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: topology_incarnation_id.clone(),
                     pane_uuid: binding.pane_uuid.clone(),
@@ -2962,6 +3004,23 @@ mod converter_tests {
             .expect("capture test checkpoint")
     }
 
+    fn make_test_ack(
+        registration_wire_identity: [u8; 16],
+        durable_pane_id: uuid::Uuid,
+        terminal_checkpoint: frankenterm_term::RecoveryTerminalCheckpointV2,
+    ) -> mux::ModelParserCheckpointAck {
+        let semantic_generation = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+            terminal_checkpoint.canonical_payload(), TerminalCheckpointLimits::default(),
+        ).unwrap().checkpoint().semantic_generation();
+        mux::ModelParserCheckpointAck {
+            registration_wire_identity,
+            durable_pane_id,
+            parser_stream_bytes: terminal_checkpoint.parser_stream_bytes(),
+            semantic_generation,
+            terminal_checkpoint,
+        }
+    }
+
     fn make_test_fixture() -> (
         RecoveryImageGenerationMeta,
         mux::MuxCapturedTopology,
@@ -3160,21 +3219,19 @@ mod converter_tests {
         let mut checkpoint_acks = HashMap::new();
         checkpoint_acks.insert(
             101,
-            mux::ModelParserCheckpointAck {
-                registration_wire_identity: wire1,
-                durable_pane_id: uuid::Uuid::from_bytes(uuid1),
-                parser_stream_bytes: 4,
-                terminal_checkpoint: make_test_checkpoint(24, 40, b"one\n"),
-            },
+            make_test_ack(
+                wire1,
+                uuid::Uuid::from_bytes(uuid1),
+                make_test_checkpoint(24, 40, b"one\n"),
+            ),
         );
         checkpoint_acks.insert(
             102,
-            mux::ModelParserCheckpointAck {
-                registration_wire_identity: wire2,
-                durable_pane_id: uuid::Uuid::from_bytes(uuid2),
-                parser_stream_bytes: 4,
-                terminal_checkpoint: make_test_checkpoint(24, 40, b"two\n"),
-            },
+            make_test_ack(
+                wire2,
+                uuid::Uuid::from_bytes(uuid2),
+                make_test_checkpoint(24, 40, b"two\n"),
+            ),
         );
 
         let mut checkpoint_object_refs = HashMap::new();
@@ -3223,6 +3280,68 @@ mod converter_tests {
     }
 
     #[test]
+    fn test_converter_projects_terminal_metadata_from_checkpoint_not_sampled_callbacks() {
+        let (meta, mut captured, mut acks, refs) = make_test_fixture();
+        let prior = acks.get(&101).unwrap();
+        let replacement = make_test_ack(
+            prior.registration_wire_identity,
+            prior.durable_pane_id,
+            make_test_checkpoint(
+                24,
+                40,
+                b"\x1b]0;checkpoint-title\x07\x1b]7;file:///model-cwd\x07\x1b[?1049h\x1b[3;5H",
+            ),
+        );
+        acks.insert(101, replacement);
+        let sampled = captured
+            .pane_bindings
+            .iter_mut()
+            .find(|pane| pane.pane_id == 101)
+            .unwrap();
+        sampled.title = "sampled-process-title".to_owned();
+        sampled.cwd = Some("/sampled-process-cwd".to_owned());
+        sampled.cursor_pos = (19, 17);
+        sampled.alt_screen_active = false;
+        sampled.size.pixel_width = 999;
+        sampled.size.pixel_height = 998;
+        sampled.size.dpi = 144;
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap();
+        let pane = image.panes.iter().find(|pane| pane.pane_id == 101).unwrap();
+        assert_eq!(pane.title, "checkpoint-title");
+        assert_eq!(pane.cwd.as_deref(), Some("file:///model-cwd"));
+        assert_eq!(pane.cursor_position, (4, 2));
+        assert!(pane.alt_screen_active);
+        assert_eq!(
+            pane.size,
+            TerminalSize {
+                rows: 24,
+                cols: 40,
+                pixel_width: 400,
+                pixel_height: 480,
+                dpi: 96
+            }
+        );
+    }
+
+    #[test]
+    fn test_converter_rejects_checkpoint_ack_semantic_generation_mismatch() {
+        let (meta, captured, mut acks, refs) = make_test_fixture();
+        acks.get_mut(&101).unwrap().semantic_generation += 1;
+        let error =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            MuxRecoveryImageError::InvalidCheckpointModel {
+                pane_id: 101,
+                reason: "semantic generation differs from ACK",
+            }
+        );
+    }
+
+    #[test]
     fn test_converter_positive_with_pane_stacks() {
         let (meta, mut captured, mut acks, mut refs) = make_test_fixture();
 
@@ -3255,12 +3374,11 @@ mod converter_tests {
 
         acks.insert(
             103,
-            mux::ModelParserCheckpointAck {
-                registration_wire_identity: wire3,
-                durable_pane_id: uuid::Uuid::from_bytes(uuid3),
-                parser_stream_bytes: 6,
-                terminal_checkpoint: make_test_checkpoint(24, 40, b"three\n"),
-            },
+            make_test_ack(
+                wire3,
+                uuid::Uuid::from_bytes(uuid3),
+                make_test_checkpoint(24, 40, b"three\n"),
+            ),
         );
 
         refs.insert(
@@ -3335,12 +3453,11 @@ mod converter_tests {
         let (meta, captured, mut acks, refs) = make_test_fixture();
         acks.insert(
             999,
-            mux::ModelParserCheckpointAck {
-                registration_wire_identity: [9u8; 16],
-                durable_pane_id: uuid::Uuid::new_v4(),
-                parser_stream_bytes: 1024,
-                terminal_checkpoint: make_test_checkpoint(24, 80, b"extra\n"),
-            },
+            make_test_ack(
+                [9u8; 16],
+                uuid::Uuid::new_v4(),
+                make_test_checkpoint(24, 80, b"extra\n"),
+            ),
         );
 
         let err =
@@ -3411,8 +3528,11 @@ mod converter_tests {
     fn test_converter_preserves_zero_parser_stream_bytes_without_invented_receipts() {
         let (meta, captured, mut acks, refs) = make_test_fixture();
         let ack = acks.get_mut(&101).unwrap();
-        ack.terminal_checkpoint = make_test_checkpoint(24, 40, b"");
-        ack.parser_stream_bytes = ack.terminal_checkpoint.parser_stream_bytes();
+        *ack = make_test_ack(
+            ack.registration_wire_identity,
+            ack.durable_pane_id,
+            make_test_checkpoint(24, 40, b""),
+        );
 
         let image =
             MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)

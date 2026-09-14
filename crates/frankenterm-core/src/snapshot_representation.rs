@@ -32,6 +32,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
+use hmac::{Hmac, Mac};
 use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,6 +55,9 @@ pub const RECOVERY_AAD_DOMAIN: &[u8] = b"frankenterm.snapshot-recovery.aad.v1\0"
 
 /// Domain separator for key-id derivation.
 pub const RECOVERY_KEY_ID_DOMAIN: &[u8] = b"frankenterm.snapshot-recovery.key-id.v1\0";
+
+/// Separate authentication-key domain for persisted repair and discovery metadata.
+pub const RECOVERY_REPAIR_KEY_DOMAIN: &[u8] = b"frankenterm.snapshot-recovery.repair-auth-key.v1\0";
 
 /// Domain separator for chunk coordinate identity derivation.
 pub const RECOVERY_CHUNK_COORDINATE_ID_DOMAIN: &[u8] =
@@ -187,6 +191,7 @@ impl RecoveryKey {
     ///
     /// Rejects all-zero keys to prevent uninitialized key use.
     pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Result<Self, RepresentationError> {
+        let bytes = Zeroizing::new(bytes);
         if bytes.iter().all(|b| *b == 0) {
             return Err(RepresentationError::KeyError {
                 reason: "all-zero recovery key is rejected".into(),
@@ -194,14 +199,11 @@ impl RecoveryKey {
         }
         let mut hasher = Sha256::new();
         hasher.update(RECOVERY_KEY_ID_DOMAIN);
-        hasher.update(&bytes);
+        hasher.update(bytes.as_slice());
         let digest = hasher.finalize();
         let mut key_id = [0u8; 8];
         key_id.copy_from_slice(&digest[..8]);
-        Ok(Self {
-            bytes: Zeroizing::new(bytes),
-            key_id,
-        })
+        Ok(Self { bytes, key_id })
     }
 
     /// Generate a cryptographically random recovery key using system entropy.
@@ -209,13 +211,14 @@ impl RecoveryKey {
     /// Returns an error if the system entropy source fails; never panics or uses
     /// fixed fallback constants.
     pub fn generate() -> Result<Self, RepresentationError> {
-        let mut bytes = [0u8; KEY_BYTES];
+        let mut bytes = Zeroizing::new([0u8; KEY_BYTES]);
         let mut rng = SysRng;
-        rng.try_fill_bytes(&mut bytes)
-            .map_err(|e| RepresentationError::EntropyUnavailable {
+        rng.try_fill_bytes(bytes.as_mut_slice()).map_err(|e| {
+            RepresentationError::EntropyUnavailable {
                 reason: format!("failed to obtain {} bytes of entropy: {e}", KEY_BYTES),
-            })?;
-        Self::from_bytes(bytes)
+            }
+        })?;
+        Self::from_bytes(*bytes)
     }
 
     /// 8-byte non-secret key identifier for key lookup and rotation.
@@ -234,6 +237,21 @@ impl RecoveryKey {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; KEY_BYTES] {
         &self.bytes
+    }
+
+    /// Deterministically derives a distinct MAC key without exposing encryption
+    /// key bytes to repair metadata. The caller retains this zeroizing owner.
+    pub fn derive_repair_authentication_key(
+        &self,
+    ) -> Result<Zeroizing<[u8; KEY_BYTES]>, RepresentationError> {
+        let mut mac =
+            <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(self.as_bytes()).map_err(|_| {
+                RepresentationError::KeyError {
+                    reason: "repair authentication key derivation failed".into(),
+                }
+            })?;
+        mac.update(RECOVERY_REPAIR_KEY_DOMAIN);
+        Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
     }
 }
 
@@ -1397,6 +1415,20 @@ pub fn decode_recovery_object_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_authentication_key_is_stable_and_separate_from_encryption_key() {
+        let first = RecoveryKey::from_bytes([7; KEY_BYTES]).unwrap();
+        let reopened = RecoveryKey::from_bytes([7; KEY_BYTES]).unwrap();
+        let other = RecoveryKey::from_bytes([8; KEY_BYTES]).unwrap();
+        let derived = first.derive_repair_authentication_key().unwrap();
+        assert_eq!(
+            *derived,
+            *reopened.derive_repair_authentication_key().unwrap()
+        );
+        assert_ne!(*derived, *first.as_bytes());
+        assert_ne!(*derived, *other.derive_repair_authentication_key().unwrap());
+    }
 
     #[test]
     fn final_frame_emission_preserves_compression_limit_error() {

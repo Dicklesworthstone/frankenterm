@@ -71,12 +71,12 @@ use crate::snapshot_repair::{
     AuthenticatedRepairSymbol, EncodedRepairBundle, ExpectedRecoveryIdentity,
     RepairAdmissionController, RepairError, RepairPermit,
 };
+#[cfg(test)]
+use crate::snapshot_representation::ObjectMetadata;
 use crate::snapshot_representation::{
     EncryptedRecoveryObject, ExpectedContext, RECOVERY_OBJECT_MAGIC, RecoveryKey,
     RecoveryObjectKind, RepresentationConfig, RepresentationError, decode_recovery_object,
 };
-#[cfg(test)]
-use crate::snapshot_representation::ObjectMetadata;
 #[cfg(all(test, feature = "frankenterm-deps"))]
 use frankenterm_term::TerminalSize as TermSize;
 #[cfg(all(test, feature = "frankenterm-deps"))]
@@ -6899,10 +6899,48 @@ impl WholeMuxRecoveryVerifier {
     fn attempt_raptorq_repair(
         &self,
         cx: &Cx,
+        store: &SnapshotPublicationStore,
         expected_representation_id: &[u8; 32],
         expected_object_id: [u8; 32],
         expected_generation: u64,
+        max_envelope_bytes: usize,
     ) -> Result<Option<(Zeroizing<Vec<u8>>, RepairPermit<'_>)>, WholeMuxRecoveryError> {
+        cx.checkpoint()
+            .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+        let expected = ExpectedRecoveryIdentity::new(
+            *expected_representation_id,
+            expected_object_id,
+            expected_generation,
+        );
+        let authentication_key = self.recovery_key.derive_repair_authentication_key()?;
+        match store.read_repair_descriptor(&expected, authentication_key.as_slice()) {
+            Ok(descriptor) => {
+                let repaired = crate::snapshot_repair::decode_repair_object(
+                    cx,
+                    &descriptor,
+                    &expected,
+                    authentication_key.as_slice(),
+                    self.admission
+                        .as_deref()
+                        .unwrap_or_else(crate::snapshot_repair::shared_admission_controller),
+                    crate::snapshot_repair::RepairObjectLimits {
+                        max_envelope_bytes,
+                        ..crate::snapshot_repair::RepairObjectLimits::default()
+                    },
+                    |chunk| {
+                        store
+                            .read_repair_records(chunk)
+                            .map_err(|error| RepairError::Storage(error.to_string()))
+                    },
+                )?;
+                let (bytes, permit) = repaired.into_parts();
+                return Ok(Some((Zeroizing::new(bytes), permit)));
+            }
+            Err(PublicationError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
         let bundle = self.repair_bundles.get(expected_representation_id);
         let Some(bundle) = bundle else {
             return Ok(None);
@@ -6910,12 +6948,14 @@ impl WholeMuxRecoveryVerifier {
         let Some(ref repair_key) = self.repair_key else {
             return Ok(None);
         };
+        if bundle.manifest.payload_len > max_envelope_bytes as u64 {
+            return Err(WholeMuxRecoveryError::Repair(
+                RepairError::AdmissionExceeded(
+                    "repair envelope exceeds caller recovery limit".to_string(),
+                ),
+            ));
+        }
 
-        let expected = ExpectedRecoveryIdentity::new(
-            *expected_representation_id,
-            expected_object_id,
-            expected_generation,
-        );
         let repair_result = crate::snapshot_repair::decode_repair_symbols(
             cx,
             &bundle.manifest,
@@ -6936,6 +6976,7 @@ impl WholeMuxRecoveryVerifier {
         &self,
         cx: &Cx,
         candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
     ) -> Result<(Zeroizing<Vec<u8>>, u64), WholeMuxRecoveryError> {
         let mut expected_rep_id = [0u8; 32];
         if let Ok(expected_bytes) = hex::decode(&candidate.manifest_sha256) {
@@ -6953,9 +6994,11 @@ impl WholeMuxRecoveryVerifier {
         } else {
             if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
                 cx,
+                store,
                 &expected_rep_id,
                 self.trusted_identity.expected_root_object_id,
                 candidate.generation,
+                self.limits.max_image_bytes,
             )? {
                 repair_permit = Some(permit);
                 reconstructed
@@ -6972,9 +7015,11 @@ impl WholeMuxRecoveryVerifier {
             Err(parse_err) => {
                 if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
                     cx,
+                    store,
                     &expected_rep_id,
                     self.trusted_identity.expected_root_object_id,
                     candidate.generation,
+                    self.limits.max_image_bytes,
                 )? {
                     repair_permit = Some(permit);
                     EncryptedRecoveryObject::from_bytes(reconstructed.as_slice())
@@ -6997,8 +7042,13 @@ impl WholeMuxRecoveryVerifier {
             max_compressed_bytes: self.limits.max_image_bytes,
             ..RepresentationConfig::default()
         };
-        let decoded = decode_recovery_object(&enc_obj, &expected_context, &self.recovery_key, Some(&config))
-            .map_err(WholeMuxRecoveryError::Representation)?;
+        let decoded = decode_recovery_object(
+            &enc_obj,
+            &expected_context,
+            &self.recovery_key,
+            Some(&config),
+        )
+        .map_err(WholeMuxRecoveryError::Representation)?;
 
         drop(wire_bytes);
         drop(enc_obj);
@@ -7034,12 +7084,20 @@ impl WholeMuxRecoveryVerifier {
         );
 
         let config = RepresentationConfig {
-            max_uncompressed_bytes: self.limits.max_per_pane_checkpoint_bytes.min(remaining_plaintext_bytes),
+            max_uncompressed_bytes: self
+                .limits
+                .max_per_pane_checkpoint_bytes
+                .min(remaining_plaintext_bytes),
             max_compressed_bytes: self.limits.max_per_pane_checkpoint_bytes,
             ..RepresentationConfig::default()
         };
-        let decoded = decode_recovery_object(&enc_obj, &expected_context, &self.recovery_key, Some(&config))
-            .map_err(WholeMuxRecoveryError::Representation)?;
+        let decoded = decode_recovery_object(
+            &enc_obj,
+            &expected_context,
+            &self.recovery_key,
+            Some(&config),
+        )
+        .map_err(WholeMuxRecoveryError::Representation)?;
 
         Ok(decoded.into_plaintext())
     }
@@ -7050,7 +7108,8 @@ impl WholeMuxRecoveryVerifier {
         candidate: &RootSlotCandidate,
         store: &SnapshotPublicationStore,
     ) -> Result<ValidatedWholeMuxRecovery, WholeMuxRecoveryError> {
-        cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+        cx.checkpoint()
+            .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
         if candidate.manifest_bytes.len() > self.limits.max_image_bytes {
             return Err(WholeMuxRecoveryError::TopologyValidation(format!(
                 "root manifest payload exceeds limit ({} > {})",
@@ -7061,7 +7120,7 @@ impl WholeMuxRecoveryVerifier {
 
         // 1. Decode and verify root manifest with AEAD and independent trusted expected identity
         let (raw_image_json, image_generation) =
-            self.decode_and_verify_manifest_payload(cx, candidate)?;
+            self.decode_and_verify_manifest_payload(cx, candidate, store)?;
 
         // 2. Decode and structurally validate canonical image slice
         let image = MuxRecoveryImage::from_json_slice(raw_image_json.as_slice())?;
@@ -7106,7 +7165,8 @@ impl WholeMuxRecoveryVerifier {
         let mut total_bytes: usize = 0;
 
         for pane in &image.panes {
-            cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+            cx.checkpoint()
+                .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
             let obj_ref = &pane.checkpoint.checkpoint_ref;
 
             // Enforce authority policy:
@@ -7135,7 +7195,7 @@ impl WholeMuxRecoveryVerifier {
 
             // Read object from immutable publication store, attempting RaptorQ repair using
             // the authenticated representation digest if needed
-            let read_result = store.read_object(&obj_ref.object_id);
+            let read_result = store.read_object_bounded(&obj_ref.object_id, obj_ref.byte_length);
             let mut repair_permit = None;
             let expected_object_id = semantic_object_id_from_str(&obj_ref.object_id);
             let payload: Zeroizing<Vec<u8>> = match read_result {
@@ -7144,9 +7204,11 @@ impl WholeMuxRecoveryVerifier {
                     if computed != obj_ref.payload_digest {
                         if let Some((repaired, permit)) = self.attempt_raptorq_repair(
                             cx,
+                            store,
                             &obj_ref.payload_digest,
                             expected_object_id,
                             image_generation,
+                            self.limits.max_per_pane_checkpoint_bytes,
                         )? {
                             repair_permit = Some(permit);
                             repaired
@@ -7160,9 +7222,11 @@ impl WholeMuxRecoveryVerifier {
                 Err(_) => {
                     if let Some((repaired, permit)) = self.attempt_raptorq_repair(
                         cx,
+                        store,
                         &obj_ref.payload_digest,
                         expected_object_id,
                         image_generation,
+                        self.limits.max_per_pane_checkpoint_bytes,
                     )? {
                         repair_permit = Some(permit);
                         repaired
@@ -7198,11 +7262,14 @@ impl WholeMuxRecoveryVerifier {
                 payload.as_slice(),
                 pane,
                 image_generation,
-                self.limits.max_total_checkpoint_bytes.saturating_sub(total_bytes),
+                self.limits
+                    .max_total_checkpoint_bytes
+                    .saturating_sub(total_bytes),
             )?;
             drop(payload);
             drop(repair_permit);
-            cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+            cx.checkpoint()
+                .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
 
             // Verify canonical terminal checkpoint decoding if dependencies are active
             #[cfg(feature = "frankenterm-deps")]
@@ -7226,7 +7293,8 @@ impl WholeMuxRecoveryVerifier {
             checkpoint_payloads.insert(obj_ref.object_id.clone(), decoded_json);
         }
 
-        cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+        cx.checkpoint()
+            .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
         Ok(ValidatedWholeMuxRecovery::new(
             image,
             candidate.generation,
@@ -7428,9 +7496,182 @@ pub fn select_verified_recovery_roots(
     store: &SnapshotPublicationStore,
     verifier: &WholeMuxRecoveryVerifier,
 ) -> Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>, WholeMuxRecoveryError> {
-    store
-        .select_verified_roots(verifier)
-        .map_err(WholeMuxRecoveryError::Publication)
+    select_verified_recovery_roots_with_cx(&crate::cx::for_request(), store, verifier)
+}
+
+/// Select from the two fixed root slots and their authenticated repair discovery.
+/// Keep one verified graph per slot; a failed newer candidate may fall back to
+/// that slot's older committed discovery without retaining a third full graph.
+#[allow(clippy::too_many_lines)]
+pub fn select_verified_recovery_roots_with_cx(
+    cx: &crate::cx::Cx,
+    store: &SnapshotPublicationStore,
+    verifier: &WholeMuxRecoveryVerifier,
+) -> Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>, WholeMuxRecoveryError> {
+    use crate::snapshot_publication::{RootSlot, TornRootDiagnostic};
+    use crate::snapshot_repair::{
+        RepairObjectDescriptor, RepairObjectLimits, decode_repair_object,
+        shared_admission_controller,
+    };
+
+    cx.checkpoint()
+        .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+    let key = verifier.recovery_key.derive_repair_authentication_key()?;
+    let root_id = verifier.trusted_identity.expected_root_object_id;
+    let namespace = format!("whole-mux-{}", hex::encode(root_id));
+    let max_outer_bytes = u64::try_from(verifier.limits.max_image_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(crate::snapshot_publication::MAX_ENVELOPE_OVERHEAD_BYTES)
+        .min(store.limits().max_root_envelope_bytes());
+    let (candidates, mut diagnostics) = store.inspect_root_candidates()?;
+    cx.checkpoint()
+        .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+    let (discoveries, discovery_diagnostics) =
+        store.inspect_repair_discovery(&namespace, &root_id, key.as_ref())?;
+    diagnostics.extend(discovery_diagnostics);
+    diagnostics.truncate(store.limits().max_error_records);
+    let admission = verifier
+        .admission
+        .as_deref()
+        .unwrap_or_else(|| shared_admission_controller());
+    let mut verified = Vec::with_capacity(2);
+    for slot in [RootSlot::SlotA, RootSlot::SlotB] {
+        let ordinary = candidates.iter().find(|candidate| candidate.slot == slot);
+        let discovery = discoveries.iter().find(|discovery| discovery.slot == slot);
+        let mut attempts = Vec::with_capacity(2);
+        if let Some(candidate) = ordinary {
+            attempts.push((candidate.generation, false));
+        }
+        if let Some(discovery) = discovery {
+            attempts.push((discovery.generation, true));
+        }
+        // Prefer the ordinary bytes at equal generation, avoiding a decoder
+        // allocation when the committed envelope and graph are already intact.
+        attempts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (generation, repair) in attempts {
+            cx.checkpoint()
+                .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+            let result = if repair {
+                let discovery = discovery.expect("repair attempt has fixed-slot discovery");
+                (|| -> Result<ValidatedWholeMuxRecovery, WholeMuxRecoveryError> {
+                    if discovery.outer_envelope_len > max_outer_bytes {
+                        return Err(PublicationError::InvalidDiscovery(
+                            "root repair exceeds store bound",
+                        )
+                        .into());
+                    }
+                    let expected = ExpectedRecoveryIdentity::new(
+                        discovery.outer_envelope_sha256,
+                        root_id,
+                        discovery.generation,
+                    );
+                    let bytes = store.read_repair_descriptor_bytes(&discovery.repair)?;
+                    let limits = RepairObjectLimits {
+                        max_envelope_bytes: usize::try_from(max_outer_bytes)
+                            .unwrap_or(usize::MAX)
+                            .min(RepairObjectLimits::default().max_envelope_bytes),
+                        ..RepairObjectLimits::default()
+                    };
+                    let descriptor = RepairObjectDescriptor::from_authenticated_bytes(
+                        &bytes,
+                        &expected,
+                        key.as_ref(),
+                        limits,
+                    )?;
+                    if descriptor.payload_len != discovery.outer_envelope_len {
+                        return Err(PublicationError::InvalidDiscovery(
+                            "root repair length mismatch",
+                        )
+                        .into());
+                    }
+                    let repaired = decode_repair_object(
+                        cx,
+                        &descriptor,
+                        &expected,
+                        key.as_ref(),
+                        admission,
+                        limits,
+                        |chunk| {
+                            store
+                                .read_repair_records(chunk)
+                                .map_err(|error| RepairError::Storage(error.to_string()))
+                        },
+                    )?;
+                    let candidate =
+                        store.decode_recovered_root(slot, &repaired.reconstructed_envelope)?;
+                    if !store.root_candidate_matches_discovery(&candidate, discovery)? {
+                        return Err(PublicationError::InvalidDiscovery(
+                            "repaired root discovery mismatch",
+                        )
+                        .into());
+                    }
+                    // Keep the reconstruction allocation's permit alive until
+                    // all authenticated graph decoding has completed.
+                    let result = verifier.verify_root_with_cx(cx, &candidate, store);
+                    drop(repaired);
+                    result
+                })()
+            } else {
+                let candidate = ordinary.expect("ordinary attempt has fixed-slot candidate");
+                let matches = discovery
+                    .filter(|d| d.generation == generation)
+                    .map(|d| store.root_candidate_matches_discovery(candidate, d))
+                    .transpose()?;
+                if matches == Some(false) {
+                    Err(PublicationError::InvalidDiscovery(
+                        "ordinary root differs from authenticated discovery",
+                    )
+                    .into())
+                } else {
+                    verifier.verify_root_with_cx(cx, candidate, store)
+                }
+            };
+            cx.checkpoint()
+                .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
+            match result {
+                Ok(graph) => {
+                    verified.push((generation, graph));
+                    break;
+                }
+                Err(
+                    WholeMuxRecoveryError::Cancelled
+                    | WholeMuxRecoveryError::Repair(RepairError::Cancelled)
+                    | WholeMuxRecoveryError::Publication(PublicationError::Repair(
+                        RepairError::Cancelled,
+                    )),
+                ) => {
+                    return Err(WholeMuxRecoveryError::Cancelled);
+                }
+                Err(_) => {
+                    if diagnostics.len() < store.limits().max_error_records {
+                        diagnostics.push(TornRootDiagnostic {
+                            slot,
+                            generation: Some(generation),
+                            reason: if repair {
+                                "authenticated root repair or graph rejected"
+                            } else {
+                                "root graph rejected"
+                            }
+                            .to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    verified.sort_by(|a, b| b.0.cmp(&a.0));
+    if verified.len() == 2 && verified[0].0 == verified[1].0 {
+        return Err(PublicationError::AmbiguousGeneration {
+            generation: verified[0].0,
+        }
+        .into());
+    }
+    let mut verified = verified.into_iter();
+    Ok(VerifiedRootSelection {
+        current: verified.next().map(|(_, graph)| graph),
+        previous: verified.next().map(|(_, graph)| graph),
+        torn_or_rejected: diagnostics,
+    })
 }
 
 // =============================================================================
@@ -7444,9 +7685,7 @@ mod tests {
 
     use super::*;
     use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
-    use crate::wezterm::{
-        MockWezterm, MoveDirection, SplitDirection, WeztermFuture, WeztermInterface,
-    };
+    use crate::wezterm::{MockWezterm, MoveDirection, MuxInterface, SplitDirection, WeztermFuture};
     use rusqlite::params;
 
     #[test]
@@ -8568,7 +8807,7 @@ mod tests {
         }
     }
 
-    impl WeztermInterface for SplitFailOnceWezterm {
+    impl MuxInterface for SplitFailOnceWezterm {
         fn list_panes(&self) -> WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
             self.inner.list_panes()
         }
@@ -8707,7 +8946,7 @@ mod tests {
         }
     }
 
-    impl WeztermInterface for SpawnFailSecondTabWezterm {
+    impl MuxInterface for SpawnFailSecondTabWezterm {
         fn list_panes(&self) -> WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
             self.inner.list_panes()
         }
