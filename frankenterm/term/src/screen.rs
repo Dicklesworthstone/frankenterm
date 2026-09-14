@@ -9786,6 +9786,89 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn admitted_geometry_native_parser_corpus_avoids_history_reads() {
+        const PARAGRAPHS: usize = 10_000;
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut terminal = crate::Terminal::new(
+            test_size(4, 173, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 100_000,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "native-geometry-test",
+            Box::new(std::io::sink()),
+        );
+        let paragraph = "Text reflow: ASCII ligatures ffi =>, 界面, e\u{301}, 🚀. ".repeat(9);
+        for row in 0..PARAGRAPHS {
+            terminal.advance_bytes(format!("{row:05} {paragraph}\r\n"));
+        }
+        // Move the final complete paragraph past both the visible screen and
+        // the one-row hot tier. No synthetic Line packing or direct spill
+        // calls may stand in for parser-created admission in this test.
+        terminal.advance_bytes(b"\r\n\r\n\r\n\r\n\r\n");
+        {
+            let rows = sink.rows.lock().unwrap();
+            assert!(rows.len() >= PARAGRAPHS * 3);
+            assert_eq!(
+                (0..3).map(|row| rows[&row].len()).collect::<Vec<_>>(),
+                [173, 174, 109],
+                "the parser writes the wide glyph before taking its pending wrap"
+            );
+            assert_eq!(rows[&1].visible_cells().last().unwrap().str(), "面");
+            assert_eq!(rows[&2].visible_cells().next().unwrap().str(), ",");
+            assert!(rows[&0].last_cell_was_wrapped());
+            assert!(rows[&1].last_cell_was_wrapped());
+            assert!(!rows[&2].last_cell_was_wrapped());
+            let mut first = rows[&0].clone();
+            first.append_line(rows[&1].clone(), 1);
+            first.append_line(rows[&2].clone(), 1);
+            assert_eq!(first.as_str(), format!("00000 {paragraph}"));
+        }
+
+        terminal.resize(test_size(4, 123, 96));
+        let screen = terminal.screen();
+        assert!(screen.stored_physical_layout.is_none());
+        let plan = screen.capture_line_read(0..1).unwrap();
+        assert!(plan.layout.is_none());
+        assert!(plan.geometry.as_ref().unwrap().rows.len() >= PARAGRAPHS * 3);
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let (geometry, _) = plan
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .expect("the actual 30k physical rows must fit the geometry budget");
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        let (reference, _) = plan
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap();
+        assert!(sink.batch_reads.load(Ordering::Relaxed) >= (PARAGRAPHS * 3 / 2) as u64);
+        assert_eq!(geometry.source, reference.source);
+        assert_eq!(geometry.visual, reference.visual);
+        assert_eq!(geometry.groups, reference.groups);
+
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let fast = plan.hydrate(|| false).unwrap();
+        assert!(sink.batch_reads.load(Ordering::Relaxed) < 32);
+        assert!(screen.validates_line_read(&fast));
+        let mut reference_read = screen.capture_line_read(0..1).unwrap();
+        reference_read.geometry = None;
+        reference_read.layout = Some(reference);
+        let reference_read = reference_read.hydrate(|| false).unwrap();
+        assert_eq!(fast.first_row(), reference_read.first_row());
+        assert_eq!(
+            fast.lines().cloned().collect::<Vec<_>>(),
+            reference_read.lines().cloned().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn admitted_geometry_changed_width_matches_stream_without_prefix_reads() {
         let (mut screen, sink) = stored_physical_fixture(20_001, 30_000);
         let cursor = test_cursor(0, 0, 1);

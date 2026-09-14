@@ -3565,12 +3565,13 @@ mod tests {
             "Text reflow: ASCII ligatures ffi =>, 界面, e\u{301}, 🚀. ".repeat(9)
         );
         let source = Line::from_text(&text, &CellAttributes::blank(), 1, None);
-        // Reproduce the parser's physical-row packing, not optimized wrap
-        // output: the native corpus is admitted at 173 columns.
+        // Match Performer::flush_print: write even an overhanging wide glyph,
+        // then wrap before the next glyph. The native corpus enters at 173
+        // columns; its second physical row therefore occupies 174 columns.
         let mut physical = Vec::new();
         let mut cells = Vec::new();
         for cell in source.visible_cells() {
-            if cells.len() + cell.width() > 173 {
+            if cells.len() >= 173 {
                 physical.push(Line::from_cells(core::mem::take(&mut cells), 1));
             }
             cells.push(cell.as_cell());
@@ -3580,8 +3581,12 @@ mod tests {
         }
         physical.push(Line::from_cells(cells, 1));
         assert_eq!(physical.len(), 3);
-        assert_eq!(physical[1].visible_cells().last().unwrap().str(), "界");
-        assert_eq!(physical[2].visible_cells().next().unwrap().str(), "面");
+        assert_eq!(
+            physical.iter().map(Line::len).collect::<Vec<_>>(),
+            [173, 174, 109]
+        );
+        assert_eq!(physical[1].visible_cells().last().unwrap().str(), "面");
+        assert_eq!(physical[2].visible_cells().next().unwrap().str(), ",");
         for storage_mask in 0..8 {
             let mut rows = physical.clone();
             for (idx, row) in rows.iter_mut().enumerate() {
