@@ -852,7 +852,18 @@ mod tests {
                         .get("event")
                         .is_some_and(|value| field_matches(value, "mcp_client_discover_paths"))
             })
-            .expect("discover paths debug event should be captured");
+            .unwrap_or_else(|| {
+                panic!(
+                    "discover paths debug event should be captured; static_max={:?}, current_max={:?}, captured={:?}",
+                    tracing::level_filters::STATIC_MAX_LEVEL,
+                    tracing::level_filters::LevelFilter::current(),
+                    captured
+                        .iter()
+                        .take(8)
+                        .map(|event| (&event.target, event.fields.get("event")))
+                        .collect::<Vec<_>>()
+                )
+            });
         let paths = path_event.fields.get("paths").expect("paths field");
         assert!(
             !paths.contains(secret),
@@ -1503,11 +1514,50 @@ for raw in sys.stdin:
         tracing::dispatcher::DefaultGuard,
         Arc<Mutex<Vec<CapturedEvent>>>,
     ) {
+        // tracing-core 0.1.36's single-dispatch callsite fast path consults
+        // the registering thread's default. Another discovery test can first
+        // reach our shared DEBUG callsite without a subscriber and cache
+        // `never`, even while this thread has an interested capture installed.
+        // Keep a second registered dispatcher alive so callsite interest is
+        // combined across the actual live dispatchers. This anchor is never
+        // installed as any thread's (or the process's) default subscriber.
+        static CALLSITE_ANCHOR: LazyLock<tracing::Dispatch> =
+            LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        LazyLock::force(&CALLSITE_ANCHOR);
         let (layer, events) = LogCapture::new();
         let subscriber = tracing_subscriber::registry().with(layer);
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
         (guard, events)
+    }
+
+    #[test]
+    fn capture_observes_callsite_first_registered_on_unsubscribed_thread() {
+        fn emit() {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event = "mcp_client_cross_thread_callsite",
+                "Capture must survive first registration on another thread"
+            );
+        }
+
+        let (_guard, events) = install_capture();
+        std::thread::spawn(|| {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), emit);
+        })
+        .join()
+        .expect("unsubscribed callsite registration thread");
+        assert!(events.lock().expect("lock logs").is_empty());
+        emit();
+        let captured = events.lock().expect("lock logs");
+        assert_eq!(captured.len(), 1, "only the subscribed event is captured");
+        assert_eq!(captured[0].target, LOG_TARGET);
+        assert!(
+            captured[0]
+                .fields
+                .get("event")
+                .is_some_and(|value| field_matches(value, "mcp_client_cross_thread_callsite"))
+        );
     }
 
     // ─── br-ft-62jai: UCB1 bandit-aware server selection tests ──────────
