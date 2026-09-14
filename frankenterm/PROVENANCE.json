@@ -641,7 +641,7 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 187,
-        "fix": 207,
+        "fix": 208,
         "other": 38,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 73
       },
-      "fork_side_commit_count": 573,
+      "fork_side_commit_count": 574,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-13T18:22:05-04:00",
-        "sha": "b7cb1d47221b8238b43b5b6545b11022bbf31785",
-        "subject": "fix(gui): capture coherent native frames without waiting on pane locks"
+        "committed_at": "2026-09-14T00:59:48-04:00",
+        "sha": "4d3f3d073c9839d4bdd129767cd919a09decf739",
+        "subject": "fix(mux): log committed cold-seam and cold-index resize sources"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -851,19 +851,19 @@
         "cosmetic": 7,
         "feat": 14,
         "fix": 35,
-        "other": 24,
+        "other": 25,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 109,
+      "fork_side_commit_count": 110,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-13T20:03:38-04:00",
-        "sha": "9a5e8ef9103981b8d92af63005caa412d3c151ef",
-        "subject": "perf(term): share compact history snapshots and prepared row indexes"
+        "committed_at": "2026-09-13T21:59:43-04:00",
+        "sha": "42180138e2a1091f329d79b9c8af96d91b74b884",
+        "subject": "perf(term): skip unused cold prepared-source hash"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 1,
         "feat": 53,
-        "fix": 93,
-        "other": 42,
+        "fix": 94,
+        "other": 43,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 47
       },
-      "fork_side_commit_count": 267,
+      "fork_side_commit_count": 269,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-13T20:37:07-04:00",
-        "sha": "191843bf7703a81e247dfa53882af1293e24b4a1",
-        "subject": "perf(term): prepare cursor mapping off the resize commit path"
+        "classification": "fix",
+        "committed_at": "2026-09-14T00:59:48-04:00",
+        "sha": "4d3f3d073c9839d4bdd129767cd919a09decf739",
+        "subject": "fix(mux): log committed cold-seam and cold-index resize sources"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 85,
+        "fix": 86,
         "other": 12,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 137,
+      "fork_side_commit_count": 138,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-13T17:34:40-04:00",
-        "sha": "33be5d11c4ba07171ac24f11dc72a2f37d4789d3",
-        "subject": "fix(window): opt-in native wakeup traces on macOS spawn coalescing"
+        "committed_at": "2026-09-14T01:09:34-04:00",
+        "sha": "8175d4c59f1ab90ad1c139390f2c247457a90e42",
+        "subject": "fix(window): use returned Windows display status and source identity"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2535,
-  "generated_at": "2026-09-14T00:45:53.315541Z",
+  "fork_side_commit_total": 2540,
+  "generated_at": "2026-09-14T05:13:30.922742Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
