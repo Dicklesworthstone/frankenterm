@@ -110,6 +110,7 @@ impl super::TermWindow {
                 selection.clear();
             }
         }
+        self.remember_native_selection(pane);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -117,18 +118,82 @@ impl super::TermWindow {
 
     pub fn selection_authority_is_current(&self, pane: &Arc<dyn Pane>) -> bool {
         let current = SelectionAuthority::capture(&**pane);
+        self.synchronize_native_selection(pane, current);
         self.selection(pane.pane_id()).is_authorized_by(current)
     }
 
     pub fn selection_authority_has_changed(&self, pane: &Arc<dyn Pane>) -> bool {
         let current = SelectionAuthority::capture(&**pane);
-        self.selection(pane.pane_id()).is_invalidated_by(current)
+        !self.synchronize_native_selection(pane, current)
+            && self.selection(pane.pane_id()).is_invalidated_by(current)
+    }
+
+    fn remember_native_selection(&self, pane: &Arc<dyn Pane>) {
+        let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
+            return;
+        };
+        let before = self.selection(pane.pane_id()).clone();
+        if before.rectangular || (before.origin.is_none() && before.range.is_none()) {
+            return;
+        }
+        let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
+        else {
+            return;
+        };
+        if before.authority != Some(authority) || before.seqno != sequence {
+            return;
+        }
+        let Some(token) = local.capture_selection_anchor(
+            authority.layout_floor(),
+            sequence,
+            dimensions,
+            before.native_points(),
+        ) else {
+            return;
+        };
+        let mut selection = self.selection(pane.pane_id());
+        if *selection == before {
+            selection.remember_native_anchor(token);
+        }
+    }
+
+    /// Return true only when a potentially valid remap is temporarily
+    /// unavailable or has outrun the caller's frame. Keep its anchor, but do
+    /// not authorize old coordinates for painting, text reads or new motion.
+    pub(super) fn synchronize_native_selection(
+        &self,
+        pane: &Arc<dyn Pane>,
+        current: Option<SelectionAuthority>,
+    ) -> bool {
+        if !self.selection(pane.pane_id()).is_invalidated_by(current) {
+            return false;
+        }
+        let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
+            return false;
+        };
+        let Some(token) = self.selection(pane.pane_id()).native_anchor().cloned() else {
+            return false;
+        };
+        let Some((floor, sequence, dimensions, points)) = local.selection_anchor_snapshot(&token)
+        else {
+            return true;
+        };
+        let resolved = SelectionAuthority::from_native_snapshot(&**pane, floor, dimensions);
+        if resolved != current {
+            return true;
+        }
+        if let Some((points, authority)) = points.zip(resolved) {
+            self.selection(pane.pane_id())
+                .rebase_native_anchor(points, authority, sequence);
+        }
+        false
     }
 
     /// Returns the selection region as a series of Line
     pub fn selection_lines(&self, pane: &Arc<dyn Pane>) -> Vec<Line> {
-        let expected = self.selection(pane.pane_id()).authority;
-        if expected.is_none() || SelectionAuthority::capture(&**pane) != expected {
+        let expected = SelectionAuthority::capture(&**pane);
+        self.synchronize_native_selection(pane, expected);
+        if !self.selection(pane.pane_id()).is_authorized_by(expected) {
             return Vec::new();
         }
         let rectangular = self.selection(pane.pane_id()).rectangular;
@@ -151,8 +216,9 @@ impl super::TermWindow {
 
     /// Returns the selection text only
     pub fn selection_text(&self, pane: &Arc<dyn Pane>) -> String {
-        let expected = self.selection(pane.pane_id()).authority;
-        if expected.is_none() || SelectionAuthority::capture(&**pane) != expected {
+        let expected = SelectionAuthority::capture(&**pane);
+        self.synchronize_native_selection(pane, expected);
+        if !self.selection(pane.pane_id()).is_authorized_by(expected) {
             return String::new();
         }
         let (rectangular, sel) = {
@@ -216,7 +282,7 @@ impl super::TermWindow {
             self.clear_selection(pane);
             return;
         }
-        if self.selection(pane.pane_id()).authority.is_none()
+        if !self.selection_authority_is_current(pane)
             || self.mouse_selection_authority(pane).is_none()
         {
             // Output/parser contention or autoscroll can outrun presentation.
@@ -349,6 +415,7 @@ impl super::TermWindow {
             self.clear_selection(pane);
             return;
         }
+        self.remember_native_selection(pane);
         let dims = pane.get_dimensions();
 
         // Scroll viewport when the mouse moves out of its vertical bounds.
@@ -507,13 +574,14 @@ impl super::TermWindow {
             self.clear_selection(pane);
             return;
         }
+        self.remember_native_selection(pane);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
     }
 }
 
-fn selected_text_from_logical_lines(
+pub(crate) fn selected_text_from_logical_lines(
     logical_lines: &[LogicalLine],
     sel: SelectionRange,
     rectangular: bool,

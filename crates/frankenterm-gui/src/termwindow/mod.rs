@@ -128,6 +128,8 @@ mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
+#[cfg(test)]
+pub(crate) use selection::selected_text_from_logical_lines;
 pub mod spawn;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
@@ -5069,14 +5071,18 @@ impl TermWindow {
                 let selection = self.selection(pane_id);
                 selection.origin.is_some() || selection.range.is_some()
             };
-            let authority_changed = frame.map_or_else(
-                || self.selection_authority_has_changed(pane),
-                |frame| {
-                    self.selection(pane_id).is_invalidated_by(
-                        crate::selection::SelectionAuthority::from_native_frame(&**pane, frame),
-                    )
-                },
+            let selection_authority = frame.map_or_else(
+                || crate::selection::SelectionAuthority::capture(&**pane),
+                |frame| crate::selection::SelectionAuthority::from_native_frame(&**pane, frame),
             );
+            if self.synchronize_native_selection(pane, selection_authority) {
+                // A busy/newer native source may still transport the anchor.
+                // Painting independently rejects coordinates for this frame.
+                return Ok(());
+            }
+            let authority_changed = self
+                .selection(pane_id)
+                .is_invalidated_by(selection_authority);
             if has_selection_anchor && authority_changed {
                 self.selection(pane_id).clear();
                 if self.active_selection_drag_pane == Some(pane_id) {
@@ -5105,7 +5111,15 @@ impl TermWindow {
                         pane.get_changed_since_with_source_fence(visible_range, selection_seqno)
                             .1
                     },
-                    |frame| frame.selection_dirty.clone(),
+                    |frame| {
+                        if frame.source_sequence == selection_seqno {
+                            // A successful native remap established this exact
+                            // frame as the selection's new damage baseline.
+                            rangeset::RangeSet::new()
+                        } else {
+                            frame.selection_dirty.clone()
+                        }
+                    },
                 );
                 let intersects = selection_rows
                     .clone()
@@ -5133,8 +5147,7 @@ impl TermWindow {
                 )
             {
                 self.clear_selection_drag();
-                self.selection(pane.pane_id()).range.take();
-                self.selection(pane.pane_id()).origin.take();
+                self.selection(pane.pane_id()).clear();
                 self.selection(pane.pane_id()).seqno =
                     frame.map_or_else(|| pane.get_current_seqno(), |frame| frame.source_sequence);
 

@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
@@ -113,6 +113,46 @@ pub struct ScreenCoordinateWitness {
     rows: usize,
     cols: usize,
     dpi: u32,
+}
+
+/// A cell coordinate, or the boundary immediately before column zero.
+/// These are terminal coordinates, never pixels or retained selected text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionAnchorCoordinate {
+    pub column: Option<usize>,
+    pub row: StableRowIndex,
+}
+
+/// Opaque ownership of one finite selection in a live Screen. A preparation
+/// clone cannot resolve or update this token, even if its contents are equal.
+#[derive(Debug, Clone)]
+pub struct ScreenSelectionAnchor(Arc<()>);
+
+impl PartialEq for ScreenSelectionAnchor {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ScreenSelectionAnchor {}
+
+#[derive(Debug)]
+struct SelectionAnchorEntry {
+    owner: Weak<()>,
+    source_sequence: SequenceNo,
+    witness: ScreenCoordinateWitness,
+    points: [Option<SelectionAnchorCoordinate>; 3],
+}
+
+/// Access is serialized by the existing terminal lock. Entries are weak and
+/// bounded, so abandoned GUI selections neither retain text nor grow a queue.
+#[derive(Debug, Default)]
+struct SelectionAnchorRegistry(Vec<SelectionAnchorEntry>);
+
+impl Clone for SelectionAnchorRegistry {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// Owned read work, captured without storage IO. Only the sink and COW row
@@ -1783,6 +1823,7 @@ impl ScreenLineRead {
 #[derive(Debug, Clone)]
 pub struct Screen {
     coordinate_identity: ScreenCoordinateIdentity,
+    selection_anchors: SelectionAnchorRegistry,
     #[cfg(feature = "use_serde")]
     cold_visual_layout: Option<Arc<ColdVisualLayout>>,
     #[cfg(feature = "use_serde")]
@@ -3884,6 +3925,125 @@ impl Screen {
             && self.dpi == witness.dpi
     }
 
+    /// Capture a resident selection against a caller's atomic terminal source
+    /// observation. The caller must hold terminal ownership and supply its
+    /// current sequence. Cold rows and ambiguous gaps in wrapped rows require
+    /// a separate source-bound history projection and are not certified here.
+    pub fn capture_selection_anchor(
+        &mut self,
+        source_sequence: SequenceNo,
+        points: [Option<SelectionAnchorCoordinate>; 3],
+    ) -> Option<ScreenSelectionAnchor> {
+        if !self.allow_scrollback
+            || source_sequence == SequenceNo::MAX
+            || points.iter().all(Option::is_none)
+            || points[0].is_some_and(|point| point.column.is_none())
+            || (points[1] == points[2] && points[1].is_some_and(|point| point.column.is_none()))
+            || !self.selection_anchor_points_are_resident(&points)
+        {
+            return None;
+        }
+        self.selection_anchors
+            .0
+            .retain(|entry| entry.owner.strong_count() != 0);
+        if self.selection_anchors.0.len() >= 16 {
+            return None;
+        }
+        let token = ScreenSelectionAnchor(Arc::new(()));
+        let entry = SelectionAnchorEntry {
+            owner: Arc::downgrade(&token.0),
+            source_sequence,
+            witness: self.capture_coordinate_witness(),
+            points,
+        };
+        self.selection_anchors.0.push(entry);
+        Some(token)
+    }
+
+    pub fn resolve_selection_anchor(
+        &self,
+        token: &ScreenSelectionAnchor,
+        source_sequence: SequenceNo,
+    ) -> Option<[Option<SelectionAnchorCoordinate>; 3]> {
+        let entry = self.selection_anchors.0.iter().find(|entry| {
+            entry.owner.as_ptr() == Arc::as_ptr(&token.0)
+                && entry.source_sequence == source_sequence
+                && source_sequence != SequenceNo::MAX
+                && self.matches_coordinate_witness(&entry.witness)
+        })?;
+        self.selection_anchor_points_are_resident(&entry.points)
+            .then_some(entry.points)
+    }
+
+    fn selection_anchor_points_are_resident(
+        &self,
+        points: &[Option<SelectionAnchorCoordinate>; 3],
+    ) -> bool {
+        points.iter().flatten().all(|point| {
+            let Some(row) = self.stable_row_to_phys(point.row) else {
+                return false;
+            };
+            let line = &self.lines[row];
+            point.column != Some(usize::MAX)
+                && (!line.last_cell_was_wrapped()
+                    || point.column.is_none_or(|column| column < line.len()))
+        })
+    }
+
+    /// LocalPane finalizes its layout floor after the terminal resize. Only
+    /// anchors already mapped to this exact Screen can follow that publication
+    /// sequence increment; an invalidated/replaced Screen cannot be blessed.
+    pub fn publish_selection_anchor_sequence(
+        &mut self,
+        resize_sequence: SequenceNo,
+        published_sequence: SequenceNo,
+    ) {
+        if published_sequence == SequenceNo::MAX
+            || (published_sequence != resize_sequence
+                && resize_sequence.checked_add(1) != Some(published_sequence))
+        {
+            return;
+        }
+        let witness = self.capture_coordinate_witness();
+        for entry in &mut self.selection_anchors.0 {
+            if entry.source_sequence == resize_sequence
+                && Arc::ptr_eq(&entry.witness.identity, &witness.identity)
+                && entry.witness.rows == witness.rows
+                && entry.witness.cols == witness.cols
+                && entry.witness.dpi == witness.dpi
+            {
+                entry.source_sequence = published_sequence;
+            }
+        }
+    }
+
+    fn take_selection_anchors_for_resize(&mut self, seqno: SequenceNo) -> SelectionAnchorRegistry {
+        let mut anchors = std::mem::take(&mut self.selection_anchors);
+        anchors.0.retain(|entry| {
+            entry.owner.strong_count() != 0
+                && seqno != SequenceNo::MAX
+                && entry.source_sequence.checked_add(1) == Some(seqno)
+                && self.matches_coordinate_witness(&entry.witness)
+                && self.selection_anchor_points_are_resident(&entry.points)
+        });
+        anchors
+    }
+
+    fn finish_selection_anchor_resize(
+        &mut self,
+        mut anchors: SelectionAnchorRegistry,
+        seqno: SequenceNo,
+    ) {
+        anchors
+            .0
+            .retain(|entry| self.selection_anchor_points_are_resident(&entry.points));
+        for entry in &mut anchors.0 {
+            entry.source_sequence = seqno;
+            entry.witness = self.capture_coordinate_witness();
+        }
+        self.selection_anchors = anchors;
+    }
+
     pub(crate) fn invalidate_coordinate_witnesses(&mut self) {
         self.coordinate_identity = ScreenCoordinateIdentity::default();
         #[cfg(feature = "use_serde")]
@@ -4259,6 +4419,7 @@ impl Screen {
             physical_cols,
             stable_row_index_offset: 0,
             coordinate_identity: ScreenCoordinateIdentity::default(),
+            selection_anchors: SelectionAnchorRegistry::default(),
             #[cfg(feature = "use_serde")]
             cold_visual_layout: None,
             #[cfg(feature = "use_serde")]
@@ -5385,13 +5546,13 @@ impl Screen {
 
         for (phys_idx, line) in self.lines.iter().enumerate() {
             if phys_idx == cursor_y {
-                return Some((logical_idx, cursor_x + prefix_len));
+                return Some((logical_idx, cursor_x.checked_add(prefix_len)?));
             }
 
             if line.last_cell_was_wrapped() {
-                prefix_len += line.len();
+                prefix_len = prefix_len.checked_add(line.len())?;
             } else {
-                logical_idx += 1;
+                logical_idx = logical_idx.checked_add(1)?;
                 prefix_len = 0;
             }
         }
@@ -6018,7 +6179,35 @@ impl Screen {
         cursor_y: PhysRowIndex,
         seqno: SequenceNo,
         verified: Option<VerifiedPreparedResize>,
+        selection_anchors: &mut SelectionAnchorRegistry,
     ) -> (usize, PhysRowIndex) {
+        // These are the live points at commit, never the worker snapshot's
+        // points. Mapping reads only row lengths/wrap flags, not cell payloads.
+        let logical_anchors: Vec<_> = selection_anchors
+            .0
+            .iter()
+            .map(|entry| {
+                let normalized_start = entry.points[1].zip(entry.points[2]).map(|(start, end)| {
+                    if (start.row, start.column) <= (end.row, end.column) {
+                        1
+                    } else {
+                        2
+                    }
+                });
+                std::array::from_fn::<_, 3, _>(|index| {
+                    let point = entry.points[index];
+                    point.and_then(|point| {
+                        let row = self.stable_row_to_phys(point.row)?;
+                        let (group, column) =
+                            self.logical_cursor_from_physical(point.column.unwrap_or(0), row)?;
+                        // BeforeZero starts include column zero; BeforeZero
+                        // ends exclude it. Preserve that role through reversal.
+                        let before = point.column.is_none() && normalized_start != Some(index);
+                        Some((group, column, before))
+                    })
+                })
+            })
+            .collect();
         self.invalidate_coordinate_witnesses();
         let started = Instant::now();
         let old_cols = self.physical_cols;
@@ -6159,6 +6348,45 @@ impl Screen {
                 }
             }
         }
+
+        let mut anchor_index = 0;
+        selection_anchors.0.retain_mut(|entry| {
+            let logical = &logical_anchors[anchor_index];
+            anchor_index += 1;
+            for (point, logical) in entry.points.iter_mut().zip(logical) {
+                if point.is_none() {
+                    continue;
+                }
+                let Some((group, mut remaining, before)) = *logical else {
+                    return false;
+                };
+                let (Some(&start), Some(&end)) = (row_prefix.get(group), row_prefix.get(group + 1))
+                else {
+                    return false;
+                };
+                let mut mapped = None;
+                for row in start..end {
+                    let len = self.lines[row].len();
+                    if remaining < len || row + 1 == end {
+                        mapped = Some(SelectionAnchorCoordinate {
+                            row: self.phys_to_stable_row_index(row),
+                            column: if before {
+                                remaining.checked_sub(1)
+                            } else {
+                                Some(remaining)
+                            },
+                        });
+                        break;
+                    }
+                    remaining -= len;
+                }
+                let Some(mapped) = mapped else {
+                    return false;
+                };
+                *point = Some(mapped);
+            }
+            true
+        });
 
         // Prune unused trailing blanks before allowing scrollback to grow,
         // but retain the cursor's row even when it is an empty hard newline.
@@ -6395,11 +6623,13 @@ impl Screen {
         self.last_viewport_first_reflow_us = 0;
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
+        let mut selection_anchors = self.take_selection_anchors_for_resize(seqno);
 
         if physical_rows == self.physical_rows
             && physical_cols == self.physical_cols
             && size.dpi == self.dpi
         {
+            self.finish_selection_anchor_resize(selection_anchors, seqno);
             return cursor;
         }
         log::debug!(
@@ -6514,6 +6744,7 @@ impl Screen {
                         cursor_phys,
                         seqno,
                         verified_wraps,
+                        &mut selection_anchors,
                     )
                 } else {
                     // Keep resize responsive for large scrollback histories
@@ -6619,6 +6850,7 @@ impl Screen {
 
         self.physical_rows = physical_rows;
         self.physical_cols = physical_cols;
+        self.finish_selection_anchor_resize(selection_anchors, seqno);
         self.retain_last_good_frame(seqno, LastGoodFrameTransition::ResizeCommit);
         CursorPosition {
             x: cursor_x,
@@ -8063,6 +8295,158 @@ pub(crate) mod tests {
 
     fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    fn anchor_point(column: usize, row: StableRowIndex) -> Option<SelectionAnchorCoordinate> {
+        Some(SelectionAnchorCoordinate {
+            column: Some(column),
+            row,
+        })
+    }
+
+    #[test]
+    fn selection_anchor_projects_actual_wide_rows_and_repeated_widths() {
+        let mut screen = test_screen(1, 12, 96);
+        screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
+        let points = [anchor_point(0, 0), anchor_point(3, 0), anchor_point(7, 0)];
+        let token = screen.capture_selection_anchor(1, points).unwrap();
+        let after_last = screen
+            .capture_selection_anchor(1, [anchor_point(8, 0); 3])
+            .unwrap();
+        let mut cursor = test_cursor(8, 0, 1);
+        for (seqno, cols) in [(2, 2), (3, 5), (4, 12)] {
+            cursor = screen.resize(test_size(1, cols, 96), cursor, seqno, false);
+            let mapped = screen.resolve_selection_anchor(&token, seqno).unwrap();
+            assert_eq!(
+                screen.resolve_selection_anchor(&after_last, seqno),
+                Some([anchor_point(cursor.x, screen.visible_row_to_stable_row(cursor.y)); 3])
+            );
+            for (point, text) in [
+                (mapped[0].unwrap(), "A"),
+                (mapped[1].unwrap(), "B"),
+                (mapped[2].unwrap(), "F"),
+            ] {
+                let row = screen.stable_row_to_phys(point.row).unwrap();
+                assert_eq!(
+                    screen.lines[row]
+                        .get_cell(point.column.unwrap())
+                        .unwrap()
+                        .str(),
+                    text
+                );
+            }
+            if cols == 2 {
+                assert_eq!(
+                    mapped[1],
+                    anchor_point(0, 2),
+                    "division by width would select the wide glyph instead of B"
+                );
+            }
+        }
+        assert!(
+            screen.resolve_selection_anchor(&token, 5).is_none(),
+            "later content is not the committed source"
+        );
+    }
+
+    #[test]
+    fn selection_anchor_preserves_before_zero_boundary_across_soft_wrap() {
+        let mut screen = test_screen(1, 12, 96);
+        screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
+        let cursor = screen.resize(test_size(1, 2, 96), test_cursor(8, 0, 1), 2, false);
+        let before_b = [
+            anchor_point(0, 0),
+            anchor_point(0, 0),
+            Some(SelectionAnchorCoordinate {
+                row: 2,
+                column: None,
+            }),
+        ];
+        let token = screen.capture_selection_anchor(2, before_b).unwrap();
+        screen.resize(test_size(1, 12, 96), cursor, 3, false);
+        assert_eq!(
+            screen.resolve_selection_anchor(&token, 3),
+            Some([anchor_point(0, 0), anchor_point(0, 0), anchor_point(2, 0)])
+        );
+    }
+
+    #[test]
+    fn selection_anchor_preparation_does_not_publish_or_overwrite_live_points() {
+        let mut screen = test_screen(1, 12, 96);
+        screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
+        let first = screen
+            .capture_selection_anchor(1, [anchor_point(0, 0); 3])
+            .unwrap();
+        let cursor = test_cursor(8, 0, 1);
+        let size = test_size(1, 2, 96);
+        let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+        assert!(prepared.snapshot.selection_anchors.0.is_empty());
+        assert!(prepared.prepare(|| false));
+        assert_eq!(
+            screen.resolve_selection_anchor(&first, 1),
+            Some([anchor_point(0, 0); 3])
+        );
+        let latest = screen
+            .capture_selection_anchor(1, [anchor_point(3, 0); 3])
+            .unwrap();
+        screen.resize_with_prepared_reflow(size, cursor, 2, false, Some(&mut prepared));
+        assert!(prepared.was_applied());
+        assert_eq!(
+            screen.resolve_selection_anchor(&latest, 2),
+            Some([anchor_point(0, 2); 3])
+        );
+        assert_eq!(
+            screen.resolve_selection_anchor(&first, 2),
+            Some([anchor_point(0, 0); 3])
+        );
+    }
+
+    #[test]
+    fn selection_anchor_rejects_changed_source_pruned_rows_and_replaced_screen() {
+        let mut screen = test_screen(3, 12, 96);
+        screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
+        let points = [anchor_point(0, 0); 3];
+        let old = screen.capture_selection_anchor(1, points).unwrap();
+        assert!(screen.clone().resolve_selection_anchor(&old, 1).is_none());
+        assert!(screen
+            .capture_selection_anchor(SequenceNo::MAX, points)
+            .is_none());
+        assert!(screen
+            .capture_selection_anchor(1, [anchor_point(0, -1); 3])
+            .is_none());
+        screen.resize(test_size(3, 5, 96), test_cursor(8, 0, 2), 3, false);
+        assert!(
+            screen.resolve_selection_anchor(&old, 3).is_none(),
+            "a source change between capture and resize must reject transport"
+        );
+
+        let pruned = screen
+            .capture_selection_anchor(3, [anchor_point(0, 2); 3])
+            .unwrap();
+        screen.resize(test_size(1, 12, 96), test_cursor(3, 1, 3), 4, false);
+        assert!(screen.resolve_selection_anchor(&pruned, 4).is_none());
+        let current = screen.capture_selection_anchor(4, points).unwrap();
+        screen.invalidate_coordinate_witnesses();
+        assert!(screen.resolve_selection_anchor(&current, 4).is_none());
+        screen.publish_selection_anchor_sequence(4, 5);
+        assert!(
+            screen.resolve_selection_anchor(&current, 5).is_none(),
+            "publication cannot bless a replaced coordinate domain"
+        );
+    }
+
+    #[test]
+    fn selection_anchor_registry_is_bounded_and_reclaims_retired_tokens() {
+        let mut screen = test_screen(1, 12, 96);
+        let points = [anchor_point(0, 0); 3];
+        let tokens: Vec<_> = (0..16)
+            .map(|_| screen.capture_selection_anchor(1, points).unwrap())
+            .collect();
+        assert!(screen.capture_selection_anchor(1, points).is_none());
+        assert_eq!(screen.selection_anchors.0.len(), 16);
+        drop(tokens);
+        assert!(screen.capture_selection_anchor(1, points).is_some());
+        assert_eq!(screen.selection_anchors.0.len(), 1);
     }
 
     #[test]
@@ -12183,7 +12567,8 @@ pub(crate) mod tests {
             Line::new(1),
             Line::new(1),
         ]);
-        let cursor = screen.rewrap_lines(3, 1, 0, 0, 2, None);
+        let cursor =
+            screen.rewrap_lines(3, 1, 0, 0, 2, None, &mut SelectionAnchorRegistry::default());
         assert_eq!(cursor, (0, 0));
         assert_eq!(screen.lines.len(), 4, "two trailing blank rows were pruned");
         assert!(
@@ -13326,7 +13711,15 @@ pub(crate) mod tests {
             )));
             let mut cursor = (logical_x, 0);
             for cols in [3, 8, 1, 12, 5, 3] {
-                cursor = screen.rewrap_lines(cols, 1, cursor.0, cursor.1, 2, None);
+                cursor = screen.rewrap_lines(
+                    cols,
+                    1,
+                    cursor.0,
+                    cursor.1,
+                    2,
+                    None,
+                    &mut SelectionAnchorRegistry::default(),
+                );
                 screen.physical_cols = cols;
                 assert_eq!(
                     screen.logical_cursor_from_physical(cursor.0, cursor.1),
@@ -13355,7 +13748,15 @@ pub(crate) mod tests {
         // The cursor is on the third grapheme, not its trailing spacer.
         let mut cursor = (4, 0);
         for cols in [3, 5, 2, 4, 6, 3] {
-            cursor = screen.rewrap_lines(cols, 1, cursor.0, cursor.1, 2, None);
+            cursor = screen.rewrap_lines(
+                cols,
+                1,
+                cursor.0,
+                cursor.1,
+                2,
+                None,
+                &mut SelectionAnchorRegistry::default(),
+            );
             screen.physical_cols = cols;
             assert_eq!(
                 screen.logical_cursor_from_physical(cursor.0, cursor.1),

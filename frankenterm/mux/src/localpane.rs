@@ -2741,6 +2741,7 @@ impl LocalPane {
         commit_id: u64,
         phase: &'static str,
     ) -> bool {
+        let resize_sequence = term.current_seqno();
         if Self::refresh_line_layout_floor(observation, term).is_none() {
             // Busy storage/observation and saturated sequences are not proof of
             // an unchanged source. Keep the resize but publish no false receipt.
@@ -2750,6 +2751,11 @@ impl LocalPane {
             )
             .increment(1);
             return false;
+        }
+        if phase == "primary" {
+            let published_sequence = term.current_seqno();
+            term.screen_mut()
+                .publish_selection_anchor_sequence(resize_sequence, published_sequence);
         }
         let size = term.get_size();
         log::trace!(
@@ -2777,6 +2783,47 @@ impl LocalPane {
             term.current_seqno(),
             terminal_get_dimensions(&mut term),
         ))
+    }
+
+    /// The source/layout checks and coordinate registration share one
+    /// nonblocking terminal acquisition. A busy capture never fabricates a
+    /// token from independently sampled metadata.
+    pub fn capture_selection_anchor(
+        &self,
+        expected_floor: SequenceNo,
+        expected_sequence: SequenceNo,
+        expected_dimensions: RenderableDimensions,
+        points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
+    ) -> Option<frankenterm_term::screen::ScreenSelectionAnchor> {
+        let mut term = self.terminal.try_lock()?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
+        if floor != expected_floor
+            || term.current_seqno() != expected_sequence
+            || terminal_get_dimensions(&mut term) != expected_dimensions
+        {
+            return None;
+        }
+        term.screen_mut()
+            .capture_selection_anchor(expected_sequence, points)
+    }
+
+    /// Outer None means unavailable; an inner None is an invalid token at the
+    /// returned exact source. The GUI must distinguish those outcomes so a
+    /// contended terminal does not destroy an otherwise valid drag.
+    pub fn selection_anchor_snapshot(
+        &self,
+        anchor: &frankenterm_term::screen::ScreenSelectionAnchor,
+    ) -> Option<(
+        SequenceNo,
+        SequenceNo,
+        RenderableDimensions,
+        Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
+    )> {
+        let mut term = self.terminal.try_lock()?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
+        let sequence = term.current_seqno();
+        let points = term.screen().resolve_selection_anchor(anchor, sequence);
+        Some((floor, sequence, terminal_get_dimensions(&mut term), points))
     }
 
     pub fn try_capture_render_frame(
@@ -5177,6 +5224,102 @@ mod tests {
             );
             assert_eq!(normalized.lines.len(), dimensions.viewport_rows);
         }
+    }
+
+    #[test]
+    fn native_selection_anchor_follows_resize_publication_and_rejects_screen_switch() {
+        use frankenterm_term::screen::SelectionAnchorCoordinate;
+        let pane = LocalPane::new(
+            704,
+            test_terminal(term_size(80, 24)),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x74; 16],
+            "native-selection-anchor".to_string(),
+        );
+        pane.terminal.lock().advance_bytes("A界BCDEF".as_bytes());
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        let points = [Some(SelectionAnchorCoordinate {
+            row: 0,
+            column: Some(3),
+        }); 3];
+        assert!(pane
+            .capture_selection_anchor(floor, sequence.saturating_add(1), dimensions, points)
+            .is_none());
+        let mut wrong_dimensions = dimensions;
+        wrong_dimensions.cols += 1;
+        assert!(pane
+            .capture_selection_anchor(floor, sequence, wrong_dimensions, points)
+            .is_none());
+        let token = pane
+            .capture_selection_anchor(floor, sequence, dimensions, points)
+            .unwrap();
+        {
+            let _busy = pane.terminal.lock();
+            assert!(pane
+                .capture_selection_anchor(floor, sequence, dimensions, points)
+                .is_none());
+            assert!(pane.selection_anchor_snapshot(&token).is_none());
+        }
+        assert_eq!(
+            pane.selection_anchor_snapshot(&token).unwrap().3,
+            Some(points)
+        );
+        for (cols, pixel_width, dpi) in [(2, 2, 96), (80, 80, 96), (80, 160, 96), (80, 160, 120)] {
+            let mut size = term_size(cols, 24);
+            size.pixel_width = pixel_width;
+            size.dpi = dpi;
+            let mut pty_size = pty_size(cols as u16, 24);
+            pty_size.pixel_width = pixel_width as u16;
+            let pending = {
+                let mut queue = pane.resize_queue.lock();
+                queue.enqueue(size, pty_size, Instant::now());
+                queue.dequeue_for_worker().unwrap()
+            };
+            let metrics = LocalPane::apply_resize_sync(
+                pane.pane_id,
+                &pane.terminal,
+                &pane.line_layout_observation,
+                #[cfg(feature = "disruptor-pane-io")]
+                &pane.action_ring,
+                &pane.pty,
+                &pane.resize_queue,
+                pending.seq,
+                size,
+                pty_size,
+                ResizeCancellationToken::new(pending.seq),
+            )
+            .unwrap();
+            assert!(!metrics.cancelled && !metrics.noop);
+            let frame = pane
+                .try_capture_render_frame(None, 0, 0, &[], false)
+                .unwrap();
+            let (floor, sequence, dimensions, points) =
+                pane.selection_anchor_snapshot(&token).unwrap();
+            assert_eq!(floor, frame.layout_floor);
+            assert_eq!(sequence, frame.source_sequence);
+            assert_eq!(dimensions, frame.dimensions);
+            assert_eq!(
+                points,
+                Some(
+                    [Some(SelectionAnchorCoordinate {
+                        row: if cols == 2 { 2 } else { 0 },
+                        column: Some(if cols == 2 { 0 } else { 3 }),
+                    }); 3]
+                )
+            );
+        }
+        pane.terminal
+            .lock()
+            .advance_bytes(b"\x1b[?1049h\x1b[?1049l");
+        assert!(
+            pane.selection_anchor_snapshot(&token).unwrap().3.is_none(),
+            "an alternate-screen ABA cannot reauthorize the original token"
+        );
     }
 
     #[test]

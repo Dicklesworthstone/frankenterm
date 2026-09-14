@@ -589,7 +589,23 @@ impl crate::TermWindow {
 
         let (selrange, rectangular) = {
             let sel = self.selection(pos.pane.pane_id());
-            (sel.range.clone(), sel.rectangular)
+            // Copy/search overlays deliberately keep the delegate pane's
+            // selection authority, matching the dirty-invalidation exemption.
+            let delegate_overlay = pos
+                .pane
+                .downcast_ref::<crate::overlay::copy::CopyOverlay>()
+                .is_some()
+                || pos
+                    .pane
+                    .downcast_ref::<crate::overlay::quickselect::QuickSelectOverlay>()
+                    .is_some();
+            (
+                (delegate_overlay
+                    || sel.is_authorized_by(selection_frame_before.map(|frame| frame.authority)))
+                .then_some(sel.range)
+                .flatten(),
+                sel.rectangular,
+            )
         };
 
         let start = Instant::now();

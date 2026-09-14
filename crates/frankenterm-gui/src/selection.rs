@@ -21,7 +21,7 @@ pub struct SmartSelectionPick {
     pub text: String,
 }
 
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct Selection {
     /// Remembers the starting coordinate of the selection prior to
     /// dragging.
@@ -34,6 +34,15 @@ pub struct Selection {
     pub authority: Option<SelectionAuthority>,
     /// Whether the selection is rectangular
     pub rectangular: bool,
+    native_anchor: Option<NativeSelectionAnchor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NativeSelectionAnchor {
+    token: wezterm_term::screen::ScreenSelectionAnchor,
+    authority: Option<SelectionAuthority>,
+    origin: Option<SelectionCoordinate>,
+    range: Option<SelectionRange>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -49,13 +58,20 @@ impl SelectionAuthority {
         pane: &dyn Pane,
         frame: &mux::localpane::NativeRenderFrame,
     ) -> Option<Self> {
-        if frame.layout_floor == SequenceNo::MAX {
+        Self::from_native_snapshot(pane, frame.layout_floor, frame.dimensions)
+    }
+
+    pub(crate) fn from_native_snapshot(
+        pane: &dyn Pane,
+        floor: SequenceNo,
+        dims: mux::renderable::RenderableDimensions,
+    ) -> Option<Self> {
+        if floor == SequenceNo::MAX {
             return None;
         }
-        let dims = frame.dimensions;
         Some(Self {
             source: pane as *const dyn Pane as *const () as usize,
-            sequence: frame.layout_floor,
+            sequence: floor,
             geometry: (
                 dims.cols,
                 dims.viewport_rows,
@@ -69,6 +85,10 @@ impl SelectionAuthority {
 
     pub fn capture(pane: &dyn Pane) -> Option<Self> {
         Self::capture_source(pane).map(|(authority, _, _)| authority)
+    }
+
+    pub(crate) fn layout_floor(self) -> SequenceNo {
+        self.sequence
     }
 
     pub fn capture_source(
@@ -217,6 +237,85 @@ impl SelectionFrameState {
 pub use config::keyassignment::SelectionMode;
 
 impl Selection {
+    pub(crate) fn native_points(
+        &self,
+    ) -> [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3] {
+        [
+            self.origin,
+            self.range.map(|r| r.start),
+            self.range.map(|r| r.end),
+        ]
+        .map(|point| {
+            point.map(|point| wezterm_term::screen::SelectionAnchorCoordinate {
+                row: point.y,
+                column: match point.x {
+                    SelectionX::Cell(column) => Some(column),
+                    SelectionX::BeforeZero => None,
+                },
+            })
+        })
+    }
+
+    pub(crate) fn remember_native_anchor(
+        &mut self,
+        token: wezterm_term::screen::ScreenSelectionAnchor,
+    ) {
+        self.native_anchor = Some(NativeSelectionAnchor {
+            token,
+            authority: self.authority,
+            origin: self.origin,
+            range: self.range,
+        });
+    }
+
+    pub(crate) fn native_anchor(&self) -> Option<&wezterm_term::screen::ScreenSelectionAnchor> {
+        self.native_anchor
+            .as_ref()
+            .filter(|anchor| {
+                !self.rectangular
+                    && anchor.authority == self.authority
+                    && anchor.origin == self.origin
+                    && anchor.range == self.range
+            })
+            .map(|anchor| &anchor.token)
+    }
+
+    /// Only the exact selection that captured a native token can consume its
+    /// remap. Later mouse motion must not be overwritten by prepared work.
+    pub(crate) fn rebase_native_anchor(
+        &mut self,
+        points: [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+        authority: SelectionAuthority,
+        source_sequence: SequenceNo,
+    ) -> bool {
+        let Some(token) = self.native_anchor().cloned() else {
+            return false;
+        };
+        if source_sequence == SequenceNo::MAX
+            || self.origin.is_some() != points[0].is_some()
+            || self.range.is_some() != points[1].is_some()
+            || self.range.is_some() != points[2].is_some()
+        {
+            return false;
+        }
+        let [origin, start, end] = points.map(|point| {
+            point.map(|point| SelectionCoordinate {
+                x: point
+                    .column
+                    .map_or(SelectionX::BeforeZero, SelectionX::Cell),
+                y: point.row,
+            })
+        });
+        self.origin = origin;
+        self.range = start
+            .zip(end)
+            .map(|(start, end)| SelectionRange { start, end });
+        self.authority = Some(authority);
+        self.seqno = source_sequence;
+        self.remember_native_anchor(token);
+        true
+    }
+
     /// An unavailable nonblocking snapshot is not evidence of a new layout.
     /// Keep the anchor until it can be checked; reads still require authority.
     pub fn is_invalidated_by(&self, current: Option<SelectionAuthority>) -> bool {
@@ -230,9 +329,11 @@ impl Selection {
         self.range = None;
         self.origin = None;
         self.authority = None;
+        self.native_anchor = None;
     }
 
     pub fn begin(&mut self, origin: SelectionCoordinate) {
+        self.native_anchor = None;
         self.range = None;
         self.origin = Some(origin);
     }
@@ -729,6 +830,211 @@ impl SelectionRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct NativeAnchorTestConfig;
+
+    impl wezterm_term::TerminalConfiguration for NativeAnchorTestConfig {
+        fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+            Default::default()
+        }
+    }
+
+    fn native_anchor_fixture() -> (wezterm_term::Terminal, Selection, String) {
+        let size = wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            dpi: 96,
+            pixel_width: 640,
+            pixel_height: 384,
+        };
+        let mut term = wezterm_term::Terminal::new(
+            size,
+            std::sync::Arc::new(NativeAnchorTestConfig),
+            "selection-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let text = "café e\u{301} 中文 🙂 end café e\u{301} 中文 🙂 end café e\u{301} 中文 🙂 end TAIL\nsecond line Ω";
+        term.advance_bytes(
+            format!(
+                "FT_HELD_READY\r\nanchor row\r\n{}",
+                text.replace('\n', "\r\n")
+            )
+            .as_bytes(),
+        );
+        let mut selection = Selection::default();
+        selection.begin(SelectionCoordinate::x_y(0, 2));
+        selection.range = Some(
+            SelectionRange::start(SelectionCoordinate::x_y(0, 2))
+                .extend(SelectionCoordinate::x_y(12, 3)),
+        );
+        selection.seqno = term.current_seqno();
+        selection.authority = Some(SelectionAuthority {
+            source: 1,
+            sequence: selection.seqno,
+            geometry: (80, 24, 96, 640, 384),
+            alternate: false,
+        });
+        let token = term
+            .screen_mut()
+            .capture_selection_anchor(selection.seqno, selection.native_points())
+            .unwrap();
+        selection.remember_native_anchor(token);
+        (term, selection, text.to_string())
+    }
+
+    fn live_native_selection_text(term: &wezterm_term::Terminal, selection: &Selection) -> String {
+        let lines: Vec<_> = term
+            .screen()
+            .all_lines()
+            .into_iter()
+            .enumerate()
+            .map(|(row, line)| mux::pane::LogicalLine {
+                first_row: term.screen().phys_to_stable_row_index(row),
+                logical: line.clone(),
+                physical_lines: vec![line],
+            })
+            .collect();
+        crate::termwindow::selected_text_from_logical_lines(&lines, selection.range.unwrap(), false)
+    }
+
+    #[test]
+    fn native_selection_transports_real_parser_endpoints_and_reads_live_unicode_text() {
+        let (mut term, mut selection, expected) = native_anchor_fixture();
+        assert_eq!(live_native_selection_text(&term, &selection), expected);
+        let token = selection.native_anchor().unwrap().clone();
+        for cols in [40, 36, 44, 80] {
+            let mut size = term.get_size();
+            size.cols = cols;
+            size.pixel_width = cols * 8;
+            term.resize(size);
+            let sequence = term.current_seqno();
+            let points = term
+                .screen()
+                .resolve_selection_anchor(&token, sequence)
+                .unwrap();
+            let authority = SelectionAuthority {
+                sequence,
+                geometry: (cols, 24, 96, cols * 8, 384),
+                ..selection.authority.unwrap()
+            };
+            assert!(
+                selection.is_invalidated_by(Some(authority)),
+                "unmapped physical points must remain unauthorized"
+            );
+            assert!(selection.rebase_native_anchor(points, authority, sequence));
+            assert!(selection.is_authorized_by(Some(authority)));
+            assert_eq!(live_native_selection_text(&term, &selection), expected);
+            if cols == 40 {
+                assert_eq!(
+                    selection.range.unwrap().end,
+                    SelectionCoordinate::x_y(12, 4)
+                );
+                assert_eq!(term.cursor_pos().x, 13);
+                assert_eq!(term.cursor_pos().y, 4);
+            }
+        }
+        // Reads still use the current cells: changing selected content cannot
+        // be hidden by a frozen text facade, nor authorize a later transport.
+        term.advance_bytes(b"\x1b[3;1HZ");
+        assert!(live_native_selection_text(&term, &selection).starts_with("Zafé"));
+        let mut size = term.get_size();
+        size.cols = 40;
+        term.resize(size);
+        assert!(
+            term.screen()
+                .resolve_selection_anchor(&token, term.current_seqno())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_selection_transport_rejects_replaced_gesture_and_cleared_selection() {
+        let (mut term, mut selection, _) = native_anchor_fixture();
+        let token = selection.native_anchor().unwrap().clone();
+        let mut size = term.get_size();
+        size.cols = 40;
+        term.resize(size);
+        let sequence = term.current_seqno();
+        let points = term
+            .screen()
+            .resolve_selection_anchor(&token, sequence)
+            .unwrap();
+        let authority = SelectionAuthority {
+            sequence,
+            geometry: (40, 24, 96, 640, 384),
+            ..selection.authority.unwrap()
+        };
+        selection.range.as_mut().unwrap().end.x = SelectionX::Cell(5);
+        let new_range = selection.range;
+        assert!(!selection.rebase_native_anchor(points, authority, sequence));
+        assert_eq!(selection.range, new_range);
+        selection.clear();
+        assert!(!selection.rebase_native_anchor(points, authority, sequence));
+        assert!(selection.origin.is_none() && selection.range.is_none());
+    }
+
+    #[test]
+    fn native_selection_before_zero_preserves_text_for_both_endpoint_roles_and_directions() {
+        for starts_before in [false, true] {
+            for reverse in [false, true] {
+                let (mut term, mut selection, _) = native_anchor_fixture();
+                let mut size = term.get_size();
+                size.cols = 40;
+                term.resize(size);
+                let before = SelectionCoordinate {
+                    x: SelectionX::BeforeZero,
+                    y: 3,
+                };
+                let (start, end) = if starts_before {
+                    (before, SelectionCoordinate::x_y(12, 4))
+                } else {
+                    (SelectionCoordinate::x_y(0, 2), before)
+                };
+                selection.origin = Some(SelectionCoordinate::x_y(0, 2));
+                selection.range = Some(if reverse {
+                    SelectionRange {
+                        start: end,
+                        end: start,
+                    }
+                } else {
+                    SelectionRange { start, end }
+                });
+                selection.seqno = term.current_seqno();
+                selection.authority = Some(SelectionAuthority {
+                    sequence: selection.seqno,
+                    geometry: (40, 24, 96, 640, 384),
+                    ..selection.authority.unwrap()
+                });
+                let token = term
+                    .screen_mut()
+                    .capture_selection_anchor(selection.seqno, selection.native_points())
+                    .unwrap();
+                selection.remember_native_anchor(token.clone());
+                let expected = live_native_selection_text(&term, &selection);
+                assert!(!expected.is_empty());
+                size.cols = 80;
+                term.resize(size);
+                let sequence = term.current_seqno();
+                let points = term
+                    .screen()
+                    .resolve_selection_anchor(&token, sequence)
+                    .unwrap();
+                let authority = SelectionAuthority {
+                    sequence,
+                    geometry: (80, 24, 96, 640, 384),
+                    ..selection.authority.unwrap()
+                };
+                assert!(selection.rebase_native_anchor(points, authority, sequence));
+                assert_eq!(
+                    live_native_selection_text(&term, &selection),
+                    expected,
+                    "starts_before={starts_before}, reverse={reverse}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn selection_coordinates_cannot_be_reauthorized_by_drag_damage_sequence() {
