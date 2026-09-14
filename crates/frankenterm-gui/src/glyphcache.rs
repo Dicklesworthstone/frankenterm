@@ -30,7 +30,9 @@ use termwiz::image::{
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
 use wezterm_term::Underline;
-use window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
+#[cfg(test)]
+use window::bitmaps::atlas::OutOfTextureSpace;
+use window::bitmaps::atlas::{Atlas, Sprite};
 use window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
 use window::color::SrgbaPixel;
 use window::{Point, Rect};
@@ -248,6 +250,8 @@ pub struct GlyphWarmupStats {
     pub attempted_requests: usize,
     pub warmed_glyphs: usize,
     pub cache_hits: usize,
+    /// Requests left to normal painting because their font is not loaded yet.
+    pub deferred_requests: usize,
     pub failed_glyphs: usize,
     pub budget_exhausted: bool,
     pub elapsed: Duration,
@@ -259,6 +263,7 @@ impl GlyphWarmupStats {
             attempted_requests: 0,
             warmed_glyphs: 0,
             cache_hits: 0,
+            deferred_requests: 0,
             failed_glyphs: 0,
             budget_exhausted: false,
             elapsed: Duration::ZERO,
@@ -1741,7 +1746,7 @@ impl GlyphCache {
             return stats;
         }
 
-        let style = TextStyle::default();
+        let style = self.fonts.config().font.clone();
         let font = match self.fonts.resolve_font(&style) {
             Ok(font) => font,
             Err(err) => {
@@ -1760,14 +1765,21 @@ impl GlyphCache {
 
             stats.attempted_requests = stats.attempted_requests.saturating_add(1);
 
-            let glyphs = match font.blocking_shape(
+            // Optional GUI-thread work must never wait for font discovery.
+            // The ordinary paint path owns missing-glyph resolution and its
+            // completion repaint; warmup must not consume that notification.
+            let glyphs = match font.shape_if_available(
                 &request.text,
                 None,
                 Direction::LeftToRight,
                 None,
                 None,
             ) {
-                Ok(glyphs) => glyphs,
+                Ok(Some(glyphs)) => glyphs,
+                Ok(None) => {
+                    stats.deferred_requests = stats.deferred_requests.saturating_add(1);
+                    continue;
+                }
                 Err(err) => {
                     log::debug!(
                         "glyph warm-up shaping failed for {:?} ({:?}): {err:#}",
@@ -1875,6 +1887,9 @@ impl GlyphCache {
         num_cells: u8,
         subpixel_bin: SubpixelBin,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
+        // Propagate raster failures through the existing failed-frame retry.
+        // Even an uncached blank would become durable authority in the shape
+        // and row caches above us, preventing a later real glyph retry.
         self.cached_glyph_for_subpixel_bin_with_status(
             info,
             style,
@@ -1915,41 +1930,7 @@ impl GlyphCache {
         }
         metrics::histogram!("glyph_cache.glyph_cache.miss.rate").record(1.);
 
-        let glyph = match self.load_glyph(info, font, followed_by_space, num_cells) {
-            Ok(g) => g,
-            Err(err) => {
-                if err
-                    .root_cause()
-                    .downcast_ref::<OutOfTextureSpace>()
-                    .is_some()
-                {
-                    // Ensure that we propagate this signal to expand
-                    // our available teexture space
-                    return Err(err);
-                }
-
-                // But otherwise: don't allow glyph loading errors to propagate,
-                // as that will result in incomplete window painting.
-                // Log the error and substitute instead.
-                log::error!(
-                    "load_glyph failed; using blank instead. Error: {:#}. {:?} {:?}",
-                    err,
-                    info,
-                    style
-                );
-                Rc::new(CachedGlyph {
-                    brightness_adjust: 1.0,
-                    has_color: false,
-                    texture: None,
-                    x_advance: PixelLength::zero(),
-                    x_offset: PixelLength::zero(),
-                    y_offset: PixelLength::zero(),
-                    bearing_x: PixelLength::zero(),
-                    bearing_y: PixelLength::zero(),
-                    scale: 1.0,
-                })
-            }
-        };
+        let glyph = self.load_glyph(info, font, followed_by_space, num_cells)?;
         self.glyph_cache.insert(key.to_owned(), Rc::clone(&glyph));
         Ok((glyph, false))
     }
@@ -3481,6 +3462,133 @@ mod tests {
     }
 
     #[test]
+    fn failed_glyph_load_never_becomes_a_cached_warmup_or_paint_success() {
+        let (mut cache, metrics) = test_glyph_cache_with_atlas_size(1024);
+        let style = cache.fonts.config().font.clone();
+        let font = cache.fonts.resolve_font(&style).unwrap();
+        let glyphs = font
+            .blocking_shape("A", None, Direction::LeftToRight, None, None)
+            .unwrap();
+        let mut unavailable = glyphs[0].clone();
+        unavailable.font_idx = font.clone_handles().len();
+        assert!(
+            font.rasterize_glyph(unavailable.glyph_pos, unavailable.font_idx)
+                .is_err()
+        );
+        for _ in 0..2 {
+            assert!(
+                cache
+                    .cached_glyph_for_subpixel_bin_with_status(
+                        &unavailable,
+                        &style,
+                        false,
+                        &font,
+                        &metrics,
+                        unavailable.num_cells,
+                        SubpixelBin::Quarter0,
+                    )
+                    .is_err()
+            );
+            assert!(cache.glyph_cache.is_empty());
+        }
+        for _ in 0..2 {
+            assert!(
+                cache
+                    .cached_glyph(
+                        &unavailable,
+                        &style,
+                        false,
+                        &font,
+                        &metrics,
+                        unavailable.num_cells,
+                    )
+                    .is_err(),
+                "painting must not cache a blank in its shape/row caches"
+            );
+        }
+        assert!(cache.glyph_cache.is_empty());
+        let valid = cache
+            .cached_glyph(
+                &glyphs[0],
+                &style,
+                false,
+                &font,
+                &metrics,
+                glyphs[0].num_cells,
+            )
+            .unwrap();
+        assert!(valid.texture.is_some());
+        let retried = cache
+            .cached_glyph(
+                &glyphs[0],
+                &style,
+                false,
+                &font,
+                &metrics,
+                glyphs[0].num_cells,
+            )
+            .unwrap();
+        assert!(Rc::ptr_eq(&valid, &retried));
+        assert_eq!(cache.glyph_cache.len(), 1);
+    }
+
+    #[test]
+    fn warmup_defers_missing_fonts_and_populates_paint_keys() {
+        let (mut cache, metrics) = test_glyph_cache_with_atlas_size(1024);
+        let style = cache.fonts.config().font.clone();
+        let font = cache.fonts.resolve_font(&style).unwrap();
+        let missing = ["\u{460}", "\u{13000}", "\u{1fae8}", "\u{10ffff}"]
+            .into_iter()
+            .find(|text| {
+                font.shape_if_available(text, None, Direction::LeftToRight, None, None)
+                    .unwrap()
+                    .is_none()
+            })
+            .expect("fixture must include a glyph outside the configured chain");
+        let before = font.clone_handles();
+        let plan = [
+            GlyphWarmupRequest::new(missing, GlyphWarmupPriority::NerdFontIcon),
+            GlyphWarmupRequest::new("A", GlyphWarmupPriority::AsciiPrintable),
+        ];
+        let first = cache.warm_up_glyphs(&plan, &metrics, Duration::from_secs(5));
+        assert_eq!(first.attempted_requests, 2);
+        assert_eq!(first.deferred_requests, 1);
+        assert_eq!(first.failed_glyphs, 0);
+        assert_eq!(first.warmed_glyphs, 1);
+        assert_eq!(font.clone_handles(), before);
+        assert_eq!(
+            cache.glyph_cache.len(),
+            1,
+            "no placeholder glyph was cached"
+        );
+        let glyphs = font
+            .blocking_shape("A", None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert_eq!(glyphs.len(), 1);
+        let (_, hit) = cache
+            .cached_glyph_for_subpixel_bin_with_status(
+                &glyphs[0],
+                &style,
+                false,
+                &font,
+                &metrics,
+                glyphs[0].num_cells,
+                SubpixelBin::Quarter0,
+            )
+            .unwrap();
+        assert!(
+            hit,
+            "normal painting must reuse the configured font's warm glyph"
+        );
+        let second = cache.warm_up_glyphs(&plan, &metrics, Duration::from_secs(5));
+        assert_eq!(second.deferred_requests, 1);
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.warmed_glyphs, 0);
+        assert_eq!(second.failed_glyphs, 0);
+        assert_eq!(font.clone_handles(), before);
+    }
+
+    #[test]
     fn warmup_caches_ascii_glyph_and_second_pass_hits_cache() {
         let (mut cache, metrics) = test_glyph_cache();
         let plan = vec![GlyphWarmupRequest::new(
@@ -3651,7 +3759,7 @@ mod tests {
 
             for text in ["ab ", "e\u{301}", "ffi"] {
                 let (mut cache, metrics) = fixture();
-                let style = TextStyle::default();
+                let style = cache.fonts.config().font.clone();
                 let font = cache.fonts.resolve_font(&style).unwrap();
                 let infos = font
                     .blocking_shape(text, None, Direction::LeftToRight, None, None)
@@ -3780,7 +3888,7 @@ mod tests {
             // The public stats start after default-plan allocation, so retain
             // the complete call cost separately, including the zero-budget case.
             let warmup_wall_ns = warmup_started.elapsed().as_nanos();
-            let style = TextStyle::default();
+            let style = cache.fonts.config().font.clone();
             let shape_started = Instant::now();
             let font = cache.fonts.resolve_font(&style).unwrap();
             let runs: Vec<_> = DEMANDS
@@ -4091,6 +4199,7 @@ mod tests {
                                 "warmup_requests": sample.warmup.attempted_requests,
                                 "warmed_glyphs": sample.warmup.warmed_glyphs,
                                 "warmup_hits": sample.warmup.cache_hits,
+                                "warmup_deferred_requests": sample.warmup.deferred_requests,
                                 "warmup_failures": sample.warmup.failed_glyphs,
                                 "budget_exhausted": sample.warmup.budget_exhausted,
                                 "demand_hits": sample.demand_hits,
