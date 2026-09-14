@@ -190,7 +190,7 @@ impl CacheRebuild {
 /// The exact cache mutation used by TermWindow, separately callable without a
 /// native window so tests exercise real LFU entries and generation fences.
 struct RenderCaches<'a> {
-    shapes: &'a RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
+    shapes: &'a RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>,
     lines: &'a RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
     quads: &'a RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 }
@@ -1016,7 +1016,7 @@ mod tests {
     use window::bitmaps::{BitmapImage, Image, TextureRect};
 
     struct CacheFixture {
-        shapes: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
+        shapes: RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>,
         lines: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
         quads: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
         shape_generation: usize,
@@ -1066,11 +1066,11 @@ mod tests {
         fn seed(&self) {
             self.shapes.borrow_mut().put(
                 shape_key(),
-                Ok(Rc::new(CachedShape {
+                Rc::new(CachedShape {
                     infos: Vec::new(),
                     glyphs: RefCell::new(Rc::new(Vec::new())),
                     generation: Cell::new(self.shape_generation),
-                })),
+                }),
             );
             self.lines.borrow_mut().put(
                 line_shape_key(self.shape_generation, 0),
@@ -1357,7 +1357,7 @@ mod tests {
         fixture
             .shapes
             .borrow_mut()
-            .put(shape_key(), Ok(Rc::clone(&shape)));
+            .put(shape_key(), Rc::clone(&shape));
         fixture
             .lines
             .borrow_mut()
@@ -1371,15 +1371,7 @@ mod tests {
             (41, 30)
         );
         assert_eq!(fixture.survivors(), (true, false, false));
-        let cached = Rc::clone(
-            fixture
-                .shapes
-                .borrow_mut()
-                .get(&shape_key())
-                .unwrap()
-                .as_ref()
-                .unwrap(),
-        );
+        let cached = Rc::clone(fixture.shapes.borrow_mut().get(&shape_key()).unwrap());
         assert!(Rc::ptr_eq(&cached, &shape), "no HarfBuzz cache rebuild");
         assert_eq!(cached.generation.get(), fixture.shape_generation);
         assert!(
