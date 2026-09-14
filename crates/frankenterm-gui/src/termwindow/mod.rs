@@ -5657,8 +5657,16 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             let now = Instant::now();
             if self.last_status_call <= now {
+                // Zero disables periodic status updates. In particular, the
+                // recurring notification must not become a zero-delay loop.
+                if self.config.status_update_interval == 0 {
+                    return;
+                }
                 let interval = Duration::from_millis(self.config.status_update_interval);
-                let target = now + interval;
+                let Some(target) = now.checked_add(interval) else {
+                    log::error!("status_update_interval exceeds the native timer range");
+                    return;
+                };
                 let window = window.clone();
                 match promise::spawn::try_reserve_main_thread(
                     promise::spawn::MainThreadServiceClass::Render,
