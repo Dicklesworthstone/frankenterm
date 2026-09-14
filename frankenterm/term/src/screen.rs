@@ -9003,7 +9003,12 @@ pub(crate) mod tests {
     #[cfg(feature = "use_serde")]
     #[test]
     fn cold_seam_reuses_retained_fragments_across_width_changes_without_payload_reads() {
-        for (cold_text, head_text, tail_text) in [("abcd", "efg", "h"), ("界ab", "cde", "f")] {
+        for (cold_text, head_text, tail_text) in [
+            ("abcd", "efg", "h"),
+            ("界ab", "cde", "f"),
+            ("e\u{301}abc", "def", "g"),
+            ("🚀ab", "cde", "f"),
+        ] {
             let sink = Arc::new(TestColdScrollbackSink::default());
             let mut cold = Line::from_text(cold_text, &CellAttributes::blank(), 1, None);
             cold.set_last_cell_was_wrapped(true, 1);
@@ -9035,7 +9040,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(screen.install_cold_seam_reflow(&mut initial, 2).unwrap());
             let mut cursor = test_cursor(0, 1, 2);
-            for (index, cols) in [2, 3, 2, 3].into_iter().enumerate() {
+            for (index, cols) in [2, 3, 2, 3].iter().copied().enumerate() {
                 let seqno = 3 + index * 2;
                 cursor = screen.resize(test_size(2, cols, 96), cursor, seqno, false);
                 let capture = screen.capture_cold_seam_reflow().unwrap().unwrap();
@@ -9229,12 +9234,17 @@ pub(crate) mod tests {
         assert!(screen.install_cold_seam_reflow(&mut plan, 2).unwrap());
         assert_eq!(screen.lines[0].as_str(), "gh");
         sink.rows.lock().unwrap().remove(&0);
+        sink.batch_reads.store(0, Ordering::Relaxed);
         let mut after_trim = screen
             .capture_cold_seam_reflow()
             .unwrap()
             .expect("partial trim must not reuse old alignment")
             .hydrate(|| false)
             .unwrap();
+        assert!(
+            sink.batch_reads.load(Ordering::Relaxed) > 0,
+            "partial retention must use the storage path, not the old seam boundary"
+        );
         assert!(screen.install_cold_seam_reflow(&mut after_trim, 3).unwrap());
         assert_eq!(screen.lines[0].as_str(), "h");
         assert_eq!(screen.stable_row_index_offset, 2);
