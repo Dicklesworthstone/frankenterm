@@ -610,6 +610,8 @@ impl EvidenceStream for VecEvidenceStream {
 
 /// Canonical proof-gate decisions consumed by Robot Mode.
 ///
+/// The wire representation is an object with a string `kind`, never a
+/// positional sequence or an externally tagged object inside `kind`.
 /// Deserialization validates every recognized numeric field, even if the
 /// selected variant does not use it. Unknown extension fields remain ignored.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -670,23 +672,13 @@ impl<'de> Deserialize<'de> for FiniteGateNumber {
 
 impl<'de> Deserialize<'de> for GateDecision {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum Kind {
-            Accept,
-            Reject,
-            Continue,
-            RegimeShift,
-            LowConfidence,
-        }
-
         // Read typed numbers directly from the wire. Internally tagged enum
         // buffering turns arbitrary_precision JSON floats into private maps;
         // accepting those maps via Number would also accept forged objects.
         // An ordinary struct avoids both the buffering and that ambiguity.
         #[derive(Deserialize)]
         struct Fields {
-            kind: Kind,
+            kind: String,
             reason: String,
             #[serde(default)]
             confidence: Option<FiniteGateNumber>,
@@ -696,31 +688,63 @@ impl<'de> Deserialize<'de> for GateDecision {
             divergence: Option<FiniteGateNumber>,
         }
 
-        let fields = Fields::deserialize(deserializer)?;
-        Ok(match fields.kind {
-            Kind::Accept => Self::Accept {
+        struct FieldsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = Fields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a gate decision object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+
+        // Derived structs also admit positional sequences. Force a map before
+        // delegating each value to its typed deserializer so variant fields
+        // can never be silently reinterpreted by their position.
+        let fields = deserializer.deserialize_map(FieldsVisitor)?;
+        Ok(match fields.kind.as_str() {
+            "accept" => Self::Accept {
                 reason: fields.reason,
                 confidence: fields.confidence.map(|value| value.0),
             },
-            Kind::Reject => Self::Reject {
+            "reject" => Self::Reject {
                 reason: fields.reason,
                 confidence: fields.confidence.map(|value| value.0),
             },
-            Kind::Continue => Self::Continue {
+            "continue" => Self::Continue {
                 reason: fields.reason,
                 needed_samples: fields.needed_samples,
             },
-            Kind::RegimeShift => Self::RegimeShift {
+            "regime_shift" => Self::RegimeShift {
                 reason: fields.reason,
                 divergence: fields
                     .divergence
                     .ok_or_else(|| <D::Error as serde::de::Error>::missing_field("divergence"))?
                     .0,
             },
-            Kind::LowConfidence => Self::LowConfidence {
+            "low_confidence" => Self::LowConfidence {
                 reason: fields.reason,
                 confidence: fields.confidence.map(|value| value.0),
             },
+            unknown => {
+                return Err(<D::Error as serde::de::Error>::unknown_variant(
+                    unknown,
+                    &[
+                        "accept",
+                        "reject",
+                        "continue",
+                        "regime_shift",
+                        "low_confidence",
+                    ],
+                ));
+            }
         })
     }
 }
@@ -894,6 +918,37 @@ mod tests {
             r#"{"kind":"regime_shift","reason":"test","divergence":null}"#,
         ] {
             assert!(serde_json::from_str::<GateDecision>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn gate_decision_requires_object_and_string_kind() {
+        for json in [
+            r#"{"kind":{"accept":null},"reason":"test"}"#,
+            r#"{"kind":{"continue":null},"reason":"test","needed_samples":5}"#,
+            r#"{"kind":["accept"],"reason":"test"}"#,
+            r#"{"kind":0,"reason":"test"}"#,
+            r#"{"kind":true,"reason":"test"}"#,
+            r#"{"kind":null,"reason":"test"}"#,
+            r#"["accept","test",0.52]"#,
+            r#"["reject","test",0.25]"#,
+            r#"["continue","test",5]"#,
+            r#"["regime_shift","test",0.52]"#,
+            r#"["low_confidence","test",0.125]"#,
+            // The union of variant fields must not introduce its own
+            // positional encoding either.
+            r#"["continue","test",null,5,null]"#,
+            r#"["regime_shift","test",null,null,0.52]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GateDecision>(json).is_err(),
+                "accepted a noncanonical wire shape: {json}"
+            );
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert!(
+                serde_json::from_value::<GateDecision>(value).is_err(),
+                "accepted a noncanonical value shape: {json}"
+            );
         }
     }
 
