@@ -76,6 +76,7 @@ expected = {
     },
     "release-interactive": {
         "inherits": "release",
+        "opt-level": 3,
         "panic": "unwind",
     },
     "release-abort-probe": {

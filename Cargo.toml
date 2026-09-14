@@ -627,7 +627,7 @@ frankenterm-core-replay = { path = "crates/frankenterm-core-replay", default-fea
 frankenterm-alloc = { path = "crates/frankenterm-alloc" }
 
 [profile.release]
-opt-level = "z"     # Conventional safe release default; explicit shipped profile inherits this
+opt-level = "z"     # Conventional safe release default; interactive artifacts override this
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "unwind"    # Fail-safe default: audited catches remain executable
@@ -637,10 +637,12 @@ debug = false       # No debuginfo in release artifacts
 [profile.release-interactive]
 # Every shipped process (`ft`, GUI, mux-server) uses this profile. In-process
 # callback/task containment is a correctness contract, so these artifacts MUST
-# unwind. Keep all other release knobs inherited until
-# ft-interactive-systems-performance-4tenz.13 records a target-class
-# latency/size A/B; this P0 changes panic semantics, not a perf arm.
+# unwind. Select throughput-oriented code generation for the native candidate;
+# keep LTO, codegen units, stripping and debug settings identical to release.
+# ft-interactive-systems-performance-4tenz.13 must retain native latency/size
+# evidence before this candidate is qualified for installation or publication.
 inherits = "release"
+opt-level = 3
 panic = "unwind"
 
 [profile.release-abort-probe]
@@ -653,9 +655,9 @@ panic = "abort"
 [profile.release-perf]
 # Round-4 gauntlet profile for algorithm A/B experiments. Measurements apply
 # only to the measured profile: speed-oriented codegen here does not establish
-# the performance of shipped release-interactive artifacts, which inherit "z".
-# Installation and release qualification must also measure the actual shipped
-# profile; its size-oriented codegen is part of the behavior being qualified.
+# the performance of release-interactive artifacts, which retain fat LTO and
+# stripped symbols. Installation and release qualification must also measure
+# the actual interactive profile.
 # Use thin LTO (not the shipped fat `lto=true`) so each A/B arm rebuilds fast on RCH workers;
 # relative before/after deltas stay valid because both arms use the identical profile.
 # Frame pointers (set via RUSTFLAGS="-C force-frame-pointers=yes" in the bench-AB driver) keep

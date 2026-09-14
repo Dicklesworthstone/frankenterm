@@ -335,6 +335,7 @@ strip = true
 
 [profile.release-interactive]
 inherits = "release"
+opt-level = 3
 panic = "unwind"
 
 [profile.release-abort-probe] # never package
