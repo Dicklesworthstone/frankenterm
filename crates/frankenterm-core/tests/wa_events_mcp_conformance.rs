@@ -1302,15 +1302,22 @@ fn mcp_conformance_idless_long_poll_is_rejected_before_dispatch() {
             "claim": true
         }),
     );
-    let notification: FrameworkJsonRpcMessage = serde_json::from_value(json!({
+    let notification_json = json!({
         "jsonrpc": "2.0",
         "method": "tools/call",
         "params": {
             "name": "wa.await_event",
             "arguments": notification_arguments
         }
-    }))
-    .expect("construct id-less tools/call notification");
+    })
+    .to_string();
+    // The pinned request decoder borrows raw JSON params. Deserialize that
+    // request from its wire bytes directly: from_value on the untagged message
+    // enum loses the raw representation before request decoding can inspect it.
+    let notification = FrameworkJsonRpcMessage::Request(
+        serde_json::from_str(&notification_json)
+            .expect("construct id-less tools/call notification"),
+    );
 
     harness
         .client
@@ -1419,11 +1426,13 @@ fn assert_await_event_claim_send_failure_releases_lease(
         .join()
         .expect("join failed-response server")
         .expect_err("failed response transport must report its error");
-    assert!(
-        server_error
-            .to_string()
-            .contains("injected MCP response write failure"),
-        "unexpected server transport failure: {server_error}"
+    // The returning server API reports fixed stage/kind metadata and must not
+    // expose peer-controlled I/O text from the failed transport.
+    assert_eq!(i32::from(server_error.code), -32603);
+    assert_eq!(server_error.message, "Server transport failed during send");
+    assert_eq!(
+        server_error.data,
+        Some(json!({"stage": "send", "kind": "io"}))
     );
 
     let events = load_fixture_events(&db_path);
@@ -1869,26 +1878,31 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
 
 #[test]
 fn mcp_conformance_delayed_storage_initialization_rejects_then_recovers() {
-    let harness = new_harness();
+    let workspace = tempfile::tempdir().expect("create delayed-open workspace");
+    let db_path = workspace.path().join("mcp-delayed-open.sqlite3");
+    let pane_id = i64::try_from(FIXTURE_PANE_ID).expect("fixture pane id fits i64");
     // The shared service opens storage before admitting requests. While that
     // initialization is blocked, admission must fail closed rather than start
     // a no-cursor observation window that it cannot service.
-    seed_many_events(&harness, Vec::new());
+    seed_many_events_at(&db_path, Vec::new());
     let lock_connection =
-        rusqlite::Connection::open(&harness.db_path).expect("open delayed-open lock connection");
+        rusqlite::Connection::open(&db_path).expect("open delayed-open lock connection");
     lock_connection
         .busy_timeout(std::time::Duration::from_secs(5))
         .expect("configure delayed-open busy timeout");
+    // An up-to-date WAL database can reopen without taking a write lock.
+    // Make its normal startup trigger repair require a write before taking
+    // the lock, so initialization genuinely cannot finish until COMMIT.
+    lock_connection
+        .execute_batch("DROP TRIGGER output_segments_ai")
+        .expect("require startup to repair the fixture FTS trigger");
     lock_connection
         .execute_batch("BEGIN IMMEDIATE")
         .expect("hold delayed-open writer lock");
 
-    let db_path = harness.db_path.clone();
-    let mut await_client = spawn_client(Some(db_path));
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let mut await_client = spawn_client(Some(db_path.clone()));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let waiter = std::thread::spawn(move || {
-        started_tx.send(()).expect("signal delayed-open call start");
         let result = await_client
             .call_tool(
                 "wa.await_event",
@@ -1904,43 +1918,56 @@ fn mcp_conformance_delayed_storage_initialization_rejects_then_recovers() {
         let _ = result_tx.send(result);
         await_client
     });
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("delayed-open request thread started");
-    let rejected = result_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("unready admission must not wait for storage initialization")
-        .expect("unready admission returns a typed envelope");
-    assert_common_envelope_fields(&rejected, false);
-    assert_eq!(rejected["error_code"], "FT-MCP-0003");
-    assert!(rejected["data"].is_null());
-    let mut await_client = waiter.join().expect("join rejected waiter");
+    // Capture admission while initialization is necessarily unready, then
+    // release the lock before asserting or joining even when admission fails.
+    let rejection_result = result_rx.recv_timeout(std::time::Duration::from_secs(2));
 
     let detected_during_open_ms = epoch_ms_i64();
-    lock_connection
-        .execute(
-            "INSERT INTO events (
+    let insert_result = lock_connection.execute(
+        "INSERT INTO events (
                 id, pane_id, rule_id, agent_type, event_type, severity, confidence,
                 matched_text, detected_at, dedupe_key
              ) SELECT max_event_id + 1, ?1, ?2, 'codex', 'usage_limit', 'warning',
                       0.5, ?3, ?4, ?5
                FROM event_retention_state WHERE singleton = 1",
-            rusqlite::params![
-                i64::try_from(FIXTURE_PANE_ID).expect("fixture pane id fits i64"),
-                "rule.open_window",
-                "detected while storage open was blocked",
-                detected_during_open_ms,
-                "wa-events-delayed-open"
-            ],
-        )
-        .expect("insert event during delayed storage open");
-    lock_connection
-        .execute_batch("COMMIT")
-        .expect("release delayed-open writer lock");
+        rusqlite::params![
+            pane_id,
+            "rule.open_window",
+            "detected while storage open was blocked",
+            detected_during_open_ms,
+            "wa-events-delayed-open"
+        ],
+    );
+    let commit_result = lock_connection.execute_batch("COMMIT");
+    // Closing also rolls back if COMMIT failed, so no assertion below can
+    // strand the service behind this connection's writer lock.
+    drop(lock_connection);
+    let mut await_client = waiter.join().expect("join rejected waiter");
+    insert_result.expect("insert event during delayed storage open");
+    commit_result.expect("release delayed-open writer lock");
+    let rejected = rejection_result
+        .expect("unready admission must not wait for storage initialization")
+        .expect("unready admission returns a typed envelope");
+    assert_common_envelope_fields(&rejected, false);
+    assert_eq!(rejected["error_code"], "FT-MCP-0003");
+    assert!(rejected["data"].is_null());
 
     wait_for_await_service_ready(&mut await_client);
+    let inspection_connection =
+        rusqlite::Connection::open(&db_path).expect("open repaired-trigger inspection connection");
+    let repaired_trigger_count: i64 = inspection_connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'output_segments_ai'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect repaired fixture FTS trigger");
+    assert_eq!(
+        repaired_trigger_count, 1,
+        "startup must complete its blocked write"
+    );
     let arguments = with_current_event_cursor_token(
-        &harness.db_path,
+        &db_path,
         json!({
             "any": ["rule:rule.open_window"], "pane": FIXTURE_PANE_ID,
             "cursor": 0, "timeout_secs": 2, "poll_interval_ms": 10
