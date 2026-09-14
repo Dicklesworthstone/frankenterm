@@ -894,22 +894,22 @@
       "classification_summary": {
         "cleanup": 3,
         "cosmetic": 15,
-        "docs": 1,
+        "docs": 2,
         "feat": 54,
         "fix": 101,
-        "other": 48,
+        "other": 50,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 53
+        "test": 54
       },
-      "fork_side_commit_count": 288,
+      "fork_side_commit_count": 292,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T12:13:10-04:00",
-        "sha": "653cd63f8d0382601c9cb331a88d199fe06b11ca",
-        "subject": "fix(term): preserve cold row counts after fallback reflow"
+        "classification": "other",
+        "committed_at": "2026-09-14T17:16:15-04:00",
+        "sha": "ec6f3d3801f7ff8a2afdf82d4b43625ffccb9d58",
+        "subject": "perf(term): expose opt-in cold seam and geometry stage timings"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2587,
-  "generated_at": "2026-09-14T19:34:31.766032Z",
+  "fork_side_commit_total": 2591,
+  "generated_at": "2026-09-14T21:16:58.366607Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
