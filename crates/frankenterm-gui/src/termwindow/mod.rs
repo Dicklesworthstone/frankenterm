@@ -1261,7 +1261,7 @@ pub struct TermWindow {
     /// here to call `begin_gesture` once per gesture rather than
     /// per `resize` event.
     quad_buffer_in_resize_gesture: bool,
-    shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
+    shape_cache: RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
     /// Unforgeable identity for this window's line-state LFU. Numeric entry

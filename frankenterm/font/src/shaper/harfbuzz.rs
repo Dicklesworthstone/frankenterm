@@ -4,7 +4,6 @@ use crate::units::*;
 use crate::{ftwrap, hbwrap as harfbuzz};
 use anyhow::{anyhow, Context};
 use config::ConfigHandle;
-use finl_unicode::grapheme_clusters::Graphemes;
 use log::error;
 use ordered_float::NotNan;
 use std::cell::{RefCell, RefMut};
@@ -101,33 +100,6 @@ pub struct HarfbuzzShaper {
     metrics: RefCell<HashMap<MetricsKey, FontMetrics>>,
     features: Vec<harfbuzz::hb_feature_t>,
     lang: harfbuzz::hb_language_t,
-}
-
-/// Make a string holding a set of unicode replacement
-/// characters equal to the number of graphemes in the
-/// original string.  That isn't perfect, but it should
-/// be good enough to indicate that something isn't right.
-fn make_question_string(s: &str) -> String {
-    let len = Graphemes::new(s).count();
-    let mut result = String::new();
-    let c = if !is_question_string(s) {
-        std::char::REPLACEMENT_CHARACTER
-    } else {
-        '?'
-    };
-    for _ in 0..len {
-        result.push(c);
-    }
-    result
-}
-
-fn is_question_string(s: &str) -> bool {
-    for c in s.chars() {
-        if c != std::char::REPLACEMENT_CHARACTER {
-            return false;
-        }
-    }
-    true
 }
 
 impl HarfbuzzShaper {
@@ -233,7 +205,23 @@ impl HarfbuzzShaper {
         direction: Direction,
         range: Range<usize>,
         presentation_width: Option<&PresentationWidth>,
+        mut no_more_fallbacks: bool,
     ) -> anyhow::Result<Vec<GlyphInfo>> {
+        // HarfBuzz takes signed 32-bit lengths and absolute UTF-8 byte offsets.
+        // Validate before entering its FFI, including recursive fallback runs.
+        anyhow::ensure!(
+            s.len() <= i32::MAX as usize,
+            "shaping text exceeds HarfBuzz length limit"
+        );
+        let shaping_text = s
+            .get(range.clone())
+            .ok_or_else(|| anyhow!("invalid UTF-8 shaping range"))?;
+        anyhow::ensure!(!self.handles.is_empty(), "shaping requires a base font");
+        if no_more_fallbacks {
+            // A failed fallback face also needs asynchronous discovery, but
+            // must not retry that broken face while producing the placeholder.
+            no_glyphs.extend(shaping_text.chars());
+        }
         let mut buf = harfbuzz::Buffer::new()?;
         // We deliberately omit setting the script and leave it to harfbuzz
         // to infer from the buffer contents so that it can correctly
@@ -255,10 +243,9 @@ impl HarfbuzzShaper {
 
         let shaped_any;
 
-        // We set this to true when we've run out of fallback fonts to try.
-        // In that case, we accept shaper info with codepoint==0 and
-        // will use the notdef glyph from the base font.
-        let mut no_more_fallbacks = false;
+        // When no_more_fallbacks is true, accept codepoint==0 and use the
+        // base font's notdef glyph. The error-recovery path uses the same
+        // behavior without discarding the original text's clusters or widths.
 
         loop {
             match self.load_fallback(font_idx).context("load_fallback")? {
@@ -330,9 +317,9 @@ impl HarfbuzzShaper {
                     break;
                 }
                 None => {
-                    for c in s.chars() {
-                        no_glyphs.push(c);
-                    }
+                    // The rest of s supplies shaping context, not missing
+                    // glyph requests. Recursive runs retain absolute offsets.
+                    no_glyphs.extend(shaping_text.chars());
 
                     if presentation.is_some() {
                         log::debug!(
@@ -360,6 +347,7 @@ impl HarfbuzzShaper {
                             direction,
                             range,
                             presentation_width,
+                            false,
                         );
                     }
 
@@ -375,8 +363,8 @@ impl HarfbuzzShaper {
         let hb_infos = buf.glyph_infos();
         let positions = buf.glyph_positions();
 
-        let mut cluster = Vec::with_capacity(s.len());
-        let mut info_clusters: Vec<Vec<Info>> = Vec::with_capacity(s.len());
+        let mut cluster = Vec::with_capacity(shaping_text.len());
+        let mut info_clusters: Vec<Vec<Info>> = Vec::with_capacity(shaping_text.len());
 
         // At this point we have a list of glyphs from the shaper.
         // Each glyph will have `info.cluster` set to the byte index
@@ -526,6 +514,7 @@ impl HarfbuzzShaper {
                 */
 
                 let first_info = &infos[0];
+                let fallback_range = first_info.cluster..first_info.cluster + first_info.len;
 
                 let mut shape = match self.do_shape(
                     font_idx + 1,
@@ -536,22 +525,29 @@ impl HarfbuzzShaper {
                     presentation,
                     direction,
                     // NOT! substr; this is a coalesced sequence of incomplete clusters!
-                    first_info.cluster..first_info.cluster + first_info.len,
+                    fallback_range.clone(),
                     presentation_width,
+                    false,
                 ) {
                     Ok(shape) => Ok(shape),
                     Err(e) => {
                         error!("{:?} for {:?}", e, substr);
+                        // Keep the complete original run and paragraph context.
+                        // A short replacement string cannot use these absolute
+                        // offsets or the original PresentationWidth mapping.
+                        // Accept base-font notdef output just as exhaustion does,
+                        // rather than recursively reopening the failed fallback.
                         self.do_shape(
                             0,
-                            &make_question_string(substr),
+                            s,
                             font_size,
                             dpi,
                             no_glyphs,
-                            presentation,
+                            None,
                             direction,
-                            sub_range,
+                            fallback_range,
                             presentation_width,
+                            true,
                         )
                     }
                 }?;
@@ -633,6 +629,7 @@ impl FontShaper for HarfbuzzShaper {
             direction,
             range,
             presentation_width,
+            false,
         );
         metrics::histogram!("shape.harfbuzz").record(start.elapsed());
         /*
@@ -912,6 +909,246 @@ mod test {
     }
 
     #[test]
+    fn missing_fallback_requests_exclude_available_paragraph_context() {
+        let handles = fallback_test_handles(1);
+        let config = config::configuration();
+        let text = "ffi é Ѡ e\u{301}";
+        let missing_start = text.find('Ѡ').unwrap();
+        let missing_range = missing_start..missing_start + 'Ѡ'.len_utf8();
+        for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+            for range in [None, Some(missing_range.clone())] {
+                let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+                let mut missing = Vec::new();
+                let glyphs = shaper
+                    .shape(text, 10., 72, &mut missing, None, direction, range, None)
+                    .unwrap();
+                assert_eq!(missing, vec!['Ѡ']);
+                assert!(glyphs.iter().any(|glyph| glyph.glyph_pos == 0));
+                assert!(glyphs
+                    .iter()
+                    .any(|glyph| glyph.cluster as usize == missing_start));
+            }
+        }
+
+        // The narrowed request still finds real bundled fallback faces and
+        // turns the unresolved run into actual glyphs, without changing the
+        // already available surrounding text.
+        let db = FontDatabase::with_built_in().unwrap();
+        let fallback_handles = db.locate_fallback_for_codepoints(&['Ѡ']).unwrap();
+        assert!(!fallback_handles.is_empty());
+        let mut resolved_handles = handles.clone();
+        resolved_handles.extend(fallback_handles);
+        for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+            let original = HarfbuzzShaper::new(&config, &handles).unwrap();
+            let resolved = HarfbuzzShaper::new(&config, &resolved_handles).unwrap();
+            let before = original
+                .shape(text, 10., 72, &mut Vec::new(), None, direction, None, None)
+                .unwrap();
+            let mut missing = Vec::new();
+            let after = resolved
+                .shape(text, 10., 72, &mut missing, None, direction, None, None)
+                .unwrap();
+            assert!(missing.is_empty());
+            assert!(after.iter().all(|glyph| glyph.glyph_pos != 0));
+            assert!(after.iter().any(|glyph| glyph.font_idx > 0));
+            let available = |glyphs: Vec<GlyphInfo>| {
+                glyphs
+                    .into_iter()
+                    .filter(|glyph| glyph.cluster as usize != missing_start)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(available(before), available(after));
+        }
+    }
+
+    #[test]
+    fn exhausted_run_retains_combining_marks_and_variation_selectors() {
+        let handles = fallback_test_handles(1);
+        let config = config::configuration();
+        let text = "éffiѠ\u{301}\u{fe0f}W";
+        let start = text.find('Ѡ').unwrap();
+        let end = text.find('W').unwrap();
+        for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+            let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+            let mut missing = Vec::new();
+            let glyphs = shaper
+                .do_shape(
+                    handles.len(),
+                    text,
+                    10.,
+                    72,
+                    &mut missing,
+                    None,
+                    direction,
+                    start..end,
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(missing, vec!['Ѡ', '\u{301}', '\u{fe0f}']);
+            assert!(!glyphs.is_empty());
+            assert!(glyphs.iter().all(|glyph| {
+                (start..end).contains(&(glyph.cluster as usize))
+                    && text.is_char_boundary(glyph.cluster as usize)
+            }));
+        }
+    }
+
+    #[test]
+    fn failed_fallback_preserves_original_clusters_context_and_cell_widths() {
+        use crate::locator::FontDataSource;
+        use termwiz::cell::CellAttributes;
+        use termwiz::surface::{Line, SEQ_ZERO};
+
+        let handles = fallback_test_handles(1);
+        let mut broken_handles = handles.clone();
+        let mut broken = handles[0].clone();
+        broken.handle.source = FontDataSource::BuiltIn {
+            name: "invalid-fallback-font",
+            data: b"This is not a font",
+        };
+        broken_handles.push(broken);
+        let config = config::configuration();
+        // The missing run begins past the end of a one-character replacement
+        // string and contains both a wide character and a combining mark.
+        let text = "éffiѠ一\u{301}W";
+        let start = text.find('Ѡ').unwrap();
+        let end = text.find('W').unwrap();
+        let line = Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None);
+        let clusters = line.cluster(None);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].text, text);
+        let width = PresentationWidth::with_cluster(&clusters[0]);
+
+        for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+            for range in [0..text.len(), start..end] {
+                for presentation_width in [None, Some(&width)] {
+                    let expected = HarfbuzzShaper::new(&config, &handles).unwrap();
+                    let actual = HarfbuzzShaper::new(&config, &broken_handles).unwrap();
+                    assert!(
+                        actual.load_fallback(1).is_err(),
+                        "exercise real font-load failure"
+                    );
+                    let mut expected_missing = Vec::new();
+                    let expected_glyphs = expected
+                        .shape(
+                            text,
+                            10.,
+                            72,
+                            &mut expected_missing,
+                            None,
+                            direction,
+                            Some(range.clone()),
+                            presentation_width,
+                        )
+                        .unwrap();
+                    let mut actual_missing = Vec::new();
+                    let actual_glyphs = actual
+                        .shape(
+                            text,
+                            10.,
+                            72,
+                            &mut actual_missing,
+                            None,
+                            direction,
+                            Some(range.clone()),
+                            presentation_width,
+                        )
+                        .unwrap();
+                    assert_eq!(actual_missing, expected_missing);
+                    assert_eq!(actual_glyphs, expected_glyphs);
+                    assert!(actual_glyphs.iter().any(|glyph| glyph.glyph_pos == 0));
+                    assert!(actual_glyphs.iter().all(|glyph| {
+                        range.contains(&(glyph.cluster as usize))
+                            && text.is_char_boundary(glyph.cluster as usize)
+                            && glyph.font_idx == 0
+                    }));
+                    assert_eq!(
+                        actual_glyphs
+                            .iter()
+                            .map(|glyph| usize::from(glyph.num_cells))
+                            .sum::<usize>(),
+                        unicode_column_width(&text[range.clone()], None)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_shaping_ranges_fail_before_font_loading_without_mutating_requests() {
+        let handles = fallback_test_handles(1);
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let text = "éѠ";
+        for (start, end) in [(1, 2), (0, 3), (5, 5), (3, 2), (0, usize::MAX)] {
+            let mut missing = vec!['!'];
+            assert!(shaper
+                .shape(
+                    text,
+                    10.,
+                    72,
+                    &mut missing,
+                    None,
+                    Direction::LeftToRight,
+                    Some(start..end),
+                    None,
+                )
+                .is_err());
+            assert_eq!(missing, vec!['!']);
+            assert!(shaper.fonts.iter().all(|font| font.borrow().is_none()));
+        }
+        let mut missing = Vec::new();
+        assert!(shaper
+            .shape(
+                text,
+                10.,
+                72,
+                &mut missing,
+                None,
+                Direction::LeftToRight,
+                Some(2..2),
+                None,
+            )
+            .unwrap()
+            .is_empty());
+        let glyphs = shaper
+            .shape(
+                "ffi",
+                10.,
+                72,
+                &mut missing,
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.iter().all(|glyph| glyph.glyph_pos != 0));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn empty_font_chain_returns_an_error_instead_of_retrying_forever() {
+        let shaper = HarfbuzzShaper::new(&config::configuration(), &[]).unwrap();
+        let mut missing = Vec::new();
+        assert!(shaper
+            .shape(
+                "a",
+                10.,
+                72,
+                &mut missing,
+                None,
+                Direction::LeftToRight,
+                None,
+                None
+            )
+            .is_err());
+        assert!(missing.is_empty());
+    }
+
+    #[test]
     fn independent_font_lifetimes_preserve_shared_harfbuzz_functions_across_threads() {
         const THREADS: usize = 8;
         let barrier = std::sync::Barrier::new(THREADS);
@@ -1125,6 +1362,7 @@ mod test {
                 Direction::LeftToRight,
                 0..3,
                 None,
+                false,
             )
             .unwrap();
         assert!(!promoted_output.is_empty());

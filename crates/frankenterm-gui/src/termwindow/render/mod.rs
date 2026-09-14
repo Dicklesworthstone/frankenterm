@@ -19,10 +19,12 @@ use config::{
 use euclid::num::Zero;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_font::units::{IntPixelLength, PixelLength};
-use frankenterm_font::{ClearShapeCache, GlyphInfo, LoadedFont};
+use frankenterm_font::{GlyphInfo, LoadedFont};
+use lfucache::LfuCache;
 use mux::pane::{Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use ordered_float::NotNan;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -324,6 +326,26 @@ pub struct ClusterStyleCache<'a> {
     fg_color: LinearRgba,
     bg_color: LinearRgba,
     underline_color: LinearRgba,
+}
+
+/// Keep only complete successful resolutions. A failure must reach the bounded
+/// frame retry without becoming an LFU hit that prevents the shaper running again.
+fn resolve_cached_shape(
+    cache: &RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>,
+    key: BorrowedShapeCacheKey<'_>,
+    resolve: impl FnOnce() -> anyhow::Result<CachedShape>,
+) -> anyhow::Result<Rc<CachedShape>> {
+    if let Some(cached) = cache
+        .borrow_mut()
+        .get(&key as &dyn ShapeCacheKeyTrait)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    // No cache borrow may span shaping, fallback notification, or rasterization.
+    let cached = Rc::new(resolve()?);
+    cache.borrow_mut().put(key.to_owned(), Rc::clone(&cached));
+    Ok(cached)
 }
 
 impl crate::TermWindow {
@@ -949,57 +971,21 @@ impl crate::TermWindow {
             style,
             text: &cluster.text,
         };
-        let cached_shape = if paragraph_range.is_some() {
-            None
-        } else {
-            self.lookup_cached_shape(&key)
-        };
-        let glyph_info = match cached_shape {
-            Some(Ok(cached)) => {
-                if cached.generation.get() == self.shape_generation {
-                    // Sprites are valid for the current atlas generation: cheap hit.
-                    Rc::clone(&cached.glyphs.borrow())
-                } else {
-                    // The glyph atlas was rebuilt since this entry was shaped.
-                    // The cached HarfBuzz output (`cached.infos`) is
-                    // atlas-invariant, so re-resolve only the (cheap) glyph
-                    // sprites instead of re-running HarfBuzz. This is what
-                    // removes the per-rebuild full-screen re-shape storm that
-                    // drove the progressive render-loop CPU climb.
-                    let font = match font {
-                        Some(f) => Rc::clone(f),
-                        None => self.fonts.resolve_font(style)?,
-                    };
-                    let glyphs = self.glyph_infos_to_glyphs(
-                        style,
-                        &mut gl_state.glyph_cache.borrow_mut(),
-                        &cached.infos,
-                        &font,
-                        metrics,
-                    )?;
-                    let shaped = Rc::new(ShapedInfo::process(&cached.infos, &glyphs));
-                    *cached.glyphs.borrow_mut() = Rc::clone(&shaped);
-                    cached.generation.set(self.shape_generation);
-                    shaped
-                }
-            }
-            Some(Err(err)) => return Err(err),
-            None => {
-                let font = match font {
-                    Some(f) => Rc::clone(f),
-                    None => self.fonts.resolve_font(style)?,
-                };
-                let fallback_completion = self.fallback_font_completion();
+        let resolve = || -> anyhow::Result<CachedShape> {
+            let font = match font {
+                Some(f) => Rc::clone(f),
+                None => self.fonts.resolve_font(style)?,
+            };
+            let fallback_completion = self.fallback_font_completion();
 
-                let paragraph_byte_offset = paragraph_range.as_ref().map(|range| range.start);
-                let presentation_width = match paragraph_byte_offset {
-                    Some(offset) => {
-                        PresentationWidth::with_cluster_and_byte_offset(cluster, offset)
-                    }
-                    None => PresentationWidth::with_cluster(cluster),
-                };
+            let paragraph_byte_offset = paragraph_range.as_ref().map(|range| range.start);
+            let presentation_width = match paragraph_byte_offset {
+                Some(offset) => PresentationWidth::with_cluster_and_byte_offset(cluster, offset),
+                None => PresentationWidth::with_cluster(cluster),
+            };
 
-                match font.shape(
+            let mut info = font
+                .shape(
                     shape_text,
                     fallback_completion,
                     BlockKey::filter_out_synthetic,
@@ -1007,48 +993,51 @@ impl crate::TermWindow {
                     cluster.direction,
                     paragraph_range.clone(),
                     Some(&presentation_width),
-                ) {
-                    Ok(mut info) => {
-                        if let Some(offset) = paragraph_byte_offset {
-                            rebase_glyph_clusters(&mut info, offset)?;
-                        }
-                        let glyphs = self.glyph_infos_to_glyphs(
-                            &style,
-                            &mut gl_state.glyph_cache.borrow_mut(),
-                            &info,
-                            &font,
-                            metrics,
-                        )?;
-                        let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
-
-                        if paragraph_range.is_none() {
-                            // Cache the atlas-invariant HarfBuzz output (`info`)
-                            // alongside the resolved sprites + the generation tag
-                            // so a future atlas rebuild can re-resolve sprites
-                            // cheaply instead of re-shaping.
-                            self.shape_cache.borrow_mut().put(
-                                key.to_owned(),
-                                Ok(Rc::new(CachedShape {
-                                    infos: info,
-                                    glyphs: std::cell::RefCell::new(Rc::clone(&shaped)),
-                                    generation: std::cell::Cell::new(self.shape_generation),
-                                })),
-                            );
-                        }
-                        shaped
-                    }
-                    Err(err) => {
-                        if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
-                            return Err(err);
-                        }
-
-                        let res = anyhow!("shaper error: {}", err);
-                        if paragraph_range.is_none() {
-                            self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
-                        }
-                        return Err(res);
-                    }
-                }
+                )
+                .context("shaper error")?;
+            if let Some(offset) = paragraph_byte_offset {
+                rebase_glyph_clusters(&mut info, offset)?;
+            }
+            let glyphs = self.glyph_infos_to_glyphs(
+                style,
+                &mut gl_state.glyph_cache.borrow_mut(),
+                &info,
+                &font,
+                metrics,
+            )?;
+            let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
+            Ok(CachedShape {
+                infos: info,
+                glyphs: RefCell::new(shaped),
+                generation: std::cell::Cell::new(self.shape_generation),
+            })
+        };
+        let glyph_info = if paragraph_range.is_some() {
+            // Context-sensitive shapes never share this context-free cache;
+            // avoid allocating an Rc<CachedShape> for their uncached result.
+            resolve()?.glyphs.into_inner()
+        } else {
+            let cached = resolve_cached_shape(&self.shape_cache, key, resolve)?;
+            if cached.generation.get() == self.shape_generation {
+                Rc::clone(&cached.glyphs.borrow())
+            } else {
+                // Atlas rebuilds preserve HarfBuzz output; refresh only sprites.
+                // Publish the new generation only after every glyph resolves.
+                let font = match font {
+                    Some(f) => Rc::clone(f),
+                    None => self.fonts.resolve_font(style)?,
+                };
+                let glyphs = self.glyph_infos_to_glyphs(
+                    style,
+                    &mut gl_state.glyph_cache.borrow_mut(),
+                    &cached.infos,
+                    &font,
+                    metrics,
+                )?;
+                let shaped = Rc::new(ShapedInfo::process(&cached.infos, &glyphs));
+                *cached.glyphs.borrow_mut() = Rc::clone(&shaped);
+                cached.generation.set(self.shape_generation);
+                shaped
             }
         };
         metrics::histogram!("cached_cluster_shape").record(shape_resolve_start.elapsed());
@@ -1058,17 +1047,6 @@ impl crate::TermWindow {
             shape_resolve_start.elapsed()
         );
         Ok(glyph_info)
-    }
-
-    fn lookup_cached_shape(
-        &self,
-        key: &dyn ShapeCacheKeyTrait,
-    ) -> Option<anyhow::Result<Rc<CachedShape>>> {
-        match self.shape_cache.borrow_mut().get(key) {
-            Some(Ok(cached)) => Some(Ok(Rc::clone(cached))),
-            Some(Err(err)) => Some(Err(anyhow!("cached shaper error: {}", err))),
-            None => None,
-        }
     }
 
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
@@ -1245,7 +1223,7 @@ mod tests {
     use super::{
         CachedLineState, LineStateCacheOwner, canonical_image_texture_region,
         image_cache_padding_for_cell, image_padding_fits_cell, rebase_glyph_clusters,
-        resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
+        resolve_cached_shape, resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
         should_use_reverse_video_cursor, update_next_frame_time,
     };
     use config::{BoldBrightening, ConfigHandle, TextStyle};
@@ -1258,6 +1236,120 @@ mod tests {
     use wezterm_term::color::{ColorAttribute, ColorPalette};
     use wezterm_term::{CellAttributes, Intensity};
     use window::color::LinearRgba;
+
+    #[test]
+    fn shape_cache_retries_failed_resolution_and_keeps_successful_runs() {
+        use crate::glyphcache::GlyphCache;
+        use crate::shapecache::{
+            BorrowedShapeCacheKey, CachedShape, ShapeCacheKeyTrait, ShapedInfo,
+        };
+        use crate::utilsprites::RenderMetrics;
+        use frankenterm_font::{ClearShapeCache, FontConfiguration};
+        use lfucache::LfuCache;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        use wezterm_bidi::Direction;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 1024).unwrap();
+        let style = fonts.config().font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let cache = RefCell::new(LfuCache::new(
+            "test.shape_cache.hit.rate",
+            "test.shape_cache.miss.rate",
+            |_| 8,
+            &fonts.config(),
+        ));
+        let key = BorrowedShapeCacheKey {
+            style: &style,
+            text: "A",
+        };
+        let attempts = Cell::new(0);
+        let mut resolve = || -> anyhow::Result<CachedShape> {
+            assert!(
+                cache.try_borrow_mut().is_ok(),
+                "resolution cannot retain an LFU borrow"
+            );
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                // Explicit failure injection at the production resolution seam;
+                // subsequent resolution uses the real bundled shaper/rasterizer.
+                anyhow::bail!("transient shape-resolution test control");
+            }
+            let infos = font.blocking_shape("A", None, Direction::LeftToRight, None, None)?;
+            assert_eq!(infos.len(), 1);
+            assert_ne!(infos[0].glyph_pos, 0);
+            let glyph = glyph_cache.cached_glyph(
+                &infos[0],
+                &style,
+                false,
+                &font,
+                &metrics,
+                infos[0].num_cells,
+            )?;
+            assert!(
+                glyph.texture.is_some(),
+                "successful retry must produce real ink"
+            );
+            let shaped = ShapedInfo::process(&infos, &[glyph]);
+            Ok(CachedShape {
+                infos,
+                glyphs: RefCell::new(Rc::new(shaped)),
+                generation: Cell::new(7),
+            })
+        };
+        let failed = resolve_cached_shape(&cache, key, &mut resolve).unwrap_err();
+        assert!(
+            failed
+                .to_string()
+                .contains("transient shape-resolution test control")
+        );
+        assert!(cache.borrow().is_empty());
+
+        let success = resolve_cached_shape(&cache, key, &mut resolve).unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(cache.borrow().len(), 1);
+        let hit =
+            resolve_cached_shape(&cache, key, || panic!("cache hit must not resolve")).unwrap();
+        assert!(Rc::ptr_eq(&success, &hit));
+        assert_eq!(hit.generation.get(), 7);
+
+        let other = BorrowedShapeCacheKey {
+            style: &style,
+            text: "B",
+        };
+        let clear = resolve_cached_shape(&cache, other, || {
+            Err(anyhow::Error::new(ClearShapeCache {}).context("shaper error"))
+        })
+        .unwrap_err();
+        assert!(
+            clear
+                .root_cause()
+                .downcast_ref::<ClearShapeCache>()
+                .is_some()
+        );
+        assert!(
+            cache
+                .borrow_mut()
+                .get(&other as &dyn ShapeCacheKeyTrait)
+                .is_none()
+        );
+        assert_eq!(
+            cache.borrow().len(),
+            1,
+            "an unrelated failure must retain successful entries"
+        );
+
+        assert!(Rc::ptr_eq(
+            &success,
+            cache
+                .borrow_mut()
+                .get(&key as &dyn ShapeCacheKeyTrait)
+                .unwrap(),
+        ));
+    }
 
     fn glyph_with_cluster(cluster: u32) -> GlyphInfo {
         GlyphInfo {

@@ -526,7 +526,7 @@ mod scale_font_tests {
         lock_or_recover(&font.pending_fallback).extend([fallback.clone(), fallback]);
         let pending = lock_or_recover(&font.pending_fallback).clone();
         for _ in 0..2 {
-            let shaped = font
+            let error = font
                 .shape(
                     "ffi A",
                     || {},
@@ -536,6 +536,15 @@ mod scale_font_tests {
                     None,
                     None,
                 )
+                .unwrap_err();
+            assert_eq!(
+                error.root_cause().to_string(),
+                "font configuration retired before fallback insertion"
+            );
+            assert!(font.tried_glyphs.borrow().is_empty());
+            let shaped = font
+                .shape_if_available("ffi A", None, Direction::LeftToRight, None, None)
+                .unwrap()
                 .unwrap();
             assert_eq!(shaped, glyphs);
             assert_same_pixels(&pixels, &glyph_pixels(&font, &shaped));
@@ -953,7 +962,11 @@ impl LoadedFont {
                     let mut pending = lock_or_recover(&self.pending_fallback);
                     pending_fallback.append(&mut pending);
                     *pending = pending_fallback;
-                    log::error!("Error adding fallback: {:#}", err);
+                    // Do not publish old-chain placeholder shapes as a
+                    // successful paint after consuming its only notification.
+                    // The caller's bounded paint retry can attempt insertion
+                    // again without caching an incomplete result.
+                    return Err(err).context("installing resolved fallback fonts");
                 }
             }
         }
