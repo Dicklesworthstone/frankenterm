@@ -451,17 +451,19 @@ fn capture_tool_contract(
     };
     let input_schema = tool_input_schema(&mut harness.client, tool_name);
     assert_schema_matches_manifest(tool_name, &input_schema);
+    let success_params = success_args(&harness);
     let success_envelope = parse_tool_envelope(
         &harness
             .client
-            .call_tool(tool_name, success_args(&harness))
+            .call_tool(tool_name, success_params)
             .unwrap_or_else(|err| panic!("call {tool_name} success case: {err}")),
     );
 
     boundary_invalid_setup(&mut harness);
+    let boundary_invalid_params = boundary_invalid_args(&harness);
     let boundary_invalid_params_error = harness
         .client
-        .call_tool(tool_name, boundary_invalid_args(&harness))
+        .call_tool(tool_name, boundary_invalid_params)
         .err()
         .map(|err| err.to_string())
         .unwrap_or_else(|| panic!("expected {tool_name} boundary-invalid case to fail"));
