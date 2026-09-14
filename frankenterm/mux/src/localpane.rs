@@ -4685,6 +4685,38 @@ mod tests {
                 .map(|line| line.len() * std::mem::size_of::<termwiz::cell::Cell>())
                 .sum()
         }
+
+        fn snapshot_scrollback(
+            &self,
+            _: StableRowIndex,
+            _: frankenterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackSnapshot,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            panic!("cold resize must not snapshot the entire durable history")
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _: Option<frankenterm_term::config::ScrollbackSnapshotGeneration>,
+            _: frankenterm_term::config::ScrollbackPrefix<'_>,
+            _: usize,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackReplaceCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            panic!("cold resize must preserve durable storage keys and payloads")
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackClearCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            panic!("cold resize must not clear durable history")
+        }
     }
 
     #[derive(Debug)]
