@@ -3,7 +3,7 @@
 use crate::macos::{nsstring, nsstring_to_str};
 use crate::superclass;
 pub use cocoa::appkit::NSEventModifierFlags;
-use cocoa::appkit::{NSApp, NSApplication, NSMenu, NSMenuItem};
+use cocoa::appkit::{NSApp, NSApplication, NSEvent, NSMenu, NSMenuItem};
 pub use cocoa::base::SEL;
 use cocoa::base::{id, nil};
 use cocoa::foundation::NSInteger;
@@ -19,6 +19,158 @@ pub struct Menu {
 }
 
 impl Menu {
+    /// Avoid populating later menus (notably macOS's dynamic Windows menu)
+    /// for a likely font shortcut. Earlier submenus still get the original
+    /// event in menu order, preserving collisions and user App Shortcuts.
+    /// AppKit remains responsible for matching, validation and action dispatch.
+    ///
+    /// # Safety
+    /// `event` must be a live NSEvent supplied by AppKit for this synchronous
+    /// callback. This rechecks the main thread and key-down type before getters.
+    /// `owns_event` must recheck the terminal first responder before each call;
+    /// it must not retain a Rust borrow across synchronous menu dispatch.
+    pub(crate) unsafe fn perform_font_key_equivalent(
+        &self,
+        event: id,
+        mut owns_event: impl FnMut() -> bool,
+    ) -> bool {
+        let main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
+        if main_thread != YES || event.is_null() || !owns_event() {
+            return false;
+        }
+        let event_type: u64 = msg_send![event, type];
+        if event_type != cocoa::appkit::NSEventType::NSKeyDown as u64 {
+            return false;
+        }
+        let delegate: id = msg_send![*self.menu, delegate];
+        if !delegate.is_null() {
+            // A main-menu delegate may define precedence independently of items.
+            return false;
+        }
+        let Some(view_item) = self.item_with_title("View") else {
+            return false;
+        };
+        let Some(view_menu) = view_item.get_sub_menu() else {
+            return false;
+        };
+        let Some(font_item) = view_menu.item_with_title("Font Size") else {
+            return false;
+        };
+        let Some(font_menu) = font_item.get_sub_menu() else {
+            return false;
+        };
+
+        let characters = event.charactersIgnoringModifiers();
+        let unshifted: id = msg_send![event, charactersByApplyingModifiers: 0_u64];
+        if characters.is_null() || unshifted.is_null() {
+            return false;
+        }
+        let characters = nsstring_to_str(characters);
+        let unshifted = nsstring_to_str(unshifted);
+        let modifiers = menu_key_modifiers(event.modifierFlags());
+        // Only actual owned font assignments qualify. Missing, disabled-default
+        // or remapped shortcuts do not acquire a hard-coded Command +/- alias.
+        let candidate = font_menu.items().iter().any(|item| {
+            if item.get_action() != Some(sel!(frankentermPerformKeyAssignment:)) {
+                return false;
+            }
+            if !matches!(
+                item.get_represented_item(),
+                Some(RepresentedItem::KeyAssignment(
+                    KeyAssignment::IncreaseFontSize
+                        | KeyAssignment::DecreaseFontSize
+                        | KeyAssignment::ResetFontSize
+                ))
+            ) {
+                return false;
+            }
+            let key: id = msg_send![*item.item, keyEquivalent];
+            let mask: NSEventModifierFlags = msg_send![*item.item, keyEquivalentModifierMask];
+            !key.is_null()
+                && crate::font_menu_key_candidate(
+                    characters,
+                    unshifted,
+                    modifiers,
+                    nsstring_to_str(key),
+                    menu_key_modifiers(mask),
+                )
+        });
+        if !candidate {
+            return false;
+        }
+
+        let items = self.items();
+        let Some(last) = items.iter().position(|item| *item.item == *view_item.item) else {
+            return false;
+        };
+        // Keep the full View submenu intact as well: an earlier View action
+        // may have the same effective shortcut. Never skip straight to Font Size.
+        let mut prefix = Vec::with_capacity(last + 1);
+        for item in &items[..=last] {
+            let hidden: BOOL = msg_send![*item.item, isHidden];
+            let enabled: BOOL = msg_send![*item.item, isEnabled];
+            let key: id = msg_send![*item.item, keyEquivalent];
+            // Unexpected top-level shortcuts or visibility rules need the normal
+            // main-menu path. Do not invent matching semantics for these cases.
+            if hidden == YES
+                || enabled != YES
+                || (!key.is_null() && !nsstring_to_str(key).is_empty())
+            {
+                return false;
+            }
+            let Some(menu) = item.get_sub_menu() else {
+                return false;
+            };
+            prefix.push(menu);
+        }
+
+        crate::dispatch_key_equivalent_prefix(&prefix, last, |index, menu| {
+            let item_count: NSInteger = msg_send![*self.menu, numberOfItems];
+            let delegate: id = msg_send![*self.menu, delegate];
+            if !owns_event()
+                // itemAtIndex: raises an ObjC exception for an out-of-range
+                // index. A preceding menu's update may have rebuilt the bar.
+                || item_count <= last as NSInteger
+                || !delegate.is_null()
+                || Self::get_main_menu().is_none_or(|current| *current.menu != *self.menu)
+                || self.item_at_index(index).is_none_or(|current| {
+                    let hidden: BOOL = msg_send![*current.item, isHidden];
+                    let enabled: BOOL = msg_send![*current.item, isEnabled];
+                    let key: id = msg_send![*current.item, keyEquivalent];
+                    hidden == YES
+                        || enabled != YES
+                        || (!key.is_null() && !nsstring_to_str(key).is_empty())
+                        || *current.item != *items[index].item
+                        || current
+                            .get_sub_menu()
+                            .is_none_or(|current| *current.menu != *menu.menu)
+                })
+                || view_item
+                    .get_sub_menu()
+                    .is_none_or(|current| *current.menu != *view_menu.menu)
+                || font_item
+                    .get_sub_menu()
+                    .is_none_or(|current| *current.menu != *font_menu.menu)
+                || self
+                    .item_at_index(last)
+                    .is_none_or(|current| *current.item != *view_item.item)
+            {
+                return None;
+            }
+            // May synchronously invoke WindowView::frankenterm_perform_key_assignment.
+            // No WindowInner borrow is held here.
+            let handled: BOOL = msg_send![*menu.menu, performKeyEquivalent: event];
+            if handled == YES {
+                log::debug!(
+                    target: "window::font_menu_profile",
+                    "event=font_menu_accelerator_dispatch route={}",
+                    if index == last { "font_parent" } else { "preceding_menu" },
+                );
+            }
+            Some(handled == YES)
+        })
+    }
+
     pub fn new_with_title(title: &str) -> Self {
         unsafe {
             let menu = NSMenu::alloc(nil);
@@ -172,6 +324,31 @@ impl Menu {
         let idx = self.index_of_item_with_represented_item(item)?;
         self.item_at_index(idx)
     }
+}
+
+fn menu_key_modifiers(flags: NSEventModifierFlags) -> crate::Modifiers {
+    let mut modifiers = crate::Modifiers::NONE;
+    for (native, portable) in [
+        (
+            NSEventModifierFlags::NSCommandKeyMask,
+            crate::Modifiers::SUPER,
+        ),
+        (
+            NSEventModifierFlags::NSControlKeyMask,
+            crate::Modifiers::CTRL,
+        ),
+        (
+            NSEventModifierFlags::NSAlternateKeyMask,
+            crate::Modifiers::ALT,
+        ),
+        (
+            NSEventModifierFlags::NSShiftKeyMask,
+            crate::Modifiers::SHIFT,
+        ),
+    ] {
+        modifiers.set(portable, flags.contains(native));
+    }
+    modifiers
 }
 
 pub struct MenuItem {

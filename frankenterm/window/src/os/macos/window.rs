@@ -7,7 +7,7 @@ use super::keycodes::*;
 use super::{nsstring, nsstring_to_str};
 use crate::clipboard::Clipboard as ClipboardContext;
 use crate::connection::ConnectionOps;
-use crate::os::macos::menu::{MenuItem, RepresentedItem};
+use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
     Clipboard, Connection, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Modifiers,
@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use cocoa::appkit::{
     self, CGFloat, NSApplication, NSApplicationActivateIgnoringOtherApps,
     NSApplicationPresentationOptions, NSBackingStoreBuffered, NSEvent, NSEventModifierFlags,
-    NSOpenGLContext, NSOpenGLPixelFormat, NSPasteboard, NSRunningApplication, NSScreen, NSView,
-    NSViewHeightSizable, NSViewWidthSizable, NSWindow, NSWindowStyleMask,
+    NSEventType, NSOpenGLContext, NSOpenGLPixelFormat, NSPasteboard, NSRunningApplication,
+    NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSWindow, NSWindowStyleMask,
 };
 use cocoa::base::*;
 use cocoa::foundation::{
@@ -2933,6 +2933,70 @@ impl WindowView {
         }
     }
 
+    /// A menu action can synchronously reenter this view. Only inspect state in
+    /// this predicate; the RefCell guard must be gone before native dispatch.
+    fn owns_font_menu_event(this: &Object, event: id) -> bool {
+        unsafe {
+            let event_type: u64 = msg_send![event, type];
+            if event_type != NSEventType::NSKeyDown as u64 {
+                return false;
+            }
+            let app = appkit::NSApp();
+            let active: BOOL = msg_send![app, isActive];
+            let modal: id = msg_send![app, modalWindow];
+            let window: id = msg_send![this, window];
+            let key_window: id = msg_send![app, keyWindow];
+            let event_window: id = msg_send![event, window];
+            if active != YES
+                || !modal.is_null()
+                || window.is_null()
+                || key_window != window
+                || event_window != window
+            {
+                return false;
+            }
+            let first_responder: id = msg_send![window, firstResponder];
+            let sheet: id = msg_send![window, attachedSheet];
+            if first_responder != this as *const Object as id || !sheet.is_null() {
+                return false;
+            }
+        }
+        let Some(myself) = Self::get_this(this) else {
+            return false;
+        };
+        let Ok(inner) = myself.inner.try_borrow() else {
+            return false;
+        };
+        inner.ime_text.is_empty() && inner.dead_pending.is_none()
+    }
+
+    fn perform_font_menu_equivalent(this: &Object, nsevent: id) -> bool {
+        // Same-binary native diagnostic control: 1 restores the original full
+        // menu route for font shortcuts only. It does not change rendering,
+        // bindings or any other platform's event dispatch. Read once per process.
+        static DISABLE_FONT_MENU_ACCELERATOR: std::sync::OnceLock<bool> =
+            std::sync::OnceLock::new();
+        let disabled = *DISABLE_FONT_MENU_ACCELERATOR.get_or_init(|| {
+            std::env::var_os("FRANKENTERM_DISABLE_FONT_MENU_ACCELERATOR")
+                .is_some_and(|value| value == "1")
+        });
+        if !disabled && Self::owns_font_menu_event(this, nsevent) {
+            if let Some(menu) = Menu::get_main_menu() {
+                // AppKit owns this event and calls the view on its main thread.
+                // The predicate drops its WindowInner borrow before the menu
+                // invokes frankentermPerformKeyAssignment synchronously.
+                if unsafe {
+                    menu.perform_font_key_equivalent(nsevent, || {
+                        Self::owns_font_menu_event(this, nsevent)
+                    })
+                } {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     extern "C" fn perform_key_equivalent(this: &mut Object, _sel: Sel, nsevent: id) -> BOOL {
         let chars = unsafe { nsstring_to_str(nsevent.characters()) };
         let modifier_flags = unsafe { nsevent.modifierFlags() };
@@ -2955,6 +3019,8 @@ impl WindowView {
             Self::key_common(this, nsevent, true);
 
             // Prevent macOS from calling doCommandBySelector(cancel:)
+            YES
+        } else if Self::perform_font_menu_equivalent(this, nsevent) {
             YES
         } else {
             // Allow macOS to process built-in shortcuts like CMD-`

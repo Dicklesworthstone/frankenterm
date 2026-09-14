@@ -71,6 +71,45 @@ pub use glium;
 pub use os::*;
 pub use wezterm_input_types::*;
 
+/// A conservative prefilter, not a replacement for AppKit key-equivalent
+/// matching. AppKit still decides whether the original event activates an
+/// enabled menu item. Ignoring Shift here admits both a printed symbol and its
+/// unshifted key without imposing a US keyboard layout.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn font_menu_key_candidate(
+    characters: &str,
+    unshifted_characters: &str,
+    modifiers: Modifiers,
+    equivalent: &str,
+    equivalent_modifiers: Modifiers,
+) -> bool {
+    !equivalent.is_empty()
+        && (equivalent == characters || equivalent == unshifted_characters)
+        && (modifiers.remove_positional_mods() - Modifiers::SHIFT)
+            == (equivalent_modifiers.remove_positional_mods() - Modifiers::SHIFT)
+}
+
+/// Try an existing menu prefix in order. None means its owner or attachment
+/// changed during synchronous native dispatch, so abandon the accelerator.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_key_equivalent_prefix<T>(
+    menus: &[T],
+    last: usize,
+    mut dispatch: impl FnMut(usize, &T) -> Option<bool>,
+) -> bool {
+    if last >= menus.len() {
+        return false;
+    }
+    for (index, menu) in menus[..=last].iter().enumerate() {
+        match dispatch(index, menu) {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return false,
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Clipboard {
     #[default]
@@ -423,6 +462,70 @@ impl ResizeIncrement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_menu_candidates_follow_live_remaps_and_preserve_modifiers() {
+        let cmd = Modifiers::SUPER;
+        let shifted = cmd | Modifiers::SHIFT;
+        let alt = cmd | Modifiers::ALT;
+        for (text, base, mods, key, key_mods, expected) in [
+            ("-", "-", cmd, "-", cmd, true),
+            ("+", "=", shifted, "=", cmd, true),
+            ("é", "é", cmd, "é", cmd, true),
+            ("j", "j", alt, "j", alt, true),
+            ("-", "-", cmd, "j", cmd, false),
+            ("j", "j", cmd, "j", alt, false),
+            ("j", "j", Modifiers::CTRL, "j", cmd, false),
+            ("", "", cmd, "", cmd, false),
+            ("`", "`", cmd, "-", cmd, false),
+        ] {
+            assert_eq!(
+                font_menu_key_candidate(text, base, mods, key, key_mods),
+                expected,
+                "event={text:?}/{mods:?}, live menu={key:?}/{key_mods:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn font_menu_prefix_preserves_collisions_and_never_visits_later_windows_menu() {
+        let menus = ["Application", "Shell", "Edit", "View", "Window"];
+        for winner in [0, 2, 3] {
+            let mut visited = vec![];
+            assert!(dispatch_key_equivalent_prefix(&menus, 3, |index, menu| {
+                visited.push(*menu);
+                Some(index == winner)
+            }));
+            assert_eq!(visited, menus[..=winner]);
+        }
+        let mut visited = vec![];
+        assert!(!dispatch_key_equivalent_prefix(&menus, 3, |_, menu| {
+            visited.push(*menu);
+            Some(false)
+        }));
+        assert_eq!(visited, menus[..=3]);
+    }
+
+    #[test]
+    fn font_menu_prefix_abandons_changed_owner_or_missing_target() {
+        let mut visited = vec![];
+        assert!(!dispatch_key_equivalent_prefix(
+            &[0, 1, 2, 3],
+            2,
+            |index, _| {
+                visited.push(index);
+                if index == 1 {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+        ));
+        assert_eq!(visited, [0, 1]);
+        assert!(!dispatch_key_equivalent_prefix(&[0], 1, |_, _| {
+            panic!("invalid menu prefix must not dispatch")
+        }));
+    }
 
     #[test]
     fn window_state_capability_and_level_goldens() {
