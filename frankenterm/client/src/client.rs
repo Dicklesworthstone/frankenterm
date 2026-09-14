@@ -4347,11 +4347,52 @@ macro_rules! rpc_surface {
         rpc!(resize, Resize, UnitResponse);
         rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
         rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);
-        rpc!(
-            get_pane_render_changes,
-            GetPaneRenderChanges,
-            LivenessResponse
-        );
+        pub fn get_pane_render_changes(
+            &self,
+            pdu: GetPaneRenderChanges,
+        ) -> impl std::future::Future<Output = anyhow::Result<LivenessResponse>> + Send + 'static {
+            let mut metric_guard = RpcAttemptMetricGuard::new("get_pane_render_changes");
+            let pane_id = pdu.pane_id;
+            // A live pane replies with a freshly correlated render observation;
+            // a missing pane replies with liveness=false. Rendering still uses
+            // the independent unilateral stream, so this poll must not apply the
+            // correlated delta a second time or move its incremental baseline.
+            let request = self.send_pdu_expect(Pdu::GetPaneRenderChanges(pdu), None);
+            async move {
+                let response = match request.await {
+                    Ok(Pdu::GetPaneRenderChangesResponse(response)) => LivenessResponse {
+                        pane_id: response.pane_id,
+                        is_alive: true,
+                    },
+                    Ok(Pdu::LivenessResponse(response)) => response,
+                    Ok(Pdu::ErrorResponse(error)) => {
+                        metric_guard.finish("remote_error");
+                        return Err(remote_rejection_error(
+                            "get_pane_render_changes",
+                            GetPaneRenderChanges::IDENT,
+                            &error,
+                        ));
+                    }
+                    Ok(other) => {
+                        metric_guard.finish("unexpected_response");
+                        return Err(anyhow!(
+                            "unexpected {} response to get_pane_render_changes",
+                            other.pdu_name(),
+                        ));
+                    }
+                    Err(error) => {
+                        metric_guard.finish("transport_error");
+                        return Err(error);
+                    }
+                };
+                if response.pane_id != pane_id {
+                    metric_guard.finish("unexpected_response");
+                    bail!("render poll response pane mismatch");
+                }
+                metric_guard.finish("success");
+                Ok(response)
+            }
+        }
         rpc!(get_lines, GetLines, GetLinesResponse);
         rpc!(
             get_lines_at_layout,
@@ -14784,6 +14825,80 @@ mod tests {
             .try_send(Ok(PendingRpcReply::pdu(Pdu::Pong(Pong {}))))
             .expect("complete admitted interactive RPC");
         asupersync_block_on(pending).expect("admitted interactive RPC should observe its reply");
+    }
+
+    #[test]
+    fn render_poll_correlated_snapshot_preserves_native_liveness_contract() {
+        let pane_id = 71;
+        let snapshot = GetPaneRenderChangesResponse {
+            pane_id,
+            mouse_grabbed: false,
+            alt_screen_active: false,
+            cursor_position: Default::default(),
+            dimensions: Default::default(),
+            tiered_scrollback_status: None,
+            dirty_lines: Vec::new(),
+            title: "current".to_string(),
+            working_dir: None,
+            bonus_lines: Vec::new().into(),
+            input_serial: None,
+            seqno: 12,
+        };
+        let mut wrong_pane = snapshot.clone();
+        wrong_pane.pane_id += 1;
+        for (response, expected_alive) in [
+            (Pdu::GetPaneRenderChangesResponse(snapshot), Some(true)),
+            (
+                Pdu::LivenessResponse(LivenessResponse {
+                    pane_id,
+                    is_alive: false,
+                }),
+                Some(false),
+            ),
+            (Pdu::GetPaneRenderChangesResponse(wrong_pane), None),
+            (
+                Pdu::LivenessResponse(LivenessResponse {
+                    pane_id: pane_id + 1,
+                    is_alive: false,
+                }),
+                None,
+            ),
+            (Pdu::Pong(Pong {}), None),
+            (
+                Pdu::ErrorResponse(ErrorResponse::backend_failure(GetPaneRenderChanges::IDENT)),
+                None,
+            ),
+        ] {
+            let (client, receiver) = client_with_idle_rpc_queue();
+            assert!(
+                !client.is_reconnectable,
+                "this is the client class whose old poll error marked a live pane dead"
+            );
+            let pending = admit_interactive_rpc_now(
+                client.get_pane_render_changes(GetPaneRenderChanges { pane_id }),
+            )
+            .unwrap()
+            .expect("poll awaits its own correlated reply");
+            let ReaderMessage::SendPdu { lease, promise, .. } = receiver.try_recv().unwrap() else {
+                panic!("poll must enqueue its request through the real RPC admission path");
+            };
+            let prepared = lease.claim_for_reader().unwrap().unwrap();
+            assert!(
+                matches!(prepared.pdu(), Pdu::GetPaneRenderChanges(request) if request.pane_id == pane_id)
+            );
+            promise
+                .try_send(Ok(PendingRpcReply::pdu(response)))
+                .unwrap();
+            let result = asupersync_block_on(pending);
+            match expected_alive {
+                Some(is_alive) => {
+                    assert_eq!(result.unwrap(), LivenessResponse { pane_id, is_alive })
+                }
+                None => assert!(result.is_err()),
+            }
+            drop(prepared);
+            drop(lease);
+        }
     }
 
     #[test]

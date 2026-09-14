@@ -1060,8 +1060,9 @@ impl RenderableInner {
         let now = Instant::now();
         // Intentionally do NOT reset poll_interval to base here. This delta arrived
         // via the server's unilateral PUSH, which already delivered the update; the
-        // liveness poll's GetPaneRenderChanges would return only liveness (no data,
-        // since the push already advanced the seqno). Re-pinning the poll to base on
+        // liveness poll's correlated observation has no new delta once that push
+        // advanced the baseline; the RPC adapter uses it only for liveness.
+        // Re-pinning the poll to base on
         // every push fires a redundant uplink RPC per push — roughly 2x the
         // round-trip/PDU traffic of an active pane on a wait-bound link, tightest
         // exactly when the pane is busiest. Let the poll back off toward max (30s)

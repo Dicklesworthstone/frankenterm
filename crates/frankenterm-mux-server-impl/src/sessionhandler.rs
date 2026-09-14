@@ -4,6 +4,7 @@ use crate::dispatch::EstablishedOrderedWindowAuthority;
 #[cfg(test)]
 use crate::dispatch::established_ordered_window_authority_for_test;
 use anyhow::{Context, anyhow};
+use codec::GetLinesAtLayout;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CoherentPaneSnapshot, CreateFloatingPane,
     CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
@@ -4331,7 +4332,26 @@ fn maybe_push_pane_changes(
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
+    push_pane_changes_with_observation(pane, sender, per_pane, false).map(|_| ())
+}
+
+/// A poll needs its own source observation: its correlated reply may be
+/// consumed while earlier unilateral deltas remain queued at the client.
+/// Reuse the exact prepared delta, or the freshly sampled no-change baseline,
+/// without performing a second viewport read or advancing push delivery state.
+fn push_pane_changes_with_observation(
+    pane: &CurrentPane<'_>,
+    sender: PduSender,
+    per_pane: Arc<Mutex<PerPane>>,
+    observe: bool,
+) -> anyhow::Result<Option<GetPaneRenderChangesResponse>> {
+    let pane_id = pane.pane_id();
+    let source_start = observe.then(|| pane.get_current_seqno());
+    let mut observation = None;
     if let Some((resp, rollback_guard)) = prepare_legacy_render_enqueue(pane, &per_pane, None)? {
+        if observe {
+            observation = Some(resp.clone());
+        }
         let send_result = sender.send_bulk(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
@@ -4459,7 +4479,42 @@ fn maybe_push_pane_changes(
             next_notification_batch = Some(batch);
         }
     }
-    Ok(())
+    if let Some(source_start) = source_start {
+        let response = match observation {
+            Some(response) => response,
+            None => {
+                let state = lock_per_pane_or_retire(&per_pane, "sampling a render poll reply")?;
+                let baseline = &state.baseline;
+                GetPaneRenderChangesResponse {
+                    pane_id,
+                    mouse_grabbed: baseline.mouse_grabbed,
+                    alt_screen_active: baseline.alt_screen_active,
+                    cursor_position: baseline.cursor_position,
+                    dimensions: baseline.dimensions,
+                    tiered_scrollback_status: baseline.tiered_scrollback_status,
+                    dirty_lines: Vec::new(),
+                    title: baseline.title.clone(),
+                    working_dir: baseline.working_dir.clone().map(Into::into),
+                    bonus_lines: Vec::new().into(),
+                    input_serial: None,
+                    seqno: baseline.seqno,
+                }
+            }
+        };
+        let source_end = pane.get_current_seqno();
+        if source_start == SequenceNo::MAX
+            || response.seqno == SequenceNo::MAX
+            || source_end == SequenceNo::MAX
+        {
+            return Err(PaneRenderPreparationError::TerminalSequenceExhausted.into());
+        }
+        if source_start != response.seqno || response.seqno != source_end {
+            return Err(PaneRenderPreparationError::SourceChanged.into());
+        }
+        Ok(Some(response))
+    } else {
+        Ok(None)
+    }
 }
 
 /// A pane input mutation is authoritative once its pane method succeeds.
@@ -8406,19 +8461,24 @@ impl SessionHandler {
                     |send_response| async move {
                         catch(
                             move || {
-                                let is_alive = authority
-                                    .try_run(|| {
-                                        registration
-                                            .try_with_current(|current| {
-                                                maybe_push_pane_changes(&current, sender, per_pane)
-                                            })
-                                            .transpose()
-                                    })??
-                                    .is_some();
-                                Ok(Pdu::LivenessResponse(LivenessResponse {
-                                    pane_id,
-                                    is_alive,
-                                }))
+                                let response = authority.try_run(|| {
+                                    registration
+                                        .try_with_current(|current| {
+                                            push_pane_changes_with_observation(
+                                                &current, sender, per_pane, true,
+                                            )
+                                        })
+                                        .transpose()
+                                })??;
+                                match response.flatten() {
+                                    Some(response) => {
+                                        Ok(Pdu::GetPaneRenderChangesResponse(response))
+                                    }
+                                    None => Ok(Pdu::LivenessResponse(LivenessResponse {
+                                        pane_id,
+                                        is_alive: false,
+                                    })),
+                                }
                             },
                             send_response,
                         );
@@ -11821,6 +11881,7 @@ mod tests {
         state: Mutex<FakePaneState>,
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
         changed_since_seqnos: Mutex<Vec<SequenceNo>>,
+        line_read_count: AtomicUsize,
         key_down_count: AtomicUsize,
         key_down_probe: Option<KeyDownProbe>,
         paste_count: AtomicUsize,
@@ -11853,6 +11914,7 @@ mod tests {
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 changed_lines: Mutex::new(RangeSet::new()),
                 changed_since_seqnos: Mutex::new(Vec::new()),
+                line_read_count: AtomicUsize::new(0),
                 key_down_count: AtomicUsize::new(0),
                 key_down_probe: None,
                 paste_count: AtomicUsize::new(0),
@@ -11984,6 +12046,7 @@ mod tests {
         }
 
         fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            self.line_read_count.fetch_add(1, Ordering::Relaxed);
             let state = self.state.lock().unwrap();
             let first_line = if lines.start == state.cursor_position.y
                 && lines.end.checked_sub(lines.start) == Some(1)
@@ -19177,6 +19240,177 @@ mod tests {
         // Modify one, verify the other is unaffected
         pp1.lock().unwrap().baseline.seqno = 42;
         assert_eq!(pp2.lock().unwrap().baseline.seqno, 0);
+    }
+
+    #[test]
+    fn correlated_render_poll_reuses_delta_and_observes_unchanged_source_without_line_reads() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).unwrap();
+        let controls = Arc::new(Mutex::new(Vec::new()));
+        let withheld_bulk = Arc::new(Mutex::new(Vec::new()));
+        let sender = PduSender::new({
+            let controls = Arc::clone(&controls);
+            let withheld_bulk = Arc::clone(&withheld_bulk);
+            move |pdu, class| {
+                match class {
+                    PduDeliveryClass::Control => controls.lock().unwrap().push(pdu),
+                    PduDeliveryClass::Bulk => withheld_bulk.lock().unwrap().push(pdu),
+                }
+                Ok(())
+            }
+        });
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        for (serial, seqno) in [(1, 11), (2, 12), (3, 12)] {
+            if serial == 2 {
+                pane.state.lock().unwrap().seqno = seqno;
+                pane.set_changed_line(0);
+            }
+            let reads_before = pane.line_read_count.load(Ordering::Relaxed);
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: pane.pane_id(),
+                }),
+            });
+            drain_simple_executor(&executor);
+            let response = take_response(&controls);
+            assert_eq!(response.serial, serial);
+            let Pdu::GetPaneRenderChangesResponse(response) = response.pdu else {
+                panic!("a live poll must carry its own correlated source observation");
+            };
+            assert_eq!(response.seqno, seqno);
+            assert_eq!(response.dimensions, pane.state.lock().unwrap().dimensions);
+            if serial == 3 {
+                assert!(response.dirty_lines.is_empty());
+                assert_eq!(response.bonus_lines.lines().count(), 0);
+                assert_eq!(pane.line_read_count.load(Ordering::Relaxed), reads_before);
+            } else {
+                assert_eq!(
+                    pane.line_read_count.load(Ordering::Relaxed) - reads_before,
+                    2
+                );
+                assert!(
+                    withheld_bulk.lock().unwrap().iter().any(|pdu| {
+                        pdu.serial == 0
+                            && pdu.pdu == Pdu::GetPaneRenderChangesResponse(response.clone())
+                    }),
+                    "the correlated delta must exactly match the admitted unilateral delta"
+                );
+            }
+        }
+        assert!(withheld_bulk.lock().unwrap().iter().any(|pdu| {
+            matches!(&pdu.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.seqno == 11)
+        }), "old deltas remain undelivered while the fresh poll observes source 12");
+        drop(handler);
+        drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn correlated_render_poll_refuses_mutation_after_render_enqueue() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sender = PduSender::new({
+            let pane = Arc::clone(&pane);
+            let captured = Arc::clone(&captured);
+            move |pdu, class| {
+                if class == PduDeliveryClass::Bulk
+                    && matches!(&pdu.pdu, Pdu::GetPaneRenderChangesResponse(_))
+                {
+                    pane.state.lock().unwrap().seqno += 1;
+                }
+                if class == PduDeliveryClass::Control {
+                    captured.lock().unwrap().push(pdu);
+                }
+                Ok(())
+            }
+        });
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        handler.process_one(DecodedPdu {
+            serial: 41,
+            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                pane_id: pane.pane_id(),
+            }),
+        });
+        drain_simple_executor(&executor);
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 41);
+        expect_error_response(
+            &response.pdu,
+            GetPaneRenderChanges::IDENT,
+            MuxErrorCode::BACKEND_FAILURE,
+        );
+        drop(handler);
+        drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn correlated_render_poll_refuses_unstable_or_exhausted_source() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        for exhausted in [false, true] {
+            let mux = Arc::new(Mux::new(None));
+            let mut fake = FakePane::new(None);
+            if exhausted {
+                fake.state.lock().unwrap().seqno = SequenceNo::MAX;
+            } else {
+                fake.seqno_on_dimensions = Some(12);
+            }
+            let pane = Arc::new(fake);
+            let pane_dyn: Arc<dyn Pane> = pane.clone();
+            mux.add_pane(&pane_dyn).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            handler.process_one(DecodedPdu {
+                serial: 43,
+                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: pane.pane_id(),
+                }),
+            });
+            drain_simple_executor(&executor);
+            let response = take_response(&captured);
+            assert_eq!(response.serial, 43);
+            expect_error_response(
+                &response.pdu,
+                GetPaneRenderChanges::IDENT,
+                MuxErrorCode::BACKEND_FAILURE,
+            );
+            assert!(captured.lock().unwrap().is_empty());
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+    }
+
+    #[test]
+    fn correlated_render_poll_retired_session_never_publishes_a_snapshot() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        handler.process_one(DecodedPdu {
+            serial: 42,
+            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                pane_id: pane.pane_id(),
+            }),
+        });
+        handler.owner.retire();
+        drain_simple_executor(&executor);
+        assert_eq!(pane.line_read_count.load(Ordering::Relaxed), 0);
+        assert!(captured.lock().unwrap().is_empty());
+        drop(handler);
+        drain_simple_executor(&executor);
     }
 
     #[test]
