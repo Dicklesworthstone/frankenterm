@@ -1204,13 +1204,15 @@ impl ScreenLineRead {
         {
             let (layout, metadata_bytes) = match self.geometry_cold_layout(limit, &cancelled)? {
                 Some(layout) => {
-                    metrics::counter!("term.cold_geometry_layout", "outcome" => "ready")
-                        .increment(1);
+                    debug!(
+                        "cold_geometry_layout outcome=ready groups={} metadata_bytes={}",
+                        layout.0.groups.len(),
+                        layout.1
+                    );
                     layout
                 }
                 None => {
-                    metrics::counter!("term.cold_geometry_layout", "outcome" => "unavailable")
-                        .increment(1);
+                    debug!("cold_geometry_layout outcome=unavailable");
                     self.streamed_cold_layout(limit, &cancelled)?
                 }
             };
@@ -8536,6 +8538,59 @@ pub(crate) mod tests {
         assert!(screen.cold_visual_layout.is_none());
         assert_eq!(sink.load_scrollback_line(0).unwrap(), originals[0]);
         assert_eq!(sink.load_scrollback_line(1).unwrap(), originals[1]);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn canonical_context_charges_only_actual_fragment_replacements() {
+        let originals = [
+            Line::from_text(&"x".repeat(128), &CellAttributes::blank(), 1, None),
+            Line::from_text("original", &CellAttributes::blank(), 1, None),
+        ];
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::new(termwiz::hyperlink::Hyperlink::new(format!(
+            "https://example.invalid/{}",
+            "a".repeat(8_192)
+        )))));
+        let replacement = Line::from_text("xy", &attrs, 1, None);
+        let (screen, _) =
+            streamed_cold_fragment_fixture(&originals, [(1, replacement.clone())].into(), 256);
+        let plan = screen.capture_line_read(0..1).unwrap();
+        let (layout, _) = plan
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap();
+        for row in 0..2 {
+            let source = if row == 1 {
+                &replacement
+            } else {
+                &originals[row]
+            };
+            let mut output = source.clone();
+            let _ = output.cells_mut_for_attr_changes_only();
+            let exact = serde_json::to_vec(&originals[row]).unwrap().len()
+                + if row == 1 {
+                    serde_json::to_vec(&replacement).unwrap().len()
+                } else {
+                    0
+                }
+                + serde_json::to_vec(&output).unwrap().len();
+            let request = row as StableRowIndex..row as StableRowIndex + 1;
+            let mut captured = screen.capture_line_read(request.clone()).unwrap();
+            captured.layout = Some(Arc::clone(&layout));
+            let ready = captured
+                .hydrate_with_payload_limit(exact, || false)
+                .unwrap();
+            assert_eq!(ready.payload_bytes(), exact);
+            assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), vec![output]);
+            assert!(screen.validates_line_read(&ready));
+            let mut captured = screen.capture_line_read(request).unwrap();
+            captured.layout = Some(Arc::clone(&layout));
+            let refused = captured
+                .hydrate_with_payload_limit(exact - 1, || false)
+                .err()
+                .unwrap();
+            assert!(refused.downcast_ref::<ColdReadPayloadLimit>().is_some());
+        }
     }
 
     #[cfg(feature = "use_serde")]
